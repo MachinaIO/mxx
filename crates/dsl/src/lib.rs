@@ -68,6 +68,12 @@ pub enum DslError {
     FamilyCountMismatch,
     #[error("parallel_map_values requires a rank-one input family")]
     ParallelMapRank,
+    #[error("parallel family operation requires rank-one input families")]
+    ParallelFamilyRank,
+    #[error("parallel_gather requires rank-one source and index families")]
+    ParallelGatherRank,
+    #[error("parallel zip requires rank-one input families")]
+    ParallelZipRank,
     #[error(transparent)]
     StructuralValidation(#[from] mxx_ir_core::ValidationError),
 }
@@ -1491,8 +1497,8 @@ impl TrapdoorFamily {
     }
 
     pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
-        if self.shape.len() != 1 {
-            return Err(DslError::Schema);
+        if self.shape.len() != 1 || indices.shape.len() != 1 {
+            return Err(DslError::ParallelGatherRank);
         }
         let source_count = self.count.clone();
         let output_count = indices.count.clone();
@@ -1608,6 +1614,9 @@ impl TrapdoorFamily {
         matrices: Family<Mat>,
         body: impl FnOnce(LoopIndex, Trapdoor, Mat) -> R,
     ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 || matrices.shape.len() != 1 {
+            return Err(DslError::ParallelZipRank);
+        }
         if self.count != matrices.count {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -1938,6 +1947,9 @@ impl Family<Int> {
         segment_count: impl Into<IntExpr>,
         bits_per_segment: impl Into<IntExpr>,
     ) -> Result<Self, DslError> {
+        if self.shape.len() != 1 {
+            return Err(DslError::ParallelFamilyRank);
+        }
         let segment_count = segment_count.into();
         let bits_per_segment = bits_per_segment.into();
         let expected_count =
@@ -2030,6 +2042,9 @@ impl Family<Int> {
         self,
         candidates: Vec<Family<Mat>>,
     ) -> Result<Family<Mat>, DslError> {
+        if self.shape.len() != 1 || candidates.iter().any(|candidate| candidate.shape.len() != 1) {
+            return Err(DslError::ParallelFamilyRank);
+        }
         let Some(first) = candidates.first() else {
             return Err(DslError::Schema);
         };
@@ -2337,6 +2352,9 @@ where
     T: ParallelOutput<Families = Family<T>> + FamilyElement + GraphValue + Clone,
     T::Schema: GraphValueSchema<Value = T>,
 {
+    if family.shape.len() != 1 {
+        return Err(DslError::ParallelMapRank);
+    }
     // The sealed body is evaluated independently at each coordinate i, producing Y[i]=F(X[i]);
     // the input family is therefore reindexed by the grid axis and captures are broadcast.
     let count = family.count.clone();
@@ -2391,6 +2409,9 @@ fn scalar_parallel_gather<T>(
 where
     T: ParallelOutput<Families = Family<T>> + GraphValue + Clone,
 {
+    if source.shape.len() != 1 || indices.shape.len() != 1 {
+        return Err(DslError::ParallelGatherRank);
+    }
     // For each output coordinate i, the selector family supplies a source index s[i], yielding
     // Y[i]=X[s[i]] while the source family itself is broadcast into the body.
     let source_count = source.count.clone();
@@ -2683,7 +2704,7 @@ impl Family<Mat> {
             return Err(DslError::Schema);
         };
         if branches.iter().any(|branch| {
-            branch.count != first.count ||
+            branch.shape != first.shape ||
                 branch.element_schema.matrix_type != first.element_schema.matrix_type
         }) {
             return Err(DslError::FamilyCountMismatch);
@@ -2717,6 +2738,9 @@ impl Family<Mat> {
     }
 
     pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
+        if self.shape.len() != 1 || indices.shape.len() != 1 {
+            return Err(DslError::ParallelGatherRank);
+        }
         let source_count = self.count.clone();
         let output_count = indices.count.clone();
         let matrix_type = self.element_schema.matrix_type.clone();
@@ -2771,6 +2795,9 @@ impl Family<Mat> {
         let Some(first) = families.first() else {
             return Err(DslError::Schema);
         };
+        if families.iter().any(|family| family.shape.len() != 1) {
+            return Err(DslError::ParallelZipRank);
+        }
         let count = first.count.clone();
         if families.iter().any(|family| family.count != count) {
             return Err(DslError::FamilyCountMismatch);
@@ -2841,6 +2868,9 @@ impl Family<Mat> {
         let Some(first) = zipped.first() else {
             return Err(DslError::Schema);
         };
+        if zipped.iter().chain(&broadcast).any(|family| family.shape.len() != 1) {
+            return Err(DslError::ParallelZipRank);
+        }
         let count = first.count.clone();
         if zipped.iter().any(|family| family.count != count) {
             return Err(DslError::FamilyCountMismatch);
@@ -2982,6 +3012,9 @@ impl Family<Mat> {
         plaintext_modulus: impl Into<IntExpr>,
         length: usize,
     ) -> Result<Vec<Family<Int>>, DslError> {
+        if self.shape.len() != 1 {
+            return Err(DslError::ParallelFamilyRank);
+        }
         self.parallel_threshold_decode(plaintext_modulus.into(), length, false).map(|values| {
             values
                 .into_iter()
@@ -3004,6 +3037,9 @@ impl Family<Mat> {
         plaintext_modulus: impl Into<IntExpr>,
         length: usize,
     ) -> Result<Vec<Family<Bool>>, DslError> {
+        if self.shape.len() != 1 {
+            return Err(DslError::ParallelFamilyRank);
+        }
         let count = self.count.clone();
         let element_type = self.element_schema.matrix_type.clone();
         let modulus = plaintext_modulus.into();
@@ -3110,6 +3146,9 @@ impl Family<Mat> {
         other: Family<Mat>,
         body: impl FnOnce(LoopIndex, Mat, Mat) -> R,
     ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 || other.shape.len() != 1 {
+            return Err(DslError::ParallelZipRank);
+        }
         if self.count != other.count {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -3178,6 +3217,9 @@ impl Family<Mat> {
         offset: usize,
         body: impl FnOnce(LoopIndex, Mat, Mat) -> R,
     ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 || other.shape.len() != 1 {
+            return Err(DslError::ParallelZipRank);
+        }
         // The second reindex reads other[i + offset] for every i in self. A
         // nonnegative canonical difference is the construction-time proof
         // that the final read remains inside the other family's domain.
@@ -3264,6 +3306,9 @@ impl Family<Mat> {
         third: Family<Mat>,
         body: impl FnOnce(LoopIndex, Mat, Mat, Mat) -> R,
     ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 || second.shape.len() != 1 || third.shape.len() != 1 {
+            return Err(DslError::ParallelZipRank);
+        }
         if self.count != second.count || self.count != third.count {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -3646,6 +3691,9 @@ where
         self,
         body: impl FnOnce(LoopIndex, Self::Items) -> Result<R, DslError>,
     ) -> Result<R::Families, DslError> {
+        if self.0.shape.len() != 1 || self.1.shape.len() != 1 {
+            return Err(DslError::ParallelZipRank);
+        }
         if self.0.count != self.1.count {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -3699,6 +3747,9 @@ where
         self,
         body: impl FnOnce(LoopIndex, Self::Items) -> Result<R, DslError>,
     ) -> Result<R::Families, DslError> {
+        if self.0.shape.len() != 1 || self.1.shape.len() != 1 || self.2.shape.len() != 1 {
+            return Err(DslError::ParallelZipRank);
+        }
         if self.0.count != self.1.count || self.0.count != self.2.count {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -6051,6 +6102,109 @@ mod tests {
     }
 
     #[test]
+    fn trapdoor_parallel_helpers_reject_rank_n_coordinate_domains() {
+        let ring = Ring::new(257, 8);
+        let shape = vec![IntExpr::constant(2), IntExpr::constant(2)];
+        let flatten = IndexMap::new([IndexExpr::Add(
+            Box::new(IndexExpr::Multiply(
+                Box::new(IndexExpr::Axis(0)),
+                Box::new(IndexExpr::constant(2)),
+            )),
+            Box::new(IndexExpr::Axis(1)),
+        )]);
+        let trapdoors = || {
+            Parallel::range(4)
+                .map_values(|_| ring.sample_trapdoor(1, 5, 4, 4, 1_000_000))
+                .expect("trapdoor family")
+        };
+        let matrices = || {
+            Family::pack(vec![
+                ring.zero((1, 1)),
+                ring.zero((1, 1)),
+                ring.zero((1, 1)),
+                ring.zero((1, 1)),
+            ])
+            .expect("matrix family")
+        };
+        let rank_two_indices = || {
+            let flat = Family::<Int>::pack(vec![
+                Int::constant(0).add(Int::constant(0)),
+                Int::constant(1).add(Int::constant(0)),
+                Int::constant(2).add(Int::constant(0)),
+                Int::constant(3).add(Int::constant(0)),
+            ])
+            .expect("flat indices");
+            let value = NodeHandle::new(
+                NodeKind::FamilyReindex { output_shape: shape.clone(), map: flatten.clone() },
+                vec![flat.value],
+                vec![WireType::Family { element: Box::new(WireType::Int), shape: shape.clone() }],
+            )
+            .output(0)
+            .expect("rank-two indices");
+            Family {
+                value,
+                element_schema: Int::constant(0).add(Int::constant(0)),
+                count: IntExpr::constant(4),
+                shape: shape.clone(),
+                pending: Pending::default(),
+            }
+        };
+
+        let rank_two_source =
+            trapdoors().reindex(shape.clone(), flatten.clone()).expect("rank-two trapdoors");
+        let rank_one_indices =
+            Family::<Int>::pack(vec![Int::constant(0)]).expect("rank-one indices");
+        assert!(matches!(
+            rank_two_source.parallel_gather(rank_one_indices),
+            Err(DslError::ParallelGatherRank)
+        ));
+        assert!(matches!(
+            trapdoors().parallel_gather(rank_two_indices()),
+            Err(DslError::ParallelGatherRank)
+        ));
+
+        let trapdoor_body_called = Cell::new(false);
+        assert!(matches!(
+            trapdoors()
+                .reindex(shape.clone(), flatten.clone())
+                .expect("rank-two trapdoors")
+                .parallel_zip_mat_values(matrices(), |_, _trapdoor, matrix| {
+                    trapdoor_body_called.set(true);
+                    matrix
+                }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!trapdoor_body_called.get());
+
+        let matrix_body_called = Cell::new(false);
+        let rank_two_matrices = matrices().reindex(shape, flatten).expect("rank-two matrices");
+        assert!(matches!(
+            trapdoors().parallel_zip_mat_values(rank_two_matrices, |_, _trapdoor, matrix| {
+                matrix_body_called.set(true);
+                matrix
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!matrix_body_called.get());
+
+        let valid_body_called = Cell::new(false);
+        let valid = trapdoors()
+            .parallel_zip_mat_values(matrices(), |_, _trapdoor, matrix| {
+                valid_body_called.set(true);
+                matrix
+            })
+            .expect("rank-one trapdoor zip");
+        assert!(valid_body_called.get());
+        DslContext::new("rank-one-trapdoor-matrix-zip")
+            .family_output("values", valid)
+            .expect("family output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+    }
+
+    #[test]
     fn trapdoor_and_matrix_zip_rejects_different_family_counts() {
         let ring = Ring::new(257, 8);
         let trapdoors =
@@ -6062,6 +6216,265 @@ mod tests {
             }),
             Err(DslError::FamilyCountMismatch)
         ));
+    }
+
+    #[test]
+    fn matrix_parallel_zip_rejects_rank_n_inputs_before_body() {
+        let ring = Ring::new(257, 8);
+        let matrix = || ring.zero((1, 1));
+        let flatten = IndexMap::new([IndexExpr::Add(
+            Box::new(IndexExpr::Multiply(
+                Box::new(IndexExpr::Axis(0)),
+                Box::new(IndexExpr::constant(2)),
+            )),
+            Box::new(IndexExpr::Axis(1)),
+        )]);
+        let rank_two = || {
+            Family::pack(vec![matrix(), matrix(), matrix(), matrix()])
+                .expect("flat family")
+                .reindex(vec![IntExpr::constant(2), IntExpr::constant(2)], flatten.clone())
+                .expect("rank-two family")
+        };
+        let rank_one =
+            || Family::pack(vec![matrix(), matrix(), matrix(), matrix()]).expect("rank-one family");
+
+        let valid_body_called = Cell::new(false);
+        rank_one()
+            .parallel_zip_values(rank_one(), |_, left, right| {
+                valid_body_called.set(true);
+                left + right
+            })
+            .expect("rank-one zip");
+        assert!(valid_body_called.get());
+
+        let left_body_called = Cell::new(false);
+        assert!(matches!(
+            rank_two().parallel_zip_values(rank_one(), |_, left, right| {
+                left_body_called.set(true);
+                left + right
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!left_body_called.get());
+
+        let right_body_called = Cell::new(false);
+        assert!(matches!(
+            rank_one().parallel_zip_values(rank_two(), |_, left, right| {
+                right_body_called.set(true);
+                left + right
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!right_body_called.get());
+
+        let offset_body_called = Cell::new(false);
+        assert!(matches!(
+            rank_one().parallel_zip_offset_values(rank_two(), 0, |_, left, right| {
+                offset_body_called.set(true);
+                left + right
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!offset_body_called.get());
+    }
+
+    #[test]
+    fn generic_parallel_zip_rejects_every_rank_n_tuple_position_before_body() {
+        let ring = Ring::new(257, 8);
+        let matrix = || ring.zero((1, 1));
+        let flatten = IndexMap::new([IndexExpr::Add(
+            Box::new(IndexExpr::Multiply(
+                Box::new(IndexExpr::Axis(0)),
+                Box::new(IndexExpr::constant(2)),
+            )),
+            Box::new(IndexExpr::Axis(1)),
+        )]);
+        let rank_two = || {
+            Family::pack(vec![matrix(), matrix(), matrix(), matrix()])
+                .expect("flat family")
+                .reindex(vec![IntExpr::constant(2), IntExpr::constant(2)], flatten.clone())
+                .expect("rank-two family")
+        };
+        let rank_one =
+            || Family::pack(vec![matrix(), matrix(), matrix(), matrix()]).expect("rank-one family");
+
+        let valid_body_calls = Cell::new(0);
+        let valid = parallel_zip((rank_one(), rank_one()), |_, (left, right)| {
+            valid_body_calls.set(valid_body_calls.get() + 1);
+            left + right
+        })
+        .expect("rank-one generic zip");
+        assert_eq!(valid_body_calls.get(), 1);
+        DslContext::new("generic-parallel-zip-rank-one")
+            .family_output("output", valid)
+            .expect("family output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let rejected_body_calls = Cell::new(0);
+        assert!(matches!(
+            parallel_zip((rank_two(), rank_one()), |_, (left, right)| {
+                rejected_body_calls.set(rejected_body_calls.get() + 1);
+                left + right
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(matches!(
+            parallel_zip((rank_one(), rank_two()), |_, (left, right)| {
+                rejected_body_calls.set(rejected_body_calls.get() + 1);
+                left + right
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(matches!(
+            parallel_zip_bundle(
+                (rank_two(), rank_one(), rank_one()),
+                |_, (left, middle, right)| {
+                    rejected_body_calls.set(rejected_body_calls.get() + 1);
+                    left + middle + right
+                },
+            ),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(matches!(
+            parallel_zip_bundle(
+                (rank_one(), rank_two(), rank_one()),
+                |_, (left, middle, right)| {
+                    rejected_body_calls.set(rejected_body_calls.get() + 1);
+                    left + middle + right
+                },
+            ),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(matches!(
+            parallel_zip_bundle_result(
+                (rank_one(), rank_one(), rank_two()),
+                |_, (left, middle, right)| {
+                    rejected_body_calls.set(rejected_body_calls.get() + 1);
+                    Ok::<_, DslError>(left + middle + right)
+                },
+            ),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert_eq!(rejected_body_calls.get(), 0);
+    }
+
+    #[test]
+    fn matrix_rank_one_parallel_helpers_reject_rank_n_and_preserve_rank_one_shape() {
+        let ring = Ring::new(257, 8);
+        let rank_one = || Parallel::range(4).map(|_| ring.zero((1, 1))).unwrap();
+        let rank_two = || {
+            Parallel::grid(vec![IntExpr::constant(2), IntExpr::constant(2)])
+                .map(|_| ring.zero((1, 1)))
+                .unwrap()
+        };
+        let rank_two_indices = || {
+            let flat = Family::<Int>::pack(vec![
+                Int::constant(0).add(Int::constant(0)),
+                Int::constant(1).add(Int::constant(0)),
+                Int::constant(2).add(Int::constant(0)),
+                Int::constant(3).add(Int::constant(0)),
+            ])
+            .unwrap();
+            let shape = vec![IntExpr::constant(2), IntExpr::constant(2)];
+            let value = NodeHandle::new(
+                NodeKind::FamilyReindex {
+                    output_shape: shape.clone(),
+                    map: IndexMap::new([IndexExpr::Add(
+                        Box::new(IndexExpr::Multiply(
+                            Box::new(IndexExpr::Axis(0)),
+                            Box::new(IndexExpr::constant(2)),
+                        )),
+                        Box::new(IndexExpr::Axis(1)),
+                    )]),
+                },
+                vec![flat.value],
+                vec![WireType::Family { element: Box::new(WireType::Int), shape: shape.clone() }],
+            )
+            .output(0)
+            .unwrap();
+            Family {
+                value,
+                element_schema: flat.element_schema,
+                count: flat.count,
+                shape,
+                pending: flat.pending,
+            }
+        };
+
+        let gathered = rank_one()
+            .parallel_gather(Family::<Int>::pack(vec![Int::constant(3), Int::constant(0)]).unwrap())
+            .expect("rank-one gather");
+        assert_eq!(gathered.shape(), &[IntExpr::constant(2)]);
+        assert!(matches!(
+            rank_two().parallel_gather(
+                Family::<Int>::pack(vec![Int::constant(0), Int::constant(1)]).unwrap()
+            ),
+            Err(DslError::ParallelGatherRank)
+        ));
+        assert!(matches!(
+            rank_one().parallel_gather(rank_two_indices()),
+            Err(DslError::ParallelGatherRank)
+        ));
+
+        let zipped =
+            Family::<Mat>::parallel_zip_many_values(vec![rank_one(), rank_one()], |_, matrices| {
+                matrices.into_iter().next().unwrap()
+            })
+            .expect("rank-one zip-many");
+        assert_eq!(zipped.shape(), &[IntExpr::constant(4)]);
+        let zip_many_body_called = Cell::new(false);
+        assert!(matches!(
+            Family::<Mat>::parallel_zip_many_values(vec![rank_one(), rank_two()], |_, matrices| {
+                zip_many_body_called.set(true);
+                matrices.into_iter().next().unwrap()
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!zip_many_body_called.get());
+
+        let broadcast_body_called = Cell::new(false);
+        assert!(matches!(
+            Family::<Mat>::parallel_zip_many_with_broadcast_values(
+                vec![rank_one()],
+                vec![rank_two()],
+                |_, matrices, _| {
+                    broadcast_body_called.set(true);
+                    Ok(matrices.into_iter().next().unwrap())
+                },
+            ),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!broadcast_body_called.get());
+
+        let decoded_ints = rank_one().parallel_threshold_decode_ints(2, 1).unwrap();
+        let decoded_bools = rank_one().parallel_threshold_decode_bools(2, 1).unwrap();
+        assert_eq!(decoded_ints[0].shape, vec![IntExpr::constant(4)]);
+        assert_eq!(decoded_bools[0].shape, vec![IntExpr::constant(4)]);
+        assert!(matches!(
+            rank_two().parallel_threshold_decode_ints(2, 1),
+            Err(DslError::ParallelFamilyRank)
+        ));
+        assert!(matches!(
+            rank_two().parallel_threshold_decode_bools(2, 1),
+            Err(DslError::ParallelFamilyRank)
+        ));
+
+        let zipped_three = rank_one()
+            .parallel_zip3_values(rank_one(), rank_one(), |_, first, _, _| first)
+            .expect("rank-one zip3");
+        assert_eq!(zipped_three.shape(), &[IntExpr::constant(4)]);
+        let zip3_body_called = Cell::new(false);
+        assert!(matches!(
+            rank_one().parallel_zip3_values(rank_one(), rank_two(), |_, first, _, _| {
+                zip3_body_called.set(true);
+                first
+            }),
+            Err(DslError::ParallelZipRank)
+        ));
+        assert!(!zip3_body_called.get());
     }
 
     #[test]
@@ -6220,6 +6633,74 @@ mod tests {
     }
 
     #[test]
+    fn scalar_parallel_helpers_reject_rank_n_and_keep_rank_one_inputs() {
+        let rank_two_shape = vec![IntExpr::constant(2), IntExpr::constant(2)];
+        let rank_one_shape = vec![IntExpr::constant(4)];
+        let rank_two_int = IntFamilyType { shape: rank_two_shape.clone() }.placeholders();
+        let rank_two_bool = BoolFamilyType { shape: rank_two_shape.clone() }.placeholders();
+        assert!(matches!(
+            rank_two_int.clone().parallel_map(|_, _| panic!("rank guard must precede callback")),
+            Err(DslError::ParallelMapRank)
+        ));
+        assert!(matches!(
+            rank_two_bool.parallel_map(|_, _| panic!("rank guard must precede callback")),
+            Err(DslError::ParallelMapRank)
+        ));
+
+        let rank_one_int = IntFamilyType { shape: rank_one_shape.clone() }.placeholders();
+        let rank_two_indices = IntFamilyType { shape: rank_two_shape.clone() }.placeholders();
+        assert!(matches!(
+            rank_two_int.clone().parallel_gather(rank_one_int.clone()),
+            Err(DslError::ParallelGatherRank)
+        ));
+        assert!(matches!(
+            rank_one_int.clone().parallel_gather(rank_two_indices),
+            Err(DslError::ParallelGatherRank)
+        ));
+        assert!(matches!(
+            rank_two_int.clone().parallel_pack_little_endian_bits(2, 2),
+            Err(DslError::ParallelFamilyRank)
+        ));
+
+        let ring = Ring::new(17, 8);
+        let rank_one_mats =
+            MatFamilyType { element: ring.matrix_type((1, 1)), shape: rank_one_shape.clone() }
+                .placeholders();
+        let rank_two_mats = Family::<Mat>::source_input(
+            "rank-two-select-candidates".into(),
+            ring.matrix_type((1, 1)),
+            IntExpr::constant(4),
+            None,
+        )
+        .reindex(
+            rank_two_shape,
+            IndexMap::new([IndexExpr::Add(
+                Box::new(IndexExpr::Multiply(
+                    Box::new(IndexExpr::Axis(0)),
+                    Box::new(IndexExpr::constant(2)),
+                )),
+                Box::new(IndexExpr::Axis(1)),
+            )]),
+        )
+        .unwrap();
+        assert!(matches!(
+            rank_two_int.parallel_select_mats(vec![rank_one_mats.clone()]),
+            Err(DslError::ParallelFamilyRank)
+        ));
+        assert!(matches!(
+            rank_one_int.clone().parallel_select_mats(vec![rank_two_mats]),
+            Err(DslError::ParallelFamilyRank)
+        ));
+
+        let rank_one_bool = BoolFamilyType { shape: rank_one_shape.clone() }.placeholders();
+        rank_one_bool.parallel_map(|_, value| value).unwrap();
+        rank_one_int.clone().parallel_map(|_, value| value).unwrap();
+        rank_one_int.clone().parallel_gather(rank_one_int.clone()).unwrap();
+        rank_one_int.clone().parallel_pack_little_endian_bits(2, 2).unwrap();
+        rank_one_int.parallel_select_mats(vec![rank_one_mats]).unwrap();
+    }
+
+    #[test]
     fn sequential_scan_keeps_nested_loop_binders_distinct() {
         let context = DslContext::new("nested-sequential-parallel");
         let initial = Family::<Int>::pack(vec![Int::constant(0), Int::constant(0)]).unwrap();
@@ -6350,6 +6831,39 @@ mod tests {
         let selected = Family::<Mat>::select(selector, vec![left, right]).unwrap();
         let built = context.public_family_output("selected", selected).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
+
+        // Both branches contain four matrices, but [4] and [2,2] are
+        // different coordinate domains. Their equal flat cardinality must
+        // not authorize constructing a Select with one branch's wire shape.
+        let four = IntExpr::Mul(Box::new(IntExpr::constant(2)), Box::new(IntExpr::constant(2)));
+        let flat = Family::<Mat>::source_input(
+            "flat-select-branch".into(),
+            ring.matrix_type((1, 1)),
+            four.clone(),
+            None,
+        );
+        let rank_two = Family::<Mat>::source_input(
+            "rank-two-select-source".into(),
+            ring.matrix_type((1, 1)),
+            four,
+            None,
+        )
+        .reindex(
+            vec![IntExpr::constant(2), IntExpr::constant(2)],
+            IndexMap::new([IndexExpr::Add(
+                Box::new(IndexExpr::Multiply(
+                    Box::new(IndexExpr::Axis(0)),
+                    Box::new(IndexExpr::constant(2)),
+                )),
+                Box::new(IndexExpr::Axis(1)),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(flat.count(), rank_two.count());
+        assert!(matches!(
+            Family::<Mat>::select(Int::constant(0), vec![flat, rank_two]),
+            Err(DslError::FamilyCountMismatch)
+        ));
     }
 
     #[test]

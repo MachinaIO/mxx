@@ -1251,12 +1251,23 @@ The integer range analyzer supports:
 
 Interval arithmetic uses unbounded `BigInt` endpoints. Addition and subtraction use the usual
 endpoint formulas. Multiplication takes the minimum and maximum of the four endpoint products.
-Division follows Rust's truncation-toward-zero semantics; the divisor interval must be wholly
-positive or wholly negative, and the endpoint quotient envelope is used. Remainder uses the same
-signed semantics and the invariant `abs(remainder) < max(abs(divisor))`; when the dividend is
-nonnegative and the divisor positive, this specializes to `[0, divisor_max - 1]`. Comparisons and
-bit extraction return singleton ranges when proven and `[0, 1]` otherwise. A branch selection joins
-only branches reachable from the selector range.
+
+Runtime integer values and deterministic coordinate maps have distinct division contracts:
+
+- `IntBinaryOp::Divide` and `IntBinaryOp::Remainder` use the positive absolute value of the
+  divisor. For each concrete pair, `q = floor(n / abs(d))` and `r = n - q * abs(d)`, so
+  `0 <= r < abs(d)`. Thus `-7 / 3 = -3` with remainder `2`, and divisor `-3` gives the same result.
+  Division uses the four endpoint quotients, while remainder is bounded by
+  `[0, max(abs(divisor)) - 1]`.
+- `IndexExpr::Divide` and `IndexExpr::Remainder` match `BigInt` coordinate evaluation: the quotient
+  truncates toward zero and the remainder has the dividend's sign. Thus `-7 / 3 = -2` with
+  remainder `-1`. Division again uses the four endpoint quotients. If
+  `M = max(abs(divisor)) - 1`, remainder is bounded by `[0, M]` for a nonnegative dividend,
+  `[-M, 0]` for a nonpositive dividend, and `[-M, M]` when the dividend range crosses zero.
+
+In both cases, the divisor interval must exclude zero. Comparisons and bit extraction return
+singleton ranges when proven and `[0, 1]` otherwise. A branch selection joins only branches
+reachable from the selector range.
 
 Every family access and branch selection validates its range. A wholly or partially out-of-domain
 range is an error; the simulator does not assume that runtime execution happens to choose a valid

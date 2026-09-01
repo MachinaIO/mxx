@@ -61,6 +61,8 @@ where
     active_placement: usize,
     preimage_batch_calls: usize,
     #[cfg(test)]
+    preimage_batch_sizes: Vec<usize>,
+    #[cfg(test)]
     multiply_calls: usize,
     #[cfg(test)]
     multiply_batch_sizes: Vec<usize>,
@@ -164,6 +166,8 @@ where
             active_placement: 0,
             preimage_batch_calls: 0,
             #[cfg(test)]
+            preimage_batch_sizes: Vec::new(),
+            #[cfg(test)]
             multiply_calls: 0,
             #[cfg(test)]
             multiply_batch_sizes: Vec::new(),
@@ -234,6 +238,11 @@ where
     /// bounded-wave batch path from scalar fallback execution.
     pub fn preimage_batch_calls(&self) -> usize {
         self.preimage_batch_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preimage_batch_sizes(&self) -> &[usize] {
+        &self.preimage_batch_sizes
     }
 
     #[cfg(test)]
@@ -826,6 +835,8 @@ where
         requests: Vec<PreimageRequest<M, T::Trapdoor>>,
     ) -> Result<Vec<M>, Self::Error> {
         self.preimage_batch_calls += 1;
+        #[cfg(test)]
+        self.preimage_batch_sizes.push(requests.len());
         #[cfg(not(feature = "gpu"))]
         {
             requests
@@ -855,6 +866,8 @@ where
         batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
     ) -> Result<Vec<(usize, Vec<M>)>, Self::Error> {
         self.preimage_batch_calls += batches.len();
+        #[cfg(test)]
+        self.preimage_batch_sizes.extend(batches.iter().map(|(_, requests)| requests.len()));
         #[cfg(feature = "gpu")]
         {
             super::poly_gpu::sample_preimage_batches_by_placement(self, batches)

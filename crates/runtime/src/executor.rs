@@ -605,6 +605,15 @@ where
                     &node,
                     &mut values,
                 )?;
+            } else if matches!(node.kind, NodeKind::FamilyPreimageSample { .. }) && envs.len() > 1 {
+                self.execute_family_preimage_batch(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
+                    &node,
+                    &mut values,
+                )?;
             } else if envs.len() > 1 &&
                 self.execute_parallel_matrix_node_by_placement(
                     &placements,
@@ -2390,6 +2399,66 @@ where
         node: &ExecutableNode<'_>,
         values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
     ) -> Result<(), ExecutionError> {
+        let placement = self.backend.active_placement();
+        let pending =
+            self.prepare_family_preimage_requests(scope_id, env, path, placement, node, values)?;
+        let outputs = self
+            .sample_preimage_requests(&pending)?
+            .into_iter()
+            .map(RuntimeValue::matrix)
+            .collect();
+        self.put(values, node.id, 0, RuntimeValue::Family(outputs));
+        Ok(())
+    }
+
+    fn execute_family_preimage_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        placements: &[usize],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<(), ExecutionError> {
+        let mut instance_counts = Vec::with_capacity(values.len());
+        let mut pending = Vec::new();
+        for instance in 0..values.len() {
+            self.set_placement(placements[instance])?;
+            let instance_pending = self.prepare_family_preimage_requests(
+                scope_id,
+                &envs[instance],
+                &paths[instance],
+                placements[instance],
+                node,
+                &mut values[instance],
+            )?;
+            instance_counts.push(instance_pending.len());
+            pending.extend(instance_pending);
+        }
+        let mut sampled = self.sample_preimage_requests(&pending)?.into_iter();
+        for (instance, count) in instance_counts.into_iter().enumerate() {
+            let outputs =
+                sampled.by_ref().take(count).map(RuntimeValue::matrix).collect::<Vec<_>>();
+            if outputs.len() != count {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            self.put(&mut values[instance], node.id, 0, RuntimeValue::Family(outputs));
+        }
+        if sampled.next().is_some() {
+            return Err(ExecutionError::InvalidBatch(node.id));
+        }
+        Ok(())
+    }
+
+    fn prepare_family_preimage_requests(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        env: &ParamEnv,
+        path: &[InstantiationFrame],
+        placement: usize,
+        node: &ExecutableNode<'_>,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
+    ) -> Result<Vec<PreparedPreimage<B::Matrix, B::Trapdoor>>, ExecutionError> {
         // A cardinality-one family is still a family: its sole artifact must
         // be loaded through family_member rather than treated as a scalar.
         let source_family_count = self.family_count(values, node.args[0]).ok();
@@ -2403,8 +2472,7 @@ where
             if target_count == 0 {
                 // There are no equations B_i * K_i,j = T_i,j to sample. The validated output
                 // wire retains the target's logical shape even though its flat value is empty.
-                self.put(values, node.id, 0, RuntimeValue::Family(Vec::new()));
-                return Ok(());
+                return Ok(Vec::new());
             }
             return Err(ExecutionError::ValueKind(node.args[2]));
         }
@@ -2431,7 +2499,6 @@ where
                     wire: output_wire,
                 })
             })?;
-        let placement = self.backend.active_placement();
         let mut pending = Vec::with_capacity(target_count);
         for lane in 0..target_count {
             let group = lane / branch_count;
@@ -2490,13 +2557,7 @@ where
                 },
             });
         }
-        let outputs = self
-            .sample_preimage_requests(&pending)?
-            .into_iter()
-            .map(RuntimeValue::matrix)
-            .collect();
-        self.put(values, node.id, 0, RuntimeValue::Family(outputs));
-        Ok(())
+        Ok(pending)
     }
 
     fn family_member(
@@ -4210,6 +4271,112 @@ mod tests {
         let production = result.production_id.expect("empty family manifest");
         let manifest = store.manifest(&production).expect("manifest");
         assert_eq!(manifest.artifacts["preimages"].family_shape, Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn nested_family_preimages_batch_across_outer_grid_instances_and_replay() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let trapdoors = Parallel::range(1)
+            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+            .expect("source trapdoor family");
+        let selected = Parallel::range(3)
+            .map_values({
+                let trapdoors = trapdoors.clone();
+                let ring = ring.clone();
+                move |_| {
+                    let targets = Parallel::grid(vec![IntExpr::constant(1), IntExpr::constant(2)])
+                        .map({
+                            let ring = ring.clone();
+                            move |_| ring.zero((1, 1))
+                        })
+                        .expect("inner target family");
+                    trapdoors
+                        .sample_preimage_branches(targets, (digit_count + 2, 1))
+                        .expect("inner family preimages")
+                        .get_static(vec![IndexExpr::constant(0), IndexExpr::constant(0)])
+                }
+            })
+            .expect("outer selected preimages");
+        let validated = DslContext::new("runtime-nested-family-preimage-batch")
+            .preimage_family_output("selected", selected)
+            .expect("selected output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let config = ExecutionConfig {
+            max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+            ..ExecutionConfig::default()
+        };
+        let mut backend = cpu_backend([parameters]);
+        let calls_before = backend.preimage_batch_calls();
+        let sizes_before = backend.preimage_batch_sizes().len();
+        let mut recorder = TranscriptRecorder::default();
+        let mut first_store = MemoryArtifactStore::default();
+        let mut first = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut first_store,
+            SamplingMode::Record(&mut recorder),
+            config,
+        )
+        .expect("recorded execution");
+        assert_eq!(backend.preimage_batch_calls(), calls_before + 1);
+        assert_eq!(&backend.preimage_batch_sizes()[sizes_before..], &[6]);
+        let first_bytes = {
+            let RuntimeValue::Family(values) = first
+                .materialize_output("selected", &backend, &mut first_store)
+                .expect("materialize recorded output")
+            else {
+                panic!("recorded output is not a family")
+            };
+            values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix.as_ref()),
+                    _ => panic!("recorded family member is not a matrix"),
+                })
+                .collect::<Vec<_>>()
+        };
+        first.cleanup_staged(&mut first_store).expect("recorded staged cleanup");
+
+        let calls_before_replay = backend.preimage_batch_calls();
+        let sizes_before_replay = backend.preimage_batch_sizes().len();
+        let replayer = recorder.into_replayer();
+        let mut replay_store = MemoryArtifactStore::default();
+        let mut replayed = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut replay_store,
+            SamplingMode::Replay(&replayer),
+            config,
+        )
+        .expect("replayed execution");
+        assert_eq!(backend.preimage_batch_calls(), calls_before_replay);
+        assert_eq!(backend.preimage_batch_sizes().len(), sizes_before_replay);
+        let replayed_bytes = {
+            let RuntimeValue::Family(values) = replayed
+                .materialize_output("selected", &backend, &mut replay_store)
+                .expect("materialize replayed output")
+            else {
+                panic!("replayed output is not a family")
+            };
+            values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix.as_ref()),
+                    _ => panic!("replayed family member is not a matrix"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(replayed_bytes, first_bytes);
+        replayed.cleanup_staged(&mut replay_store).expect("replayed staged cleanup");
     }
 
     #[test]

@@ -249,7 +249,10 @@ pub struct FamilyState {
 
 impl FamilyState {
     pub fn new(shape: Vec<usize>, element: AbstractValue) -> Result<Self, StateError> {
-        if shape.is_empty() || shape.contains(&0) || matches!(element, AbstractValue::Family(_)) {
+        // An empty runtime family still has an element type.  Its abstract
+        // element is the typed bottom summary and is never observable through
+        // a member access because every zero extent rejects all indices.
+        if shape.is_empty() || matches!(element, AbstractValue::Family(_)) {
             return Err(StateError::InvalidFamilyShape);
         }
         shape
@@ -273,9 +276,16 @@ pub struct TrapdoorState {
 pub enum AbstractValue {
     Matrix(MatrixState),
     Integer(IntegerState),
+    /// Type-only state used when an empty family has real-valued elements.
+    /// Real transfers remain unsupported; no member of an empty family can
+    /// expose this value to such a transfer.
+    Real,
     Boolean(BooleanState),
     Bytes,
-    TypedBlob { type_name: String, schema_hash: [u8; 32] },
+    TypedBlob {
+        type_name: String,
+        schema_hash: [u8; 32],
+    },
     Trapdoor(TrapdoorState),
     Family(FamilyState),
 }

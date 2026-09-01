@@ -30,6 +30,44 @@ struct Info {
     paired_public: Option<crate::FamilyViewId>,
 }
 
+/// Evaluator-private numeric provenance for one structural loop binder.
+///
+/// The public abstract domain remains an interval.  This sidecar retains only
+/// the small amount of correlation needed to refine an affine scalar on a
+/// comparison branch; expressions involving multiple binders or non-affine
+/// arithmetic simply have no provenance and continue with interval semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScalarFacts {
+    Affine(AffineScalar),
+    Truth(TruthFacts),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AffineScalar {
+    binder: Option<u64>,
+    coefficient: BigInt,
+    offset: BigInt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BinderRefinement {
+    binder: u64,
+    range: state::IntegerState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OutcomeRefinement {
+    Impossible,
+    Unconstrained,
+    Restricted(BinderRefinement),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TruthFacts {
+    when_zero: OutcomeRefinement,
+    when_one: OutcomeRefinement,
+}
+
 fn artifact_validation_order(
     request: &SimulationRequest,
     needed: &HashSet<crate::StageId>,
@@ -143,6 +181,23 @@ pub(crate) fn run(request: &SimulationRequest) -> Result<crate::SimulationReport
         mapped_sources: HashMap::new(),
         gathered_sources: HashMap::new(),
         binder_sources: HashMap::new(),
+        abstract_integers: request
+            .environment
+            .integers
+            .iter()
+            .map(|(name, value)| (name.clone(), state::IntegerState::singleton(value.clone())))
+            .collect(),
+        abstract_integer_facts: request
+            .environment
+            .integers
+            .iter()
+            .map(|(name, value)| (name.clone(), ScalarFacts::Affine(AffineScalar::constant(value))))
+            .collect(),
+        abstract_loop_indices: HashMap::new(),
+        abstract_loop_atoms: HashMap::new(),
+        binder_ranges: HashMap::new(),
+        next_binder_atom: 0,
+        scalar_facts: HashMap::new(),
         next_source: 0,
         preimages: HashMap::new(),
         states: HashMap::new(),
@@ -204,6 +259,19 @@ struct Evaluator<'a> {
     /// The key is the representative source, output shape, and flat lane;
     /// consequently public/trapdoor paired views receive the same leaves.
     binder_sources: HashMap<(crate::SourceId, Vec<usize>, usize), crate::SourceId>,
+    /// Integer parameters and loop binders visible to the current symbolic
+    /// scope.  Parallel-grid binders are intervals, so the body is evaluated
+    /// once while still covering every concrete lane.
+    abstract_integers: BTreeMap<String, state::IntegerState>,
+    abstract_integer_facts: BTreeMap<String, ScalarFacts>,
+    abstract_loop_indices: HashMap<u32, state::IntegerState>,
+    /// Loop slots are lexical names and may be reused by nested grids.  Each
+    /// active slot therefore maps to a fresh atom before it enters affine
+    /// provenance, preventing unrelated binders from being correlated.
+    abstract_loop_atoms: HashMap<u32, u64>,
+    binder_ranges: HashMap<u64, state::IntegerState>,
+    next_binder_atom: u64,
+    scalar_facts: HashMap<crate::FamilyViewId, ScalarFacts>,
     next_source: u32,
     preimages: HashMap<crate::FamilyViewId, RightPreimage>,
     states: HashMap<crate::FamilyViewId, MatrixState>,
@@ -237,6 +305,228 @@ struct SourceLineage {
 }
 
 impl<'a> Evaluator<'a> {
+    fn scalar_fact(&self, value: &Info) -> Option<&ScalarFacts> {
+        self.scalar_facts.get(&value.view)
+    }
+
+    fn int_binary_transfer(
+        &self,
+        operation: IntBinaryOp,
+        left: &Info,
+        right: &Info,
+    ) -> Result<(state::IntegerState, Option<ScalarFacts>), SimulationError> {
+        let a = int(left)?;
+        let b = int(right)?;
+        let left_fact = self.scalar_fact(left);
+        let right_fact = self.scalar_fact(right);
+        let ordinary = || match operation {
+            IntBinaryOp::Add => Ok(a.add(&b)),
+            IntBinaryOp::Subtract => Ok(a.subtract(&b)),
+            IntBinaryOp::Multiply => Ok(a.multiply(&b)),
+            IntBinaryOp::Divide => a.divide(&b).map_err(|error| SimulationError::InvalidGraph {
+                message: error.to_string(),
+                site: None,
+            }),
+            IntBinaryOp::Remainder => a.remainder(&b).map_err(|error| {
+                SimulationError::InvalidGraph { message: error.to_string(), site: None }
+            }),
+        };
+
+        let affine = (|| match operation {
+            IntBinaryOp::Add => affine_fact(left_fact)?.add(&affine_fact(right_fact)?),
+            IntBinaryOp::Subtract => affine_fact(left_fact)?.subtract(&affine_fact(right_fact)?),
+            IntBinaryOp::Multiply => {
+                let left = affine_fact(left_fact)?;
+                let right = affine_fact(right_fact)?;
+                if left.binder.is_none() {
+                    Some(right.multiply_constant(&left.offset))
+                } else if right.binder.is_none() {
+                    Some(left.multiply_constant(&right.offset))
+                } else {
+                    None
+                }
+            }
+            IntBinaryOp::Divide => {
+                let left = affine_fact(left_fact)?;
+                let right = affine_fact(right_fact)?;
+                if right.binder.is_none() &&
+                    !right.offset.is_zero() &&
+                    &left.coefficient % &right.offset == BigInt::zero() &&
+                    &left.offset % &right.offset == BigInt::zero()
+                {
+                    Some(AffineScalar {
+                        binder: left.binder,
+                        coefficient: left.coefficient / &right.offset,
+                        offset: left.offset / right.offset,
+                    })
+                } else {
+                    None
+                }
+            }
+            IntBinaryOp::Remainder => None,
+        })();
+        if let Some(affine) = affine {
+            return Ok((ordinary()?, Some(ScalarFacts::Affine(affine))));
+        }
+
+        if operation == IntBinaryOp::Multiply {
+            if let (Some(left), Some(right)) = (truth_fact(left_fact), truth_fact(right_fact)) {
+                let when_one = intersect_outcomes(&left.when_one, &right.when_one);
+                let when_zero = if matches!(left.when_zero, OutcomeRefinement::Impossible) &&
+                    matches!(right.when_zero, OutcomeRefinement::Impossible)
+                {
+                    OutcomeRefinement::Impossible
+                } else {
+                    OutcomeRefinement::Unconstrained
+                };
+                let minimum =
+                    if matches!(when_zero, OutcomeRefinement::Impossible) { 1 } else { 0 };
+                let maximum = if matches!(when_one, OutcomeRefinement::Impossible) { 0 } else { 1 };
+                return Ok((
+                    state::IntegerState::new(minimum.into(), maximum.into())?,
+                    Some(ScalarFacts::Truth(TruthFacts { when_zero, when_one })),
+                ));
+            }
+        }
+        Ok((ordinary()?, None))
+    }
+
+    fn derived_scalar_fact(
+        &self,
+        kind: &NodeKind,
+        inputs: &[Info],
+        env: &ParamEnv,
+    ) -> Option<ScalarFacts> {
+        match kind {
+            NodeKind::ConstantInt(value) => {
+                Some(ScalarFacts::Affine(AffineScalar::constant(value)))
+            }
+            NodeKind::EvaluateInt(expression) => {
+                eval_int_facts(expression, &self.abstract_integer_facts, &self.abstract_loop_atoms)
+            }
+            NodeKind::ConstantBool(value) => Some(ScalarFacts::Truth(TruthFacts {
+                when_zero: if *value {
+                    OutcomeRefinement::Impossible
+                } else {
+                    OutcomeRefinement::Unconstrained
+                },
+                when_one: if *value {
+                    OutcomeRefinement::Unconstrained
+                } else {
+                    OutcomeRefinement::Impossible
+                },
+            })),
+            NodeKind::IntCompare(operation) => comparison_facts(
+                *operation,
+                inputs.first().and_then(|value| self.scalar_fact(value)),
+                inputs.get(1).and_then(|value| self.scalar_fact(value)),
+                &self.binder_ranges,
+            ),
+            NodeKind::BoolToInt => {
+                inputs.first().and_then(|value| self.scalar_fact(value)).cloned()
+            }
+            NodeKind::IntBinary(operation) => {
+                let (left, right) = (inputs.first()?, inputs.get(1)?);
+                self.int_binary_transfer(*operation, left, right).ok()?.1
+            }
+            NodeKind::Select { count }
+                if eval_int_interval(
+                    count,
+                    env,
+                    &self.abstract_integers,
+                    &self.abstract_loop_indices,
+                )
+                .ok()
+                .is_some_and(|range| {
+                    range.minimum == 2.into() && range.maximum_inclusive == 2.into()
+                }) =>
+            {
+                let left = inputs.get(1).and_then(|value| self.scalar_fact(value));
+                let right = inputs.get(2).and_then(|value| self.scalar_fact(value));
+                (left == right).then(|| left.cloned()).flatten()
+            }
+            _ => None,
+        }
+    }
+
+    fn integer_expression(
+        &self,
+        expression: &mxx_ir_core::IntExpr,
+        env: &ParamEnv,
+    ) -> Result<state::IntegerState, SimulationError> {
+        eval_int_interval(expression, env, &self.abstract_integers, &self.abstract_loop_indices)
+    }
+
+    fn singleton_integer_expression(
+        &self,
+        expression: &mxx_ir_core::IntExpr,
+        env: &ParamEnv,
+        purpose: &str,
+    ) -> Result<BigInt, SimulationError> {
+        let range = self.integer_expression(expression, env)?;
+        if range.minimum != range.maximum_inclusive {
+            return Err(SimulationError::InvalidGraph {
+                message: format!("{purpose} must be uniform across a parallel grid"),
+                site: None,
+            });
+        }
+        Ok(range.minimum)
+    }
+
+    fn integer_expression_magnitude(
+        &self,
+        expression: &mxx_ir_core::IntExpr,
+        env: &ParamEnv,
+    ) -> Result<BigInt, SimulationError> {
+        let range = self.integer_expression(expression, env)?;
+        Ok(BigInt::from(crate::bound::max_abs_interval(&range.minimum, &range.maximum_inclusive)))
+    }
+
+    fn require_uniform_wire_type(
+        &self,
+        ty: &WireType,
+        env: &ParamEnv,
+    ) -> Result<(), SimulationError> {
+        let require = |expression: &mxx_ir_core::IntExpr, purpose: &str| {
+            self.singleton_integer_expression(expression, env, purpose).map(|_| ())
+        };
+        match ty {
+            WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
+                require(&matrix.modulus, "matrix modulus")?;
+                require(&matrix.ring_dimension, "matrix ring dimension")?;
+                require(&matrix.rows, "matrix row count")?;
+                require(&matrix.columns, "matrix column count")?;
+            }
+            WireType::Trapdoor {
+                matrix,
+                gadget_base,
+                digit_count,
+                preimage_max_coefficient_bound,
+                ..
+            } => {
+                self.require_uniform_wire_type(&WireType::Matrix(matrix.clone()), env)?;
+                require(gadget_base, "trapdoor gadget base")?;
+                require(digit_count, "trapdoor digit count")?;
+                require(preimage_max_coefficient_bound, "trapdoor preimage bound")?;
+            }
+            WireType::Family { element, shape } => {
+                self.require_uniform_wire_type(element, env)?;
+                for extent in shape {
+                    require(extent, "family extent")?;
+                }
+            }
+            WireType::Bytes { length } => require(length, "byte length")?,
+            WireType::ConstantInt |
+            WireType::ConstantReal |
+            WireType::ConstantBool |
+            WireType::Int |
+            WireType::Real |
+            WireType::Bool |
+            WireType::TypedBlob { .. } => {}
+        }
+        Ok(())
+    }
+
     /// Record each input carrier whose source identity is absent from the
     /// result.  Carrier identities are the simulator's symbolic witnesses;
     /// losing one means the corresponding source can no longer be related to
@@ -393,6 +683,20 @@ impl<'a> Evaluator<'a> {
     fn register_lineage(&mut self, source: crate::SourceId, lineage: SourceLineage) {
         self.source_lineages.insert(source, lineage.clone());
         self.lineage_sources.entry(lineage).or_insert(source);
+    }
+
+    /// Return whether a source is the canonical gadget source or a structural
+    /// family lineage made entirely from that source.  This is deliberately
+    /// identity-only: numeric values, labels, and protocol metadata are not
+    /// evidence that an automorphism may transform a tracked matrix.
+    fn is_gadget_source(&self, source: crate::SourceId) -> bool {
+        let is_gadget = |candidate: &crate::SourceId| {
+            self.gadget_sources.values().any(|gadget| gadget == candidate)
+        };
+        is_gadget(&source) ||
+            self.source_lineages.get(&source).is_some_and(|lineage| {
+                !lineage.leaves.is_empty() && lineage.leaves.iter().all(is_gadget)
+            })
     }
 
     fn source_origin(&self, source: crate::SourceId) -> String {
@@ -743,6 +1047,14 @@ impl<'a> Evaluator<'a> {
         {
             return self.mapped_source_for(parent, &map, shape, None);
         }
+        // A family source that already has this coordinate domain is already
+        // the normalized lane-indexed function.  Reusing it through a grid
+        // must not replace its exact public/trapdoor leaves with fresh body
+        // sources.  Only a shape-less primitive created by the body needs the
+        // coordinate lifting below.
+        if self.source_lineages.get(&source).is_some_and(|lineage| lineage.shape == shape) {
+            return source;
+        }
         // A canonical family source may already have been interned from a
         // pointwise pack, so it is not present in `mapped_sources` even
         // though all of its leaves are primitive samples.  It is still a
@@ -800,6 +1112,16 @@ impl<'a> Evaluator<'a> {
                 site: None,
             })?
             .clone();
+        // Every concrete type used by a transfer must be uniform while a
+        // symbolic grid binder is active.  Checking on scope entry covers
+        // nested subgraph intermediates as well as the grid body's declared
+        // outputs; otherwise a grandchild could silently use lane zero's
+        // matrix dimensions in its noise geometry.
+        for node in scope.nodes() {
+            for output_type in node.output_types() {
+                self.require_uniform_wire_type(output_type, &env)?;
+            }
+        }
         // Structural child inputs are preloaded and their Input nodes are skipped below.
         // Register the same numeric and relation facts that an evaluated producer would
         // register, including grid-specialized views used as decomposition targets.
@@ -860,15 +1182,32 @@ impl<'a> Evaluator<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut out = self
                 .node(stage, graph, sid, occurrence, &scope, n, node.kind(), &inputs, &env)
-                .map_err(|error| SimulationError::InvalidGraph {
-                    message: format!("stage {:?}, node {n} ({:?}): {error}", stage, node.kind()),
-                    site: Some(DiagnosticSite {
+                .map_err(|error| {
+                    let site = Some(DiagnosticSite {
                         stage: Some(stage.clone()),
                         occurrence: occurrence.to_vec(),
                         node: Some(mxx_ir_core::NodeId(n as u64)),
                         port: Some(mxx_ir_core::Port(0)),
                         operation: Some(format!("{:?}", node.kind())),
-                    }),
+                    });
+                    match error {
+                        // Relation failures are semantic violations at the
+                        // operation site, not malformed graph syntax. Keep
+                        // their typed category so callers can fail closed.
+                        SimulationError::Relation { message, .. }
+                            if matches!(node.kind(), NodeKind::RingAutomorphism { .. }) =>
+                        {
+                            SimulationError::Relation { message, site }
+                        }
+                        error => SimulationError::InvalidGraph {
+                            message: format!(
+                                "stage {:?}, node {n} ({:?}): {error}",
+                                stage,
+                                node.kind()
+                            ),
+                            site,
+                        },
+                    }
                 })?;
             // Views must be assigned to all ports before pairing is attached:
             // the public output of a two-port sampler is often port 0 while
@@ -888,6 +1227,11 @@ impl<'a> Evaluator<'a> {
                         &inputs,
                         &env,
                     )?;
+                }
+            }
+            if let Some(value) = out.first() {
+                if let Some(facts) = self.derived_scalar_fact(node.kind(), &inputs, &env) {
+                    self.scalar_facts.insert(value.view, facts);
                 }
             }
             // Attach pair facts only after all output views are frozen.  This
@@ -1109,9 +1453,12 @@ impl<'a> Evaluator<'a> {
                 Ok(vec![x])
             }
             NodeKind::ConstantInt(v) => Ok(vec![integer(v.clone())]),
-            NodeKind::EvaluateInt(v) => {
-                Ok(vec![integer(v.evaluate(env).map_err(|e| bad(&e.to_string()))?)])
-            }
+            NodeKind::EvaluateInt(v) => Ok(vec![integer_range(eval_int_interval(
+                v,
+                env,
+                &self.abstract_integers,
+                &self.abstract_loop_indices,
+            )?)]),
             NodeKind::ConstantMatrix { matrix_type, value } => {
                 let t = concrete_matrix(&WireType::Matrix(matrix_type.clone()), env)
                     .ok_or_else(|| bad("invalid matrix type"))?;
@@ -1125,7 +1472,7 @@ impl<'a> Evaluator<'a> {
                         state::exact_matrix(&t, 1u8.into(), true)?
                     }
                     mxx_ir_core::node::ConstantMatrix::Gadget { base, small } => {
-                        let base = base.evaluate(env).map_err(|e| bad(&e.to_string()))?;
+                        let base = self.singleton_integer_expression(base, env, "gadget base")?;
                         if t.rows == 0 || t.columns == 0 || !t.columns.is_multiple_of(t.rows) {
                             return Err(bad("gadget matrix dimensions are incompatible"));
                         }
@@ -1138,10 +1485,10 @@ impl<'a> Evaluator<'a> {
                         gadget
                     }
                     mxx_ir_core::node::ConstantMatrix::PowerOfBase { base, exponent } => {
-                        let base = base.evaluate(env).map_err(|e| bad(&e.to_string()))?;
-                        let exponent = exponent
-                            .evaluate(env)
-                            .map_err(|e| bad(&e.to_string()))?
+                        let base =
+                            self.singleton_integer_expression(base, env, "power-of-base base")?;
+                        let exponent = self
+                            .singleton_integer_expression(exponent, env, "power-of-base exponent")?
                             .to_u32()
                             .ok_or_else(|| bad("invalid power-of-base exponent"))?;
                         let base = base
@@ -1156,22 +1503,27 @@ impl<'a> Evaluator<'a> {
                     mxx_ir_core::node::ConstantMatrix::Polynomial { coefficients } => {
                         let evaluated = coefficients
                             .iter()
-                            .map(|coefficient| {
-                                coefficient.evaluate(env).map_err(|e| bad(&e.to_string()))
-                            })
+                            .map(|coefficient| self.integer_expression(coefficient, env))
                             .collect::<Result<Vec<_>, _>>()?;
                         let magnitude = evaluated
                             .iter()
-                            .map(|coefficient| coefficient.abs().to_biguint().unwrap_or_default())
+                            .map(|coefficient| {
+                                crate::bound::max_abs_interval(
+                                    &coefficient.minimum,
+                                    &coefficient.maximum_inclusive,
+                                )
+                            })
                             .max()
                             .unwrap_or_default();
-                        let constant = evaluated.iter().skip(1).all(Zero::is_zero);
+                        let constant = evaluated.iter().skip(1).all(|coefficient| {
+                            coefficient.minimum.is_zero() && coefficient.maximum_inclusive.is_zero()
+                        });
                         state::exact_matrix(&t, magnitude, constant)?
                     }
                 };
                 let source =
                     if let mxx_ir_core::node::ConstantMatrix::Gadget { base, small } = value {
-                        let base = base.evaluate(env).map_err(|e| bad(&e.to_string()))?;
+                        let base = self.singleton_integer_expression(base, env, "gadget base")?;
                         let descriptor = crate::GadgetDescriptor {
                             modulus: t.modulus.clone(),
                             ring_dimension: t.ring_dimension,
@@ -1203,33 +1555,43 @@ impl<'a> Evaluator<'a> {
             NodeKind::GadgetTrapdoor { matrix_type, base } => {
                 let t = concrete_matrix(&WireType::Matrix(matrix_type.clone()), env)
                     .ok_or_else(|| bad("invalid gadget type"))?;
-                let b = base.evaluate(env).map_err(|e| bad(&e.to_string()))?;
+                let b = self.singleton_integer_expression(base, env, "gadget base")?;
                 let digits = t.columns.checked_div(t.rows).unwrap_or(1);
-                let mut p = state::gadget_matrix(&t, &b, digits)?;
-                let source = self.source_for(stage, sid, occurrence, n, "gadget");
-                p.right_carrier = Some(crate::RightCarrier { source, left_gain: 1u8.into() });
-                Ok(vec![
-                    Info {
-                        value: AbstractValue::Matrix(p),
-                        ty: Some(t.clone()),
-                        relation: None,
-                        view: crate::FamilyViewId(u32::MAX),
-                        paired_public: None,
-                    },
-                    Info {
-                        value: AbstractValue::Trapdoor(TrapdoorState {
-                            matrix: t,
-                            sigma: mxx_ir_core::RealExpr::FromInt(b.clone().into()),
-                            gadget_base: b,
-                            digit_count: digits,
-                            preimage_max_coefficient_bound: 0.into(),
-                        }),
-                        ty: None,
-                        relation: None,
-                        view: crate::FamilyViewId(u32::MAX),
-                        paired_public: None,
-                    },
-                ])
+                // The public matrix emitted with a trapdoor is the same
+                // structural gadget as ConstantMatrix::Gadget.  Register
+                // that descriptor once, without inspecting values or node
+                // names, so automorphisms and decompositions share G's
+                // canonical source identity.
+                let descriptor = crate::GadgetDescriptor {
+                    modulus: t.modulus.clone(),
+                    ring_dimension: t.ring_dimension,
+                    rows: t.rows,
+                    columns: t.columns,
+                    base: b.clone(),
+                    digit_count: digits,
+                    small: false,
+                };
+                if !self.gadget_sources.contains_key(&descriptor) {
+                    let source = self.source_for(stage, sid, occurrence, n, "gadget");
+                    self.gadget_sources.insert(descriptor, source);
+                }
+                // The IR exposes the trapdoor as one value; TrapdoorPublic
+                // materializes this registered G when needed.  Keeping the
+                // public matrix out of the trapdoor value matches the typed
+                // runtime representation and avoids an unpaired second port.
+                Ok(vec![Info {
+                    value: AbstractValue::Trapdoor(TrapdoorState {
+                        matrix: t,
+                        sigma: mxx_ir_core::RealExpr::FromInt(b.clone().into()),
+                        gadget_base: b,
+                        digit_count: digits,
+                        preimage_max_coefficient_bound: 0.into(),
+                    }),
+                    ty: None,
+                    relation: None,
+                    view: crate::FamilyViewId(u32::MAX),
+                    paired_public: None,
+                }])
             }
             NodeKind::ConstantReal(_) |
             NodeKind::IntToReal |
@@ -1308,15 +1670,9 @@ impl<'a> Evaluator<'a> {
                 paired_public: None,
             }]),
             NodeKind::IntBinary(op) => {
-                let a = int(&xs[0])?;
-                let b = int(&xs[1])?;
-                let z = match op {
-                    IntBinaryOp::Add => a.add(&b),
-                    IntBinaryOp::Subtract => a.subtract(&b),
-                    IntBinaryOp::Multiply => a.multiply(&b),
-                    IntBinaryOp::Divide => a.divide(&b).map_err(|e| bad(&e.to_string()))?,
-                    IntBinaryOp::Remainder => a.remainder(&b).map_err(|e| bad(&e.to_string()))?,
-                };
+                let (z, _) = self
+                    .int_binary_transfer(*op, &xs[0], &xs[1])
+                    .map_err(|error| bad(&error.to_string()))?;
                 Ok(vec![Info {
                     value: AbstractValue::Integer(z),
                     ty: None,
@@ -1448,7 +1804,7 @@ impl<'a> Evaluator<'a> {
             }
             NodeKind::MatrixScale { scalar } => {
                 let t = mt(&xs[0])?;
-                let s = scalar.evaluate(env).map_err(|e| bad(&e.to_string()))?;
+                let s = self.integer_expression_magnitude(scalar, env)?;
                 Ok(vec![Info {
                     value: AbstractValue::Matrix(matrix(&xs[0])?.scale(&s, &t.modulus)?),
                     ty: Some(t),
@@ -1458,14 +1814,29 @@ impl<'a> Evaluator<'a> {
                 }])
             }
             NodeKind::RingAutomorphism { .. } => {
-                // A valid ring automorphism only permutes (and possibly negates)
-                // polynomial coefficients.  It is therefore an exact isometry
-                // for the coefficient error and magnitude bounds.  The source
-                // carrier and any paired public view remain attached to the
-                // same abstract value because the operation does not introduce
-                // a new sampled value or discard the existing witness relation.
                 let t = mt(&xs[0])?;
                 let value = matrix(&xs[0])?;
+                if xs[0].relation.is_some() {
+                    return Err(SimulationError::Relation {
+                        message: "ring automorphism cannot transform a relation-bearing preimage"
+                            .into(),
+                        site: site(),
+                    });
+                }
+                if let Some(carrier) = &value.right_carrier {
+                    let source = carrier.source;
+                    if !self.is_gadget_source(source) {
+                        return Err(SimulationError::Relation {
+                            message: format!(
+                                "ring automorphism requires an untracked matrix or canonical gadget source, got {source:?}"
+                            ),
+                            site: site(),
+                        });
+                    }
+                }
+                // A valid ring automorphism only permutes (and possibly
+                // negates) polynomial coefficients, so all numeric bounds and
+                // the canonical gadget carrier are unchanged.
                 Ok(vec![Info {
                     value: AbstractValue::Matrix(value),
                     ty: Some(t),
@@ -1582,7 +1953,7 @@ impl<'a> Evaluator<'a> {
                         },
                         &t.modulus,
                     )?;
-                    let coefficient = coefficient.evaluate(env).map_err(|e| bad(&e.to_string()))?;
+                    let coefficient = self.integer_expression_magnitude(coefficient, env)?;
                     term = term.scale(&coefficient, &t.modulus)?;
                     value = value.add(&term, &t.modulus)?;
                 }
@@ -1629,10 +2000,12 @@ impl<'a> Evaluator<'a> {
             }
             NodeKind::UniformIntervalSample { range, .. } => {
                 let t = output_type(scope, n, env)?;
+                let minimum = self.integer_expression(&range.minimum, env)?;
+                let maximum = self.integer_expression(&range.maximum, env)?;
                 let mut z = state::uniform_interval_sample(
                     &t,
-                    &range.minimum.evaluate(env).map_err(|e| bad(&e.to_string()))?,
-                    &range.maximum.evaluate(env).map_err(|e| bad(&e.to_string()))?,
+                    &minimum.minimum,
+                    &maximum.maximum_inclusive,
                 )?;
                 z.right_carrier = Some(crate::RightCarrier {
                     source: self.source_for(stage, sid, occurrence, n, "uniform-interval"),
@@ -1648,11 +2021,9 @@ impl<'a> Evaluator<'a> {
             }
             NodeKind::GaussianSample { max_coefficient_bound, .. } => {
                 let t = output_type(scope, n, env)?;
+                let bound = self.integer_expression_magnitude(max_coefficient_bound, env)?;
                 Ok(vec![Info {
-                    value: AbstractValue::Matrix(state::gaussian_sample(
-                        &t,
-                        &max_coefficient_bound.evaluate(env).map_err(|e| bad(&e.to_string()))?,
-                    )?),
+                    value: AbstractValue::Matrix(state::gaussian_sample(&t, &bound)?),
                     ty: Some(t),
                     relation: None,
                     view: crate::FamilyViewId(u32::MAX),
@@ -1684,17 +2055,23 @@ impl<'a> Evaluator<'a> {
                         value: AbstractValue::Trapdoor(TrapdoorState {
                             matrix: t,
                             sigma: sigma.clone(),
-                            gadget_base: gadget_base
-                                .evaluate(env)
-                                .map_err(|e| bad(&e.to_string()))?,
-                            digit_count: digit_count
-                                .evaluate(env)
-                                .map_err(|e| bad(&e.to_string()))?
+                            gadget_base: self.singleton_integer_expression(
+                                gadget_base,
+                                env,
+                                "trapdoor gadget base",
+                            )?,
+                            digit_count: self
+                                .singleton_integer_expression(
+                                    digit_count,
+                                    env,
+                                    "trapdoor digit count",
+                                )?
                                 .to_usize()
                                 .ok_or_else(|| bad("invalid digit count"))?,
-                            preimage_max_coefficient_bound: preimage_max_coefficient_bound
-                                .evaluate(env)
-                                .map_err(|e| bad(&e.to_string()))?,
+                            preimage_max_coefficient_bound: self.integer_expression_magnitude(
+                                preimage_max_coefficient_bound,
+                                env,
+                            )?,
                         }),
                         ty: None,
                         relation: None,
@@ -1745,7 +2122,7 @@ impl<'a> Evaluator<'a> {
                 Ok(vec![Info {
                     value: AbstractValue::Matrix(state::preimage_sample(
                         &t,
-                        &max_coefficient_bound.evaluate(env).map_err(|e| bad(&e.to_string()))?,
+                        &self.integer_expression_magnitude(max_coefficient_bound, env)?,
                     )?),
                     ty: Some(t),
                     relation: Some(RightPreimage {
@@ -1841,9 +2218,7 @@ impl<'a> Evaluator<'a> {
                         shape,
                         AbstractValue::Matrix(state::preimage_sample(
                             &t,
-                            &max_coefficient_bound
-                                .evaluate(env)
-                                .map_err(|e| bad(&e.to_string()))?,
+                            &self.integer_expression_magnitude(max_coefficient_bound, env)?,
                         )?),
                     )?),
                     ty: Some(t),
@@ -1859,10 +2234,9 @@ impl<'a> Evaluator<'a> {
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
                 let t = output_type(scope, n, env)?;
-                let b = base.evaluate(env).map_err(|e| bad(&e.to_string()))?;
-                let d = digit_count
-                    .evaluate(env)
-                    .map_err(|e| bad(&e.to_string()))?
+                let b = self.singleton_integer_expression(base, env, "decomposition base")?;
+                let d = self
+                    .singleton_integer_expression(digit_count, env, "decomposition digit count")?
                     .to_usize()
                     .ok_or_else(|| bad("invalid digit count"))?;
                 let gadget_rows = t
@@ -2109,7 +2483,40 @@ impl<'a> Evaluator<'a> {
                     paired_public: None,
                 }])
             }
-            NodeKind::TrapdoorPublic => Ok(vec![xs[0].clone()]),
+            NodeKind::TrapdoorPublic => {
+                let AbstractValue::Trapdoor(trapdoor) = &xs[0].value else {
+                    return Err(bad("trapdoor public projection requires a trapdoor"));
+                };
+                let descriptor = crate::GadgetDescriptor {
+                    modulus: trapdoor.matrix.modulus.clone(),
+                    ring_dimension: trapdoor.matrix.ring_dimension,
+                    rows: trapdoor.matrix.rows,
+                    columns: trapdoor.matrix.columns,
+                    base: trapdoor.gadget_base.clone(),
+                    digit_count: trapdoor.digit_count,
+                    small: false,
+                };
+                let mut public = if self.gadget_sources.contains_key(&descriptor) {
+                    state::gadget_matrix(
+                        &trapdoor.matrix,
+                        &trapdoor.gadget_base,
+                        trapdoor.digit_count,
+                    )?
+                } else {
+                    state::trapdoor_public_matrix(&trapdoor.matrix)?
+                };
+                if let Some(source) = self.gadget_sources.get(&descriptor).copied() {
+                    public.right_carrier =
+                        Some(crate::RightCarrier { source, left_gain: 1u8.into() });
+                }
+                Ok(vec![Info {
+                    value: AbstractValue::Matrix(public),
+                    ty: Some(trapdoor.matrix.clone()),
+                    relation: None,
+                    view: crate::FamilyViewId(u32::MAX),
+                    paired_public: None,
+                }])
+            }
             NodeKind::LiftIntegerToConstantPolynomial { .. } => {
                 let t = output_type(scope, n, env)?;
                 let interval = int(&xs[0])?;
@@ -2154,8 +2561,10 @@ impl<'a> Evaluator<'a> {
                 }])
             }
             NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
-                let modulus = plaintext_modulus.evaluate(env).map_err(|e| bad(&e.to_string()))?;
-                let length = length.evaluate(env).map_err(|e| bad(&e.to_string()))?;
+                let modulus =
+                    self.singleton_integer_expression(plaintext_modulus, env, "plaintext modulus")?;
+                let length =
+                    self.singleton_integer_expression(length, env, "decoded output length")?;
                 if modulus <= BigInt::zero() || length < BigInt::zero() {
                     return Err(bad("invalid threshold-decode parameters"));
                 }
@@ -2186,18 +2595,14 @@ impl<'a> Evaluator<'a> {
                 }
                 let t = mt(&xs[0])?;
                 let mut result = matrix(&xs[0])?.scale(
-                    &reconstruction_coefficients[0]
-                        .evaluate(env)
-                        .map_err(|e| bad(&e.to_string()))?,
+                    &self.integer_expression_magnitude(&reconstruction_coefficients[0], env)?,
                     &t.modulus,
                 )?;
                 for (x, coefficient) in
                     xs.iter().skip(1).zip(reconstruction_coefficients.iter().skip(1))
                 {
-                    let term = matrix(x)?.scale(
-                        &coefficient.evaluate(env).map_err(|e| bad(&e.to_string()))?,
-                        &t.modulus,
-                    )?;
+                    let term = matrix(x)?
+                        .scale(&self.integer_expression_magnitude(coefficient, env)?, &t.modulus)?;
                     result = result.add(&term, &t.modulus)?;
                 }
                 Ok(vec![Info {
@@ -2210,9 +2615,8 @@ impl<'a> Evaluator<'a> {
             }
             NodeKind::PackPolynomialCoefficients { matrix_type: _, coefficient_bits } => {
                 let t = output_type(scope, n, env)?;
-                let bits = coefficient_bits
-                    .evaluate(env)
-                    .map_err(|e| bad(&e.to_string()))?
+                let bits = self
+                    .singleton_integer_expression(coefficient_bits, env, "coefficient bit count")?
                     .to_usize()
                     .ok_or_else(|| bad("coefficient bit count is not nonnegative"))?;
                 if bits == 0 {
@@ -2249,9 +2653,9 @@ impl<'a> Evaluator<'a> {
                 let shape = shape
                     .iter()
                     .map(|e| {
-                        e.evaluate(env)
+                        self.singleton_integer_expression(e, env, "family extent")
                             .ok()
-                            .and_then(|x| x.to_usize())
+                            .and_then(|value| value.to_usize())
                             .ok_or_else(|| bad("invalid family extent"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2316,11 +2720,18 @@ impl<'a> Evaluator<'a> {
                 };
                 if indices.len() != f.shape.len() ||
                     indices.iter().enumerate().any(|(axis, index)| {
-                        index
-                            .evaluate(env)
-                            .ok()
-                            .and_then(|v| v.to_usize())
-                            .is_none_or(|v| v >= f.shape[axis])
+                        eval_index_interval(
+                            index,
+                            env,
+                            &self.abstract_integers,
+                            &self.abstract_loop_indices,
+                            &[],
+                        )
+                        .ok()
+                        .is_none_or(|range| {
+                            range.minimum < BigInt::zero() ||
+                                range.maximum_inclusive >= BigInt::from(f.shape[axis])
+                        })
                     })
                 {
                     return Err(SimulationError::SelectorOutOfRange {
@@ -2565,9 +2976,9 @@ impl<'a> Evaluator<'a> {
                 let shape = output_shape
                     .iter()
                     .map(|e| {
-                        e.evaluate(env)
+                        self.singleton_integer_expression(e, env, "family extent")
                             .ok()
-                            .and_then(|x| x.to_usize())
+                            .and_then(|value| value.to_usize())
                             .ok_or_else(|| bad("invalid family extent"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2637,9 +3048,9 @@ impl<'a> Evaluator<'a> {
                 let shape = output_shape
                     .iter()
                     .map(|e| {
-                        e.evaluate(env)
+                        self.singleton_integer_expression(e, env, "family extent")
                             .ok()
-                            .and_then(|x| x.to_usize())
+                            .and_then(|value| value.to_usize())
                             .ok_or_else(|| bad("invalid family extent"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2730,35 +3141,54 @@ impl<'a> Evaluator<'a> {
                 }])
             }
             NodeKind::Select { count } => {
-                let count = count
-                    .evaluate(env)
-                    .map_err(|e| bad(&e.to_string()))?
+                let count = self
+                    .singleton_integer_expression(count, env, "select branch count")?
                     .to_usize()
                     .ok_or_else(|| bad("invalid select count"))?;
                 if xs.len() != count.saturating_add(1) {
                     return Err(bad("select branch count mismatch"));
                 }
                 validate_index(&xs[0], count, site())?;
-                // Structural loops are evaluated with a concrete binder in
-                // `env`.  Preserve that precision when the selector is a
-                // singleton; joining all branches here would manufacture
-                // impossible values (for example `slot - base` from an
-                // inactive branch) and make a later dynamic gather reject a
-                // valid loop.  Non-singleton selectors retain the sound
-                // conservative join below.
+                // A singleton selector chooses one branch directly.  For a
+                // symbolic Boolean selector, recompute an affine integer
+                // branch over the binder interval where that selector value
+                // holds before joining the alternatives.  Thus an inactive
+                // `slot - base` value cannot pollute a later dynamic gather,
+                // while selectors without such provenance use the ordinary
+                // conservative interval join.
                 let selector = int(&xs[0])?;
+                let selector_truth = truth_fact(self.scalar_fact(&xs[0]));
+                let refine_branch = |branch: &Info, outcome: &OutcomeRefinement| {
+                    let mut branch = branch.clone();
+                    let affine = affine_fact(self.scalar_fact(&branch));
+                    if let AbstractValue::Integer(range) = &mut branch.value &&
+                        let Some(affine) = affine &&
+                        let Some(refined) = affine.range_under(outcome, &self.binder_ranges)
+                    {
+                        *range = refined;
+                    }
+                    branch
+                };
+                let mut branches = xs[1..].to_vec();
+                if count == 2 &&
+                    let Some(truth) = &selector_truth
+                {
+                    branches[0] = refine_branch(&branches[0], &truth.when_zero);
+                    branches[1] = refine_branch(&branches[1], &truth.when_one);
+                }
                 let mut selected = if selector.minimum == selector.maximum_inclusive {
-                    xs[selector.minimum.to_usize().ok_or_else(|| bad("invalid select index"))? + 1]
-                        .clone()
+                    branches
+                        [selector.minimum.to_usize().ok_or_else(|| bad("invalid select index"))?]
+                    .clone()
                 } else {
-                    xs[1].clone()
+                    branches[0].clone()
                 };
                 if let Some(relation) = selected.relation.take() {
                     let selector_id = self.selector_for(xs[0].view);
                     selected.relation = Some(specialize_relation(relation, &[selector_id]));
                 }
                 if selector.minimum != selector.maximum_inclusive {
-                    for branch in &xs[2..] {
+                    for branch in &branches[1..] {
                         let type_info = selected.ty.clone();
                         selected = self.join_uniform_with_diagnostics(
                             selected,
@@ -2858,12 +3288,8 @@ impl<'a> Evaluator<'a> {
         let outputs = if let mxx_ir_core::node::NodeKind::SequentialLoop(spec) =
             graph.scope(parent).unwrap().node(mxx_ir_core::NodeId(n as u64)).unwrap().kind()
         {
-            let count = spec
-                .count
-                .evaluate(env)
-                .map_err(|e| SimulationError::InvalidParameterEnvironment {
-                    message: e.to_string(),
-                })?
+            let count = self
+                .singleton_integer_expression(&spec.count, env, "sequential loop count")?
                 .to_usize()
                 .ok_or_else(|| SimulationError::InvalidGraph {
                     message: "loop count is not usize".into(),
@@ -2879,16 +3305,39 @@ impl<'a> Evaluator<'a> {
             let mut current = xs[..carried].to_vec();
             let invariant = &xs[carried..];
             for iteration in 0..count {
+                let saved_integers = self.abstract_integers.clone();
+                let saved_integer_facts = self.abstract_integer_facts.clone();
+                let saved_loop_indices = self.abstract_loop_indices.clone();
+                let saved_loop_atoms = self.abstract_loop_atoms.clone();
                 let mut loop_env = env.clone();
                 loop_env.loop_indices.insert(spec.index_slot, iteration.into());
+                self.abstract_loop_indices
+                    .insert(spec.index_slot, state::IntegerState::singleton(iteration));
+                let atom = self.next_binder_atom;
+                self.next_binder_atom += 1;
+                self.abstract_loop_atoms.insert(spec.index_slot, atom);
+                self.binder_ranges.insert(atom, state::IntegerState::singleton(iteration));
+                let binding_env = loop_env.clone();
                 loop_env = apply_bindings(loop_env, &spec.bindings)?;
+                apply_abstract_bindings(
+                    &mut self.abstract_integers,
+                    &mut self.abstract_integer_facts,
+                    &spec.bindings,
+                    &binding_env,
+                    &self.abstract_loop_indices,
+                    &self.abstract_loop_atoms,
+                )?;
                 let mut args = current.clone();
                 args.extend_from_slice(invariant);
                 let preload = cs.inputs().iter().copied().zip(args).collect();
                 let mut child_occurrence = occurrence.to_vec();
                 child_occurrence.push(format!("node:{n}/iteration:{iteration}"));
-                let vals =
-                    self.scope(stage, graph, &child, &child_occurrence, loop_env, preload)?;
+                let result = self.scope(stage, graph, &child, &child_occurrence, loop_env, preload);
+                self.abstract_integers = saved_integers;
+                self.abstract_integer_facts = saved_integer_facts;
+                self.abstract_loop_indices = saved_loop_indices;
+                self.abstract_loop_atoms = saved_loop_atoms;
+                let vals = result?;
                 current = cs
                     .outputs()
                     .iter()
@@ -2942,11 +3391,7 @@ impl<'a> Evaluator<'a> {
                 .shape
                 .iter()
                 .map(|extent| {
-                    extent
-                        .evaluate(env)
-                        .map_err(|e| SimulationError::InvalidParameterEnvironment {
-                            message: e.to_string(),
-                        })?
+                    self.singleton_integer_expression(extent, env, "parallel grid extent")?
                         .to_usize()
                         .ok_or_else(|| SimulationError::InvalidGraph {
                             message: "parallel grid extent is not usize".into(),
@@ -2973,37 +3418,80 @@ impl<'a> Evaluator<'a> {
             let lane_count = grid_shape
                 .iter()
                 .try_fold(1usize, |count, extent| count.checked_mul(*extent))
-                .filter(|count| *count > 0)
                 .ok_or_else(|| SimulationError::InvalidGraph {
-                    message: "parallel grid cardinality is zero or overflows usize".into(),
+                    message: "parallel grid cardinality overflows usize".into(),
                     site: None,
                 })?;
-            let mut joined_outputs: Vec<Option<Info>> = vec![None; cs.outputs().len()];
-            let mut joined_target_states: Vec<Option<MatrixState>> = vec![None; cs.outputs().len()];
-            let base_preimages = self.preimages.clone();
-            let base_states = self.states.clone();
-            let mut representative_preimages = None;
-            let mut representative_states = None;
-            for lane in 0..lane_count {
-                if lane > 0 {
-                    // Every lane executes the same frozen body occurrence but
-                    // with different loop-index values. Restore its incoming
-                    // relation tables so lane-local producers cannot collide
-                    // with or consume facts left by the preceding lane.
-                    self.preimages = base_preimages.clone();
-                    self.states = base_states.clone();
-                }
-                let mut remainder = lane;
-                let mut coordinates = vec![0usize; grid_shape.len()];
-                for axis in (0..grid_shape.len()).rev() {
-                    coordinates[axis] = remainder % grid_shape[axis];
-                    remainder /= grid_shape[axis];
-                }
+            let vals = if lane_count == 0 {
+                let grid_node = graph
+                    .scope(parent)
+                    .and_then(|scope| scope.node(mxx_ir_core::NodeId(n as u64)))
+                    .expect("validated parallel grid node");
+                cs.outputs()
+                    .iter()
+                    .copied()
+                    .zip(grid_node.output_types().iter())
+                    .enumerate()
+                    .map(|(port, (wire, output_type))| {
+                        let WireType::Family { element, .. } = output_type else {
+                            return Err(SimulationError::InvalidGraph {
+                                message: "parallel grid output must be a family".into(),
+                                site: None,
+                            });
+                        };
+                        let mut info = empty_info_for_type(element, env)?;
+                        info.view = self.view_for_wire(
+                            stage,
+                            parent,
+                            occurrence,
+                            WireRef {
+                                node: mxx_ir_core::NodeId(n as u64),
+                                port: mxx_ir_core::Port(port as u32),
+                            },
+                            Some(output_type),
+                            grid_node.kind(),
+                            xs,
+                            env,
+                        )?;
+                        Ok((wire, info))
+                    })
+                    .collect::<Result<HashMap<_, _>, SimulationError>>()?
+            } else {
+                // The body is one symbolic occurrence.  Loop slots carry their
+                // full coordinate intervals, so one transfer covers every
+                // concrete lane without making simulation cost depend on the
+                // family cardinality.
+                let saved_integers = self.abstract_integers.clone();
+                let saved_integer_facts = self.abstract_integer_facts.clone();
+                let saved_loop_indices = self.abstract_loop_indices.clone();
+                let saved_loop_atoms = self.abstract_loop_atoms.clone();
                 let mut grid_env = env.clone();
-                for (slot, coordinate) in spec.index_slots.iter().zip(coordinates) {
-                    grid_env.loop_indices.insert(*slot, coordinate.into());
+                for ((slot, extent), representative) in
+                    spec.index_slots.iter().zip(&grid_shape).zip(std::iter::repeat(0usize))
+                {
+                    grid_env.loop_indices.insert(*slot, representative.into());
+                    self.abstract_loop_indices.insert(
+                        *slot,
+                        state::IntegerState::new(0.into(), BigInt::from(extent - 1))?,
+                    );
+                    let atom = self.next_binder_atom;
+                    self.next_binder_atom += 1;
+                    self.abstract_loop_atoms.insert(*slot, atom);
+                    self.binder_ranges.insert(
+                        atom,
+                        state::IntegerState::new(0.into(), BigInt::from(extent - 1))?,
+                    );
                 }
+                let binding_env = grid_env.clone();
                 grid_env = apply_bindings(grid_env, &spec.bindings)?;
+                apply_abstract_bindings(
+                    &mut self.abstract_integers,
+                    &mut self.abstract_integer_facts,
+                    &spec.bindings,
+                    &binding_env,
+                    &self.abstract_loop_indices,
+                    &self.abstract_loop_atoms,
+                )?;
                 let preload = cs
                     .inputs()
                     .iter()
@@ -3013,18 +3501,28 @@ impl<'a> Evaluator<'a> {
                     .map(|(arg, (wire, value))| {
                         let mapped = match spec.input_modes.get(arg) {
                             Some(mxx_ir_core::node::GridInputMode::Reindex { map }) => {
-                                let coordinates = map
+                                let coordinate_ranges = map
                                     .input_indices
                                     .iter()
-                                    .map(|expr| eval_grid_index(expr, &grid_env, &spec.index_slots))
+                                    .map(|expr| {
+                                        eval_index_interval(
+                                            expr,
+                                            &grid_env,
+                                            &self.abstract_integers,
+                                            &self.abstract_loop_indices,
+                                            &spec.index_slots,
+                                        )
+                                    })
                                     .collect::<Result<Vec<_>, _>>()?;
                                 let family_shape = match &value.value {
                                     AbstractValue::Family(family) => family.shape.clone(),
                                     _ => unreachable!(),
                                 };
-                                if coordinates.len() != family_shape.len() ||
-                                    coordinates.iter().enumerate().any(|(axis, coordinate)| {
-                                        *coordinate >= family_shape[axis]
+                                if coordinate_ranges.len() != family_shape.len() ||
+                                    coordinate_ranges.iter().enumerate().any(|(axis, range)| {
+                                        range.minimum < BigInt::zero() ||
+                                            range.maximum_inclusive >=
+                                                BigInt::from(family_shape[axis])
                                     })
                                 {
                                     return Err(SimulationError::SelectorOutOfRange {
@@ -3060,19 +3558,14 @@ impl<'a> Evaluator<'a> {
                                 mapped.value = family_element;
                                 let relation_source = mapped.relation.as_ref().map(|r| r.source);
                                 remap_carriers(&mut mapped.value, |source| {
-                                    self.mapped_source_for(
-                                        source,
-                                        map,
-                                        grid_shape.clone(),
-                                        Some(&grid_env),
-                                    )
+                                    self.mapped_source_for(source, map, grid_shape.clone(), None)
                                 });
                                 if let Some(source) = relation_source {
                                     let mapped_source = self.mapped_source_for(
                                         source,
                                         map,
                                         grid_shape.clone(),
-                                        Some(&grid_env),
+                                        None,
                                     );
                                     if let Some(relation) = mapped.relation.as_mut() {
                                         relation.source = mapped_source;
@@ -3089,7 +3582,7 @@ impl<'a> Evaluator<'a> {
                                         old_target,
                                         map,
                                         grid_shape.clone(),
-                                        Some(&grid_env),
+                                        None,
                                     ) {
                                         self.states.insert(target, state);
                                     }
@@ -3102,77 +3595,13 @@ impl<'a> Evaluator<'a> {
                         Ok((wire, mapped))
                     })
                     .collect::<Result<HashMap<_, _>, SimulationError>>()?;
-                let vals =
-                    self.scope(stage, graph, &child, &child_occurrence, grid_env, preload)?;
-                if lane == 0 {
-                    representative_preimages = Some(self.preimages.clone());
-                    representative_states = Some(self.states.clone());
-                }
-                for (port, wire) in cs.outputs().iter().enumerate() {
-                    let info =
-                        vals.get(wire).cloned().ok_or_else(|| SimulationError::InvalidGraph {
-                            message: "missing parallel-grid output".into(),
-                            site: None,
-                        })?;
-                    if let Some(state) = info
-                        .relation
-                        .as_ref()
-                        .and_then(|relation| self.states.get(&relation.target))
-                        .cloned()
-                    {
-                        joined_target_states[port] =
-                            Some(match joined_target_states[port].take() {
-                                Some(previous) => {
-                                    let representative_carrier = previous.right_carrier.clone();
-                                    let AbstractValue::Matrix(joined) = crate::family::join(
-                                        &AbstractValue::Matrix(previous),
-                                        &AbstractValue::Matrix(state),
-                                    )?
-                                    else {
-                                        unreachable!("joining matrix states returns a matrix")
-                                    };
-                                    MatrixState { right_carrier: representative_carrier, ..joined }
-                                }
-                                None => state,
-                            });
-                    }
-                    joined_outputs[port] = Some(match joined_outputs[port].take() {
-                        Some(previous) => {
-                            let ty = previous.ty.clone().or_else(|| info.ty.clone());
-                            let joined = self.join_uniform_with_diagnostics(
-                                previous.clone(),
-                                info,
-                                ty.as_ref(),
-                                None,
-                            )?;
-                            let mut joined_value = joined.value;
-                            preserve_grid_carriers(&previous.value, &mut joined_value);
-                            // Bounds are uniform across the frozen family, but
-                            // relation/view identity is the one symbolic grid
-                            // occurrence. Keep the representative provenance
-                            // while replacing only its joined abstract value.
-                            Info { value: joined_value, ty: joined.ty, ..previous }
-                        }
-                        None => info,
-                    });
-                }
-            }
-            self.preimages = representative_preimages.expect("positive grid cardinality");
-            self.states = representative_states.expect("positive grid cardinality");
-            let vals = cs
-                .outputs()
-                .iter()
-                .enumerate()
-                .map(|(port, wire)| {
-                    let info = joined_outputs[port].clone().expect("positive grid cardinality");
-                    if let (Some(relation), Some(state)) =
-                        (&info.relation, joined_target_states[port].clone())
-                    {
-                        self.states.insert(relation.target, state);
-                    }
-                    (*wire, info)
-                })
-                .collect::<HashMap<_, _>>();
+                let result = self.scope(stage, graph, &child, &child_occurrence, grid_env, preload);
+                self.abstract_integers = saved_integers;
+                self.abstract_integer_facts = saved_integer_facts;
+                self.abstract_loop_indices = saved_loop_indices;
+                self.abstract_loop_atoms = saved_loop_atoms;
+                result?
+            };
             cs.outputs()
                 .iter()
                 .map(|wire| {
@@ -3234,9 +3663,28 @@ impl<'a> Evaluator<'a> {
                 }
                 _ => env.clone(),
             };
+            let saved_integers = self.abstract_integers.clone();
+            let saved_integer_facts = self.abstract_integer_facts.clone();
+            if let Some(mxx_ir_core::node::NodeKind::SubgraphCall(spec)) = graph
+                .scope(parent)
+                .and_then(|scope| scope.node(mxx_ir_core::NodeId(n as u64)))
+                .map(|node| node.kind())
+            {
+                apply_abstract_bindings(
+                    &mut self.abstract_integers,
+                    &mut self.abstract_integer_facts,
+                    &spec.bindings,
+                    env,
+                    &self.abstract_loop_indices,
+                    &self.abstract_loop_atoms,
+                )?;
+            }
             let mut child_occurrence = occurrence.to_vec();
             child_occurrence.push(format!("node:{n}"));
-            let vals = self.scope(stage, graph, &child, &child_occurrence, child_env, preload)?;
+            let result = self.scope(stage, graph, &child, &child_occurrence, child_env, preload);
+            self.abstract_integers = saved_integers;
+            self.abstract_integer_facts = saved_integer_facts;
+            let vals = result?;
             cs.outputs()
                 .iter()
                 .map(|x| {
@@ -3269,13 +3717,567 @@ impl<'a> Evaluator<'a> {
 }
 
 fn integer(x: BigInt) -> Info {
+    integer_range(state::IntegerState::singleton(x))
+}
+
+fn integer_range(range: state::IntegerState) -> Info {
     Info {
-        value: AbstractValue::Integer(state::IntegerState::singleton(x)),
+        value: AbstractValue::Integer(range),
         ty: None,
         relation: None,
         view: crate::FamilyViewId(u32::MAX),
         paired_public: None,
     }
+}
+
+fn empty_info_for_type(ty: &WireType, env: &ParamEnv) -> Result<Info, SimulationError> {
+    let invalid =
+        |message: &str| SimulationError::InvalidGraph { message: message.into(), site: None };
+    let (value, matrix_type) = match ty {
+        WireType::Matrix(_) | WireType::Preimage(_) => {
+            let matrix = concrete_matrix(ty, env).ok_or_else(|| invalid("invalid matrix type"))?;
+            (AbstractValue::Matrix(state::zero_matrix(&matrix)?), Some(matrix))
+        }
+        WireType::ConstantInt | WireType::Int => {
+            (AbstractValue::Integer(state::IntegerState::singleton(0)), None)
+        }
+        WireType::ConstantBool | WireType::Bool => {
+            (AbstractValue::Boolean(state::BooleanState::FalseOnly), None)
+        }
+        WireType::Bytes { .. } => (AbstractValue::Bytes, None),
+        WireType::TypedBlob { type_name, schema_hash } => (
+            AbstractValue::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash },
+            None,
+        ),
+        WireType::Trapdoor {
+            matrix,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+        } => {
+            let matrix = concrete_matrix(&WireType::Matrix(matrix.clone()), env)
+                .ok_or_else(|| invalid("invalid trapdoor matrix type"))?;
+            let digit_count = digit_count
+                .evaluate(env)
+                .ok()
+                .and_then(|value| value.to_usize())
+                .ok_or_else(|| invalid("invalid trapdoor digit count"))?;
+            (
+                AbstractValue::Trapdoor(TrapdoorState {
+                    matrix,
+                    sigma: sigma.clone(),
+                    gadget_base: gadget_base
+                        .evaluate(env)
+                        .map_err(|error| invalid(&error.to_string()))?,
+                    digit_count,
+                    preimage_max_coefficient_bound: preimage_max_coefficient_bound
+                        .evaluate(env)
+                        .map_err(|error| invalid(&error.to_string()))?,
+                }),
+                None,
+            )
+        }
+        WireType::ConstantReal | WireType::Real => (AbstractValue::Real, None),
+        WireType::Family { .. } => {
+            return Err(SimulationError::Unsupported {
+                operation: "empty parallel-grid output element type".into(),
+                site: None,
+            });
+        }
+    };
+    Ok(Info {
+        value,
+        ty: matrix_type,
+        relation: None,
+        view: crate::FamilyViewId(u32::MAX),
+        paired_public: None,
+    })
+}
+
+impl AffineScalar {
+    fn constant(value: &BigInt) -> Self {
+        Self { binder: None, coefficient: BigInt::zero(), offset: value.clone() }
+    }
+
+    fn binder(binder: u64) -> Self {
+        Self { binder: Some(binder), coefficient: BigInt::one(), offset: BigInt::zero() }
+    }
+
+    fn add(&self, other: &Self) -> Option<Self> {
+        match (self.binder, other.binder) {
+            (Some(left), Some(right)) if left != right => None,
+            (binder, _) => Some(Self {
+                binder: binder.or(other.binder),
+                coefficient: &self.coefficient + &other.coefficient,
+                offset: &self.offset + &other.offset,
+            }),
+        }
+    }
+
+    fn subtract(&self, other: &Self) -> Option<Self> {
+        match (self.binder, other.binder) {
+            (Some(left), Some(right)) if left != right => None,
+            (binder, _) => Some(Self {
+                binder: binder.or(other.binder),
+                coefficient: &self.coefficient - &other.coefficient,
+                offset: &self.offset - &other.offset,
+            }),
+        }
+    }
+
+    fn multiply_constant(&self, scalar: &BigInt) -> Self {
+        Self {
+            binder: self.binder,
+            coefficient: &self.coefficient * scalar,
+            offset: &self.offset * scalar,
+        }
+    }
+
+    fn range_under(
+        &self,
+        refinement: &OutcomeRefinement,
+        binders: &HashMap<u64, state::IntegerState>,
+    ) -> Option<state::IntegerState> {
+        let Some(binder_atom) = self.binder else {
+            return Some(state::IntegerState::singleton(self.offset.clone()));
+        };
+        let mut binder = binders.get(&binder_atom)?.clone();
+        match refinement {
+            OutcomeRefinement::Impossible => return None,
+            OutcomeRefinement::Unconstrained => {}
+            OutcomeRefinement::Restricted(required) if required.binder == binder_atom => {
+                binder.minimum = binder.minimum.max(required.range.minimum.clone());
+                binder.maximum_inclusive =
+                    binder.maximum_inclusive.min(required.range.maximum_inclusive.clone());
+                if binder.minimum > binder.maximum_inclusive {
+                    return None;
+                }
+            }
+            OutcomeRefinement::Restricted(_) => return None,
+        }
+        let low = &self.coefficient * &binder.minimum + &self.offset;
+        let high = &self.coefficient * &binder.maximum_inclusive + &self.offset;
+        state::IntegerState::new(low.clone().min(high.clone()), low.max(high)).ok()
+    }
+}
+
+fn intersect_outcomes(left: &OutcomeRefinement, right: &OutcomeRefinement) -> OutcomeRefinement {
+    match (left, right) {
+        (OutcomeRefinement::Impossible, _) | (_, OutcomeRefinement::Impossible) => {
+            OutcomeRefinement::Impossible
+        }
+        (OutcomeRefinement::Unconstrained, other) | (other, OutcomeRefinement::Unconstrained) => {
+            other.clone()
+        }
+        (OutcomeRefinement::Restricted(left), OutcomeRefinement::Restricted(right))
+            if left.binder == right.binder =>
+        {
+            let minimum = left.range.minimum.clone().max(right.range.minimum.clone());
+            let maximum =
+                left.range.maximum_inclusive.clone().min(right.range.maximum_inclusive.clone());
+            if minimum > maximum {
+                OutcomeRefinement::Impossible
+            } else {
+                OutcomeRefinement::Restricted(BinderRefinement {
+                    binder: left.binder,
+                    range: state::IntegerState::new(minimum, maximum)
+                        .expect("ordered intersection"),
+                })
+            }
+        }
+        // A conjunction over different binders is outside this deliberately
+        // one-binder reduced product.  Dropping it is conservative.
+        _ => OutcomeRefinement::Unconstrained,
+    }
+}
+
+fn affine_fact(fact: Option<&ScalarFacts>) -> Option<AffineScalar> {
+    match fact {
+        Some(ScalarFacts::Affine(affine)) => Some(affine.clone()),
+        _ => None,
+    }
+}
+
+fn truth_fact(fact: Option<&ScalarFacts>) -> Option<TruthFacts> {
+    match fact {
+        Some(ScalarFacts::Truth(truth)) => Some(truth.clone()),
+        _ => None,
+    }
+}
+
+fn comparison_facts(
+    operation: mxx_ir_core::node::IntCompareOp,
+    left: Option<&ScalarFacts>,
+    right: Option<&ScalarFacts>,
+    binders: &HashMap<u64, state::IntegerState>,
+) -> Option<ScalarFacts> {
+    let difference = affine_fact(left)?.subtract(&affine_fact(right)?)?;
+    let binder_atom = difference.binder?;
+    // Unit slope is sufficient for loop-index boundary predicates and keeps
+    // integer rounding out of the trusted refinement logic.
+    if difference.coefficient != BigInt::one() && difference.coefficient != -BigInt::one() {
+        return None;
+    }
+    let binder = binders.get(&binder_atom)?;
+    let restricted = |minimum: BigInt, maximum: BigInt| {
+        let minimum = minimum.max(binder.minimum.clone());
+        let maximum = maximum.min(binder.maximum_inclusive.clone());
+        if minimum > maximum {
+            OutcomeRefinement::Impossible
+        } else {
+            OutcomeRefinement::Restricted(BinderRefinement {
+                binder: binder_atom,
+                range: state::IntegerState::new(minimum, maximum).expect("ordered refinement"),
+            })
+        }
+    };
+    let (when_zero, when_one) = match (operation, difference.coefficient.sign()) {
+        (mxx_ir_core::node::IntCompareOp::LessEqual, num_bigint::Sign::Plus) => (
+            restricted(-&difference.offset + 1, binder.maximum_inclusive.clone()),
+            restricted(binder.minimum.clone(), -&difference.offset),
+        ),
+        (mxx_ir_core::node::IntCompareOp::LessEqual, num_bigint::Sign::Minus) => (
+            restricted(binder.minimum.clone(), difference.offset.clone() - 1),
+            restricted(difference.offset.clone(), binder.maximum_inclusive.clone()),
+        ),
+        (mxx_ir_core::node::IntCompareOp::Less, num_bigint::Sign::Plus) => (
+            restricted(-&difference.offset, binder.maximum_inclusive.clone()),
+            restricted(binder.minimum.clone(), -&difference.offset - 1),
+        ),
+        (mxx_ir_core::node::IntCompareOp::Less, num_bigint::Sign::Minus) => (
+            restricted(binder.minimum.clone(), difference.offset.clone()),
+            restricted(difference.offset.clone() + 1, binder.maximum_inclusive.clone()),
+        ),
+        (mxx_ir_core::node::IntCompareOp::Equal, _) => (OutcomeRefinement::Unconstrained, {
+            let value = if difference.coefficient.is_positive() {
+                -difference.offset
+            } else {
+                difference.offset
+            };
+            restricted(value.clone(), value)
+        }),
+        _ => return None,
+    };
+    Some(ScalarFacts::Truth(TruthFacts { when_zero, when_one }))
+}
+
+fn eval_int_facts(
+    expression: &mxx_ir_core::IntExpr,
+    integers: &BTreeMap<String, ScalarFacts>,
+    loop_atoms: &HashMap<u32, u64>,
+) -> Option<ScalarFacts> {
+    use mxx_ir_core::IntExpr;
+    fn evaluate(
+        expression: &IntExpr,
+        integers: &BTreeMap<String, ScalarFacts>,
+        loop_atoms: &HashMap<u32, u64>,
+    ) -> Option<AffineScalar> {
+        match expression {
+            IntExpr::Const(value) => Some(AffineScalar::constant(value)),
+            IntExpr::Var(name) => affine_fact(integers.get(name)),
+            IntExpr::LoopIndex(slot) => Some(AffineScalar::binder(*loop_atoms.get(slot)?)),
+            IntExpr::Add(left, right) => {
+                evaluate(left, integers, loop_atoms)?.add(&evaluate(right, integers, loop_atoms)?)
+            }
+            IntExpr::Sub(left, right) => evaluate(left, integers, loop_atoms)?
+                .subtract(&evaluate(right, integers, loop_atoms)?),
+            IntExpr::Mul(left, right) => {
+                let left = evaluate(left, integers, loop_atoms)?;
+                let right = evaluate(right, integers, loop_atoms)?;
+                if left.binder.is_none() {
+                    Some(right.multiply_constant(&left.offset))
+                } else if right.binder.is_none() {
+                    Some(left.multiply_constant(&right.offset))
+                } else {
+                    None
+                }
+            }
+            IntExpr::Div(left, right) => {
+                let left = evaluate(left, integers, loop_atoms)?;
+                let right = evaluate(right, integers, loop_atoms)?;
+                if right.binder.is_some() ||
+                    right.offset.is_zero() ||
+                    &left.coefficient % &right.offset != BigInt::zero() ||
+                    &left.offset % &right.offset != BigInt::zero()
+                {
+                    None
+                } else {
+                    Some(AffineScalar {
+                        binder: left.binder,
+                        coefficient: left.coefficient / &right.offset,
+                        offset: left.offset / right.offset,
+                    })
+                }
+            }
+            IntExpr::RoundDiv(_, _) | IntExpr::Log2Ceil(_) => None,
+        }
+    }
+    evaluate(&expression.canonicalize(), integers, loop_atoms).map(ScalarFacts::Affine)
+}
+
+fn eval_int_interval(
+    expression: &mxx_ir_core::IntExpr,
+    concrete: &ParamEnv,
+    integers: &BTreeMap<String, state::IntegerState>,
+    loop_indices: &HashMap<u32, state::IntegerState>,
+) -> Result<state::IntegerState, SimulationError> {
+    use mxx_ir_core::IntExpr;
+
+    fn log2_ceil(value: &BigInt) -> Result<BigInt, SimulationError> {
+        let positive = value.to_biguint().filter(|value| !value.is_zero()).ok_or_else(|| {
+            SimulationError::InvalidParameterEnvironment {
+                message: "log2ceil argument must be positive".into(),
+            }
+        })?;
+        let floor = positive.bits() - 1;
+        Ok(BigInt::from(if positive == (BigUint::one() << floor as usize) {
+            floor
+        } else {
+            floor + 1
+        }))
+    }
+
+    fn evaluate(
+        expression: &IntExpr,
+        concrete: &ParamEnv,
+        integers: &BTreeMap<String, state::IntegerState>,
+        loop_indices: &HashMap<u32, state::IntegerState>,
+    ) -> Result<state::IntegerState, SimulationError> {
+        let invalid = |message: String| SimulationError::InvalidParameterEnvironment { message };
+        Ok(match expression {
+            IntExpr::Const(value) => state::IntegerState::singleton(value.clone()),
+            IntExpr::Var(name) => integers
+                .get(name)
+                .cloned()
+                .or_else(|| {
+                    concrete.integers.get(name).cloned().map(state::IntegerState::singleton)
+                })
+                .ok_or_else(|| invalid(format!("unbound integer variable {name}")))?,
+            IntExpr::LoopIndex(slot) => loop_indices
+                .get(slot)
+                .cloned()
+                .or_else(|| {
+                    concrete.loop_indices.get(slot).cloned().map(state::IntegerState::singleton)
+                })
+                .ok_or_else(|| invalid(format!("unbound loop-index[{slot}]")))?,
+            IntExpr::Add(left, right) => evaluate(left, concrete, integers, loop_indices)?
+                .add(&evaluate(right, concrete, integers, loop_indices)?),
+            IntExpr::Sub(left, right) => evaluate(left, concrete, integers, loop_indices)?
+                .subtract(&evaluate(right, concrete, integers, loop_indices)?),
+            IntExpr::Mul(left, right) => evaluate(left, concrete, integers, loop_indices)?
+                .multiply(&evaluate(right, concrete, integers, loop_indices)?),
+            IntExpr::Div(left, right) => {
+                let numerator = evaluate(left, concrete, integers, loop_indices)?;
+                let denominator = evaluate(right, concrete, integers, loop_indices)?;
+                if numerator.minimum != numerator.maximum_inclusive ||
+                    denominator.minimum != denominator.maximum_inclusive
+                {
+                    return Err(invalid(
+                        "exact division of a non-singleton symbolic interval is unsupported".into(),
+                    ));
+                }
+                if denominator.minimum.is_zero() ||
+                    &numerator.minimum % &denominator.minimum != BigInt::zero()
+                {
+                    return Err(invalid("symbolic integer division is not exact".into()));
+                }
+                state::IntegerState::singleton(&numerator.minimum / &denominator.minimum)
+            }
+            IntExpr::RoundDiv(left, right) => {
+                let numerator = evaluate(left, concrete, integers, loop_indices)?;
+                let denominator = evaluate(right, concrete, integers, loop_indices)?;
+                if denominator.minimum <= BigInt::zero() {
+                    return Err(invalid("RoundDiv denominator must be positive".into()));
+                }
+                let two = BigInt::from(2);
+                let rounded = |n: &BigInt, d: &BigInt| {
+                    let numerator = n * &two + d;
+                    let denominator = d * &two;
+                    let quotient = &numerator / &denominator;
+                    if &numerator % &denominator < BigInt::zero() {
+                        quotient - BigInt::one()
+                    } else {
+                        quotient
+                    }
+                };
+                let candidates = [
+                    rounded(&numerator.minimum, &denominator.minimum),
+                    rounded(&numerator.minimum, &denominator.maximum_inclusive),
+                    rounded(&numerator.maximum_inclusive, &denominator.minimum),
+                    rounded(&numerator.maximum_inclusive, &denominator.maximum_inclusive),
+                ];
+                state::IntegerState::new(
+                    candidates.iter().min().expect("four rounded quotients").clone(),
+                    candidates.iter().max().expect("four rounded quotients").clone(),
+                )?
+            }
+            IntExpr::Log2Ceil(value) => {
+                let range = evaluate(value, concrete, integers, loop_indices)?;
+                state::IntegerState::new(
+                    log2_ceil(&range.minimum)?,
+                    log2_ceil(&range.maximum_inclusive)?,
+                )?
+            }
+        })
+    }
+
+    // Canonicalization preserves correlations that interval arithmetic alone
+    // cannot see, such as `i - i = 0`, before ranges are propagated.
+    evaluate(&expression.canonicalize(), concrete, integers, loop_indices)
+}
+
+fn eval_index_interval(
+    expression: &mxx_ir_core::IndexExpr,
+    concrete: &ParamEnv,
+    integers: &BTreeMap<String, state::IntegerState>,
+    loop_indices: &HashMap<u32, state::IntegerState>,
+    axis_slots: &[u32],
+) -> Result<state::IntegerState, SimulationError> {
+    use mxx_ir_core::IndexExpr;
+
+    let invalid = |message: String| SimulationError::InvalidIndexMap { message, site: None };
+    let evaluate = |expression: &IndexExpr| {
+        eval_index_interval(expression, concrete, integers, loop_indices, axis_slots)
+    };
+    Ok(match expression.normalize() {
+        IndexExpr::Axis(axis) => {
+            let slot = axis_slots
+                .get(axis)
+                .ok_or_else(|| invalid("grid map axis is out of range".into()))?;
+            loop_indices
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| invalid(format!("unbound grid axis {axis}")))?
+        }
+        IndexExpr::Parameter(name) => integers
+            .get(&name)
+            .cloned()
+            .or_else(|| concrete.integers.get(&name).cloned().map(state::IntegerState::singleton))
+            .ok_or_else(|| invalid(format!("unbound index parameter {name}")))?,
+        IndexExpr::LoopIndex(slot) => loop_indices
+            .get(&slot)
+            .cloned()
+            .or_else(|| {
+                concrete.loop_indices.get(&slot).cloned().map(state::IntegerState::singleton)
+            })
+            .ok_or_else(|| invalid(format!("unbound loop-index[{slot}]")))?,
+        IndexExpr::Constant(value) => state::IntegerState::singleton(value),
+        IndexExpr::Add(left, right) => evaluate(&left)?.add(&evaluate(&right)?),
+        IndexExpr::Subtract(left, right) if left == right => state::IntegerState::singleton(0),
+        IndexExpr::Subtract(left, right) => evaluate(&left)?.subtract(&evaluate(&right)?),
+        IndexExpr::Multiply(left, right) => evaluate(&left)?.multiply(&evaluate(&right)?),
+        IndexExpr::Divide(left, right) => {
+            let numerator = evaluate(&left)?;
+            let denominator = evaluate(&right)?;
+            if denominator.minimum <= BigInt::zero() &&
+                denominator.maximum_inclusive >= BigInt::zero()
+            {
+                return Err(invalid("index divisor range contains zero".into()));
+            }
+            let candidates = [
+                &numerator.minimum / &denominator.minimum,
+                &numerator.minimum / &denominator.maximum_inclusive,
+                &numerator.maximum_inclusive / &denominator.minimum,
+                &numerator.maximum_inclusive / &denominator.maximum_inclusive,
+            ];
+            state::IntegerState::new(
+                candidates.iter().min().expect("four quotients").clone(),
+                candidates.iter().max().expect("four quotients").clone(),
+            )?
+        }
+        IndexExpr::Remainder(left, right) => {
+            let numerator = evaluate(&left)?;
+            let denominator = evaluate(&right)?;
+            if denominator.minimum <= BigInt::zero() &&
+                denominator.maximum_inclusive >= BigInt::zero()
+            {
+                return Err(invalid("index divisor range contains zero".into()));
+            }
+            let maximum =
+                denominator.minimum.abs().max(denominator.maximum_inclusive.abs()) - BigInt::one();
+            if numerator.minimum >= BigInt::zero() {
+                state::IntegerState::new(BigInt::zero(), maximum)?
+            } else if numerator.maximum_inclusive <= BigInt::zero() {
+                state::IntegerState::new(-maximum, BigInt::zero())?
+            } else {
+                state::IntegerState::new(-maximum.clone(), maximum)?
+            }
+        }
+        IndexExpr::Equal(left, right) if left == right => state::IntegerState::singleton(1),
+        IndexExpr::Equal(left, right) => {
+            let left = evaluate(&left)?;
+            let right = evaluate(&right)?;
+            if left.maximum_inclusive < right.minimum || right.maximum_inclusive < left.minimum {
+                state::IntegerState::singleton(0)
+            } else if left.minimum == left.maximum_inclusive &&
+                right.minimum == right.maximum_inclusive &&
+                left.minimum == right.minimum
+            {
+                state::IntegerState::singleton(1)
+            } else {
+                state::IntegerState::new(0.into(), 1.into())?
+            }
+        }
+        IndexExpr::Less(left, right) | IndexExpr::LessEqual(left, right) => {
+            let strict = matches!(expression.normalize(), IndexExpr::Less(_, _));
+            let left = evaluate(&left)?;
+            let right = evaluate(&right)?;
+            let always_true = if strict {
+                left.maximum_inclusive < right.minimum
+            } else {
+                left.maximum_inclusive <= right.minimum
+            };
+            let always_false = if strict {
+                left.minimum >= right.maximum_inclusive
+            } else {
+                left.minimum > right.maximum_inclusive
+            };
+            if always_true {
+                state::IntegerState::singleton(1)
+            } else if always_false {
+                state::IntegerState::singleton(0)
+            } else {
+                state::IntegerState::new(0.into(), 1.into())?
+            }
+        }
+        IndexExpr::Log2Ceil(value) => {
+            let range = evaluate(&value)?;
+            let evaluate_endpoint = |value: &BigInt| {
+                let positive = value
+                    .to_biguint()
+                    .filter(|value| !value.is_zero())
+                    .ok_or_else(|| invalid("log2ceil argument must be positive".into()))?;
+                let floor = positive.bits() - 1;
+                Ok::<_, SimulationError>(BigInt::from(
+                    if positive == (BigUint::one() << floor as usize) { floor } else { floor + 1 },
+                ))
+            };
+            state::IntegerState::new(
+                evaluate_endpoint(&range.minimum)?,
+                evaluate_endpoint(&range.maximum_inclusive)?,
+            )?
+        }
+        IndexExpr::Select { selector, branches } => {
+            let selector = evaluate(&selector)?;
+            let minimum = selector
+                .minimum
+                .to_usize()
+                .ok_or_else(|| invalid("negative index-map selector".into()))?;
+            let maximum = selector
+                .maximum_inclusive
+                .to_usize()
+                .ok_or_else(|| invalid("invalid index-map selector".into()))?;
+            let selected = branches
+                .get(minimum..=maximum)
+                .ok_or_else(|| invalid("index-map selector is out of range".into()))?;
+            let mut ranges = selected.iter().map(evaluate);
+            let first =
+                ranges.next().ok_or_else(|| invalid("index-map select has no branch".into()))??;
+            ranges
+                .try_fold(first, |joined, range| Ok::<_, SimulationError>(joined.join(&range?)))?
+        }
+    })
 }
 
 fn wire_types_compatible(expected: &WireType, actual: &WireType, env: &ParamEnv) -> bool {
@@ -3320,13 +4322,52 @@ fn apply_bindings(
     mut env: ParamEnv,
     bindings: &[(String, mxx_ir_core::IntExpr)],
 ) -> Result<ParamEnv, SimulationError> {
-    for (name, expression) in bindings {
-        let value = expression.evaluate(&env).map_err(|error| {
-            SimulationError::InvalidParameterEnvironment { message: error.to_string() }
-        })?;
+    // Bindings are simultaneous: every right-hand side reads the unchanged
+    // parent environment, including an outer variable shadowed by another
+    // binding in this same list.
+    let parent = env.clone();
+    let evaluated = bindings
+        .iter()
+        .map(|(name, expression)| {
+            expression.evaluate(&parent).map(|value| (name.clone(), value)).map_err(|error| {
+                SimulationError::InvalidParameterEnvironment { message: error.to_string() }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, value) in evaluated {
         env.integers.insert(name.clone(), value);
     }
     Ok(env)
+}
+
+fn apply_abstract_bindings(
+    integers: &mut BTreeMap<String, state::IntegerState>,
+    integer_facts: &mut BTreeMap<String, ScalarFacts>,
+    bindings: &[(String, mxx_ir_core::IntExpr)],
+    concrete: &ParamEnv,
+    loop_indices: &HashMap<u32, state::IntegerState>,
+    loop_atoms: &HashMap<u32, u64>,
+) -> Result<(), SimulationError> {
+    let parent = integers.clone();
+    let parent_facts = integer_facts.clone();
+    let evaluated = bindings
+        .iter()
+        .map(|(name, expression)| {
+            eval_int_interval(expression, concrete, &parent, loop_indices)
+                .map(|range| (name.clone(), range))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, range) in evaluated {
+        integers.insert(name, range);
+    }
+    for (name, expression) in bindings {
+        if let Some(facts) = eval_int_facts(expression, &parent_facts, loop_atoms) {
+            integer_facts.insert(name.clone(), facts);
+        } else {
+            integer_facts.remove(name);
+        }
+    }
+    Ok(())
 }
 
 fn int(x: &Info) -> Result<state::IntegerState, SimulationError> {
@@ -3434,20 +4475,6 @@ fn matrix_state_mut(x: &mut AbstractValue) -> Option<&mut MatrixState> {
         AbstractValue::Matrix(x) => Some(x),
         AbstractValue::Family(f) => matrix_state_mut(f.element.as_mut()),
         _ => None,
-    }
-}
-
-fn preserve_grid_carriers(representative: &AbstractValue, joined: &mut AbstractValue) {
-    match (representative, joined) {
-        (AbstractValue::Matrix(representative), AbstractValue::Matrix(joined)) => {
-            joined.right_carrier = representative.right_carrier.clone();
-        }
-        (AbstractValue::Family(representative), AbstractValue::Family(joined))
-            if representative.shape == joined.shape =>
-        {
-            preserve_grid_carriers(representative.element.as_ref(), joined.element.as_mut());
-        }
-        _ => {}
     }
 }
 
@@ -3747,32 +4774,6 @@ fn index_expr_depends_axis(expr: &mxx_ir_core::IndexExpr, axis: usize) -> bool {
     }
 }
 
-fn eval_grid_index(
-    expr: &mxx_ir_core::IndexExpr,
-    env: &ParamEnv,
-    axis_slots: &[u32],
-) -> Result<usize, SimulationError> {
-    let value = match expr {
-        mxx_ir_core::IndexExpr::Axis(axis) => BigInt::from(
-            env.loop_indices
-                .get(axis_slots.get(*axis).ok_or_else(|| SimulationError::InvalidIndexMap {
-                    message: "grid map axis is out of range".into(),
-                    site: None,
-                })?)
-                .cloned()
-                .unwrap_or_else(|| BigInt::from(*axis)),
-        ),
-        _ => expr.evaluate(env).map_err(|error| SimulationError::InvalidIndexMap {
-            message: error.to_string(),
-            site: None,
-        })?,
-    };
-    value.to_usize().ok_or_else(|| SimulationError::InvalidIndexMap {
-        message: "grid index is not a nonnegative usize".into(),
-        site: None,
-    })
-}
-
 fn specialize_relation(
     mut relation: RightPreimage,
     selectors: &[crate::SelectorId],
@@ -3952,11 +4953,44 @@ mod tests {
         GraphOutput, NodeHandle, SubgraphHandle,
         artifact::{ArtifactConfidentiality, ProductionId},
         encoding::spec_hash,
-        node::{ArtifactInput, ConstantMatrix},
+        node::{ArtifactInput, ConstantMatrix, IndexRange},
         types::MatrixType,
         with_new_construction_scope,
     };
     use std::collections::BTreeMap;
+
+    fn run_single_output(
+        graph: Graph,
+        name: &str,
+    ) -> Result<crate::SimulationReport, SimulationError> {
+        run_single_output_with_inputs(graph, name, vec![])
+    }
+
+    fn run_single_output_with_inputs(
+        graph: Graph,
+        name: &str,
+        external_inputs: Vec<crate::ExternalInputFact>,
+    ) -> Result<crate::SimulationReport, SimulationError> {
+        let environment = ParamEnv::default();
+        let stage = crate::StageId(name.into());
+        let request = SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![crate::SimulationStage {
+                    id: stage.clone(),
+                    production_id: ProductionId {
+                        spec_hash: spec_hash(&graph, &environment).unwrap(),
+                        execution_nonce: [0; 32],
+                    },
+                    graph,
+                }],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage, output: "out".into() }],
+            external_inputs,
+            limits: crate::SimulationLimits::default(),
+        };
+        run(&request)
+    }
 
     #[test]
     fn opaque_dynamic_selection_of_uniform_family_keeps_source_identity() {
@@ -4083,6 +5117,209 @@ mod tests {
             report.roots[0].maximum_absolute_coefficient_error
         );
         assert!(report.diagnostics.dropped_carriers.is_empty());
+    }
+
+    #[test]
+    fn ring_automorphism_accepts_gadget_trapdoor_public_matrix() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(2),
+        };
+        let trapdoor = NodeHandle::new(
+            NodeKind::GadgetTrapdoor { matrix_type: matrix.clone(), base: 4.into() },
+            vec![],
+            vec![WireType::Trapdoor {
+                matrix: matrix.clone(),
+                sigma: mxx_ir_core::RealExpr::Rational(mxx_ir_core::Rational::from_integer(
+                    4.into(),
+                )),
+                gadget_base: 4.into(),
+                digit_count: 2.into(),
+                preimage_max_coefficient_bound: 0.into(),
+            }],
+        );
+        let public = NodeHandle::new(
+            NodeKind::TrapdoorPublic,
+            vec![trapdoor.output(0).unwrap()],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let automorphism = NodeHandle::new(
+            NodeKind::RingAutomorphism { index: 3.into() },
+            vec![public],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "automorphism-gadget-trapdoor",
+            vec![],
+            BTreeMap::from([(
+                String::from("out"),
+                GraphOutput { value: automorphism, confidentiality: None },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let report = run_single_output(graph, "automorphism-gadget-trapdoor").unwrap();
+        assert_eq!(report.roots[0].maximum_absolute_coefficient_error, BigUint::ZERO);
+    }
+
+    #[test]
+    fn ring_automorphism_rejects_tracked_non_gadget_matrices() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let cases = [NodeHandle::new(
+            NodeKind::ConstantMatrix { matrix_type: matrix.clone(), value: ConstantMatrix::Zero },
+            vec![],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap()];
+        for (index, source) in cases.into_iter().enumerate() {
+            let automorphism = NodeHandle::new(
+                NodeKind::RingAutomorphism { index: 3.into() },
+                vec![source],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            let graph = Graph::freeze(
+                format!("automorphism-tracked-{index}"),
+                vec![],
+                BTreeMap::from([(
+                    String::from("out"),
+                    GraphOutput { value: automorphism, confidentiality: None },
+                )]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .0;
+            let result = run_single_output(graph, &format!("automorphism-tracked-{index}"));
+            assert!(matches!(result, Err(SimulationError::Relation { .. })));
+        }
+
+        let name = "automorphism-tracked-hash";
+        let key = NodeHandle::new(
+            NodeKind::Input {
+                name: "key".into(),
+                wire_type: WireType::Bytes { length: mxx_ir_core::IntExpr::constant(32) },
+                artifact: None,
+            },
+            vec![],
+            vec![WireType::Bytes { length: mxx_ir_core::IntExpr::constant(32) }],
+        )
+        .output(0)
+        .unwrap();
+        let hash = NodeHandle::new(
+            NodeKind::HashSample {
+                matrix_type: matrix.clone(),
+                tag_prefix: vec![1],
+                tag_expressions: vec![],
+                tag_decimal_expressions: vec![],
+                tag_u64_le_expressions: vec![],
+            },
+            vec![key],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let automorphism = NodeHandle::new(
+            NodeKind::RingAutomorphism { index: 3.into() },
+            vec![hash],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            name,
+            vec![],
+            BTreeMap::from([(
+                String::from("out"),
+                GraphOutput { value: automorphism, confidentiality: None },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let result = run_single_output_with_inputs(
+            graph,
+            name,
+            vec![crate::ExternalInputFact {
+                stage: crate::StageId(name.into()),
+                input: "key".into(),
+                value: crate::ExternalInputValue::Bytes,
+            }],
+        );
+        assert!(matches!(result, Err(SimulationError::Relation { .. })));
+    }
+
+    #[test]
+    fn ring_automorphism_rejects_tracked_trapdoor_sample_public_matrix() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(3),
+        };
+        let sample = NodeHandle::new(
+            NodeKind::TrapdoorSample {
+                matrix_type: matrix.clone(),
+                sigma: mxx_ir_core::RealExpr::from_integer(1),
+                gadget_base: 4.into(),
+                digit_count: 1.into(),
+                preimage_max_coefficient_bound: 8.into(),
+            },
+            vec![],
+            vec![
+                WireType::Matrix(matrix.clone()),
+                WireType::Trapdoor {
+                    matrix: matrix.clone(),
+                    sigma: mxx_ir_core::RealExpr::from_integer(1),
+                    gadget_base: 4.into(),
+                    digit_count: 1.into(),
+                    preimage_max_coefficient_bound: 8.into(),
+                },
+            ],
+        );
+        let automorphism = NodeHandle::new(
+            NodeKind::RingAutomorphism { index: 3.into() },
+            vec![sample.output(0).unwrap()],
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "automorphism-tracked-trapdoor",
+            vec![],
+            BTreeMap::from([(
+                String::from("out"),
+                GraphOutput { value: automorphism, confidentiality: None },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(
+            run_single_output(graph, "automorphism-tracked-trapdoor"),
+            Err(SimulationError::Relation { .. })
+        ));
     }
 
     #[test]
@@ -4876,7 +6113,7 @@ mod tests {
                 }],
             },
             environment,
-            roots: vec![crate::SimulationRoot { stage, output: "out".into() }],
+            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
             external_inputs: vec![],
             limits: crate::SimulationLimits::default(),
         };
@@ -4889,11 +6126,77 @@ mod tests {
     fn structural_bindings_and_grid_indices_are_substituted() {
         let mut env = ParamEnv::default();
         env.loop_indices.insert(3, BigInt::from(5));
-        let env =
-            apply_bindings(env, &[("bound".into(), mxx_ir_core::IntExpr::LoopIndex(3))]).unwrap();
+        env.integers.insert("outer".into(), BigInt::from(9));
+        let bindings = [
+            ("outer".into(), mxx_ir_core::IntExpr::LoopIndex(3)),
+            ("copy".into(), mxx_ir_core::IntExpr::Var("outer".into())),
+            ("bound".into(), mxx_ir_core::IntExpr::LoopIndex(3)),
+        ];
+        let env = apply_bindings(env, &bindings).unwrap();
         assert_eq!(env.integers["bound"], BigInt::from(5));
+        assert_eq!(env.integers["outer"], BigInt::from(5));
+        assert_eq!(env.integers["copy"], BigInt::from(9));
+        let mut abstract_integers =
+            BTreeMap::from([("outer".into(), state::IntegerState::singleton(9))]);
+        let abstract_loop_indices =
+            HashMap::from([(3, state::IntegerState::new(2.into(), 5.into()).unwrap())]);
+        apply_abstract_bindings(
+            &mut abstract_integers,
+            &mut BTreeMap::new(),
+            &bindings,
+            &env,
+            &abstract_loop_indices,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            abstract_integers["outer"],
+            state::IntegerState::new(2.into(), 5.into()).unwrap()
+        );
+        assert_eq!(abstract_integers["copy"], state::IntegerState::singleton(9));
         let index = mxx_ir_core::IndexExpr::Axis(0);
-        assert_eq!(eval_grid_index(&index, &env, &[3]).unwrap(), 5);
+        let loop_indices = HashMap::from([(
+            3,
+            state::IntegerState::new(BigInt::from(2), BigInt::from(5)).unwrap(),
+        )]);
+        assert_eq!(
+            eval_index_interval(&index, &env, &BTreeMap::new(), &loop_indices, &[3]).unwrap(),
+            state::IntegerState::new(BigInt::from(2), BigInt::from(5)).unwrap()
+        );
+        let truncating_division = mxx_ir_core::IndexExpr::Divide(
+            Box::new(mxx_ir_core::IndexExpr::constant(-1)),
+            Box::new(mxx_ir_core::IndexExpr::constant(2)),
+        );
+        assert_eq!(
+            eval_index_interval(
+                &truncating_division,
+                &env,
+                &BTreeMap::new(),
+                &HashMap::new(),
+                &[],
+            )
+            .unwrap(),
+            state::IntegerState::singleton(0),
+        );
+        assert!(matches!(
+            empty_info_for_type(&WireType::Real, &env).unwrap().value,
+            AbstractValue::Real
+        ));
+    }
+
+    #[test]
+    fn affine_provenance_distinguishes_reused_loop_slot_names() {
+        let expression = mxx_ir_core::IntExpr::LoopIndex(0);
+        let outer = eval_int_facts(&expression, &BTreeMap::new(), &HashMap::from([(0, 7)]));
+        let inner = eval_int_facts(&expression, &BTreeMap::new(), &HashMap::from([(0, 8)]));
+        assert_ne!(outer, inner, "lexically distinct binders cannot share provenance");
+        assert!(
+            affine_fact(outer.as_ref())
+                .unwrap()
+                .add(&affine_fact(inner.as_ref()).unwrap())
+                .is_none(),
+            "multi-binder arithmetic must conservatively drop affine provenance",
+        );
     }
 
     #[test]
@@ -4938,7 +6241,7 @@ mod tests {
             .output(0)
             .unwrap();
             let selector = NodeHandle::new(
-                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(0)),
+                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::Var("selector".into())),
                 vec![],
                 vec![WireType::ConstantInt],
             )
@@ -4951,7 +6254,19 @@ mod tests {
             )
             .output(0)
             .unwrap();
-            SubgraphHandle::new("loop-index-select-body", scope, vec![body_noisy], vec![selected])
+            let scaled = NodeHandle::new(
+                NodeKind::MatrixScale {
+                    scalar: mxx_ir_core::IntExpr::Add(
+                        Box::new(mxx_ir_core::IntExpr::LoopIndex(0)),
+                        Box::new(mxx_ir_core::IntExpr::constant(1)),
+                    ),
+                },
+                vec![selected],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("loop-index-select-body", scope, vec![body_noisy], vec![scaled])
                 .unwrap()
         });
         let family_type = WireType::Family {
@@ -4965,7 +6280,7 @@ mod tests {
             mxx_ir_core::node::ParallelGrid {
                 shape: vec![mxx_ir_core::IntExpr::constant(2)],
                 index_slots: vec![0],
-                bindings: vec![],
+                bindings: vec![("selector".into(), mxx_ir_core::IntExpr::LoopIndex(0))],
                 input_modes: vec![mxx_ir_core::node::GridInputMode::Broadcast],
             },
         )
@@ -5007,7 +6322,394 @@ mod tests {
             limits: crate::SimulationLimits::default(),
         })
         .unwrap();
-        assert_eq!(report.roots[0].maximum_absolute_coefficient_error, 7u8.into());
+        assert_eq!(report.roots[0].maximum_absolute_coefficient_error, 14u8.into());
+    }
+
+    #[test]
+    fn parallel_grid_symbolic_cost_is_independent_of_cardinality_and_zero_is_empty() {
+        fn request(extent: usize) -> SimulationRequest {
+            let matrix = MatrixType {
+                modulus: mxx_ir_core::IntExpr::constant(97),
+                ring_dimension: mxx_ir_core::IntExpr::constant(1),
+                rows: mxx_ir_core::IntExpr::constant(1),
+                columns: mxx_ir_core::IntExpr::constant(1),
+            };
+            let body = with_new_construction_scope(|scope| {
+                let constants = (0..2)
+                    .map(|_| {
+                        NodeHandle::new(
+                            NodeKind::ConstantMatrix {
+                                matrix_type: matrix.clone(),
+                                value: ConstantMatrix::Zero,
+                            },
+                            vec![],
+                            vec![WireType::Matrix(matrix.clone())],
+                        )
+                        .output(0)
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let sum = NodeHandle::new(
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+                    constants,
+                    vec![WireType::Matrix(matrix.clone())],
+                )
+                .output(0)
+                .unwrap();
+                SubgraphHandle::new("uniform-grid-body", scope, vec![], vec![sum]).unwrap()
+            });
+            let shape = vec![mxx_ir_core::IntExpr::constant(extent)];
+            let output = NodeHandle::parallel_grid(
+                body,
+                vec![],
+                vec![WireType::Family {
+                    element: Box::new(WireType::Matrix(matrix)),
+                    shape: shape.clone(),
+                }],
+                mxx_ir_core::node::ParallelGrid {
+                    shape,
+                    index_slots: vec![0],
+                    bindings: vec![],
+                    input_modes: vec![],
+                },
+            )
+            .output(0)
+            .unwrap();
+            let (graph, _) = Graph::freeze(
+                format!("uniform-grid-{extent}"),
+                vec![],
+                BTreeMap::from([(
+                    "out".into(),
+                    GraphOutput { value: output, confidentiality: None },
+                )]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let environment = ParamEnv::default();
+            let stage = crate::StageId(format!("uniform-grid-{extent}"));
+            SimulationRequest {
+                program: crate::SimulationProgram {
+                    stages: vec![crate::SimulationStage {
+                        id: stage.clone(),
+                        production_id: ProductionId {
+                            spec_hash: spec_hash(&graph, &environment).unwrap(),
+                            execution_nonce: [0; 32],
+                        },
+                        graph,
+                    }],
+                },
+                environment,
+                roots: vec![crate::SimulationRoot { stage, output: "out".into() }],
+                external_inputs: vec![],
+                limits: crate::SimulationLimits::default(),
+            }
+        }
+
+        let small = run(&request(1)).unwrap();
+        let large = run(&request(100_000)).unwrap();
+        assert_eq!(small.diagnostics.transfer_steps, large.diagnostics.transfer_steps);
+        assert_eq!(large.roots[0].maximum_absolute_coefficient_error, BigUint::zero());
+
+        let empty = run(&request(0)).unwrap();
+        assert_eq!(empty.roots[0].maximum_absolute_coefficient_error, BigUint::zero());
+        assert!(empty.diagnostics.transfer_steps < small.diagnostics.transfer_steps);
+    }
+
+    #[test]
+    fn parallel_grid_refines_diamond_witness_selector_before_dynamic_gather() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(97),
+            ring_dimension: mxx_ir_core::IntExpr::constant(1),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let family_type = WireType::Family {
+            element: Box::new(WireType::Matrix(matrix.clone())),
+            shape: vec![mxx_ir_core::IntExpr::constant(3)],
+        };
+        let packed = NodeHandle::new(
+            NodeKind::Input {
+                name: "witnesses".into(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![family_type.clone()],
+        )
+        .output(0)
+        .unwrap();
+        let body = with_new_construction_scope(|scope| {
+            let witnesses = NodeHandle::new(
+                NodeKind::Input {
+                    name: "witness-family".into(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                vec![],
+                vec![family_type.clone()],
+            )
+            .output(0)
+            .unwrap();
+            let integer = |kind, inputs, output_type| {
+                NodeHandle::new(kind, inputs, vec![output_type]).output(0).unwrap()
+            };
+            let slot = integer(
+                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(0)),
+                vec![],
+                WireType::ConstantInt,
+            );
+            let witness_end =
+                integer(NodeKind::ConstantInt(4.into()), vec![], WireType::ConstantInt);
+            let instance_width =
+                integer(NodeKind::ConstantInt(2.into()), vec![], WireType::ConstantInt);
+            let after_instance = integer(
+                NodeKind::IntCompare(mxx_ir_core::node::IntCompareOp::LessEqual),
+                vec![instance_width.clone(), slot.clone()],
+                WireType::Bool,
+            );
+            let before_end = integer(
+                NodeKind::IntCompare(mxx_ir_core::node::IntCompareOp::LessEqual),
+                vec![slot.clone(), witness_end],
+                WireType::Bool,
+            );
+            let after_instance = integer(NodeKind::BoolToInt, vec![after_instance], WireType::Int);
+            let before_end = integer(NodeKind::BoolToInt, vec![before_end], WireType::Int);
+            let witness_active = integer(
+                NodeKind::IntBinary(IntBinaryOp::Multiply),
+                vec![after_instance, before_end],
+                WireType::Int,
+            );
+            // Diamond chooses a nonnegative base before subtracting the
+            // instance width: active witness lanes select `slot`, and padded
+            // lanes select `instance_width`.  Refining the selected affine
+            // branch under `witness_active == 1` proves a final range 0..2.
+            let zero = integer(NodeKind::ConstantInt(0.into()), vec![], WireType::ConstantInt);
+            let inactive_base = integer(
+                NodeKind::IntBinary(IntBinaryOp::Add),
+                vec![instance_width.clone(), zero.clone()],
+                WireType::Int,
+            );
+            let active_base =
+                integer(NodeKind::IntBinary(IntBinaryOp::Add), vec![slot, zero], WireType::Int);
+            let selected_base = integer(
+                NodeKind::Select { count: mxx_ir_core::IntExpr::constant(2) },
+                vec![witness_active, inactive_base, active_base],
+                WireType::Int,
+            );
+            let witness_index = integer(
+                NodeKind::IntBinary(IntBinaryOp::Subtract),
+                vec![selected_base, instance_width],
+                WireType::Int,
+            );
+            let selected = NodeHandle::new(
+                NodeKind::FamilyGetDynamic { rank: 1 },
+                vec![witnesses.clone(), witness_index],
+                vec![WireType::Matrix(matrix.clone())],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("diamond-witness-selector", scope, vec![witnesses], vec![selected])
+                .unwrap()
+        });
+        let output = NodeHandle::parallel_grid(
+            body,
+            vec![packed],
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(matrix)),
+                shape: vec![mxx_ir_core::IntExpr::constant(7)],
+            }],
+            mxx_ir_core::node::ParallelGrid {
+                shape: vec![mxx_ir_core::IntExpr::constant(7)],
+                index_slots: vec![0],
+                bindings: vec![],
+                input_modes: vec![mxx_ir_core::node::GridInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "diamond-witness-selector",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: output, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let environment = ParamEnv::default();
+        let stage = crate::StageId("diamond-witness-selector".into());
+        let report = run(&SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![crate::SimulationStage {
+                    id: stage.clone(),
+                    production_id: ProductionId {
+                        spec_hash: spec_hash(&graph, &environment).unwrap(),
+                        execution_nonce: [0; 32],
+                    },
+                    graph,
+                }],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
+            external_inputs: vec![crate::ExternalInputFact {
+                stage: stage.clone(),
+                input: "witnesses".into(),
+                value: crate::ExternalInputValue::Family {
+                    shape: vec![3],
+                    element: Box::new(crate::ExternalInputValue::Matrix {
+                        maximum_absolute_coefficient_error: 0u8.into(),
+                        maximum_absolute_coefficient_value: Some(0u8.into()),
+                        is_constant_polynomial: true,
+                    }),
+                },
+            }],
+            limits: crate::SimulationLimits::default(),
+        })
+        .unwrap();
+        assert!(report.roots[0].maximum_absolute_coefficient_error.is_zero());
+    }
+
+    #[test]
+    fn parallel_grid_rejects_nested_nonuniform_matrix_dimensions() {
+        let varying = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(97),
+            ring_dimension: mxx_ir_core::IntExpr::constant(1),
+            rows: mxx_ir_core::IntExpr::Var("nested_rows".into()),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let uniform = MatrixType { rows: mxx_ir_core::IntExpr::constant(1), ..varying.clone() };
+        let grandchild = with_new_construction_scope(|scope| {
+            let intermediate = NodeHandle::new(
+                NodeKind::ConstantMatrix {
+                    matrix_type: varying.clone(),
+                    value: ConstantMatrix::Zero,
+                },
+                vec![],
+                vec![WireType::Matrix(varying.clone())],
+            )
+            .output(0)
+            .unwrap();
+            let output = NodeHandle::new(
+                NodeKind::Slice {
+                    rows: Some(IndexRange {
+                        start: mxx_ir_core::IntExpr::constant(0),
+                        end: mxx_ir_core::IntExpr::constant(1),
+                    }),
+                    columns: None,
+                },
+                vec![intermediate],
+                vec![WireType::Matrix(uniform.clone())],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("nonuniform-grandchild", scope, vec![], vec![output]).unwrap()
+        });
+        let body = with_new_construction_scope(|scope| {
+            let output = NodeHandle::subgraph_call(
+                grandchild,
+                vec![],
+                vec![("nested_rows".into(), mxx_ir_core::IntExpr::Var("lane_rows".into()))],
+                vec![],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("uniform-grid-caller", scope, vec![], vec![output]).unwrap()
+        });
+        let shape = vec![mxx_ir_core::IntExpr::constant(2)];
+        let output = NodeHandle::parallel_grid(
+            body,
+            vec![],
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(uniform)),
+                shape: shape.clone(),
+            }],
+            mxx_ir_core::node::ParallelGrid {
+                shape,
+                index_slots: vec![4],
+                bindings: vec![(
+                    "lane_rows".into(),
+                    mxx_ir_core::IntExpr::Add(
+                        Box::new(mxx_ir_core::IntExpr::LoopIndex(4)),
+                        Box::new(mxx_ir_core::IntExpr::constant(1)),
+                    ),
+                )],
+                input_modes: vec![],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "nested-nonuniform-grid",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: output, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let stage = crate::StageId("nested-nonuniform-grid".into());
+        let request = SimulationRequest {
+            program: crate::SimulationProgram { stages: vec![] },
+            environment: ParamEnv::default(),
+            roots: vec![],
+            external_inputs: vec![],
+            limits: crate::SimulationLimits::default(),
+        };
+        let mut evaluator = Evaluator {
+            request: &request,
+            stages: HashMap::new(),
+            visiting: HashSet::new(),
+            sources: HashMap::new(),
+            gadget_sources: HashMap::new(),
+            source_lineages: HashMap::new(),
+            lineage_sources: HashMap::new(),
+            mapped_sources: HashMap::new(),
+            gathered_sources: HashMap::new(),
+            binder_sources: HashMap::new(),
+            abstract_integers: BTreeMap::from([(
+                "nested_rows".into(),
+                state::IntegerState::new(1.into(), 2.into()).unwrap(),
+            )]),
+            abstract_integer_facts: BTreeMap::new(),
+            abstract_loop_indices: HashMap::new(),
+            abstract_loop_atoms: HashMap::new(),
+            binder_ranges: HashMap::new(),
+            next_binder_atom: 0,
+            scalar_facts: HashMap::new(),
+            next_source: 0,
+            preimages: HashMap::new(),
+            states: HashMap::new(),
+            selector_views: HashMap::new(),
+            next_selector: 0,
+            planned: 0,
+            transfers: 0,
+            dropped: vec![],
+            interners: crate::identity::Interners::default(),
+            reached: HashSet::new(),
+            artifact_outputs: BTreeMap::new(),
+        };
+        let body_scope =
+            graph.child_scope_id(&FrozenGraphScopeId::Root, mxx_ir_core::NodeId(0)).unwrap();
+        let nested_scope = graph.child_scope_id(&body_scope, mxx_ir_core::NodeId(0)).unwrap();
+        let mut environment = ParamEnv::default();
+        environment.integers.insert("nested_rows".into(), BigInt::one());
+        let error = match evaluator.scope(
+            &stage,
+            &graph,
+            &nested_scope,
+            &["nested".into()],
+            environment,
+            HashMap::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("nested nonuniform matrix type must be rejected"),
+        };
+        assert!(
+            error.to_string().contains("matrix row count must be uniform"),
+            "unexpected error: {error}",
+        );
     }
 
     #[test]
@@ -5030,6 +6732,13 @@ mod tests {
             mapped_sources: HashMap::new(),
             gathered_sources: HashMap::new(),
             binder_sources: HashMap::new(),
+            abstract_integers: BTreeMap::new(),
+            abstract_integer_facts: BTreeMap::new(),
+            abstract_loop_indices: HashMap::new(),
+            abstract_loop_atoms: HashMap::new(),
+            binder_ranges: HashMap::new(),
+            next_binder_atom: 0,
+            scalar_facts: HashMap::new(),
             next_source: 0,
             preimages: HashMap::new(),
             states: HashMap::new(),
@@ -5058,13 +6767,27 @@ mod tests {
         assert_eq!(flat_lineage.leaves.len(), 6);
         assert_eq!(flat_lineage.leaves.iter().copied().collect::<HashSet<_>>().len(), 6);
 
+        let other_primitive = evaluator.source_for(
+            &crate::StageId("source-lineage".into()),
+            &FrozenGraphScopeId::Root,
+            &[],
+            1,
+            "public",
+        );
+        let packed_distinct = evaluator.group_source_for(vec![primitive, other_primitive], vec![2]);
+        assert_eq!(
+            evaluator.lift_source_for_shape(packed_distinct, vec![2]),
+            packed_distinct,
+            "a normalized family source must survive grid reuse without fresh lane identities",
+        );
+
         // The public gadget relation is index-independent: every grid lane
         // consumes a preimage of the same G rather than sampling a new source.
         let gadget = evaluator.source_for(
             &crate::StageId("source-lineage".into()),
             &FrozenGraphScopeId::Root,
             &[],
-            1,
+            2,
             "gadget",
         );
         evaluator.gadget_sources.insert(
@@ -5475,7 +7198,7 @@ mod tests {
     fn explicit_gadget_and_decomposition_share_one_canonical_source() {
         let target_type = MatrixType {
             modulus: mxx_ir_core::IntExpr::constant(17),
-            ring_dimension: mxx_ir_core::IntExpr::constant(1),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
             rows: mxx_ir_core::IntExpr::constant(1),
             columns: mxx_ir_core::IntExpr::constant(1),
         };
@@ -5513,13 +7236,20 @@ mod tests {
                 },
             },
             vec![],
+            vec![WireType::Matrix(gadget_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let automorphed_gadget = NodeHandle::new(
+            NodeKind::RingAutomorphism { index: mxx_ir_core::IntExpr::constant(3) },
+            vec![gadget],
             vec![WireType::Matrix(gadget_type)],
         )
         .output(0)
         .unwrap();
         let product = NodeHandle::new(
             NodeKind::ApplyPreimage,
-            vec![gadget, decomposition],
+            vec![automorphed_gadget, decomposition],
             vec![WireType::Matrix(target_type)],
         )
         .output(0)

@@ -584,7 +584,9 @@ fn validate_node(
             let digit_count = matrix.columns / matrix.rows;
             vec![ConcreteWireType::Trapdoor {
                 matrix,
-                sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone())),
+                sigma: crate::RealExpr::Rational(crate::expr::Rational::from_integer(
+                    gadget_base.clone(),
+                )),
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound: BigInt::zero(),
@@ -691,7 +693,19 @@ fn validate_node(
         }
         NodeKind::RingAutomorphism { index } => {
             require_arity(scope, node, 1)?;
-            let input = matrix_argument(scope, values, node, 0)?;
+            // An automorphism is a matrix-level operation.  A typed preimage
+            // carries a relation witness and must be consumed by an explicit
+            // preimage operation before it can enter this path.
+            let input = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => matrix.clone(),
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "ring automorphism requires an ordinary matrix argument",
+                    )
+                }
+            };
             if !input.ring_dimension.is_power_of_two() {
                 return node_error(
                     scope,
@@ -2359,6 +2373,30 @@ mod tests {
             vec![WireType::Matrix(residue_type)],
         );
         assert!(validate(&graph("uniform-residue", residue), &ParamEnv::default()).is_ok());
+    }
+
+    #[test]
+    fn ring_automorphism_rejects_typed_preimage_input() {
+        let target_type = matrix_type(17, 1, 1);
+        let decomposition_type = MatrixType { rows: IntExpr::constant(2), ..target_type.clone() };
+        let target = input("target", target_type.clone());
+        let decomposition = value(
+            NodeKind::GadgetDecompose {
+                base: IntExpr::constant(4),
+                digit_count: IntExpr::constant(2),
+                small: false,
+            },
+            vec![target],
+            vec![WireType::Preimage(decomposition_type.clone())],
+        );
+        let automorphism = value(
+            NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
+            vec![decomposition],
+            vec![WireType::Matrix(decomposition_type)],
+        );
+        let error = validate(&graph("automorphism-preimage", automorphism), &ParamEnv::default())
+            .expect_err("typed preimages must not enter a ring automorphism");
+        assert_eq!(node_message(error), "ring automorphism requires an ordinary matrix argument");
     }
 
     #[test]

@@ -1555,6 +1555,12 @@ impl TrapdoorFamily {
         self,
         body: impl FnOnce(LoopIndex, Trapdoor) -> R,
     ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 {
+            // TrapdoorFamily carries paired public and secret family views.
+            // Flattening either view here would discard their common
+            // Cartesian coordinate and invalidate the pairing contract.
+            return Err(DslError::ParallelMapRank);
+        }
         let count = self.count.clone();
         let schema = self.element_schema.clone();
         let (index_slot, (body_value, explicit_inputs, scope)) = with_loop_index(|index| {
@@ -3172,6 +3178,20 @@ impl Family<Mat> {
         offset: usize,
         body: impl FnOnce(LoopIndex, Mat, Mat) -> R,
     ) -> Result<R::Families, DslError> {
+        // The second reindex reads other[i + offset] for every i in self. A
+        // nonnegative canonical difference is the construction-time proof
+        // that the final read remains inside the other family's domain.
+        let remaining_capacity = IntExpr::Sub(
+            Box::new(other.count.clone()),
+            Box::new(IntExpr::Add(
+                Box::new(self.count.clone()),
+                Box::new(IntExpr::constant(offset)),
+            )),
+        )
+        .canonicalize();
+        if !matches!(remaining_capacity, IntExpr::Const(remaining) if remaining >= 0.into()) {
+            return Err(DslError::FamilyCountMismatch);
+        }
         let count = self.count.clone();
         let left_type = self.element_schema.matrix_type.clone();
         let right_type = other.element_schema.matrix_type.clone();
@@ -5940,6 +5960,44 @@ mod tests {
     }
 
     #[test]
+    fn parallel_zip_offset_accepts_exact_boundary_and_rejects_short_source_before_body() {
+        let ring = Ring::new(257, 8);
+        let matrix = || ring.zero((1, 1));
+        let left = Family::pack(vec![matrix(), matrix()]).expect("left family");
+        let exact =
+            Family::pack(vec![matrix(), matrix(), matrix(), matrix()]).expect("offset family");
+        let valid_body_called = Cell::new(false);
+        let zipped = left
+            .parallel_zip_offset(exact, 2, |_, left, right| {
+                valid_body_called.set(true);
+                left + right
+            })
+            .expect("exact offset boundary");
+        assert!(valid_body_called.get());
+        assert_eq!(zipped.count, IntExpr::constant(2));
+        DslContext::new("parallel-zip-offset-boundary")
+            .family_output("zipped", zipped)
+            .expect("family output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let left = Family::pack(vec![matrix(), matrix()]).expect("left family");
+        let too_short =
+            Family::pack(vec![matrix(), matrix(), matrix()]).expect("short offset family");
+        let rejected_body_called = Cell::new(false);
+        assert!(matches!(
+            left.parallel_zip_offset_values(too_short, 2, |_, left, right| {
+                rejected_body_called.set(true);
+                left + right
+            }),
+            Err(DslError::FamilyCountMismatch)
+        ));
+        assert!(!rejected_body_called.get());
+    }
+
+    #[test]
     fn trapdoor_family_branch_preimages_validate() {
         let ring = Ring::new(257, 8);
         let trapdoors =
@@ -6114,7 +6172,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_map_values_rejects_rank_n_matrix_and_preimage_families() {
+    fn parallel_map_values_rejects_rank_n_matrix_preimage_and_trapdoor_families() {
         let ring = Ring::new(17, 8);
         let matrix_type = ring.matrix_type((1, 1));
         let shape = vec![IntExpr::constant(2), IntExpr::constant(2)];
@@ -6131,17 +6189,32 @@ mod tests {
             IntExpr::constant(4),
             None,
         )
-        .reindex(shape.clone(), flatten)
+        .reindex(shape.clone(), flatten.clone())
         .unwrap();
         assert!(matches!(
             matrices.parallel_map_values(|_, matrix| matrix),
             Err(DslError::ParallelMapRank)
         ));
 
-        let preimages =
-            Family::<Preimage>::source_input("rank-two-preimages".into(), matrix_type, shape, None);
+        let preimages = Family::<Preimage>::source_input(
+            "rank-two-preimages".into(),
+            matrix_type,
+            shape.clone(),
+            None,
+        );
         assert!(matches!(
             preimages.parallel_map_values(|_, preimage| preimage),
+            Err(DslError::ParallelMapRank)
+        ));
+
+        let trapdoors = Parallel::range(4)
+            .map_values(|_| ring.sample_trapdoor(1, 5, 4, 4, 1_000_000))
+            .unwrap()
+            .reindex(shape, flatten)
+            .unwrap();
+        assert_eq!(trapdoors.public_matrices().shape(), &[2.into(), 2.into()]);
+        assert!(matches!(
+            trapdoors.parallel_map_values(|_, trapdoor| trapdoor.public_matrix()),
             Err(DslError::ParallelMapRank)
         ));
     }

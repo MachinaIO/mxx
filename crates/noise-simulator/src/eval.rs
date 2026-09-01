@@ -3070,27 +3070,21 @@ impl<'a> Evaluator<'a> {
                     branches[0] = refine_branch(&branches[0], &truth.when_zero);
                     branches[1] = refine_branch(&branches[1], &truth.when_one);
                 }
-                let mut selected = if selector.minimum == selector.maximum_inclusive {
-                    branches
-                        [selector.minimum.to_usize().ok_or_else(|| bad("invalid select index"))?]
-                    .clone()
-                } else {
-                    branches[0].clone()
-                };
+                let mut reachable = reachable_select_branches(&branches, &selector)?.iter();
+                let mut selected =
+                    reachable.next().expect("validated nonempty selector range").clone();
                 if let Some(relation) = selected.relation.take() {
                     let selector_id = self.selector_for(xs[0].view);
                     selected.relation = Some(specialize_relation(relation, &[selector_id]));
                 }
-                if selector.minimum != selector.maximum_inclusive {
-                    for branch in &branches[1..] {
-                        let type_info = selected.ty.clone();
-                        selected = self.join_uniform_with_diagnostics(
-                            selected,
-                            branch.clone(),
-                            type_info.as_ref(),
-                            site(),
-                        )?;
-                    }
+                for branch in reachable {
+                    let type_info = selected.ty.clone();
+                    selected = self.join_uniform_with_diagnostics(
+                        selected,
+                        branch.clone(),
+                        type_info.as_ref(),
+                        site(),
+                    )?;
                 }
                 Ok(vec![selected])
             }
@@ -4270,6 +4264,24 @@ fn int(x: &Info) -> Result<state::IntegerState, SimulationError> {
         _ => Err(SimulationError::InvalidGraph { message: "integer required".into(), site: None }),
     }
 }
+
+fn reachable_select_branches<'a>(
+    branches: &'a [Info],
+    selector: &state::IntegerState,
+) -> Result<&'a [Info], SimulationError> {
+    let minimum = selector.minimum.to_usize().ok_or_else(|| SimulationError::InvalidGraph {
+        message: "invalid select index".into(),
+        site: None,
+    })?;
+    let maximum = selector.maximum_inclusive.to_usize().ok_or_else(|| {
+        SimulationError::InvalidGraph { message: "invalid select index".into(), site: None }
+    })?;
+    branches.get(minimum..=maximum).ok_or_else(|| SimulationError::InvalidGraph {
+        message: "select index range is outside its branches".into(),
+        site: None,
+    })
+}
+
 fn join_uniform(
     a: Info,
     b: Info,
@@ -4282,7 +4294,9 @@ fn join_uniform(
             // alternatives describe the same source and target family.
             a.relation.clone()
         }
-        (Some(relation), None) | (None, Some(relation)) => Some(relation.clone()),
+        // A relation is a universal equation for the selected value.  If one
+        // reachable branch lacks that equation, the join cannot attach the
+        // other branch's relation to the combined output.
         _ => None,
     };
     let value = match (&a.value, &b.value) {
@@ -5606,6 +5620,71 @@ mod tests {
                 left_gain: BigUint::from(11u8),
             })
         );
+    }
+
+    #[test]
+    fn select_relation_join_requires_compatible_relation_on_every_branch() {
+        let matrix = ConcreteMatrixType {
+            modulus: BigInt::from(17),
+            ring_dimension: 1,
+            rows: 1,
+            columns: 1,
+        };
+        let branch = |relation: Option<RightPreimage>| Info {
+            value: AbstractValue::Matrix(MatrixState {
+                error_bound: 2u8.into(),
+                coefficient_magnitude_bound: 5u8.into(),
+                is_constant_polynomial: true,
+                right_carrier: None,
+            }),
+            ty: Some(matrix.clone()),
+            relation,
+            view: crate::FamilyViewId(u32::MAX),
+            paired_public: None,
+        };
+        let relation = RightPreimage {
+            source: crate::SourceId(7),
+            target: crate::FamilyViewId(11),
+            view: Some(crate::FamilyViewId(13)),
+            selector: None,
+        };
+
+        let compatible = join_uniform(
+            branch(Some(relation.clone())),
+            branch(Some(relation.clone())),
+            Some(&matrix),
+        )
+        .unwrap();
+        assert_eq!(compatible.relation, Some(relation.clone()));
+
+        let missing =
+            join_uniform(branch(Some(relation.clone())), branch(None), Some(&matrix)).unwrap();
+        assert_eq!(missing.relation, None);
+
+        let mut incompatible = relation.clone();
+        incompatible.source = crate::SourceId(8);
+        let incompatible =
+            join_uniform(branch(Some(relation.clone())), branch(Some(incompatible)), Some(&matrix))
+                .unwrap();
+        assert_eq!(incompatible.relation, None);
+
+        let nested =
+            join_uniform(branch(Some(relation.clone())), incompatible, Some(&matrix)).unwrap();
+        assert_eq!(nested.relation, None, "a later join cannot revive a dropped relation");
+
+        let selector = state::IntegerState::new(1.into(), 2.into()).unwrap();
+        let branches =
+            vec![branch(None), branch(Some(relation.clone())), branch(Some(relation.clone()))];
+        let reachable = reachable_select_branches(&branches, &selector).unwrap();
+        let joined =
+            join_uniform(reachable[0].clone(), reachable[1].clone(), Some(&matrix)).unwrap();
+        assert_eq!(joined.relation, Some(relation.clone()));
+
+        let branches = vec![branch(None), branch(Some(relation)), branch(None)];
+        let reachable = reachable_select_branches(&branches, &selector).unwrap();
+        let joined =
+            join_uniform(reachable[0].clone(), reachable[1].clone(), Some(&matrix)).unwrap();
+        assert_eq!(joined.relation, None);
     }
 
     #[test]

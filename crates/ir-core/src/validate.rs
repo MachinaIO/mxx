@@ -844,18 +844,11 @@ fn validate_node(
             }
             let public = matrix_argument(scope, values, node, 0)?;
             let trapdoor = trapdoor_argument(scope, values, node, 1)?;
-            if public != trapdoor {
-                return node_error(
-                    scope,
-                    node.id,
-                    "preimage public matrix does not match its trapdoor type",
-                );
-            }
             let target = matrix_argument(scope, values, node, 2)?;
             let output = concrete_matrix(matrix_type, env, scope, node.id)?;
             // Matrix multiplication fixes the witness dimensions, and equality of the resulting
             // shape with T is the structural part of the relation B*K=T.
-            check_add_shape(&multiplication_type(&trapdoor, &output)?, &target)?;
+            check_preimage_equation(scope, node.id, &public, &trapdoor, &target, &output)?;
             vec![ConcreteWireType::Preimage(output)]
         }
         NodeKind::ApplyPreimage => {
@@ -875,31 +868,35 @@ fn validate_node(
             if max_coefficient_bound.evaluate(env)?.is_negative() {
                 return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
             }
-            let public = argument(scope, values, node, 0)?.clone();
-            let trapdoor = argument(scope, values, node, 1)?.clone();
-            let public_shape = family_parts(&public).map(|(_, shape)| shape).unwrap_or_default();
-            let trapdoor_shape =
-                family_parts(&trapdoor).map(|(_, shape)| shape).unwrap_or_default();
-            if public_shape != trapdoor_shape ||
-                (!is_family(&public) && !matches!(public, ConcreteWireType::Matrix(_))) ||
-                (!is_family(&trapdoor) && !matches!(trapdoor, ConcreteWireType::Trapdoor { .. }))
-            {
+            let public = argument(scope, values, node, 0)?;
+            let trapdoor = argument(scope, values, node, 1)?;
+            let (public_element, public_shape) = family_element_shape(public);
+            let (trapdoor_element, trapdoor_shape) = family_element_shape(trapdoor);
+            if public_shape != trapdoor_shape {
                 return node_error(scope, node.id, "preimage public/trapdoor family does not match");
             }
+            let ConcreteWireType::Matrix(public_matrix) = public_element else {
+                return node_error(scope, node.id, "preimage public source must contain matrices");
+            };
+            let ConcreteWireType::Trapdoor { matrix: trapdoor_matrix, .. } = trapdoor_element
+            else {
+                return node_error(
+                    scope,
+                    node.id,
+                    "preimage trapdoor source must contain trapdoors",
+                );
+            };
             let target = family_argument(scope, values, node, 2)?;
             let output = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let public_element =
-                family_parts(&public).map(|(element, _)| element).unwrap_or_else(|| public.clone());
             let (target_element, target_shape) =
                 family_parts(&target).ok_or_else(|| ValidationError::Node {
                     scope: scope.to_owned(),
                     node: node.id,
                     message: "family preimage target must be a family".into(),
                 })?;
-            if public_shape != trapdoor_shape ||
-                target_shape.len() != public_shape.len() + 1 ||
-                target_shape[..public_shape.len()] != public_shape ||
-                !matches!(public_element, ConcreteWireType::Matrix(_)) ||
+            let public_shape = public_shape.unwrap_or_default();
+            if target_shape.len() != public_shape.len() + 1 ||
+                target_shape[..public_shape.len()] != *public_shape ||
                 !matches!(target_element, ConcreteWireType::Matrix(_))
             {
                 return node_error(
@@ -908,20 +905,16 @@ fn validate_node(
                     "family preimage shapes or element types do not match",
                 );
             }
-            let trapdoor_matrix = family_parts(&trapdoor)
-                .and_then(|_| matrix_from_family(&trapdoor))
-                .or_else(|| match trapdoor {
-                    ConcreteWireType::Trapdoor { matrix, .. } => Some(matrix),
-                    _ => None,
-                })
-                .ok_or_else(|| ValidationError::Node {
-                    scope: scope.to_owned(),
-                    node: node.id,
-                    message: "preimage trapdoor type is invalid".into(),
-                })?;
-            check_add_shape(
-                &multiplication_type(&trapdoor_matrix, &output)?,
-                &matrix_from_family(&target).expect("target matrix family checked"),
+            let ConcreteWireType::Matrix(target_matrix) = target_element else {
+                unreachable!("target matrix family checked")
+            };
+            check_preimage_equation(
+                scope,
+                node.id,
+                public_matrix,
+                trapdoor_matrix,
+                &target_matrix,
+                &output,
             )?;
             // The output keeps every source axis and the target's final branch axis, so relation
             // identity is preserved at each concrete family coordinate.
@@ -1603,6 +1596,23 @@ fn trapdoor_argument(
     }
 }
 
+fn check_preimage_equation(
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+    public: &ConcreteMatrixType,
+    trapdoor: &ConcreteMatrixType,
+    target: &ConcreteMatrixType,
+    preimage: &ConcreteMatrixType,
+) -> Result<(), ValidationError> {
+    // Both scalar and family samplers instantiate the same equation B*K=T. The family validator
+    // strips only the common outer coordinate shape before checking these leaf matrix schemas.
+    if public != trapdoor {
+        return node_error(scope, node, "preimage public matrix does not match its trapdoor type");
+    }
+    check_add_shape(&multiplication_type(trapdoor, preimage)?, target)?;
+    Ok(())
+}
+
 fn require_scalar(
     scope: &FrozenGraphScopeId,
     values: &BTreeMap<WireRef, ConcreteWireType>,
@@ -1931,12 +1941,6 @@ fn family_argument(
     }
 }
 
-fn matrix_from_family(ty: &ConcreteWireType) -> Option<ConcreteMatrixType> {
-    // This projection reads the common matrix schema of every family element; it does not select
-    // a coordinate and therefore does not alter the family relation or shape.
-    family_parts(ty).and_then(|(element, _)| element.matrix_type().cloned())
-}
-
 fn concrete_shape(
     shape: &[IntExpr],
     env: &ParamEnv,
@@ -2207,7 +2211,10 @@ mod tests {
     }
 
     fn input(name: &str, matrix_type: MatrixType) -> ValueHandle {
-        let wire_type = WireType::Matrix(matrix_type);
+        typed_input(name, WireType::Matrix(matrix_type))
+    }
+
+    fn typed_input(name: &str, wire_type: WireType) -> ValueHandle {
         NodeHandle::new(
             NodeKind::Input { name: name.to_owned(), wire_type: wire_type.clone(), artifact: None },
             Vec::new(),
@@ -2338,6 +2345,85 @@ mod tests {
             vec![WireType::Matrix(residue_type)],
         );
         assert!(validate(&graph("uniform-residue", residue), &ParamEnv::default()).is_ok());
+    }
+
+    #[test]
+    fn family_preimage_requires_matching_matrix_and_trapdoor_leaf_types() {
+        fn family(element: WireType, shape: &[i64]) -> WireType {
+            WireType::Family {
+                element: Box::new(element),
+                shape: shape.iter().copied().map(IntExpr::constant).collect(),
+            }
+        }
+
+        fn trapdoor(matrix: MatrixType) -> WireType {
+            WireType::Trapdoor {
+                matrix,
+                sigma: crate::RealExpr::from_integer(4),
+                gadget_base: IntExpr::constant(2),
+                digit_count: IntExpr::constant(2),
+                preimage_max_coefficient_bound: IntExpr::constant(8),
+            }
+        }
+
+        fn sampled(
+            public_type: WireType,
+            trapdoor_type: WireType,
+            target_type: MatrixType,
+            preimage_type: MatrixType,
+        ) -> ValueHandle {
+            let public = typed_input("public", public_type);
+            let trapdoor = typed_input("trapdoor", trapdoor_type);
+            let target = typed_input("target", family(WireType::Matrix(target_type), &[2, 4]));
+            value(
+                NodeKind::FamilyPreimageSample {
+                    matrix_type: preimage_type.clone(),
+                    max_coefficient_bound: IntExpr::constant(8),
+                },
+                vec![public, trapdoor, target],
+                vec![family(WireType::Preimage(preimage_type), &[2, 4])],
+            )
+        }
+
+        let public_matrix = matrix_type(17, 2, 3);
+        let target_matrix = matrix_type(17, 2, 1);
+        let preimage_matrix = matrix_type(17, 3, 1);
+        let valid = sampled(
+            family(WireType::Matrix(public_matrix.clone()), &[2]),
+            family(trapdoor(public_matrix.clone()), &[2]),
+            target_matrix.clone(),
+            preimage_matrix.clone(),
+        );
+        assert!(validate(&graph("valid-family-preimage", valid), &ParamEnv::default()).is_ok());
+
+        let matrix_trapdoor = sampled(
+            family(WireType::Matrix(public_matrix.clone()), &[2]),
+            family(WireType::Matrix(public_matrix.clone()), &[2]),
+            target_matrix.clone(),
+            preimage_matrix.clone(),
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("matrix-family-trapdoor", matrix_trapdoor), &ParamEnv::default())
+                    .unwrap_err()
+            ),
+            "preimage trapdoor source must contain trapdoors"
+        );
+
+        let mismatched_trapdoor_matrix = matrix_type(19, 2, 3);
+        let mismatched = sampled(
+            family(WireType::Matrix(public_matrix), &[2]),
+            family(trapdoor(mismatched_trapdoor_matrix), &[2]),
+            target_matrix,
+            preimage_matrix,
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("mismatched-family-trapdoor", mismatched), &ParamEnv::default())
+                    .unwrap_err()
+            ),
+            "preimage public matrix does not match its trapdoor type"
+        );
     }
 
     #[test]

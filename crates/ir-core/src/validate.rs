@@ -1554,7 +1554,25 @@ fn validate_structural_boundaries(
                 } else {
                     child_type.clone()
                 };
-                if *call_type != expected {
+                // A structurally constant integer is a valid realization of
+                // the ordinary integer family element.  DSL construction may
+                // fold a loop predicate's BoolToInt body to ConstantInt,
+                // while the sealed family schema intentionally remains Int;
+                // preserve that subtype relation at the grid boundary.
+                let compatible = match (handle.kind(), call_type, &expected) {
+                    (
+                        NodeKind::ParallelGrid(_),
+                        ConcreteWireType::Family { element: actual, shape: actual_shape },
+                        ConcreteWireType::Family { element: wanted, shape: wanted_shape },
+                    ) if actual_shape == wanted_shape => {
+                        matches!(
+                            (&**actual, &**wanted),
+                            (ConcreteWireType::Int, ConcreteWireType::ConstantInt)
+                        )
+                    }
+                    _ => false,
+                };
+                if *call_type != expected && !compatible {
                     return node_error(scope_id, node_id, "child output type mismatch");
                 }
             }
@@ -2871,6 +2889,100 @@ mod tests {
                 shape: vec![3],
             }
         );
+    }
+
+    #[test]
+    fn parallel_grid_allows_constant_integer_body_only_in_matching_family_shape() {
+        let make = |name: &str, call_element: WireType, call_shape: i64, grid_shape: i64| {
+            let (body, _) = with_new_construction_scope(|scope| {
+                let constant = value(
+                    NodeKind::ConstantInt(BigInt::from(0)),
+                    Vec::new(),
+                    vec![WireType::ConstantInt],
+                );
+                (
+                    SubgraphHandle::new(name, scope, Vec::new(), vec![constant.clone()]).unwrap(),
+                    constant,
+                )
+            });
+            let output = NodeHandle::parallel_grid(
+                body,
+                Vec::new(),
+                vec![WireType::Family {
+                    element: Box::new(call_element),
+                    shape: vec![IntExpr::constant(call_shape)],
+                }],
+                ParallelGrid {
+                    shape: vec![IntExpr::constant(grid_shape)],
+                    index_slots: vec![0],
+                    bindings: Vec::new(),
+                    input_modes: Vec::new(),
+                },
+            )
+            .output(0)
+            .unwrap();
+            graph(name, output)
+        };
+
+        validate(&make("constant-grid", WireType::Int, 3, 3), &ParamEnv::default()).unwrap();
+        assert!(validate(&make("shape-grid", WireType::Int, 3, 4), &ParamEnv::default()).is_err());
+        assert!(
+            validate(
+                &make("matrix-grid", WireType::Matrix(matrix_type(17, 1, 1)), 3, 3),
+                &ParamEnv::default()
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &make("bytes-grid", WireType::Bytes { length: IntExpr::constant(1) }, 3, 3),
+                &ParamEnv::default()
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &make(
+                    "nested-family-grid",
+                    WireType::Family {
+                        element: Box::new(WireType::Int),
+                        shape: vec![IntExpr::constant(2)],
+                    },
+                    3,
+                    3,
+                ),
+                &ParamEnv::default()
+            )
+            .is_err()
+        );
+
+        let (body, _) = with_new_construction_scope(|scope| {
+            let input = typed_input("flag", WireType::Bool);
+            let output = value(NodeKind::BoolToInt, vec![input.clone()], vec![WireType::Int]);
+            (
+                SubgraphHandle::new("integer-grid-body", scope, vec![input], vec![output.clone()])
+                    .unwrap(),
+                output,
+            )
+        });
+        let flag = typed_input("flag", WireType::Bool);
+        let reversed = NodeHandle::parallel_grid(
+            body,
+            vec![flag],
+            vec![WireType::Family {
+                element: Box::new(WireType::ConstantInt),
+                shape: vec![IntExpr::constant(3)],
+            }],
+            ParallelGrid {
+                shape: vec![IntExpr::constant(3)],
+                index_slots: vec![0],
+                bindings: Vec::new(),
+                input_modes: vec![GridInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .unwrap();
+        assert!(validate(&graph("reversed-grid", reversed), &ParamEnv::default()).is_err());
     }
 
     #[test]

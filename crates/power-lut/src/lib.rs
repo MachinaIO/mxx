@@ -102,3 +102,27 @@ mod encoding_gpu_tests;
 
 #[cfg(test)]
 mod refresh_setup_gpu_tests;
+
+#[cfg(test)]
+extern crate self as mxx_power_lut;
+
+#[cfg(test)]
+mod parameter_search_test_support {
+    include!("parameter_search_test_support.rs");
+
+    mod tests {
+        include!("parameter_search_unit_tests.rs");
+    }
+}
+
+#[cfg(test)]
+mod sparse_lwr_parameter_unit {
+    include!("sparse_lwr_parameter_test_support.rs");
+
+    mod tests {
+        use super::*;
+        use serde_json::Value;
+        use std::collections::BTreeMap;
+        include!("sparse_lwr_parameter_unit_tests.rs");
+    }
+}

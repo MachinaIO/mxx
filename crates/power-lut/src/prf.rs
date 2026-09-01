@@ -21,7 +21,7 @@
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use mxx_bgg::{BggEncodingWire, BggPublicKeyWire};
-use mxx_dsl::{Bool, Family, Int, LoopIndex, Mat, Parallel, Sequential};
+use mxx_dsl::{Family, Int, Mat, Parallel, Sequential};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -31,9 +31,9 @@ use crate::{
     PowerLutEncodingCompiler, PowerLutError,
     encoding::{EncodingSelectorFamily, FlatLutHelper, FlatLutHelperMap, FlatLutHelperSet},
     program::{
-        FamilyRange, LutTable, PowerLutProgram, PowerLutProgramBuilder, PowerLutProgramId,
-        ProgramFamilyRanges, ProgramInputId, ProgramValidationError, ProgramWireId,
-        PublicValueFamilyId, RhsFamilyId,
+        FamilyRange, LutTable, PBC_MONOMIAL_FAMILY_PROVENANCE, PowerLutMonomialFamily,
+        PowerLutProgram, PowerLutProgramBuilder, PowerLutProgramId, ProgramFamilyRanges,
+        ProgramInputId, ProgramValidationError, ProgramWireId, PublicValueFamilyId, RhsFamilyId,
     },
     public_key::{
         FlatLutPublicHelper, FlatLutPublicHelperMap, FlatLutPublicHelperSet,
@@ -58,8 +58,9 @@ pub struct RefreshPrfBatchInputs {
     batch_id: PbcPublicValueBatchId,
     active_count: usize,
     value_count: usize,
-    label_digests: Vec<[u8; 32]>,
-    public_vector_identities: Vec<[u8; 32]>,
+    label_count: usize,
+    program_id: PowerLutProgramId,
+    output_wire: ProgramWireId,
 }
 
 /// Stable identity for the deferred public-value family payload.
@@ -74,20 +75,11 @@ impl RefreshPrfBatchInputs {
         layout: &crate::pbc::PbcPublicLayout,
         profile: SparseLwrPrfProfile,
         labels: &crate::refresh::RefreshPrfLabelIndex,
+        program: &SparseLwrPrfProgram,
     ) -> Result<Self, PowerLutError> {
         layout.validate().map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        let mut label_digests = Vec::with_capacity(labels.len());
-        let mut public_vector_identities = Vec::with_capacity(labels.len());
-        for index in 0..labels.len() {
-            let label =
-                labels.label(index).ok_or(PowerLutError::InvalidSparseLwrBlock)?.canonical_bytes();
-            let encoded =
-                crate::pbc::PbcEncodedPublicVector::from_label(layout, &label, profile.q_l)
-                    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-            let vector = crate::pbc::PbcPublicVectorFamilyBinding::from_encoded(layout, &encoded)
-                .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-            label_digests.push(label_digest(&label));
-            public_vector_identities.push(public_vector_identity(layout, &vector));
+        if program.profile() != &profile {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
         }
         let active_count = crate::pbc::PbcActiveCellIndex::build(layout)
             .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
@@ -95,7 +87,7 @@ impl RefreshPrfBatchInputs {
         let value_count =
             labels.len().checked_mul(active_count).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
         let batch_id =
-            public_value_batch_id(layout, &profile, &label_digests, &public_vector_identities);
+            public_value_batch_id(layout, &profile, labels, active_count, value_count, program)?;
         Ok(Self {
             layout: layout.clone(),
             layout_id: layout.layout_id,
@@ -103,29 +95,20 @@ impl RefreshPrfBatchInputs {
             batch_id,
             active_count,
             value_count,
-            label_digests,
-            public_vector_identities,
+            label_count: labels.len(),
+            program_id: program.id(),
+            output_wire: program.terminal_output_wire(),
         })
     }
 
     /// Returns the number of canonical label positions.
     pub fn len(&self) -> usize {
-        self.label_digests.len()
+        self.label_count
     }
 
     /// Returns whether the batch contains no labels.
     pub fn is_empty(&self) -> bool {
-        self.label_digests.is_empty()
-    }
-
-    /// Returns the public label digest at a canonical index.
-    pub fn label_digest(&self, index: usize) -> Option<[u8; 32]> {
-        self.label_digests.get(index).copied()
-    }
-
-    /// Returns the public routed-vector identity at a canonical index.
-    pub fn public_vector_identity(&self, index: usize) -> Option<[u8; 32]> {
-        self.public_vector_identities.get(index).copied()
+        self.label_count == 0
     }
 
     /// Returns the layout identity bound into every batch member.
@@ -158,6 +141,13 @@ impl RefreshPrfBatchInputs {
         self.value_count
     }
 
+    pub const fn program_id(&self) -> PowerLutProgramId {
+        self.program_id
+    }
+    pub const fn output_wire(&self) -> ProgramWireId {
+        self.output_wire
+    }
+
     /// Returns the stable input name used for this deferred public family.
     ///
     /// Runtime values for this input are ring matrices containing the
@@ -169,89 +159,40 @@ impl RefreshPrfBatchInputs {
             u128::from_le_bytes(self.batch_id.0[..16].try_into().unwrap())
         )
     }
-
-    /// Materializes canonical residues for small trusted fixtures. Production
-    /// execution payload streaming is intentionally deferred; this helper
-    /// rederives and validates the same identity used by the runtime family.
-    pub fn materialize_public_values(
-        &self,
-        labels: &crate::refresh::RefreshPrfLabelIndex,
-    ) -> Result<Vec<u64>, PowerLutError> {
-        if labels.len() != self.len() {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        let mut values = Vec::with_capacity(self.value_count);
-        let mut label_digests = Vec::with_capacity(self.len());
-        let mut vector_identities = Vec::with_capacity(self.len());
-        for index in 0..labels.len() {
-            let label =
-                labels.label(index).ok_or(PowerLutError::InvalidSparseLwrBlock)?.canonical_bytes();
-            let encoded = crate::pbc::PbcEncodedPublicVector::from_label(
-                &self.layout,
-                &label,
-                self.profile.q_l,
-            )
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-            let vector =
-                crate::pbc::PbcPublicVectorFamilyBinding::from_encoded(&self.layout, &encoded)
-                    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-            label_digests.push(label_digest(&label));
-            vector_identities.push(public_vector_identity(&self.layout, &vector));
-            values.extend(vector.values_u64());
-        }
-        if label_digests != self.label_digests ||
-            vector_identities != self.public_vector_identities ||
-            public_value_batch_id(
-                &self.layout,
-                &self.profile,
-                &label_digests,
-                &vector_identities,
-            ) != self.batch_id ||
-            values.len() != self.value_count
-        {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        Ok(values)
-    }
 }
 
 fn public_value_batch_id(
     layout: &crate::pbc::PbcPublicLayout,
     profile: &SparseLwrPrfProfile,
-    labels: &[[u8; 32]],
-    vectors: &[[u8; 32]],
-) -> PbcPublicValueBatchId {
+    labels: &crate::refresh::RefreshPrfLabelIndex,
+    active_count: usize,
+    value_count: usize,
+    program: &SparseLwrPrfProgram,
+) -> Result<PbcPublicValueBatchId, PowerLutError> {
     let mut digest = Sha256::new();
     digest.update(b"mxx-power-lut/pbc-public-value-batch/v1");
+    digest.update(b"order=mask-slot-component-coefficient-digit/fresh-component-coefficient-digit");
+    digest.update(b"public-values=canonical-label-pbc-encoding-v1");
     digest.update(layout.layout_id.0);
     digest.update((profile.q_l as u64).to_le_bytes());
+    digest.update((profile.p as u64).to_le_bytes());
+    digest.update((profile.lut_width as u64).to_le_bytes());
     digest.update((profile.ring_dimension as u64).to_le_bytes());
-    for value in labels.iter().chain(vectors) {
-        digest.update(value);
-    }
-    PbcPublicValueBatchId(digest.finalize().into())
-}
-
-fn label_digest(label: &[u8]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/sparse-lwr/prf-label/v1");
-    digest.update((label.len() as u64).to_le_bytes());
-    digest.update(label);
-    digest.finalize().into()
-}
-
-fn public_vector_identity(
-    layout: &crate::pbc::PbcPublicLayout,
-    vector: &crate::pbc::PbcPublicVectorFamilyBinding,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/sparse-lwr/public-vector/v1");
-    digest.update(layout.layout_id.0);
-    digest.update((vector.modulus as u64).to_le_bytes());
-    for value in vector.values_u64() {
-        digest.update(value.to_le_bytes());
-    }
-    digest.finalize().into()
+    digest.update(labels.refresh_id());
+    digest.update((labels.mask_slot_count() as u64).to_le_bytes());
+    digest.update((labels.component_count() as u64).to_le_bytes());
+    digest.update((labels.coefficient_count() as u64).to_le_bytes());
+    digest.update((labels.mask_base_p_digit_count() as u64).to_le_bytes());
+    digest.update((labels.fresh_error_base_p_digit_count() as u64).to_le_bytes());
+    digest.update((active_count as u64).to_le_bytes());
+    digest.update((labels.len() as u64).to_le_bytes());
+    digest.update((value_count as u64).to_le_bytes());
+    digest.update((layout.bucket_width as u64).to_le_bytes());
+    digest.update((layout.parameters.bucket_count as u64).to_le_bytes());
+    digest.update(program.id().0);
+    digest.update(format!("{:?}", program.terminal_output_wire()).as_bytes());
+    digest.update(b"terminal=raw-scalar-v1");
+    Ok(PbcPublicValueBatchId(digest.finalize().into()))
 }
 
 /// Declares the batch's deferred label-major public-value family. The runtime
@@ -261,10 +202,12 @@ fn public_vector_identity(
 /// `X^a`. This distinction is part of the one-hot gate's public-factor
 /// contract and is therefore documented at the single family declaration
 /// boundary used by both private and public-key lowering.
+type SparseLwrPublicMonomialFamily = PowerLutMonomialFamily;
+
 fn batch_public_values_family(
     batch: &RefreshPrfBatchInputs,
     ring: &mxx_dsl::Ring,
-) -> Result<Family<Mat>, PowerLutError> {
+) -> Result<SparseLwrPublicMonomialFamily, PowerLutError> {
     let ring_type = ring.matrix_type((1, 1));
     let ring_dimension = ring_type
         .ring_dimension
@@ -289,7 +232,12 @@ fn batch_public_values_family(
     {
         return Err(PowerLutError::InvalidSparseLwrBlock);
     }
-    Ok(ring.input_family(batch.public_input_name(), batch.value_count, (1, 1)))
+    PowerLutMonomialFamily::from_trusted(
+        ring.input_family(batch.public_input_name(), batch.value_count, (1, 1)),
+        ring,
+        PBC_MONOMIAL_FAMILY_PROVENANCE,
+    )
+    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)
 }
 
 /// Concrete sparse-LWR parameters used to construct a PRF program.
@@ -304,6 +252,174 @@ pub struct SparseLwrPrfProfile {
     p: usize,
     lut_width: usize,
     ring_dimension: usize,
+}
+
+/// Immutable schedule and LUT-width contract for grouped sparse-LWR
+/// reduction.  The schedule always leaves a non-empty terminal group, so
+/// every intermediate group has exactly `k` buckets and the terminal group
+/// has `1..=k` buckets.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SparseLwrReductionPlan {
+    q_l: usize,
+    bucket_count: usize,
+    ring_dimension: usize,
+    k: usize,
+    intermediate_groups: usize,
+    terminal_start: usize,
+    terminal_len: usize,
+    lut_width: usize,
+}
+
+impl SparseLwrReductionPlan {
+    /// Derives the maximal valid cadence under the ring and 4096-width
+    /// limits.  Width is computed from the largest possible unreduced sum in
+    /// one group, `(k + 1) * (Q_L - 1)`, and must divide `N`.
+    pub fn derive(
+        q_l: usize,
+        bucket_count: usize,
+        ring_dimension: usize,
+    ) -> Result<Self, PowerLutError> {
+        if q_l == 0 || bucket_count == 0 || ring_dimension == 0 {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
+        let cap = ring_dimension.min(4096);
+        let mut k = 1usize;
+        let mut width = 0usize;
+        // The width grows monotonically in k.  Search the finite integer
+        // domain below the width cap and retain the maximal divisible one.
+        let mut candidate = 1usize;
+        // Keep one bucket for the terminal scan.  The cadence is therefore
+        // maximal subject to both the LUT/ring constraints and `k < B`;
+        // without this bound a large ring could absorb the entire batch into
+        // one nominal group and silently erase the terminal transfer.
+        let max_candidate = bucket_count.saturating_sub(1).max(1);
+        while let Some(term) = candidate
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(q_l.saturating_sub(1)))
+            .and_then(|value| value.checked_add(1))
+        {
+            let Some(candidate_width) = term.checked_next_power_of_two() else { break };
+            if candidate > max_candidate || candidate_width > cap {
+                break;
+            }
+            if ring_dimension % candidate_width == 0 {
+                k = candidate;
+                width = candidate_width;
+            }
+            candidate = candidate.saturating_add(1);
+        }
+        if width == 0 {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
+        let intermediate_groups = (bucket_count - 1) / k;
+        let terminal_start =
+            intermediate_groups.checked_mul(k).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+        let terminal_len =
+            bucket_count.checked_sub(terminal_start).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+        if terminal_len == 0 || terminal_len > k {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
+        Ok(Self {
+            q_l,
+            bucket_count,
+            ring_dimension,
+            k,
+            intermediate_groups,
+            terminal_start,
+            terminal_len,
+            lut_width: width,
+        })
+    }
+
+    pub const fn q_l(&self) -> usize {
+        self.q_l
+    }
+    pub const fn bucket_count(&self) -> usize {
+        self.bucket_count
+    }
+    pub const fn ring_dimension(&self) -> usize {
+        self.ring_dimension
+    }
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+    pub const fn intermediate_groups(&self) -> usize {
+        self.intermediate_groups
+    }
+    pub const fn terminal_start(&self) -> usize {
+        self.terminal_start
+    }
+    pub const fn terminal_len(&self) -> usize {
+        self.terminal_len
+    }
+    pub const fn lut_width(&self) -> usize {
+        self.lut_width
+    }
+}
+
+/// Private reduction helper set. The wrapper prevents accidental role swaps.
+#[derive(Clone)]
+pub struct SparseLwrReductionHelpers(FlatLutHelperSet);
+
+/// Private terminal helper set. It is intentionally a distinct type from the
+/// reduction set even though both contain flat helper branches.
+#[derive(Clone)]
+pub struct SparseLwrTerminalHelpers(FlatLutHelperSet);
+
+impl SparseLwrReductionHelpers {
+    pub fn new(set: FlatLutHelperSet) -> Self {
+        Self(set)
+    }
+    fn as_set(&self) -> &FlatLutHelperSet {
+        &self.0
+    }
+}
+impl SparseLwrTerminalHelpers {
+    pub fn new(set: FlatLutHelperSet) -> Self {
+        Self(set)
+    }
+    fn as_set(&self) -> &FlatLutHelperSet {
+        &self.0
+    }
+}
+
+/// Role-typed helper material for the two reductions in a grouped PRF.
+#[derive(Clone)]
+pub struct SparseLwrPrfHelperBundle {
+    pub reduction: SparseLwrReductionHelpers,
+    pub terminal: SparseLwrTerminalHelpers,
+}
+
+/// Public reduction helper set.
+#[derive(Clone)]
+pub struct SparseLwrPublicReductionHelpers(FlatLutPublicHelperSet);
+
+/// Public terminal helper set.
+#[derive(Clone)]
+pub struct SparseLwrPublicTerminalHelpers(FlatLutPublicHelperSet);
+
+impl SparseLwrPublicReductionHelpers {
+    pub fn new(set: FlatLutPublicHelperSet) -> Self {
+        Self(set)
+    }
+    fn as_set(&self) -> &FlatLutPublicHelperSet {
+        &self.0
+    }
+}
+impl SparseLwrPublicTerminalHelpers {
+    pub fn new(set: FlatLutPublicHelperSet) -> Self {
+        Self(set)
+    }
+    fn as_set(&self) -> &FlatLutPublicHelperSet {
+        &self.0
+    }
+}
+
+/// Public-key counterpart of [`SparseLwrPrfHelperBundle`].
+#[derive(Clone)]
+pub struct SparseLwrPrfPublicHelperBundle {
+    pub reduction: SparseLwrPublicReductionHelpers,
+    pub terminal: SparseLwrPublicTerminalHelpers,
 }
 
 impl SparseLwrPrfProfile {
@@ -383,10 +499,9 @@ pub struct SparseLwrBucketProgram {
 
 /// A complete sparse-LWR PRF program for one structural bucket iteration.
 ///
-/// The mandatory reduction table is the one-hot gate's single unary LUT. The
-/// mandatory rounding table is a second shared program applied once after the
-/// bucket scan and never per bucket. Its terminal LUT has the raw-scalar form,
-/// so the result is a constant polynomial rather than a monomial encoding.
+/// The selection program contains only the one-hot family selection. The
+/// reduction program is a separate unary `z % Q_L` LUT applied once per full
+/// group, while the terminal scalar LUT is applied once to the remainder.
 #[derive(Clone, Debug)]
 pub struct SparseLwrPrfProgram {
     /// Canonical program shared by private and public-key lowering.
@@ -406,6 +521,7 @@ pub struct SparseLwrPrfProgram {
     /// Public rectangular PBC bucket width. This controls family ranges, not
     /// the logical LUT domain.
     pub bucket_width: usize,
+    pub bucket_count: usize,
     /// Concrete profile from which both mandatory LUTs were derived.
     profile: SparseLwrPrfProfile,
     /// Shared program for the final LWR rounding operation. Its output is a
@@ -419,8 +535,21 @@ pub struct SparseLwrPrfProgram {
     /// The final table is cached only as immutable lowering data. Its
     /// declaration is also present in `rounding_program`.
     rounding_lut: Vec<usize>,
+    /// Immutable grouped cadence derived from the concrete profile and PBC
+    /// bucket count.
+    pub plan: SparseLwrReductionPlan,
+    /// Selection-only program and unary intermediate-reduction program.
+    pub selection_program: PowerLutProgram,
+    pub reduction_program: PowerLutProgram,
+    pub selection_input: ProgramInputId,
+    pub selection_output: ProgramWireId,
+    pub reduction_input: ProgramInputId,
+    pub reduction_output: ProgramWireId,
 }
 
+#[allow(dead_code)]
+#[allow(dead_code)]
+#[allow(dead_code)]
 impl SparseLwrPrfProgram {
     fn bind_output(&self, label: &[u8]) -> Result<SparseLwrPrfOutput, PowerLutError> {
         SparseLwrPrfOutput::bind_with_id(self.id(), label, self.rounding_output)
@@ -474,6 +603,20 @@ impl SparseLwrPrfProgram {
         self.composite_id
     }
 
+    /// Checks the complete batch/program binding before any lowering work is
+    /// performed.  Keeping this in one predicate prevents one typed lowering
+    /// entry point from accidentally accepting a batch for another program.
+    fn validate_batch(&self, batch: &RefreshPrfBatchInputs) -> Result<(), PowerLutError> {
+        if batch.layout_id != batch.layout.layout_id ||
+            batch.profile != self.profile ||
+            batch.program_id != self.id() ||
+            batch.output_wire != self.terminal_output_wire()
+        {
+            return Err(PowerLutError::InvalidSparseLwrBlock);
+        }
+        Ok(())
+    }
+
     fn validate_widths(&self, ring_dimension: usize) -> Result<(), PowerLutError> {
         if self.profile.ring_dimension != ring_dimension ||
             self.lut_width == 0 ||
@@ -517,264 +660,10 @@ impl SparseLwrPrfProgram {
     /// The caller supplies selector RHS packages and public bucket values as
     /// explicit family bindings. No support, schedule, or selected slot is
     /// copied into the program or inferred by the lowerer.
-    pub fn compile_encoding(
+    fn lower_private_grouped(
         &self,
         compiler: &PowerLutEncodingCompiler,
         input: BggEncodingWire,
-        selectors: BTreeMap<RhsFamilyId, EncodingSelectorFamily>,
-        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &FlatLutHelperMap,
-        label: &[u8],
-    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_encoding_inner(compiler, input, selectors, public_values, helpers, label, None)
-    }
-
-    /// Private lowering entry point with the separately sampled terminal
-    /// rounding helper set.  Bucket helpers and rounding helpers are kept as
-    /// distinct arguments because their local LUT identifiers are independent.
-    pub fn compile_encoding_with_rounding_helpers(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        selectors: BTreeMap<RhsFamilyId, EncodingSelectorFamily>,
-        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &FlatLutHelperMap,
-        rounding_helpers: &FlatLutHelperSet,
-        label: &[u8],
-    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_encoding_inner(
-            compiler,
-            input,
-            selectors,
-            public_values,
-            helpers,
-            label,
-            Some(rounding_helpers),
-        )
-    }
-
-    fn compile_encoding_inner(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        selectors: BTreeMap<RhsFamilyId, EncodingSelectorFamily>,
-        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &FlatLutHelperMap,
-        label: &[u8],
-        rounding_helpers: Option<&FlatLutHelperSet>,
-    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
-        self.validate_widths(concrete_ring_dimension(&input)?)?;
-        let outputs = compiler.compile_program(
-            &self.program,
-            &BTreeMap::from([(self.input, input)]),
-            &BTreeMap::new(),
-            &selectors,
-            &public_values,
-            helpers,
-        )?;
-        let output = outputs.get(&self.output).cloned().ok_or(PowerLutError::InvalidLut)?;
-        let output = self.apply_final_rounding_encoding(compiler, output, rounding_helpers)?;
-        let descriptor = self.bind_output(label)?;
-        Ok((output, descriptor))
-    }
-
-    /// Lowers this same program through the public-key API.
-    ///
-    /// Only public input keys, RHS projections, and public value matrices are
-    /// accepted. This method cannot receive a sparse support or private
-    /// selector package, which keeps the public derivation independent of the
-    /// secret schedule.
-    pub fn compile_public_key(
-        &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input: BggPublicKeyWire,
-        selectors: BTreeMap<RhsFamilyId, PublicSelectorFamily>,
-        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &FlatLutPublicHelperMap,
-        label: &[u8],
-    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_public_key_inner(
-            compiler,
-            input,
-            selectors,
-            public_values,
-            helpers,
-            label,
-            None,
-        )
-    }
-
-    /// Public-key lowering entry point with the setup-fixed terminal helper
-    /// set supplied separately from bucket helper material.
-    pub fn compile_public_key_with_rounding_helpers(
-        &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input: BggPublicKeyWire,
-        selectors: BTreeMap<RhsFamilyId, PublicSelectorFamily>,
-        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &FlatLutPublicHelperMap,
-        rounding_helpers: &FlatLutPublicHelperSet,
-        label: &[u8],
-    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_public_key_inner(
-            compiler,
-            input,
-            selectors,
-            public_values,
-            helpers,
-            label,
-            Some(rounding_helpers),
-        )
-    }
-
-    fn compile_public_key_inner(
-        &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input: BggPublicKeyWire,
-        selectors: BTreeMap<RhsFamilyId, PublicSelectorFamily>,
-        public_values: BTreeMap<PublicValueFamilyId, mxx_dsl::Family<Mat>>,
-        helpers: &FlatLutPublicHelperMap,
-        label: &[u8],
-        rounding_helpers: Option<&FlatLutPublicHelperSet>,
-    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
-        self.validate_widths(concrete_ring_dimension_public(&input)?)?;
-        let outputs = compiler.compile_program(
-            &self.program,
-            &BTreeMap::from([(self.input, input)]),
-            &BTreeMap::new(),
-            &selectors,
-            &public_values,
-            helpers,
-        )?;
-        let output = outputs.get(&self.output).cloned().ok_or(PowerLutError::InvalidLut)?;
-        let output = self.apply_final_rounding_public(compiler, output, rounding_helpers)?;
-        Ok((output, self.bind_output(label)?))
-    }
-
-    /// Evaluates the same bucket body over a structural sequential loop.
-    ///
-    /// The binding closure is invoked once while the DSL graph is being
-    /// constructed with the loop index.  It must return the selector and
-    /// public-value families plus one identical contiguous range for that
-    /// bucket.  The range must exclude padding cells rather than
-    /// manufacturing private RHS packages for them.  The loop state is the
-    /// current monomial accumulator, so the body output becomes the next
-    /// accumulator without a host-side bucket loop.
-    pub fn compile_encoding_sequential(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
-        bucket_bindings: impl FnOnce(
-            LoopIndex,
-        ) -> Result<
-            (EncodingSelectorFamily, Family<Mat>, FamilyRange),
-            PowerLutError,
-        >,
-        helpers: &FlatLutHelperMap,
-        label: &[u8],
-    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_encoding_sequential_inner(
-            compiler,
-            input,
-            bucket_count,
-            bucket_bindings,
-            helpers,
-            label,
-            None,
-        )
-    }
-
-    /// Structural sequential lowering with the explicitly supplied terminal
-    /// scalar-rounding helper set.
-    pub fn compile_encoding_sequential_with_rounding_helpers(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
-        bucket_bindings: impl FnOnce(
-            LoopIndex,
-        ) -> Result<
-            (EncodingSelectorFamily, Family<Mat>, FamilyRange),
-            PowerLutError,
-        >,
-        helpers: &FlatLutHelperMap,
-        rounding_helpers: &FlatLutHelperSet,
-        label: &[u8],
-    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_encoding_sequential_inner(
-            compiler,
-            input,
-            bucket_count,
-            bucket_bindings,
-            helpers,
-            label,
-            Some(rounding_helpers),
-        )
-    }
-
-    fn compile_encoding_sequential_inner(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
-        bucket_bindings: impl FnOnce(
-            LoopIndex,
-        ) -> Result<
-            (EncodingSelectorFamily, Family<Mat>, FamilyRange),
-            PowerLutError,
-        >,
-        helpers: &FlatLutHelperMap,
-        label: &[u8],
-        rounding_helpers: Option<&FlatLutHelperSet>,
-    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
-        self.validate_widths(concrete_ring_dimension(&input)?)?;
-        let lowering_error = RefCell::new(None);
-        let final_state = Sequential::range(bucket_count)
-            .scan(input, Bool::constant(true), |bucket, state, _| {
-                let (selectors, public_values, range) =
-                    bucket_bindings(bucket).map_err(|error| {
-                        *lowering_error.borrow_mut() = Some(error);
-                        mxx_dsl::DslError::Schema
-                    })?;
-                let mut ranges = ProgramFamilyRanges::new();
-                ranges.selector(self.selector_family, range.clone());
-                ranges.public_values(self.public_value_family, range);
-                let outputs = compiler
-                    .compile_program_with_ranges(
-                        &self.program,
-                        &BTreeMap::from([(self.input, state)]),
-                        &BTreeMap::new(),
-                        &BTreeMap::from([(self.selector_family, selectors)]),
-                        &BTreeMap::from([(self.public_value_family, public_values)]),
-                        &ranges,
-                        helpers,
-                    )
-                    .map_err(|error| {
-                        *lowering_error.borrow_mut() = Some(error);
-                        mxx_dsl::DslError::Schema
-                    })?;
-                outputs.get(&self.output).cloned().ok_or_else(|| {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
-                    mxx_dsl::DslError::Schema
-                })
-            })
-            .map_err(|_| {
-                lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
-            })?;
-        let output = self.apply_final_rounding_encoding(compiler, final_state, rounding_helpers)?;
-        let descriptor = self.bind_output(label)?;
-        Ok((output, descriptor))
-    }
-
-    /// Sequential bucket lowering with all dynamic selector inputs supplied
-    /// as explicit loop invariants.  This is used by the batched PBC path so
-    /// the outer label loop does not rely on captured executable families.
-    fn compile_encoding_sequential_with_invariants(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input: BggEncodingWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
         offsets: Vec<usize>,
         widths: Vec<usize>,
         selector_flat_count: usize,
@@ -782,187 +671,168 @@ impl SparseLwrPrfProgram {
         invariants: Vec<Family<Mat>>,
         helpers: &FlatLutHelperMap,
         label: &[u8],
-        rounding_helpers: Option<&FlatLutHelperSet>,
+        rounding_helpers: &FlatLutHelperSet,
     ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
         self.validate_widths(concrete_ring_dimension(&input)?)?;
+        let plan = &self.plan;
         let lowering_error = RefCell::new(None);
-        let final_state = Sequential::range(bucket_count)
-            .scan(input, invariants, |bucket, state, mut flat| {
+        let grouped_state = if plan.intermediate_groups() == 0 {
+            input
+        } else {
+            Sequential::range(plan.intermediate_groups())
+                .scan(input, invariants.clone(), |group, state, invariants| {
+                    let grouped = Sequential::range(plan.k())
+                        .scan(state, invariants, |bucket, state, mut flat| {
+                            if flat.len() != selector_flat_count + 1 {
+                                *lowering_error.borrow_mut() =
+                                    Some(PowerLutError::InvalidSparseLwrBlock);
+                                return Err(mxx_dsl::DslError::Schema);
+                            }
+                            let public_values = PowerLutMonomialFamily::from_trusted(
+                                flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
+                                &compiler.bgg.public_key.ring,
+                                PBC_MONOMIAL_FAMILY_PROVENANCE,
+                            )
+                            .map_err(|_| mxx_dsl::DslError::Schema)?;
+                            let selectors =
+                                EncodingSelectorFamily::from_flattened(flat).map_err(|error| {
+                                    *lowering_error.borrow_mut() = Some(error);
+                                    mxx_dsl::DslError::Schema
+                                })?;
+                            let index = mxx_ir_core::IntExpr::Add(
+                                Box::new(mxx_ir_core::IntExpr::Mul(
+                                    Box::new(mxx_ir_core::IntExpr::constant(plan.k())),
+                                    Box::new(group.expression()),
+                                )),
+                                Box::new(bucket.expression()),
+                            )
+                            .canonicalize();
+                            let start =
+                                interpolate_lookup(&offsets, index.clone()).map_err(|e| {
+                                    *lowering_error.borrow_mut() = Some(e);
+                                    mxx_dsl::DslError::Schema
+                                })?;
+                            let count = interpolate_lookup(&widths, index).map_err(|e| {
+                                *lowering_error.borrow_mut() = Some(e);
+                                mxx_dsl::DslError::Schema
+                            })?;
+                            let range =
+                                FamilyRange::bounded(start, count, capacity).map_err(|_| {
+                                    *lowering_error.borrow_mut() =
+                                        Some(PowerLutError::InvalidSparseLwrBlock);
+                                    mxx_dsl::DslError::Schema
+                                })?;
+                            let mut ranges = ProgramFamilyRanges::new();
+                            ranges.selector(self.selector_family, range.clone());
+                            ranges.public_values(self.public_value_family, range);
+                            let selected = compiler
+                                .compile_program_with_ranges(
+                                    &self.selection_program,
+                                    &BTreeMap::from([(self.selection_input, state)]),
+                                    &BTreeMap::new(),
+                                    &BTreeMap::from([(self.selector_family, selectors)]),
+                                    &BTreeMap::from([(self.public_value_family, public_values)]),
+                                    &ranges,
+                                    &BTreeMap::new(),
+                                )
+                                .map_err(|e| {
+                                    *lowering_error.borrow_mut() = Some(e);
+                                    mxx_dsl::DslError::Schema
+                                })?
+                                .remove(&self.selection_output)
+                                .ok_or_else(|| {
+                                    *lowering_error.borrow_mut() =
+                                        Some(PowerLutError::InvalidSparseLwrBlock);
+                                    mxx_dsl::DslError::Schema
+                                })?;
+                            Ok(selected)
+                        })
+                        .map_err(|_| mxx_dsl::DslError::Schema)?;
+                    let reduced = compiler
+                        .compile_program(
+                            &self.reduction_program,
+                            &BTreeMap::from([(self.reduction_input, grouped)]),
+                            &BTreeMap::new(),
+                            &BTreeMap::new(),
+                            &BTreeMap::new(),
+                            helpers,
+                        )
+                        .map_err(|e| {
+                            *lowering_error.borrow_mut() = Some(e);
+                            mxx_dsl::DslError::Schema
+                        })?;
+                    reduced.get(&self.reduction_output).cloned().ok_or_else(|| {
+                        *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
+                        mxx_dsl::DslError::Schema
+                    })
+                })
+                .map_err(|_| {
+                    lowering_error
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or(PowerLutError::InvalidSparseLwrBlock)
+                })?
+        };
+        let terminal_state = Sequential::range(plan.terminal_len())
+            .scan(grouped_state, invariants, |bucket, state, mut flat| {
                 if flat.len() != selector_flat_count + 1 {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
                     return Err(mxx_dsl::DslError::Schema);
                 }
-                let public_values = flat.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                let selectors = EncodingSelectorFamily::from_flattened(flat).map_err(|error| {
-                    *lowering_error.borrow_mut() = Some(error);
-                    mxx_dsl::DslError::Schema
-                })?;
-                let index = bucket.expression();
-                let start = interpolate_lookup(&offsets, index.clone()).map_err(|error| {
-                    *lowering_error.borrow_mut() = Some(error);
-                    mxx_dsl::DslError::Schema
-                })?;
-                let count = interpolate_lookup(&widths, index).map_err(|error| {
-                    *lowering_error.borrow_mut() = Some(error);
-                    mxx_dsl::DslError::Schema
-                })?;
-                let range = FamilyRange::bounded(start, count, capacity).map_err(|_| {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
-                    mxx_dsl::DslError::Schema
-                })?;
+                let public_values = PowerLutMonomialFamily::from_trusted(
+                    flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
+                    &compiler.bgg.public_key.ring,
+                    PBC_MONOMIAL_FAMILY_PROVENANCE,
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                let selectors = EncodingSelectorFamily::from_flattened(flat)
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
+                let index = mxx_ir_core::IntExpr::Add(
+                    Box::new(mxx_ir_core::IntExpr::constant(plan.terminal_start())),
+                    Box::new(bucket.expression()),
+                )
+                .canonicalize();
+                let start = interpolate_lookup(&offsets, index.clone())
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
+                let count =
+                    interpolate_lookup(&widths, index).map_err(|_| mxx_dsl::DslError::Schema)?;
+                let range = FamilyRange::bounded(start, count, capacity)
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
                 let mut ranges = ProgramFamilyRanges::new();
                 ranges.selector(self.selector_family, range.clone());
                 ranges.public_values(self.public_value_family, range);
-                let outputs = compiler
+                let selected = compiler
                     .compile_program_with_ranges(
-                        &self.program,
-                        &BTreeMap::from([(self.input, state)]),
+                        &self.selection_program,
+                        &BTreeMap::from([(self.selection_input, state)]),
                         &BTreeMap::new(),
                         &BTreeMap::from([(self.selector_family, selectors)]),
                         &BTreeMap::from([(self.public_value_family, public_values)]),
                         &ranges,
-                        helpers,
+                        &BTreeMap::new(),
                     )
-                    .map_err(|error| {
-                        *lowering_error.borrow_mut() = Some(error);
-                        mxx_dsl::DslError::Schema
-                    })?;
-                outputs.get(&self.output).cloned().ok_or_else(|| {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
-                    mxx_dsl::DslError::Schema
-                })
+                    .map_err(|_| mxx_dsl::DslError::Schema)?
+                    .remove(&self.selection_output)
+                    .ok_or(mxx_dsl::DslError::Schema)?;
+                Ok(selected)
             })
             .map_err(|_| {
                 lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
             })?;
-        let output = self.apply_final_rounding_encoding(compiler, final_state, rounding_helpers)?;
-        let descriptor = self.bind_output(label)?;
-        Ok((output, descriptor))
+        let output =
+            self.apply_final_rounding_encoding(compiler, terminal_state, rounding_helpers)?;
+        Ok((output, self.bind_output(label)?))
     }
 
-    /// Public-key counterpart of [`Self::compile_encoding_sequential`].
+    /// Retained only as an internal migration boundary.
     ///
     /// The binding closure can expose only public selector projections and
     /// public routed values.  It cannot receive a sparse support, schedule,
     /// selected slot, or private GSW family.  Both methods construct the same
     /// structural loop and invoke the same immutable program body.
-    pub fn compile_public_key_sequential(
+    fn lower_public_grouped(
         &self,
         compiler: &PowerLutPublicKeyCompiler,
         input: BggPublicKeyWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
-        bucket_bindings: impl FnOnce(
-            LoopIndex,
-        ) -> Result<
-            (PublicSelectorFamily, Family<Mat>, FamilyRange),
-            PowerLutError,
-        >,
-        helpers: &FlatLutPublicHelperMap,
-        label: &[u8],
-    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_public_key_sequential_inner(
-            compiler,
-            input,
-            bucket_count,
-            bucket_bindings,
-            helpers,
-            label,
-            None,
-        )
-    }
-
-    /// Public structural sequential lowering with the setup-fixed terminal
-    /// rounding helpers supplied separately from bucket helpers.
-    pub fn compile_public_key_sequential_with_rounding_helpers(
-        &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input: BggPublicKeyWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
-        bucket_bindings: impl FnOnce(
-            LoopIndex,
-        ) -> Result<
-            (PublicSelectorFamily, Family<Mat>, FamilyRange),
-            PowerLutError,
-        >,
-        helpers: &FlatLutPublicHelperMap,
-        rounding_helpers: &FlatLutPublicHelperSet,
-        label: &[u8],
-    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
-        self.compile_public_key_sequential_inner(
-            compiler,
-            input,
-            bucket_count,
-            bucket_bindings,
-            helpers,
-            label,
-            Some(rounding_helpers),
-        )
-    }
-
-    fn compile_public_key_sequential_inner(
-        &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input: BggPublicKeyWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
-        bucket_bindings: impl FnOnce(
-            LoopIndex,
-        ) -> Result<
-            (PublicSelectorFamily, Family<Mat>, FamilyRange),
-            PowerLutError,
-        >,
-        helpers: &FlatLutPublicHelperMap,
-        label: &[u8],
-        rounding_helpers: Option<&FlatLutPublicHelperSet>,
-    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
-        // Public lowering carries only A. Each selected concrete C_i applies
-        // `A^\sigma G^{-1}(C_i)`, and the public factor `X^{a'_{b}[i]}` updates
-        // the same accumulator exponent as in the private recurrence.
-        self.validate_widths(concrete_ring_dimension_public(&input)?)?;
-        let lowering_error = RefCell::new(None);
-        let final_state = Sequential::range(bucket_count)
-            .scan(input, Bool::constant(true), |bucket, state, _| {
-                let (selectors, public_values, range) =
-                    bucket_bindings(bucket).map_err(|error| {
-                        *lowering_error.borrow_mut() = Some(error);
-                        mxx_dsl::DslError::Schema
-                    })?;
-                let mut ranges = ProgramFamilyRanges::new();
-                ranges.selector(self.selector_family, range.clone());
-                ranges.public_values(self.public_value_family, range);
-                let outputs = compiler
-                    .compile_program_with_ranges(
-                        &self.program,
-                        &BTreeMap::from([(self.input, state)]),
-                        &BTreeMap::new(),
-                        &BTreeMap::from([(self.selector_family, selectors)]),
-                        &BTreeMap::from([(self.public_value_family, public_values)]),
-                        &ranges,
-                        helpers,
-                    )
-                    .map_err(|error| {
-                        *lowering_error.borrow_mut() = Some(error);
-                        mxx_dsl::DslError::Schema
-                    })?;
-                outputs.get(&self.output).cloned().ok_or_else(|| {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
-                    mxx_dsl::DslError::Schema
-                })
-            })
-            .map_err(|_| {
-                lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
-            })?;
-        let output = self.apply_final_rounding_public(compiler, final_state, rounding_helpers)?;
-        Ok((output, self.bind_output(label)?))
-    }
-
-    /// Public-key sequential bucket lowering with explicit selector and value
-    /// invariants.  The invariant representation mirrors the private path,
-    /// while containing only public companion families.
-    fn compile_public_key_sequential_with_invariants(
-        &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input: BggPublicKeyWire,
-        bucket_count: impl Into<mxx_ir_core::IntExpr>,
         offsets: Vec<usize>,
         widths: Vec<usize>,
         selector_flat_count: usize,
@@ -970,95 +840,132 @@ impl SparseLwrPrfProgram {
         invariants: Vec<Family<Mat>>,
         helpers: &FlatLutPublicHelperMap,
         label: &[u8],
-        rounding_helpers: Option<&FlatLutPublicHelperSet>,
+        rounding_helpers: &FlatLutPublicHelperSet,
     ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
         self.validate_widths(concrete_ring_dimension_public(&input)?)?;
+        let plan = &self.plan;
         let lowering_error = RefCell::new(None);
-        let final_state = Sequential::range(bucket_count)
-            .scan(input, invariants, |bucket, state, mut flat| {
+        let grouped_state = if plan.intermediate_groups() == 0 {
+            input
+        } else {
+            Sequential::range(plan.intermediate_groups())
+                .scan(input, invariants.clone(), |group, state, invariants| {
+                    let grouped = Sequential::range(plan.k())
+                        .scan(state, invariants, |bucket, state, mut flat| {
+                            if flat.len() != selector_flat_count + 1 {
+                                return Err(mxx_dsl::DslError::Schema);
+                            }
+                            let public_values = PowerLutMonomialFamily::from_trusted(
+                                flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
+                                &compiler.public_key.ring,
+                                PBC_MONOMIAL_FAMILY_PROVENANCE,
+                            )
+                            .map_err(|_| mxx_dsl::DslError::Schema)?;
+                            let selectors = PublicSelectorFamily::from_flattened(flat)
+                                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                            let index = mxx_ir_core::IntExpr::Add(
+                                Box::new(mxx_ir_core::IntExpr::Mul(
+                                    Box::new(mxx_ir_core::IntExpr::constant(plan.k())),
+                                    Box::new(group.expression()),
+                                )),
+                                Box::new(bucket.expression()),
+                            )
+                            .canonicalize();
+                            let start = interpolate_lookup(&offsets, index.clone())
+                                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                            let count = interpolate_lookup(&widths, index)
+                                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                            let range = FamilyRange::bounded(start, count, capacity)
+                                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                            let mut ranges = ProgramFamilyRanges::new();
+                            ranges.selector(self.selector_family, range.clone());
+                            ranges.public_values(self.public_value_family, range);
+                            let selected = compiler
+                                .compile_program_with_ranges(
+                                    &self.selection_program,
+                                    &BTreeMap::from([(self.selection_input, state)]),
+                                    &BTreeMap::new(),
+                                    &BTreeMap::from([(self.selector_family, selectors)]),
+                                    &BTreeMap::from([(self.public_value_family, public_values)]),
+                                    &ranges,
+                                    &BTreeMap::new(),
+                                )
+                                .map_err(|_| mxx_dsl::DslError::Schema)?
+                                .remove(&self.selection_output)
+                                .ok_or(mxx_dsl::DslError::Schema)?;
+                            Ok(selected)
+                        })
+                        .map_err(|_| mxx_dsl::DslError::Schema)?;
+                    let reduced = compiler
+                        .compile_program(
+                            &self.reduction_program,
+                            &BTreeMap::from([(self.reduction_input, grouped)]),
+                            &BTreeMap::new(),
+                            &BTreeMap::new(),
+                            &BTreeMap::new(),
+                            helpers,
+                        )
+                        .map_err(|_| mxx_dsl::DslError::Schema)?;
+                    reduced.get(&self.reduction_output).cloned().ok_or(mxx_dsl::DslError::Schema)
+                })
+                .map_err(|_| {
+                    lowering_error
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or(PowerLutError::InvalidSparseLwrBlock)
+                })?
+        };
+        let terminal_state = Sequential::range(plan.terminal_len())
+            .scan(grouped_state, invariants, |bucket, state, mut flat| {
                 if flat.len() != selector_flat_count + 1 {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
                     return Err(mxx_dsl::DslError::Schema);
                 }
-                let public_values = flat.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                let selectors = PublicSelectorFamily::from_flattened(flat).map_err(|error| {
-                    *lowering_error.borrow_mut() = Some(error);
-                    mxx_dsl::DslError::Schema
-                })?;
-                let index = bucket.expression();
-                let start = interpolate_lookup(&offsets, index.clone()).map_err(|error| {
-                    *lowering_error.borrow_mut() = Some(error);
-                    mxx_dsl::DslError::Schema
-                })?;
-                let count = interpolate_lookup(&widths, index).map_err(|error| {
-                    *lowering_error.borrow_mut() = Some(error);
-                    mxx_dsl::DslError::Schema
-                })?;
-                let range = FamilyRange::bounded(start, count, capacity).map_err(|_| {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
-                    mxx_dsl::DslError::Schema
-                })?;
+                let public_values = PowerLutMonomialFamily::from_trusted(
+                    flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
+                    &compiler.public_key.ring,
+                    PBC_MONOMIAL_FAMILY_PROVENANCE,
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                let selectors = PublicSelectorFamily::from_flattened(flat)
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
+                let index = mxx_ir_core::IntExpr::Add(
+                    Box::new(mxx_ir_core::IntExpr::constant(plan.terminal_start())),
+                    Box::new(bucket.expression()),
+                )
+                .canonicalize();
+                let start = interpolate_lookup(&offsets, index.clone())
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
+                let count =
+                    interpolate_lookup(&widths, index).map_err(|_| mxx_dsl::DslError::Schema)?;
+                let range = FamilyRange::bounded(start, count, capacity)
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
                 let mut ranges = ProgramFamilyRanges::new();
                 ranges.selector(self.selector_family, range.clone());
                 ranges.public_values(self.public_value_family, range);
-                let outputs = compiler
+                compiler
                     .compile_program_with_ranges(
-                        &self.program,
-                        &BTreeMap::from([(self.input, state)]),
+                        &self.selection_program,
+                        &BTreeMap::from([(self.selection_input, state)]),
                         &BTreeMap::new(),
                         &BTreeMap::from([(self.selector_family, selectors)]),
                         &BTreeMap::from([(self.public_value_family, public_values)]),
                         &ranges,
-                        helpers,
+                        &BTreeMap::new(),
                     )
-                    .map_err(|error| {
-                        *lowering_error.borrow_mut() = Some(error);
-                        mxx_dsl::DslError::Schema
-                    })?;
-                outputs.get(&self.output).cloned().ok_or_else(|| {
-                    *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
-                    mxx_dsl::DslError::Schema
-                })
+                    .map_err(|_| mxx_dsl::DslError::Schema)?
+                    .remove(&self.selection_output)
+                    .ok_or(mxx_dsl::DslError::Schema)
             })
             .map_err(|_| {
                 lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
             })?;
-        let output = self.apply_final_rounding_public(compiler, final_state, rounding_helpers)?;
+        let output =
+            self.apply_final_rounding_public(compiler, terminal_state, rounding_helpers)?;
         Ok((output, self.bind_output(label)?))
     }
 
-    /// Lowers a family of independent PBC labels through one outer
-    /// structural parallel loop. The input families are zipped by label;
-    /// selector families and label-major public values are explicit outer
-    /// broadcast inputs, then become invariants of the nested sequential
-    /// bucket loop. Public values are flattened in
-    /// canonical label-major, active-cell order, and each bucket iteration
-    /// selects only its own contiguous active-cell range.
-    ///
-    /// It deliberately returns families rather than a host vector of wires,
-    /// so callers can continue routing and reducing the labels structurally.
-    pub(crate) fn compile_pbc_encoding_family(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input_vectors: Family<Mat>,
-        input_public_keys: Family<Mat>,
-        batch: &RefreshPrfBatchInputs,
-        selectors: EncodingSelectorFamily,
-        helpers: &FlatLutHelperMap,
-    ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
-        self.compile_pbc_encoding_family_inner(
-            compiler,
-            input_vectors,
-            input_public_keys,
-            batch,
-            selectors,
-            helpers,
-            None,
-        )
-    }
-
     /// Batched PBC lowering with one explicit terminal rounding helper set.
-    pub(crate) fn compile_pbc_encoding_family_with_rounding_helpers(
+    fn lower_private_batch(
         &self,
         compiler: &PowerLutEncodingCompiler,
         input_vectors: Family<Mat>,
@@ -1068,18 +975,18 @@ impl SparseLwrPrfProgram {
         helpers: &FlatLutHelperMap,
         rounding_helpers: &FlatLutHelperSet,
     ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
-        self.compile_pbc_encoding_family_inner(
+        self.lower_private_batch_impl(
             compiler,
             input_vectors,
             input_public_keys,
             batch,
             selectors,
             helpers,
-            Some(rounding_helpers),
+            rounding_helpers,
         )
     }
 
-    fn compile_pbc_encoding_family_inner(
+    fn lower_private_batch_impl(
         &self,
         compiler: &PowerLutEncodingCompiler,
         input_vectors: Family<Mat>,
@@ -1087,7 +994,7 @@ impl SparseLwrPrfProgram {
         batch: &RefreshPrfBatchInputs,
         selectors: EncodingSelectorFamily,
         helpers: &FlatLutHelperMap,
-        rounding_helpers: Option<&FlatLutHelperSet>,
+        rounding_helpers: &FlatLutHelperSet,
     ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
         // For label `ell`, public values are
         // `(X^{a'_{\ell}[0]},...,X^{a'_{\ell}[m-1]})`. The nested bucket scan keeps
@@ -1116,21 +1023,18 @@ impl SparseLwrPrfProgram {
         let active_count = active.len();
         let expected_values =
             label_count.checked_mul(active_count).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
-        ensure_family_count(&public_values, expected_values)?;
+        ensure_family_count(public_values.as_family(), expected_values)?;
 
         let selector_flat = selectors.flattened();
         let selector_flat_count = selector_flat.len();
         let (helper_flat, helper_arities) = flatten_private_helper_families(helpers)?;
-        let (rounding_flat, rounding_arities) = if let Some(rounding_helpers) = rounding_helpers {
+        let (rounding_flat, rounding_arities) =
             flatten_private_helper_families(&FlatLutHelperMap::from([(
                 crate::program::LutId::from_index(0),
                 rounding_helpers.clone(),
-            )]))?
-        } else {
-            (Vec::new(), Vec::new())
-        };
+            )]))?;
         let mut broadcasts = selector_flat;
-        broadcasts.push(public_values);
+        broadcasts.push(public_values.into_family());
         let helper_flat_count = helper_flat.len();
         broadcasts.extend(helper_flat);
         let rounding_flat_count = rounding_flat.len();
@@ -1151,18 +1055,11 @@ impl SparseLwrPrfProgram {
                 let selectors = EncodingSelectorFamily::from_flattened(broadcasts)
                     .map_err(|_| mxx_dsl::DslError::Schema)?;
                 let helpers = rebuild_private_helper_families(helper_broadcasts, &helper_arities)?;
-                let rounding_map = if rounding_arities.is_empty() {
-                    None
-                } else {
-                    Some(rebuild_private_helper_families(rounding_broadcasts, &rounding_arities)?)
-                };
+                let rounding_map =
+                    rebuild_private_helper_families(rounding_broadcasts, &rounding_arities)?;
                 let rounding_helpers = rounding_map
-                    .as_ref()
-                    .map(|map| {
-                        map.get(&crate::program::LutId::from_index(0))
-                            .ok_or(mxx_dsl::DslError::Schema)
-                    })
-                    .transpose()?;
+                    .get(&crate::program::LutId::from_index(0))
+                    .ok_or(mxx_dsl::DslError::Schema)?;
                 let public_offset = mxx_ir_core::IntExpr::Mul(
                     Box::new(label.expression()),
                     Box::new(mxx_ir_core::IntExpr::constant(active_count)),
@@ -1183,10 +1080,9 @@ impl SparseLwrPrfProgram {
                     plaintext: None,
                 };
                 let (output, _) = self
-                    .compile_encoding_sequential_with_invariants(
+                    .lower_private_grouped(
                         compiler,
                         input,
-                        layout.parameters.bucket_count,
                         offsets,
                         widths,
                         selector_flat_count,
@@ -1211,42 +1107,10 @@ impl SparseLwrPrfProgram {
         Ok(outputs)
     }
 
-    /// Lowers a trusted canonical refresh batch through one structural
-    /// parallel loop. The output family is already bound to the batch's
-    /// ordered labels and routed public-vector identities.
-    pub fn compile_pbc_encoding_family_typed_with_batch(
-        &self,
-        compiler: &PowerLutEncodingCompiler,
-        input_vectors: Family<Mat>,
-        input_public_keys: Family<Mat>,
-        batch: &RefreshPrfBatchInputs,
-        selectors: EncodingSelectorFamily,
-        helpers: &FlatLutHelperMap,
-    ) -> Result<PbcSparseLwrEncodingOutputs, PowerLutError> {
-        if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        let (vectors, public_keys) = self.compile_pbc_encoding_family(
-            compiler,
-            input_vectors,
-            input_public_keys,
-            batch,
-            selectors,
-            helpers,
-        )?;
-        Ok(PbcSparseLwrEncodingOutputs::new(
-            vectors,
-            public_keys,
-            self.id(),
-            self.rounding_output,
-            batch,
-        ))
-    }
-
     /// Typed batched private lowering with the setup-fixed terminal rounding
     /// helpers.  The resulting family has the scalar terminal operation
     /// already executed in the structural label loop.
-    pub fn compile_pbc_encoding_family_typed_with_batch_and_rounding_helpers(
+    fn lower_private_batch_typed(
         &self,
         compiler: &PowerLutEncodingCompiler,
         input_vectors: Family<Mat>,
@@ -1256,10 +1120,8 @@ impl SparseLwrPrfProgram {
         helpers: &FlatLutHelperMap,
         rounding_helpers: &FlatLutHelperSet,
     ) -> Result<PbcSparseLwrEncodingOutputs, PowerLutError> {
-        if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        let (vectors, public_keys) = self.compile_pbc_encoding_family_with_rounding_helpers(
+        self.validate_batch(batch)?;
+        let (vectors, public_keys) = self.lower_private_batch(
             compiler,
             input_vectors,
             input_public_keys,
@@ -1268,33 +1130,51 @@ impl SparseLwrPrfProgram {
             helpers,
             rounding_helpers,
         )?;
+        let reduction_helper_commitment = helpers
+            .get(&crate::program::LutId::from_index(0))
+            .ok_or(PowerLutError::InvalidLut)?
+            .metadata()
+            .0;
+        let terminal_helper_commitment = rounding_helpers.metadata().0;
         Ok(PbcSparseLwrEncodingOutputs::new(
             vectors,
             public_keys,
             self.id(),
             self.rounding_output,
             batch,
+            reduction_helper_commitment,
+            terminal_helper_commitment,
         ))
     }
 
-    /// Public-key counterpart of [`Self::compile_pbc_encoding_family`].  The
-    /// label inputs, public values, selector projections, and helper masks
-    /// are all public; no private selector or schedule can enter this path.
-    pub(crate) fn compile_pbc_public_key_family(
+    /// Typed batched private lowering with an explicit role-typed helper
+    /// bundle.  Reduction and terminal tables are intentionally separate
+    /// even though both programs use local LUT identifier zero.
+    pub fn compile_pbc_encoding_family_typed_with_batch_and_helpers(
         &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input_keys: Family<Mat>,
+        compiler: &PowerLutEncodingCompiler,
+        input_vectors: Family<Mat>,
+        input_public_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
-        selectors: PublicSelectorFamily,
-        helpers: &FlatLutPublicHelperMap,
-    ) -> Result<Family<Mat>, PowerLutError> {
-        self.compile_pbc_public_key_family_inner(
-            compiler, input_keys, batch, selectors, helpers, None,
+        selectors: EncodingSelectorFamily,
+        helpers: &SparseLwrPrfHelperBundle,
+    ) -> Result<PbcSparseLwrEncodingOutputs, PowerLutError> {
+        self.lower_private_batch_typed(
+            compiler,
+            input_vectors,
+            input_public_keys,
+            batch,
+            selectors,
+            &BTreeMap::from([(
+                crate::program::LutId::from_index(0),
+                helpers.reduction.as_set().clone(),
+            )]),
+            helpers.terminal.as_set(),
         )
     }
 
     /// Public batched PBC lowering with explicit terminal rounding helpers.
-    pub(crate) fn compile_pbc_public_key_family_with_rounding_helpers(
+    fn lower_public_batch(
         &self,
         compiler: &PowerLutPublicKeyCompiler,
         input_keys: Family<Mat>,
@@ -1303,24 +1183,24 @@ impl SparseLwrPrfProgram {
         helpers: &FlatLutPublicHelperMap,
         rounding_helpers: &FlatLutPublicHelperSet,
     ) -> Result<Family<Mat>, PowerLutError> {
-        self.compile_pbc_public_key_family_inner(
+        self.lower_public_batch_impl(
             compiler,
             input_keys,
             batch,
             selectors,
             helpers,
-            Some(rounding_helpers),
+            rounding_helpers,
         )
     }
 
-    fn compile_pbc_public_key_family_inner(
+    fn lower_public_batch_impl(
         &self,
         compiler: &PowerLutPublicKeyCompiler,
         input_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: PublicSelectorFamily,
         helpers: &FlatLutPublicHelperMap,
-        rounding_helpers: Option<&FlatLutPublicHelperSet>,
+        rounding_helpers: &FlatLutPublicHelperSet,
     ) -> Result<Family<Mat>, PowerLutError> {
         let label_count = batch.len();
         if label_count == 0 ||
@@ -1343,20 +1223,17 @@ impl SparseLwrPrfProgram {
         let active_count = active.len();
         let expected_values =
             label_count.checked_mul(active_count).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
-        ensure_family_count(&public_values, expected_values)?;
+        ensure_family_count(public_values.as_family(), expected_values)?;
         let selector_flat = selectors.flattened();
         let selector_flat_count = selector_flat.len();
         let (helper_flat, helper_arities) = flatten_public_helper_families(helpers)?;
-        let (rounding_flat, rounding_arities) = if let Some(rounding_helpers) = rounding_helpers {
+        let (rounding_flat, rounding_arities) =
             flatten_public_helper_families(&FlatLutPublicHelperMap::from([(
                 crate::program::LutId::from_index(0),
                 rounding_helpers.clone(),
-            )]))?
-        } else {
-            (Vec::new(), Vec::new())
-        };
+            )]))?;
         let mut broadcasts = selector_flat;
-        broadcasts.push(public_values);
+        broadcasts.push(public_values.into_family());
         let helper_flat_count = helper_flat.len();
         broadcasts.extend(helper_flat);
         let rounding_flat_count = rounding_flat.len();
@@ -1377,18 +1254,11 @@ impl SparseLwrPrfProgram {
                 let selectors = PublicSelectorFamily::from_flattened(broadcasts)
                     .map_err(|_| mxx_dsl::DslError::Schema)?;
                 let helpers = rebuild_public_helper_families(helper_broadcasts, &helper_arities)?;
-                let rounding_map = if rounding_arities.is_empty() {
-                    None
-                } else {
-                    Some(rebuild_public_helper_families(rounding_broadcasts, &rounding_arities)?)
-                };
+                let rounding_map =
+                    rebuild_public_helper_families(rounding_broadcasts, &rounding_arities)?;
                 let rounding_helpers = rounding_map
-                    .as_ref()
-                    .map(|map| {
-                        map.get(&crate::program::LutId::from_index(0))
-                            .ok_or(mxx_dsl::DslError::Schema)
-                    })
-                    .transpose()?;
+                    .get(&crate::program::LutId::from_index(0))
+                    .ok_or(mxx_dsl::DslError::Schema)?;
                 let public_offset = mxx_ir_core::IntExpr::Mul(
                     Box::new(label.expression()),
                     Box::new(mxx_ir_core::IntExpr::constant(active_count)),
@@ -1404,10 +1274,9 @@ impl SparseLwrPrfProgram {
                 let public_key = inputs.pop().ok_or(mxx_dsl::DslError::Schema)?;
                 let input = BggPublicKeyWire { matrix: public_key, reveal_plaintext: false };
                 let (output, _) = self
-                    .compile_public_key_sequential_with_invariants(
+                    .lower_public_grouped(
                         compiler,
                         input,
-                        layout.parameters.bucket_count,
                         offsets,
                         widths,
                         selector_flat_count,
@@ -1432,29 +1301,9 @@ impl SparseLwrPrfProgram {
         Ok(outputs)
     }
 
-    /// Lowers a canonical refresh batch through the public-key PBC path.
-    ///
-    /// The batch owns the label order and the routed-vector identities. This
-    /// is the production entry point for public-key sparse-LWR evaluation;
-    /// the raw family lowerer remains crate-private so callers cannot attach
-    /// replacement labels or vectors after construction.
-    pub fn compile_pbc_public_key_family_with_batch(
-        &self,
-        compiler: &PowerLutPublicKeyCompiler,
-        input_keys: Family<Mat>,
-        batch: &RefreshPrfBatchInputs,
-        selectors: PublicSelectorFamily,
-        helpers: &FlatLutPublicHelperMap,
-    ) -> Result<Family<Mat>, PowerLutError> {
-        if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        self.compile_pbc_public_key_family(compiler, input_keys, batch, selectors, helpers)
-    }
-
     /// Typed public batched lowering with the explicit terminal rounding
     /// helper family supplied by setup.
-    pub fn compile_pbc_public_key_family_with_batch_and_rounding_helpers(
+    fn lower_public_batch_typed(
         &self,
         compiler: &PowerLutPublicKeyCompiler,
         input_keys: Family<Mat>,
@@ -1463,16 +1312,29 @@ impl SparseLwrPrfProgram {
         helpers: &FlatLutPublicHelperMap,
         rounding_helpers: &FlatLutPublicHelperSet,
     ) -> Result<Family<Mat>, PowerLutError> {
-        if batch.layout_id != batch.layout.layout_id || batch.profile != self.profile {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        self.compile_pbc_public_key_family_with_rounding_helpers(
+        self.validate_batch(batch)?;
+        self.lower_public_batch(compiler, input_keys, batch, selectors, helpers, rounding_helpers)
+    }
+
+    /// Typed batched public-key lowering with role-typed helper material.
+    pub fn compile_pbc_public_key_family_with_batch_and_helpers(
+        &self,
+        compiler: &PowerLutPublicKeyCompiler,
+        input_keys: Family<Mat>,
+        batch: &RefreshPrfBatchInputs,
+        selectors: PublicSelectorFamily,
+        helpers: &SparseLwrPrfPublicHelperBundle,
+    ) -> Result<Family<Mat>, PowerLutError> {
+        self.lower_public_batch_typed(
             compiler,
             input_keys,
             batch,
             selectors,
-            helpers,
-            rounding_helpers,
+            &BTreeMap::from([(
+                crate::program::LutId::from_index(0),
+                helpers.reduction.as_set().clone(),
+            )]),
+            helpers.terminal.as_set(),
         )
     }
 
@@ -1484,9 +1346,8 @@ impl SparseLwrPrfProgram {
         &self,
         compiler: &PowerLutEncodingCompiler,
         state: BggEncodingWire,
-        rounding_helpers: Option<&FlatLutHelperSet>,
+        rounding_helpers: &FlatLutHelperSet,
     ) -> Result<BggEncodingWire, PowerLutError> {
-        let rounding_helpers = rounding_helpers.ok_or(PowerLutError::MissingRoundingHelpers)?;
         let table = self
             .rounding_program
             .lut(crate::program::LutId::from_index(0))
@@ -1512,9 +1373,8 @@ impl SparseLwrPrfProgram {
         &self,
         compiler: &PowerLutPublicKeyCompiler,
         state: BggPublicKeyWire,
-        rounding_helpers: Option<&FlatLutPublicHelperSet>,
+        rounding_helpers: &FlatLutPublicHelperSet,
     ) -> Result<BggPublicKeyWire, PowerLutError> {
-        let rounding_helpers = rounding_helpers.ok_or(PowerLutError::MissingRoundingHelpers)?;
         let table = self
             .rounding_program
             .lut(crate::program::LutId::from_index(0))
@@ -1728,14 +1588,14 @@ fn interpolate_lookup(
     Ok(result.canonicalize())
 }
 
-/// Builds the reusable one-hot bucket body and its reduction LUT.
+/// Builds the reusable one-hot bucket body. The bucket body is selection-only;
+/// the sole non-identity LUT is the terminal scalar rounding table.
 ///
 /// The selector and public-value families stay as runtime inputs; this helper
 /// only declares the structural program shared by every bucket.
 fn build_bucket_program(
     lut_width: usize,
     bucket_width: usize,
-    reduction_lut: &[usize],
 ) -> Result<SparseLwrBucketProgram, ProgramValidationError> {
     if lut_width == 0 || !lut_width.is_power_of_two() || bucket_width == 0 {
         return Err(ProgramValidationError::WidthMismatch);
@@ -1745,16 +1605,28 @@ fn build_bucket_program(
     let selector_family = builder.rhs_family(lut_width)?;
     let public_value_family = builder.public_value_family(lut_width)?;
     let input_wire = builder.input_wire(input)?;
-    let reduction = builder.lut(LutTable::unary(lut_width, lut_width, reduction_lut.to_vec())?)?;
-    // The public family already supplies the selected ring factor.  Applying
-    // the reduction table directly in `one_hot` keeps the single LUT's
-    // monomial output bound to the bucket's modulo-Q semantics; an identity
-    // LUT followed by a second unary gate would rebind the factor and obscure
-    // that contract.
-    let output = builder.one_hot(input_wire, selector_family, public_value_family, reduction)?;
+    let output = builder.one_hot_select(input_wire, selector_family, public_value_family)?;
     builder.output(output)?;
     let program = builder.build()?;
     Ok(SparseLwrBucketProgram { program, input, selector_family, public_value_family, output })
+}
+
+/// Builds the unary monomial reduction `z -> z mod Q_L`.
+fn build_reduction_program(
+    lut_width: usize,
+    q_l: usize,
+) -> Result<(PowerLutProgram, ProgramInputId, ProgramWireId), ProgramValidationError> {
+    let mut builder = PowerLutProgramBuilder::new();
+    let input = builder.input(lut_width)?;
+    let input_wire = builder.input_wire(input)?;
+    let table = builder.lut(LutTable::unary(
+        lut_width,
+        lut_width,
+        (0..lut_width).map(|z| z % q_l).collect(),
+    )?)?;
+    let output = builder.unary(input_wire, table)?;
+    builder.output(output)?;
+    Ok((builder.build()?, input, output))
 }
 
 /// Builds the final scalar LUT that rounds a reduced sparse-LWR value.
@@ -1782,33 +1654,46 @@ fn build_rounding_program(
 /// contract.
 fn composite_prf_id(
     profile: &SparseLwrPrfProfile,
+    plan: &SparseLwrReductionPlan,
     bucket_program: &PowerLutProgram,
+    reduction_program: &PowerLutProgram,
     rounding_program: &PowerLutProgram,
 ) -> PowerLutProgramId {
     let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/sparse-lwr/prf-program/v2");
+    digest.update(b"mxx-power-lut/sparse-lwr/prf-program/v4-grouped-reduction");
     digest.update((profile.q_l as u64).to_le_bytes());
     digest.update((profile.p as u64).to_le_bytes());
     digest.update((profile.lut_width as u64).to_le_bytes());
     digest.update((profile.ring_dimension as u64).to_le_bytes());
     digest.update(bucket_program.id().as_bytes());
+    digest.update(reduction_program.id().as_bytes());
+    digest.update((plan.k as u64).to_le_bytes());
+    digest.update((plan.intermediate_groups as u64).to_le_bytes());
+    digest.update((plan.terminal_start as u64).to_le_bytes());
+    digest.update((plan.terminal_len as u64).to_le_bytes());
+    digest.update((plan.lut_width as u64).to_le_bytes());
     digest.update(rounding_program.id().as_bytes());
     PowerLutProgramId::from_digest(digest.finalize().into())
 }
 
 impl SparseLwrPrfProgram {
-    /// Constructs the mandatory sparse-LWR bucket and final-rounding programs.
+    /// Constructs the selection, grouped reduction, and terminal programs.
     ///
     /// The PBC `bucket_width` is only a rectangular family shape. It is not a
     /// LUT domain and never determines either table. The reduction table is
     /// `z mod Q_L`; the final table is `floor(p * (z mod Q_L) / Q_L)` and is
     /// applied exactly once after the sequential bucket scan.
-    pub fn new(profile: SparseLwrPrfProfile, bucket_width: usize) -> Result<Self, PowerLutError> {
-        if bucket_width == 0 {
+    pub fn new(
+        profile: SparseLwrPrfProfile,
+        bucket_width: usize,
+        bucket_count: usize,
+    ) -> Result<Self, PowerLutError> {
+        if bucket_width == 0 || bucket_count == 0 {
             return Err(PowerLutError::InvalidSparseLwrBlock);
         }
-        let w = profile.lut_width;
-        let reduction_lut = (0..w).map(|z| z % profile.q_l).collect::<Vec<_>>();
+        let plan =
+            SparseLwrReductionPlan::derive(profile.q_l, bucket_count, profile.ring_dimension)?;
+        let w = plan.lut_width;
         let rounding_lut = (0..w)
             .map(|z| {
                 profile
@@ -1818,11 +1703,19 @@ impl SparseLwrPrfProgram {
                     .ok_or(PowerLutError::InvalidSparseLwrBlock)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bucket =
-            build_bucket_program(w, bucket_width, &reduction_lut).map_err(PowerLutError::from)?;
+        let bucket = build_bucket_program(w, bucket_width).map_err(PowerLutError::from)?;
+        let (reduction_program, reduction_input, reduction_output) =
+            build_reduction_program(w, profile.q_l).map_err(PowerLutError::from)?;
         let (rounding_program, rounding_input, rounding_output) =
             build_rounding_program(w, profile.p, &rounding_lut).map_err(PowerLutError::from)?;
-        let composite_id = composite_prf_id(&profile, &bucket.program, &rounding_program);
+        let composite_id = composite_prf_id(
+            &profile,
+            &plan,
+            &bucket.program,
+            &reduction_program,
+            &rounding_program,
+        );
+        let selection_program = bucket.program.clone();
         Ok(Self {
             program: bucket.program,
             input: bucket.input,
@@ -1831,12 +1724,20 @@ impl SparseLwrPrfProgram {
             output: bucket.output,
             lut_width: w,
             bucket_width,
+            bucket_count,
             profile,
             rounding_program,
             composite_id,
             rounding_input,
             rounding_output,
             rounding_lut,
+            plan,
+            selection_program,
+            reduction_program,
+            selection_input: bucket.input,
+            selection_output: bucket.output,
+            reduction_input,
+            reduction_output,
         })
     }
 }
@@ -1870,36 +1771,23 @@ pub struct SparseLwrPrfOutput {
     terminal_form: SparseLwrPrfTerminalForm,
 }
 
-/// Opaque output of the real private PBC lowering.
-///
-/// The layout identity is retained alongside the evaluated wire and its
-/// program descriptor.  Keeping all three values together prevents refresh
-/// setup from accepting an evaluated wire that was produced for another PBC
-/// layout.  The constructor and accessors are crate-private: external callers
-/// can only obtain this value by invoking the corresponding private lowering
-/// or the public typed batch entry point
-/// [`SparseLwrPrfProgram::compile_pbc_encoding_family_typed_with_batch`].
-#[derive(Clone)]
-pub struct PbcSparseLwrEncodingOutput {
-    encoding: BggEncodingWire,
-    descriptor: SparseLwrPrfOutput,
-    layout_id: crate::pbc::PbcLayoutId,
-}
-
 /// Opaque family result of one structural PBC lowering.
 ///
 /// The family is produced by
-/// [`SparseLwrPrfProgram::compile_pbc_encoding_family_typed_with_batch`] and
-/// can only be projected at a canonical static label index. The
-/// projection keeps the output wire and layout identity from that lowering.
+/// [`SparseLwrPrfProgram::compile_pbc_encoding_family_typed_with_batch_and_helpers`]
+/// and remains in canonical label order. Production refresh consumes these sealed
+/// families directly; no per-label projection API exists.
 pub struct PbcSparseLwrEncodingOutputs {
     vectors: Family<Mat>,
     public_keys: Family<Mat>,
     program_id: PowerLutProgramId,
     output_wire: ProgramWireId,
     layout_id: crate::pbc::PbcLayoutId,
-    label_digests: Vec<[u8; 32]>,
-    public_vector_identities: Vec<[u8; 32]>,
+    batch_id: PbcPublicValueBatchId,
+    batch_count: usize,
+    family_pair_id: [u8; 32],
+    reduction_helper_commitment: [u8; 32],
+    terminal_helper_commitment: [u8; 32],
 }
 
 impl PbcSparseLwrEncodingOutputs {
@@ -1909,91 +1797,63 @@ impl PbcSparseLwrEncodingOutputs {
         program_id: PowerLutProgramId,
         output_wire: ProgramWireId,
         batch: &RefreshPrfBatchInputs,
+        reduction_helper_commitment: [u8; 32],
+        terminal_helper_commitment: [u8; 32],
     ) -> Self {
+        let mut pair_digest = Sha256::new();
+        pair_digest.update(b"mxx-power-lut/pbc-output-family-pair/v1");
+        pair_digest.update(batch.batch_id.0);
+        pair_digest.update(batch.layout_id.0);
+        pair_digest.update(program_id.0);
+        pair_digest.update(format!("{output_wire:?}").as_bytes());
+        pair_digest.update(reduction_helper_commitment);
+        pair_digest.update(terminal_helper_commitment);
+        let family_pair_id = pair_digest.finalize().into();
         Self {
             vectors,
             public_keys,
             program_id,
             output_wire,
             layout_id: batch.layout_id,
-            label_digests: batch.label_digests.clone(),
-            public_vector_identities: batch.public_vector_identities.clone(),
+            batch_id: batch.batch_id,
+            batch_count: batch.len(),
+            family_pair_id,
+            reduction_helper_commitment,
+            terminal_helper_commitment,
         }
     }
 
-    /// Projects one member of the already-lowered family at its immutable
-    /// canonical index. The index, rather than a caller-supplied label, is
-    /// part of the trusted batch binding.
-    pub fn project(&self, index: usize) -> Result<PbcSparseLwrEncodingOutput, PowerLutError> {
-        let digest =
-            self.label_digests.get(index).copied().ok_or(PowerLutError::InvalidSparseLwrBlock)?;
-        // A projection is valid only after both canonical label and routed
-        // public-vector identities were attached by the trusted builder.
-        // Keeping the two ordered lists in lockstep prevents a descriptor
-        // from being produced for an incompletely bound family.
-        if self.public_vector_identities.get(index).is_none() {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        self.project_with_digest(index, digest)
+    /// Borrows the complete lowered vector family. The family remains sealed
+    /// to the canonical batch order; callers must not project it into a
+    /// label-sized host collection.
+    pub(crate) fn vectors(&self) -> &Family<Mat> {
+        &self.vectors
     }
 
-    fn project_with_digest(
+    /// Borrows the complete lowered public-key family in the same canonical
+    /// batch order as [`Self::vectors`].
+    pub(crate) fn public_keys(&self) -> &Family<Mat> {
+        &self.public_keys
+    }
+
+    /// Returns the family-level batch metadata needed by a typed consumer.
+    pub(crate) fn family_metadata(
         &self,
-        index: usize,
-        digest: [u8; 32],
-    ) -> Result<PbcSparseLwrEncodingOutput, PowerLutError> {
-        let count = self
-            .vectors
-            .count()
-            .evaluate(&mxx_ir_core::ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_usize())
-            .ok_or(PowerLutError::InvalidSparseLwrBlock)?;
-        if index >= count || self.public_keys.count() != self.vectors.count() {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        let encoding = BggEncodingWire {
-            vector: self.vectors.get_static(index),
-            pubkey: BggPublicKeyWire {
-                matrix: self.public_keys.get_static(index),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let descriptor = SparseLwrPrfOutput {
-            program_id: self.program_id,
-            label_digest: digest,
-            output_wire: self.output_wire,
-            terminal_form: SparseLwrPrfTerminalForm::RawScalar,
-        };
-        Ok(PbcSparseLwrEncodingOutput::new(encoding, descriptor, self.layout_id))
+    ) -> (PowerLutProgramId, ProgramWireId, crate::pbc::PbcLayoutId, usize) {
+        (self.program_id, self.output_wire, self.layout_id, self.batch_count)
     }
 
-    /// Returns the public identity of the routed vector at `index`.
-    pub fn public_vector_identity(&self, index: usize) -> Option<[u8; 32]> {
-        self.public_vector_identities.get(index).copied()
-    }
-}
-
-impl PbcSparseLwrEncodingOutput {
-    fn new(
-        encoding: BggEncodingWire,
-        descriptor: SparseLwrPrfOutput,
-        layout_id: crate::pbc::PbcLayoutId,
-    ) -> Self {
-        Self { encoding, descriptor, layout_id }
+    /// Returns the immutable public-value batch identity bound to this family.
+    pub(crate) const fn batch_id(&self) -> PbcPublicValueBatchId {
+        self.batch_id
     }
 
-    pub(crate) fn encoding(&self) -> &BggEncodingWire {
-        &self.encoding
+    pub(crate) const fn family_pair_id(&self) -> [u8; 32] {
+        self.family_pair_id
     }
 
-    pub(crate) fn descriptor(&self) -> SparseLwrPrfOutput {
-        self.descriptor
-    }
-
-    pub(crate) fn layout_id(&self) -> crate::pbc::PbcLayoutId {
-        self.layout_id
+    pub const fn helper_commitments(&self) -> ([u8; 32], [u8; 32]) {
+        (self.reduction_helper_commitment, self.terminal_helper_commitment)
     }
 }
 
@@ -2045,24 +1905,107 @@ impl SparseLwrPrfOutput {
 mod tests {
     use super::*;
     use mxx_bgg::BggPublicKeyCompiler;
-    use mxx_dsl::Ring;
+    use mxx_dsl::{DslContext, Ring};
+
+    fn batch_fixture() -> (
+        crate::pbc::PbcPublicLayout,
+        SparseLwrPrfProfile,
+        SparseLwrPrfProgram,
+        crate::refresh::RefreshPrfLabelIndex,
+    ) {
+        let parameters = crate::pbc::PbcParameters::custom(1, 1, 2, 2, 1, None);
+        let generated =
+            crate::pbc::generate_key_layout(&parameters, crate::pbc::PbcRootSeed([0x41; 32]), &[0])
+                .expect("small PBC fixture layout");
+        let profile = SparseLwrPrfProfile::new(2, 2, 4, 8).expect("test profile");
+        let program = SparseLwrPrfProgram::new(
+            profile.clone(),
+            generated.public_layout.bucket_width,
+            generated.public_layout.parameters.bucket_count,
+        )
+        .expect("test PRF program");
+        let labels = crate::refresh::RefreshPrfLabelIndex::new([0x52; 32], 1, 2, 1, 1, 1)
+            .expect("test label index");
+        (generated.public_layout, profile, program, labels)
+    }
 
     #[test]
-    fn bucket_program_uses_one_reduction_lut_in_one_hot() {
+    fn selection_and_reduction_are_separate_programs() {
         let program = SparseLwrPrfProgram::new(
             SparseLwrPrfProfile::new(2, 2, 4, 4).expect("test profile"),
+            1,
             1,
         )
         .expect("test PRF program");
 
-        assert!(program.program.lut(crate::program::LutId::from_index(0)).is_some());
-        assert!(program.program.lut(crate::program::LutId::from_index(1)).is_none());
-        assert_eq!(program.program.gates().len(), 1);
+        assert!(program.selection_program.lut(crate::program::LutId::from_index(0)).is_none());
+        assert_eq!(program.selection_program.gates().len(), 1);
         assert!(matches!(
-            program.program.gates()[0],
-            crate::program::ProgramGate::OneHot { lut, .. }
-                if lut == crate::program::LutId::from_index(0)
+            program.selection_program.gates()[0],
+            crate::program::ProgramGate::OneHot { .. }
         ));
+        assert_eq!(program.reduction_program.gates().len(), 1);
+        assert!(program.reduction_program.lut(crate::program::LutId::from_index(0)).is_some());
+    }
+
+    #[test]
+    fn grouped_plan_q512_b32_is_maximal_and_reserves_terminal_group() {
+        let plan = SparseLwrReductionPlan::derive(512, 32, 4096).expect("grouped plan");
+        assert_eq!(plan.k(), 7);
+        assert_eq!(plan.intermediate_groups(), 4);
+        assert_eq!(plan.terminal_start(), 28);
+        assert_eq!(plan.terminal_len(), 4);
+        assert_eq!(plan.lut_width(), 4096);
+        let next = (plan.k() + 2) * (plan.q_l() - 1) + 1;
+        assert!(next.next_power_of_two() > 4096);
+    }
+
+    #[test]
+    fn grouped_plan_selected_profiles_have_one_reduction_and_terminal_transfer() {
+        let cases = [(8, 27, 26, 256), (16, 27, 26, 512), (32, 35, 34, 2048)];
+        for (q_l, bucket_count, k, width) in cases {
+            let plan = SparseLwrReductionPlan::derive(q_l, bucket_count, width)
+                .expect("selected grouped profile plan");
+            assert_eq!(plan.k(), k);
+            assert_eq!(plan.intermediate_groups(), 1);
+            assert_eq!(plan.terminal_start(), k);
+            assert_eq!(plan.terminal_len(), bucket_count - k);
+            assert_eq!(plan.lut_width(), width);
+        }
+    }
+
+    #[test]
+    fn grouped_plan_q16_b34_uses_maximal_cadence_and_width() {
+        let plan = SparseLwrReductionPlan::derive(16, 34, 1 << 16).expect("Q16/B34 plan");
+        assert_eq!(plan.k(), 33);
+        assert_eq!(plan.intermediate_groups(), 1);
+        assert_eq!(plan.terminal_start(), 33);
+        assert_eq!(plan.terminal_len(), 1);
+        assert_eq!(plan.lut_width(), 512);
+
+        // k=34 would consume every bucket and leave no terminal transfer;
+        // its unreduced sum would otherwise require the next power-of-two
+        // width, 1024.
+        assert_eq!(plan.k() + 1, plan.bucket_count());
+        let next_width = ((plan.k() + 2) * (plan.q_l() - 1) + 1).next_power_of_two();
+        assert_eq!(next_width, 1024);
+    }
+
+    #[test]
+    fn grouped_plan_rejects_overflow_and_nondivisible_width() {
+        assert!(SparseLwrReductionPlan::derive(usize::MAX, 2, 4096).is_err());
+        assert!(SparseLwrReductionPlan::derive(512, 32, 3000).is_err());
+    }
+
+    #[test]
+    fn grouped_plan_handles_terminal_only_and_partial_terminal_cases() {
+        let small = SparseLwrReductionPlan::derive(2, 2, 8).expect("small plan");
+        assert!(small.terminal_len() > 0 && small.terminal_len() <= small.k());
+        for buckets in [small.k(), small.k() + 1, small.k() * 2 + 1] {
+            let plan = SparseLwrReductionPlan::derive(2, buckets, 8).expect("plan");
+            assert!(plan.terminal_len() > 0 && plan.terminal_len() <= plan.k());
+            assert_eq!(plan.terminal_start(), plan.intermediate_groups() * plan.k());
+        }
     }
 
     #[test]
@@ -2075,6 +2018,7 @@ mod tests {
         });
         let program = SparseLwrPrfProgram::new(
             SparseLwrPrfProfile::new(2, 2, 4, 4).expect("test profile"),
+            1,
             1,
         )
         .expect("test PRF program");
@@ -2104,8 +2048,100 @@ mod tests {
         };
 
         assert!(matches!(
-            program.apply_final_rounding_encoding(&compiler, state, Some(&wrong_set)),
+            program.apply_final_rounding_encoding(&compiler, state, &wrong_set),
             Err(PowerLutError::InvalidLut)
         ));
+    }
+
+    #[test]
+    fn batch_constructor_and_lowering_reject_mismatched_profile_or_program() {
+        let (layout, profile_a, program_a, labels) = batch_fixture();
+        let profile_b = SparseLwrPrfProfile::new(3, 2, 8, 8).expect("different profile");
+
+        // The public constructor binds the program profile, rather than
+        // allowing a caller to pair a descriptor with a different program.
+        assert!(matches!(
+            RefreshPrfBatchInputs::new(&layout, profile_b.clone(), &labels, &program_a),
+            Err(PowerLutError::InvalidSparseLwrBlock)
+        ));
+
+        let program_b = SparseLwrPrfProgram::new(
+            profile_b.clone(),
+            program_a.bucket_width(),
+            program_a.bucket_count,
+        )
+        .expect("different program identity");
+        let mut batch = RefreshPrfBatchInputs::new(&layout, profile_a, &labels, &program_a)
+            .expect("matching batch");
+        batch.profile = profile_b;
+        // This is the common guard used by every typed private/public
+        // lowering entry point, so a forged batch cannot cross that boundary.
+        assert!(matches!(
+            program_a.validate_batch(&batch),
+            Err(PowerLutError::InvalidSparseLwrBlock)
+        ));
+        batch.profile = program_a.profile().clone();
+        batch.program_id = program_b.id();
+        assert!(matches!(
+            program_a.validate_batch(&batch),
+            Err(PowerLutError::InvalidSparseLwrBlock)
+        ));
+    }
+
+    #[test]
+    fn huge_compact_batch_uses_deferred_family_without_host_enumeration() {
+        let (layout, profile, program, small_labels) = batch_fixture();
+        let active_count =
+            crate::pbc::PbcActiveCellIndex::build(&layout).expect("active cells").len();
+        let small = RefreshPrfBatchInputs::new(&layout, profile.clone(), &small_labels, &program)
+            .expect("small batch");
+
+        // Leave ample room for the label-to-value multiplication while still
+        // making the synthetic domain far larger than any host materializer
+        // could accidentally enumerate.
+        let huge_slots = (usize::MAX / active_count / 4).max(1 << 40);
+        let huge_labels =
+            crate::refresh::RefreshPrfLabelIndex::new([0x53; 32], huge_slots, 2, 1, 1, 1)
+                .expect("huge checked label index");
+        let huge = RefreshPrfBatchInputs::new(&layout, profile.clone(), &huge_labels, &program)
+            .expect("huge compact batch");
+        assert!(huge.len() > (1usize << 40));
+        assert_eq!(huge.value_count(), huge.len() * active_count);
+        assert!(huge.public_input_name().len() <= 64);
+
+        let ring = Ring::new(17, profile.ring_dimension);
+        let small_family = batch_public_values_family(&small, &ring).expect("small family");
+        let huge_family = batch_public_values_family(&huge, &ring).expect("huge family");
+        assert_eq!(
+            small_family.as_family().count().evaluate(&mxx_ir_core::ParamEnv::default()).unwrap(),
+            BigInt::from(small.value_count())
+        );
+        assert_eq!(
+            huge_family.as_family().count().evaluate(&mxx_ir_core::ParamEnv::default()).unwrap(),
+            BigInt::from(huge.value_count())
+        );
+
+        // A deferred family contributes no label-sized host graph structure:
+        // only the input declaration is emitted for either cardinality.
+        let small_graph = DslContext::new("compact-small")
+            .family_output("values", small_family.into_family())
+            .expect("small output")
+            .build()
+            .expect("small graph");
+        let huge_graph = DslContext::new("compact-huge")
+            .family_output("values", huge_family.into_family())
+            .expect("huge output")
+            .build()
+            .expect("huge graph");
+        assert_eq!(small_graph.graph.scopes().len(), huge_graph.graph.scopes().len());
+        assert_eq!(
+            small_graph.graph.root_scope().nodes().len(),
+            huge_graph.graph.root_scope().nodes().len()
+        );
+
+        assert!(
+            crate::refresh::RefreshPrfLabelIndex::new([0x54; 32], usize::MAX, usize::MAX, 2, 2, 2,)
+                .is_err()
+        );
     }
 }

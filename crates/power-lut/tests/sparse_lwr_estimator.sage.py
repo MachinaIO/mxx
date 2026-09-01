@@ -59,16 +59,20 @@ def json_safe(value):
         return {str(key): json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [json_safe(item) for item in value]
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if value is None or isinstance(value, (str, bool, int)):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     try:
         if value == oo:
             return None
         if isinstance(value, Integer):
             return int(value)
         if isinstance(value, (Rational, RealNumber)):
-            return float(value)
-        return float(value)
+            converted = float(value)
+            return converted if math.isfinite(converted) else None
+        converted = float(value)
+        return converted if math.isfinite(converted) else None
     except Exception:
         return repr(value)
 
@@ -121,8 +125,15 @@ def main():
             fields["rop_log2"] = math.log2(float(rop))
         attacks[name] = fields
     finite_bits = [fields["rop_log2"] for fields in attacks.values() if fields["rop_log2"] is not None]
-    minimum = min(finite_bits) if finite_bits and not failures and not infinite_attacks else float("nan")
-    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    if failures or not finite_bits:
+        raise RuntimeError("estimator has missing attacks or no finite attack cost")
+    minimum = min(finite_bits)
+    # Bind provenance to the imported estimator source checkout, not the
+    # wrapper repository that happens to contain this submodule.
+    source_root = root / "estimator"
+    commit = subprocess.check_output(
+        ["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True
+    ).strip()
     report = {
         "schema_version": 1,
         "repository_url": "https://github.com/malb/lattice-estimator.git",

@@ -1925,7 +1925,11 @@ impl<'a> Evaluator<'a> {
                         state::exact_matrix(&t, base.pow(exponent), true)?
                     }
                     mxx_ir_core::node::ConstantMatrix::Rotation { .. } => {
-                        state::exact_matrix(&t, crate::centered_residue_bound(&t.modulus)?, false)?
+                        // A rotation is a signed monomial ±X^j, hence its
+                        // coefficient L1 norm is exactly one. It is not a
+                        // constant polynomial: the operation permutes (and
+                        // possibly negates) ring coefficients.
+                        state::exact_matrix(&t, 1u8.into(), false)?
                     }
                     mxx_ir_core::node::ConstantMatrix::Polynomial { coefficients } => {
                         let evaluated = coefficients
@@ -5716,6 +5720,81 @@ mod tests {
             report.roots[0].maximum_absolute_coefficient_error
         );
         assert!(report.diagnostics.dropped_carriers.is_empty());
+    }
+
+    #[test]
+    fn rotation_is_signed_monomial_with_unit_error_gain() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let sampled = NodeHandle::new(
+            NodeKind::GaussianSample {
+                matrix_type: matrix.clone(),
+                sigma: mxx_ir_core::RealExpr::from_integer(1),
+                max_coefficient_bound: 7.into(),
+            },
+            vec![],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let rotation = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: matrix.clone(),
+                value: mxx_ir_core::node::ConstantMatrix::Rotation {
+                    exponent: mxx_ir_core::IntExpr::constant(1),
+                },
+            },
+            vec![],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let rotated = NodeHandle::new(
+            NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply),
+            vec![sampled.clone(), rotation],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "rotation-unit-gain",
+            vec![],
+            BTreeMap::from([
+                ("sampled".into(), GraphOutput { value: sampled, confidentiality: None }),
+                ("rotated".into(), GraphOutput { value: rotated, confidentiality: None }),
+            ]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let environment = ParamEnv::default();
+        let stage = crate::StageId("rotation-unit-gain".into());
+        let request = SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![crate::SimulationStage {
+                    id: stage.clone(),
+                    production_id: ProductionId {
+                        spec_hash: spec_hash(&graph, &environment).unwrap(),
+                        execution_nonce: [0; 32],
+                    },
+                    graph,
+                }],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage, output: "rotated".into() }],
+            external_inputs: vec![],
+            limits: crate::SimulationLimits::default(),
+        };
+        let report = run(&request).unwrap();
+        // The generic matrix multiply sums four ring-coordinate products;
+        // the rotation contributes unit L1 gain, so the result is N*7, not
+        // floor(q/2)*7.
+        assert_eq!(report.roots[0].maximum_absolute_coefficient_error, BigUint::from(28u8));
     }
 
     #[test]

@@ -7,14 +7,126 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    process::Command,
+};
 
 pub const LATTICE_ESTIMATOR_REPOSITORY: &str = "https://github.com/malb/lattice-estimator.git";
-pub const TARGET_SECURITY_BITS: f64 = 128.0;
+pub const REVIEWED_ESTIMATOR_COMMIT: &str = "53da5982597709ba0fdf94ea37a84d822310fd84";
 pub const PBC_REPLICATION_FACTOR: usize = 3;
 pub const PBC_BUCKET_OFFSET: usize = 3;
 pub const EXPECTED_ATTACKS: &[&str] =
     &["arora-gb", "bkw", "usvp", "bdd", "bdd_hybrid", "bdd_mitm_hybrid", "dual", "dual_hybrid"];
+
+/// Security tier used by the reviewed Phase-1 tuple grid.  A fallback tier is
+/// deliberately distinct from the fallback tier, while both are evaluated
+/// against the reviewed 100-bit target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SparseLwrSecurityTier {
+    Primary100,
+    Fallback100,
+}
+
+impl SparseLwrSecurityTier {
+    pub const fn target_bits(self) -> u64 {
+        match self {
+            Self::Primary100 => 100,
+            Self::Fallback100 => 100,
+        }
+    }
+}
+
+/// One reviewed Phase-1 point.  The tuple is ordered as `(Q_L, p, nu, h)`;
+/// The estimator result is part of the declaration so a checkpoint cannot
+/// silently substitute a different model or security policy. Tier is assigned
+/// from the reviewed primary/fallback thresholds after evaluating this row.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SparseLwrParameterTuple {
+    pub q_l: usize,
+    pub p: usize,
+    pub nu: usize,
+    pub h: usize,
+    pub lut_width: usize,
+    /// Exact finite minimum over the requested attack set.  This is the
+    /// security value used for the threshold comparison; the integer field
+    /// below is only its conservative persisted floor.
+    pub estimator_minimum_classical_bits: f64,
+    pub estimator_security_bits: u64,
+}
+
+impl PartialEq for SparseLwrParameterTuple {
+    fn eq(&self, other: &Self) -> bool {
+        self.q_l == other.q_l &&
+            self.p == other.p &&
+            self.nu == other.nu &&
+            self.h == other.h &&
+            self.lut_width == other.lut_width &&
+            (self.estimator_minimum_classical_bits - other.estimator_minimum_classical_bits)
+                .abs() <=
+                1e-12 &&
+            self.estimator_security_bits == other.estimator_security_bits
+    }
+}
+
+impl SparseLwrParameterTuple {
+    pub fn candidate(&self) -> Result<SparseLwrCandidate, String> {
+        let derived_w = self
+            .q_l
+            .checked_mul(2)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| "Q_L is too large for W_mod derivation".to_owned())?
+            .checked_next_power_of_two()
+            .ok_or_else(|| "W_mod overflows usize".to_owned())?;
+        let mut n_enc_candidates = Vec::new();
+        for exponent in (0..=16).map(|index| derived_w.checked_shl(index as u32)) {
+            let Some(n) = exponent else { continue };
+            if n <= (1usize << 16) {
+                n_enc_candidates.push(n);
+            }
+        }
+        SparseLwrCandidate::new(
+            format!("q{}_p{}_nu{}_h{}", self.q_l, self.p, self.nu, self.h),
+            self.nu,
+            self.h,
+            self.q_l,
+            self.p,
+            n_enc_candidates,
+        )
+    }
+}
+
+fn reviewed_tuple(
+    q_l: usize,
+    p: usize,
+    nu: usize,
+    h: usize,
+    lut_width: usize,
+    estimator_minimum_classical_bits: f64,
+    estimator_security_bits: u64,
+) -> SparseLwrParameterTuple {
+    SparseLwrParameterTuple {
+        q_l,
+        p,
+        nu,
+        h,
+        lut_width,
+        estimator_minimum_classical_bits,
+        estimator_security_bits,
+    }
+}
+
+/// The finite, ordered primary Phase-1 grid reviewed for integration.  It is
+/// intentionally a tuple list, not a generated Cartesian product.
+pub fn reviewed_phase1_tuple_grid() -> Vec<SparseLwrParameterTuple> {
+    vec![
+        // The adjacent lower-ν point is retained as explicit minimality
+        // evidence and must reject the 100-bit floor.
+        reviewed_tuple(16, 2, 450, 31, 512, 99.95743319144975, 99),
+        reviewed_tuple(16, 2, 451, 31, 512, 100.00493881140125, 100),
+    ]
+}
 
 /// A concrete sparse-binary LWR candidate.  `n_enc_candidates` belongs to the
 /// encoding layer; the estimator dimension is always `nu`.
@@ -42,16 +154,12 @@ impl SparseLwrCandidate {
         Ok(candidate)
     }
 
-    pub fn candidate_a() -> Result<Self, String> {
-        Self::new("A", 1450, 29, 512, 32, vec![4096, 8192, 16384, 32768, 65536])
-    }
-
     pub fn derived(&self) -> Result<SparseLwrDerived, String> {
         if self.nu == 0 || self.h == 0 || self.h > self.nu {
             return Err("sparse-binary candidate requires 0 < h <= nu".to_owned());
         }
-        if self.q == 0 || self.p == 0 || self.p > self.q || self.q % self.p != 0 {
-            return Err("baseline LWR candidate requires 0 < p <= q and p | q".to_owned());
+        if self.p != 2 || self.q == 0 || self.q % 2 != 0 {
+            return Err("Phase-1 sparse-LWR candidates require p == 2 and even Q_L".to_owned());
         }
         if self.n_enc_candidates.is_empty() {
             return Err("at least one encoding ring dimension is required".to_owned());
@@ -117,69 +225,11 @@ pub struct SparseLwrDerived {
     pub gcd_condition: bool,
 }
 
-/// The direct-LWR algorithm is intentionally a separate coverage item.  A
-/// generic LWE estimate must never silently upgrade this field.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum DirectLwrStatus {
-    NotEvaluated,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AttackCoverage {
-    pub direct_lwr: DirectLwrStatus,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AssessmentStatus {
-    Below128Lwe,
-    IncompleteAttackCoverage,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SparseLwrAssessment {
-    pub candidate: SparseLwrCandidate,
-    pub derived: SparseLwrDerived,
-    pub estimator: EstimatorReport,
-    pub attack_coverage: AttackCoverage,
-    pub status: AssessmentStatus,
-}
-
-pub type Assessment = SparseLwrAssessment;
-
-impl SparseLwrAssessment {
-    pub fn from_estimator(
-        candidate: SparseLwrCandidate,
-        estimator: EstimatorReport,
-    ) -> Result<Self, String> {
-        let derived = candidate.derived()?;
-        let status = if estimator.minimum_classical_bits < TARGET_SECURITY_BITS ||
-            derived.raw_key_entropy_bits < TARGET_SECURITY_BITS
-        {
-            AssessmentStatus::Below128Lwe
-        } else {
-            AssessmentStatus::IncompleteAttackCoverage
-        };
-        Ok(Self {
-            candidate,
-            derived,
-            estimator,
-            attack_coverage: AttackCoverage { direct_lwr: DirectLwrStatus::NotEvaluated },
-            status,
-        })
-    }
-
-    /// The generic LWE surrogate passes the requested 128-bit floor.  The
-    /// overall assessment remains incomplete until direct-LWR coverage exists.
-    pub fn passes_lwe_floor(&self) -> bool {
-        self.estimator.minimum_classical_bits >= TARGET_SECURITY_BITS &&
-            self.derived.raw_key_entropy_bits >= TARGET_SECURITY_BITS
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EstimatorReport {
     pub schema_version: u32,
     pub repository_url: String,
+    /// Commit of the imported lattice-estimator source checkout (not its wrapper).
     pub git_commit: String,
     pub sage_version: String,
     pub python_version: String,
@@ -213,18 +263,32 @@ impl EstimatorReport {
         if self.quantum || self.sample_count != "infinity" {
             return Err("estimator report is not the requested classical m=infinity run".to_owned());
         }
-        if !self.failures.is_empty() || !self.infinite_attacks.is_empty() {
-            return Err("estimator failures and infinite attack costs are fail-closed".to_owned());
+        if !self.failures.is_empty() {
+            return Err("estimator failures are fail-closed".to_owned());
+        }
+        let infinite = self.infinite_attacks.iter().cloned().collect::<BTreeSet<_>>();
+        if infinite.len() != self.infinite_attacks.len() ||
+            infinite
+                .iter()
+                .any(|name| !EXPECTED_ATTACKS.iter().any(|attack| *attack == name.as_str()))
+        {
+            return Err("estimator infinite attack list is unknown or duplicated".to_owned());
         }
         for attack in EXPECTED_ATTACKS {
             let fields = self
                 .attacks
                 .get(*attack)
                 .ok_or_else(|| format!("full estimator result is missing attack {attack}"))?;
-            let bits = fields
-                .get("rop_log2")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| format!("attack {attack} has no finite rop_log2"))?;
+            let listed_infinite = infinite.contains(*attack);
+            if listed_infinite && fields.get("rop_log2") != Some(&Value::Null) {
+                return Err(format!("infinite attack {attack} must have null rop_log2"));
+            }
+            let Some(bits) = fields.get("rop_log2").and_then(Value::as_f64) else {
+                if listed_infinite {
+                    continue;
+                }
+                return Err(format!("attack {attack} has no finite rop_log2"));
+            };
             if !bits.is_finite() {
                 return Err(format!("attack {attack} has non-finite rop_log2"));
             }
@@ -234,8 +298,11 @@ impl EstimatorReport {
         }
         let minimum = EXPECTED_ATTACKS
             .iter()
-            .map(|attack| self.attacks[*attack].get("rop_log2").unwrap().as_f64().unwrap())
+            .filter_map(|attack| self.attacks[*attack].get("rop_log2").and_then(Value::as_f64))
             .fold(f64::INFINITY, f64::min);
+        if !minimum.is_finite() {
+            return Err("estimator has no finite attack cost".to_owned());
+        }
         if (minimum - self.minimum_classical_bits).abs() > 1e-6 {
             return Err("minimum classical security does not match attack results".to_owned());
         }
@@ -282,7 +349,7 @@ pub fn run_estimator(
     if let Some(expected) = expected_commit {
         if report.git_commit != expected {
             return Err(format!(
-                "estimator commit mismatch: expected {expected}, got {}",
+                "estimator source commit mismatch: expected {expected}, got {}",
                 report.git_commit
             ));
         }
@@ -300,25 +367,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidate_a_derives_reviewed_values() {
-        let candidate = SparseLwrCandidate::candidate_a().unwrap();
+    fn reviewed_primary_tuple_derives_reviewed_values() {
+        let tuple = reviewed_phase1_tuple_grid().remove(1);
+        let candidate = tuple.candidate().unwrap();
         let derived = candidate.derived().unwrap();
-        assert_eq!(derived.h_prime, 32);
-        assert_eq!(derived.delta, 16);
-        assert_eq!((derived.error_lower, derived.error_upper), (-8, 7));
-        assert_eq!(derived.w_mod, 1024);
-        assert_eq!(derived.total_slots, 4350);
-        assert!((derived.raw_key_entropy_bits - 201.3444740929121).abs() < 1e-10);
+        assert_eq!(candidate.p, 2);
+        assert_eq!(candidate.q, 16);
+        assert_eq!(derived.h_prime, 34);
+        assert_eq!(derived.delta, 8);
+        assert_eq!((derived.error_lower, derived.error_upper), (-4, 3));
+        assert_eq!(derived.w_mod, 32);
     }
 
     #[test]
     fn non_dividing_output_modulus_is_rejected() {
-        assert!(SparseLwrCandidate::new("bad", 1450, 29, 512, 31, vec![4096]).is_err());
+        assert!(SparseLwrCandidate::new("bad", 32, 4, 8, 31, vec![16]).is_err());
     }
 
     #[test]
     fn incompatible_encoding_ring_is_rejected() {
-        assert!(SparseLwrCandidate::new("bad", 1450, 29, 512, 32, vec![2048]).is_err());
+        assert!(SparseLwrCandidate::new("bad", 32, 4, 8, 2, vec![10]).is_err());
+    }
+
+    #[test]
+    fn phase_one_grid_is_ordered_and_rejects_non_phase1_parameters() {
+        let grid = reviewed_phase1_tuple_grid();
+        assert_eq!(
+            grid.iter().map(|tuple| (tuple.q_l, tuple.p, tuple.nu, tuple.h)).collect::<Vec<_>>(),
+            vec![(16, 2, 450, 31), (16, 2, 451, 31)]
+        );
+        assert!(SparseLwrCandidate::new("bad", 896, 24, 8, 4, vec![16]).is_err());
+        assert!(SparseLwrCandidate::new("bad", 896, 24, 9, 2, vec![32]).is_err());
     }
 
     #[test]
@@ -343,6 +422,15 @@ mod tests {
             infinite_attacks: vec!["bkw".to_owned()],
             minimum_classical_bits: 200.0,
         };
-        assert!(report.validate().is_err());
+        assert!(report.validate().is_ok());
+        let mut numeric_infinite = report.clone();
+        numeric_infinite.attacks.get_mut("bkw").unwrap()["rop_log2"] = serde_json::json!(200.0);
+        assert!(numeric_infinite.validate().is_err());
+        let mut unknown = report.clone();
+        unknown.infinite_attacks.push("unknown".to_owned());
+        assert!(unknown.validate().is_err());
+        let mut duplicate = report;
+        duplicate.infinite_attacks.push("bkw".to_owned());
+        assert!(duplicate.validate().is_err());
     }
 }

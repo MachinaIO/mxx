@@ -15,6 +15,7 @@
 //! checks; they do not construct an encrypted graph.
 
 pub mod encoding;
+pub mod noise;
 pub mod pbc;
 pub mod prf;
 pub mod program;
@@ -30,6 +31,26 @@ pub use encoding::PowerArtifactImportError;
 pub use mxx_bgg::{
     BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout,
     EncodingCompileError, PreimageCoefficientBound,
+};
+pub use noise::{
+    AVERAGE_CASE_REPORT_SCHEMA_VERSION, AcceptedUnder, AffineNoiseTransfer, AverageCaseConfig,
+    AverageEventBudget, AverageGateNoiseStep, AverageNoiseTransfer, AverageProgramNoiseReport,
+    AverageRefreshNoiseReport, AverageRefreshSlotNoiseReport, AverageSparsePrfNoiseReport,
+    AverageVariance, GateNoiseStep, HeuristicId, NoiseMagnitude, NoiseModelKind,
+    NoiseSimulationError, PowerLutAverageNoiseReport, PowerLutNoiseParameters, PowerLutNoiseReport,
+    PowerLutNoiseSnapshot, ProgramNoiseInputs, ProgramNoiseReport, RefreshHardAuthority,
+    RefreshNoiseParameters, RefreshNoiseReport, RefreshSlotNoiseParameters, RefreshSlotNoiseReport,
+    SparsePrfNoiseReport, average_fixed_fuse_transfer, average_fixed_lut_transfer,
+    average_monomial_one_hot_transfer, average_refresh_accepts, average_two_input_lut_transfer,
+    average_variance_transfer, fixed_fuse_transfer, fixed_lut_transfer, monomial_one_hot_transfer,
+    simulate_average_program, simulate_average_refresh, simulate_average_sparse_prf,
+    simulate_program, simulate_refresh, simulate_sparse_prf, two_input_lut_transfer,
+};
+pub use prf::{
+    SparseLwrPrfHelperBundle, SparseLwrPrfProfile, SparseLwrPrfProgram,
+    SparseLwrPrfPublicHelperBundle, SparseLwrPublicReductionHelpers,
+    SparseLwrPublicTerminalHelpers, SparseLwrReductionHelpers, SparseLwrReductionPlan,
+    SparseLwrTerminalHelpers,
 };
 pub use public_key::PowerLutPublicKeyCompiler;
 use thiserror::Error;
@@ -79,5 +100,5 @@ pub(crate) fn ensure_ciphertext_only(encoding: &BggEncodingWire) -> Result<(), P
 #[cfg(all(test, feature = "gpu"))]
 mod encoding_gpu_tests;
 
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(test)]
 mod refresh_setup_gpu_tests;

@@ -21,9 +21,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::{
     PowerLutError,
     program::{
-        FamilyRange, LutOutputForm, LutTable, PowerLutProgram, ProgramBindings,
-        ProgramFamilyRanges, ProgramInputId, ProgramLoweringBackend, ProgramWireId, RhsInputId,
-        lower_program,
+        FamilyRange, LutOutputForm, LutTable, PowerLutMonomialFamily, PowerLutProgram,
+        ProgramBindings, ProgramFamilyRanges, ProgramInputId, ProgramLoweringBackend,
+        ProgramWireId, RhsInputId, lower_program,
     },
     rhs::{
         ManifestSecretMetadata, PowerRhsPackage, PowerRhsPackageArtifactNames, PowerRhsPackageError,
@@ -571,13 +571,13 @@ impl PowerLutEncodingCompiler {
         Self::new(BggEncodingCompiler { public_key })
     }
 
-    pub fn compile_program(
+    pub(crate) fn compile_program(
         &self,
         program: &PowerLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggEncodingWire>,
         rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
         selectors: &BTreeMap<crate::program::RhsFamilyId, EncodingSelectorFamily>,
-        values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, PowerLutMonomialFamily>,
         helpers: &FlatLutHelperMap,
     ) -> Result<BTreeMap<ProgramWireId, BggEncodingWire>, PowerLutError> {
         let mut ranges = ProgramFamilyRanges::new();
@@ -599,13 +599,13 @@ impl PowerLutEncodingCompiler {
         lower_program(program, &bindings, &ranges, self)
     }
 
-    pub fn compile_program_with_ranges(
+    pub(crate) fn compile_program_with_ranges(
         &self,
         program: &PowerLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggEncodingWire>,
         rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
         selectors: &BTreeMap<crate::program::RhsFamilyId, EncodingSelectorFamily>,
-        values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, PowerLutMonomialFamily>,
         ranges: &ProgramFamilyRanges,
         helpers: &FlatLutHelperMap,
     ) -> Result<BTreeMap<ProgramWireId, BggEncodingWire>, PowerLutError> {
@@ -803,7 +803,7 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
     type Wire = BggEncodingWire;
     type Rhs = PowerRhsPackage;
     type SelectorFamily = EncodingSelectorFamily;
-    type PublicValueFamily = Family<Mat>;
+    type PublicValueFamily = PowerLutMonomialFamily;
     type Helper = FlatLutHelper;
     type HelperSet = FlatLutHelperSet;
 
@@ -834,25 +834,24 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
     ) -> Result<Self::Wire, PowerLutError> {
         self.two_input_lut_table(&lhs, rhs, table, helpers)
     }
-    fn one_hot(
+    fn one_hot_select(
         &self,
-        lhs: Self::Wire,
+        input: Self::Wire,
         selectors: &Self::SelectorFamily,
         public_values: &Self::PublicValueFamily,
         selector_range: &FamilyRange,
         public_value_range: &FamilyRange,
-        table: &crate::program::LutTable,
-        helpers: &[Self::Helper],
     ) -> Result<Self::Wire, PowerLutError> {
         // For selector entries `C_i` and public values `v_i`, compute
-        // `sum_i m_i * Fuse(lhs,C_i) * v_i`; `indices` and `masks` relocate
+        // `sum_i m_i * Fuse(input,C_i) * v_i`; `indices` and `masks` relocate
         // the logical selector range into one-hot coefficients.
-        if table.rhs_width().is_some() {
+        if !public_values.has_provenance(crate::program::PBC_MONOMIAL_FAMILY_PROVENANCE) ||
+            selector_range != public_value_range ||
+            selectors.count() != public_values.count()
+        {
             return Err(PowerLutError::InvalidSparseLwrBlock);
         }
-        if selector_range != public_value_range || selectors.count() != public_values.count() {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
+        crate::ensure_ciphertext_only(&input)?;
         let capacity = selector_range
             .capacity()
             .evaluate(&ParamEnv::default())
@@ -870,6 +869,7 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
             .parallel_gather(indices.clone())
             .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
         let vals = public_values
+            .as_family()
             .clone()
             .parallel_gather(indices)
             .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
@@ -880,7 +880,7 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
                 let value = items.pop().ok_or(DslError::Schema)?;
                 let c = items.pop().ok_or(DslError::Schema)?;
                 let rhs = PowerRhsPackage::new(c).map_err(|_| DslError::Schema)?;
-                let fused = self.fuse(&lhs, &rhs).map_err(|_| DslError::Schema)?;
+                let fused = self.fuse(&input, &rhs).map_err(|_| DslError::Schema)?;
                 let weighted = value * mask;
                 Ok((fused.vector * weighted.clone(), fused.pubkey.matrix * weighted))
             },
@@ -889,15 +889,11 @@ impl ProgramLoweringBackend for PowerLutEncodingCompiler {
         let (vectors, publics) = weighted;
         let vector = balanced_sum_family(vectors)?;
         let public = balanced_sum_family(publics)?;
-        self.single_input_lut_table(
-            &BggEncodingWire {
-                vector,
-                pubkey: BggPublicKeyWire { matrix: public, reveal_plaintext: false },
-                plaintext: None,
-            },
-            table,
-            helpers,
-        )
+        Ok(BggEncodingWire {
+            vector,
+            pubkey: BggPublicKeyWire { matrix: public, reveal_plaintext: false },
+            plaintext: None,
+        })
     }
 }
 

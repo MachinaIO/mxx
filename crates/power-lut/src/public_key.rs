@@ -17,9 +17,9 @@ use crate::{
         canonical_sigma, one_hot_indices_and_masks,
     },
     program::{
-        FamilyRange, LutOutputForm, LutTable, PowerLutProgram, ProgramBindings,
-        ProgramFamilyRanges, ProgramInputId, ProgramLoweringBackend, ProgramWireId, RhsInputId,
-        lower_program,
+        FamilyRange, LutOutputForm, LutTable, PowerLutMonomialFamily, PowerLutProgram,
+        ProgramBindings, ProgramFamilyRanges, ProgramInputId, ProgramLoweringBackend,
+        ProgramWireId, RhsInputId, lower_program,
     },
     rhs::PowerRhsPackage,
 };
@@ -222,13 +222,13 @@ impl PowerLutPublicKeyCompiler {
     pub fn new(public_key: mxx_bgg::BggPublicKeyCompiler) -> Self {
         Self { public_key }
     }
-    pub fn compile_program(
+    pub(crate) fn compile_program(
         &self,
         program: &PowerLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggPublicKeyWire>,
         rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
         selectors: &BTreeMap<crate::program::RhsFamilyId, PublicSelectorFamily>,
-        values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, PowerLutMonomialFamily>,
         helpers: &FlatLutPublicHelperMap,
     ) -> Result<BTreeMap<ProgramWireId, BggPublicKeyWire>, PowerLutError> {
         let mut ranges = ProgramFamilyRanges::new();
@@ -249,13 +249,13 @@ impl PowerLutPublicKeyCompiler {
         let bindings = ProgramBindings::new(inputs, rhs, selectors, values, helpers);
         lower_program(program, &bindings, &ranges, self)
     }
-    pub fn compile_program_with_ranges(
+    pub(crate) fn compile_program_with_ranges(
         &self,
         program: &PowerLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggPublicKeyWire>,
         rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
         selectors: &BTreeMap<crate::program::RhsFamilyId, PublicSelectorFamily>,
-        values: &BTreeMap<crate::program::PublicValueFamilyId, Family<Mat>>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, PowerLutMonomialFamily>,
         ranges: &ProgramFamilyRanges,
         helpers: &FlatLutPublicHelperMap,
     ) -> Result<BTreeMap<ProgramWireId, BggPublicKeyWire>, PowerLutError> {
@@ -409,7 +409,7 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
     type Wire = BggPublicKeyWire;
     type Rhs = PowerRhsPackage;
     type SelectorFamily = PublicSelectorFamily;
-    type PublicValueFamily = Family<Mat>;
+    type PublicValueFamily = PowerLutMonomialFamily;
     type Helper = FlatLutPublicHelper;
     type HelperSet = FlatLutPublicHelperSet;
 
@@ -446,17 +446,15 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
             reveal_plaintext: false,
         })
     }
-    fn one_hot(
+    fn one_hot_select(
         &self,
-        lhs: Self::Wire,
+        input: Self::Wire,
         selectors: &Self::SelectorFamily,
         values: &Self::PublicValueFamily,
         selector_range: &FamilyRange,
         value_range: &FamilyRange,
-        table: &crate::program::LutTable,
-        helpers: &[Self::Helper],
     ) -> Result<Self::Wire, PowerLutError> {
-        // Public projection of OneHot is
+        // Public projection of one-hot selection is
         // `sum_i m_i * (A G^{-1}(C_i)) * v_i`: `m_i` is the public structural
         // active-lane mask (1 for a real or dummy active cell, 0 for padding
         // or an inactive lane), `v_i = X^{a_i}` is the public monomial made
@@ -478,10 +476,10 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
         // by `C_i`.
         // Selector C and public values are gathered in lockstep; no private
         // selector bit is reconstructed on this path.
-        if table.rhs_width().is_some() {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
-        }
-        if selector_range != value_range || selectors.count() != values.count() {
+        if !values.has_provenance(crate::program::PBC_MONOMIAL_FAMILY_PROVENANCE) ||
+            selector_range != value_range ||
+            selectors.count() != values.count()
+        {
             return Err(PowerLutError::InvalidSparseLwrBlock);
         }
         let capacity = selector_range
@@ -501,6 +499,7 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
             .parallel_gather(indices.clone())
             .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
         let vals = values
+            .as_family()
             .clone()
             .parallel_gather(indices)
             .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
@@ -511,17 +510,14 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
                 let value = items.pop().ok_or(DslError::Schema)?;
                 let c = items.pop().ok_or(DslError::Schema)?;
                 let rhs = PowerRhsPackage::new(c).map_err(|_| DslError::Schema)?;
-                Ok(self.fuse_public(&lhs.matrix, &rhs).map_err(|_| DslError::Schema)? *
+                Ok(self.fuse_public(&input.matrix, &rhs).map_err(|_| DslError::Schema)? *
                     (value * mask))
             },
         )
         .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
         Ok(BggPublicKeyWire {
-            matrix: self.single_input_lut_table(
-                &balanced_sum_family(weighted).map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
-                table,
-                helpers,
-            )?,
+            matrix: balanced_sum_family(weighted)
+                .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
             reveal_plaintext: false,
         })
     }
@@ -560,11 +556,17 @@ impl PublicSelectorFamily {
 mod tests {
     use super::{
         FlatLutPublicHelper, FlatLutPublicHelperSet, PowerLutPublicKeyCompiler,
-        PowerLutPublicKeySampler,
+        PowerLutPublicKeySampler, PublicSelectorFamily,
     };
-    use crate::{program::LutTable, rhs::PowerRhsPackage};
+    use crate::{
+        program::{
+            FamilyRange, LutTable, PBC_MONOMIAL_FAMILY_PROVENANCE, PowerLutMonomialFamily,
+            ProgramLoweringBackend,
+        },
+        rhs::PowerRhsPackage,
+    };
     use mxx_bgg::BggPublicKeyCompiler;
-    use mxx_dsl::Ring;
+    use mxx_dsl::{Family, Ring};
 
     #[test]
     fn public_input_sampler_batches_and_rejects_empty_count() {
@@ -608,6 +610,63 @@ mod tests {
             output.value_handle().node().kind(),
             mxx_ir_core::node::NodeKind::ApplyPreimage
         ));
+    }
+
+    #[test]
+    fn public_one_hot_selection_returns_the_balanced_sum_without_lut_helpers() {
+        let ring = Ring::new(97, 4);
+        let compiler = PowerLutPublicKeyCompiler::new(BggPublicKeyCompiler {
+            ring: ring.clone(),
+            base: 4.into(),
+            digit_count: 2.into(),
+        });
+        let input = super::BggPublicKeyWire {
+            matrix: ring.input("public-selection-input", (2, 2)),
+            reveal_plaintext: false,
+        };
+        let selectors = PublicSelectorFamily::new(
+            Family::pack(vec![ring.zero((2, 2)), ring.zero((2, 2))]).unwrap(),
+        )
+        .unwrap();
+        let values = PowerLutMonomialFamily::from_trusted(
+            Family::pack(vec![ring.polynomial([0.into()]), ring.polynomial([1.into()])]).unwrap(),
+            &ring,
+            PBC_MONOMIAL_FAMILY_PROVENANCE,
+        )
+        .unwrap();
+        let range = FamilyRange::full(2).unwrap();
+
+        let wrong_provenance = PowerLutMonomialFamily::from_trusted(
+            values.as_family().clone(),
+            &ring,
+            PBC_MONOMIAL_FAMILY_PROVENANCE + 1,
+        )
+        .unwrap();
+        assert!(
+            compiler
+                .one_hot_select(input.clone(), &selectors, &wrong_provenance, &range, &range)
+                .is_err()
+        );
+        let wrong_count = PowerLutMonomialFamily::from_trusted(
+            Family::pack(vec![ring.polynomial([0.into()])]).unwrap(),
+            &ring,
+            PBC_MONOMIAL_FAMILY_PROVENANCE,
+        )
+        .unwrap();
+        assert!(
+            compiler
+                .one_hot_select(input.clone(), &selectors, &wrong_count, &range, &range)
+                .is_err()
+        );
+
+        // The selection-only interface has no LUT/helper arguments. Its
+        // result is already the balanced public projection.
+        let output = compiler.one_hot_select(input, &selectors, &values, &range, &range).unwrap();
+        assert!(!output.reveal_plaintext);
+        assert_eq!(
+            output.matrix.matrix_type(),
+            ring.input("public-selection-type", (2, 2)).matrix_type()
+        );
     }
 
     #[test]

@@ -13,13 +13,15 @@
 //! the program itself never stores private support or selected-slot data.
 //!
 //! The gate equations are: unary `y=f(x)`; binary `y=f(x,r)` after explicit
-//! RHS fusion with package `r`; and one-hot `y=sum_i m_i v_i`, where `m_i` is
-//! derived from selector packages and `v_i` is the public value family. The
-//! builder validates wire, table, family-range, and gate-order obligations
-//! before either backend performs matrix lowering.
+//! RHS fusion with package `r`; and one-hot selection
+//! `y=sum_i m_i Fuse(x,C_i) v_i`, where `m_i` is derived from selector
+//! packages and `v_i` is the public value family. The builder validates wire,
+//! table, family-range, and gate-order obligations before either backend
+//! performs matrix lowering.
 
 use std::collections::BTreeMap;
 
+use mxx_dsl::{Family, Mat, Ring};
 use mxx_ir_core::IntExpr;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
@@ -52,6 +54,61 @@ id_type!(RhsFamilyId, "Identifier of a selector/RHS family declaration.");
 id_type!(PublicValueFamilyId, "Identifier of a public value family declaration.");
 id_type!(LutId, "Identifier of a LUT table in a Power-LUT program.");
 id_type!(ProgramGateId, "Identifier of a gate in declaration order.");
+
+/// Provenance descriptor for a trusted monomial public-value family.
+pub(crate) const PBC_MONOMIAL_FAMILY_PROVENANCE: u8 = 1;
+
+/// Opaque, validated family of ring monomials consumed by one-hot selection.
+///
+/// The wrapper deliberately exposes no public constructor. Trusted PBC
+/// derivation paths create it after checking the concrete ring type and
+/// non-empty family cardinality; lowerers additionally require the PBC
+/// provenance descriptor before accepting it.
+#[derive(Clone)]
+pub(crate) struct PowerLutMonomialFamily {
+    family: Family<Mat>,
+    ring_type: mxx_ir_core::types::MatrixType,
+    count: IntExpr,
+    provenance: u8,
+}
+
+impl PowerLutMonomialFamily {
+    pub(crate) fn from_trusted(
+        family: Family<Mat>,
+        ring: &Ring,
+        provenance: u8,
+    ) -> Result<Self, ProgramValidationError> {
+        let ring_type = ring.matrix_type((1, 1));
+        let count = family
+            .count()
+            .evaluate(&mxx_ir_core::ParamEnv::default())
+            .map_err(|_| ProgramValidationError::InvalidMonomialFamily)?;
+        if *family.element_type() != ring_type || count <= 0.into() {
+            return Err(ProgramValidationError::InvalidMonomialFamily);
+        }
+        Ok(Self { count: family.count().clone(), family, ring_type, provenance })
+    }
+
+    pub(crate) fn as_family(&self) -> &Family<Mat> {
+        &self.family
+    }
+
+    pub(crate) fn into_family(self) -> Family<Mat> {
+        self.family
+    }
+
+    pub(crate) fn count(&self) -> &IntExpr {
+        &self.count
+    }
+
+    pub(crate) fn element_type(&self) -> &mxx_ir_core::types::MatrixType {
+        &self.ring_type
+    }
+
+    pub(crate) fn has_provenance(&self, provenance: u8) -> bool {
+        self.provenance == provenance
+    }
+}
 
 /// Canonical SHA-256 identity of a complete Power-LUT program.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
@@ -408,21 +465,18 @@ pub enum ProgramGate {
         /// Newly defined output wire.
         output: ProgramWireId,
     },
-    /// Applies one selector-family element at a time to a paired public-value
-    /// family, then evaluates the resulting value through a unary LUT.
+    /// Selects one paired selector/public-value family element at a time.
     ///
     /// The selector family is an explicit runtime input, not a private support
     /// list stored in the program. Lowerers implement this gate with one
     /// reusable structural loop body.
     OneHot {
         /// Input wire consumed by the gate.
-        lhs: ProgramWireId,
+        input: ProgramWireId,
         /// Declared selector/RHS family.
         selector_family: RhsFamilyId,
         /// Declared public value family.
         public_value_family: PublicValueFamilyId,
-        /// Unary LUT selected by the gate.
-        lut: LutId,
         /// Newly defined output wire.
         output: ProgramWireId,
     },
@@ -467,6 +521,9 @@ pub enum ProgramValidationError {
     #[error("one-hot family range is empty, negative, or outside its family")]
     /// A runtime family view has invalid statically known bounds.
     InvalidFamilyRange,
+    #[error("one-hot public values are not a trusted monomial family")]
+    /// A one-hot public-value family failed ring, cardinality, or provenance validation.
+    InvalidMonomialFamily,
     #[error("runtime value for program input is missing: {0:?}")]
     /// The private or public runtime input map omitted a declared input.
     MissingRuntimeInput(ProgramInputId),
@@ -720,13 +777,13 @@ impl PowerLutProgramBuilder {
         Ok(output)
     }
 
-    /// Adds a validated one-hot gate for a selector-family lowerer.
-    pub fn one_hot(
+    /// Adds a validated selection-only one-hot gate for a selector-family
+    /// lowerer.
+    pub fn one_hot_select(
         &mut self,
-        lhs: ProgramWireId,
+        input: ProgramWireId,
         selector_family: RhsFamilyId,
         public_value_family: PublicValueFamilyId,
-        lut: LutId,
     ) -> Result<ProgramWireId, ProgramValidationError> {
         let selector = self
             .rhs_families
@@ -736,20 +793,15 @@ impl PowerLutProgramBuilder {
             .public_value_families
             .get(&public_value_family)
             .ok_or(ProgramValidationError::UndefinedPublicValueFamily(public_value_family))?;
-        let table = self.luts.get(&lut).ok_or(ProgramValidationError::UndefinedLut(lut))?;
-        if table.rhs_width().is_some() ||
-            self.wire_width(lhs)? != selector.width ||
-            table.input_width() != values.width
-        {
+        if self.wire_width(input)? != selector.width || selector.width != values.width {
             return Err(ProgramValidationError::WidthMismatch);
         }
         let output = ProgramWireId::from_index(self.wires.len());
-        self.wires.insert(output, table.output_width());
+        self.wires.insert(output, selector.width);
         self.gates.push(ProgramGate::OneHot {
-            lhs,
+            input,
             selector_family,
             public_value_family,
-            lut,
             output,
         });
         Ok(output)
@@ -835,12 +887,13 @@ fn builder_from_program_parts(
     }
     for gate in &gates {
         let (output, width) = match gate {
-            ProgramGate::Unary { output, lut, .. } |
-            ProgramGate::Binary { output, lut, .. } |
-            ProgramGate::OneHot { output, lut, .. } => (
+            ProgramGate::Unary { output, lut, .. } | ProgramGate::Binary { output, lut, .. } => (
                 *output,
                 luts.get(lut).ok_or(ProgramValidationError::UndefinedLut(*lut))?.output_width(),
             ),
+            ProgramGate::OneHot { output, input, .. } => {
+                (*output, *wires.get(input).ok_or(ProgramValidationError::UndefinedWire(*input))?)
+            }
         };
         if wires.insert(output, width).is_some() {
             return Err(ProgramValidationError::DuplicateIdentifier);
@@ -906,8 +959,8 @@ pub(crate) fn validate_builder(
                     return Err(ProgramValidationError::WidthMismatch);
                 }
             }
-            ProgramGate::OneHot { lhs, selector_family, public_value_family, lut, output } => {
-                let lhs_width = builder.wire_width(*lhs)?;
+            ProgramGate::OneHot { input, selector_family, public_value_family, output } => {
+                let input_width = builder.wire_width(*input)?;
                 let selector = builder
                     .rhs_families
                     .get(selector_family)
@@ -915,9 +968,8 @@ pub(crate) fn validate_builder(
                 let values = builder.public_value_families.get(public_value_family).ok_or(
                     ProgramValidationError::UndefinedPublicValueFamily(*public_value_family),
                 )?;
-                let table = builder.lut_definition(*lut)?;
-                if lhs_width != selector.width ||
-                    table.input_width() != values.width ||
+                if input_width != selector.width ||
+                    selector.width != values.width ||
                     !builder.wires.contains_key(output)
                 {
                     return Err(ProgramValidationError::WidthMismatch);
@@ -930,15 +982,18 @@ pub(crate) fn validate_builder(
             ProgramGate::Unary { output, lut, .. } => {
                 (*output, builder.lut_definition(*lut)?, true)
             }
-            ProgramGate::Binary { output, lut, .. } | ProgramGate::OneHot { output, lut, .. } => {
+            ProgramGate::Binary { output, lut, .. } => {
                 (*output, builder.lut_definition(*lut)?, false)
+            }
+            ProgramGate::OneHot { .. } => {
+                continue;
             }
         };
         if table.output_form() == LutOutputForm::Scalar {
             let consumed_later = builder.gates.iter().any(|consumer| match consumer {
                 ProgramGate::Unary { input, .. } => *input == output,
                 ProgramGate::Binary { lhs, .. } => *lhs == output,
-                ProgramGate::OneHot { lhs, .. } => *lhs == output,
+                ProgramGate::OneHot { input, .. } => *input == output,
             });
             if !is_unary || consumed_later || !builder.outputs.contains(&output) {
                 return Err(ProgramValidationError::InvalidLutTable);
@@ -1042,15 +1097,16 @@ pub(crate) trait ProgramLoweringBackend {
         helpers: &[Self::Helper],
     ) -> Result<Self::Wire, PowerLutError>;
 
-    fn one_hot(
+    /// Selects from paired runtime families and returns their balanced sum.
+    /// Selection has no LUT/helper inputs; callers append a unary gate when a
+    /// LUT is required after this operation.
+    fn one_hot_select(
         &self,
-        lhs: Self::Wire,
+        input: Self::Wire,
         selectors: &Self::SelectorFamily,
         public_values: &Self::PublicValueFamily,
         selector_range: &FamilyRange,
         public_value_range: &FamilyRange,
-        table: &LutTable,
-        helpers: &[Self::Helper],
     ) -> Result<Self::Wire, PowerLutError>;
 }
 
@@ -1068,7 +1124,8 @@ pub(crate) trait ProgramLoweringBackend {
 /// mapped input; binary dispatch supplies the separately declared RHS `r`;
 /// OneHot gathers matching selector/value family ranges and evaluates
 /// `sum_i m_i Fuse(wire,C_i) v_i`. The output is inserted only after the
-/// backend has accepted the gate's shape and helper commitment.
+/// backend has accepted the gate's shape. Any following LUT is represented by
+/// an ordinary [`ProgramGate::Unary`] gate.
 pub(crate) fn lower_program<B: ProgramLoweringBackend>(
     program: &PowerLutProgram,
     bindings: &ProgramBindings<
@@ -1122,11 +1179,11 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
                 let helpers = backend.resolve_helpers(helper_set, table)?;
                 (*output, backend.binary(lhs_value, rhs_value, table, helpers)?)
             }
-            ProgramGate::OneHot { lhs, selector_family, public_value_family, lut, output } => {
-                let lhs_value =
-                    wires.get(lhs).cloned().ok_or(ProgramValidationError::UndefinedWire(*lhs))?;
-                let table = program.lut(*lut).ok_or(ProgramValidationError::UndefinedLut(*lut))?;
-                validate_unary_table(table)?;
+            ProgramGate::OneHot { input, selector_family, public_value_family, output } => {
+                let input_value = wires
+                    .get(input)
+                    .cloned()
+                    .ok_or(ProgramValidationError::UndefinedWire(*input))?;
                 // The declarations establish the per-element algebraic
                 // widths. Their family cardinality is intentionally a
                 // separate runtime shape: PBC may bind one flattened family
@@ -1157,17 +1214,12 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
                 }
                 (
                     *output,
-                    backend.one_hot(
-                        lhs_value,
+                    backend.one_hot_select(
+                        input_value,
                         selectors,
                         public_values,
                         selector_range,
                         public_value_range,
-                        table,
-                        backend.resolve_helpers(
-                            bindings.helpers.get(lut).ok_or(PowerLutError::InvalidLut)?,
-                            table,
-                        )?,
                     )?,
                 )
             }
@@ -1236,6 +1288,161 @@ mod tests {
         second_builder.output(output).unwrap();
         assert_eq!(first.id(), second_builder.build().unwrap().id());
         assert!(matches!(first.gates()[0], ProgramGate::Binary { rhs: RhsInputId(0), .. }));
+    }
+
+    #[test]
+    fn one_hot_selection_has_no_lut_and_round_trips_canonical_identity() {
+        let mut builder = PowerLutProgramBuilder::new();
+        let input = builder.input(2).unwrap();
+        let selector_family = builder.rhs_family(2).unwrap();
+        let public_value_family = builder.public_value_family(2).unwrap();
+        let output = builder
+            .one_hot_select(
+                builder.input_wire(input).unwrap(),
+                selector_family,
+                public_value_family,
+            )
+            .unwrap();
+        builder.output(output).unwrap();
+        let program = builder.build().unwrap();
+
+        assert!(program.luts.is_empty());
+        assert!(matches!(
+            program.gates()[0],
+            ProgramGate::OneHot {
+                input: ProgramWireId(0),
+                selector_family: RhsFamilyId(0),
+                public_value_family: PublicValueFamilyId(0),
+                output: ProgramWireId(1),
+            }
+        ));
+        let encoded = serde_json::to_value(&program).unwrap();
+        assert!(encoded["gates"][0].get("lut").is_none());
+        let decoded: PowerLutProgram = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.id(), program.id());
+    }
+
+    #[test]
+    fn one_hot_selection_requires_matching_input_and_value_widths() {
+        let mut builder = PowerLutProgramBuilder::new();
+        let input = builder.input(2).unwrap();
+        let selector_family = builder.rhs_family(2).unwrap();
+        let public_value_family = builder.public_value_family(4).unwrap();
+        assert_eq!(
+            builder.one_hot_select(
+                builder.input_wire(input).unwrap(),
+                selector_family,
+                public_value_family,
+            ),
+            Err(ProgramValidationError::WidthMismatch)
+        );
+    }
+
+    #[test]
+    fn one_hot_selection_traversal_does_not_resolve_lut_helpers() {
+        struct SelectionOnlyBackend;
+        impl ProgramLoweringBackend for SelectionOnlyBackend {
+            type Wire = usize;
+            type Rhs = ();
+            type SelectorFamily = ();
+            type PublicValueFamily = ();
+            type Helper = ();
+            type HelperSet = ();
+
+            fn resolve_helpers<'a>(
+                &self,
+                _helpers: &'a Self::HelperSet,
+                _table: &LutTable,
+            ) -> Result<&'a [Self::Helper], PowerLutError> {
+                panic!("selection-only lowering must not resolve LUT helpers")
+            }
+
+            fn unary(
+                &self,
+                _input: Self::Wire,
+                _table: &LutTable,
+                _helpers: &[Self::Helper],
+            ) -> Result<Self::Wire, PowerLutError> {
+                panic!("selection-only test has no unary gates")
+            }
+
+            fn binary(
+                &self,
+                _lhs: Self::Wire,
+                _rhs: &Self::Rhs,
+                _table: &LutTable,
+                _helpers: &[Self::Helper],
+            ) -> Result<Self::Wire, PowerLutError> {
+                panic!("selection-only test has no binary gates")
+            }
+
+            fn one_hot_select(
+                &self,
+                input: Self::Wire,
+                _selectors: &Self::SelectorFamily,
+                _public_values: &Self::PublicValueFamily,
+                _selector_range: &FamilyRange,
+                _public_value_range: &FamilyRange,
+            ) -> Result<Self::Wire, PowerLutError> {
+                Ok(input + 1)
+            }
+        }
+
+        let mut builder = PowerLutProgramBuilder::new();
+        let input = builder.input(2).unwrap();
+        let selector_family = builder.rhs_family(2).unwrap();
+        let public_value_family = builder.public_value_family(2).unwrap();
+        let output = builder
+            .one_hot_select(
+                builder.input_wire(input).unwrap(),
+                selector_family,
+                public_value_family,
+            )
+            .unwrap();
+        builder.output(output).unwrap();
+        let program = builder.build().unwrap();
+        let inputs = BTreeMap::from([(input, 41usize)]);
+        let rhs_inputs = BTreeMap::new();
+        let selectors = BTreeMap::from([(selector_family, ())]);
+        let public_values = BTreeMap::from([(public_value_family, ())]);
+        let helpers = BTreeMap::new();
+        let bindings =
+            ProgramBindings::new(&inputs, &rhs_inputs, &selectors, &public_values, &helpers);
+        let mut ranges = ProgramFamilyRanges::new();
+        ranges.selector(selector_family, FamilyRange::full(2).unwrap());
+        ranges.public_values(public_value_family, FamilyRange::full(2).unwrap());
+        let wires = lower_program(&program, &bindings, &ranges, &SelectionOnlyBackend).unwrap();
+        assert_eq!(wires[&output], 42);
+    }
+
+    #[test]
+    fn trusted_monomial_family_rejects_wrong_ring_and_empty_count() {
+        let ring = Ring::new(97, 4);
+        let valid = Family::pack(vec![ring.zero((1, 1))]).unwrap();
+        assert!(
+            PowerLutMonomialFamily::from_trusted(valid, &ring, PBC_MONOMIAL_FAMILY_PROVENANCE,)
+                .is_ok()
+        );
+        let wrong_ring = Ring::new(97, 8);
+        let wrong_ring_family = Family::pack(vec![ring.zero((1, 1))]).unwrap();
+        assert!(
+            PowerLutMonomialFamily::from_trusted(
+                wrong_ring_family,
+                &wrong_ring,
+                PBC_MONOMIAL_FAMILY_PROVENANCE,
+            )
+            .is_err()
+        );
+        let empty = Family::pack(Vec::<Mat>::new());
+        assert!(
+            empty.is_err() ||
+                PowerLutMonomialFamily::from_trusted(
+                    empty.unwrap(),
+                    &ring,
+                    PBC_MONOMIAL_FAMILY_PROVENANCE,
+                )
+                .is_err()
+        );
     }
 
     #[test]

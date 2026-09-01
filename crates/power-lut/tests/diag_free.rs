@@ -5,7 +5,12 @@ fn diag_free() {
     let config = refresh_parameter_search_support::SearchConfig::reviewed();
     let result = refresh_parameter_search_support::prepare_candidate(
         &config,
-        refresh_parameter_search_support::Candidate { crt_depth: 30, log_ring_dimension: 15 },
+        refresh_parameter_search_support::Candidate {
+            crt_depth: 30,
+            log_ring_dimension: 15,
+            crt_bits: 32,
+            base_bits: 16,
+        },
     );
     match result {
         Ok(prepared) => {

@@ -66,6 +66,8 @@ pub enum DslError {
     CanonicalInputUpperNonMatrix,
     #[error("parallel families have different counts")]
     FamilyCountMismatch,
+    #[error("parallel_map_values requires a rank-one input family")]
+    ParallelMapRank,
     #[error(transparent)]
     StructuralValidation(#[from] mxx_ir_core::ValidationError),
 }
@@ -2920,6 +2922,12 @@ impl Family<Mat> {
         self,
         body: impl FnOnce(LoopIndex, Mat) -> R,
     ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 {
+            // This API exposes one flat LoopIndex and ParallelOutput builds a
+            // rank-one result. Reject a Cartesian input instead of silently
+            // replacing its logical shape with [product(shape)].
+            return Err(DslError::ParallelMapRank);
+        }
         let outer_family = self.value.clone();
         let count = self.count.clone();
         let element_type = self.element_schema.matrix_type.clone();
@@ -5023,6 +5031,12 @@ impl Family<Preimage> {
         self,
         body: impl FnOnce(LoopIndex, Preimage) -> R,
     ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 {
+            // A typed preimage relation is indexed by the full family
+            // coordinate. Flattening that coordinate would also invalidate
+            // the source/target relation views, so fail at the DSL boundary.
+            return Err(DslError::ParallelMapRank);
+        }
         // For each branch coordinate i, the body maps a witness K[i] to F(K[i]); relation typing
         // is retained by the output family schema and no witness is materialized implicitly.
         let outer_family = self.value.clone();
@@ -6097,6 +6111,39 @@ mod tests {
         let output = subgraph.call((ring.input("matrix", (1, 1)), input_family)).unwrap();
         let built = context.output("output", output).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn parallel_map_values_rejects_rank_n_matrix_and_preimage_families() {
+        let ring = Ring::new(17, 8);
+        let matrix_type = ring.matrix_type((1, 1));
+        let shape = vec![IntExpr::constant(2), IntExpr::constant(2)];
+        let flatten = IndexMap::new([IndexExpr::Add(
+            Box::new(IndexExpr::Multiply(
+                Box::new(IndexExpr::Axis(0)),
+                Box::new(IndexExpr::constant(2)),
+            )),
+            Box::new(IndexExpr::Axis(1)),
+        )]);
+        let matrices = Family::<Mat>::source_input(
+            "rank-two-matrices".into(),
+            matrix_type.clone(),
+            IntExpr::constant(4),
+            None,
+        )
+        .reindex(shape.clone(), flatten)
+        .unwrap();
+        assert!(matches!(
+            matrices.parallel_map_values(|_, matrix| matrix),
+            Err(DslError::ParallelMapRank)
+        ));
+
+        let preimages =
+            Family::<Preimage>::source_input("rank-two-preimages".into(), matrix_type, shape, None);
+        assert!(matches!(
+            preimages.parallel_map_values(|_, preimage| preimage),
+            Err(DslError::ParallelMapRank)
+        ));
     }
 
     #[test]

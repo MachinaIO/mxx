@@ -879,18 +879,11 @@ fn validate_node(
             }
             let public = matrix_argument(scope, values, node, 0)?;
             let trapdoor = trapdoor_argument(scope, values, node, 1)?;
-            if public != trapdoor {
-                return node_error(
-                    scope,
-                    node.id,
-                    "preimage public matrix does not match its trapdoor type",
-                );
-            }
             let target = matrix_argument(scope, values, node, 2)?;
             let output = concrete_matrix(matrix_type, env, scope, node.id)?;
             // Matrix multiplication fixes the witness dimensions, and equality of the resulting
             // shape with T is the structural part of the relation B*K=T.
-            check_add_shape(&multiplication_type(&trapdoor, &output)?, &target)?;
+            check_preimage_equation(scope, node.id, &public, &trapdoor, &target, &output)?;
             vec![ConcreteWireType::Preimage(output)]
         }
         NodeKind::ApplyPreimage => {
@@ -910,31 +903,35 @@ fn validate_node(
             if max_coefficient_bound.evaluate(env)?.is_negative() {
                 return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
             }
-            let public = argument(scope, values, node, 0)?.clone();
-            let trapdoor = argument(scope, values, node, 1)?.clone();
-            let public_shape = family_parts(&public).map(|(_, shape)| shape).unwrap_or_default();
-            let trapdoor_shape =
-                family_parts(&trapdoor).map(|(_, shape)| shape).unwrap_or_default();
-            if public_shape != trapdoor_shape ||
-                (!is_family(&public) && !matches!(public, ConcreteWireType::Matrix(_))) ||
-                (!is_family(&trapdoor) && !matches!(trapdoor, ConcreteWireType::Trapdoor { .. }))
-            {
+            let public = argument(scope, values, node, 0)?;
+            let trapdoor = argument(scope, values, node, 1)?;
+            let (public_element, public_shape) = family_element_shape(public);
+            let (trapdoor_element, trapdoor_shape) = family_element_shape(trapdoor);
+            if public_shape != trapdoor_shape {
                 return node_error(scope, node.id, "preimage public/trapdoor family does not match");
             }
+            let ConcreteWireType::Matrix(public_matrix) = public_element else {
+                return node_error(scope, node.id, "preimage public source must contain matrices");
+            };
+            let ConcreteWireType::Trapdoor { matrix: trapdoor_matrix, .. } = trapdoor_element
+            else {
+                return node_error(
+                    scope,
+                    node.id,
+                    "preimage trapdoor source must contain trapdoors",
+                );
+            };
             let target = family_argument(scope, values, node, 2)?;
             let output = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let public_element =
-                family_parts(&public).map(|(element, _)| element).unwrap_or_else(|| public.clone());
             let (target_element, target_shape) =
                 family_parts(&target).ok_or_else(|| ValidationError::Node {
                     scope: scope.to_owned(),
                     node: node.id,
                     message: "family preimage target must be a family".into(),
                 })?;
-            if public_shape != trapdoor_shape ||
-                target_shape.len() != public_shape.len() + 1 ||
-                target_shape[..public_shape.len()] != public_shape ||
-                !matches!(public_element, ConcreteWireType::Matrix(_)) ||
+            let public_shape = public_shape.unwrap_or_default();
+            if target_shape.len() != public_shape.len() + 1 ||
+                target_shape[..public_shape.len()] != *public_shape ||
                 !matches!(target_element, ConcreteWireType::Matrix(_))
             {
                 return node_error(
@@ -943,20 +940,16 @@ fn validate_node(
                     "family preimage shapes or element types do not match",
                 );
             }
-            let trapdoor_matrix = family_parts(&trapdoor)
-                .and_then(|_| matrix_from_family(&trapdoor))
-                .or_else(|| match trapdoor {
-                    ConcreteWireType::Trapdoor { matrix, .. } => Some(matrix),
-                    _ => None,
-                })
-                .ok_or_else(|| ValidationError::Node {
-                    scope: scope.to_owned(),
-                    node: node.id,
-                    message: "preimage trapdoor type is invalid".into(),
-                })?;
-            check_add_shape(
-                &multiplication_type(&trapdoor_matrix, &output)?,
-                &matrix_from_family(&target).expect("target matrix family checked"),
+            let ConcreteWireType::Matrix(target_matrix) = target_element else {
+                unreachable!("target matrix family checked")
+            };
+            check_preimage_equation(
+                scope,
+                node.id,
+                public_matrix,
+                trapdoor_matrix,
+                &target_matrix,
+                &output,
             )?;
             // The output keeps every source axis and the target's final branch axis, so relation
             // identity is preserved at each concrete family coordinate.
@@ -1638,6 +1631,23 @@ fn trapdoor_argument(
     }
 }
 
+fn check_preimage_equation(
+    scope: &FrozenGraphScopeId,
+    node: NodeId,
+    public: &ConcreteMatrixType,
+    trapdoor: &ConcreteMatrixType,
+    target: &ConcreteMatrixType,
+    preimage: &ConcreteMatrixType,
+) -> Result<(), ValidationError> {
+    // Both scalar and family samplers instantiate the same equation B*K=T. The family validator
+    // strips only the common outer coordinate shape before checking these leaf matrix schemas.
+    if public != trapdoor {
+        return node_error(scope, node, "preimage public matrix does not match its trapdoor type");
+    }
+    check_add_shape(&multiplication_type(trapdoor, preimage)?, target)?;
+    Ok(())
+}
+
 fn require_scalar(
     scope: &FrozenGraphScopeId,
     values: &BTreeMap<WireRef, ConcreteWireType>,
@@ -1846,8 +1856,25 @@ fn validate_index_expr(
             })?
         }
         IndexExpr::Log2Ceil(value) => {
-            validate_index_expr(value, output_rank, env, scope, node, sequential_slots)?;
-            None
+            let Some(value) =
+                validate_index_expr(value, output_rank, env, scope, node, sequential_slots)?
+            else {
+                return Ok(None);
+            };
+            let positive =
+                value.to_biguint().filter(|value| !value.is_zero()).ok_or_else(|| {
+                    ValidationError::Node {
+                        scope: scope.clone(),
+                        node,
+                        message: "index map log2ceil argument must be positive".to_owned(),
+                    }
+                })?;
+            let floor = positive.bits() - 1;
+            Some(BigInt::from(if positive == (num_bigint::BigUint::one() << floor as usize) {
+                floor
+            } else {
+                floor + 1
+            }))
         }
         IndexExpr::Select { selector, branches } => {
             if branches.is_empty() {
@@ -1861,8 +1888,17 @@ fn validate_index_expr(
                     validate_index_expr(branch, output_rank, env, scope, node, sequential_slots)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            match selector.and_then(|value| value.to_usize()) {
-                Some(index) => branches.get(index).cloned().flatten(),
+            match selector {
+                Some(value) => {
+                    let Some(index) = value.to_usize() else {
+                        return node_error(scope, node, "index map select selector is out of range");
+                    };
+                    branches.get(index).cloned().ok_or_else(|| ValidationError::Node {
+                        scope: scope.clone(),
+                        node,
+                        message: "index map select selector is out of range".to_owned(),
+                    })?
+                }
                 None => None,
             }
         }
@@ -1964,12 +2000,6 @@ fn family_argument(
     } else {
         node_error(scope, node.id, "expected family argument")
     }
-}
-
-fn matrix_from_family(ty: &ConcreteWireType) -> Option<ConcreteMatrixType> {
-    // This projection reads the common matrix schema of every family element; it does not select
-    // a coordinate and therefore does not alter the family relation or shape.
-    family_parts(ty).and_then(|(element, _)| element.matrix_type().cloned())
 }
 
 fn concrete_shape(
@@ -2242,7 +2272,10 @@ mod tests {
     }
 
     fn input(name: &str, matrix_type: MatrixType) -> ValueHandle {
-        let wire_type = WireType::Matrix(matrix_type);
+        typed_input(name, WireType::Matrix(matrix_type))
+    }
+
+    fn typed_input(name: &str, wire_type: WireType) -> ValueHandle {
         NodeHandle::new(
             NodeKind::Input { name: name.to_owned(), wire_type: wire_type.clone(), artifact: None },
             Vec::new(),
@@ -2467,6 +2500,220 @@ mod tests {
         );
         validate(&graph("positive-trapdoor-wire-digits", trapdoor_input(1)), &ParamEnv::default())
             .expect("a trapdoor wire with one gadget digit is valid");
+    }
+
+    #[test]
+    fn family_preimage_requires_matching_matrix_and_trapdoor_leaf_types() {
+        fn family(element: WireType, shape: &[i64]) -> WireType {
+            WireType::Family {
+                element: Box::new(element),
+                shape: shape.iter().copied().map(IntExpr::constant).collect(),
+            }
+        }
+
+        fn trapdoor(matrix: MatrixType) -> WireType {
+            WireType::Trapdoor {
+                matrix,
+                sigma: crate::RealExpr::from_integer(4),
+                gadget_base: IntExpr::constant(2),
+                digit_count: IntExpr::constant(2),
+                preimage_max_coefficient_bound: IntExpr::constant(8),
+            }
+        }
+
+        fn sampled(
+            public_type: WireType,
+            trapdoor_type: WireType,
+            target_type: MatrixType,
+            preimage_type: MatrixType,
+        ) -> ValueHandle {
+            let public = typed_input("public", public_type);
+            let trapdoor = typed_input("trapdoor", trapdoor_type);
+            let target = typed_input("target", family(WireType::Matrix(target_type), &[2, 4]));
+            value(
+                NodeKind::FamilyPreimageSample {
+                    matrix_type: preimage_type.clone(),
+                    max_coefficient_bound: IntExpr::constant(8),
+                },
+                vec![public, trapdoor, target],
+                vec![family(WireType::Preimage(preimage_type), &[2, 4])],
+            )
+        }
+
+        let public_matrix = matrix_type(17, 2, 3);
+        let target_matrix = matrix_type(17, 2, 1);
+        let preimage_matrix = matrix_type(17, 3, 1);
+        let valid = sampled(
+            family(WireType::Matrix(public_matrix.clone()), &[2]),
+            family(trapdoor(public_matrix.clone()), &[2]),
+            target_matrix.clone(),
+            preimage_matrix.clone(),
+        );
+        assert!(validate(&graph("valid-family-preimage", valid), &ParamEnv::default()).is_ok());
+
+        let matrix_trapdoor = sampled(
+            family(WireType::Matrix(public_matrix.clone()), &[2]),
+            family(WireType::Matrix(public_matrix.clone()), &[2]),
+            target_matrix.clone(),
+            preimage_matrix.clone(),
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("matrix-family-trapdoor", matrix_trapdoor), &ParamEnv::default())
+                    .unwrap_err()
+            ),
+            "preimage trapdoor source must contain trapdoors"
+        );
+
+        let mismatched_trapdoor_matrix = matrix_type(19, 2, 3);
+        let mismatched = sampled(
+            family(WireType::Matrix(public_matrix), &[2]),
+            family(trapdoor(mismatched_trapdoor_matrix), &[2]),
+            target_matrix,
+            preimage_matrix,
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("mismatched-family-trapdoor", mismatched), &ParamEnv::default())
+                    .unwrap_err()
+            ),
+            "preimage public matrix does not match its trapdoor type"
+        );
+    }
+
+    #[test]
+    fn index_select_rejects_invalid_constants_and_preserves_dynamic_axes() {
+        let evaluate = |selector| {
+            validate_index_expr(
+                &IndexExpr::Select {
+                    selector: Box::new(selector),
+                    branches: vec![IndexExpr::constant(3), IndexExpr::constant(7)],
+                },
+                1,
+                &ParamEnv::default(),
+                &FrozenGraphScopeId::Root,
+                NodeId(0),
+                &BTreeSet::new(),
+            )
+        };
+
+        assert_eq!(evaluate(IndexExpr::constant(1)).unwrap(), Some(BigInt::from(7)));
+        for selector in [-1, 2] {
+            assert_eq!(
+                node_message(evaluate(IndexExpr::constant(selector)).unwrap_err()),
+                "index map select selector is out of range"
+            );
+        }
+        assert_eq!(evaluate(IndexExpr::Axis(0)).unwrap(), None);
+    }
+
+    #[test]
+    fn constant_log2ceil_is_validated_in_family_and_grid_reindex_maps() {
+        let evaluate_log2ceil = |value| {
+            validate_index_expr(
+                &IndexExpr::Log2Ceil(Box::new(value)),
+                1,
+                &ParamEnv::default(),
+                &FrozenGraphScopeId::Root,
+                NodeId(0),
+                &BTreeSet::new(),
+            )
+        };
+        assert_eq!(evaluate_log2ceil(IndexExpr::constant(1)).unwrap(), Some(BigInt::from(0)));
+        assert_eq!(evaluate_log2ceil(IndexExpr::constant(8)).unwrap(), Some(BigInt::from(3)));
+        assert_eq!(evaluate_log2ceil(IndexExpr::constant(3)).unwrap(), Some(BigInt::from(2)));
+        assert_eq!(evaluate_log2ceil(IndexExpr::Axis(0)).unwrap(), None);
+
+        let matrix = matrix_type(17, 1, 1);
+        let log2ceil =
+            |value| IndexExpr::Log2Ceil(Box::new(IndexExpr::Constant(BigInt::from(value))));
+        let family_reindex = |name: &str, input_extent: i64, index: IndexExpr| {
+            let input_type = WireType::Family {
+                element: Box::new(WireType::Matrix(matrix.clone())),
+                shape: vec![IntExpr::constant(input_extent)],
+            };
+            let input = typed_input("family", input_type);
+            let output = value(
+                NodeKind::FamilyReindex {
+                    output_shape: vec![IntExpr::constant(1)],
+                    map: IndexMap::new([index]),
+                },
+                vec![input],
+                vec![WireType::Family {
+                    element: Box::new(WireType::Matrix(matrix.clone())),
+                    shape: vec![IntExpr::constant(1)],
+                }],
+            );
+            graph(name, output)
+        };
+        let parallel_reindex = |name: &str, input_extent: i64, index: IndexExpr| {
+            let input_type = WireType::Family {
+                element: Box::new(WireType::Matrix(matrix.clone())),
+                shape: vec![IntExpr::constant(input_extent)],
+            };
+            let input = typed_input("family", input_type);
+            let body = with_new_construction_scope(|scope| {
+                let element = typed_input("element", WireType::Matrix(matrix.clone()));
+                SubgraphHandle::new(
+                    "log2ceil-grid-body",
+                    scope,
+                    vec![element.clone()],
+                    vec![element],
+                )
+                .unwrap()
+            });
+            let output = NodeHandle::parallel_grid(
+                body,
+                vec![input],
+                vec![WireType::Family {
+                    element: Box::new(WireType::Matrix(matrix.clone())),
+                    shape: vec![IntExpr::constant(1)],
+                }],
+                ParallelGrid {
+                    shape: vec![IntExpr::constant(1)],
+                    index_slots: vec![0],
+                    bindings: Vec::new(),
+                    input_modes: vec![GridInputMode::Reindex { map: IndexMap::new([index]) }],
+                },
+            )
+            .output(0)
+            .unwrap();
+            graph(name, output)
+        };
+
+        validate(&family_reindex("valid-family-log2ceil", 4, log2ceil(8)), &ParamEnv::default())
+            .unwrap();
+        validate(&parallel_reindex("valid-grid-log2ceil", 4, log2ceil(8)), &ParamEnv::default())
+            .unwrap();
+        for invalid in [
+            family_reindex("outside-family-log2ceil", 2, log2ceil(8)),
+            parallel_reindex("outside-grid-log2ceil", 2, log2ceil(8)),
+        ] {
+            assert_eq!(
+                node_message(validate(&invalid, &ParamEnv::default()).unwrap_err()),
+                "index map result is outside input shape"
+            );
+        }
+        assert_eq!(
+            node_message(
+                validate(
+                    &family_reindex("zero-family-log2ceil", 4, log2ceil(0)),
+                    &ParamEnv::default(),
+                )
+                .unwrap_err()
+            ),
+            "index map log2ceil argument must be positive"
+        );
+        assert_eq!(
+            node_message(
+                validate(
+                    &parallel_reindex("negative-grid-log2ceil", 4, log2ceil(-1)),
+                    &ParamEnv::default(),
+                )
+                .unwrap_err()
+            ),
+            "index map log2ceil argument must be positive"
+        );
     }
 
     #[test]

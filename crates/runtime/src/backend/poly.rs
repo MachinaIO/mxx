@@ -51,6 +51,9 @@ pub enum PolyBackendError {
         backend_base: BigInt,
         backend_digits: usize,
     },
+    #[cfg(test)]
+    #[error("injected release-fence failure")]
+    InjectedReleaseFenceFailure,
 }
 
 pub struct PolyBackend<M, U, H, T>
@@ -70,6 +73,14 @@ where
         Option<fn(&mut Self, Vec<UniformSampleRequest>) -> Result<Vec<M>, PolyBackendError>>,
     hash_batch_dispatch:
         Option<fn(&mut Self, Vec<HashSampleRequest>) -> Result<Vec<M>, PolyBackendError>>,
+    #[cfg(test)]
+    preimage_batch_sizes: Vec<usize>,
+    #[cfg(test)]
+    multiply_calls: usize,
+    #[cfg(test)]
+    multiply_batch_sizes: Vec<usize>,
+    #[cfg(test)]
+    fail_next_release_fence: bool,
     _marker: PhantomData<(M, U, H, T)>,
 }
 
@@ -188,6 +199,14 @@ where
             hash_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
             uniform_batch_dispatch: None,
             hash_batch_dispatch: None,
+            #[cfg(test)]
+            preimage_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            multiply_calls: 0,
+            #[cfg(test)]
+            multiply_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            fail_next_release_fence: false,
             _marker: PhantomData,
         }
     }
@@ -250,6 +269,14 @@ where
             hash_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
             uniform_batch_dispatch: None,
             hash_batch_dispatch: None,
+            #[cfg(test)]
+            preimage_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            multiply_calls: 0,
+            #[cfg(test)]
+            multiply_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            fail_next_release_fence: false,
             _marker: PhantomData,
         };
         for (placement, parameters) in placements.into_iter().enumerate() {
@@ -305,6 +332,26 @@ where
     ) {
         self.uniform_batch_dispatch = Some(uniform);
         self.hash_batch_dispatch = Some(hash);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preimage_batch_sizes(&self) -> &[usize] {
+        &self.preimage_batch_sizes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn multiply_calls(&self) -> usize {
+        self.multiply_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn multiply_batch_sizes(&self) -> &[usize] {
+        &self.multiply_batch_sizes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_release_fence(&mut self) {
+        self.fail_next_release_fence = true;
     }
 
     pub(super) fn parameters(
@@ -430,6 +477,10 @@ where
     }
 
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_release_fence) {
+            return Err(PolyBackendError::InjectedReleaseFenceFailure);
+        }
         for placement in &self.parameters {
             for parameters in placement.values() {
                 parameters.fence_released_memory();
@@ -616,6 +667,10 @@ where
     }
 
     fn multiply(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
+        #[cfg(test)]
+        {
+            self.multiply_calls += 1;
+        }
         let left_size = left.size();
         let right_size = right.size();
         Ok(if left_size == (1, 1) {
@@ -628,6 +683,8 @@ where
     }
 
     fn multiply_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
+        #[cfg(test)]
+        self.multiply_batch_sizes.push(inputs.len());
         Ok(M::multiply_batch_out_of_place(inputs))
     }
 
@@ -949,6 +1006,8 @@ where
         requests: Vec<PreimageRequest<M, T::Trapdoor>>,
     ) -> Result<Vec<M>, Self::Error> {
         self.preimage_batch_calls += 1;
+        #[cfg(test)]
+        self.preimage_batch_sizes.push(requests.len());
         #[cfg(not(feature = "gpu"))]
         {
             requests
@@ -978,6 +1037,8 @@ where
         batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
     ) -> Result<Vec<(usize, Vec<M>)>, Self::Error> {
         self.preimage_batch_calls += batches.len();
+        #[cfg(test)]
+        self.preimage_batch_sizes.extend(batches.iter().map(|(_, requests)| requests.len()));
         #[cfg(feature = "gpu")]
         {
             super::poly_gpu::sample_preimage_batches_by_placement(self, batches)

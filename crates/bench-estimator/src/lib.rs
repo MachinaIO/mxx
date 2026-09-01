@@ -396,7 +396,10 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 .backend
                 .measure(self.validated.source.name(), node, bindings)
                 .map(|measurement| {
-                    let preimage_work = if matches!(node.kind, NodeKind::PreimageSample { .. }) {
+                    let preimage_work = if matches!(
+                        node.kind,
+                        NodeKind::PreimageSample { .. } | NodeKind::FamilyPreimageSample { .. }
+                    ) {
                         measurement.work_seconds
                     } else {
                         0.0
@@ -633,6 +636,31 @@ mod tests {
             estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
         assert_eq!(report.total_work_seconds, 3.0);
         assert_eq!(report.critical_path_seconds, 2.0);
+    }
+
+    #[test]
+    fn family_preimage_measurement_is_counted_as_preimage_sampling_work() {
+        let ring = Ring::new(257, 8);
+        let digit_count = 4;
+        let trapdoors = Parallel::range(1)
+            .map_values(|_| ring.sample_trapdoor(1, 5, 4, digit_count, 1_000_000))
+            .expect("trapdoor family");
+        let targets = Parallel::grid(vec![1.into(), 2.into()])
+            .map(|_| ring.zero((1, 1)))
+            .expect("target family");
+        let preimages = trapdoors
+            .sample_preimage_branches(targets, (digit_count + 2, 1))
+            .expect("preimage family");
+        let built = DslContext::new("estimate-family-preimage")
+            .preimage_family_output("preimages", preimages)
+            .expect("preimage output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+
+        assert_eq!(report.preimage_sampling_work_seconds, 1.0);
     }
 
     #[test]

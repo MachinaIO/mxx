@@ -9,7 +9,7 @@ use crate::{
 };
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
-    artifact::{ArtifactType, ManifestArtifact, ProductionId},
+    artifact::{ArtifactConfidentiality, ArtifactType, ManifestArtifact, ProductionId},
     expr::{IndexExpr, euclidean_div_rem},
     graph::{FrozenGraphScopeId, GraphScope},
     node::{
@@ -490,6 +490,7 @@ where
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
+    let scratch_production = scratch_production_id(&production, rand::random());
     let mut executor = Executor {
         validated,
         backend,
@@ -499,6 +500,7 @@ where
         session,
         config,
         production,
+        scratch_production,
         staged_families: BTreeMap::new(),
         preimage_progress: config.preimage_progress.map(PreimageProgress::new),
         executed_node_count: 0,
@@ -555,7 +557,12 @@ where
             });
         }
     }
-    executor.fence_pending_releases()?;
+    if let Err(error) = executor.fence_pending_releases() {
+        return Err(ExecutionError::StagedCleanup {
+            message: format!("final release fence failed: {error}"),
+            leases: staged_family_leases,
+        });
+    }
     let result = ExecutionResult {
         outputs: named_outputs,
         production_id,
@@ -575,6 +582,7 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     session: Option<ProductionId>,
     config: ExecutionConfig,
     production: ProductionId,
+    scratch_production: ProductionId,
     staged_families: BTreeMap<(ProductionId, String), ManifestArtifact>,
     preimage_progress: Option<PreimageProgress>,
     executed_node_count: usize,
@@ -586,6 +594,14 @@ struct PreparedPreimage<M, T> {
     placement: usize,
     site: DrawSite,
     request: PreimageRequest<M, T>,
+}
+
+struct PreparedPreimageGroup<M, T> {
+    public: Arc<M>,
+    trapdoor: Arc<T>,
+    sigma: f64,
+    gadget_base: BigInt,
+    digit_count: usize,
 }
 
 struct PreimageProgress {
@@ -739,6 +755,15 @@ where
             *node_kind_counts.entry(node_kind_label(node.kind)).or_default() += envs.len();
             if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {
                 self.execute_preimage_batch(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
+                    &node,
+                    &mut values,
+                )?;
+            } else if matches!(node.kind, NodeKind::FamilyPreimageSample { .. }) && envs.len() > 1 {
+                self.execute_family_preimage_batch(
                     scope_id,
                     &envs,
                     &paths,
@@ -1018,6 +1043,7 @@ where
         if !matches!(
             node.kind,
             NodeKind::MatrixBinary(_) |
+                NodeKind::ApplyPreimage |
                 NodeKind::MatrixMulAccumulate { .. } |
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
@@ -1350,7 +1376,7 @@ where
     ) -> Result<(), ExecutionError> {
         self.set_placement(placement)?;
         let outputs = match node.kind {
-            NodeKind::MatrixBinary(operation) => {
+            NodeKind::MatrixBinary(_) | NodeKind::ApplyPreimage => {
                 let mut inputs = Vec::with_capacity(indices.len());
                 for index in indices {
                     let instance = &mut values[*index];
@@ -1358,10 +1384,15 @@ where
                     let right = self.matrix(instance, node.args[1])?;
                     inputs.push((left, right));
                 }
-                match operation {
-                    MatrixBinaryOp::Add => self.backend.add_batch(inputs),
-                    MatrixBinaryOp::Subtract => self.backend.sub_batch(inputs),
-                    MatrixBinaryOp::Multiply => self.backend.multiply_batch(inputs),
+                match node.kind {
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Add) => self.backend.add_batch(inputs),
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => {
+                        self.backend.sub_batch(inputs)
+                    }
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) | NodeKind::ApplyPreimage => {
+                        self.backend.multiply_batch(inputs)
+                    }
+                    _ => unreachable!("matrix batch kind checked by caller"),
                 }
                 .map_err(Self::backend_error)?
             }
@@ -1676,6 +1707,43 @@ where
             );
         }
         Ok((Some(production), handles))
+    }
+
+    fn staged_family_descriptor(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        path: &[InstantiationFrame],
+        node: NodeId,
+        port: u32,
+        shape: &[usize],
+    ) -> Result<Option<(String, ManifestArtifact)>, ExecutionError> {
+        let wire_id =
+            WireId { instantiation_path: path.to_vec(), wire: WireRef { node, port: Port(port) } };
+        let Some(ConcreteWireType::Family { element, shape: validated_shape }) =
+            self.validated_wire_type(scope_id, wire_id.wire)
+        else {
+            return Ok(None);
+        };
+        if validated_shape != shape {
+            return Err(ExecutionError::MissingMetadata(wire_id));
+        }
+        let Some(artifact_type) = ArtifactType::from_wire_type(element) else {
+            return Ok(None);
+        };
+        let encoded = mxx_ir_core::encoding::canonical_json(&wire_id)
+            .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+        let digest = Sha256::digest(encoded);
+        let name = format!("runtime-staged-{}", hex_bytes(&digest));
+        let descriptor = ManifestArtifact {
+            artifact_type,
+            family_shape: Some(shape.to_vec()),
+            confidentiality: ArtifactConfidentiality::Private,
+            content_hash: None,
+            layout: Some("runtime/staged-family-v1".to_owned()),
+        };
+        self.staged_families
+            .insert((self.scratch_production.clone(), name.clone()), descriptor.clone());
+        Ok(Some((name, descriptor)))
     }
 
     fn cleanup_unreturned_staged_families(
@@ -2847,9 +2915,22 @@ where
                 {
                     return Err(ExecutionError::ValueKind(WireRef { node: node.id, port: Port(0) }));
                 }
-                let mut outputs = (0..child.outputs().len())
-                    .map(|_| Vec::with_capacity(count))
-                    .collect::<Vec<_>>();
+                let staged = (0..child.outputs().len())
+                    .map(|port| {
+                        self.staged_family_descriptor(scope_id, path, node.id, port as u32, &shape)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outputs =
+                    staged
+                        .iter()
+                        .map(|descriptor| {
+                            if descriptor.is_some() {
+                                Vec::new()
+                            } else {
+                                Vec::with_capacity(count)
+                            }
+                        })
+                        .collect::<Vec<_>>();
                 let parent_placement = self.backend.active_placement();
                 let placement_count = self.backend.placement_count();
                 if placement_count == 0 {
@@ -2910,15 +2991,43 @@ where
                         child_inputs,
                         placements,
                     )?;
-                    for instance in instances {
+                    for (offset, instance) in instances.into_iter().enumerate() {
                         for (port, value) in instance.outputs.into_iter().enumerate() {
-                            outputs[port].push(value);
+                            if let Some((name, descriptor)) = &staged[port] {
+                                let (payload, _) =
+                                    self.encode_artifact(&value, &descriptor.artifact_type)?;
+                                self.artifact_store
+                                    .store(
+                                        ArtifactKey {
+                                            production: self.scratch_production.clone(),
+                                            name: name.clone(),
+                                            index: Some(wave_start + offset),
+                                        },
+                                        &descriptor.artifact_type,
+                                        descriptor.confidentiality,
+                                        descriptor.layout.as_deref(),
+                                        payload,
+                                    )
+                                    .map_err(Self::artifact_error)?;
+                                self.has_pending_releases |=
+                                    value.releases_backend_resources_on_drop();
+                            } else {
+                                outputs[port].push(value);
+                            }
                         }
                     }
                 }
                 self.set_placement(parent_placement)?;
                 for (port, output) in outputs.into_iter().enumerate() {
-                    self.put(values, node.id, port as u32, RuntimeValue::Family(output));
+                    let value = match &staged[port] {
+                        Some((name, descriptor)) => RuntimeValue::StagedArtifactFamily {
+                            production: self.scratch_production.clone(),
+                            name: name.clone(),
+                            descriptor: descriptor.clone(),
+                        },
+                        None => RuntimeValue::Family(output),
+                    };
+                    self.put(values, node.id, port as u32, value);
                 }
             }
             NodeKind::Select { count } => {
@@ -2982,6 +3091,66 @@ where
         node: &ExecutableNode<'_>,
         values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
     ) -> Result<(), ExecutionError> {
+        let placement = self.backend.active_placement();
+        let pending =
+            self.prepare_family_preimage_requests(scope_id, env, path, placement, node, values)?;
+        let outputs = self
+            .sample_preimage_requests(&pending)?
+            .into_iter()
+            .map(RuntimeValue::matrix)
+            .collect();
+        self.put(values, node.id, 0, RuntimeValue::Family(outputs));
+        Ok(())
+    }
+
+    fn execute_family_preimage_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        placements: &[usize],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+    ) -> Result<(), ExecutionError> {
+        let mut instance_counts = Vec::with_capacity(values.len());
+        let mut pending = Vec::new();
+        for instance in 0..values.len() {
+            self.set_placement(placements[instance])?;
+            let instance_pending = self.prepare_family_preimage_requests(
+                scope_id,
+                &envs[instance],
+                &paths[instance],
+                placements[instance],
+                node,
+                &mut values[instance],
+            )?;
+            instance_counts.push(instance_pending.len());
+            pending.extend(instance_pending);
+        }
+        let mut sampled = self.sample_preimage_requests(&pending)?.into_iter();
+        for (instance, count) in instance_counts.into_iter().enumerate() {
+            let outputs =
+                sampled.by_ref().take(count).map(RuntimeValue::matrix).collect::<Vec<_>>();
+            if outputs.len() != count {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            self.put(&mut values[instance], node.id, 0, RuntimeValue::Family(outputs));
+        }
+        if sampled.next().is_some() {
+            return Err(ExecutionError::InvalidBatch(node.id));
+        }
+        Ok(())
+    }
+
+    fn prepare_family_preimage_requests(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        env: &ParamEnv,
+        path: &[InstantiationFrame],
+        placement: usize,
+        node: &ExecutableNode<'_>,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
+    ) -> Result<Vec<PreparedPreimage<B::Matrix, B::Trapdoor>>, ExecutionError> {
         // A cardinality-one family is still a family: its sole artifact must
         // be loaded through family_member rather than treated as a scalar.
         let source_family_count = self.family_count(values, node.args[0]).ok();
@@ -2995,13 +3164,15 @@ where
             if target_count == 0 {
                 // There are no equations B_i * K_i,j = T_i,j to sample. The validated output
                 // wire retains the target's logical shape even though its flat value is empty.
-                self.put(values, node.id, 0, RuntimeValue::Family(Vec::new()));
-                return Ok(());
+                return Ok(Vec::new());
             }
             return Err(ExecutionError::ValueKind(node.args[2]));
         }
         if target_count % source_count != 0 {
             return Err(ExecutionError::ValueKind(node.args[2]));
+        }
+        if target_count == 0 {
+            return Ok(Vec::new());
         }
         let branch_count = target_count / source_count;
         let max_coefficient_bound = match node.kind {
@@ -3023,10 +3194,12 @@ where
                     wire: output_wire,
                 })
             })?;
-        let placement = self.backend.active_placement();
-        let mut pending = Vec::with_capacity(target_count);
-        for lane in 0..target_count {
-            let group = lane / branch_count;
+        // B_i and its trapdoor are shared by every branch j in
+        // B_i * K_i,j = T_i,j. Materialize each source group once so an
+        // artifact-backed family performs one decode/transfer per i, then
+        // clone the resulting Arcs into all branch requests.
+        let mut groups = Vec::with_capacity(source_count);
+        for group in 0..source_count {
             let public = if source_family_count.is_some() {
                 match self.family_member(values, node.args[0], group, node.id)? {
                     RuntimeValue::Matrix(value) => value,
@@ -3054,6 +3227,18 @@ where
             if public.as_ref() != trapdoor_public.as_ref() {
                 return Err(ExecutionError::PreimagePublicMismatch(node.id));
             }
+            groups.push(PreparedPreimageGroup {
+                public,
+                trapdoor: secret,
+                sigma,
+                gadget_base,
+                digit_count,
+            });
+        }
+
+        let mut pending = Vec::with_capacity(target_count);
+        for lane in 0..target_count {
+            let group = &groups[lane / branch_count];
             let target = match self.family_member(values, node.args[2], lane, node.id)? {
                 RuntimeValue::Matrix(value) => value,
                 _ => return Err(ExecutionError::ValueKind(node.args[2])),
@@ -3072,23 +3257,17 @@ where
                 },
                 request: PreimageRequest {
                     matrix_type: matrix_type.clone(),
-                    sigma,
-                    gadget_base,
-                    digit_count,
+                    sigma: group.sigma,
+                    gadget_base: group.gadget_base.clone(),
+                    digit_count: group.digit_count,
                     max_coefficient_bound: max_coefficient_bound.clone(),
-                    trapdoor: secret,
-                    public,
+                    trapdoor: group.trapdoor.clone(),
+                    public: group.public.clone(),
                     target,
                 },
             });
         }
-        let outputs = self
-            .sample_preimage_requests(&pending)?
-            .into_iter()
-            .map(RuntimeValue::matrix)
-            .collect();
-        self.put(values, node.id, 0, RuntimeValue::Family(outputs));
-        Ok(())
+        Ok(pending)
     }
 
     fn family_member(
@@ -4214,6 +4393,30 @@ fn hash_sized(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+fn scratch_production_id(
+    production: &ProductionId,
+    scratch_execution_nonce: [u8; 32],
+) -> ProductionId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mxx-runtime/staged-family/v1");
+    hasher.update(production.spec_hash.0);
+    hasher.update(production.execution_nonce);
+    ProductionId {
+        spec_hash: mxx_ir_core::artifact::SpecHash(hasher.finalize().into()),
+        execution_nonce: scratch_execution_nonce,
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn collect_staged_families<B: Backend>(
     value: &RuntimeValue<B>,
     families: &mut BTreeMap<(ProductionId, String), usize>,
@@ -4620,7 +4823,7 @@ mod tests {
             .map(|index| ring.polynomial([index.expression()]))
             .expect("range loop");
         let built = DslContext::new("runtime-range")
-            .family_output("values", family)
+            .public_family_output("values", family)
             .expect("output")
             .build()
             .expect("build");
@@ -4640,9 +4843,18 @@ mod tests {
             },
         )
         .expect("execution");
-        if let RuntimeValue::StagedArtifactFamily { descriptor, .. } = &result.outputs["values"] {
-            assert_eq!(descriptor.family_shape, Some(vec![3]));
-        }
+        let RuntimeValue::LazyArtifactFamily { descriptor, .. } = &result.outputs["values"] else {
+            panic!("persisted matrix grid output is not a lazy artifact family")
+        };
+        assert_eq!(descriptor.family_shape, Some(vec![3]));
+        assert_eq!(result.artifact_handles["values"].len(), 3);
+        assert!(result.staged_family_leases.is_empty());
+        let production = result.production_id.clone().expect("artifact production");
+        assert_eq!(
+            store.manifest(&production).expect("artifact manifest").artifacts["values"]
+                .family_shape,
+            Some(vec![3])
+        );
         let RuntimeValue::Family(values) = result
             .materialize_output("values", &backend, &mut store)
             .expect("materialize range output")
@@ -4706,6 +4918,71 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first_bytes, comparison_bytes);
         comparison.cleanup_staged(&mut comparison_store).expect("comparison staged cleanup");
+    }
+
+    #[test]
+    fn final_fence_failure_returns_cleanup_ownership_for_staged_grid_outputs() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let family = Parallel::range(3)
+            .map(|index| ring.polynomial([index.expression()]))
+            .expect("range loop");
+        let validated = DslContext::new("runtime-staged-final-fence-failure")
+            .family_output("values", family)
+            .expect("unexported output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters]);
+        backend.fail_next_release_fence();
+        let mut store = MemoryArtifactStore::default();
+        let mut error = match execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        ) {
+            Ok(_) => panic!("injected final release fence unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let (production, name, descriptor) = match &error {
+            ExecutionError::StagedCleanup { message, leases } => {
+                assert!(message.contains("final release fence failed"));
+                assert_eq!(leases.len(), 1);
+                assert_eq!(leases[0].descriptor.family_shape, Some(vec![3]));
+                (leases[0].production.clone(), leases[0].name.clone(), leases[0].descriptor.clone())
+            }
+            other => panic!("final fence failure lost staged cleanup ownership: {other}"),
+        };
+        for index in 0..3 {
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: name.clone(),
+                index: Some(index),
+            };
+            assert!(store.load_staged(&key, &descriptor).is_ok());
+        }
+
+        error.cleanup_staged(&mut store).expect("retry staged cleanup");
+        for index in 0..3 {
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: name.clone(),
+                index: Some(index),
+            };
+            assert!(store.load_staged(&key, &descriptor).is_err());
+        }
+        assert!(matches!(
+            error,
+            ExecutionError::StagedCleanup { ref leases, .. } if leases.is_empty()
+        ));
     }
 
     #[test]
@@ -4951,6 +5228,186 @@ mod tests {
     }
 
     #[test]
+    fn nested_family_preimages_batch_across_outer_grid_instances_and_replay() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let trapdoors = Parallel::range(1)
+            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+            .expect("source trapdoor family");
+        let selected = Parallel::range(3)
+            .map_values({
+                let trapdoors = trapdoors.clone();
+                let ring = ring.clone();
+                move |_| {
+                    let targets = Parallel::grid(vec![IntExpr::constant(1), IntExpr::constant(2)])
+                        .map({
+                            let ring = ring.clone();
+                            move |_| ring.zero((1, 1))
+                        })
+                        .expect("inner target family");
+                    trapdoors
+                        .sample_preimage_branches(targets, (digit_count + 2, 1))
+                        .expect("inner family preimages")
+                        .get_static(vec![IndexExpr::constant(0), IndexExpr::constant(0)])
+                }
+            })
+            .expect("outer selected preimages");
+        let validated = DslContext::new("runtime-nested-family-preimage-batch")
+            .preimage_family_output("selected", selected)
+            .expect("selected output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let config = ExecutionConfig {
+            max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+            ..ExecutionConfig::default()
+        };
+        let mut backend = cpu_backend([parameters]);
+        let calls_before = backend.preimage_batch_calls();
+        let sizes_before = backend.preimage_batch_sizes().len();
+        let mut recorder = TranscriptRecorder::default();
+        let mut first_store = MemoryArtifactStore::default();
+        let mut first = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut first_store,
+            SamplingMode::Record(&mut recorder),
+            config,
+        )
+        .expect("recorded execution");
+        assert_eq!(backend.preimage_batch_calls(), calls_before + 1);
+        assert_eq!(&backend.preimage_batch_sizes()[sizes_before..], &[6]);
+        let first_bytes = {
+            let RuntimeValue::Family(values) = first
+                .materialize_output("selected", &backend, &mut first_store)
+                .expect("materialize recorded output")
+            else {
+                panic!("recorded output is not a family")
+            };
+            values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix.as_ref()),
+                    _ => panic!("recorded family member is not a matrix"),
+                })
+                .collect::<Vec<_>>()
+        };
+        first.cleanup_staged(&mut first_store).expect("recorded staged cleanup");
+
+        let calls_before_replay = backend.preimage_batch_calls();
+        let sizes_before_replay = backend.preimage_batch_sizes().len();
+        let replayer = recorder.into_replayer();
+        let mut replay_store = MemoryArtifactStore::default();
+        let mut replayed = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut replay_store,
+            SamplingMode::Replay(&replayer),
+            config,
+        )
+        .expect("replayed execution");
+        assert_eq!(backend.preimage_batch_calls(), calls_before_replay);
+        assert_eq!(backend.preimage_batch_sizes().len(), sizes_before_replay);
+        let replayed_bytes = {
+            let RuntimeValue::Family(values) = replayed
+                .materialize_output("selected", &backend, &mut replay_store)
+                .expect("materialize replayed output")
+            else {
+                panic!("replayed output is not a family")
+            };
+            values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix.as_ref()),
+                    _ => panic!("replayed family member is not a matrix"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(replayed_bytes, first_bytes);
+        replayed.cleanup_staged(&mut replay_store).expect("replayed staged cleanup");
+    }
+
+    #[test]
+    fn artifact_family_preimage_materializes_shared_source_group_once() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let trapdoors = Parallel::range(1)
+            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+            .expect("source trapdoor family");
+        let producer = DslContext::new("runtime-artifact-preimage-source-producer")
+            .public_family_output("public", trapdoors.public_matrices())
+            .expect("public family output")
+            .private_trapdoor_family_output("trapdoors", trapdoors)
+            .expect("trapdoor family output")
+            .build()
+            .expect("producer build")
+            .validate(&ParamEnv::default())
+            .expect("producer validation");
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let produced =
+            execute(&producer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("producer execution");
+        let production = produced.production_id.expect("producer artifact production");
+        let manifest = store.manifest(&production).expect("producer manifest").clone();
+
+        let imported = ring.trapdoor_family_artifact_input(
+            production.clone(),
+            "public",
+            "trapdoors",
+            1,
+            1,
+            5,
+            gadget_base,
+            digit_count,
+            1_000_000,
+        );
+        let targets = Parallel::grid(vec![IntExpr::constant(1), IntExpr::constant(3)])
+            .map(|indices| ring.polynomial([indices[1].expression()]))
+            .expect("branch target family");
+        let preimages = imported
+            .sample_preimage_branches(targets, (digit_count + 2, 1))
+            .expect("artifact-backed family preimages");
+        let consumer = DslContext::new("runtime-artifact-preimage-source-consumer")
+            .preimage_family_output("preimages", preimages)
+            .expect("preimage family output")
+            .build()
+            .expect("consumer build")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .expect("consumer validation");
+        let public_key = ArtifactKey {
+            production: production.clone(),
+            name: "public".to_owned(),
+            index: Some(0),
+        };
+        let trapdoor_key = ArtifactKey { production, name: "trapdoors".to_owned(), index: Some(0) };
+        let public_loads_before = store.load_count(&public_key);
+        let trapdoor_loads_before = store.load_count(&trapdoor_key);
+        let batch_sizes_before = backend.preimage_batch_sizes().len();
+
+        let mut consumed =
+            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("consumer execution");
+
+        assert_eq!(store.load_count(&public_key), public_loads_before + 1);
+        assert_eq!(store.load_count(&trapdoor_key), trapdoor_loads_before + 1);
+        assert_eq!(&backend.preimage_batch_sizes()[batch_sizes_before..], &[3]);
+        consumed.cleanup_staged(&mut store).expect("preimage staged cleanup");
+    }
+
+    #[test]
     fn dynamic_integer_hash_tags_are_deterministic_and_row_distinct() {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -5046,7 +5503,6 @@ mod tests {
         )
         .expect("execution");
         assert_eq!(backend.uniform_sampling_batch_calls(), 1);
-        assert!(matches!(result.outputs["samples"], RuntimeValue::Family(_)));
         let members = result
             .materialize_output("samples", &backend, &mut store)
             .expect("materialize samples");
@@ -5748,21 +6204,22 @@ mod tests {
             .expect("build")
             .validate(&ParamEnv::default())
             .expect("validation");
-        let result = execute(
-            &built,
-            &mut cpu_backend([parameters.clone()]),
-            BTreeMap::new(),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .expect("execution");
+        let mut backend = cpu_backend([parameters.clone()]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&built, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("execution");
         let expected = |value| {
             DCRTPolyMatrix::from_poly_vec_row(
                 &parameters,
                 vec![DCRTPoly::from_usize_to_constant(&parameters, value)],
             )
         };
-        let RuntimeValue::Family(one) = &result.outputs["one"] else {
+        let one_output = result
+            .materialize_output("one", &backend, &mut store)
+            .expect("materialize singleton output")
+            .clone();
+        let RuntimeValue::Family(one) = one_output else {
             panic!("singleton output must be a family")
         };
         assert_eq!(one.len(), 1);
@@ -5770,7 +6227,11 @@ mod tests {
             panic!("singleton family member must be a matrix")
         };
         assert_eq!(one.as_ref(), &expected(0));
-        let RuntimeValue::Family(three) = &result.outputs["three"] else {
+        let three_output = result
+            .materialize_output("three", &backend, &mut store)
+            .expect("materialize ordered output")
+            .clone();
+        let RuntimeValue::Family(three) = three_output else {
             panic!("ordered output must be a family")
         };
         assert_eq!(three.len(), 3);
@@ -5780,6 +6241,63 @@ mod tests {
             };
             assert_eq!(actual.as_ref(), &expected(value));
         }
+    }
+
+    #[test]
+    fn parallel_apply_preimage_uses_one_relation_aware_multiply_batch() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u64 << parameters.base_bits());
+        let trapdoor = ring.sample_trapdoor(1, 5, gadget_base, digit_count, 1_000_000);
+        let preimages = Parallel::range(3)
+            .map_values({
+                let trapdoor = trapdoor.clone();
+                let ring = ring.clone();
+                move |index| {
+                    trapdoor.sample_preimage(
+                        ring.polynomial([index.expression()]),
+                        (digit_count + 2, 1),
+                    )
+                }
+            })
+            .expect("preimage family");
+        let left = ring.input("left", (1, digit_count + 2));
+        let products = preimages
+            .parallel_map_values(move |_, preimage| left.clone().apply_preimage(preimage))
+            .expect("applied preimage family");
+        let validated = DslContext::new("runtime-parallel-apply-preimage-batch")
+            .family_output("products", products)
+            .expect("products output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters.clone()]);
+        let result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::from([(
+                "left".to_owned(),
+                RuntimeValue::matrix(DCRTPolyMatrix::zero(&parameters, 1, digit_count + 2)),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(3).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("execution");
+
+        assert!(matches!(
+            &result.outputs["products"],
+            RuntimeValue::StagedArtifactFamily { descriptor, .. }
+                if descriptor.family_shape == Some(vec![3])
+        ));
+        assert_eq!(backend.multiply_calls(), 0);
+        assert_eq!(backend.multiply_batch_sizes(), &[3]);
     }
 
     #[test]

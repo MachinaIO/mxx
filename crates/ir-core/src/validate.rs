@@ -1821,8 +1821,25 @@ fn validate_index_expr(
             })?
         }
         IndexExpr::Log2Ceil(value) => {
-            validate_index_expr(value, output_rank, env, scope, node, sequential_slots)?;
-            None
+            let Some(value) =
+                validate_index_expr(value, output_rank, env, scope, node, sequential_slots)?
+            else {
+                return Ok(None);
+            };
+            let positive =
+                value.to_biguint().filter(|value| !value.is_zero()).ok_or_else(|| {
+                    ValidationError::Node {
+                        scope: scope.clone(),
+                        node,
+                        message: "index map log2ceil argument must be positive".to_owned(),
+                    }
+                })?;
+            let floor = positive.bits() - 1;
+            Some(BigInt::from(if positive == (num_bigint::BigUint::one() << floor as usize) {
+                floor
+            } else {
+                floor + 1
+            }))
         }
         IndexExpr::Select { selector, branches } => {
             if branches.is_empty() {
@@ -2459,6 +2476,115 @@ mod tests {
             );
         }
         assert_eq!(evaluate(IndexExpr::Axis(0)).unwrap(), None);
+    }
+
+    #[test]
+    fn constant_log2ceil_is_validated_in_family_and_grid_reindex_maps() {
+        let evaluate_log2ceil = |value| {
+            validate_index_expr(
+                &IndexExpr::Log2Ceil(Box::new(value)),
+                1,
+                &ParamEnv::default(),
+                &FrozenGraphScopeId::Root,
+                NodeId(0),
+                &BTreeSet::new(),
+            )
+        };
+        assert_eq!(evaluate_log2ceil(IndexExpr::constant(1)).unwrap(), Some(BigInt::from(0)));
+        assert_eq!(evaluate_log2ceil(IndexExpr::constant(8)).unwrap(), Some(BigInt::from(3)));
+        assert_eq!(evaluate_log2ceil(IndexExpr::constant(3)).unwrap(), Some(BigInt::from(2)));
+        assert_eq!(evaluate_log2ceil(IndexExpr::Axis(0)).unwrap(), None);
+
+        let matrix = matrix_type(17, 1, 1);
+        let log2ceil =
+            |value| IndexExpr::Log2Ceil(Box::new(IndexExpr::Constant(BigInt::from(value))));
+        let family_reindex = |name: &str, input_extent: i64, index: IndexExpr| {
+            let input_type = WireType::Family {
+                element: Box::new(WireType::Matrix(matrix.clone())),
+                shape: vec![IntExpr::constant(input_extent)],
+            };
+            let input = typed_input("family", input_type);
+            let output = value(
+                NodeKind::FamilyReindex {
+                    output_shape: vec![IntExpr::constant(1)],
+                    map: IndexMap::new([index]),
+                },
+                vec![input],
+                vec![WireType::Family {
+                    element: Box::new(WireType::Matrix(matrix.clone())),
+                    shape: vec![IntExpr::constant(1)],
+                }],
+            );
+            graph(name, output)
+        };
+        let parallel_reindex = |name: &str, input_extent: i64, index: IndexExpr| {
+            let input_type = WireType::Family {
+                element: Box::new(WireType::Matrix(matrix.clone())),
+                shape: vec![IntExpr::constant(input_extent)],
+            };
+            let input = typed_input("family", input_type);
+            let body = with_new_construction_scope(|scope| {
+                let element = typed_input("element", WireType::Matrix(matrix.clone()));
+                SubgraphHandle::new(
+                    "log2ceil-grid-body",
+                    scope,
+                    vec![element.clone()],
+                    vec![element],
+                )
+                .unwrap()
+            });
+            let output = NodeHandle::parallel_grid(
+                body,
+                vec![input],
+                vec![WireType::Family {
+                    element: Box::new(WireType::Matrix(matrix.clone())),
+                    shape: vec![IntExpr::constant(1)],
+                }],
+                ParallelGrid {
+                    shape: vec![IntExpr::constant(1)],
+                    index_slots: vec![0],
+                    bindings: Vec::new(),
+                    input_modes: vec![GridInputMode::Reindex { map: IndexMap::new([index]) }],
+                },
+            )
+            .output(0)
+            .unwrap();
+            graph(name, output)
+        };
+
+        validate(&family_reindex("valid-family-log2ceil", 4, log2ceil(8)), &ParamEnv::default())
+            .unwrap();
+        validate(&parallel_reindex("valid-grid-log2ceil", 4, log2ceil(8)), &ParamEnv::default())
+            .unwrap();
+        for invalid in [
+            family_reindex("outside-family-log2ceil", 2, log2ceil(8)),
+            parallel_reindex("outside-grid-log2ceil", 2, log2ceil(8)),
+        ] {
+            assert_eq!(
+                node_message(validate(&invalid, &ParamEnv::default()).unwrap_err()),
+                "index map result is outside input shape"
+            );
+        }
+        assert_eq!(
+            node_message(
+                validate(
+                    &family_reindex("zero-family-log2ceil", 4, log2ceil(0)),
+                    &ParamEnv::default(),
+                )
+                .unwrap_err()
+            ),
+            "index map log2ceil argument must be positive"
+        );
+        assert_eq!(
+            node_message(
+                validate(
+                    &parallel_reindex("negative-grid-log2ceil", 4, log2ceil(-1)),
+                    &ParamEnv::default(),
+                )
+                .unwrap_err()
+            ),
+            "index map log2ceil argument must be positive"
+        );
     }
 
     #[test]

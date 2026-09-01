@@ -81,9 +81,10 @@ pub enum WireType {
         preimage_max_coefficient_bound: IntExpr,
     },
     Preimage(MatrixType),
-    IndexedFamily {
+    /// A flat row-major family with one logical rank-N shape.
+    Family {
         element: Box<WireType>,
-        count: IntExpr,
+        shape: Vec<IntExpr>,
     },
 }
 
@@ -114,9 +115,9 @@ pub enum ConcreteWireType {
         preimage_max_coefficient_bound: BigInt,
     },
     Preimage(ConcreteMatrixType),
-    IndexedFamily {
+    Family {
         element: Box<ConcreteWireType>,
-        count: usize,
+        shape: Vec<usize>,
     },
 }
 

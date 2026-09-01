@@ -284,11 +284,10 @@ impl DiamondGpuMeasurementBackend {
             NodeKind::RealSqrt |
             NodeKind::TrapdoorPublic |
             NodeKind::SubgraphCall(_) |
-            NodeKind::ParallelLoop(_) |
             NodeKind::SequentialLoop(_) |
             NodeKind::FamilyPack { .. } |
             NodeKind::FamilyGetStatic { .. } |
-            NodeKind::FamilyGetDynamic |
+            NodeKind::FamilyGetDynamic { .. } |
             NodeKind::Select { .. } => Ok(NodeMeasurement::default()),
             NodeKind::ConstantMatrix { value, .. } => {
                 let output = Self::matrix_output(node)?.clone();
@@ -506,49 +505,12 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)
                 })
             }
-            NodeKind::HashSample { variant, tag_prefix, base, digit_count, .. } => {
+            NodeKind::HashSample { tag_prefix, .. } => {
                 let output = Self::matrix_output(node)?.clone();
                 let tag = tag_prefix.clone();
-                let gadget_base = base
-                    .as_ref()
-                    .map(|value| {
-                        value.evaluate(bindings).map_err(|error| {
-                            DiamondGpuMeasurementError::Expression(error.to_string())
-                        })
-                    })
-                    .transpose()?;
-                let digit_count = digit_count
-                    .as_ref()
-                    .map(|value| {
-                        value
-                            .evaluate(bindings)
-                            .map_err(|error| {
-                                DiamondGpuMeasurementError::Expression(error.to_string())
-                            })?
-                            .try_into()
-                            .map_err(|_| {
-                                DiamondGpuMeasurementError::Expression(
-                                    "hash digit count is not usize".to_owned(),
-                                )
-                            })
-                    })
-                    .transpose()?;
-                let gadget_layout = match (variant, gadget_base.as_ref(), digit_count) {
-                    (HashVariant::Plain, None, None) => None,
-                    (
-                        HashVariant::Decomposed | HashVariant::SmallDecomposed,
-                        Some(base),
-                        Some(count),
-                    ) if count > 0 && output.rows % count == 0 => Some((base, count)),
-                    _ => {
-                        return Err(DiamondGpuMeasurementError::Expression(
-                            "hash variant and gadget layout do not match".to_owned(),
-                        ));
-                    }
-                };
                 self.measure_placements(node, bindings, |this| {
                     this.backend
-                        .sample_hash(&output, [0x5a; 32], &tag, *variant, gadget_layout)
+                        .sample_hash(&output, [0x5a; 32], &tag, HashVariant::Plain, None)
                         .map(ReadyOutput::Matrix)
                         .map_err(Self::backend_error)
                 })

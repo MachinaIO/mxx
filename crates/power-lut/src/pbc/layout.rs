@@ -21,7 +21,8 @@ use super::{
 pub enum PbcProfile {
     /// A conservative bucket-count and retry policy.
     Conservative,
-    /// Parameters used by the balanced three-replica evaluation path.
+    /// Parameters using three candidate buckets per coordinate and a larger
+    /// deterministic retry budget.
     PaperEvaluation,
     /// Explicit values supplied through [`PbcParameters::custom`].
     Custom,
@@ -91,7 +92,8 @@ impl PbcParameters {
         }
     }
 
-    /// Creates the three-replica evaluation preset for a universe and support weight.
+    /// Creates the numeric policy with three candidate buckets per coordinate,
+    /// `bucket_count = max(3, support_weight + 3)`, and 128 retries.
     pub fn paper_evaluation(universe_size: usize, support_weight: usize) -> Self {
         Self {
             universe_size,

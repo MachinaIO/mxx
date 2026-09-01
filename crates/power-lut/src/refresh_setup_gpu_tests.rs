@@ -177,7 +177,7 @@ impl Fixture {
         let generated = generate_key_layout(&pbc_parameters, PbcRootSeed([0x27; 32]), &[0])
             .expect("small PBC fixture layout");
         let selector_bits = PbcTrustedSelectorBits::from_schedule(&generated, &ring, [0x4b; 32])
-            .expect("trusted selector bits");
+            .expect("selector bits");
         let selector_names = PbcSelectorArtifactNames::canonicalize_schema(
             &generated.public_layout,
             [0x4b; 32],
@@ -741,7 +741,7 @@ fn test_gpu_refresh_setup_producer_export_import_refresh_verify() {
         BTreeMap::from([
             (
                 fixture.selector_bits.input_name().to_owned(),
-                RuntimeValue::IndexedFamily(
+                RuntimeValue::Family(
                     fixture
                         .selector_bits
                         .runtime_bits()
@@ -805,7 +805,7 @@ fn test_gpu_refresh_setup_producer_export_import_refresh_verify() {
             ("refresh-setup-gpu-hash-key".to_owned(), RuntimeValue::Bytes(vec![0x42; 32])),
             (
                 fixture.public_values_name.clone(),
-                RuntimeValue::IndexedFamily(
+                RuntimeValue::Family(
                     fixture
                         .public_values
                         .iter()
@@ -930,7 +930,7 @@ fn test_gpu_refresh_setup_producer_export_import_refresh_verify() {
             .refresh
             .scale_expression(slot)
             .expect("slot scale")]);
-        let actual = imported.public_b.clone() * imported.preimages[slot].clone();
+        let actual = imported.public_b.clone().apply_preimage(imported.preimages[slot].clone());
         let scaled_state = fixture.compiler.bgg.large_scalar_mul(&imported.state, &alpha);
         let scaled_fresh = fixture.compiler.bgg.large_scalar_mul(&imported.fresh, &alpha);
         let target = scaled_state.pubkey.matrix +
@@ -943,7 +943,10 @@ fn test_gpu_refresh_setup_producer_export_import_refresh_verify() {
                 imported.masks[slot].pubkey.matrix.clone(),
             )
             .expect("mask oracle output")
-            .public_output(format!("imported_preimage_{slot}"), imported.preimages[slot].clone())
+            .private_preimage_output(
+                format!("imported_preimage_{slot}"),
+                imported.preimages[slot].clone(),
+            )
             .expect("preimage oracle output")
             .public_output(format!("actual_bk_{slot}"), actual)
             .expect("B*K oracle output")
@@ -971,7 +974,7 @@ fn test_gpu_refresh_setup_producer_export_import_refresh_verify() {
             ("refresh-setup-gpu-hash-key".to_owned(), RuntimeValue::Bytes(vec![0x42; 32])),
             (
                 fixture.public_values_name.clone(),
-                RuntimeValue::IndexedFamily(
+                RuntimeValue::Family(
                     fixture
                         .public_values
                         .iter()
@@ -981,7 +984,7 @@ fn test_gpu_refresh_setup_producer_export_import_refresh_verify() {
             ),
             (
                 fixture.independent_public_values_name.clone(),
-                RuntimeValue::IndexedFamily(
+                RuntimeValue::Family(
                     fixture
                         .independent_public_values
                         .iter()

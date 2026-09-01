@@ -20,6 +20,7 @@ use mxx_runtime::{ExecutionConfig, artifact::MemoryArtifactStore};
 use mxx_we::diamond::{
     DiamondGpuMeasurementBackend, DiamondParameterSearch, DiamondWeRuntime, estimate_diamond_cost,
 };
+use num_traits::Signed;
 use std::{env, num::NonZeroUsize, time::Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -49,7 +50,7 @@ fn and_circuit() -> BooleanCircuitData {
     }
 }
 
-/// Exercises the real selection, Rust operational checker, GPU cost model, and GPU runtime path.
+/// Exercises parameter selection, direct noise simulation, GPU cost model, and runtime.
 ///
 /// The small defaults are intentionally only a smoke configuration. All search, measurement, and
 /// execution settings are environment-overridable for a larger benchmark invocation.
@@ -59,32 +60,43 @@ fn and_circuit() -> BooleanCircuitData {
 fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
     install_tracing();
     let total_started = Instant::now();
-    let device_ids = detected_gpu_device_ids();
-    assert!(!device_ids.is_empty(), "the GPU Diamond WE integration test requires a GPU");
-    let effective_parallel_width =
-        env_usize("MXX_DIAMOND_WE_GPU_PARALLEL_WIDTH", device_ids.len()).clamp(1, device_ids.len());
-    let device_ids = device_ids[..effective_parallel_width].to_vec();
-    let shape =
-        BooleanCircuitShape { instance_width: 1, witness_width: 1, depth: 1, max_layer_width: 2 };
+    let witness_size = env_usize("MXX_DIAMOND_WE_GPU_WITNESS_SIZE", 10);
+    assert!(witness_size > 0, "MXX_DIAMOND_WE_GPU_WITNESS_SIZE must be positive");
+    assert!(
+        witness_size < usize::BITS as usize,
+        "MXX_DIAMOND_WE_GPU_WITNESS_SIZE must fit the host digit representation"
+    );
+    // One Diamond input digit contains all witness bits for this smoke graph.
+    // The injector requires digit_base >= 2^batch_bits, so derive the base
+    // from the selected batch width instead of using the binary base 2.
+    let digit_base = 1usize
+        .checked_shl(witness_size as u32)
+        .expect("validated witness size fits the host digit representation");
+    let shape = BooleanCircuitShape {
+        instance_width: 1,
+        witness_width: witness_size,
+        depth: 1,
+        max_layer_width: witness_size + 1,
+    };
     let search = DiamondParameterSearch {
         shape,
         min_crt_depth: env_usize("MXX_DIAMOND_WE_GPU_MIN_CRT_DEPTH", 1),
         initial_max_crt_depth: env_usize("MXX_DIAMOND_WE_GPU_INITIAL_MAX_CRT_DEPTH", 1),
         max_crt_depth: env_usize("MXX_DIAMOND_WE_GPU_MAX_CRT_DEPTH", 4),
         min_log_ring_dimension: env_usize("MXX_DIAMOND_WE_GPU_MIN_LOG_RING_DIM", 5),
-        max_log_ring_dimension: env_usize("MXX_DIAMOND_WE_GPU_MAX_LOG_RING_DIM", 5),
+        max_log_ring_dimension: env_usize("MXX_DIAMOND_WE_GPU_MAX_LOG_RING_DIM", 12),
         crt_modulus_bits: env_usize("MXX_DIAMOND_WE_GPU_CRT_MODULUS_BITS", 60),
         gadget_base_bits: env_usize("MXX_DIAMOND_WE_GPU_GADGET_BASE_BITS", 4) as u32,
-        security_bits: env_usize("MXX_DIAMOND_WE_GPU_SECURITY_BITS", 1),
+        security_bits: env_usize("MXX_DIAMOND_WE_GPU_SECURITY_BITS", 128),
         input_count: 1,
-        digit_base: 2,
-        batch_bits: 1,
+        digit_base,
+        batch_bits: witness_size,
         trapdoor_sigma: 4.0,
         error_sigma: 1.0,
         bgg_tag: b"diamond-we-gpu-integration".to_vec(),
     };
 
-    info!(?device_ids, effective_parallel_width, "starting GPU Diamond WE integration test");
+    info!("starting GPU Diamond WE parameter search and noise simulation");
     let search_started = Instant::now();
     let selected = search.search().expect("GPU Diamond WE parameter search");
     info!(
@@ -95,6 +107,14 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         elapsed_seconds = search_started.elapsed().as_secs_f64(),
         "completed GPU Diamond WE parameter search"
     );
+
+    // Defer hardware discovery until the CPU-only parameter-search stages have
+    // completed, so their result remains observable on machines without CUDA.
+    let device_ids = detected_gpu_device_ids();
+    assert!(!device_ids.is_empty(), "the GPU Diamond WE integration test requires a GPU");
+    let effective_parallel_width =
+        env_usize("MXX_DIAMOND_WE_GPU_PARALLEL_WIDTH", device_ids.len()).clamp(1, device_ids.len());
+    let device_ids = device_ids[..effective_parallel_width].to_vec();
 
     let (moduli, _, _) = selected.parameters.to_crt();
     let gpu_parameters = GpuDCRTPolyParams::new_with_gpu(
@@ -149,36 +169,74 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         "the analytical matrix/trapdoor payload estimate must be nonzero"
     );
 
-    let runtime_started = Instant::now();
-    let mut runtime =
-        GpuDiamondWeRuntime::new(selected.compiler, gpu_parameters, MemoryArtifactStore::default())
-            .expect("GPU Diamond WE runtime construction")
-            .with_execution_config(ExecutionConfig {
-                max_parallel_instances: NonZeroUsize::new(effective_parallel_width)
-                    .expect("effective parallel width is nonzero"),
-                ..ExecutionConfig::default()
-            });
+    // GPU.md requires repeated runtime executions to expose intermittent synchronization faults.
+    // The parameter simulation and cost estimate remain single-run stages.
+    let runtime_repetitions = env_usize("MXX_DIAMOND_WE_GPU_RUNTIME_REPETITIONS", 3);
+    assert!(runtime_repetitions > 0, "MXX_DIAMOND_WE_GPU_RUNTIME_REPETITIONS must be positive");
     let circuit = and_circuit();
-    let instance = [true];
-    let witness = [true];
+    let instance = vec![true; 1];
+    let witness = vec![true; witness_size];
     let message = true;
-    let encrypt_started = Instant::now();
-    let ciphertext =
-        runtime.encrypt(&circuit, &instance, message).expect("GPU Diamond WE encryption");
-    info!(
-        elapsed_seconds = encrypt_started.elapsed().as_secs_f64(),
-        "completed GPU Diamond WE encryption"
-    );
-    let decrypt_started = Instant::now();
-    let decoded = runtime
-        .decrypt(&circuit, &instance, &witness, &ciphertext)
-        .expect("GPU Diamond WE decryption");
-    info!(
-        elapsed_seconds = decrypt_started.elapsed().as_secs_f64(),
-        runtime_elapsed_seconds = runtime_started.elapsed().as_secs_f64(),
-        "completed GPU Diamond WE decryption"
-    );
-    assert_eq!(decoded, message, "GPU Diamond WE round trip must preserve the message");
+    for iteration in 0..runtime_repetitions {
+        let runtime_started = Instant::now();
+        let mut runtime = GpuDiamondWeRuntime::new(
+            selected.compiler.clone(),
+            gpu_parameters.clone(),
+            MemoryArtifactStore::default(),
+        )
+        .expect("GPU Diamond WE runtime construction")
+        .with_execution_config(ExecutionConfig {
+            max_parallel_instances: NonZeroUsize::new(effective_parallel_width)
+                .expect("effective parallel width is nonzero"),
+            ..ExecutionConfig::default()
+        });
+        let encrypt_started = Instant::now();
+        let ciphertext =
+            runtime.encrypt(&circuit, &instance, message).expect("GPU Diamond WE encryption");
+        info!(
+            iteration,
+            elapsed_seconds = encrypt_started.elapsed().as_secs_f64(),
+            "completed GPU Diamond WE encryption"
+        );
+        let decrypt_started = Instant::now();
+        let decryption = runtime
+            .decrypt_with_diagnostics(&circuit, &instance, &witness, &ciphertext)
+            .expect("GPU Diamond WE decryption");
+        info!(
+            iteration,
+            elapsed_seconds = decrypt_started.elapsed().as_secs_f64(),
+            runtime_elapsed_seconds = runtime_started.elapsed().as_secs_f64(),
+            "completed GPU Diamond WE decryption"
+        );
+        assert_eq!(
+            decryption.decoded, message,
+            "GPU Diamond WE round trip must preserve the message"
+        );
+        let modulus = num_bigint::BigInt::from(selected.modulus.clone());
+        let ideal_constant = if message { &modulus / 2 } else { num_bigint::BigInt::from(0) };
+        let observed_noise = decryption
+            .noisy_plaintext_coefficients
+            .iter()
+            .enumerate()
+            .map(|(position, coefficient)| {
+                let ideal = if position == 0 { ideal_constant.clone() } else { 0.into() };
+                let direct_distance = (coefficient - ideal).abs();
+                direct_distance.clone().min(&modulus - direct_distance)
+            })
+            .max()
+            .expect("the noisy plaintext polynomial has coefficients");
+        assert!(
+            observed_noise <= num_bigint::BigInt::from(selected.noise_bound.clone()),
+            "observed noise {observed_noise} exceeds simulated bound {}",
+            selected.noise_bound
+        );
+        info!(
+            iteration,
+            observed_noise = %observed_noise,
+            simulated_noise_bound = %selected.noise_bound,
+            "verified observed Diamond WE noise against the simulator bound"
+        );
+    }
     info!(
         elapsed_seconds = total_started.elapsed().as_secs_f64(),
         "completed GPU Diamond WE integration test"

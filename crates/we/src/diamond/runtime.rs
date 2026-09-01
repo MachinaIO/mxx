@@ -21,12 +21,19 @@ use std::{collections::BTreeMap, time::Instant};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use super::graph::{DECODED_OUTPUT, HASH_KEY_INPUT, MESSAGE_INPUT};
+use super::graph::{DECODED_OUTPUT, HASH_KEY_INPUT, MESSAGE_INPUT, NOISY_PLAINTEXT_OUTPUT};
 
 #[derive(Clone)]
 pub struct DiamondWeCiphertext {
     pub hash_key: [u8; 32],
     pub encryption: ProductionId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiamondDecryptionResult {
+    pub decoded: bool,
+    /// Canonical coefficients of the noisy plaintext polynomial in [0, q).
+    pub noisy_plaintext_coefficients: Vec<num_bigint::BigInt>,
 }
 
 pub struct DiamondWeRuntime<M, U, H, T, S>
@@ -66,6 +73,8 @@ pub enum DiamondRuntimeError {
     ProductionGraphMismatch,
     #[error("the Diamond decryption graph did not return a boolean")]
     DecodeOutput,
+    #[error("the Diamond decryption graph did not return its noisy plaintext matrix")]
+    NoisyPlaintextOutput,
 }
 
 impl<M, U, H, T, S> DiamondWeRuntime<M, U, H, T, S>
@@ -190,6 +199,34 @@ where
         witness: &[bool],
         ciphertext: &DiamondWeCiphertext,
     ) -> Result<bool, DiamondRuntimeError> {
+        self.decrypt_internal(circuit, instance, witness, ciphertext, false)
+            .map(|(decoded, _)| decoded)
+    }
+
+    pub fn decrypt_with_diagnostics(
+        &mut self,
+        circuit: &BooleanCircuitData,
+        instance: &[bool],
+        witness: &[bool],
+        ciphertext: &DiamondWeCiphertext,
+    ) -> Result<DiamondDecryptionResult, DiamondRuntimeError> {
+        let (decoded, noisy_plaintext_coefficients) =
+            self.decrypt_internal(circuit, instance, witness, ciphertext, true)?;
+        Ok(DiamondDecryptionResult {
+            decoded,
+            noisy_plaintext_coefficients: noisy_plaintext_coefficients
+                .ok_or(DiamondRuntimeError::NoisyPlaintextOutput)?,
+        })
+    }
+
+    fn decrypt_internal(
+        &mut self,
+        circuit: &BooleanCircuitData,
+        instance: &[bool],
+        witness: &[bool],
+        ciphertext: &DiamondWeCiphertext,
+        include_diagnostics: bool,
+    ) -> Result<(bool, Option<Vec<num_bigint::BigInt>>), DiamondRuntimeError> {
         let total_started = Instant::now();
         let validation_started = Instant::now();
         self.validate_public_inputs(circuit, instance)?;
@@ -262,12 +299,35 @@ where
         let Some(RuntimeValue::Bool(decoded)) = result.outputs.get(DECODED_OUTPUT) else {
             return Err(DiamondRuntimeError::DecodeOutput);
         };
+        let decoded = *decoded;
+        let noisy_plaintext_coefficients = if include_diagnostics {
+            let Some(RuntimeValue::Matrix(noisy_plaintext)) =
+                result.outputs.get(NOISY_PLAINTEXT_OUTPUT)
+            else {
+                return Err(DiamondRuntimeError::NoisyPlaintextOutput);
+            };
+            // The ideal plaintext is a constant polynomial. Returning every
+            // canonical coefficient lets diagnostics measure the maximum
+            // modular error, including nonconstant coefficients that decoding
+            // ignores. The ordinary decrypt path deliberately avoids this
+            // device-to-host materialization and synchronization.
+            Some(
+                noisy_plaintext
+                    .entry(0, 0)
+                    .coeffs_biguints()
+                    .into_iter()
+                    .map(num_bigint::BigInt::from)
+                    .collect(),
+            )
+        } else {
+            None
+        };
         info!(
             execution_elapsed_seconds = execution_started.elapsed().as_secs_f64(),
             total_elapsed_seconds = total_started.elapsed().as_secs_f64(),
             "finished Diamond decryption graph execution"
         );
-        Ok(*decoded)
+        Ok((decoded, noisy_plaintext_coefficients))
     }
 
     fn validate_public_inputs(
@@ -289,7 +349,7 @@ fn circuit_inputs<B: Backend>(
 ) -> BTreeMap<String, RuntimeValue<B>> {
     let maximum_width = shape.analyze().expect("validated Boolean shape").maximum_layer_width;
     let family = |values: Vec<num_bigint::BigInt>| {
-        RuntimeValue::IndexedFamily(values.into_iter().map(RuntimeValue::Int).collect())
+        RuntimeValue::Family(values.into_iter().map(RuntimeValue::Int).collect())
     };
     let mut active_gate_counts = Vec::with_capacity(circuit.layers.len());
     let mut kinds = Vec::with_capacity(circuit.layers.len() * maximum_width);
@@ -324,7 +384,7 @@ fn insert_boolean_family_input<B: Backend>(
     padded.resize(maximum_width, 0.into());
     inputs.insert(
         name.to_owned(),
-        RuntimeValue::IndexedFamily(padded.into_iter().map(RuntimeValue::Int).collect()),
+        RuntimeValue::Family(padded.into_iter().map(RuntimeValue::Int).collect()),
     );
 }
 

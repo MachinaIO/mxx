@@ -1,7 +1,7 @@
 use crate::{
     artifact::ArtifactConfidentiality,
     expr::RealExpr,
-    node::{NodeKind, ParallelLoop, SequentialLoop, SubgraphCall},
+    node::{NodeKind, ParallelGrid, SequentialLoop, SubgraphCall},
     types::{NodeId, Port, WireRef, WireType},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -145,15 +145,15 @@ impl NodeHandle {
     }
 
     #[track_caller]
-    pub fn parallel_loop(
+    pub fn parallel_grid(
         body: SubgraphHandle,
         arguments: Vec<ValueHandle>,
         output_types: Vec<WireType>,
-        loop_spec: ParallelLoop,
+        grid_spec: ParallelGrid,
     ) -> Self {
         Self::new_in_scope(
             current_construction_scope(),
-            NodeKind::ParallelLoop(loop_spec),
+            NodeKind::ParallelGrid(grid_spec),
             arguments,
             output_types,
             Some(SourceLocation::caller()),
@@ -444,10 +444,6 @@ impl ScopeSealer {
             NodeKind::Input { artifact, .. } => artifact.clone(),
             _ => None,
         };
-        let is_artifact_family = artifact.is_some();
-        if matches!(value.wire_type(), WireType::IndexedFamily { .. }) && !is_artifact_family {
-            return Err(FreezeError::ForeignScope { graph: "parallel family capture".to_owned() });
-        }
         let key = (value.node.identity(), value.port);
         if let Some(input) = self.capture_inputs.get(&key) {
             return Ok(input.clone());
@@ -726,7 +722,7 @@ impl Graph {
             NodeKind::SubgraphCall(call) => {
                 Some(FrozenGraphScopeId::Subgraph { canonical_name: call.definition.clone() })
             }
-            NodeKind::ParallelLoop(_) => Some(FrozenGraphScopeId::ParallelBody {
+            NodeKind::ParallelGrid(_) => Some(FrozenGraphScopeId::ParallelBody {
                 parent: Box::new(parent.clone()),
                 owner: node,
             }),
@@ -1297,9 +1293,9 @@ mod tests {
                 output,
             )
         });
-        let family_type = WireType::IndexedFamily {
+        let family_type = WireType::Family {
             element: Box::new(WireType::Matrix(matrix_type())),
-            count: IntExpr::constant(1),
+            shape: vec![IntExpr::constant(1)],
         };
         let family = NodeHandle::new(
             NodeKind::Input {
@@ -1313,17 +1309,17 @@ mod tests {
         .output(0)
         .unwrap();
         let make_loop = || {
-            NodeHandle::parallel_loop(
+            NodeHandle::parallel_grid(
                 body.clone(),
                 vec![family.clone()],
                 vec![family_type.clone()],
-                ParallelLoop {
-                    count: IntExpr::constant(1),
-                    minimum_count: 0,
-                    index_slot: 0,
+                ParallelGrid {
+                    shape: vec![IntExpr::constant(1)],
+                    index_slots: vec![0],
                     bindings: Vec::new(),
-                    input_modes: vec![crate::node::LoopInputMode::Zip],
-                    output_mode: crate::node::ParallelOutputMode::Family,
+                    input_modes: vec![crate::node::GridInputMode::Reindex {
+                        map: crate::IndexMap::new([crate::IndexExpr::Axis(0)]),
+                    }],
                 },
             )
             .output(0)

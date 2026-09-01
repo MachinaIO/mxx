@@ -461,7 +461,7 @@ pub enum RuntimeValue<B: Backend> {
         name: String,
         descriptor: mxx_ir_core::artifact::ManifestArtifact,
     },
-    IndexedFamily(Vec<RuntimeValue<B>>),
+    Family(Vec<RuntimeValue<B>>),
 }
 
 impl<B: Backend> Clone for RuntimeValue<B> {
@@ -514,7 +514,7 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                     descriptor: descriptor.clone(),
                 }
             }
-            Self::IndexedFamily(values) => Self::IndexedFamily(values.clone()),
+            Self::Family(values) => Self::Family(values.clone()),
         }
     }
 }
@@ -527,9 +527,7 @@ impl<B: Backend> RuntimeValue<B> {
                 Arc::strong_count(public) == 1 ||
                     secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)
             }
-            Self::IndexedFamily(values) => {
-                values.iter().any(Self::releases_backend_resources_on_drop)
-            }
+            Self::Family(values) => values.iter().any(Self::releases_backend_resources_on_drop),
             Self::Int(_) |
             Self::Real(_) |
             Self::Bool(_) |

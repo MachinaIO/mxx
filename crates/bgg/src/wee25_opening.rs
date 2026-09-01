@@ -1,7 +1,7 @@
 //! Standalone WEE25 opening and verification graphs.
 
 use crate::{Wee25CommitmentCompiler, Wee25CommitmentError};
-use mxx_dsl::{Family, Mat};
+use mxx_dsl::{Family, Mat, Preimage};
 use mxx_ir_core::{
     IntExpr,
     artifact::{ArtifactConfidentiality, ProductionId},
@@ -31,7 +31,7 @@ pub struct Wee25CommitmentArtifacts {
 pub struct Wee25PublicParameterWires {
     pub b: Mat,
     /// Ordered by `(digit_row, column_part)`.
-    pub t_top: Vec<Family<Mat>>,
+    pub t_top: Vec<Family<Preimage>>,
     pub t_bottom: Family<Mat>,
 }
 
@@ -72,10 +72,10 @@ impl Wee25CommitmentCompiler {
         let t_top = (0..self.public_parameter_top_family_count())
             .map(|index| {
                 let name = self.public_parameter_top_name(index / part_count, index % part_count);
-                ring.family_artifact_input(
+                ring.preimage_family_artifact_input(
                     artifacts.production_id.clone(),
                     name,
-                    self.public_parameter_block_count(),
+                    vec![self.public_parameter_block_count().into()],
                     (self.public_columns(), self.public_columns()),
                     ArtifactConfidentiality::Public,
                 )
@@ -128,7 +128,7 @@ impl Wee25CommitmentCompiler {
         range: Option<Range<usize>>,
         parameters: &Wee25PublicParameterWires,
         commitment_nodes: &Family<Mat>,
-    ) -> Result<Mat, Wee25CommitmentError> {
+    ) -> Result<Preimage, Wee25CommitmentError> {
         self.validate_opening_inputs(message_blocks, commitment_nodes)?;
         self.validate_public_parameter_wires(parameters)?;
         let range = checked_range(range, message_blocks.len())?;
@@ -152,7 +152,7 @@ impl Wee25CommitmentCompiler {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(concat_columns(openings))
+        Ok(Preimage::concat_columns(openings))
     }
 
     pub fn verifier(
@@ -179,7 +179,7 @@ impl Wee25CommitmentCompiler {
         &self,
         message_blocks: &[Mat],
         commitment: &Mat,
-        opening: &Mat,
+        opening: &Preimage,
         range: Option<Range<usize>>,
         parameters: &Wee25PublicParameterWires,
     ) -> Result<Wee25VerificationWire, Wee25CommitmentError> {
@@ -189,7 +189,7 @@ impl Wee25CommitmentCompiler {
         let message = concat_columns(message_blocks[range].to_vec());
         Ok(Wee25VerificationWire {
             residual: commitment.clone() * verifier -
-                (message - parameters.b.clone() * opening.clone()),
+                (message - parameters.b.clone().apply_preimage(opening.clone())),
         })
     }
 
@@ -238,9 +238,9 @@ impl Wee25CommitmentCompiler {
         nodes: &Family<Mat>,
         verifier_base: &Mat,
         verifier_base_last: &Mat,
-        z_cache: &mut BTreeMap<(usize, usize, usize), Mat>,
+        z_cache: &mut BTreeMap<(usize, usize, usize), Preimage>,
         verifier_cache: &mut BTreeMap<(usize, usize), Mat>,
-    ) -> Result<Mat, Wee25CommitmentError> {
+    ) -> Result<Preimage, Wee25CommitmentError> {
         if blocks.len() == self.tree_base {
             return Ok(self.open_base(&concat_columns(blocks.to_vec()), column, parameters, true));
         }
@@ -284,8 +284,11 @@ impl Wee25CommitmentCompiler {
             child_column,
             verifier_cache,
         );
-        Ok(z_prime * verifier.decompose(self.gadget_base.clone(), self.digit_count).as_mat() +
-            z_child)
+        Ok(z_prime
+            .compose_exact_decomposition(
+                verifier.decompose(self.gadget_base.clone(), self.digit_count),
+            )
+            .add_same_source(z_child))
     }
 
     fn open_base(
@@ -294,11 +297,9 @@ impl Wee25CommitmentCompiler {
         column: usize,
         parameters: &Wee25PublicParameterWires,
         leaf: bool,
-    ) -> Mat {
+    ) -> Preimage {
         let base_columns = self.tree_base * self.public_columns();
-        let width = self.public_columns() * self.digit_count;
-        let decomposition =
-            message.clone().decompose(self.gadget_base.clone(), self.digit_count).as_mat();
+        let decomposition = message.clone().decompose(self.gadget_base.clone(), self.digit_count);
         let terms = (0..base_columns * self.gadget_rows())
             .map(|index| {
                 let message_column = index / self.gadget_rows();
@@ -311,28 +312,22 @@ impl Wee25CommitmentCompiler {
                             .get_static(message_column)
                     })
                     .collect();
-                let scalar = decomposition.clone().slice(
-                    Some(IndexRange { start: digit_row.into(), end: (digit_row + 1).into() }),
-                    Some(IndexRange {
-                        start: message_column.into(),
-                        end: (message_column + 1).into(),
-                    }),
-                );
-                concat_columns(chunks) * scalar
+                let scalar = decomposition.entry(digit_row, message_column);
+                Preimage::concat_columns(chunks).right_multiply_exact(scalar)
             })
             .collect::<Vec<_>>();
         let opening = terms
             .into_iter()
-            .reduce(|sum, term| sum + term)
-            .unwrap_or_else(|| self.ring().zero((self.public_columns(), width)));
+            .reduce(Preimage::add_same_source)
+            .expect("validated WEE25 layout has at least one opening term");
         if !leaf {
             return opening;
         }
-        opening *
+        opening.compose_exact_decomposition(
             self.ring()
                 .identity(self.public_columns())
-                .decompose(self.gadget_base.clone(), self.digit_count)
-                .as_mat()
+                .decompose(self.gadget_base.clone(), self.digit_count),
+        )
     }
 
     fn verifier_base(&self, parameters: &Wee25PublicParameterWires, leaf: bool) -> Mat {
@@ -344,11 +339,9 @@ impl Wee25CommitmentCompiler {
             return bottom;
         }
         let columns = self.tree_base * self.public_columns();
-        bottom *
-            self.ring()
-                .identity(columns)
-                .decompose(self.gadget_base.clone(), self.digit_count)
-                .as_mat()
+        bottom.mul_decomposed(
+            self.ring().identity(columns).decompose(self.gadget_base.clone(), self.digit_count),
+        )
     }
 
     fn verifier_recursive(
@@ -376,13 +369,15 @@ impl Wee25CommitmentCompiler {
                 self.verifier_recursive(base, base_last, child_count, column % child_count, cache);
             let sibling = column / child_count;
             let width = self.public_columns() * self.digit_count;
-            base.clone().slice(
-                None,
-                Some(IndexRange {
-                    start: (width * sibling).into(),
-                    end: (width * (sibling + 1)).into(),
-                }),
-            ) * child.decompose(self.gadget_base.clone(), self.digit_count).as_mat()
+            base.clone()
+                .slice(
+                    None,
+                    Some(IndexRange {
+                        start: (width * sibling).into(),
+                        end: (width * (sibling + 1)).into(),
+                    }),
+                )
+                .mul_decomposed(child.decompose(self.gadget_base.clone(), self.digit_count))
         };
         cache.insert((block_count, column), result.clone());
         result
@@ -687,7 +682,7 @@ mod tests {
             .map(|(index, value)| {
                 let name = format!("top-{index}");
                 inputs.insert(name.clone(), RuntimeValue::matrix(value.clone()));
-                ring.input(name, (compiler.public_columns(), compiler.public_columns()))
+                ring.preimage_input(name, (compiler.public_columns(), compiler.public_columns()))
             })
             .collect::<Vec<_>>();
         let mut top_families = Vec::with_capacity(compiler.public_parameter_top_family_count());
@@ -725,7 +720,7 @@ mod tests {
         let opening = compiler.opening(&blocks, Some(1..3), &public, &tree.cached_nodes).unwrap();
         let verifier = compiler.verifier(4, Some(1..3), &public).unwrap();
         let graph = DslContext::new("wee25-partial-range-runtime")
-            .output("opening", opening)
+            .preimage_output("opening", opening)
             .unwrap()
             .output("verifier", verifier)
             .unwrap()

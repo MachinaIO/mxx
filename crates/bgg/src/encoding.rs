@@ -3,10 +3,7 @@
 use crate::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
 use bigdecimal::BigDecimal;
 use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
-use mxx_ir_core::{
-    IntExpr, RealExpr, ValueHandle, WireType,
-    node::{ConcatAxis, IndexRange},
-};
+use mxx_ir_core::{IntExpr, RealExpr, ValueHandle, WireType, node::IndexRange};
 use num_bigint::ToBigInt;
 use num_traits::{ToPrimitive, Zero};
 use rayon::prelude::*;
@@ -119,6 +116,9 @@ impl BggEncodingCompiler {
         lhs: &BggEncodingWire,
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
+        // If C_L and C_R are encodings, their additive carrier is C_L + C_R and
+        // their known message is x_L + x_R; the public-key relation is added in
+        // the same coordinate system, so no carrier or column is discarded.
         Ok(BggEncodingWire {
             vector: lhs.vector.clone() + rhs.vector.clone(),
             pubkey: self.public_key.add(&lhs.pubkey, &rhs.pubkey),
@@ -131,6 +131,8 @@ impl BggEncodingCompiler {
         lhs: &BggEncodingWire,
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
+        // Subtraction is the same component-wise relation with signs reversed:
+        // C_L - C_R carries x_L - x_R and A_L - A_R, respectively.
         Ok(BggEncodingWire {
             vector: lhs.vector.clone() - rhs.vector.clone(),
             pubkey: self.public_key.sub(&lhs.pubkey, &rhs.pubkey),
@@ -149,18 +151,25 @@ impl BggEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        // For C_L = s_L A_L - x_L s_L G + e_L and the decomposition
+        // G K_R = A_R, the two terms C_L K_R + x_L C_R cancel the
+        // cross term and leave an encoding of x_L x_R.  `mul_decomposed`
+        // keeps K_R as the rightmost carrier consumed by C_L.
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone() * decomposed_rhs + rhs.vector.clone() * plaintext,
+            vector: lhs.vector.clone().mul_decomposed(decomposed_rhs) +
+                plaintext * rhs.vector.clone(),
             pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
     }
 
     pub fn small_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
+        // For a small scalar t, t C_x is the encoding carrier and t x is its
+        // known plaintext.  The scalar is on the left so it acts on every row
+        // without changing the gadget-column layout.
         BggEncodingWire {
-            vector: input.vector.clone() * scalar.clone(),
+            vector: scalar.clone() * input.vector.clone(),
             pubkey: self.public_key.small_scalar_mul(&input.pubkey, scalar),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
@@ -168,8 +177,11 @@ impl BggEncodingCompiler {
 
     pub fn large_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
         let decomposed = self.public_key.large_scalar_decomposition(&input.pubkey, scalar);
+        // A large scalar t is represented by the decomposition of tG.  Thus
+        // C_x G^-1(tG) is the carrier-preserving form of t C_x, while the
+        // metadata records the ordinary plaintext product t x.
         BggEncodingWire {
-            vector: input.vector.clone() * decomposed.clone(),
+            vector: input.vector.clone().mul_decomposed(decomposed.clone()),
             pubkey: self.public_key.large_scalar_mul_with_decomposition(&input.pubkey, decomposed),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
@@ -178,10 +190,12 @@ impl BggEncodingCompiler {
     pub fn matrix_mul(&self, input: &BggEncodingWire, target: &Mat) -> BggEncodingWire {
         let decomposed = target
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        // This is an explicit right action by an arbitrary target matrix.  Its
+        // decomposition is used only to consume the input carrier; it does not
+        // assert that the projected target itself is a canonical G encoding.
         BggEncodingWire {
-            vector: input.vector.clone() * decomposed,
+            vector: input.vector.clone().mul_decomposed(decomposed),
             pubkey: self.public_key.matrix_mul(&input.pubkey, target),
             plaintext: None,
         }
@@ -390,38 +404,38 @@ impl BggEncodingSampler {
         {
             return Err(BggSampleError::MatrixTypeMismatch);
         }
-        let all_public_keys = Mat::concat(
-            ConcatAxis::Columns,
-            public_keys.iter().map(|key| key.matrix.clone()).collect(),
-        );
         let one = ring.identity(1);
         let mut extended_plaintexts = Vec::with_capacity(count);
         extended_plaintexts.push(one);
         extended_plaintexts.extend(plaintexts.iter().cloned());
-        let encoded_plaintexts = Mat::concat(ConcatAxis::Columns, extended_plaintexts.clone());
         let gadget = ring.gadget(
             self.layout.secret_dimension,
             self.layout.gadget_base.clone(),
             self.layout.digit_count,
         );
-        let packed_vector = mask_secret * all_public_keys -
-            encoded_plaintexts.tensor(payload_secret * gadget) +
-            match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
-                (Some(sigma), Some(bound)) => {
-                    ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
-                }
-                (None, None) => ring.zero((1, columns * count)),
-                _ => return Err(BggSampleError::MissingGaussianBound),
-            };
+        let packed_error = match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
+            (Some(sigma), Some(bound)) => {
+                ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+            }
+            (None, None) => ring.zero((1, columns * count)),
+            _ => return Err(BggSampleError::MissingGaussianBound),
+        };
+        // Construct each block against its own public matrix. The error is
+        // sampled once as a packed row and sliced, while the signal term keeps
+        // `G` as its final right operand. This preserves the typed carrier
+        // relation without introducing graph-level concatenation nodes.
         Ok((0..count)
             .map(|index| BggEncodingWire {
-                vector: packed_vector.clone().slice(
-                    None,
-                    Some(IndexRange {
-                        start: (columns * index).into(),
-                        end: (columns * (index + 1)).into(),
-                    }),
-                ),
+                vector: mask_secret.clone() * public_keys[index].matrix.clone() -
+                    extended_plaintexts[index].clone().tensor(payload_secret.clone()) *
+                        gadget.clone() +
+                    packed_error.clone().slice(
+                        None,
+                        Some(IndexRange {
+                            start: (columns * index).into(),
+                            end: (columns * (index + 1)).into(),
+                        }),
+                    ),
                 pubkey: public_keys[index].clone(),
                 plaintext: public_keys[index]
                     .reveal_plaintext
@@ -592,6 +606,19 @@ mod tests {
             kinds.iter().filter(|kind| matches!(kind, NodeKind::GadgetDecompose { .. })).count(),
             2
         );
+        assert_eq!(
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::ApplyPreimage)).count(),
+            1,
+            "the encoding vector must strictly consume its decomposition relation"
+        );
+        assert_eq!(
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::MaterializePreimageExact)).count(),
+            1,
+            "the exact public-key product must use guarded materialization"
+        );
+        assert!(kinds.iter().any(|kind| {
+            matches!(kind, NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply))
+        }));
         assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
 
         built.validate(&ParamEnv::default()).expect("valid executable graph");
@@ -721,8 +748,20 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(concat_count, 2, "packed public keys and packed plaintext row");
-        assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
+        assert_eq!(concat_count, 0, "encoding blocks are built directly without concatenation");
+        assert_eq!(tensor_count, 2, "one plaintext-secret tensor per encoding block");
+        assert!(
+            built.graph.root_scope().nodes().iter().any(|node| {
+                matches!(
+                    node.kind(),
+                    NodeKind::ConstantMatrix {
+                        matrix_type,
+                        value: mxx_ir_core::node::ConstantMatrix::Gadget { .. },
+                    } if matrix_type.rows.canonicalize() == IntExpr::constant(2)
+                )
+            }),
+            "each plaintext-secret row is multiplied by the real gadget"
+        );
         assert_eq!(gaussian_types.len(), 1, "one packed error sample");
         assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
         built.validate(&ParamEnv::default()).expect("valid executable graph");
@@ -808,6 +847,7 @@ mod tests {
                 &parameters,
                 vec![encoded_plaintexts[index].clone()],
             );
+            assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);
             let vector = mask_secret_value.clone() * public.clone() -
                 plaintext.tensor(&payload_secret_gadget);
             assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);

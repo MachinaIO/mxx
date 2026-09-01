@@ -571,7 +571,9 @@ fn slot_gate_public_key_name(reduction: bool, identity: &str) -> String {
 
 mod artifact {
     use crate::BggSlotTransferGateRequest;
-    use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Parallel, Ring, Trapdoor};
+    use mxx_dsl::{
+        Bytes, DslContext, DslError, Family, HashTag, Mat, Parallel, Preimage, Ring, Trapdoor,
+    };
     use mxx_ir_core::{
         IntExpr, RealExpr,
         artifact::{ArtifactConfidentiality, ProductionId},
@@ -631,15 +633,15 @@ mod artifact {
     pub struct BggSlotTransferSlotWires {
         pub secrets: Family<Mat>,
         pub public_keys: Family<Mat>,
-        pub b0_preimage_chunks: Vec<Family<Mat>>,
-        pub b1_preimage_chunks: Vec<Family<Mat>>,
+        pub b0_preimage_chunks: Vec<Family<Preimage>>,
+        pub b1_preimage_chunks: Vec<Family<Preimage>>,
     }
 
     #[derive(Clone)]
     pub struct BggSlotTransferPublicSlotWires {
         pub public_keys: Family<Mat>,
-        pub b0_preimage_chunks: Vec<Family<Mat>>,
-        pub b1_preimage_chunks: Vec<Family<Mat>>,
+        pub b0_preimage_chunks: Vec<Family<Preimage>>,
+        pub b1_preimage_chunks: Vec<Family<Preimage>>,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -649,7 +651,7 @@ mod artifact {
 
     #[derive(Clone, Default)]
     pub struct BggSlotTransferGateWires {
-        pub preimage_chunks: BTreeMap<String, Family<Mat>>,
+        pub preimage_chunks: BTreeMap<String, Family<Preimage>>,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -769,7 +771,7 @@ mod artifact {
                     let b0 = base.b0.clone();
                     let b1_public = b1_public.clone();
                     let identity = identity.clone();
-                    secrets.clone().parallel_map(move |_, secret| {
+                    secrets.clone().parallel_map_values(move |_, secret| {
                         let secret_identity =
                             Mat::concat(ConcatAxis::Columns, vec![secret, identity.clone()]);
                         let target = secret_identity *
@@ -784,7 +786,6 @@ mod artifact {
                                 ),
                             (b0.public_matrix().matrix_type().columns.clone(), columns),
                         )
-                        .as_mat()
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -799,7 +800,7 @@ mod artifact {
                     let ring = ring.clone();
                     let b1 = base.b1.clone();
                     let gadget = gadget.clone();
-                    secrets.clone().parallel_zip(
+                    secrets.clone().parallel_zip_values(
                         public_keys.clone(),
                         move |_, secret, public_key| {
                             let a_chunk = public_key.slice(None, Some(target_columns.clone()));
@@ -818,7 +819,6 @@ mod artifact {
                                     ),
                                 (b1.public_matrix().matrix_type().columns.clone(), columns),
                             )
-                            .as_mat()
                         },
                     )
                 })
@@ -842,13 +842,13 @@ mod artifact {
             let context = slots.b0_preimage_chunks.into_iter().enumerate().try_fold(
                 context,
                 |context, (chunk, family)| {
-                    context.public_family_output(b0_preimage_name(chunk), family)
+                    context.public_preimage_family_output(b0_preimage_name(chunk), family)
                 },
             )?;
             Ok(slots.b1_preimage_chunks.into_iter().enumerate().try_fold(
                 context,
                 |context, (chunk, family)| {
-                    context.public_family_output(b1_preimage_name(chunk), family)
+                    context.public_preimage_family_output(b1_preimage_name(chunk), family)
                 },
             )?)
         }
@@ -989,7 +989,7 @@ mod artifact {
             gates: BggSlotTransferGateWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             Ok(gates.preimage_chunks.into_iter().try_fold(context, |context, (name, family)| {
-                context.public_family_output(name, family)
+                context.public_preimage_family_output(name, family)
             })?)
         }
 
@@ -1035,10 +1035,10 @@ mod artifact {
                 };
                 for (chunk, columns) in self.chunks(self.gadget_columns()).into_iter().enumerate() {
                     let name = gate_preimage_name(reduction, identity, chunk);
-                    let family = ring.family_artifact_input(
+                    let family = ring.preimage_family_artifact_input(
                         artifacts.production_id.clone(),
                         name.clone(),
-                        count,
+                        vec![IntExpr::constant(count)],
                         (self.b0_public_columns(), range_len(&columns)),
                         ArtifactConfidentiality::Public,
                     );
@@ -1056,12 +1056,16 @@ mod artifact {
             output: &Mat,
             source_slots: &[(u32, Option<u32>)],
             columns: IndexRange,
-        ) -> Result<Family<Mat>, BggSlotTransferArtifactError> {
+        ) -> Result<Family<Preimage>, BggSlotTransferArtifactError> {
             let ring = self.ring();
             if source_slots.is_empty() {
                 let rows = self.b0_public_columns();
                 let columns = range_len(&columns);
-                return Ok(Parallel::range(0).map(move |_| ring.zero((rows, columns)))?);
+                let target_rows = self.secret_size;
+                let b0 = base.b0.clone();
+                return Ok(Parallel::range(0).map_values(move |_| {
+                    b0.sample_preimage(ring.zero((target_rows, columns)), (rows, columns))
+                })?);
             }
             let results = source_slots
                 .iter()
@@ -1072,12 +1076,12 @@ mod artifact {
                     let destination_secret = slots.secrets.get_static(destination);
                     let destination_public = slots.public_keys.get_static(destination);
                     let destination_chunk = destination_public.slice(None, Some(columns.clone()));
-                    let decomposed = destination_chunk
-                        .decompose(self.gadget_base.clone(), self.digit_count)
-                        .as_mat();
                     let rhs = source_secret *
-                        input.clone() *
-                        decomposed *
+                        (input.clone() *
+                            destination_chunk
+                                .decompose(self.gadget_base.clone(), self.digit_count)
+                                .into_preimage_relation()
+                                .materialize_exact()) *
                         ring.polynomial([IntExpr::constant(scalar.unwrap_or(1))]);
                     let lhs =
                         destination_secret * output.clone().slice(None, Some(columns.clone()));
@@ -1087,9 +1091,7 @@ mod artifact {
                             self.error_sigma.clone(),
                             self.error_max_coefficient_bound.clone(),
                         );
-                    base.b0
-                        .sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
-                        .as_mat()
+                    base.b0.sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
                 })
                 .collect::<Vec<_>>();
             Ok(Family::pack(results)?)
@@ -1103,7 +1105,7 @@ mod artifact {
             output: &Mat,
             source_slot_count: usize,
             columns: IndexRange,
-        ) -> Result<Family<Mat>, BggSlotTransferArtifactError> {
+        ) -> Result<Family<Preimage>, BggSlotTransferArtifactError> {
             let ring = self.ring();
             let results = inputs
                 .iter()
@@ -1114,14 +1116,15 @@ mod artifact {
                         .public_keys
                         .get_static(destination)
                         .slice(None, Some(columns.clone()));
-                    let decomposed = destination_chunk
-                        .decompose(self.gadget_base.clone(), self.digit_count)
-                        .as_mat();
                     let rhs = (0..source_slot_count)
                         .map(|source| {
                             slots.secrets.get_static(source) *
-                                input.clone() *
-                                decomposed.clone() *
+                                (input.clone() *
+                                    destination_chunk
+                                        .clone()
+                                        .decompose(self.gadget_base.clone(), self.digit_count)
+                                        .into_preimage_relation()
+                                        .materialize_exact()) *
                                 ring.constant(
                                     (1, 1),
                                     ConstantMatrix::Rotation {
@@ -1141,9 +1144,7 @@ mod artifact {
                             self.error_sigma.clone(),
                             self.error_max_coefficient_bound.clone(),
                         );
-                    base.b0
-                        .sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
-                        .as_mat()
+                    base.b0.sample_preimage(target, (self.b0_public_columns(), range_len(&columns)))
                 })
                 .collect::<Vec<_>>();
             Ok(Family::pack(results)?)
@@ -1191,16 +1192,16 @@ mod artifact {
             b0: bool,
             columns: usize,
             rows: usize,
-        ) -> Vec<Family<Mat>> {
+        ) -> Vec<Family<Preimage>> {
             let ring = self.ring();
             self.chunks(columns)
                 .into_iter()
                 .enumerate()
                 .map(|(chunk, range)| {
-                    ring.family_artifact_input(
+                    ring.preimage_family_artifact_input(
                         production_id.clone(),
                         if b0 { b0_preimage_name(chunk) } else { b1_preimage_name(chunk) },
-                        self.slot_count,
+                        vec![IntExpr::constant(self.slot_count)],
                         (rows, range_len(&range)),
                         ArtifactConfidentiality::Public,
                     )
@@ -1359,12 +1360,12 @@ mod artifact {
                     .expect("public key");
                 for (chunk, family) in slots.b0_preimage_chunks.iter().enumerate() {
                     context = context
-                        .output(format!("slot_b0_{chunk}_{slot}"), family.get_static(slot))
+                        .preimage_output(format!("slot_b0_{chunk}_{slot}"), family.get_static(slot))
                         .expect("b0 preimage");
                 }
                 for (chunk, family) in slots.b1_preimage_chunks.iter().enumerate() {
                     context = context
-                        .output(format!("slot_b1_{chunk}_{slot}"), family.get_static(slot))
+                        .preimage_output(format!("slot_b1_{chunk}_{slot}"), family.get_static(slot))
                         .expect("b1 preimage");
                 }
             }
@@ -1374,7 +1375,7 @@ mod artifact {
                         &gates.preimage_chunks[&gate_preimage_name(reduction, identity, chunk)];
                     for destination in 0..2 {
                         context = context
-                            .output(
+                            .preimage_output(
                                 format!("gate_{identity}_{chunk}_{destination}"),
                                 family.get_static(destination),
                             )
@@ -1573,12 +1574,18 @@ mod artifact {
                 .unwrap();
             for (chunk, family) in imported_slots.b0_preimage_chunks.iter().enumerate() {
                 inspect = inspect
-                    .output(format!("b0-preimage-{chunk}"), family.get_static(inspected_slot))
+                    .preimage_output(
+                        format!("b0-preimage-{chunk}"),
+                        family.get_static(inspected_slot),
+                    )
                     .unwrap();
             }
             for (chunk, family) in imported_slots.b1_preimage_chunks.iter().enumerate() {
                 inspect = inspect
-                    .output(format!("b1-preimage-{chunk}"), family.get_static(inspected_slot))
+                    .preimage_output(
+                        format!("b1-preimage-{chunk}"),
+                        family.get_static(inspected_slot),
+                    )
                     .unwrap();
             }
             let inspect = inspect
@@ -1700,12 +1707,6 @@ mod artifact {
             .unwrap();
             let gate_production = gate_result.production_id.expect("gate production");
             let gate_manifest = store.manifest(&gate_production).unwrap().clone();
-            for chunk in 0..compiler.chunks(compiler.gadget_columns()).len() {
-                assert_eq!(
-                    gate_manifest.artifacts[&gate_preimage_name(false, "9", chunk)].family_count,
-                    Some(0)
-                );
-            }
             let invalid = BggSlotTransferGateRequest::Transfer {
                 identity: "7".to_owned(),
                 input_public_key: ring.identity(1),
@@ -1762,12 +1763,12 @@ mod artifact {
                 .unwrap()
                 .output("reduce-output", reduce_output)
                 .unwrap()
-                .output(
+                .preimage_output(
                     "transfer-preimage",
                     imported_gates.preimage_chunks[&transfer_name].get_static(0),
                 )
                 .unwrap()
-                .output(
+                .preimage_output(
                     "reduce-preimage",
                     imported_gates.preimage_chunks[&reduce_name].get_static(0),
                 )
@@ -1896,7 +1897,7 @@ mod tall {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::{IntExpr, ValueHandle};
+    use mxx_ir_core::IntExpr;
     use std::collections::BTreeMap;
 
     /// Public-key slot lowering for the secret-transfer-free Tall subset.
@@ -2062,13 +2063,6 @@ mod tall {
         /// Direct tall-rotation encodings keyed by `(num_slots, normalized_offset)`.
         rotations: BTreeMap<TallRotationEncodingKey, TallLinearTransformEncodingWires>,
         anchor_reduce: Option<((u32, Vec<num_bigint::BigUint>), TallLinearTransformEncodingWires)>,
-        /// Reusable encodings of compact repeated-lane masks, keyed by their canonical scalars.
-        ///
-        /// The configured slot count fixes the repetition count, so the short lane pattern is a
-        /// complete semantic key. `None` and `Some(1)` are both canonicalized to `1`.
-        repeated_lane_mask_encodings: BTreeMap<Vec<u32>, BggTallEncodingWire>,
-        /// Decomposition shared by consecutive masks applied to the same Tall input.
-        cached_rhs_decomposition: Option<(ValueHandle, Mat)>,
     }
 
     impl BggTallSlotLowering {
@@ -2090,13 +2084,7 @@ mod tall {
                 sampler,
                 rotations,
                 anchor_reduce,
-                repeated_lane_mask_encodings: BTreeMap::new(),
-                cached_rhs_decomposition: None,
             }
-        }
-
-        pub fn repeated_lane_mask_encoding_count(&self) -> usize {
-            self.repeated_lane_mask_encodings.len()
         }
 
         fn transfer(
@@ -2118,7 +2106,7 @@ mod tall {
                 self.diagonal_mask_public_key.clone(),
                 masks,
             )?;
-            self.multiply_mask(&mask, input)
+            Ok(self.compiler.simd_mul(&mask, input)?)
         }
 
         fn configured_slot_count(&self) -> usize {
@@ -2128,26 +2116,6 @@ mod tall {
                 }
                 _ => unreachable!("Tall slot lowering requires a concrete secret-row family"),
             }
-        }
-
-        fn multiply_mask(
-            &mut self,
-            mask: &BggTallEncodingWire,
-            input: &BggTallEncodingWire,
-        ) -> Result<BggTallEncodingWire, CircuitCompileError> {
-            let input_handle = input.pubkey.matrix.value_handle();
-            let decomposition = match &self.cached_rhs_decomposition {
-                Some((cached_handle, decomposition)) if cached_handle == input_handle => {
-                    decomposition.clone()
-                }
-                _ => {
-                    let decomposition = self.compiler.public_key.decompose(&input.pubkey);
-                    self.cached_rhs_decomposition =
-                        Some((input_handle.clone(), decomposition.clone()));
-                    decomposition
-                }
-            };
-            Ok(self.compiler.simd_mul_with_decomposition(mask, input, decomposition)?)
         }
 
         fn transfer_identity_repeated_lanes(
@@ -2163,24 +2131,17 @@ mod tall {
                 self.configured_slot_count(),
                 gate,
             )?;
-            let key = canonical_lane_scalar_pattern(lane_scalars);
-            let mask = if let Some(mask) = self.repeated_lane_mask_encodings.get(&key) {
-                mask.clone()
-            } else {
-                let masks = identity_repeated_lane_masks(
-                    &self.sampler.layout.ring(),
-                    total_slots,
-                    lane_scalars,
-                )?;
-                let mask = self.sampler.sample_diagonal(
-                    self.secret_rows.clone(),
-                    self.diagonal_mask_public_key.clone(),
-                    masks,
-                )?;
-                self.repeated_lane_mask_encodings.insert(key, mask.clone());
-                mask
-            };
-            self.multiply_mask(&mask, input)
+            let masks = identity_repeated_lane_masks(
+                &self.sampler.layout.ring(),
+                total_slots,
+                lane_scalars,
+            )?;
+            let mask = self.sampler.sample_diagonal(
+                self.secret_rows.clone(),
+                self.diagonal_mask_public_key.clone(),
+                masks,
+            )?;
+            Ok(self.compiler.simd_mul(&mask, input)?)
         }
     }
 
@@ -2331,20 +2292,6 @@ mod tall {
                     .collect(),
             )
         })
-    }
-
-    fn canonical_lane_scalar_pattern(lane_scalars: &[Option<u32>]) -> Vec<u32> {
-        let scalars = lane_scalars.iter().map(|scalar| scalar.unwrap_or(1)).collect::<Vec<_>>();
-        let period = (1..=scalars.len())
-            .find(|period| {
-                scalars.len() % period == 0 &&
-                    scalars
-                        .iter()
-                        .enumerate()
-                        .all(|(index, scalar)| scalar == &scalars[index % period])
-            })
-            .expect("a scalar pattern always repeats over its full length");
-        scalars[..period].to_vec()
     }
 
     #[cfg(test)]

@@ -147,7 +147,7 @@ mod tests {
     use super::*;
     use crate::{
         GraphOutput, NodeHandle, SubgraphHandle, WireType,
-        node::{LoopInputMode, NodeKind, ParallelLoop},
+        node::{GridInputMode, NodeKind, ParallelGrid},
         with_new_construction_scope,
     };
 
@@ -192,17 +192,18 @@ mod tests {
             Vec::new(),
             vec![None, None],
         );
-        let loop_output = NodeHandle::parallel_loop(
+        let loop_output = NodeHandle::parallel_grid(
             loop_body,
             vec![integer],
-            vec![WireType::Int],
-            ParallelLoop {
-                count: crate::IntExpr::constant(1),
-                minimum_count: 0,
-                index_slot: 0,
+            vec![WireType::Family {
+                element: Box::new(WireType::Int),
+                shape: vec![crate::IntExpr::constant(1)],
+            }],
+            ParallelGrid {
+                shape: vec![crate::IntExpr::constant(1)],
+                index_slots: vec![0],
                 bindings: Vec::new(),
-                input_modes: vec![LoopInputMode::Broadcast],
-                output_mode: crate::node::ParallelOutputMode::Family,
+                input_modes: vec![GridInputMode::Broadcast],
             },
         )
         .output(0)

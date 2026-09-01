@@ -265,11 +265,11 @@ impl PowerLutPublicKeyCompiler {
     /// Setup-fixed Fuse is the public matrix product `A G^{-1}(C)`.
     pub fn fuse_public(&self, input: &Mat, rhs: &PowerRhsPackage) -> Result<Mat, PowerLutError> {
         // Public projection of Fuse: multiply `A` by the digit matrix of C.
-        Ok(input.clone() *
+        Ok(input.clone().mul_decomposed(
             rhs.gsw_ciphertext()
                 .clone()
-                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                .as_mat())
+                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone()),
+        ))
     }
     pub fn single_input_lut(
         &self,
@@ -334,44 +334,41 @@ impl PowerLutPublicKeyCompiler {
         .map_err(|_| PowerLutError::InvalidLut)?;
         let masks = Family::pack(helpers.iter().map(|helper| helper.mask().clone()).collect())
             .map_err(|_| PowerLutError::InvalidLut)?;
-        let branches = Family::try_parallel_zip_many_values(
-            vec![raw_publics, switches, masks],
-            move |_index, mut items| {
-                // The families were zipped as `[raw_publics, switches, masks]`;
-                // `pop` therefore yields the public mask, the concrete
-                // setup-fixed selector ciphertext `C_{sigma,L}`, then the
-                // automorphed public-key matrix `A^{\sigma}`.
-                let mask = items.pop().ok_or(DslError::Schema)?;
-                // `mask` is the public matrix from the mask-alignment helper
-                // encoding. Its private vector switches the mask secret from
-                // `sigma(s)` back to `s` after the automorphed fixed-C Fuse;
-                // this public closure computes only that helper's projection.
-                let switch = items.pop().ok_or(DslError::Schema)?;
-                // `switch` is the concrete setup-fixed GSW ciphertext
-                // `C_{sigma,L}`, wrapped below for fixed-RHS shape validation.
-                let raw = items.pop().ok_or(DslError::Schema)?;
-                // `raw = A^\sigma` is the automorphed public-key matrix; no
-                // payload or plaintext term is formed on this public path.
-                let rhs = PowerRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
-                // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
-                let fused = raw *
-                    rhs.gsw_ciphertext()
-                        .clone()
-                        .decompose(
-                            self.public_key.base.clone(),
-                            self.public_key.digit_count.clone(),
-                        )
-                        .as_mat();
-                // `decomp = G^{-1}(fused)` has the gadget-digit shape needed
-                // by `mask`; `mask * decomp` is the helper's public projection
-                // that accompanies the private vector-side alignment.
-                let decomp = fused
-                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                    .as_mat();
-                Ok(mask * decomp)
-            },
-        )
-        .map_err(|_| PowerLutError::InvalidLut)?;
+        let branches =
+            Family::try_parallel_zip_many_values(
+                vec![raw_publics, switches, masks],
+                move |_index, mut items| {
+                    // The families were zipped as `[raw_publics, switches, masks]`;
+                    // `pop` therefore yields the public mask, the concrete
+                    // setup-fixed selector ciphertext `C_{sigma,L}`, then the
+                    // automorphed public-key matrix `A^{\sigma}`.
+                    let mask = items.pop().ok_or(DslError::Schema)?;
+                    // `mask` is the public matrix from the mask-alignment helper
+                    // encoding. Its private vector switches the mask secret from
+                    // `sigma(s)` back to `s` after the automorphed fixed-C Fuse;
+                    // this public closure computes only that helper's projection.
+                    let switch = items.pop().ok_or(DslError::Schema)?;
+                    // `switch` is the concrete setup-fixed GSW ciphertext
+                    // `C_{sigma,L}`, wrapped below for fixed-RHS shape validation.
+                    let raw = items.pop().ok_or(DslError::Schema)?;
+                    // `raw = A^\sigma` is the automorphed public-key matrix; no
+                    // payload or plaintext term is formed on this public path.
+                    let rhs = PowerRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
+                    // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
+                    let fused = raw.mul_decomposed(rhs.gsw_ciphertext().clone().decompose(
+                        self.public_key.base.clone(),
+                        self.public_key.digit_count.clone(),
+                    ));
+                    // `decomp = G^{-1}(fused)` has the gadget-digit shape needed
+                    // by `mask`; `mask * decomp` is the helper's public projection
+                    // that accompanies the private vector-side alignment.
+                    Ok(mask.mul_decomposed(fused.decompose(
+                        self.public_key.base.clone(),
+                        self.public_key.digit_count.clone(),
+                    )))
+                },
+            )
+            .map_err(|_| PowerLutError::InvalidLut)?;
         balanced_sum_family(branches)
     }
     pub fn two_input_lut(
@@ -605,11 +602,11 @@ mod tests {
         let input = ring.zero((2, 2));
         let rhs = PowerRhsPackage::new(ring.zero((2, 2))).unwrap();
         let output = compiler.fuse_public(&input, &rhs).unwrap();
-        let expected = input * rhs.gsw_ciphertext().clone().decompose(4, 2).as_mat();
+        let expected = input.mul_decomposed(rhs.gsw_ciphertext().clone().decompose(4, 2));
         assert_eq!(output.matrix_type(), expected.matrix_type());
         assert!(matches!(
             output.value_handle().node().kind(),
-            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
+            mxx_ir_core::node::NodeKind::ApplyPreimage
         ));
     }
 

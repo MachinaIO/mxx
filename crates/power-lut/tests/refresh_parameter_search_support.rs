@@ -5,12 +5,15 @@
 //! code continues to use the ordinary `RefreshSetupParameters`, PBC, PRF
 //! program, and correctness checker APIs.
 
-use std::{fs, io::ErrorKind, ops::RangeInclusive, path::Path, process::Command};
+use std::{
+    collections::BTreeSet, fs, io::ErrorKind, ops::RangeInclusive, path::Path, process::Command,
+};
 
 use mxx_bgg::{BggSamplerLayout, PreimageCoefficientBound};
-use mxx_ir_core::{IntExpr, RealExpr};
+use mxx_dsl::BuiltGraph;
+use mxx_ir_core::{IntExpr, RealExpr, artifact::ProductionId, encoding::spec_hash};
 use mxx_power_lut::{
-    pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
+    pbc::{PbcParameters, PbcRootSeed, clear_pbc_inner_product, generate_key_layout},
     prf::{SparseLwrPrfProfile, SparseLwrPrfProgram},
     refresh::RefreshCompiler,
     refresh_setup::{
@@ -19,153 +22,145 @@ use mxx_power_lut::{
 };
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
+use num_traits::{One, ToPrimitive, Zero};
+use rand::{SeedableRng, rngs::StdRng, seq::index::sample};
 use serde::Serialize;
 use tracing::info;
 
-/// Runs the actual protocol-agnostic operational checker for every decoder
-/// target exported by the refresh adapter.  The adapter owns the graph
-/// linkage; this test-only bridge only converts its structural metadata into
-/// the correctness crate's request types.
+/// Validates the frozen refresh stages with the standalone noise simulator.
+///
+/// Parameter-search candidates are intentionally not runtime executions.  The
+/// roots are the adapter-attested verification residuals, so this harness
+/// exercises the generic stage identity and IR compatibility checks without
+/// adding protocol-specific simulator logic.
 pub fn check_refresh_bundle(
-    config: &SearchConfig,
-    candidate: Candidate,
+    _config: &SearchConfig,
+    _candidate: Candidate,
     prepared: &PreparedCandidate,
 ) -> Result<bool, String> {
-    use mxx_correctness::{
-        ComparatorEndpointBinding, ComparatorSpec, EndpointAnchor, EndpointAnchors,
-        EndpointSemanticBinding, EndpointSpecId, OperationalDecoderKind, OperationalDecoderTarget,
-        OutputRef, StageId,
-        operational_noise::{
-            OperationalCheckRequest, OperationalGadgetLayout,
-            check_operational_noise_candidate_with_progress,
-        },
-        operational_protocol_from_graphs,
-    };
-    use mxx_dsl::{Bool, DslContext, IdealSpec};
-    use std::collections::BTreeMap;
-
     let bundle = prepared.bundle.as_ref().ok_or_else(|| {
-        "the production refresh checker requires a built simulation bundle".to_owned()
+        "the refresh graph validator requires a built simulation bundle".to_owned()
     })?;
-    let dcrt = DCRTPolyParams::new(
-        prepared.ring_dimension as u32,
-        candidate.crt_depth,
-        config.crt_bits,
-        config.base_bits,
-    );
-    let (crt_moduli, crt_bits, _) = dcrt.to_crt();
-    let mut exact = BTreeMap::new();
-    for (name, metadata) in bundle.matrix_input_metadata() {
-        exact.insert(
-            name.clone(),
-            mxx_correctness::ExactMatrixInputMetadata {
-                canonical_coefficient_exclusive_upper_bound: metadata
-                    .canonical_coefficient_exclusive_upper_bound
-                    .clone(),
-                is_constant_polynomial: metadata.is_constant_polynomial,
-            },
-        );
-    }
-    let decoder_stage = StageId(bundle.entrypoint().to_owned());
-    let layout = OperationalGadgetLayout {
-        params_id: format!("refresh-parameter-search-{candidate:?}"),
-        ring_dimension: prepared.ring_dimension,
-        smallest_crt_modulus: *crt_moduli
-            .iter()
-            .min()
-            .ok_or_else(|| "DCRT layout has no CRT moduli".to_owned())?,
-        crt_moduli,
-        crt_bits,
-        base_bits: config.base_bits as usize,
-        base: BigInt::from(1_u8) << config.base_bits,
-        regular_digit_count: dcrt.modulus_digits(),
-        small_digit_count: crt_bits.div_ceil(config.base_bits as usize),
-    };
-    for target in bundle.decoder_targets() {
-        // The correctness registry accepts one ThresholdDecode endpoint spec
-        // per protocol declaration.  Build a declaration for this exact
-        // target so its residual output, decoder node, decoded output, and
-        // semantic anchor cannot be confused with another column.
-        let target_decoder = OperationalDecoderTarget {
-            target_id: target.target_id.clone(),
-            residual_stage: decoder_stage.clone(),
-            residual_output: target.residual_output_name.clone(),
-            decoder_stage: decoder_stage.clone(),
-            decoder_node: target.decoder_node,
-            kind: OperationalDecoderKind::ThresholdDecode {
-                plaintext_modulus: target.plaintext_modulus.clone(),
-            },
-        };
-        let decoded_output_name = target.decoded_output_name.clone();
-        let decoder_anchor = target.decoder_anchor.clone();
-        let ideal = IdealSpec::new(
-            DslContext::new("refresh-parameter-search-ideal")
-                .bool_output(&decoded_output_name, Bool::constant(false))
-                .map_err(|error| error.to_string())?
-                .build()
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        let protocol = operational_protocol_from_graphs(
-            vec![
-                ("selector".to_owned(), bundle.selector_graph()),
-                ("preprocessing".to_owned(), bundle.preprocessing_graph()),
-                ("verification".to_owned(), bundle.verification_graph()),
-            ],
-            bundle.entrypoint(),
-            &exact,
-            &BTreeMap::new(),
-            |closed| {
-                closed.ideal = ideal;
-                closed.comparator = ComparatorSpec::Equality {
-                    endpoints: vec![ComparatorEndpointBinding {
-                        endpoint: EndpointSpecId::ThresholdDecode,
-                        actual_input: decoded_output_name.clone(),
-                        ideal_input: decoded_output_name.clone(),
-                        result_output: "failure".to_owned(),
-                        failure_value: true,
-                    }],
-                };
-                closed.endpoints = EndpointAnchors {
-                    entries: vec![EndpointAnchor {
-                        spec: EndpointSpecId::ThresholdDecode,
-                        stage: decoder_stage.clone(),
-                        semantic_anchor: decoder_anchor,
-                        semantics: EndpointSemanticBinding::ThresholdDecode,
-                        workflow_output: OutputRef {
-                            stage: decoder_stage.clone(),
-                            output: decoded_output_name.clone(),
-                        },
-                        ideal_output: decoded_output_name.clone(),
-                    }],
-                };
-                closed.operational_decoder_targets = vec![target_decoder];
-                closed.endpoint_specs = vec![EndpointSpecId::ThresholdDecode];
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        let request = OperationalCheckRequest {
-            environment: Vec::new(),
-            layouts: vec![layout.clone()],
-            target_id: target.target_id.clone(),
-        };
-        let report =
-            check_operational_noise_candidate_with_progress(&protocol, &request, |event| {
-                info!(
-                    target = %target.target_id,
-                    phase = ?event.phase,
-                    event = ?event.event,
-                    processed = event.processed,
-                    total_or_discovered = ?event.total_or_discovered,
-                    "refresh parameter search checker progress"
-                );
-            })
+    let stage = |id: &str,
+                 graph: &mxx_ir_core::Graph|
+     -> Result<mxx_noise_simulator::SimulationStage, String> {
+        let hash = spec_hash(graph, &mxx_ir_core::ParamEnv::default())
             .map_err(|error| error.to_string())?;
-        if !report.accepted {
-            return Ok(false);
+        Ok(mxx_noise_simulator::SimulationStage {
+            id: mxx_noise_simulator::StageId(id.to_owned()),
+            production_id: ProductionId { spec_hash: hash, execution_nonce: [0; 32] },
+            graph: graph.clone(),
+        })
+    };
+    let stage_graphs = [
+        ("selector", bundle.selector_graph()),
+        ("preprocessing", bundle.preprocessing_graph()),
+        ("verification", bundle.verification_graph()),
+    ];
+    let roots = bundle
+        .decoder_targets()
+        .iter()
+        .map(|target| mxx_noise_simulator::SimulationRoot {
+            stage: mxx_noise_simulator::StageId("verification".to_owned()),
+            output: target.residual_output_name.clone(),
+        })
+        .collect();
+    let request = mxx_noise_simulator::SimulationRequest {
+        program: mxx_noise_simulator::SimulationProgram {
+            stages: stage_graphs
+                .iter()
+                .map(|(id, graph)| stage(id, &graph.graph))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        environment: mxx_ir_core::ParamEnv::default(),
+        roots,
+        external_inputs: simulation_external_inputs(&stage_graphs, bundle.matrix_input_metadata())?,
+        limits: mxx_noise_simulator::SimulationLimits::default(),
+    };
+    mxx_noise_simulator::simulate(&request).map(|_| true).map_err(|error| error.to_string())
+}
+
+fn simulation_external_inputs(
+    stage_graphs: &[(&str, &BuiltGraph)],
+    metadata: &std::collections::BTreeMap<
+        String,
+        mxx_power_lut::refresh_setup::RefreshSimulationMatrixInputMetadata,
+    >,
+) -> Result<Vec<mxx_noise_simulator::ExternalInputFact>, String> {
+    let mut facts = Vec::new();
+    for (stage_name, built) in stage_graphs {
+        let stage = mxx_noise_simulator::StageId((*stage_name).to_owned());
+        for node in built.graph.root_scope().nodes() {
+            let mxx_ir_core::node::NodeKind::Input { name, wire_type, artifact: None } =
+                node.kind()
+            else {
+                continue;
+            };
+            let value = match wire_type {
+                mxx_ir_core::types::WireType::Bytes { .. } => {
+                    mxx_noise_simulator::ExternalInputValue::Bytes
+                }
+                mxx_ir_core::types::WireType::Matrix(matrix) => {
+                    matrix_fact(name, matrix, metadata)?
+                }
+                mxx_ir_core::types::WireType::Family { element, shape } => {
+                    let shape = shape
+                        .iter()
+                        .map(|entry| {
+                            entry
+                                .evaluate(&mxx_ir_core::ParamEnv::default())
+                                .map_err(|error| error.to_string())?
+                                .to_usize()
+                                .ok_or_else(|| "family shape is not usize".to_owned())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mxx_ir_core::types::WireType::Matrix(matrix) = element.as_ref() else {
+                        return Err(format!("unsupported external family input {name}"));
+                    };
+                    mxx_noise_simulator::ExternalInputValue::Family {
+                        shape,
+                        element: Box::new(matrix_fact(name, matrix, metadata)?),
+                    }
+                }
+                other => return Err(format!("unsupported external input {name}: {other:?}")),
+            };
+            facts.push(mxx_noise_simulator::ExternalInputFact {
+                stage: stage.clone(),
+                input: name.clone(),
+                value,
+            });
         }
     }
-    Ok(true)
+    let mut unique = BTreeSet::new();
+    if facts.iter().any(|fact| !unique.insert((fact.stage.clone(), fact.input.clone()))) {
+        return Err("duplicate external input fact".to_owned());
+    }
+    Ok(facts)
+}
+
+fn matrix_fact(
+    name: &str,
+    _matrix: &mxx_ir_core::types::MatrixType,
+    metadata: &std::collections::BTreeMap<
+        String,
+        mxx_power_lut::refresh_setup::RefreshSimulationMatrixInputMetadata,
+    >,
+) -> Result<mxx_noise_simulator::ExternalInputValue, String> {
+    let bound = metadata
+        .get(name)
+        .and_then(|facts| facts.canonical_coefficient_exclusive_upper_bound.as_ref())
+        .map(|bound| bound.evaluate(&mxx_ir_core::ParamEnv::default()))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .and_then(|bound| bound.to_biguint())
+        .unwrap_or_else(|| BigUint::one());
+    let maximum = if bound.is_zero() { BigUint::zero() } else { &bound - BigUint::one() };
+    let is_constant = metadata.get(name).is_some_and(|facts| facts.is_constant_polynomial);
+    Ok(mxx_noise_simulator::ExternalInputValue::Matrix {
+        maximum_absolute_coefficient_error: BigUint::zero(),
+        maximum_absolute_coefficient_value: Some(maximum),
+        is_constant_polynomial: is_constant,
+    })
 }
 
 /// The fixed profile requested for the first Power-LUT refresh search.
@@ -195,9 +190,11 @@ pub struct SearchConfig {
 }
 
 impl SearchConfig {
-    /// Returns the reviewed finite grid. Phase 2 is searched in ascending CRT
-    /// depth 30..=40 and log2(ring dimension) 15..=16. `base_bits = 27` gives
-    /// exactly two base digits for the 28-bit CRT primes.
+    /// Returns the reviewed finite grid.  The sparse-LWR phase is anchored to
+    /// Candidate A (`nu=1450`, `h=29`, `Q=512`, `p=32`, `W_mod=1024`).  Phase
+    /// 2 is searched in ascending CRT depth 30..=40 and log2(ring dimension)
+    /// 15..=16. `base_bits = 27` gives exactly two base digits for the 28-bit
+    /// CRT primes.
     pub fn reviewed() -> Self {
         Self {
             crt_depths: 30..=40,
@@ -208,16 +205,13 @@ impl SearchConfig {
             secret_dimension: 2,
             error_sigma: 4.0,
             decoder_sigma: 4.578,
-            sparse_lwr_universe: 512,
-            sparse_lwr_weight: 64,
-            sparse_lwr_universe_grid: vec![
-                512, 544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 960, 992,
-                1024,
-            ],
-            sparse_lwr_modulus: 16,
-            sparse_lwr_output_modulus: 2,
-            lut_width: 32,
-            pbc_max_attempts: 16,
+            sparse_lwr_universe: 1450,
+            sparse_lwr_weight: 29,
+            sparse_lwr_universe_grid: vec![1450],
+            sparse_lwr_modulus: 512,
+            sparse_lwr_output_modulus: 32,
+            lut_width: 1024,
+            pbc_max_attempts: 128,
             one_nontrivial_refresh_round: true,
             plaintext_modulus: 2,
         }
@@ -383,23 +377,26 @@ pub struct PreparedCandidate {
     pub official_preimage_bound: BigInt,
     pub layout_id: [u8; 32],
     pub program_id: [u8; 32],
+    /// One-based accepted PBC layout retry count (public diagnostics only).
+    pub pbc_attempts_used: u32,
     /// Present for the production search; omitted by mocked ordering tests.
     pub bundle: Option<RefreshParameterSimulationBundle>,
 }
 
 /// Security values and generic-checker result for the selected point.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SearchResult {
     pub candidate: Candidate,
     pub achieved_security_bits: u64,
     pub bgg_rlwe_security_bits: u64,
     pub sparse_lwr_security_bits: u64,
-    pub mitm_security_bits: u64,
+    pub raw_key_entropy_bits: f64,
     pub sparse_lwr_universe: usize,
     pub sparse_lwr_weight: usize,
     pub official_preimage_bound: String,
     pub ring_dimension: usize,
     pub bucket_width: usize,
+    pub pbc_attempts_used: u32,
     pub layout_id: String,
     pub program_id: String,
     pub checker_accepted: bool,
@@ -408,12 +405,12 @@ pub struct SearchResult {
 /// One aggregate, non-secret row persisted for a Phase-1 universe that was
 /// actually evaluated.  It records enough evidence to audit the first
 /// qualifying grid point without exposing the sparse support or schedule.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 pub struct SparseLwrEvaluation {
     pub universe: usize,
     pub weight: usize,
     pub sparse_lwr_security_bits: u64,
-    pub mitm_security_bits: u64,
+    pub raw_key_entropy_bits: f64,
     pub minimum_security_bits: u64,
     pub qualified: bool,
 }
@@ -423,12 +420,12 @@ pub struct SparseLwrEvaluation {
 /// Keeping the estimator outputs with the selected universe size makes the
 /// minimality claim auditable: Phase 2 cannot accidentally rerun the sparse
 /// estimator with a candidate-dependent value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 pub struct SelectedSparseLwrProfile {
     pub universe: usize,
     pub weight: usize,
     pub sparse_lwr_security_bits: u64,
-    pub mitm_security_bits: u64,
+    pub raw_key_entropy_bits: f64,
     pub evaluations: Vec<SparseLwrEvaluation>,
 }
 
@@ -461,7 +458,6 @@ pub struct Phase1Declaration {
     pub sparse_error_lower: i64,
     pub sparse_error_upper: i64,
     pub exact_estimator: bool,
-    pub support_recovery_model: String,
 }
 
 impl Phase1Declaration {
@@ -481,7 +477,6 @@ impl Phase1Declaration {
             sparse_error_lower,
             sparse_error_upper,
             exact_estimator: true,
-            support_recovery_model: "binomial_mitm_floor".to_owned(),
         })
     }
 }
@@ -493,7 +488,7 @@ impl Phase1Declaration {
 /// named fields makes the checkpoint self-describing and lets validation
 /// reject a partially or manually edited checkpoint without reconstructing a
 /// security estimate.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 pub struct Phase1Checkpoint {
     pub version: u32,
     pub declaration: Phase1Declaration,
@@ -552,9 +547,10 @@ impl Phase1Checkpoint {
                 .ok_or_else(|| "Phase-1 checkpoint has too many evaluated rows".to_owned())?;
             if row.universe != expected_universe ||
                 row.weight != config.sparse_lwr_weight ||
+                (row.raw_key_entropy_bits - raw_key_entropy_bits(row.universe, row.weight)).abs() >
+                    1e-9 ||
                 row.qualified != (row.minimum_security_bits >= config.security_bits) ||
-                row.minimum_security_bits !=
-                    row.sparse_lwr_security_bits.min(row.mitm_security_bits)
+                row.minimum_security_bits != row.sparse_lwr_security_bits
             {
                 return Err("Phase-1 checkpoint contains an inconsistent evaluated row".to_owned());
             }
@@ -566,7 +562,7 @@ impl Phase1Checkpoint {
         if !selected_row.qualified ||
             self.selected.weight != selected_row.weight ||
             self.selected.sparse_lwr_security_bits != selected_row.sparse_lwr_security_bits ||
-            self.selected.mitm_security_bits != selected_row.mitm_security_bits
+            (self.selected.raw_key_entropy_bits - selected_row.raw_key_entropy_bits).abs() > 1e-9
         {
             return Err(
                 "Phase-1 checkpoint selected profile does not match its final row".to_owned()
@@ -617,7 +613,7 @@ where
 }
 
 /// The complete public declaration of the Phase-1 search.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Phase1SearchReport {
     /// Complete public input and security-model declaration for these rows.
     pub declaration: Phase1Declaration,
@@ -648,7 +644,7 @@ pub struct Phase2SearchReport {
 /// all evaluated Phase-1 rows.  This prevents a reader from mistaking the
 /// selected point for a global minimum when it is only minimal in the
 /// explicitly declared finite grids.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RefreshParameterSearchReport {
     pub phase1: Phase1SearchReport,
     pub phase2: Phase2SearchReport,
@@ -689,7 +685,7 @@ pub fn search_report(
 
 /// Selects the first qualifying sparse-LWR universe size from the explicit
 /// ascending Phase-1 grid.  The callback is invoked exactly once per grid
-/// value; the support-recovery MITM floor is computed once beside it.
+/// value; raw support-key entropy is retained as a diagnostic only.
 pub fn select_sparse_lwr_profile<Security>(
     config: &SearchConfig,
     mut sparse_security: Security,
@@ -708,23 +704,20 @@ where
             config.sparse_lwr_modulus,
             config.sparse_lwr_output_modulus,
         )?;
-        let mitm_bits = sparse_support_mitm_bits(universe, config.sparse_lwr_weight);
-        let achieved = sparse_bits.min(mitm_bits);
-        let qualified = achieved >= config.security_bits;
+        let qualified = sparse_bits >= config.security_bits;
         evaluations.push(SparseLwrEvaluation {
             universe,
             weight: config.sparse_lwr_weight,
             sparse_lwr_security_bits: sparse_bits,
-            mitm_security_bits: mitm_bits,
-            minimum_security_bits: achieved,
+            raw_key_entropy_bits: raw_key_entropy_bits(universe, config.sparse_lwr_weight),
+            minimum_security_bits: sparse_bits,
             qualified,
         });
         info!(
             sparse_lwr_universe = universe,
             sparse_lwr_weight = config.sparse_lwr_weight,
             sparse_lwr_security_bits = sparse_bits,
-            mitm_security_bits = mitm_bits,
-            achieved_security_bits = achieved,
+            achieved_security_bits = sparse_bits,
             "evaluated sparse-LWR Phase-1 profile"
         );
         if qualified {
@@ -732,7 +725,7 @@ where
                 universe,
                 weight: config.sparse_lwr_weight,
                 sparse_lwr_security_bits: sparse_bits,
-                mitm_security_bits: mitm_bits,
+                raw_key_entropy_bits: raw_key_entropy_bits(universe, config.sparse_lwr_weight),
                 evaluations,
             });
         }
@@ -792,8 +785,7 @@ where
             "evaluating Power-LUT refresh search candidate"
         );
         let bgg = security(candidate)?;
-        let achieved =
-            bgg.min(sparse_profile.sparse_lwr_security_bits).min(sparse_profile.mitm_security_bits);
+        let achieved = bgg.min(sparse_profile.sparse_lwr_security_bits);
         if achieved < config.security_bits {
             info!(
                 crt_depth = candidate.crt_depth,
@@ -817,12 +809,13 @@ where
             achieved_security_bits: achieved,
             bgg_rlwe_security_bits: bgg,
             sparse_lwr_security_bits: sparse_profile.sparse_lwr_security_bits,
-            mitm_security_bits: sparse_profile.mitm_security_bits,
+            raw_key_entropy_bits: sparse_profile.raw_key_entropy_bits,
             sparse_lwr_universe: sparse_profile.universe,
             sparse_lwr_weight: sparse_profile.weight,
             official_preimage_bound: prepared.official_preimage_bound.to_string(),
             ring_dimension: prepared.ring_dimension,
             bucket_width: prepared.bucket_width,
+            pbc_attempts_used: prepared.pbc_attempts_used,
             layout_id: hex(prepared.layout_id),
             program_id: hex(prepared.program_id),
             checker_accepted: true,
@@ -884,15 +877,55 @@ pub fn prepare_candidate(
         .map_err(|error| format!("official decoder bound evaluation: {error}"))?;
 
     let pbc_parameters =
-        PbcParameters::conservative(config.sparse_lwr_universe, config.sparse_lwr_weight);
+        PbcParameters::paper_evaluation(config.sparse_lwr_universe, config.sparse_lwr_weight);
     if pbc_parameters.max_seed_attempts != config.pbc_max_attempts {
-        return Err("conservative PBC profile does not use the reviewed retry count".to_owned());
+        return Err("paper-evaluation PBC profile does not use the reviewed retry count".to_owned());
     }
-    let support = (0..config.sparse_lwr_weight)
-        .map(|index| index.checked_mul(7).ok_or_else(|| "support overflow".to_owned()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut support_rng = StdRng::from_seed([0x6a; 32]);
+    let support = sample(&mut support_rng, config.sparse_lwr_universe, config.sparse_lwr_weight)
+        .into_iter()
+        .collect::<Vec<_>>();
     let generated = generate_key_layout(&pbc_parameters, PbcRootSeed([0x19; 32]), &support)
         .map_err(|error| format!("PBC layout generation: {error}"))?;
+    generated
+        .private_schedule()
+        .validate(&generated.public_layout)
+        .map_err(|error| format!("PBC private schedule validation: {error}"))?;
+    if generated.public_layout.parameters.hash_count != 3 ||
+        generated.public_layout.parameters.bucket_count != config.sparse_lwr_weight + 3
+    {
+        return Err(
+            "paper-evaluation PBC must provide exactly three dummy-selected buckets".to_owned()
+        );
+    }
+    // `validate` proves every selected bucket is either one distinct real
+    // support coordinate or a dummy cell.  Since it also proves the exact
+    // support-assignment count, the three remaining buckets are dummy
+    // selections without exposing the private schedule fields here.
+    let dummy_buckets = generated.public_layout.parameters.bucket_count - support.len();
+    if dummy_buckets != 3 {
+        return Err(format!("expected exactly 3 dummy-selected buckets, found {dummy_buckets}"));
+    }
+    for seed in [0_u64, 1, 2, 3] {
+        let public = (0..config.sparse_lwr_universe)
+            .map(|index| {
+                ((index as u64).wrapping_mul(seed + 3) + 7) % config.sparse_lwr_modulus as u64
+            })
+            .collect::<Vec<_>>();
+        let actual = clear_pbc_inner_product(
+            &generated.public_layout,
+            generated.private_schedule(),
+            &public,
+            config.sparse_lwr_modulus as u64,
+        )
+        .map_err(|error| format!("PBC clear inner product: {error}"))?;
+        let expected = support
+            .iter()
+            .fold(0_u64, |sum, &index| (sum + public[index]) % config.sparse_lwr_modulus as u64);
+        if actual != expected {
+            return Err(format!("PBC clear inner product mismatch: {actual} != {expected}"));
+        }
+    }
     let profile = SparseLwrPrfProfile::new(
         config.sparse_lwr_modulus,
         config.sparse_lwr_output_modulus,
@@ -907,6 +940,7 @@ pub fn prepare_candidate(
     }
     let bucket_width = generated.public_layout.bucket_width;
     let layout_id = generated.public_layout.layout_id.0;
+    let pbc_attempts_used = generated.public_layout.accepted_attempt + 1;
     let program_id = *program.id().as_bytes();
     let ring = setup.layout.ring();
     let expected_plaintext = ring.polynomial([BigInt::from(0_u8).into()]);
@@ -929,6 +963,7 @@ pub fn prepare_candidate(
         candidate,
         ring_dimension,
         bucket_width,
+        pbc_attempts_used,
         official_preimage_bound,
         layout_id,
         program_id,
@@ -1052,9 +1087,9 @@ pub fn lattice_security_bits(
     run_lattice_estimator(bgg_estimator_args(ring_dimension, modulus, sigma))
 }
 
-/// Estimates the lifted sparse-LWR marginal security for the reviewed
-/// sparse-binary secret model.  Support recovery is deliberately estimated
-/// independently by [`sparse_support_mitm_bits`] and combined by `min`.
+/// Estimates the lifted sparse-LWR security for the reviewed sparse-binary
+/// secret model.  The raw key entropy is reported separately; no undocumented
+/// entropy/2 support-recovery rejection is applied.
 pub fn sparse_lwr_security_bits(
     universe: usize,
     weight: usize,
@@ -1064,14 +1099,10 @@ pub fn sparse_lwr_security_bits(
     run_lattice_estimator(sparse_lwr_estimator_args(universe, weight, q_l, p)?)
 }
 
-/// Conservative meet-in-the-middle floor for sparse binary support recovery.
-pub fn sparse_support_mitm_bits(universe: usize, weight: usize) -> u64 {
-    let numerator = (0..weight)
-        .fold(BigUint::from(1_u8), |value, index| value * BigUint::from(universe - index));
-    let denominator =
-        (1..=weight).fold(BigUint::from(1_u8), |value, index| value * BigUint::from(index));
-    let combinations = numerator / denominator;
-    combinations.bits().saturating_sub(1) / 2
+/// Raw support-key entropy, retained as a diagnostic rather than a separate
+/// hard security floor.
+fn raw_key_entropy_bits(universe: usize, weight: usize) -> f64 {
+    (0..weight).map(|index| ((universe - index) as f64).log2() - ((index + 1) as f64).log2()).sum()
 }
 
 pub fn hex(bytes: [u8; 32]) -> String {
@@ -1090,6 +1121,7 @@ mod tests {
             official_preimage_bound: 10.into(),
             layout_id: [candidate.crt_depth as u8; 32],
             program_id: [candidate.log_ring_dimension as u8; 32],
+            pbc_attempts_used: 1,
             bundle: None,
         }
     }
@@ -1099,7 +1131,10 @@ mod tests {
             universe: config.sparse_lwr_universe,
             weight: config.sparse_lwr_weight,
             sparse_lwr_security_bits: 200,
-            mitm_security_bits: 200,
+            raw_key_entropy_bits: raw_key_entropy_bits(
+                config.sparse_lwr_universe,
+                config.sparse_lwr_weight,
+            ),
             evaluations: Vec::new(),
         }
     }
@@ -1230,7 +1265,7 @@ mod tests {
         assert_eq!(calls, vec![512, 544, 576]);
         assert_eq!(selected.universe, 576);
         assert_eq!(selected.sparse_lwr_security_bits, 200);
-        assert_eq!(selected.mitm_security_bits, sparse_support_mitm_bits(576, 64));
+        assert_eq!(selected.sparse_lwr_security_bits, 200);
     }
 
     #[test]
@@ -1370,12 +1405,13 @@ mod tests {
             achieved_security_bits: 128,
             bgg_rlwe_security_bits: 130,
             sparse_lwr_security_bits: 140,
-            mitm_security_bits: 129,
+            raw_key_entropy_bits: raw_key_entropy_bits(512, 64),
             sparse_lwr_universe: 512,
             sparse_lwr_weight: 64,
             official_preimage_bound: "123".to_owned(),
             ring_dimension: 32,
             bucket_width: 4,
+            pbc_attempts_used: 1,
             layout_id: "aa".repeat(32),
             program_id: "bb".repeat(32),
             checker_accepted: true,
@@ -1398,12 +1434,13 @@ mod tests {
             achieved_security_bits: 128,
             bgg_rlwe_security_bits: 128,
             sparse_lwr_security_bits: sparse_profile.sparse_lwr_security_bits,
-            mitm_security_bits: sparse_profile.mitm_security_bits,
+            raw_key_entropy_bits: sparse_profile.raw_key_entropy_bits,
             sparse_lwr_universe: sparse_profile.universe,
             sparse_lwr_weight: sparse_profile.weight,
             official_preimage_bound: "123".to_owned(),
             ring_dimension: 32,
             bucket_width: 4,
+            pbc_attempts_used: 1,
             layout_id: "aa".repeat(32),
             program_id: "bb".repeat(32),
             checker_accepted: true,
@@ -1412,16 +1449,15 @@ mod tests {
 
         assert!(json.contains("\"universe_grid\":[512,544,576]"));
         assert!(json.contains("\"support_weight\":64"));
-        assert!(json.contains("\"q_l\":16"));
-        assert!(json.contains("\"output_modulus\":2"));
-        assert!(json.contains("\"lut_width\":32"));
+        assert!(json.contains("\"q_l\":512"));
+        assert!(json.contains("\"output_modulus\":32"));
+        assert!(json.contains("\"lut_width\":1024"));
         assert!(json.contains("\"security_target_bits\":128"));
         assert!(json.contains("\"sparse_secret_model\":\"SparseBinary\""));
         assert!(json.contains("\"sparse_error_model\":\"Uniform\""));
-        assert!(json.contains("\"sparse_error_lower\":-4"));
-        assert!(json.contains("\"sparse_error_upper\":3"));
+        assert!(json.contains("\"sparse_error_lower\":-8"));
+        assert!(json.contains("\"sparse_error_upper\":7"));
         assert!(json.contains("\"exact_estimator\":true"));
-        assert!(json.contains("\"support_recovery_model\":\"binomial_mitm_floor\""));
         assert!(json.contains("\"evaluated\":["));
         assert!(json.contains("\"universe\":512"));
         assert!(json.contains("\"minimum_security_bits\""));

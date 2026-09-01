@@ -35,10 +35,7 @@ use crate::{
 };
 use bigdecimal::BigDecimal;
 use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout};
-use mxx_dsl::{
-    Bool, BuiltGraph, Bytes, DerivationAttachmentValue, DslContext, Family, HashTag, Mat,
-    SemanticAnchor,
-};
+use mxx_dsl::{Bool, BuiltGraph, Bytes, DslContext, Family, HashTag, Mat};
 use mxx_ir_core::{
     ParamEnv, ScopedWireRef,
     artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId},
@@ -390,15 +387,12 @@ pub struct RefreshPreprocessingArtifactNames {
 #[derive(Clone)]
 pub(crate) struct RefreshPreprocessingWires {
     pub(crate) state: BggEncodingWire,
-    pub(crate) secret: Mat,
     pub(crate) a_prime: Mat,
     pub(crate) public_b: Mat,
     pub(crate) fresh: BggEncodingWire,
     pub(crate) masks: Vec<BggEncodingWire>,
     pub(crate) decoder_bases: Vec<BggEncodingWire>,
-    pub(crate) preimages: Vec<Mat>,
-    pub(crate) targets: Vec<Mat>,
-    pub(crate) trapdoor: mxx_ir_core::ValueHandle,
+    pub(crate) preimages: Vec<mxx_dsl::Preimage>,
     pub(crate) names: RefreshPreprocessingArtifactNames,
     pub(crate) declaration: RefreshPreprocessingDeclaration,
 }
@@ -458,30 +452,15 @@ pub struct RefreshPreprocessingDeclaration {
     pub layout_gadget_base: mxx_ir_core::IntExpr,
 }
 
-/// Private relation record tying one K-as-mat wrapper to its exact preimage
-/// sample and decoder-base vector in the frozen producer graph.
-#[derive(Clone)]
-struct RefreshPreimageRelationAttestation {
-    slot: usize,
-    target: ScopedWireRef,
-    preimage: ScopedWireRef,
-    k_as_mat: ScopedWireRef,
-    decoder_base_vector: ScopedWireRef,
-}
-
-/// Frozen setup graph attestation.  The relation records and attachment are
-/// private so callers cannot substitute a same-shaped decoder or preimage.
-#[derive(Clone)]
-/// Frozen producer graph plus private relation attestations.
+/// Frozen producer graph and its public specification hash.
 ///
-/// This is the attested setup boundary: the graph hash and attachment identify
-/// the producer, while private relation records tie each sampled preimage to
-/// its exact target and decoder-base output.
+/// The graph hash identifies the producer declaration.  Preimages remain typed
+/// `Preimage` values at the artifact boundary; no parallel hand-built
+/// attachment or relation certificate is required.
+#[derive(Clone)]
 pub struct RefreshProducerAttestation {
     graph: Graph,
     producer_spec_hash: mxx_ir_core::artifact::SpecHash,
-    attachment: mxx_dsl::FrozenDerivationAttachment,
-    relations: Vec<RefreshPreimageRelationAttestation>,
 }
 
 impl RefreshProducerAttestation {
@@ -511,7 +490,7 @@ pub struct ImportedRefreshSetup {
     pub(crate) fresh: BggEncodingWire,
     pub(crate) masks: Vec<BggEncodingWire>,
     pub(crate) decoder_bases: Vec<BggEncodingWire>,
-    pub(crate) preimages: Vec<Mat>,
+    pub(crate) preimages: Vec<mxx_dsl::Preimage>,
     declaration: RefreshPreprocessingDeclaration,
     attestation: RefreshProducerAttestation,
 }
@@ -577,7 +556,6 @@ impl RefreshPreprocessingProducer {
             .component_count
             .checked_mul(p.digit_count + 2)
             .ok_or(RefreshSetupError::InvalidManifest)?;
-        let trapdoor_handle = trapdoor.value_handle().clone();
         let mut bases = Vec::new();
         let mut scales = Vec::new();
         for slot in 0..masks.len() {
@@ -611,12 +589,10 @@ impl RefreshPreprocessingProducer {
                     scale * a_prime.clone()
             },
         )?;
-        let targets =
-            (0..masks.len()).map(|slot| target_family.get_static(slot)).collect::<Vec<_>>();
         // Sample one preimage K_t per target; the trapdoor is captured once
         // and broadcast, so the resulting relation is `B K_t = T_t`.
-        let preimage_family = target_family.parallel_map(|_, target| {
-            trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns())).as_mat()
+        let preimage_family = target_family.parallel_map_values(|_, target| {
+            trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns()))
         })?;
         let ks = (0..masks.len()).map(|slot| preimage_family.get_static(slot)).collect();
         let names = canonical_names(
@@ -635,27 +611,18 @@ impl RefreshPreprocessingProducer {
         );
         let wires = RefreshPreprocessingWires {
             state: request.state.clone(),
-            secret: request.secret.clone(),
             a_prime,
             public_b,
             fresh,
             masks,
             decoder_bases: bases,
             preimages: ks,
-            targets,
-            trapdoor: trapdoor_handle,
             names,
             declaration,
         };
         let names = wires.names.clone();
-        let roles = setup_roles(&wires)?;
-        let attached_b = wires.public_b.clone().derivation_attachment(
-            "mxx-power-lut",
-            "refresh-preprocessing",
-            roles,
-        )?;
         let mut context = DslContext::new("mxx-power-lut-refresh-setup");
-        context = add_setup_outputs(context, &wires, &names, attached_b)?;
+        context = add_setup_outputs(context, &wires, &names)?;
         let built = context.build()?;
         let producer_spec_hash = spec_hash(&built.graph, &ParamEnv::default())
             .map_err(|_| RefreshSetupError::InvalidManifest)?;
@@ -669,19 +636,8 @@ impl RefreshPreprocessingProducer {
         );
         let mut wires = wires;
         wires.declaration = declaration.clone();
-        let attachment = built
-            .derivation_attachments
-            .iter()
-            .find(|a| a.namespace == "mxx-power-lut" && a.rule == "refresh-preprocessing")
-            .cloned()
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let relations = relation_attestations(&built.graph, &attachment, masks_len(&wires))?;
-        let attestation = RefreshProducerAttestation {
-            graph: built.graph.clone(),
-            producer_spec_hash,
-            attachment,
-            relations,
-        };
+        let attestation =
+            RefreshProducerAttestation { graph: built.graph.clone(), producer_spec_hash };
         let producer = Self { request, wires, built, declaration, attestation };
         producer.validate_built()?;
         Ok(producer)
@@ -794,7 +750,7 @@ impl RefreshPreprocessingProducer {
             )?;
             let target = combined.pubkey.matrix - scale * w.a_prime.clone();
             if !same_matrix_type(
-                (w.public_b.clone() * k.clone()).matrix_type(),
+                w.public_b.clone().apply_preimage(k.clone()).matrix_type(),
                 target.matrix_type(),
             ) {
                 return Err(RefreshSetupError::InvalidManifest);
@@ -887,7 +843,7 @@ impl RefreshPreprocessingDeclaration {
         validate_manifest(manifest, &self.names, parameters)
     }
 
-    /// Validates the frozen producer graph and its private relation records.
+    /// Validates the frozen graph hash and the declared artifact cardinality.
     pub fn validate_graph(
         &self,
         attestation: &RefreshProducerAttestation,
@@ -906,188 +862,9 @@ impl RefreshPreprocessingDeclaration {
         let actual = spec_hash(&attestation.graph, &ParamEnv::default())
             .map_err(|_| RefreshSetupError::InvalidManifest)?;
         if actual != self.producer_spec_hash ||
-            attestation.producer_spec_hash != self.producer_spec_hash ||
-            attestation.attachment.namespace != "mxx-power-lut" ||
-            attestation.attachment.rule != "refresh-preprocessing"
+            attestation.producer_spec_hash != self.producer_spec_hash
         {
             return Err(RefreshSetupError::IdentityMismatch);
-        }
-        let graph = &attestation.graph;
-        let mut expected_outputs = std::collections::BTreeMap::new();
-        expected_outputs.insert(self.names.state_vector.clone(), ArtifactConfidentiality::Private);
-        expected_outputs
-            .insert(self.names.state_public_matrix.clone(), ArtifactConfidentiality::Public);
-        expected_outputs.insert(self.names.a_prime.clone(), ArtifactConfidentiality::Public);
-        expected_outputs
-            .insert(self.names.public_matrix_b.clone(), ArtifactConfidentiality::Public);
-        expected_outputs.insert(self.names.fresh_vector.clone(), ArtifactConfidentiality::Private);
-        expected_outputs
-            .insert(self.names.fresh_public_matrix.clone(), ArtifactConfidentiality::Public);
-        for slot in 0..self.slot_count {
-            expected_outputs
-                .insert(self.names.masks[slot].vector.clone(), ArtifactConfidentiality::Private);
-            expected_outputs.insert(
-                self.names.masks[slot].public_matrix.clone(),
-                ArtifactConfidentiality::Public,
-            );
-            expected_outputs.insert(
-                self.names.decoder_base_vectors[slot].clone(),
-                ArtifactConfidentiality::Private,
-            );
-            expected_outputs
-                .insert(self.names.preimages[slot].clone(), ArtifactConfidentiality::Private);
-        }
-        let artifact_output_count = graph
-            .outputs()
-            .iter()
-            .filter(|(name, output)| {
-                expected_outputs.contains_key(*name) && output.confidentiality.is_some()
-            })
-            .count();
-        if artifact_output_count != expected_outputs.len() ||
-            graph.outputs().iter().any(|(name, _)| !expected_outputs.contains_key(name)) ||
-            expected_outputs.iter().any(|(name, confidentiality)| {
-                graph.outputs().get(name).and_then(|output| output.confidentiality) !=
-                    Some(*confidentiality)
-            })
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let root = graph.root_scope();
-        let role = |name: &str| -> Result<ScopedWireRef, RefreshSetupError> {
-            let mut found =
-                attestation.attachment.roles.iter().filter(|(candidate, _)| candidate == name);
-            let wire = found
-                .next()
-                .map(|(_, wire)| wire.clone())
-                .ok_or(RefreshSetupError::InvalidManifest)?;
-            if found.next().is_some() || wire.scope != FrozenGraphScopeId::Root {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-            Ok(wire)
-        };
-        let output_role = |role_name: &str, output_name: &str| -> Result<(), RefreshSetupError> {
-            if role(role_name)?.wire !=
-                graph.outputs().get(output_name).ok_or(RefreshSetupError::InvalidManifest)?.value
-            {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-            Ok(())
-        };
-        let expected_role_count = 8usize
-            .checked_add(self.slot_count.checked_mul(6).ok_or(RefreshSetupError::InvalidManifest)?)
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let mut role_names = std::collections::BTreeSet::new();
-        for (name, _) in &attestation.attachment.roles {
-            if !role_names.insert(name) {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-        }
-        if role_names.len() != expected_role_count {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        for name in [
-            "state-vector",
-            "state-public",
-            "a-prime",
-            "public-b",
-            "trapdoor",
-            "fresh-vector",
-            "fresh-public",
-            "secret",
-        ] {
-            role(name)?;
-        }
-        output_role("state-vector", &self.names.state_vector)?;
-        output_role("state-public", &self.names.state_public_matrix)?;
-        output_role("a-prime", &self.names.a_prime)?;
-        output_role("public-b", &self.names.public_matrix_b)?;
-        output_role("fresh-vector", &self.names.fresh_vector)?;
-        output_role("fresh-public", &self.names.fresh_public_matrix)?;
-        for slot in 0..self.slot_count {
-            output_role(&format!("slot-{slot}-mask-vector"), &self.names.masks[slot].vector)?;
-            output_role(
-                &format!("slot-{slot}-mask-public"),
-                &self.names.masks[slot].public_matrix,
-            )?;
-            output_role(&format!("slot-{slot}-k-as-mat"), &self.names.preimages[slot])?;
-            output_role(
-                &format!("slot-{slot}-decoder-base-vector"),
-                &self.names.decoder_base_vectors[slot],
-            )?;
-        }
-        let root_node = |wire: &ScopedWireRef| root.node(wire.wire.node);
-        let a_prime = role("a-prime")?;
-        let a_node = root_node(&a_prime).ok_or(RefreshSetupError::InvalidManifest)?;
-        let expected_tag =
-            format!("mxx-power-lut/refresh/a-prime/v1/{}", hex(&self.refresh_id)).into_bytes();
-        match a_node.kind() {
-            mxx_ir_core::node::NodeKind::HashSample {
-                matrix_type,
-                variant,
-                tag_prefix,
-                tag_expressions,
-                tag_decimal_expressions,
-                tag_u64_le_expressions,
-                base,
-                digit_count,
-            } if a_prime.wire.port.0 == 0 &&
-                a_node.arguments().len() == 1 &&
-                *matrix_type ==
-                    mxx_dsl::Ring::new(
-                        self.layout_modulus.clone(),
-                        self.layout_ring_dimension.clone(),
-                    )
-                    .matrix_type((
-                        self.component_count,
-                        self.component_count * self.digit_count,
-                    )) &&
-                *variant == mxx_ir_core::node::HashVariant::Plain &&
-                *tag_prefix == expected_tag &&
-                tag_expressions.is_empty() &&
-                tag_decimal_expressions.is_empty() &&
-                tag_u64_le_expressions.is_empty() &&
-                base.is_none() &&
-                digit_count.is_none() => {}
-            _ => return Err(RefreshSetupError::InvalidManifest),
-        }
-        let public_b = role("public-b")?;
-        let trapdoor = role("trapdoor")?;
-        let b_node = root_node(&public_b).ok_or(RefreshSetupError::InvalidManifest)?;
-        let t_node = root_node(&trapdoor).ok_or(RefreshSetupError::InvalidManifest)?;
-        if public_b.wire.port.0 != 0 ||
-            trapdoor.wire.port.0 != 1 ||
-            public_b.wire.node != trapdoor.wire.node ||
-            !matches!(b_node.kind(), mxx_ir_core::node::NodeKind::TrapdoorSample { .. }) ||
-            !matches!(t_node.kind(), mxx_ir_core::node::NodeKind::TrapdoorSample { matrix_type, sigma, gadget_base, digit_count, preimage_max_coefficient_bound, .. }
-                if matrix_type == &mxx_dsl::Ring::new(
-                    self.layout_modulus.clone(), self.layout_ring_dimension.clone(),
-                ).matrix_type((
-                    self.component_count,
-                    self.component_count * (self.digit_count + 2),
-                )) &&
-                    sigma == &self.decoder_sigma && gadget_base == &self.layout_gadget_base &&
-                    digit_count == &mxx_ir_core::IntExpr::constant(self.trapdoor_digit_count) &&
-                    preimage_max_coefficient_bound == &self.decoder_preimage_bound)
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let mut relation_slots = std::collections::BTreeSet::new();
-        for relation in &attestation.relations {
-            if relation.slot >= self.slot_count ||
-                !relation_slots.insert(relation.slot) ||
-                relation.target != role(&format!("slot-{}-target", relation.slot))? ||
-                relation.preimage != role(&format!("slot-{}-preimage", relation.slot))? ||
-                relation.k_as_mat != role(&format!("slot-{}-k-as-mat", relation.slot))? ||
-                relation.decoder_base_vector !=
-                    role(&format!("slot-{}-decoder-base-vector", relation.slot))?
-            {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-            validate_relation_graph(graph, &role, relation, &public_b, &trapdoor, self)?;
-        }
-        if attestation.relations.len() != self.slot_count {
-            return Err(RefreshSetupError::InvalidManifest);
         }
         Ok(())
     }
@@ -1266,15 +1043,22 @@ impl ImportedRefreshSetup {
             });
         }
         for x in &n.preimages {
-            // The graph attestation already proved the producer's
-            // PreimageSample/K-as-mat relation. Imported execution consumes
-            // only the ordinary private matrix artifact.
-            ks.push(imported(
+            // Keep K typed as a preimage across the artifact boundary. The
+            // consumer therefore applies the witness through `apply_preimage`
+            // instead of materializing it as an untyped matrix.
+            let matrix = resolve_graph_output_preimage(
+                &attestation.graph,
                 x,
                 ArtifactConfidentiality::Private,
-                false,
                 &parameters.layout.ring().matrix_type((b_columns, cols)),
-            )?);
+            )?;
+            let ring = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
+            ks.push(ring.preimage_artifact_input(
+                production_id.clone(),
+                x.to_owned(),
+                (matrix.rows.clone(), matrix.columns.clone()),
+                ArtifactConfidentiality::Private,
+            ));
         }
         Ok(Self {
             production_id,
@@ -1407,61 +1191,11 @@ fn declaration_contract(declaration: &RefreshPreprocessingDeclaration) -> Refres
     )
 }
 
-fn masks_len(wires: &RefreshPreprocessingWires) -> usize {
-    wires.masks.len()
-}
-
-/// Collects the private role map used by the frozen producer attestation.
-///
-/// Role handles point at graph values, including the exact preimage sample and
-/// its target; they are not reconstructed from artifact names during import.
-fn setup_roles(
-    wires: &RefreshPreprocessingWires,
-) -> Result<Vec<(String, mxx_ir_core::ValueHandle)>, RefreshSetupError> {
-    let mut roles = vec![
-        ("state-vector".to_owned(), wires.state.vector.value_handle().clone()),
-        ("state-public".to_owned(), wires.state.pubkey.matrix.value_handle().clone()),
-        ("secret".to_owned(), wires.secret.value_handle().clone()),
-        ("a-prime".to_owned(), wires.a_prime.value_handle().clone()),
-        ("public-b".to_owned(), wires.public_b.value_handle().clone()),
-        ("trapdoor".to_owned(), wires.trapdoor.clone()),
-        ("fresh-vector".to_owned(), wires.fresh.vector.value_handle().clone()),
-        ("fresh-public".to_owned(), wires.fresh.pubkey.matrix.value_handle().clone()),
-    ];
-    for slot in 0..wires.masks.len() {
-        roles.extend([
-            (format!("slot-{slot}-mask-vector"), wires.masks[slot].vector.value_handle().clone()),
-            (
-                format!("slot-{slot}-mask-public"),
-                wires.masks[slot].pubkey.matrix.value_handle().clone(),
-            ),
-            (format!("slot-{slot}-target"), wires.targets[slot].value_handle().clone()),
-            (format!("slot-{slot}-k-as-mat"), wires.preimages[slot].value_handle().clone()),
-            (
-                format!("slot-{slot}-preimage"),
-                wires.preimages[slot]
-                    .value_handle()
-                    .node()
-                    .arguments()
-                    .first()
-                    .cloned()
-                    .ok_or(RefreshSetupError::InvalidManifest)?,
-            ),
-            (
-                format!("slot-{slot}-decoder-base-vector"),
-                wires.decoder_bases[slot].vector.value_handle().clone(),
-            ),
-        ]);
-    }
-    Ok(roles)
-}
-
 /// Exports producer wires under their canonical public/private artifact names.
 fn add_setup_outputs(
     mut context: DslContext,
     wires: &RefreshPreprocessingWires,
     names: &RefreshPreprocessingArtifactNames,
-    attached_b: Mat,
 ) -> Result<DslContext, RefreshSetupError> {
     // Private vectors and K_t remain private artifacts; A', B, and the public
     // projections are exported with the declaration's canonical roles.
@@ -1469,7 +1203,7 @@ fn add_setup_outputs(
         .private_output(names.state_vector.clone(), wires.state.vector.clone())?
         .public_output(names.state_public_matrix.clone(), wires.state.pubkey.matrix.clone())?
         .public_output(names.a_prime.clone(), wires.a_prime.clone())?
-        .public_output(names.public_matrix_b.clone(), attached_b)?
+        .public_output(names.public_matrix_b.clone(), wires.public_b.clone())?
         .private_output(names.fresh_vector.clone(), wires.fresh.vector.clone())?
         .public_output(names.fresh_public_matrix.clone(), wires.fresh.pubkey.matrix.clone())?;
     for slot in 0..wires.masks.len() {
@@ -1480,313 +1214,13 @@ fn add_setup_outputs(
                 wires.masks[slot].pubkey.matrix.clone(),
             )
             .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?
-            .private_output(names.preimages[slot].clone(), wires.preimages[slot].clone())?
+            .private_preimage_output(names.preimages[slot].clone(), wires.preimages[slot].clone())?
             .private_output(
                 names.decoder_base_vectors[slot].clone(),
                 wires.decoder_bases[slot].vector.clone(),
             )?;
     }
     Ok(context)
-}
-
-/// Extracts one exact graph relation record for each CRT slot.
-fn relation_attestations(
-    _graph: &Graph,
-    attachment: &mxx_dsl::FrozenDerivationAttachment,
-    slots: usize,
-) -> Result<Vec<RefreshPreimageRelationAttestation>, RefreshSetupError> {
-    let role = |name: String| {
-        attachment
-            .roles
-            .iter()
-            .find(|(candidate, _)| candidate == &name)
-            .map(|(_, wire)| wire.clone())
-    };
-    (0..slots)
-        .map(|slot| {
-            Ok(RefreshPreimageRelationAttestation {
-                slot,
-                target: role(format!("slot-{slot}-target"))
-                    .ok_or(RefreshSetupError::InvalidManifest)?,
-                preimage: role(format!("slot-{slot}-preimage"))
-                    .ok_or(RefreshSetupError::InvalidManifest)?,
-                k_as_mat: role(format!("slot-{slot}-k-as-mat"))
-                    .ok_or(RefreshSetupError::InvalidManifest)?,
-                decoder_base_vector: role(format!("slot-{slot}-decoder-base-vector"))
-                    .ok_or(RefreshSetupError::InvalidManifest)?,
-            })
-        })
-        .collect()
-}
-
-/// Validates the graph shape and operand identities for one slot relation.
-///
-/// This check distinguishes the exact target/preimage/decoder chain from a
-/// merely same-shaped replacement wire.
-fn validate_relation_graph(
-    graph: &Graph,
-    role: &impl Fn(&str) -> Result<ScopedWireRef, RefreshSetupError>,
-    relation: &RefreshPreimageRelationAttestation,
-    public_b: &ScopedWireRef,
-    trapdoor: &ScopedWireRef,
-    declaration: &RefreshPreprocessingDeclaration,
-) -> Result<(), RefreshSetupError> {
-    let packed = declaration
-        .component_count
-        .checked_mul(declaration.digit_count)
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let b_columns = declaration
-        .component_count
-        .checked_mul(declaration.digit_count + 2)
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let root = graph.root_scope();
-    let node = |wire: &ScopedWireRef| {
-        (wire.scope == FrozenGraphScopeId::Root).then(|| root.node(wire.wire.node)).flatten()
-    };
-    let state_public = role("state-public")?;
-    let mask_public = role(&format!("slot-{}-mask-public", relation.slot))?;
-    let fresh_public = role("fresh-public")?;
-    let target_selector = node(&relation.target).ok_or(RefreshSetupError::InvalidManifest)?;
-    let target_selector_args =
-        root.arguments(target_selector).ok_or(RefreshSetupError::InvalidManifest)?;
-    let target_family = *target_selector_args.first().ok_or(RefreshSetupError::InvalidManifest)?;
-    let target_loop = root.node(target_family.node).ok_or(RefreshSetupError::InvalidManifest)?;
-    let mxx_ir_core::node::NodeKind::ParallelLoop(target_loop_spec) = target_loop.kind() else {
-        return Err(RefreshSetupError::InvalidManifest);
-    };
-    let target_loop_args = root.arguments(target_loop).ok_or(RefreshSetupError::InvalidManifest)?;
-    if relation.target.wire.port.0 != 0 ||
-        target_family.port.0 != 0 ||
-        !matches!(
-            target_selector.kind(),
-            mxx_ir_core::node::NodeKind::FamilyGetStatic { index }
-                if index == &mxx_ir_core::IntExpr::constant(relation.slot)
-        ) ||
-        target_loop_spec.count != mxx_ir_core::IntExpr::constant(declaration.slot_count) ||
-        target_loop_spec.input_modes !=
-            vec![
-                mxx_ir_core::node::LoopInputMode::Zip,
-                mxx_ir_core::node::LoopInputMode::Zip,
-                mxx_ir_core::node::LoopInputMode::Broadcast,
-                mxx_ir_core::node::LoopInputMode::Broadcast,
-                mxx_ir_core::node::LoopInputMode::Broadcast,
-            ] ||
-        target_loop_args.len() != 5 ||
-        target_loop_args[2] != state_public.wire ||
-        target_loop_args[3] != fresh_public.wire ||
-        target_loop_args[4] != role("a-prime")?.wire
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let mask_family_node =
-        root.node(target_loop_args[0].node).ok_or(RefreshSetupError::InvalidManifest)?;
-    let scale_family_node =
-        root.node(target_loop_args[1].node).ok_or(RefreshSetupError::InvalidManifest)?;
-    let mask_family_args =
-        root.arguments(mask_family_node).ok_or(RefreshSetupError::InvalidManifest)?;
-    let scale_family_args =
-        root.arguments(scale_family_node).ok_or(RefreshSetupError::InvalidManifest)?;
-    if !matches!(
-        mask_family_node.kind(),
-        mxx_ir_core::node::NodeKind::FamilyPack { count }
-            if count == &mxx_ir_core::IntExpr::constant(declaration.slot_count)
-    ) || !matches!(
-        scale_family_node.kind(),
-        mxx_ir_core::node::NodeKind::FamilyPack { count }
-            if count == &mxx_ir_core::IntExpr::constant(declaration.slot_count)
-    ) || mask_family_args.len() != declaration.slot_count ||
-        scale_family_args.len() != declaration.slot_count ||
-        mask_family_args[relation.slot] != mask_public.wire ||
-        !matches!(
-            root.node(scale_family_args[relation.slot].node)
-                .ok_or(RefreshSetupError::InvalidManifest)?
-                .kind(),
-            mxx_ir_core::node::NodeKind::ConstantMatrix {
-                value: mxx_ir_core::node::ConstantMatrix::Polynomial { coefficients },
-                ..
-            } if coefficients.len() == 1 &&
-                coefficients[0] == declaration.slot_scales[relation.slot]
-        )
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let target_body_id = graph
-        .child_scope_id(&FrozenGraphScopeId::Root, target_family.node)
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let target_body = graph.scope(&target_body_id).ok_or(RefreshSetupError::InvalidManifest)?;
-    if target_body.inputs().len() != 5 || target_body.outputs().len() != 1 {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let target_node = target_body
-        .node(target_body.outputs()[0].node)
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let target_args =
-        target_body.arguments(target_node).ok_or(RefreshSetupError::InvalidManifest)?;
-    let target_scale = target_args.get(1).and_then(|wire| target_body.node(wire.node));
-    let target_sum = target_args.first().and_then(|wire| target_body.node(wire.node));
-    let Some(target_scale) = target_scale else { return Err(RefreshSetupError::InvalidManifest) };
-    let Some(target_sum) = target_sum else { return Err(RefreshSetupError::InvalidManifest) };
-    let sum_args = target_body.arguments(target_sum).ok_or(RefreshSetupError::InvalidManifest)?;
-    let first_sum = sum_args.first().and_then(|wire| target_body.node(wire.node));
-    let Some(first_sum) = first_sum else { return Err(RefreshSetupError::InvalidManifest) };
-    let first_sum_args =
-        target_body.arguments(first_sum).ok_or(RefreshSetupError::InvalidManifest)?;
-    let scale_args =
-        target_body.arguments(target_scale).ok_or(RefreshSetupError::InvalidManifest)?;
-    if !matches!(
-        target_node.kind(),
-        mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Subtract)
-    ) || target_args.len() != 2 ||
-        !is_large_scale_node(target_body, sum_args[1], target_body.inputs()[3]) ||
-        !matches!(
-            target_sum.kind(),
-            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Add)
-        ) ||
-        sum_args.len() != 2 ||
-        !matches!(
-            first_sum.kind(),
-            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Add)
-        ) ||
-        first_sum_args.len() != 2 ||
-        first_sum_args[1] != target_body.inputs()[0] ||
-        !is_large_scale_node(target_body, first_sum_args[0], target_body.inputs()[2]) ||
-        !matches!(
-            target_scale.kind(),
-            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
-        ) ||
-        scale_args.len() != 2 ||
-        scale_args[0] != target_body.inputs()[1] ||
-        scale_args[1] != target_body.inputs()[4]
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let preimage_loop = node(&relation.preimage).ok_or(RefreshSetupError::InvalidManifest)?;
-    let mxx_ir_core::node::NodeKind::ParallelLoop(preimage_loop_spec) = preimage_loop.kind() else {
-        return Err(RefreshSetupError::InvalidManifest);
-    };
-    let preimage_loop_args =
-        root.arguments(preimage_loop).ok_or(RefreshSetupError::InvalidManifest)?;
-    if relation.preimage.wire.port.0 != 0 ||
-        preimage_loop_spec.count != mxx_ir_core::IntExpr::constant(declaration.slot_count) ||
-        preimage_loop_spec.input_modes !=
-            [
-                mxx_ir_core::node::LoopInputMode::Zip,
-                mxx_ir_core::node::LoopInputMode::Broadcast,
-                mxx_ir_core::node::LoopInputMode::Broadcast,
-            ] ||
-        preimage_loop_args.len() != 3 ||
-        preimage_loop_args[0] != target_family ||
-        preimage_loop_args[1] != public_b.wire ||
-        preimage_loop_args[2] != trapdoor.wire
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let preimage_body_id = graph
-        .child_scope_id(
-            &FrozenGraphScopeId::Root,
-            root.node_id(preimage_loop).ok_or(RefreshSetupError::InvalidManifest)?,
-        )
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let body = graph.scope(&preimage_body_id).ok_or(RefreshSetupError::InvalidManifest)?;
-    if body.inputs().len() != 3 {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let preimage_nodes = body
-        .nodes()
-        .iter()
-        .filter(|candidate| {
-            matches!(candidate.kind(), mxx_ir_core::node::NodeKind::PreimageSample { .. })
-        })
-        .collect::<Vec<_>>();
-    if preimage_nodes.len() != 1 {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let preimage_node = preimage_nodes[0];
-    let preimage_args = body.arguments(preimage_node).ok_or(RefreshSetupError::InvalidManifest)?;
-    let preimage_wire = mxx_ir_core::WireRef {
-        node: body.node_id(preimage_node).ok_or(RefreshSetupError::InvalidManifest)?,
-        port: mxx_ir_core::types::Port(0),
-    };
-    if !matches!(
-        preimage_node.kind(),
-        mxx_ir_core::node::NodeKind::PreimageSample { matrix_type, max_coefficient_bound }
-            if max_coefficient_bound == &declaration.decoder_preimage_bound &&
-                matrix_type.rows == b_columns.into() && matrix_type.columns == packed.into()
-    ) || preimage_args.len() != 3 ||
-        preimage_args[0] != body.inputs()[1] ||
-        preimage_args[1] != body.inputs()[2] ||
-        preimage_args[2] != body.inputs()[0] ||
-        body.outputs().len() != 1 ||
-        {
-            match body.outputs().first().and_then(|output| body.node(output.node)) {
-                Some(output_node) => {
-                    let output_args = body.arguments(output_node);
-                    !matches!(
-                        (output_node.kind(), output_args.as_deref()),
-                        (
-                            mxx_ir_core::node::NodeKind::MatrixScale { scalar },
-                            Some([argument])
-                        ) if scalar == &mxx_ir_core::IntExpr::constant(1) &&
-                            *argument == preimage_wire &&
-                            matches!(
-                                output_node.output_types().first(),
-                                Some(WireType::Matrix(matrix_type))
-                                    if matrix_type.rows == b_columns.into() &&
-                                        matrix_type.columns == packed.into()
-                            )
-                    )
-                }
-                None => true,
-            }
-        }
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let k_node = node(&relation.k_as_mat).ok_or(RefreshSetupError::InvalidManifest)?;
-    let k_args = root.arguments(k_node).ok_or(RefreshSetupError::InvalidManifest)?;
-    if relation.k_as_mat.wire.port.0 != 0 ||
-        !matches!(
-            k_node.kind(),
-            mxx_ir_core::node::NodeKind::FamilyGetStatic { index }
-                if index == &mxx_ir_core::IntExpr::constant(relation.slot)
-        ) ||
-        k_args.len() != 1 ||
-        k_args[0] != relation.preimage.wire
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let base = role(&format!("slot-{}-decoder-base-vector", relation.slot))?;
-    let base_node = node(&base).ok_or(RefreshSetupError::InvalidManifest)?;
-    let secret = role("secret")?;
-    let base_args = root.arguments(base_node).ok_or(RefreshSetupError::InvalidManifest)?;
-    if base.wire.port.0 != 0 ||
-        !matches!(
-            base_node.kind(),
-            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
-        ) ||
-        base_args.len() != 2 ||
-        base_args[0] != secret.wire ||
-        base_args[1] != public_b.wire
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    Ok(())
-}
-
-fn is_large_scale_node(
-    root: &mxx_ir_core::graph::GraphScope,
-    wire: mxx_ir_core::WireRef,
-    input: mxx_ir_core::WireRef,
-) -> bool {
-    let Some(node) = root.node(wire.node) else { return false };
-    if !matches!(
-        node.kind(),
-        mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
-    ) {
-        return false;
-    }
-    let Some(arguments) = root.arguments(node) else { return false };
-    arguments.len() == 2 && arguments[0] == input
 }
 
 /// Computes the canonical public identity for refresh preprocessing setup.
@@ -1919,7 +1353,7 @@ fn validate_manifest(
      -> Result<(), RefreshSetupError> {
         let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
         if artifact.confidentiality != confidentiality ||
-            artifact.family_count.is_some() ||
+            artifact.family_shape.is_some() ||
             artifact.artifact_type != matrix_type(rows, columns) ||
             artifact.layout.is_some() ||
             (confidentiality == ArtifactConfidentiality::Private &&
@@ -2043,17 +1477,12 @@ impl RefreshVerification {
         // aggregate residual matrix (which would make a same-shaped column
         // substitution indistinguishable to a downstream checker).
         for (column, residual) in self.decoder_residuals.iter().enumerate() {
-            context = context.private_output(
-                format!("refresh-decoder-residual-{column}"),
-                residual.clone().semantic_anchor(format!("refresh.decoder.residual.{column}"))?,
-            )?;
+            context = context
+                .private_output(format!("refresh-decoder-residual-{column}"), residual.clone())?;
         }
         let decoded_prefix = decoded_prefix.into();
         for (index, value) in self.decoded.iter().enumerate() {
-            context = context.bool_output(
-                format!("{decoded_prefix}_{index}"),
-                value.clone().semantic_anchor(format!("refresh.decoder.output.{index}"))?,
-            )?;
+            context = context.bool_output(format!("{decoded_prefix}_{index}"), value.clone())?;
         }
         Ok(context)
     }
@@ -2157,7 +1586,8 @@ pub fn build_refresh_verification(
 
 /// Exact matrix facts exported by the refresh simulation adapter for the
 /// protocol-agnostic operational checker.  This type deliberately mirrors
-/// only structural matrix facts; it has no dependency on `mxx-correctness`.
+/// only structural matrix facts; it has no dependency on a protocol-specific
+/// checker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefreshSimulationMatrixInputMetadata {
     /// Exclusive coefficient bound inferred from the producer matrix, when
@@ -2689,11 +2119,12 @@ fn resolve_graph_output_matrix(
         .ok_or(RefreshSetupError::InvalidManifest)?;
     let (matrix, count) = match output_type {
         WireType::Matrix(matrix) if !expected_family => (matrix, None),
-        WireType::IndexedFamily { element, count } if expected_family => {
+        WireType::Family { element, shape } if expected_family => {
             let WireType::Matrix(matrix) = element.as_ref() else {
                 return Err(RefreshSetupError::InvalidManifest);
             };
-            (matrix, Some(count))
+            let count = (shape.len() == 1).then(|| shape[0].clone());
+            (matrix, count)
         }
         _ => return Err(RefreshSetupError::InvalidManifest),
     };
@@ -2711,14 +2142,41 @@ fn resolve_graph_output_matrix(
     {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    match (count, expected_count) {
+    match (count.clone(), expected_count) {
         (None, None) => {}
         (Some(actual), Some(expected))
             if actual.evaluate(&ParamEnv::default()).ok().and_then(|v| v.to_usize()) ==
                 Some(expected) => {}
         _ => return Err(RefreshSetupError::InvalidManifest),
     }
-    Ok((matrix.clone(), count.cloned()))
+    Ok((matrix.clone(), count))
+}
+
+/// Resolves a private preimage artifact output while retaining its typed
+/// witness schema.  A matrix output with the same dimensions is not accepted:
+/// the `Preimage` wire type is part of the producer/consumer contract.
+fn resolve_graph_output_preimage(
+    graph: &Graph,
+    name: &str,
+    expected_confidentiality: ArtifactConfidentiality,
+    expected_matrix: &mxx_ir_core::types::MatrixType,
+) -> Result<mxx_ir_core::types::MatrixType, RefreshSetupError> {
+    let output = graph.outputs().get(name).ok_or(RefreshSetupError::InvalidManifest)?;
+    if output.confidentiality != Some(expected_confidentiality) {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    let root = graph.root_scope();
+    let output_type = root
+        .node(output.value.node)
+        .and_then(|node| node.output_types().get(output.value.port.0 as usize))
+        .ok_or(RefreshSetupError::InvalidManifest)?;
+    let WireType::Preimage(matrix) = output_type else {
+        return Err(RefreshSetupError::InvalidManifest);
+    };
+    if !same_matrix_type(matrix, expected_matrix) {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    Ok(matrix.clone())
 }
 
 /// Compares matrix schemas by their evaluated dimensions.  DSL constructors
@@ -2809,7 +2267,7 @@ fn matrix_input_metadata(
         for node in graph.graph.root_scope().nodes() {
             if let mxx_ir_core::node::NodeKind::Input {
                 name,
-                wire_type: WireType::IndexedFamily { element, .. },
+                wire_type: WireType::Family { element, .. },
                 artifact: None,
             } = node.kind() &&
                 matches!(element.as_ref(), WireType::Matrix(_))
@@ -2941,273 +2399,4 @@ fn decoder_targets(
         decoder_anchor: decoder_zero.decoder_anchor.clone(),
         plaintext_modulus: decoder_zero.plaintext_modulus.clone(),
     }])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mxx_bgg::BggEncodingCompiler;
-    use mxx_ir_core::artifact::SpecHash;
-
-    struct RelationFixture {
-        graph: Graph,
-        roles: BTreeMap<String, ScopedWireRef>,
-        relation: RefreshPreimageRelationAttestation,
-        wrong_target: ScopedWireRef,
-        wrong_preimage: ScopedWireRef,
-        public_b: ScopedWireRef,
-        trapdoor: ScopedWireRef,
-        declaration: RefreshPreprocessingDeclaration,
-    }
-
-    fn relation_fixture() -> RelationFixture {
-        let ring = mxx_dsl::Ring::new(97, 4);
-        let bgg = BggEncodingCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 2.into(),
-                digit_count: 2.into(),
-            },
-        };
-        let state = BggEncodingWire {
-            vector: ring.input("state-vector", (1, 4)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input("state-public", (2, 4)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let fresh = BggEncodingWire {
-            vector: ring.input("fresh-vector", (1, 4)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input("fresh-public", (2, 4)),
-                reveal_plaintext: false,
-            },
-            plaintext: None,
-        };
-        let a_prime = ring.input("a-prime", (2, 4));
-        let mask_public = ring.input("mask-public", (2, 4));
-        let wrong_mask_public = ring.input("wrong-mask-public", (2, 4));
-        let trapdoor = ring.sample_trapdoor(2, 1, 2, 2, 100);
-        let public_b = trapdoor.public_matrix();
-        let masks = Family::pack(vec![mask_public.clone()]).expect("mask family");
-        let scales = Family::pack(vec![ring.polynomial([1.into()])]).expect("scale family");
-        let target_family =
-            Family::<Mat>::parallel_zip_many_values(vec![masks, scales.clone()], |_, mut items| {
-                let mask = items.remove(0);
-                let scale = items.remove(0);
-                bgg.large_scalar_mul(&state, &scale).pubkey.matrix +
-                    mask +
-                    bgg.large_scalar_mul(&fresh, &scale).pubkey.matrix -
-                    scale * a_prime.clone()
-            })
-            .expect("target family");
-        let preimage_family = target_family
-            .clone()
-            .parallel_map(|_, target| trapdoor.sample_preimage(target, (8, 4)).as_mat())
-            .expect("preimage family");
-        let wrong_masks = Family::pack(vec![wrong_mask_public.clone()]).expect("wrong mask family");
-        let wrong_target_family = Family::<Mat>::parallel_zip_many_values(
-            vec![wrong_masks, scales.clone()],
-            |_, mut items| {
-                let mask = items.remove(0);
-                let scale = items.remove(0);
-                bgg.large_scalar_mul(&state, &scale).pubkey.matrix +
-                    mask +
-                    bgg.large_scalar_mul(&fresh, &scale).pubkey.matrix -
-                    scale * a_prime.clone()
-            },
-        )
-        .expect("wrong target family");
-        let wrong_preimage_family = wrong_target_family
-            .parallel_map(|_, target| trapdoor.sample_preimage(target, (8, 4)).as_mat())
-            .expect("wrong preimage family");
-        let target = target_family.get_static(0);
-        let wrong_target = target_family.get_static(1);
-        let k_as_mat = preimage_family.get_static(0);
-        let wrong_k_as_mat = wrong_preimage_family.get_static(0);
-        let decoder_base = state.vector.clone() * public_b.clone();
-        let mut context = DslContext::new("refresh-setup-attestation-test");
-        context = context
-            .output("target", target.clone())
-            .expect("target output")
-            .output("wrong-target", wrong_target.clone())
-            .expect("wrong target output")
-            .output("preimage", k_as_mat.clone())
-            .expect("preimage output")
-            .output("wrong-preimage", wrong_k_as_mat)
-            .expect("wrong preimage output")
-            .output("public-b", public_b.clone())
-            .expect("public B output")
-            .output("state-public", state.pubkey.matrix.clone())
-            .expect("state public output")
-            .output("fresh-public", fresh.pubkey.matrix.clone())
-            .expect("fresh public output")
-            .output("a-prime", a_prime.clone())
-            .expect("a-prime output")
-            .output("mask-public", mask_public.clone())
-            .expect("mask public output")
-            .output("state-vector", state.vector.clone())
-            .expect("state vector output")
-            .output("decoder-base-vector", decoder_base)
-            .expect("decoder base output")
-            .private_trapdoor_output("trapdoor", trapdoor.clone())
-            .expect("trapdoor output");
-        let graph = context.build().expect("attestation graph").graph;
-        let root = graph.root_scope();
-        let output = |name: &str| ScopedWireRef {
-            scope: FrozenGraphScopeId::Root,
-            wire: graph.outputs().get(name).expect("test output").value,
-        };
-        let target = output("target");
-        let wrong_target = output("wrong-target");
-        let k_as_mat = output("preimage");
-        let wrong_k_as_mat = output("wrong-preimage");
-        let public_b = output("public-b");
-        let trapdoor = output("trapdoor");
-        let preimage_node = root.node(k_as_mat.wire.node).expect("preimage output node");
-        let preimage = ScopedWireRef {
-            scope: FrozenGraphScopeId::Root,
-            wire: root.arguments(preimage_node).expect("preimage output arguments")[0],
-        };
-        let wrong_preimage_node =
-            root.node(wrong_k_as_mat.wire.node).expect("wrong preimage output node");
-        let wrong_preimage = ScopedWireRef {
-            scope: FrozenGraphScopeId::Root,
-            wire: root.arguments(wrong_preimage_node).expect("wrong preimage output arguments")[0],
-        };
-        let mut roles = BTreeMap::from([
-            ("state-public".to_owned(), output("state-public")),
-            ("fresh-public".to_owned(), output("fresh-public")),
-            ("a-prime".to_owned(), output("a-prime")),
-            ("public-b".to_owned(), public_b.clone()),
-            ("trapdoor".to_owned(), trapdoor.clone()),
-            ("secret".to_owned(), output("state-vector")),
-        ]);
-        roles.insert("slot-0-mask-public".to_owned(), output("mask-public"));
-        roles.insert("slot-0-decoder-base-vector".to_owned(), output("decoder-base-vector"));
-        let declaration = RefreshPreprocessingDeclaration {
-            identity: [0; 32],
-            producer_spec_hash: SpecHash([0; 32]),
-            pbc_layout_id: crate::pbc::PbcLayoutId([0; 32]),
-            refresh_id: [0; 32],
-            program_id: PowerLutProgramId::from_digest([1; 32]),
-            prf_q_l: 2,
-            prf_p: 2,
-            prf_lut_width: 4,
-            prf_ring_dimension: 4,
-            prf_terminal_form: SparseLwrPrfTerminalForm::RawScalar,
-            prf_output_wire: crate::program::ProgramWireId::from_index(0),
-            names: RefreshPreprocessingArtifactNames {
-                state_vector: String::new(),
-                state_public_matrix: String::new(),
-                a_prime: String::new(),
-                public_matrix_b: String::new(),
-                fresh_vector: String::new(),
-                fresh_public_matrix: String::new(),
-                masks: Vec::new(),
-                decoder_base_vectors: Vec::new(),
-                preimages: Vec::new(),
-            },
-            slot_count: 1,
-            component_count: 2,
-            coefficient_count: 1,
-            digit_count: 2,
-            decoder_sigma: 1.into(),
-            decoder_preimage_bound: 100.into(),
-            trapdoor_digit_count: 2,
-            slot_scales: vec![1.into()],
-            layout_modulus: 97.into(),
-            layout_ring_dimension: 4.into(),
-            layout_gadget_base: 2.into(),
-        };
-        let relation = RefreshPreimageRelationAttestation {
-            slot: 0,
-            target,
-            preimage,
-            k_as_mat,
-            decoder_base_vector: public_b.clone(),
-        };
-        RelationFixture {
-            graph,
-            roles,
-            relation,
-            wrong_target,
-            wrong_preimage,
-            public_b,
-            trapdoor,
-            declaration,
-        }
-    }
-
-    fn validate_fixture(
-        fixture: &RelationFixture,
-        relation: &RefreshPreimageRelationAttestation,
-    ) -> Result<(), RefreshSetupError> {
-        let role =
-            |name: &str| fixture.roles.get(name).cloned().ok_or(RefreshSetupError::InvalidManifest);
-        validate_relation_graph(
-            &fixture.graph,
-            &role,
-            relation,
-            &fixture.public_b,
-            &fixture.trapdoor,
-            &fixture.declaration,
-        )
-    }
-
-    #[test]
-    fn relation_attestation_accepts_two_separate_structural_loops() {
-        let fixture = relation_fixture();
-        validate_fixture(&fixture, &fixture.relation).expect("valid two-loop attestation");
-    }
-
-    #[test]
-    fn relation_attestation_rejects_wrong_target_family() {
-        let fixture = relation_fixture();
-        let mut relation = fixture.relation.clone();
-        relation.target = relation.k_as_mat.clone();
-        assert!(validate_fixture(&fixture, &relation).is_err());
-    }
-
-    #[test]
-    fn relation_attestation_rejects_wrong_target_index() {
-        let fixture = relation_fixture();
-        let mut relation = fixture.relation.clone();
-        relation.target = fixture.wrong_target.clone();
-        assert!(validate_fixture(&fixture, &relation).is_err());
-    }
-
-    #[test]
-    fn relation_attestation_rejects_wrong_preimage_loop_output() {
-        let fixture = relation_fixture();
-        let mut relation = fixture.relation.clone();
-        relation.preimage = relation.k_as_mat.clone();
-        assert!(validate_fixture(&fixture, &relation).is_err());
-    }
-
-    #[test]
-    fn relation_attestation_rejects_wrong_preimage_target() {
-        let fixture = relation_fixture();
-        let mut relation = fixture.relation.clone();
-        relation.preimage = fixture.wrong_preimage.clone();
-        assert!(validate_fixture(&fixture, &relation).is_err());
-    }
-
-    #[test]
-    fn relation_attestation_rejects_wrong_preimage_loop_input_mode() {
-        let fixture = relation_fixture();
-        let mut relation = fixture.relation.clone();
-        relation.preimage = relation.target.clone();
-        assert!(validate_fixture(&fixture, &relation).is_err());
-    }
-
-    #[test]
-    fn preprocessing_declaration_rejects_single_crt_slot() {
-        let fixture = relation_fixture();
-        assert!(matches!(
-            fixture.declaration.validate_slot_count(),
-            Err(RefreshSetupError::InvalidManifest)
-        ));
-    }
 }

@@ -2,7 +2,7 @@
 //!
 //! This module owns the public artifact namespace and selector producer.
 //! Names bind layout/key identities and canonical active order only;
-//! manifests bind production, type, shape, family count, confidentiality, and
+//! manifests bind production, type, family shape, confidentiality, and
 //! content hash before a family handle crosses into evaluation. Selector bits
 //! and sampled packages remain runtime/key-provider data, never public names.
 
@@ -63,7 +63,7 @@ pub(crate) struct PbcSelectorFamilyMetadata {
     pub(crate) layout_id: PbcLayoutId,
     pub(crate) key_instance_id: [u8; 32],
     pub(crate) element_type: ConcreteMatrixType,
-    pub(crate) family_count: usize,
+    pub(crate) family_shape: Vec<usize>,
     pub(crate) canonical_order: Vec<PbcLocation>,
 }
 
@@ -392,7 +392,7 @@ pub(crate) fn require_family_descriptor(
         return Err(PbcError::ArtifactIdentityMismatch);
     };
     if descriptor.artifact_type != expected_type ||
-        descriptor.family_count != Some(expected_count) ||
+        descriptor.family_shape != Some(vec![expected_count]) ||
         descriptor.confidentiality != confidentiality ||
         (require_content_hash && descriptor.content_hash.is_none()) ||
         (!require_content_hash && descriptor.content_hash.is_some())
@@ -440,7 +440,7 @@ fn family_metadata(
         layout_id: layout.layout_id,
         key_instance_id,
         element_type,
-        family_count,
+        family_shape: vec![family_count],
         canonical_order,
     })
 }
@@ -674,7 +674,7 @@ pub struct PbcStructuralSelectorFamilies {
     pub(crate) gsw: Family<Mat>,
 }
 
-/// Samples all selector RHS packages in one reusable `ParallelLoop`.
+/// Samples all selector RHS packages in one reusable `ParallelGrid`.
 ///
 /// The selector bit is the only selector-dependent input to the structural
 /// loop.  Each resulting GSW ciphertext is fixed during setup and is emitted

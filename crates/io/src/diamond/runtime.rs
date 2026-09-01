@@ -342,7 +342,7 @@ where
         inputs.extend(seed_bindings.into_iter().map(|(name, matrices)| {
             (
                 name,
-                RuntimeValue::IndexedFamily(
+                RuntimeValue::Family(
                     matrices.into_iter().map(RuntimeValue::matrix).collect(),
                 ),
             )
@@ -409,7 +409,7 @@ where
                 .map_err(|error| DiamondIoRuntimeError::Execution(error.to_string()))?;
         (0..obfuscation.function.output_bits())
             .map(|output| {
-                let Some(RuntimeValue::IndexedFamily(slots)) =
+                let Some(RuntimeValue::Family(slots)) =
                     result.outputs.get(&output_name(output))
                 else {
                     return Err(DiamondIoRuntimeError::OutputLayout);

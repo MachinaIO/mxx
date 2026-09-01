@@ -622,7 +622,7 @@ fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
         .root_scope()
         .nodes()
         .iter()
-        .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+        .filter(|node| matches!(node.kind(), NodeKind::ParallelGrid(_)))
         .count();
     assert_eq!(loops, 1);
     let bit_name = bits.input_name().to_owned();
@@ -778,7 +778,7 @@ fn selector_family_manifest_fixture() -> (
                     rows: sampler.secret_dimension,
                     columns: sampler.public_key_columns(),
                 }),
-                family_count: Some(active_count),
+                family_shape: Some(vec![active_count]),
                 confidentiality: ArtifactConfidentiality::Public,
                 content_hash: Some([9; 32]),
                 layout: None,
@@ -918,7 +918,7 @@ fn selector_family_import_rejects_wrong_rhs_bindings_and_family_schema() {
         .unwrap(),
         "gsw",
     );
-    wrong_count.artifacts.get_mut(&family_name).unwrap().family_count = Some(1);
+    wrong_count.artifacts.get_mut(&family_name).unwrap().family_shape = Some(vec![1]);
     assert!(
         import(
             &wrong_count,

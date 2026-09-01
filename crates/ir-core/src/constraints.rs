@@ -113,7 +113,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         format!("{prefix}: preimage coefficient bound"),
                     );
                 }
-                NodeKind::PreimageSample { max_coefficient_bound, .. } => nonnegative(
+                NodeKind::PreimageSample { max_coefficient_bound, .. } |
+                NodeKind::FamilyPreimageSample { max_coefficient_bound, .. } => nonnegative(
                     &mut constraints,
                     max_coefficient_bound,
                     format!("{prefix}: preimage coefficient bound"),
@@ -149,10 +150,14 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                     });
                     positive(&mut constraints, length, format!("{prefix}: decode length"));
                 }
-                NodeKind::FamilyPack { count } | NodeKind::Select { count } => {
+                NodeKind::FamilyPack { shape } => {
+                    for extent in shape {
+                        nonnegative(&mut constraints, extent, format!("{prefix}: family extent"));
+                    }
+                }
+                NodeKind::Select { count } => {
                     positive(&mut constraints, count, format!("{prefix}: family count"));
                 }
-                NodeKind::FamilyGetStatic { index } |
                 NodeKind::ExtractCoefficient { position: index, .. } |
                 NodeKind::BitExtract { bit: index } => {
                     nonnegative(&mut constraints, index, format!("{prefix}: index"));
@@ -160,13 +165,28 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RingAutomorphism { index } => {
                     positive(&mut constraints, index, format!("{prefix}: automorphism index"));
                 }
-                NodeKind::ParallelLoop(loop_spec) => {
+                NodeKind::DecompositionEntry { row, column } => {
+                    nonnegative(&mut constraints, row, format!("{prefix}: decomposition row"));
                     nonnegative(
                         &mut constraints,
-                        &loop_spec.count,
-                        format!("{prefix}: loop count"),
+                        column,
+                        format!("{prefix}: decomposition column"),
                     );
                 }
+                NodeKind::MaterializePreimageExact |
+                NodeKind::PreimageBinary(_) |
+                NodeKind::PreimageConcatColumns => {}
+                NodeKind::FamilyGetStatic { indices } => {
+                    let _ = indices;
+                }
+                NodeKind::FamilySelectAxis { .. } => {}
+                NodeKind::FamilyReindex { output_shape, .. } |
+                NodeKind::FamilyGather { output_shape, .. } => {
+                    for extent in output_shape {
+                        nonnegative(&mut constraints, extent, format!("{prefix}: family extent"));
+                    }
+                }
+                NodeKind::ParallelGrid(_) => {}
                 NodeKind::SequentialLoop(loop_spec) => {
                     nonnegative(
                         &mut constraints,
@@ -202,7 +222,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::CrtRecompose { .. } |
                 NodeKind::PackPolynomialCoefficients { .. } |
                 NodeKind::SubgraphCall(_) |
-                NodeKind::FamilyGetDynamic => {}
+                NodeKind::FamilyGetDynamic { .. } |
+                NodeKind::ApplyPreimage => {}
             }
         }
     }
@@ -251,8 +272,10 @@ fn derive_wire_constraints(wire_type: &WireType, output: &mut Vec<ParamConstrain
         }
         WireType::Bytes { length } => nonnegative(output, length, "byte length".to_owned()),
         WireType::TypedBlob { .. } => {}
-        WireType::IndexedFamily { element, count } => {
-            nonnegative(output, count, "family count".to_owned());
+        WireType::Family { element, shape } => {
+            for extent in shape {
+                nonnegative(output, extent, "family extent".to_owned());
+            }
             derive_wire_constraints(element, output);
         }
         WireType::ConstantInt |

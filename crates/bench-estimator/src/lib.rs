@@ -319,21 +319,14 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 let child_bindings = child_bindings(bindings, &call.bindings, None)?;
                 self.cached_child(child, child_bindings)
             }
-            NodeKind::ParallelLoop(loop_node) => {
+            NodeKind::ParallelGrid(grid) => {
                 if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
                     return Err(EstimateError::LoopIndexDependentCost {
                         scope: node.scope.clone(),
                         node: node.id,
                     });
                 }
-                let count = loop_node
-                    .count
-                    .evaluate(bindings)
-                    .map_err(|error| EstimateError::Expression(error.to_string()))?
-                    .to_usize()
-                    .ok_or_else(|| {
-                        EstimateError::Expression("loop count is not usize".to_owned())
-                    })?;
+                let count = grid_size(bindings, &grid.shape)?;
                 if count == 0 {
                     return Ok((NodeMeasurement::default(), 0.0, 0, 1));
                 }
@@ -342,8 +335,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .source
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
-                let child_bindings =
-                    child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
+                let child_bindings = grid_child_bindings(bindings, grid)?;
                 let (one, preimage_work, peak, parallelism) =
                     self.cached_child(child, child_bindings)?;
                 let concurrent = (self.config.device_pool_size.max(1) /
@@ -462,26 +454,12 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 NodeKind::SubgraphCall(call) => {
                     (child_bindings(bindings, &call.bindings, None)?, 1)
                 }
-                NodeKind::ParallelLoop(loop_node) => {
-                    let count = loop_node
-                        .count
-                        .evaluate(bindings)
-                        .map_err(|error| EstimateError::Expression(error.to_string()))?
-                        .to_usize()
-                        .ok_or_else(|| {
-                            EstimateError::Expression("loop count is not usize".to_owned())
-                        })?;
+                NodeKind::ParallelGrid(grid) => {
+                    let count = grid_size(bindings, &grid.shape)?;
                     if count == 0 {
                         continue;
                     }
-                    (
-                        child_bindings(
-                            bindings,
-                            &loop_node.bindings,
-                            Some((loop_node.index_slot, 0)),
-                        )?,
-                        count,
-                    )
+                    (grid_child_bindings(bindings, grid)?, count)
                 }
                 NodeKind::SequentialLoop(loop_node) => {
                     let count = loop_node
@@ -536,10 +514,49 @@ fn child_bindings(
     Ok(child)
 }
 
+fn grid_size(parent: &ParamEnv, shape: &[mxx_ir_core::IntExpr]) -> Result<usize, EstimateError> {
+    shape
+        .iter()
+        .map(|extent| {
+            extent
+                .evaluate(parent)
+                .map_err(|error| EstimateError::Expression(error.to_string()))?
+                .to_usize()
+                .ok_or_else(|| {
+                    EstimateError::Expression("parallel grid extent is not usize".to_owned())
+                })
+        })
+        .try_fold(1usize, |count, extent| {
+            count.checked_mul(extent?).ok_or_else(|| {
+                EstimateError::Expression("parallel grid size overflows usize".to_owned())
+            })
+        })
+}
+
+fn grid_child_bindings(
+    parent: &ParamEnv,
+    grid: &mxx_ir_core::node::ParallelGrid,
+) -> Result<ParamEnv, EstimateError> {
+    let mut child = parent.clone();
+    for slot in &grid.index_slots {
+        child.loop_indices.insert(*slot, 0usize.into());
+    }
+    let expression_env = child.clone();
+    for (name, expression) in &grid.bindings {
+        let value = expression
+            .evaluate(&expression_env)
+            .map_err(|error| EstimateError::Expression(error.to_string()))?;
+        child.integers.insert(name.clone(), value);
+    }
+    Ok(child)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Family, Int, IntType, Parallel, Ring, Sequential, Subgraph};
+    use mxx_dsl::{
+        DslContext, Family, Int, IntType, Mat, MatType, Parallel, Ring, Sequential, Subgraph,
+    };
     use std::convert::Infallible;
 
     struct UnitBackend;
@@ -584,15 +601,17 @@ mod tests {
         }
     }
 
-    fn collect_columns_graph(count: usize) -> ValidatedGraph {
+    fn parallel_zip_many_graph(count: usize) -> ValidatedGraph {
         let ring = Ring::new(17, 8);
         let family = Parallel::range(count).map(|_| ring.zero((1, 1))).expect("source family");
-        let columns = Family::try_parallel_zip_many_columns(vec![family], |_, mut inputs| {
-            Ok(inputs.remove(0))
-        })
-        .expect("column collection");
-        DslContext::new("estimate-collect-columns")
-            .output("columns", columns)
+        let values =
+            Family::try_parallel_zip_many_values(
+                vec![family],
+                |_, mut inputs| Ok(inputs.remove(0)),
+            )
+            .expect("parallel value zip");
+        DslContext::new("estimate-parallel-zip-many")
+            .family_output("values", values)
             .expect("output")
             .build()
             .expect("build")
@@ -673,8 +692,8 @@ mod tests {
     }
 
     #[test]
-    fn collect_columns_requires_index_invariant_measurement_cost() {
-        let validated = collect_columns_graph(3);
+    fn parallel_zip_many_requires_index_invariant_measurement_cost() {
+        let validated = parallel_zip_many_graph(3);
         assert!(matches!(
             estimate(&validated, &mut IndexDependentBackend, &EstimateConfig::default()),
             Err(EstimateError::LoopIndexDependentCost { .. })
@@ -682,10 +701,36 @@ mod tests {
     }
 
     #[test]
-    fn collect_columns_nested_peak_excludes_persistent_output() {
-        let validated = collect_columns_graph(3);
+    fn parallel_zip_many_nested_peak_excludes_persistent_output() {
+        let validated = parallel_zip_many_graph(3);
         let report =
             estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
         assert_eq!(report.peak_memory_bytes, 28, "final output is counted by outer liveness only");
+    }
+
+    #[test]
+    fn parallel_grid_multiplies_invocations_across_all_axes() {
+        let ring = Ring::new(17, 8);
+        let matrix_type = MatType(ring.matrix_type((1, 1)));
+        let identity = Subgraph::<Mat, Mat>::define("grid-identity", matrix_type, |value| value)
+            .expect("identity subgraph");
+        let values = Parallel::grid(vec![2.into(), 3.into()])
+            .map(|_| identity.call(ring.zero((1, 1))).expect("subgraph call"))
+            .expect("parallel grid");
+        let built = DslContext::new("estimate-parallel-grid")
+            .family_output("values", values)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+
+        let invocations = report
+            .per_subgraph
+            .iter()
+            .find_map(|(scope, cost)| scope.contains("grid-identity").then_some(cost.invocations))
+            .expect("grid subgraph cost");
+        assert_eq!(invocations, 6);
     }
 }

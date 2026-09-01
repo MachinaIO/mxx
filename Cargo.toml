@@ -4,7 +4,7 @@ members = [
     "crates/ir-core",
     "crates/dsl",
     "crates/runtime",
-    "crates/correctness",
+    "crates/noise-simulator",
     "crates/bench-estimator",
     "crates/bgg",
     "crates/power-lut",
@@ -29,7 +29,7 @@ mxx-io = { path = "crates/io" }
 mxx-ir-core = { path = "crates/ir-core" }
 mxx-dsl = { path = "crates/dsl" }
 mxx-runtime = { path = "crates/runtime" }
-mxx-correctness = { path = "crates/correctness" }
+mxx-noise-simulator = { path = "crates/noise-simulator" }
 mxx-bench-estimator = { path = "crates/bench-estimator" }
 mxx-bgg = { path = "crates/bgg" }
 bigdecimal = "0.4"

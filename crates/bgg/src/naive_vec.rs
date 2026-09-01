@@ -55,6 +55,8 @@ impl NaiveBggVecCompiler {
         }
         let compiler = self.public_key.clone();
         let reveal = input.reveal_plaintext;
+        // Each slot applies the large-scalar relation A K_t with G K_t = tG;
+        // the family operation changes only which slot receives the scalar.
         let matrices = input.matrices.clone().parallel_zip(scalars, move |_, matrix, scalar| {
             compiler
                 .large_scalar_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &scalar)
@@ -76,15 +78,15 @@ impl NaiveBggVecCompiler {
         }
         let vector_compiler = self.public_key.clone();
         let reveal = input.pubkey_reveal_plaintext;
-        let factors =
-            input.pubkeys.clone().parallel_zip(scalars.clone(), move |_, matrix, scalar| {
-                vector_compiler.large_scalar_decomposition(
-                    &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
-                    &scalar,
-                )
-            })?;
-        let vectors =
-            input.vectors.clone().parallel_zip(factors, |_, vector, factor| vector * factor)?;
+        // For every slot, K_t (defined by G K_t = tG) acts on the vector and
+        // the matching public matrix, while revealed plaintext records t x.
+        let vectors = mxx_dsl::parallel_zip_bundle_result(
+            (input.vectors.clone(), input.pubkeys.clone(), scalars.clone()),
+            move |_, (vector, matrix, scalar)| {
+                let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
+                Ok(vector.mul_decomposed(vector_compiler.large_scalar_decomposition(&key, &scalar)))
+            },
+        )?;
         let key_compiler = self.public_key.clone();
         let pubkeys =
             input.pubkeys.clone().parallel_zip(scalars.clone(), move |_, matrix, scalar| {
@@ -182,17 +184,19 @@ impl NaiveBggVecCompiler {
         validate_encoding_pair(lhs, rhs)?;
         let lhs_plaintexts =
             lhs.plaintexts.clone().ok_or(NaiveVecCompileError::MissingLeftPlaintext)?;
+        // Slotwise BGG+ multiplication is C_L K_R + x_L C_R, where
+        // G K_R = A_R.  One decomposition is reused for all family slots so
+        // the rightmost carrier is consumed consistently.
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        let decomposed_rhs = rhs.pubkeys.clone().parallel_map(move |_, matrix| {
-            matrix.decompose(base.clone(), digits.clone()).as_mat()
-        })?;
         let first =
-            lhs.vectors.clone().parallel_zip(decomposed_rhs, |_, left, right| left * right)?;
+            lhs.vectors.clone().parallel_zip(rhs.pubkeys.clone(), move |_, left, right| {
+                left.mul_decomposed(right.decompose(base.clone(), digits.clone()))
+            })?;
         let second = rhs
             .vectors
             .clone()
-            .parallel_zip(lhs_plaintexts, |_, right, plaintext| right * plaintext)?;
+            .parallel_zip(lhs_plaintexts, |_, right, plaintext| plaintext * right)?;
         let vectors = first.parallel_zip(second, |_, left, right| left + right)?;
         let pubkeys =
             self.key_family_binary(lhs, rhs, |compiler, left, right| compiler.mul(left, right))?;
@@ -234,9 +238,12 @@ impl NaiveBggVecCompiler {
         validate_encoding(input)?;
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        let decomposed = target.clone().decompose(base, digits).as_mat();
-        let vectors =
-            input.vectors.clone().parallel_map(move |_, value| value * decomposed.clone())?;
+        // This is a slotwise action by an arbitrary target T.  Decomposing T
+        // consumes the current carrier; it does not call T a canonical G
+        // encoding.
+        let vectors = input.vectors.clone().parallel_map(move |_, value| {
+            value.mul_decomposed(target.clone().decompose(base.clone(), digits.clone()))
+        })?;
         let key_compiler = self.public_key.clone();
         let target_for_keys = target.clone();
         let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
@@ -348,38 +355,25 @@ impl NaiveBggVecCompiler {
         large: bool,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding(input)?;
-        let vector_factor = if large {
-            let rows = input.pubkeys.clone().parallel_map({
-                let compiler = self.public_key.clone();
-                let scalar = scalar.clone();
-                move |_, matrix| {
-                    compiler.large_scalar_decomposition(
-                        &BggPublicKeyWire {
-                            matrix,
-                            reveal_plaintext: input.pubkey_reveal_plaintext,
-                        },
-                        &scalar,
-                    )
-                }
-            })?;
-            Some(rows)
+        // Small scalars use direct t C.  Large scalars use the decomposition
+        // of tG, while any revealed plaintext family is updated by t x.
+        let vectors = if large {
+            let compiler = self.public_key.clone();
+            let reveal = input.pubkey_reveal_plaintext;
+            input.vectors.clone().parallel_zip(input.pubkeys.clone(), move |_, value, matrix| {
+                let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
+                value.mul_decomposed(compiler.large_scalar_decomposition(&key, scalar))
+            })?
         } else {
-            None
-        };
-        let vectors = match vector_factor {
-            Some(factors) => {
-                input.vectors.clone().parallel_zip(factors, |_, value, factor| value * factor)?
-            }
-            None => {
-                let scalar = scalar.clone();
-                input.vectors.clone().parallel_map(move |_, value| value * scalar.clone())?
-            }
+            let scalar = scalar.clone();
+            input.vectors.clone().parallel_map(move |_, value| scalar.clone() * value)?
         };
         let compiler = self.public_key.clone();
         let scalar_for_keys = scalar.clone();
         let reveal = input.pubkey_reveal_plaintext;
         let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
             let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
+            // The public-key side uses the same K_t satisfying G K_t = tG.
             if large {
                 compiler.large_scalar_mul(&key, &scalar_for_keys).matrix
             } else {
@@ -525,6 +519,9 @@ impl NaiveBggEncodingVecSampler {
         {
             return Err(BggSampleError::MatrixTypeMismatch);
         }
+        // Every family member uses C_x = sA - (x tensor s)G + e.  The scalar
+        // sampler keeps G rightmost and preserves the shaped zero operation
+        // as 0*G rather than dropping the carrier columns.
         let outputs = (0..public_keys.len())
             .map(|output| {
                 let vectors = if output == 0 {

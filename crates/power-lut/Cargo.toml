@@ -24,7 +24,7 @@ thiserror.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
-mxx-correctness.workspace = true
+mxx-noise-simulator.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 mxx-runtime.workspace = true
 serial_test.workspace = true

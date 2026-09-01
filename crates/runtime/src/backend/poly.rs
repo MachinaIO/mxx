@@ -57,7 +57,7 @@ pub struct PolyBackend<M, U, H, T>
 where
     M: PolyMatrix,
 {
-    parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
+    pub(super) parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
     active_placement: usize,
     preimage_batch_calls: usize,
     #[cfg(test)]
@@ -264,7 +264,7 @@ where
         self.register_at(self.active_placement, parameters);
     }
 
-    fn register_at(&mut self, placement: usize, parameters: <M::P as Poly>::Params) {
+    pub(super) fn register_at(&mut self, placement: usize, parameters: <M::P as Poly>::Params) {
         let modulus: Arc<BigUint> = parameters.modulus().into();
         let key = RingKey {
             modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
@@ -311,16 +311,9 @@ where
         &self,
         matrix_type: &ConcreteMatrixType,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
-        let key = RingKey {
-            modulus: matrix_type.modulus.clone(),
-            ring_dimension: matrix_type.ring_dimension,
-        };
-        self.parameters[self.active_placement]
-            .get(&key)
-            .ok_or(PolyBackendError::MissingParameters(key))
+        self.parameters_at(self.active_placement, matrix_type)
     }
 
-    #[cfg(feature = "gpu")]
     pub(super) fn parameters_at(
         &self,
         placement: usize,

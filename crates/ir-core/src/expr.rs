@@ -95,6 +95,319 @@ pub struct ParamEnv {
     pub loop_indices: BTreeMap<u32, BigInt>,
 }
 
+/// A deterministic, typed index program used by rank-N family operations.
+///
+/// Unlike [`IntExpr`], index programs are normalized structurally rather than
+/// as algebraic polynomials. This keeps axis positions and scoped loop slots
+/// explicit in the frozen IR while still making serialization deterministic.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum IndexExpr {
+    Axis(usize),
+    Parameter(String),
+    LoopIndex(u32),
+    Constant(#[serde(with = "serde_support::bigint")] BigInt),
+    Add(Box<Self>, Box<Self>),
+    Subtract(Box<Self>, Box<Self>),
+    Multiply(Box<Self>, Box<Self>),
+    Divide(Box<Self>, Box<Self>),
+    Remainder(Box<Self>, Box<Self>),
+    Equal(Box<Self>, Box<Self>),
+    Less(Box<Self>, Box<Self>),
+    LessEqual(Box<Self>, Box<Self>),
+    Log2Ceil(Box<Self>),
+    Select { selector: Box<Self>, branches: Vec<Self> },
+}
+
+impl Serialize for IndexExpr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.normalize().serialize_inner(serializer)
+    }
+}
+
+impl IndexExpr {
+    pub fn constant(value: impl Into<BigInt>) -> Self {
+        Self::Constant(value.into())
+    }
+
+    /// Resolves parameters and loop slots, then folds concrete arithmetic.
+    pub fn evaluate(&self, env: &ParamEnv) -> Result<BigInt, ExprError> {
+        match self {
+            Self::Axis(axis) => Ok(BigInt::from(*axis)),
+            Self::Parameter(name) => env
+                .integers
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ExprError::UnboundVariable(name.clone())),
+            Self::LoopIndex(slot) => env
+                .loop_indices
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| ExprError::UnboundVariable(format!("loop-index[{slot}]"))),
+            Self::Constant(value) => Ok(value.clone()),
+            Self::Add(lhs, rhs) => Ok(lhs.evaluate(env)? + rhs.evaluate(env)?),
+            Self::Subtract(lhs, rhs) => Ok(lhs.evaluate(env)? - rhs.evaluate(env)?),
+            Self::Multiply(lhs, rhs) => Ok(lhs.evaluate(env)? * rhs.evaluate(env)?),
+            Self::Divide(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)? / denominator)
+            }
+            Self::Remainder(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)? % denominator)
+            }
+            Self::Equal(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? == rhs.evaluate(env)?)),
+            Self::Less(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? < rhs.evaluate(env)?)),
+            Self::LessEqual(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? <= rhs.evaluate(env)?)),
+            Self::Log2Ceil(value) => {
+                let value = value.evaluate(env)?;
+                let value = value.to_biguint().ok_or_else(|| {
+                    ExprError::UnboundVariable("log2ceil argument must be positive".into())
+                })?;
+                if value.is_zero() {
+                    return Err(ExprError::UnboundVariable(
+                        "log2ceil argument must be positive".into(),
+                    ));
+                }
+                let floor = value.bits() - 1;
+                Ok(BigInt::from(if value == (num_bigint::BigUint::one() << floor as usize) {
+                    floor
+                } else {
+                    floor + 1
+                }))
+            }
+            Self::Select { selector, branches } => {
+                let index = selector.evaluate(env)?.to_usize().ok_or_else(|| {
+                    ExprError::UnboundVariable("index selector is not a nonnegative usize".into())
+                })?;
+                branches
+                    .get(index)
+                    .ok_or_else(|| {
+                        ExprError::UnboundVariable("index selector out of range".into())
+                    })?
+                    .evaluate(env)
+            }
+        }
+    }
+
+    /// Performs only fixed structural normalization and constant folding.
+    pub fn normalize(&self) -> Self {
+        fn fold(expr: &IndexExpr) -> IndexExpr {
+            let result = match expr {
+                IndexExpr::Axis(axis) => IndexExpr::Axis(*axis),
+                IndexExpr::Parameter(name) => IndexExpr::Parameter(name.clone()),
+                IndexExpr::LoopIndex(slot) => IndexExpr::LoopIndex(*slot),
+                IndexExpr::Constant(value) => IndexExpr::Constant(value.clone()),
+                IndexExpr::Add(lhs, rhs) => binary(lhs, rhs, |a, b| a + b, IndexExpr::Add),
+                IndexExpr::Subtract(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| a - b, IndexExpr::Subtract)
+                }
+                IndexExpr::Multiply(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| a * b, IndexExpr::Multiply)
+                }
+                IndexExpr::Divide(lhs, rhs) => {
+                    binary_checked(lhs, rhs, |a, b| a / b, IndexExpr::Divide)
+                }
+                IndexExpr::Remainder(lhs, rhs) => {
+                    binary_checked(lhs, rhs, |a, b| a % b, IndexExpr::Remainder)
+                }
+                IndexExpr::Equal(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| BigInt::from(a == b), IndexExpr::Equal)
+                }
+                IndexExpr::Less(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| BigInt::from(a < b), IndexExpr::Less)
+                }
+                IndexExpr::LessEqual(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| BigInt::from(a <= b), IndexExpr::LessEqual)
+                }
+                IndexExpr::Log2Ceil(value) => {
+                    let value = fold(value);
+                    match &value {
+                        IndexExpr::Constant(value) if value > &BigInt::zero() => {
+                            let bits = value.to_biguint().expect("positive").bits() - 1;
+                            IndexExpr::Constant(BigInt::from(
+                                if value.to_biguint().as_ref() ==
+                                    Some(&(num_bigint::BigUint::one() << bits as usize))
+                                {
+                                    bits
+                                } else {
+                                    bits + 1
+                                },
+                            ))
+                        }
+                        _ => IndexExpr::Log2Ceil(Box::new(value)),
+                    }
+                }
+                IndexExpr::Select { selector, branches } => {
+                    let selector = fold(selector);
+                    let branches = branches.iter().map(fold).collect::<Vec<_>>();
+                    match &selector {
+                        IndexExpr::Constant(index) => index_to_usize(index)
+                            .and_then(|index| branches.get(index))
+                            .cloned()
+                            .unwrap_or(IndexExpr::Select {
+                                selector: Box::new(selector),
+                                branches,
+                            }),
+                        _ => IndexExpr::Select { selector: Box::new(selector), branches },
+                    }
+                }
+            };
+            result
+        }
+        fn binary(
+            lhs: &IndexExpr,
+            rhs: &IndexExpr,
+            operation: impl FnOnce(BigInt, BigInt) -> BigInt,
+            build: impl FnOnce(Box<IndexExpr>, Box<IndexExpr>) -> IndexExpr,
+        ) -> IndexExpr {
+            let lhs = fold(lhs);
+            let rhs = fold(rhs);
+            match (&lhs, &rhs) {
+                (IndexExpr::Constant(lhs), IndexExpr::Constant(rhs)) => {
+                    IndexExpr::Constant(operation(lhs.clone(), rhs.clone()))
+                }
+                _ => build(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+        fn binary_checked(
+            lhs: &IndexExpr,
+            rhs: &IndexExpr,
+            operation: impl FnOnce(BigInt, BigInt) -> BigInt,
+            build: impl FnOnce(Box<IndexExpr>, Box<IndexExpr>) -> IndexExpr,
+        ) -> IndexExpr {
+            let lhs = fold(lhs);
+            let rhs = fold(rhs);
+            match (&lhs, &rhs) {
+                (IndexExpr::Constant(lhs), IndexExpr::Constant(rhs)) if !rhs.is_zero() => {
+                    IndexExpr::Constant(operation(lhs.clone(), rhs.clone()))
+                }
+                _ => build(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+        fn index_to_usize(value: &BigInt) -> Option<usize> {
+            value.to_usize()
+        }
+        fold(self)
+    }
+
+    fn serialize_inner<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(tag = "tag", content = "value")]
+        enum Repr<'a> {
+            Axis(usize),
+            Parameter(&'a str),
+            LoopIndex(u32),
+            Constant(String),
+            Add(Box<Repr<'a>>, Box<Repr<'a>>),
+            Subtract(Box<Repr<'a>>, Box<Repr<'a>>),
+            Multiply(Box<Repr<'a>>, Box<Repr<'a>>),
+            Divide(Box<Repr<'a>>, Box<Repr<'a>>),
+            Remainder(Box<Repr<'a>>, Box<Repr<'a>>),
+            Equal(Box<Repr<'a>>, Box<Repr<'a>>),
+            Less(Box<Repr<'a>>, Box<Repr<'a>>),
+            LessEqual(Box<Repr<'a>>, Box<Repr<'a>>),
+            Log2Ceil(Box<Repr<'a>>),
+            Select { selector: Box<Repr<'a>>, branches: Vec<Repr<'a>> },
+        }
+        fn repr<'a>(value: &'a IndexExpr) -> Repr<'a> {
+            match value {
+                IndexExpr::Axis(axis) => Repr::Axis(*axis),
+                IndexExpr::Parameter(name) => Repr::Parameter(name),
+                IndexExpr::LoopIndex(slot) => Repr::LoopIndex(*slot),
+                IndexExpr::Constant(value) => Repr::Constant(value.to_string()),
+                IndexExpr::Add(lhs, rhs) => Repr::Add(Box::new(repr(lhs)), Box::new(repr(rhs))),
+                IndexExpr::Subtract(lhs, rhs) => {
+                    Repr::Subtract(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Multiply(lhs, rhs) => {
+                    Repr::Multiply(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Divide(lhs, rhs) => {
+                    Repr::Divide(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Remainder(lhs, rhs) => {
+                    Repr::Remainder(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Equal(lhs, rhs) => Repr::Equal(Box::new(repr(lhs)), Box::new(repr(rhs))),
+                IndexExpr::Less(lhs, rhs) => Repr::Less(Box::new(repr(lhs)), Box::new(repr(rhs))),
+                IndexExpr::LessEqual(lhs, rhs) => {
+                    Repr::LessEqual(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Log2Ceil(value) => Repr::Log2Ceil(Box::new(repr(value))),
+                IndexExpr::Select { selector, branches } => Repr::Select {
+                    selector: Box::new(repr(selector)),
+                    branches: branches.iter().map(repr).collect(),
+                },
+            }
+        }
+        repr(self).serialize(serializer)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum IndexExprConversionError {
+    #[error("RoundDiv cannot be represented by IndexExpr")]
+    RoundDiv,
+}
+
+impl TryFrom<IntExpr> for IndexExpr {
+    type Error = IndexExprConversionError;
+
+    fn try_from(value: IntExpr) -> Result<Self, Self::Error> {
+        match value {
+            IntExpr::Const(value) => Ok(Self::Constant(value)),
+            IntExpr::Var(name) => Ok(Self::Parameter(name)),
+            IntExpr::LoopIndex(slot) => Ok(Self::LoopIndex(slot)),
+            IntExpr::Add(lhs, rhs) => {
+                Ok(Self::Add(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Sub(lhs, rhs) => {
+                Ok(Self::Subtract(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Mul(lhs, rhs) => {
+                Ok(Self::Multiply(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Div(lhs, rhs) => {
+                Ok(Self::Divide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::RoundDiv(_, _) => Err(IndexExprConversionError::RoundDiv),
+            IntExpr::Log2Ceil(value) => Ok(Self::Log2Ceil(Box::new((*value).try_into()?))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize)]
+pub struct IndexMap {
+    pub input_indices: Vec<IndexExpr>,
+}
+
+impl Serialize for IndexMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Repr {
+            input_indices: Vec<IndexExpr>,
+        }
+        Repr { input_indices: self.normalize().input_indices }.serialize(serializer)
+    }
+}
+
+impl IndexMap {
+    pub fn new(input_indices: impl Into<Vec<IndexExpr>>) -> Self {
+        Self { input_indices: input_indices.into() }
+    }
+
+    pub fn normalize(&self) -> Self {
+        Self { input_indices: self.input_indices.iter().map(IndexExpr::normalize).collect() }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ExprError {
     #[error("unbound compile variable: {0}")]
@@ -630,5 +943,37 @@ mod tests {
         for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             assert!(matches!(RealExpr::from_f64_exact(value), Err(ExprError::NonFiniteReal)));
         }
+    }
+
+    #[test]
+    fn index_map_serialization_is_structural_and_normalized() {
+        let map = IndexMap::new(vec![IndexExpr::Add(
+            Box::new(IndexExpr::constant(1)),
+            Box::new(IndexExpr::constant(2)),
+        )]);
+        let encoded = serde_json::to_string(&map).expect("index map encoding");
+        assert!(encoded.contains("\"tag\":\"Constant\""));
+        assert!(encoded.contains("\"value\":\"3\""));
+    }
+
+    #[test]
+    fn index_expr_resolves_parameters_and_scoped_loop_indices() {
+        let expression = IndexExpr::Add(
+            Box::new(IndexExpr::Parameter("stride".into())),
+            Box::new(IndexExpr::LoopIndex(7)),
+        );
+        let env = ParamEnv {
+            integers: BTreeMap::from([("stride".into(), BigInt::from(3))]),
+            reals: BTreeMap::new(),
+            loop_indices: BTreeMap::from([(7, BigInt::from(4))]),
+        };
+        assert_eq!(expression.evaluate(&env).expect("index evaluation"), BigInt::from(7));
+    }
+
+    #[test]
+    fn round_div_conversion_is_rejected_instead_of_truncated() {
+        let expression =
+            IntExpr::RoundDiv(Box::new(IntExpr::constant(7)), Box::new(IntExpr::constant(2)));
+        assert_eq!(IndexExpr::try_from(expression), Err(IndexExprConversionError::RoundDiv));
     }
 }

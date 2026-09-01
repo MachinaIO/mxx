@@ -1342,8 +1342,8 @@ mod tests {
                 .scopes()
                 .values()
                 .flat_map(|scope| scope.nodes())
-                .any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))),
-            "Ring-GSW column calls must lower to an IR parallel loop"
+                .any(|node| matches!(node.kind(), NodeKind::ParallelGrid(_))),
+            "Ring-GSW column calls must lower to an IR parallel grid"
         );
     }
 

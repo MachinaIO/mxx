@@ -625,11 +625,10 @@ impl PowerLutEncodingCompiler {
         let decomposed = rhs
             .gsw_ciphertext()
             .clone()
-            .decompose(self.bgg.public_key.base.clone(), self.bgg.public_key.digit_count.clone())
-            .as_mat();
-        let public = lhs.pubkey.matrix.clone() * decomposed.clone();
+            .decompose(self.bgg.public_key.base.clone(), self.bgg.public_key.digit_count.clone());
+        let public = lhs.pubkey.matrix.clone().mul_decomposed(decomposed.clone());
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone() * decomposed,
+            vector: lhs.vector.clone().mul_decomposed(decomposed),
             pubkey: BggPublicKeyWire { matrix: public, reveal_plaintext: false },
             plaintext: None,
         })
@@ -736,25 +735,19 @@ impl PowerLutEncodingCompiler {
                 let raw_vector = items.pop().ok_or(DslError::Schema)?;
                 let rhs = PowerRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
                 // The same digit matrix is used in both components of Fuse.
-                let c_decomposition = rhs
-                    .gsw_ciphertext()
-                    .clone()
-                    .decompose(
-                        self.bgg.public_key.base.clone(),
-                        self.bgg.public_key.digit_count.clone(),
-                    )
-                    .as_mat();
-                let switched_vector = raw_vector * c_decomposition.clone();
-                let switched_public = raw_public * c_decomposition;
-                let a_decomposition = switched_public
-                    .decompose(
-                        self.bgg.public_key.base.clone(),
-                        self.bgg.public_key.digit_count.clone(),
-                    )
-                    .as_mat();
+                let c_decomposition = rhs.gsw_ciphertext().clone().decompose(
+                    self.bgg.public_key.base.clone(),
+                    self.bgg.public_key.digit_count.clone(),
+                );
+                let switched_vector = raw_vector.mul_decomposed(c_decomposition.clone());
+                let switched_public = raw_public.mul_decomposed(c_decomposition);
+                let a_decomposition = switched_public.decompose(
+                    self.bgg.public_key.base.clone(),
+                    self.bgg.public_key.digit_count.clone(),
+                );
                 Ok((
-                    mask_vector * a_decomposition.clone() + switched_vector,
-                    mask_public * a_decomposition,
+                    mask_vector.mul_decomposed(a_decomposition.clone()) + switched_vector,
+                    mask_public.mul_decomposed(a_decomposition),
                 ))
             },
         )
@@ -1450,22 +1443,22 @@ mod tests {
         };
         let rhs = PowerRhsPackage::new(ring.zero((2, 2))).unwrap();
         let output = compiler.fuse(&lhs, &rhs).unwrap();
-        let c_decomposition = rhs.gsw_ciphertext().clone().decompose(4, 2).as_mat();
+        let c_decomposition = rhs.gsw_ciphertext().clone().decompose(4, 2);
         assert_eq!(
             output.vector.matrix_type(),
-            (ring.zero((1, 2)) * c_decomposition.clone()).matrix_type()
+            ring.zero((1, 2)).mul_decomposed(c_decomposition.clone()).matrix_type()
         );
         assert_eq!(
             output.pubkey.matrix.matrix_type(),
-            (ring.zero((2, 2)) * c_decomposition).matrix_type()
+            ring.zero((2, 2)).mul_decomposed(c_decomposition).matrix_type()
         );
         assert!(matches!(
             output.vector.value_handle().node().kind(),
-            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
+            mxx_ir_core::node::NodeKind::ApplyPreimage
         ));
         assert!(matches!(
             output.pubkey.matrix.value_handle().node().kind(),
-            mxx_ir_core::node::NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply)
+            mxx_ir_core::node::NodeKind::ApplyPreimage
         ));
     }
 
@@ -1667,24 +1660,14 @@ mod tests {
             .unwrap();
         let nodes = graph.graph.scopes().values().flat_map(|scope| scope.nodes());
         let mut parallel_loops = 0;
-        let mut collected_columns = 0;
         for node in nodes {
             match node.kind() {
-                mxx_ir_core::node::NodeKind::ParallelLoop(spec)
-                    if spec.output_mode == mxx_ir_core::node::ParallelOutputMode::Family =>
-                {
+                mxx_ir_core::node::NodeKind::ParallelGrid(_) => {
                     parallel_loops += 1;
-                }
-                mxx_ir_core::node::NodeKind::ParallelLoop(spec)
-                    if spec.output_mode ==
-                        mxx_ir_core::node::ParallelOutputMode::CollectColumns =>
-                {
-                    collected_columns += 1;
                 }
                 _ => {}
             }
         }
         assert!(parallel_loops >= 1, "flat branches must use a structural family loop");
-        assert_eq!(collected_columns, 0, "flat LUT must not collect dynamic columns");
     }
 }

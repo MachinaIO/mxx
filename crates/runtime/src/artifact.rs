@@ -17,6 +17,12 @@ use crate::{
     transcript::{DrawSite, RecordedValue},
 };
 
+fn shape_product(shape: &[usize]) -> Result<usize, MemoryArtifactError> {
+    shape.iter().try_fold(1usize, |product, extent| product.checked_mul(*extent)).ok_or_else(|| {
+        MemoryArtifactError::InvalidManifest("family shape product overflow".to_owned())
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ArtifactKey {
     pub production: ProductionId,
@@ -166,8 +172,8 @@ impl MemoryArtifactStore {
         }
         let mut payloads = Vec::new();
         for (name, descriptor) in &manifest.artifacts {
-            let indices: Box<dyn Iterator<Item = Option<usize>>> = match descriptor.family_count {
-                Some(count) => Box::new((0..count).map(Some)),
+            let indices: Box<dyn Iterator<Item = Option<usize>>> = match &descriptor.family_shape {
+                Some(shape) => Box::new((0..shape_product(shape)?).map(Some)),
                 None => Box::new(std::iter::once(None)),
             };
             for index in indices {
@@ -244,7 +250,9 @@ impl ArtifactStore for MemoryArtifactStore {
         if manifest_artifact != descriptor {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
-        match (manifest_artifact.family_count, key.index) {
+        let family_count =
+            manifest_artifact.family_shape.as_deref().map(shape_product).transpose()?;
+        match (family_count, key.index) {
             (None, None) => {}
             (Some(count), Some(index)) if index < count => {}
             _ => return Err(MemoryArtifactError::FamilyIndexMismatch(key.clone())),
@@ -267,11 +275,11 @@ impl ArtifactStore for MemoryArtifactStore {
                 return Ok(payload.clone());
             }
             self.family_hash_verifications += 1;
-            let actual: [u8; 32] = match manifest_artifact.family_count {
+            let actual: [u8; 32] = match &manifest_artifact.family_shape {
                 None => Sha256::digest(payload_bytes(payload)).into(),
-                Some(count) => {
+                Some(shape) => {
                     let mut hasher = Sha256::new();
-                    for index in 0..count {
+                    for index in 0..shape_product(shape)? {
                         let member_key = ArtifactKey {
                             production: key.production.clone(),
                             name: key.name.clone(),
@@ -527,9 +535,9 @@ impl SessionStore for MemoryArtifactStore {
                         Ok(())
                     }
                 };
-                match artifact.family_count {
-                    Some(count) => {
-                        for index in 0..count {
+                match &artifact.family_shape {
+                    Some(shape) => {
+                        for index in 0..shape_product(shape)? {
                             check_index(Some(index))?;
                         }
                     }
@@ -749,7 +757,7 @@ mod tests {
             ArtifactKey { production: production.clone(), name: "bytes".to_owned(), index: None };
         let descriptor = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 3 },
-            family_count: None,
+            family_shape: None,
             confidentiality: ArtifactConfidentiality::Public,
             content_hash: Some([0; 32]),
             layout: None,
@@ -786,7 +794,7 @@ mod tests {
                 "bytes".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 3 },
-                    family_count: None,
+                    family_shape: None,
                     confidentiality: ArtifactConfidentiality::Private,
                     content_hash: None,
                     layout: None,
@@ -811,7 +819,7 @@ mod tests {
                 "private".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
-                    family_count: None,
+                    family_shape: None,
                     confidentiality: ArtifactConfidentiality::Private,
                     content_hash: Some([19; 32]),
                     layout: None,
@@ -831,14 +839,14 @@ mod tests {
         let production = ProductionId { spec_hash: SpecHash([20; 32]), execution_nonce: [21; 32] };
         let scalar = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
-            family_count: None,
+            family_shape: None,
             confidentiality: ArtifactConfidentiality::Private,
             content_hash: None,
             layout: None,
         };
         let family = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
-            family_count: Some(2),
+            family_shape: Some(vec![2]),
             confidentiality: ArtifactConfidentiality::Public,
             content_hash: None,
             layout: Some("lane".to_owned()),

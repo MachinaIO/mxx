@@ -15,7 +15,7 @@ use mxx_bgg::{
     AttributeEncodingCompiler, AttributeEncodingWire, AttributeEvaluationError,
     AttributeMatrixEvaluation,
 };
-use mxx_dsl::{Bool, Family, Int, Mat, Ring, Trapdoor};
+use mxx_dsl::{Bool, Family, Int, Mat, Preimage, Ring, Trapdoor};
 #[cfg(test)]
 use mxx_gadgets::circuit_gadgets::fhe_prg::goldreich::GoldreichGraph;
 use mxx_gadgets::{
@@ -174,7 +174,7 @@ pub(crate) struct PrivatePrfeEncryptionCoins {
 
 #[derive(Clone)]
 pub(crate) struct PrivatePrfeFunctionKeyWire {
-    pub preimage: Mat,
+    pub preimage: Preimage,
     pub output_count: usize,
 }
 
@@ -666,8 +666,7 @@ impl PrivatePrfeLayerWires {
         let b_rows = IntExpr::constant(SECRET_ROWS * (self.config.digit_count + 2));
         let preimage = self
             .b_trapdoor
-            .sample_preimage(target, (b_rows, IntExpr::constant(output_count)))
-            .as_mat();
+            .sample_preimage(target, (b_rows, IntExpr::constant(output_count)));
         Ok(PrivatePrfeFunctionKeyWire { preimage, output_count })
     }
 
@@ -694,7 +693,7 @@ impl PrivatePrfeLayerWires {
         let high = self.evaluate_ciphertext_matrix(veval_high, ciphertext, public_inputs)?;
         let low = self.evaluate_ciphertext_matrix(veval_low, ciphertext, public_inputs)?;
         let evaluated = self.combine_high_low(high.vector, low.vector, 1, output_count)?;
-        let z = ciphertext.c_b.clone() * key.preimage.clone() - evaluated;
+        let z = ciphertext.c_b.clone().apply_preimage(key.preimage.clone()) - evaluated;
         Ok(z.threshold_decode_bools(2, output_count))
     }
 

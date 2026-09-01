@@ -28,13 +28,10 @@ use crate::{
     },
 };
 use mxx_bgg::{BggEncodingWire, BggPublicKeyWire};
-use mxx_dsl::{BuiltGraph, DerivationAttachmentValue, Family, FrozenDerivationAttachment, Mat};
-use mxx_ir_core::{
-    FrozenGraphScopeId, Graph, GraphScope, IntExpr, ScopedWireRef, WireRef, WireType,
-    node::{LoopInputMode, MatrixBinaryOp, NodeKind},
-};
+use mxx_dsl::{Family, Mat, Preimage};
+use mxx_ir_core::IntExpr;
 use num_bigint::BigInt;
-use num_traits::{ToPrimitive, Zero};
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -863,80 +860,6 @@ impl RefreshResult {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-/// Collection of refresh declarations attached to one protocol graph.
-pub struct PowerLutProtocolDeclaration {
-    refreshes: Vec<RefreshDeclaration>,
-}
-
-impl PowerLutProtocolDeclaration {
-    /// Creates a declaration set and rejects an empty protocol.
-    pub fn new(refreshes: Vec<RefreshDeclaration>) -> Result<Self, RefreshError> {
-        if refreshes.is_empty() {
-            return Err(RefreshError::InvalidLayout);
-        }
-        Ok(Self { refreshes })
-    }
-
-    /// Validates all refresh attachments in a built graph.
-    pub fn validate(&self, built: &BuiltGraph) -> Result<(), RefreshError> {
-        let matching = built
-            .derivation_attachments
-            .iter()
-            .filter(|attachment| {
-                attachment.namespace == "mxx-power-lut" && attachment.rule == "section-7-refresh"
-            })
-            .count();
-        if matching != self.refreshes.len() {
-            return Err(RefreshError::InvalidLayout);
-        }
-        for declaration in &self.refreshes {
-            declaration.validate_built(built)?;
-        }
-        Ok(())
-    }
-}
-
-fn body_ancestry_contains(scope: &GraphScope, wire: WireRef, target: WireRef) -> bool {
-    if wire == target {
-        return true;
-    }
-    scope
-        .node(wire.node)
-        .and_then(|node| scope.arguments(node))
-        .into_iter()
-        .flatten()
-        .any(|argument| body_ancestry_contains(scope, argument, target))
-}
-
-fn validate_parallel_refresh(
-    loop_spec: &mxx_ir_core::node::ParallelLoop,
-    slots: usize,
-    argument_count: usize,
-    output_count: usize,
-) -> Result<(), RefreshError> {
-    if loop_spec.count.evaluate(&Default::default()).ok() != Some(BigInt::from(slots)) ||
-        loop_spec.minimum_count != 0 ||
-        !loop_spec.bindings.is_empty() ||
-        loop_spec.input_modes !=
-            [
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Zip,
-                LoopInputMode::Broadcast,
-            ] ||
-        argument_count != 8 ||
-        output_count != 1
-    {
-        return Err(RefreshError::GraphLink("parallel loop schema"));
-    }
-    Ok(())
-}
-
 impl RefreshDeclaration {
     fn validate_parameters(&self) -> Result<(), RefreshError> {
         if self.owner != "mxx-power-lut" ||
@@ -961,433 +884,6 @@ impl RefreshDeclaration {
         }
         Ok(())
     }
-
-    /// Checks this declaration against the graph attachments and slot equations.
-    pub fn validate_built(&self, built: &BuiltGraph) -> Result<(), RefreshError> {
-        self.validate_parameters()?;
-        let instance_role = format!("refresh-instance-{}", hex_identity(&self.identity));
-        let mut candidates = built.derivation_attachments.iter().filter(|attachment| {
-            attachment.namespace == self.owner &&
-                attachment.rule == self.plan &&
-                attachment.roles.iter().any(|(role, _)| role == &instance_role)
-        });
-        let attachment = candidates.next().ok_or(RefreshError::InvalidLayout)?;
-        if candidates.next().is_some() {
-            return Err(RefreshError::GraphLink("role set"));
-        }
-        self.validate_graph(attachment, &built.graph)
-    }
-
-    fn validate_graph(
-        &self,
-        attachment: &FrozenDerivationAttachment,
-        graph: &Graph,
-    ) -> Result<(), RefreshError> {
-        let role = |name: &str| {
-            let mut found = attachment.roles.iter().filter(|(role, _)| role == name);
-            let value = found.next().map(|(_, wire)| wire);
-            (found.next().is_none()).then_some(value).flatten()
-        };
-        let required = ["refresh-output", "shared-fresh-error", "refresh-state", "a-prime"];
-        if required.iter().any(|name| role(name).is_none()) ||
-            role(&format!("refresh-instance-{}", hex_identity(&self.identity))).is_none() ||
-            role(&format!("refresh-setup-{}", hex_identity(&self.setup_identity))).is_none() ||
-            attachment.roles.len() != 6 + 14 * self.slots.len()
-        {
-            return Err(RefreshError::GraphLink("role set"));
-        }
-        let output = role("refresh-output").ok_or(RefreshError::InvalidLayout)?;
-        let instance = role(&format!("refresh-instance-{}", hex_identity(&self.identity)))
-            .ok_or(RefreshError::InvalidLayout)?;
-        let setup = role(&format!("refresh-setup-{}", hex_identity(&self.setup_identity)))
-            .ok_or(RefreshError::InvalidLayout)?;
-        let a_prime = role("a-prime").ok_or(RefreshError::InvalidLayout)?;
-        if output != instance || setup != a_prime {
-            return Err(RefreshError::GraphLink("output identity"));
-        }
-        let root_node = |wire: &ScopedWireRef| {
-            if wire.scope != FrozenGraphScopeId::Root {
-                return None;
-            }
-            graph.root_scope().node(wire.wire.node)
-        };
-        let output_node = root_node(output).ok_or(RefreshError::InvalidLayout)?;
-        let NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } =
-            output_node.kind()
-        else {
-            return Err(RefreshError::GraphLink("CRT output kind"));
-        };
-        if output_node.arguments().len() != self.slots.len() ||
-            plaintext_moduli.iter().zip(&self.slots).any(|(modulus, slot)| {
-                modulus.evaluate(&Default::default()).ok().as_ref() != Some(&slot.q_t)
-            }) ||
-            reconstruction_coefficients
-                .iter()
-                .map(|coefficient| coefficient.evaluate(&Default::default()).ok())
-                .ne(self.reconstruction_coefficients.iter().cloned().map(Some))
-        {
-            return Err(RefreshError::GraphLink("CRT parameters or arity"));
-        }
-        let Some(mxx_ir_core::types::WireType::Matrix(output_type)) =
-            output_node.output_types().first()
-        else {
-            return Err(RefreshError::GraphLink("output matrix type"));
-        };
-        if output_type.rows.evaluate(&Default::default()).ok().and_then(|v| v.to_usize()) !=
-            Some(self.rows) ||
-            output_type.columns.evaluate(&Default::default()).ok().and_then(|v| v.to_usize()) !=
-                Some(self.columns)
-        {
-            return Err(RefreshError::GraphLink("output matrix shape"));
-        }
-        // Slot arithmetic is built once in an indexed ParallelLoop.
-        // Each declared level must be a static projection of the one loop's
-        // sole output.  This is deliberately checked before inspecting the
-        // arithmetic so a second loop, a swapped projection, or a nonzero
-        // output port cannot be accepted as a look-alike.
-        let role_root = |wire: &ScopedWireRef| {
-            (wire.scope == FrozenGraphScopeId::Root && wire.wire.port.0 == 0).then_some(wire.wire)
-        };
-        let get_role = |slot: usize, suffix: &str| {
-            role(&format!("slot-{slot}-{suffix}")).ok_or(RefreshError::InvalidLayout)
-        };
-        let first_level = get_role(0, "level")?;
-        let first_level_node = root_node(first_level).ok_or(RefreshError::InvalidLayout)?;
-        let NodeKind::FamilyGetStatic { index } = first_level_node.kind() else {
-            return Err(RefreshError::GraphLink("parallel slot projection"));
-        };
-        if first_level_node.arguments().len() != 1 ||
-            index.evaluate(&Default::default()).ok() != Some(BigInt::zero())
-        {
-            return Err(RefreshError::GraphLink("parallel slot projection"));
-        }
-        let first_family = graph
-            .root_scope()
-            .wire_ref(&first_level_node.arguments()[0])
-            .ok_or(RefreshError::InvalidLayout)?;
-        if first_family.port.0 != 0 {
-            return Err(RefreshError::GraphLink("parallel family port"));
-        }
-        let first_family_node =
-            graph.root_scope().node(first_family.node).ok_or(RefreshError::InvalidLayout)?;
-        let NodeKind::ParallelLoop(loop_spec) = first_family_node.kind() else {
-            return Err(RefreshError::GraphLink("parallel slot body"));
-        };
-        let loop_node_id = first_family.node;
-        validate_parallel_refresh(
-            loop_spec,
-            self.slots.len(),
-            first_family_node.arguments().len(),
-            first_family_node.output_types().len(),
-        )?;
-        let loop_args =
-            graph.root_scope().arguments(first_family_node).ok_or(RefreshError::InvalidLayout)?;
-        let body_id = graph
-            .child_scope_id(&FrozenGraphScopeId::Root, loop_node_id)
-            .ok_or(RefreshError::GraphLink("parallel body scope"))?;
-        let body = graph.scope(&body_id).ok_or(RefreshError::InvalidLayout)?;
-        if body.inputs().len() != 8 || body.outputs().len() != 1 || body.outputs()[0].port.0 != 0 {
-            return Err(RefreshError::GraphLink("parallel body schema"));
-        }
-        let body_output = body.outputs()[0];
-        let body_output_type = body
-            .node(body_output.node)
-            .and_then(|node| node.output_types().get(body_output.port.0 as usize))
-            .ok_or(RefreshError::InvalidLayout)?;
-        let loop_output_type =
-            first_family_node.output_types().first().ok_or(RefreshError::InvalidLayout)?;
-        let WireType::IndexedFamily { element, count } = loop_output_type else {
-            return Err(RefreshError::GraphLink("parallel output family"));
-        };
-        if count.evaluate(&Default::default()).ok() != Some(BigInt::from(self.slots.len())) ||
-            element.as_ref() != body_output_type
-        {
-            return Err(RefreshError::GraphLink("parallel output alignment"));
-        }
-        let body_input = |index: usize| body.inputs()[index];
-        for input_index in 0..8 {
-            let parent_node = graph
-                .root_scope()
-                .node(loop_args[input_index].node)
-                .ok_or(RefreshError::InvalidLayout)?;
-            let parent_type = parent_node
-                .output_types()
-                .get(loop_args[input_index].port.0 as usize)
-                .ok_or(RefreshError::InvalidLayout)?;
-            let expected_type = if input_index < 7 {
-                let WireType::IndexedFamily { element, .. } = parent_type else {
-                    return Err(RefreshError::GraphLink("parallel family input type"));
-                };
-                element.as_ref()
-            } else {
-                parent_type
-            };
-            let input = body_input(input_index);
-            let body_input_type = body
-                .node(input.node)
-                .and_then(|node| node.output_types().get(input.port.0 as usize))
-                .ok_or(RefreshError::InvalidLayout)?;
-            if body_input_type != expected_type {
-                return Err(RefreshError::GraphLink("parallel input alignment"));
-            }
-        }
-        let body_args =
-            |wire: WireRef, operation: MatrixBinaryOp| -> Result<[WireRef; 2], RefreshError> {
-                let node = body.node(wire.node).ok_or(RefreshError::InvalidLayout)?;
-                if wire.port.0 != 0 ||
-                    node.output_types().len() != 1 ||
-                    !matches!(node.kind(), NodeKind::MatrixBinary(found) if *found == operation) ||
-                    node.arguments().len() != 2
-                {
-                    return Err(RefreshError::GraphLink("parallel body arithmetic"));
-                }
-                Ok(body.arguments(node).ok_or(RefreshError::InvalidLayout)?.try_into().unwrap())
-            };
-        let validate_large = |source: WireRef, scale: WireRef, result: WireRef| {
-            let result_args = body_args(result, MatrixBinaryOp::Multiply)?;
-            if result_args[0] != source {
-                return Err(RefreshError::GraphLink("parallel large source"));
-            }
-            let wrapper = body.node(result_args[1].node).ok_or(RefreshError::InvalidLayout)?;
-            if result_args[1].port.0 != 0 || wrapper.output_types().len() != 1 {
-                return Err(RefreshError::GraphLink("parallel large wrapper"));
-            }
-            let decomposition_wire = match wrapper.kind() {
-                NodeKind::MatrixScale { scalar }
-                    if wrapper.arguments().len() == 1 &&
-                        scalar.evaluate(&Default::default()).ok() == Some(BigInt::from(1)) =>
-                {
-                    body.arguments(wrapper).ok_or(RefreshError::InvalidLayout)?[0]
-                }
-                _ => return Err(RefreshError::GraphLink("parallel large wrapper")),
-            };
-            let decomposition =
-                body.node(decomposition_wire.node).ok_or(RefreshError::InvalidLayout)?;
-            let NodeKind::GadgetDecompose { base, small, digit_count } = decomposition.kind()
-            else {
-                return Err(RefreshError::GraphLink("parallel decomposition"));
-            };
-            if decomposition_wire.port.0 != 0 || decomposition.arguments().len() != 1 || *small {
-                return Err(RefreshError::GraphLink("parallel decomposition"));
-            }
-            let decomposition_arg =
-                body.arguments(decomposition).ok_or(RefreshError::InvalidLayout)?[0];
-            let scale_product = body_args(decomposition_arg, MatrixBinaryOp::Multiply)?;
-            if scale_product[1] != scale {
-                return Err(RefreshError::GraphLink("parallel scale ancestry"));
-            }
-            let gadget = body.node(scale_product[0].node).ok_or(RefreshError::InvalidLayout)?;
-            let NodeKind::ConstantMatrix {
-                value:
-                    mxx_ir_core::node::ConstantMatrix::Gadget { base: gadget_base, small: gadget_small },
-                ..
-            } = gadget.kind()
-            else {
-                return Err(RefreshError::GraphLink("parallel gadget"));
-            };
-            if scale_product[0].port.0 != 0 ||
-                gadget.arguments().len() != 0 ||
-                *gadget_small ||
-                gadget_base != base
-            {
-                return Err(RefreshError::GraphLink("parallel gadget relation"));
-            }
-            Ok((base.clone(), digit_count.clone()))
-        };
-        let mut large_parameters = None;
-        for slot in 0..self.slots.len() {
-            let level = get_role(slot, "level")?;
-            let level_node = root_node(level).ok_or(RefreshError::InvalidLayout)?;
-            let NodeKind::FamilyGetStatic { index } = level_node.kind() else {
-                return Err(RefreshError::GraphLink("parallel slot projection"));
-            };
-            if level_node.arguments().len() != 1 ||
-                level.wire.port.0 != 0 ||
-                index.evaluate(&Default::default()).ok() != Some(BigInt::from(slot)) ||
-                graph.root_scope().wire_ref(&level_node.arguments()[0]) != Some(first_family) ||
-                graph.root_scope().wire_ref(&output_node.arguments()[slot]) != Some(level.wire)
-            {
-                return Err(RefreshError::GraphLink("parallel slot projection"));
-            }
-            for suffix in [
-                "scale-target",
-                "mask",
-                "scaled-fresh-error",
-                "decoder",
-                "decoder-public",
-                "target",
-            ] {
-                if role_root(get_role(slot, suffix)?).is_none() {
-                    return Err(RefreshError::GraphLink("parallel role scope"));
-                }
-            }
-            let expected = [
-                get_role(slot, "scale-target")?,
-                get_role(slot, "mask")?,
-                get_role(slot, "scaled-fresh-error")?,
-                get_role(slot, "decoder")?,
-                get_role(slot, "decoder-public")?,
-            ];
-            let family_indices = [0usize, 1, 3, 5, 6];
-            for (family_index, expected_role) in family_indices.into_iter().zip(expected) {
-                let family_wire = loop_args[family_index];
-                let family_node =
-                    graph.root_scope().node(family_wire.node).ok_or(RefreshError::InvalidLayout)?;
-                let NodeKind::FamilyPack { count } = family_node.kind() else {
-                    return Err(RefreshError::GraphLink("parallel family pack"));
-                };
-                if family_wire.port.0 != 0 ||
-                    family_node.arguments().len() != self.slots.len() ||
-                    family_node.output_types().len() != 1 ||
-                    count.evaluate(&Default::default()).ok() !=
-                        Some(BigInt::from(self.slots.len())) ||
-                    graph.root_scope().wire_ref(&family_node.arguments()[slot]) !=
-                        role_root(expected_role)
-                {
-                    return Err(RefreshError::GraphLink("parallel family order"));
-                }
-            }
-            for family_index in [2usize, 4] {
-                let family_node = graph
-                    .root_scope()
-                    .node(loop_args[family_index].node)
-                    .ok_or(RefreshError::InvalidLayout)?;
-                let NodeKind::FamilyPack { count } = family_node.kind() else {
-                    return Err(RefreshError::GraphLink("parallel family pack"));
-                };
-                if loop_args[family_index].port.0 != 0 ||
-                    family_node.arguments().len() != self.slots.len() ||
-                    family_node.output_types().len() != 1 ||
-                    count.evaluate(&Default::default()).ok() !=
-                        Some(BigInt::from(self.slots.len()))
-                {
-                    return Err(RefreshError::GraphLink("parallel family shape"));
-                }
-            }
-            if loop_args[7] !=
-                role_root(role("refresh-state").ok_or(RefreshError::InvalidLayout)?)
-                    .ok_or(RefreshError::GraphLink("parallel state"))?
-            {
-                return Err(RefreshError::GraphLink("parallel state"));
-            }
-            let vector_types = [1usize, 3, 5]
-                .map(|index| {
-                    body.node(body_input(index).node).and_then(|node| node.output_types().first())
-                })
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or(RefreshError::InvalidLayout)?;
-            let public_types = [2usize, 4, 6]
-                .map(|index| {
-                    body.node(body_input(index).node).and_then(|node| node.output_types().first())
-                })
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or(RefreshError::InvalidLayout)?;
-            if vector_types.iter().any(|ty| !matches!(ty, WireType::Matrix(_))) ||
-                public_types.iter().any(|ty| !matches!(ty, WireType::Matrix(_))) ||
-                vector_types[1] != vector_types[0] ||
-                vector_types[2] != vector_types[0] ||
-                public_types[1] != public_types[0] ||
-                public_types[2] != public_types[0]
-            {
-                return Err(RefreshError::GraphLink("parallel input shapes"));
-            }
-            if body_ancestry_contains(body, body_output, body_input(2)) ||
-                body_ancestry_contains(body, body_output, body_input(4)) ||
-                body_ancestry_contains(body, body_output, body_input(6))
-            {
-                return Err(RefreshError::GraphLink("parallel unused inputs"));
-            }
-            let subtract = body_args(body_output, MatrixBinaryOp::Subtract)?;
-            if subtract[1] != body_input(5) {
-                return Err(RefreshError::GraphLink("parallel decoder order"));
-            }
-            let add_mask = body_args(subtract[0], MatrixBinaryOp::Add)?;
-            let add_state = body_args(add_mask[0], MatrixBinaryOp::Add)?;
-            if add_state[1] != body_input(1) {
-                return Err(RefreshError::GraphLink("parallel mask order"));
-            }
-            let state_large = validate_large(body_input(7), body_input(0), add_state[0])?;
-            let fresh_large = validate_large(body_input(3), body_input(0), add_mask[1])?;
-            if state_large != fresh_large {
-                return Err(RefreshError::GraphLink("parallel large parameters"));
-            }
-            if let Some(previous) = &large_parameters {
-                if previous != &state_large {
-                    return Err(RefreshError::GraphLink("parallel producer"));
-                }
-            } else {
-                large_parameters = Some(state_large);
-            }
-        }
-        if role("refresh-state").ok_or(RefreshError::InvalidLayout)?.scope !=
-            FrozenGraphScopeId::Root
-        {
-            return Err(RefreshError::GraphLink("parallel state scope"));
-        }
-        let binary_args = |wire: &ScopedWireRef,
-                           operation: MatrixBinaryOp|
-         -> Result<[ScopedWireRef; 2], RefreshError> {
-            let node = root_node(wire).ok_or(RefreshError::InvalidLayout)?;
-            if !matches!(node.kind(), NodeKind::MatrixBinary(found) if *found == operation) ||
-                node.arguments().len() != 2
-            {
-                return Err(RefreshError::GraphLink("slot add/subtract chain"));
-            }
-            let left = graph
-                .root_scope()
-                .wire_ref(&node.arguments()[0])
-                .ok_or(RefreshError::InvalidLayout)?;
-            let right = graph
-                .root_scope()
-                .wire_ref(&node.arguments()[1])
-                .ok_or(RefreshError::InvalidLayout)?;
-            Ok([
-                ScopedWireRef { scope: FrozenGraphScopeId::Root, wire: left },
-                ScopedWireRef { scope: FrozenGraphScopeId::Root, wire: right },
-            ])
-        };
-        for slot in 0..self.slots.len() {
-            let get = |suffix: &str| {
-                role(&format!("slot-{slot}-{suffix}")).ok_or(RefreshError::InvalidLayout)
-            };
-            let scale_target = get("scale-target")?;
-            let decoder_public = get("decoder-public")?;
-            let a_sum = get("a-sum")?;
-            let target = get("target")?;
-            let b = get("b")?;
-            let k = get("k")?;
-            let scale_node = root_node(scale_target).ok_or(RefreshError::InvalidLayout)?;
-            let NodeKind::ConstantMatrix {
-                value: mxx_ir_core::node::ConstantMatrix::Polynomial { coefficients },
-                ..
-            } = scale_node.kind()
-            else {
-                return Err(RefreshError::InvalidLayout);
-            };
-            if coefficients.len() != 1 ||
-                coefficients[0].evaluate(&Default::default()).ok() !=
-                    Some(&self.slots[slot].q / &self.slots[slot].q_t)
-            {
-                return Err(RefreshError::GraphLink("scale constant"));
-            }
-            let target_args = binary_args(target, MatrixBinaryOp::Subtract)?;
-            if target_args[0] != *a_sum {
-                return Err(RefreshError::GraphLink("decoder target minuend"));
-            }
-            let scaled_a_prime_args = binary_args(&target_args[1], MatrixBinaryOp::Multiply)?;
-            if scaled_a_prime_args != [scale_target.clone(), a_prime.clone()] {
-                return Err(RefreshError::GraphLink("decoder target scale"));
-            }
-            let b_k_product = get("b-k-product")?;
-            let b_k = binary_args(b_k_product, MatrixBinaryOp::Multiply)?;
-            if b_k != [b.clone(), k.clone()] || decoder_public != target {
-                return Err(RefreshError::GraphLink("decoder preimage equation"));
-            }
-        }
-        Ok(())
-    }
 }
 
 /// The graph-checked `B*K` equation used to validate decoder preimages.
@@ -1408,11 +904,11 @@ struct RefreshAnchorEquation {
 
 impl RefreshAnchor {
     /// Builds an anchor from the issuer's decoder matrix `B` and preimage
-    /// matrix `K`, retaining their graph product as the trusted target.
-    pub(crate) fn with_equation(b: Mat, k: Mat) -> Self {
+    /// typed preimage `K`, retaining the exact graph product `B*K` as target.
+    pub(crate) fn with_equation(b: Mat, k: Preimage) -> Self {
         // Construct the issuer target here so callers cannot attach an
         // unrelated matrix while claiming it is B*K.
-        let target = b.clone() * k.clone();
+        let target = b.apply_preimage(k);
         Self { equation: Some(RefreshAnchorEquation { target }) }
     }
 }
@@ -1484,7 +980,7 @@ struct RefreshScalarPackage {
     decoder: RefreshDecoderPreimage,
     target_public_matrix: Mat,
     b: Mat,
-    k: Mat,
+    k: Preimage,
     anchor_product_handle: mxx_ir_core::ValueHandle,
 }
 
@@ -1507,7 +1003,7 @@ impl RefreshScalarPackage {
         target_public_matrix: Mat,
         anchor: &RefreshAnchor,
         b: Mat,
-        k: Mat,
+        k: Preimage,
     ) -> Result<Self, RefreshError> {
         crate::ensure_ciphertext_only(state).map_err(RefreshError::Power)?;
         crate::ensure_ciphertext_only(&mask).map_err(RefreshError::Power)?;
@@ -1566,8 +1062,8 @@ pub(crate) struct RefreshSetupSlotArtifacts {
     pub decoder: BggEncodingWire,
     /// Public `B` matrix in the slot's anchor equation.
     pub b: Mat,
-    /// Public `K` matrix in the slot's anchor equation.
-    pub k: Mat,
+    /// Typed preimage `K` in the slot's anchor equation.
+    pub k: Preimage,
 }
 
 impl RefreshSetupManifest {
@@ -1652,7 +1148,7 @@ impl RefreshCompiler {
         fresh: BggEncodingWire,
         masks: Vec<BggEncodingWire>,
         decoder_bases: Vec<BggEncodingWire>,
-        preimages: Vec<Mat>,
+        preimages: Vec<Preimage>,
     ) -> Result<RefreshSetupManifest, RefreshError> {
         self.validate_layout()?;
         crate::ensure_ciphertext_only(&state).map_err(RefreshError::Power)?;
@@ -1694,7 +1190,7 @@ impl RefreshCompiler {
             // `target = A_{sum,t} - mu_t A'`; the imported preimage K_t must
             // satisfy `B K_t = target` and is checked by RefreshDecoderPreimage.
             let decoder = BggEncodingWire {
-                vector: base.vector * k.clone(),
+                vector: base.vector.apply_preimage(k.clone()),
                 pubkey: BggPublicKeyWire { matrix: target.clone(), reveal_plaintext: false },
                 plaintext: None,
             };
@@ -1782,7 +1278,7 @@ impl RefreshCompiler {
                 let a_sum_t = combined.pubkey.matrix;
                 let target_public_matrix = a_sum_t.clone() - scale_target.clone() * a_prime.clone();
                 if !same_matrix_type(
-                    (artifacts.b.clone() * artifacts.k.clone()).matrix_type(),
+                    artifacts.b.clone().apply_preimage(artifacts.k.clone()).matrix_type(),
                     target_public_matrix.matrix_type(),
                 ) {
                     return Err(RefreshError::InvalidLayout);
@@ -1949,7 +1445,7 @@ impl RefreshCompiler {
         let _ = packages.first().ok_or(RefreshError::InvalidLayout)?;
         let fresh_handle = packages[0].fresh_error_source_handle.clone();
         // Package fields are exposed as indexed families once, then one
-        // structural ParallelLoop performs the complete per-slot equation.
+        // The structural family operation performs the complete per-slot equation.
         // This keeps CRT-slot work independent while preserving the caller's
         // declared slot order for the final recomposition.
         let scales =
@@ -2081,7 +1577,7 @@ impl RefreshCompiler {
                 (format!("slot-{slot}-k"), package.k.value_handle().clone()),
                 (
                     format!("slot-{slot}-b-k-product"),
-                    (package.b.clone() * package.k.clone()).value_handle().clone(),
+                    package.b.clone().apply_preimage(package.k.clone()).value_handle().clone(),
                 ),
             ]);
             levels.push(level);
@@ -2092,24 +1588,6 @@ impl RefreshCompiler {
             self.reconstruction_coefficients.clone(),
         );
         let declaration = self.refresh_declaration(setup, &vector)?;
-        let mut roles = vec![
-            ("refresh-output".to_owned(), vector.value_handle().clone()),
-            ("shared-fresh-error".to_owned(), fresh_handle),
-            ("refresh-state".to_owned(), state.vector.value_handle().clone()),
-            ("a-prime".to_owned(), setup.a_prime.value_handle().clone()),
-            (
-                format!("refresh-instance-{}", hex_identity(&declaration.identity)),
-                vector.value_handle().clone(),
-            ),
-            (
-                format!("refresh-setup-{}", hex_identity(&setup.identity)),
-                setup.a_prime.value_handle().clone(),
-            ),
-        ];
-        roles.extend(slot_roles);
-        let vector = vector
-            .derivation_attachment("mxx-power-lut", "section-7-refresh", roles)
-            .map_err(|_| RefreshError::InvalidLayout)?;
         Ok(RefreshResult {
             encoding: BggEncodingWire {
                 vector,
@@ -2218,16 +1696,6 @@ fn same_matrix_type(
     ]
     .into_iter()
     .all(|(left, right)| left.evaluate(&environment).ok() == right.evaluate(&environment).ok())
-}
-
-fn hex_identity(identity: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in identity {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0xf) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]

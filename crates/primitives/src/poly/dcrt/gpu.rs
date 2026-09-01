@@ -213,6 +213,7 @@ unsafe extern "C" {
         indices: *const usize,
         matrix_count: usize,
     ) -> c_int;
+    #[cfg(test)]
     pub(crate) fn gpu_matrix_validate_ring_automorphism(
         ring_dimension: usize,
         indices: *const usize,

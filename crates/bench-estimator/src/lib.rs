@@ -320,12 +320,6 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 self.cached_child(child, child_bindings)
             }
             NodeKind::ParallelGrid(grid) => {
-                if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
-                    return Err(EstimateError::LoopIndexDependentCost {
-                        scope: node.scope.clone(),
-                        node: node.id,
-                    });
-                }
                 let count = grid_size(bindings, &grid.shape)?;
                 if count == 0 {
                     return Ok((NodeMeasurement::default(), 0.0, 0, 1));
@@ -335,6 +329,22 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .source
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                // A grid may extrapolate only work which is invariant under
+                // its own coordinates. Ambient loop slots belong to their
+                // owning extrapolation boundary and are checked there.
+                if node_depends_on_loop_slots(node, &grid.index_slots) ||
+                    scope_tree_depends_on_loop_slots(
+                        &self.validated.source,
+                        &child,
+                        &grid.index_slots,
+                    ) ||
+                    !self.backend.loop_index_invariant(self.validated.source.name(), node)
+                {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
                 let child_bindings = grid_child_bindings(bindings, grid)?;
                 let (one, preimage_work, peak, parallelism) =
                     self.cached_child(child, child_bindings)?;
@@ -354,12 +364,6 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 ))
             }
             NodeKind::SequentialLoop(loop_node) => {
-                if !self.backend.loop_index_invariant(self.validated.source.name(), node) {
-                    return Err(EstimateError::LoopIndexDependentCost {
-                        scope: node.scope.clone(),
-                        node: node.id,
-                    });
-                }
                 let count = loop_node
                     .count
                     .evaluate(bindings)
@@ -376,6 +380,16 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .source
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                let owner_slot = [loop_node.index_slot];
+                if node_depends_on_loop_slots(node, &owner_slot) ||
+                    scope_tree_depends_on_loop_slots(&self.validated.source, &child, &owner_slot) ||
+                    !self.backend.loop_index_invariant(self.validated.source.name(), node)
+                {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
                 let (one, preimage_work, peak, parallelism) =
@@ -553,11 +567,69 @@ fn grid_child_bindings(
     Ok(child)
 }
 
+fn node_depends_on_loop_slots(node: &MeasurementNode<'_>, slots: &[u32]) -> bool {
+    serialized_value_depends_on_loop_slots(&(node.kind, node.output_types), slots)
+}
+
+fn scope_tree_depends_on_loop_slots(
+    graph: &mxx_ir_core::Graph,
+    scope_id: &FrozenGraphScopeId,
+    slots: &[u32],
+) -> bool {
+    let Some(scope) = graph.scope(scope_id) else { return false };
+    scope.nodes().iter().enumerate().any(|(position, node)| {
+        // The call node (including its bindings) is inspected here, but a
+        // canonical Subgraph has an independent loop-slot namespace. Only
+        // lexical loop/grid bodies inherit the owning boundary's slots.
+        serialized_value_depends_on_loop_slots(&(node.kind(), node.output_types()), slots) ||
+            graph.child_scope_id(scope_id, NodeId(position as u64)).is_some_and(|child| {
+                matches!(
+                    child,
+                    FrozenGraphScopeId::ParallelBody { .. } |
+                        FrozenGraphScopeId::SequentialBody { .. }
+                ) && scope_tree_depends_on_loop_slots(graph, &child, slots)
+            })
+    })
+}
+
+fn serialized_value_depends_on_loop_slots<T: Serialize>(value: &T, slots: &[u32]) -> bool {
+    fn contains_loop_slot(value: &serde_json::Value, slots: &[u32]) -> bool {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if fields.get("tag").and_then(serde_json::Value::as_str) == Some("LoopIndex") &&
+                    fields
+                        .get("value")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|slot| u32::try_from(slot).ok())
+                        .is_some_and(|slot| slots.contains(&slot))
+                {
+                    return true;
+                }
+                fields.values().any(|child| contains_loop_slot(child, slots))
+            }
+            serde_json::Value::Array(values) => {
+                values.iter().any(|child| contains_loop_slot(child, slots))
+            }
+            _ => false,
+        }
+    }
+
+    let encoded = serde_json::to_value(value).expect("IR expression containers are serializable");
+    contains_loop_slot(&encoded, slots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Int, IntType, Mat, MatType, Parallel, Ring, Sequential, Subgraph};
-    use std::convert::Infallible;
+    use mxx_dsl::{
+        DslContext, Family, GraphValue, Int, IntType, Mat, MatFamilyType, MatType, Parallel,
+        Pending, Ring, Sequential, Subgraph,
+    };
+    use mxx_ir_core::{
+        Graph, GraphOutput, IntExpr, NodeHandle, SubgraphHandle, WireType,
+        graph::with_new_construction_scope, node::ParallelGrid,
+    };
+    use std::{cell::Cell, convert::Infallible};
 
     struct UnitBackend;
 
@@ -699,5 +771,251 @@ mod tests {
             .find_map(|(scope, cost)| scope.contains("grid-identity").then_some(cost.invocations))
             .expect("grid subgraph cost");
         assert_eq!(invocations, 6);
+    }
+
+    #[test]
+    fn parallel_grid_rejects_index_dependent_cost_bindings_and_multiplies_invariant_cost() {
+        fn gaussian_grid(shape: usize, binding: IntExpr) -> ValidatedGraph {
+            let ring = Ring::new(257, 8);
+            let matrix_type = ring.matrix_type((1, 1));
+            let body = with_new_construction_scope(|scope| {
+                let sample = ring.gaussian((1, 1), 5, IntExpr::Var("sampler_bound".to_owned()));
+                SubgraphHandle::new(
+                    "measured-grid-body",
+                    scope,
+                    Vec::new(),
+                    vec![sample.value_handle().clone()],
+                )
+                .expect("grid body")
+            });
+            let grid = NodeHandle::parallel_grid(
+                body,
+                Vec::new(),
+                vec![WireType::Family {
+                    element: Box::new(WireType::Matrix(matrix_type)),
+                    shape: vec![IntExpr::constant(shape)],
+                }],
+                ParallelGrid {
+                    shape: vec![IntExpr::constant(shape)],
+                    index_slots: vec![7],
+                    bindings: vec![("sampler_bound".to_owned(), binding)],
+                    input_modes: Vec::new(),
+                },
+            )
+            .output(0)
+            .expect("grid output");
+            let (graph, _) = Graph::freeze(
+                "estimate-grid-binding-invariance",
+                Vec::new(),
+                BTreeMap::from([(
+                    "samples".to_owned(),
+                    GraphOutput { value: grid, confidentiality: None },
+                )]),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .expect("graph");
+            let bindings = ParamEnv {
+                integers: BTreeMap::from([("sampler_bound".to_owned(), 19.into())]),
+                ..ParamEnv::default()
+            };
+            mxx_ir_core::validate(&graph, &bindings).expect("valid grid")
+        }
+
+        struct CountingBackend {
+            measurements: usize,
+        }
+
+        impl MeasurementBackend for CountingBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                _node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                self.measurements += 1;
+                Ok(NodeMeasurement { work_seconds: 2.0, latency_seconds: 2.0, workspace_bytes: 4 })
+            }
+
+            fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+                8
+            }
+        }
+
+        let dependent = gaussian_grid(3, IntExpr::LoopIndex(7));
+        let mut dependent_backend = CountingBackend { measurements: 0 };
+        assert!(matches!(
+            estimate(&dependent, &mut dependent_backend, &EstimateConfig::default()),
+            Err(EstimateError::LoopIndexDependentCost { .. })
+        ));
+        assert_eq!(dependent_backend.measurements, 0);
+
+        let empty_dependent = gaussian_grid(0, IntExpr::LoopIndex(7));
+        let mut empty_backend = CountingBackend { measurements: 0 };
+        let empty_report =
+            estimate(&empty_dependent, &mut empty_backend, &EstimateConfig::default())
+                .expect("empty grid has no work to extrapolate");
+        assert_eq!(empty_backend.measurements, 0);
+        assert_eq!(empty_report.total_work_seconds, 0.0);
+
+        let invariant = gaussian_grid(3, IntExpr::constant(19));
+        let mut invariant_backend = CountingBackend { measurements: 0 };
+        let report = estimate(&invariant, &mut invariant_backend, &EstimateConfig::default())
+            .expect("invariant estimate");
+        assert_eq!(invariant_backend.measurements, 1);
+        assert_eq!(report.total_work_seconds, 6.0);
+    }
+
+    #[test]
+    fn sequential_owner_rejects_an_ambient_slot_used_by_a_nested_grid_binding() {
+        let ring = Ring::new(257, 8);
+        let matrix_type = ring.matrix_type((1, 1));
+        let initial = Parallel::range(1).map_values(|_| ring.zero((1, 1))).expect("initial family");
+        let output = Sequential::range(3)
+            .scan(initial, Int::constant(0), |layer, _state, _| {
+                let body = with_new_construction_scope(|scope| {
+                    let sample = ring.gaussian((1, 1), 5, IntExpr::Var("ambient_bound".to_owned()));
+                    SubgraphHandle::new(
+                        "nested-grid-body",
+                        scope,
+                        Vec::new(),
+                        vec![sample.value_handle().clone()],
+                    )
+                    .expect("nested grid body")
+                });
+                let family_type = MatFamilyType {
+                    element: matrix_type.clone(),
+                    shape: vec![IntExpr::constant(1)],
+                };
+                let nested_grid = NodeHandle::parallel_grid(
+                    body,
+                    Vec::new(),
+                    vec![WireType::Family {
+                        element: Box::new(WireType::Matrix(matrix_type.clone())),
+                        shape: vec![IntExpr::constant(1)],
+                    }],
+                    ParallelGrid {
+                        shape: vec![IntExpr::constant(1)],
+                        index_slots: vec![10_000],
+                        bindings: vec![("ambient_bound".to_owned(), layer.expression())],
+                        input_modes: Vec::new(),
+                    },
+                )
+                .output(0)
+                .expect("nested grid output");
+                Family::<Mat>::from_values(&family_type, &[nested_grid], Pending::default())
+            })
+            .expect("sequential scan");
+        let built = DslContext::new("estimate-sequential-ambient-grid-binding")
+            .family_output("output", output)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validation_bindings = ParamEnv {
+            integers: BTreeMap::from([("ambient_bound".to_owned(), 19.into())]),
+            ..ParamEnv::default()
+        };
+        let validated =
+            mxx_ir_core::validate(&built.graph, &validation_bindings).expect("valid graph");
+
+        struct RejectMeasurementBackend {
+            gaussian_measurements: usize,
+        }
+
+        impl MeasurementBackend for RejectMeasurementBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                if matches!(node.kind, NodeKind::GaussianSample { .. }) {
+                    self.gaussian_measurements += 1;
+                }
+                Ok(NodeMeasurement::default())
+            }
+
+            fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+                0
+            }
+        }
+
+        let mut backend = RejectMeasurementBackend { gaussian_measurements: 0 };
+        assert!(matches!(
+            estimate(&validated, &mut backend, &EstimateConfig::default()),
+            Err(EstimateError::LoopIndexDependentCost { .. })
+        ));
+        assert_eq!(backend.gaussian_measurements, 0);
+    }
+
+    #[test]
+    fn grid_ignores_a_colliding_slot_in_an_independent_subgraph_namespace() {
+        let ring = Ring::new(257, 8);
+        let matrix_type = ring.matrix_type((1, 1));
+        let local_slot = Cell::new(None);
+        let independent = Subgraph::<Mat, Mat>::try_define(
+            "independent-empty-loop",
+            MatType(matrix_type.clone()),
+            |value| {
+                Sequential::range(0).scan(value, Int::constant(0), |layer, _state, _invariant| {
+                    let IntExpr::LoopIndex(slot) = layer.expression() else {
+                        panic!("sequential layer must be a loop index")
+                    };
+                    local_slot.set(Some(slot));
+                    Ok(ring.gaussian((1, 1), 5, IntExpr::LoopIndex(slot)))
+                })
+            },
+        )
+        .expect("independent subgraph");
+        let colliding_slot = local_slot.get().expect("local sequential slot");
+
+        let outer_body = with_new_construction_scope(|scope| {
+            let output = independent.call(ring.zero((1, 1))).expect("subgraph call");
+            SubgraphHandle::new(
+                "outer-grid-body",
+                scope,
+                Vec::new(),
+                vec![output.value_handle().clone()],
+            )
+            .expect("outer grid body")
+        });
+        let output = NodeHandle::parallel_grid(
+            outer_body,
+            Vec::new(),
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(matrix_type)),
+                shape: vec![IntExpr::constant(2)],
+            }],
+            ParallelGrid {
+                shape: vec![IntExpr::constant(2)],
+                index_slots: vec![colliding_slot],
+                bindings: Vec::new(),
+                input_modes: Vec::new(),
+            },
+        )
+        .output(0)
+        .expect("outer grid output");
+        let (graph, _) = Graph::freeze(
+            "estimate-independent-slot-namespaces",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("graph");
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("valid graph");
+
+        let report =
+            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        assert!(report.total_work_seconds > 0.0);
     }
 }

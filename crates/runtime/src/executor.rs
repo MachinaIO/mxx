@@ -2307,7 +2307,16 @@ where
         }
         let source_count = source_family_count.unwrap_or(1);
         let target_count = self.family_count(values, node.args[2])?;
-        if source_count == 0 || target_count % source_count != 0 {
+        if source_count == 0 {
+            if target_count == 0 {
+                // There are no equations B_i * K_i,j = T_i,j to sample. The validated output
+                // wire retains the target's logical shape even though its flat value is empty.
+                self.put(values, node.id, 0, RuntimeValue::Family(Vec::new()));
+                return Ok(());
+            }
+            return Err(ExecutionError::ValueKind(node.args[2]));
+        }
+        if target_count % source_count != 0 {
             return Err(ExecutionError::ValueKind(node.args[2]));
         }
         let branch_count = target_count / source_count;
@@ -3970,6 +3979,47 @@ mod tests {
                 matches!(value, RuntimeValue::Int(actual) if actual == &BigInt::from(expected))
             );
         }
+    }
+
+    #[test]
+    fn empty_family_preimage_sample_preserves_shape_without_sampling() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let gadget_base = BigInt::from(4);
+        let digit_count = 4;
+        let trapdoors = Parallel::range(0)
+            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+            .expect("empty trapdoor family");
+        let targets = Parallel::grid(vec![IntExpr::constant(0), IntExpr::constant(2)])
+            .map(|_| ring.zero((1, 1)))
+            .expect("empty target family");
+        let preimages = trapdoors
+            .sample_preimage_branches(targets, (digit_count + 2, 1))
+            .expect("empty preimage family");
+        let validated = DslContext::new("runtime-empty-family-preimage")
+            .public_preimage_family_output("preimages", preimages)
+            .expect("preimage output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters]);
+        let batch_calls_before = backend.preimage_batch_calls();
+        let mut store = MemoryArtifactStore::default();
+        let result =
+            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("execution");
+
+        assert_eq!(backend.preimage_batch_calls(), batch_calls_before);
+        assert!(matches!(
+            &result.outputs["preimages"],
+            RuntimeValue::Family(values) if values.is_empty()
+        ));
+        assert!(result.artifact_handles.get("preimages").is_none_or(Vec::is_empty));
+        let production = result.production_id.expect("empty family manifest");
+        let manifest = store.manifest(&production).expect("manifest");
+        assert_eq!(manifest.artifacts["preimages"].family_shape, Some(vec![0, 2]));
     }
 
     #[test]

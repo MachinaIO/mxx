@@ -857,7 +857,7 @@ fn validate_node(
             // MatrixBinary::Multiply follows the same arithmetic without this authorization.
             require_arity(scope, node, 2)?;
             let left = matrix_argument(scope, values, node, 0)?;
-            let right = matrix_argument(scope, values, node, 1)?;
+            let right = preimage_argument(scope, values, node, 1)?;
             // The output shape is the usual product shape for A*K; the relation marker is gone.
             vec![ConcreteWireType::Matrix(multiplication_type(&left, &right)?)]
         }
@@ -2307,6 +2307,34 @@ mod tests {
             validate(&graph("ring-mismatch", product), &ParamEnv::default()),
             Err(ValidationError::Check(CheckError::RingMismatch))
         ));
+    }
+
+    #[test]
+    fn apply_preimage_requires_a_typed_preimage_right_operand() {
+        let left_type = matrix_type(17, 1, 2);
+        let preimage_type = matrix_type(17, 2, 1);
+        let output_type = matrix_type(17, 1, 1);
+        let applied = |name: &str, right_type: WireType| {
+            let left = input("left", left_type.clone());
+            let right = typed_input("right", right_type);
+            graph(
+                name,
+                value(
+                    NodeKind::ApplyPreimage,
+                    vec![left, right],
+                    vec![WireType::Matrix(output_type.clone())],
+                ),
+            )
+        };
+
+        let typed = applied("typed-apply-preimage", WireType::Preimage(preimage_type.clone()));
+        assert!(validate(&typed, &ParamEnv::default()).is_ok());
+
+        let ordinary = applied("matrix-apply-preimage", WireType::Matrix(preimage_type));
+        assert_eq!(
+            node_message(validate(&ordinary, &ParamEnv::default()).unwrap_err()),
+            "expected preimage argument"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use mxx_ir_core::{
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Signed, ToPrimitive, Zero};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone)]
 struct Info {
@@ -40,6 +40,25 @@ struct Info {
 enum ScalarFacts {
     Affine(AffineScalar),
     Truth(TruthFacts),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BinderDependencies {
+    Known(BTreeSet<u64>),
+    Unknown,
+}
+
+impl BinderDependencies {
+    fn union<'b>(dependencies: impl IntoIterator<Item = &'b Self>) -> Self {
+        let mut combined = BTreeSet::new();
+        for dependency in dependencies {
+            match dependency {
+                Self::Known(binders) => combined.extend(binders.iter().copied()),
+                Self::Unknown => return Self::Unknown,
+            }
+        }
+        Self::Known(combined)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,11 +212,19 @@ pub(crate) fn run(request: &SimulationRequest) -> Result<crate::SimulationReport
             .iter()
             .map(|(name, value)| (name.clone(), ScalarFacts::Affine(AffineScalar::constant(value))))
             .collect(),
+        abstract_integer_dependencies: request
+            .environment
+            .integers
+            .keys()
+            .map(|name| (name.clone(), BinderDependencies::Known(BTreeSet::new())))
+            .collect(),
         abstract_loop_indices: HashMap::new(),
         abstract_loop_atoms: HashMap::new(),
         binder_ranges: HashMap::new(),
         next_binder_atom: 0,
         scalar_facts: HashMap::new(),
+        scalar_dependencies: HashMap::new(),
+        family_axis_dependencies: HashMap::new(),
         next_source: 0,
         preimages: HashMap::new(),
         states: HashMap::new(),
@@ -264,6 +291,7 @@ struct Evaluator<'a> {
     /// once while still covering every concrete lane.
     abstract_integers: BTreeMap<String, state::IntegerState>,
     abstract_integer_facts: BTreeMap<String, ScalarFacts>,
+    abstract_integer_dependencies: BTreeMap<String, BinderDependencies>,
     abstract_loop_indices: HashMap<u32, state::IntegerState>,
     /// Loop slots are lexical names and may be reused by nested grids.  Each
     /// active slot therefore maps to a fresh atom before it enters affine
@@ -272,6 +300,10 @@ struct Evaluator<'a> {
     binder_ranges: HashMap<u64, state::IntegerState>,
     next_binder_atom: u64,
     scalar_facts: HashMap<crate::FamilyViewId, ScalarFacts>,
+    scalar_dependencies: HashMap<crate::FamilyViewId, BinderDependencies>,
+    /// Output-coordinate axes on which a family-valued selector can vary.
+    /// Absence means unknown and is interpreted as dependence on every axis.
+    family_axis_dependencies: HashMap<crate::FamilyViewId, BTreeSet<usize>>,
     next_source: u32,
     preimages: HashMap<crate::FamilyViewId, RightPreimage>,
     states: HashMap<crate::FamilyViewId, MatrixState>,
@@ -332,6 +364,129 @@ impl RelationSourceProjection {
 impl<'a> Evaluator<'a> {
     fn scalar_fact(&self, value: &Info) -> Option<&ScalarFacts> {
         self.scalar_facts.get(&value.view)
+    }
+
+    fn derived_scalar_dependencies(
+        &self,
+        kind: &NodeKind,
+        inputs: &[Info],
+    ) -> Option<BinderDependencies> {
+        match kind {
+            NodeKind::ConstantInt(_) | NodeKind::ConstantBool(_) => {
+                Some(BinderDependencies::Known(BTreeSet::new()))
+            }
+            NodeKind::EvaluateInt(expression) => Some(int_expr_dependencies(
+                expression,
+                &self.abstract_integer_dependencies,
+                &self.abstract_loop_atoms,
+            )),
+            NodeKind::IntBinary(_) |
+            NodeKind::IntCompare(_) |
+            NodeKind::BoolToInt |
+            NodeKind::Select { .. } => {
+                let dependencies = inputs
+                    .iter()
+                    .map(|input| self.scalar_dependencies.get(&input.view))
+                    .collect::<Option<Vec<_>>>();
+                Some(
+                    dependencies
+                        .map(BinderDependencies::union)
+                        .unwrap_or(BinderDependencies::Unknown),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn family_dependencies(&self, value: &Info) -> BTreeSet<usize> {
+        match &value.value {
+            AbstractValue::Family(family) => self
+                .family_axis_dependencies
+                .get(&value.view)
+                .cloned()
+                .unwrap_or_else(|| (0..family.shape.len()).collect()),
+            _ => BTreeSet::new(),
+        }
+    }
+
+    fn record_family_axis_dependencies(
+        &mut self,
+        kind: &NodeKind,
+        inputs: &[Info],
+        outputs: &[Info],
+    ) {
+        for output in outputs {
+            let AbstractValue::Family(family) = &output.value else { continue };
+            let all = || (0..family.shape.len()).collect::<BTreeSet<_>>();
+            let dependencies = match kind {
+                // Packing distinct scalar wires provides no syntactic proof
+                // that coordinates are equal, even when their intervals or
+                // binder dependencies happen to match.
+                NodeKind::FamilyPack { .. } => all(),
+                NodeKind::FamilyReindex { map, .. } => {
+                    let input_dependencies = inputs
+                        .first()
+                        .map(|input| self.family_dependencies(input))
+                        .unwrap_or_default();
+                    let mut dependencies = BTreeSet::new();
+                    for input_axis in input_dependencies {
+                        let Some(expression) = map.input_indices.get(input_axis) else {
+                            dependencies = all();
+                            break;
+                        };
+                        dependencies.extend(
+                            (0..family.shape.len())
+                                .filter(|axis| index_expr_depends_axis(expression, *axis)),
+                        );
+                    }
+                    dependencies
+                }
+                NodeKind::FamilySelectAxis { axis } => {
+                    let input_dependencies = inputs
+                        .first()
+                        .map(|input| self.family_dependencies(input))
+                        .unwrap_or_default();
+                    let selector_dependencies = inputs
+                        .get(1)
+                        .map(|selector| self.family_dependencies(selector))
+                        .unwrap_or_default();
+                    let mut dependencies = BTreeSet::new();
+                    for input_axis in input_dependencies {
+                        if input_axis < *axis {
+                            dependencies.insert(input_axis);
+                        } else if input_axis > *axis {
+                            dependencies.insert(input_axis - 1);
+                        } else {
+                            dependencies.extend(selector_dependencies.iter().copied());
+                        }
+                    }
+                    dependencies
+                }
+                NodeKind::FamilyGather { .. } => {
+                    let source_dependencies = inputs
+                        .first()
+                        .map(|input| self.family_dependencies(input))
+                        .unwrap_or_default();
+                    let mut dependencies = BTreeSet::new();
+                    for source_axis in source_dependencies {
+                        let Some(selector) = inputs.get(source_axis + 1) else {
+                            dependencies = all();
+                            break;
+                        };
+                        dependencies.extend(self.family_dependencies(selector));
+                    }
+                    dependencies
+                }
+                NodeKind::Select { .. } => inputs
+                    .iter()
+                    .skip(1)
+                    .flat_map(|input| self.family_dependencies(input))
+                    .collect(),
+                NodeKind::ParallelGrid(_) => continue,
+                _ => all(),
+            };
+            self.family_axis_dependencies.insert(output.view, dependencies);
+        }
     }
 
     fn int_binary_transfer(
@@ -878,25 +1033,21 @@ impl<'a> Evaluator<'a> {
                 site,
             });
         }
-        // The source of B[g] may use only selectors independent of the
-        // trailing preimage branch.  A scalar selector is independent by
-        // construction, and a family whose integer summary is a singleton
-        // denotes that same index at every output coordinate.  A varying
-        // family has no per-axis provenance in this domain, so it fails closed.
-        if projection.is_shared() &&
-            selector_values[..projection.source_rank].iter().any(|selector| {
-                match &selector.value {
-                    AbstractValue::Integer(_) => false,
-                    AbstractValue::Family(family) => !matches!(
-                        family.element.as_ref(),
-                        AbstractValue::Integer(range)
-                            if range.minimum == range.maximum_inclusive
-                    ),
-                    _ => true,
-                }
-            })
-        {
-            return Err(SimulationError::BranchDependentSource { site });
+        // B[g] may use a varying group selector, but that selector must not
+        // depend on the final output branch coordinate d.  Missing structural
+        // provenance is interpreted as dependence on every output axis.
+        if projection.is_shared() {
+            let branch_axis =
+                output_shape.len().checked_sub(1).ok_or_else(|| SimulationError::Relation {
+                    message: "shared preimage gather output has no final branch axis".into(),
+                    site: site.clone(),
+                })?;
+            if selector_values[..projection.source_rank]
+                .iter()
+                .any(|selector| self.family_dependencies(selector).contains(&branch_axis))
+            {
+                return Err(SimulationError::BranchDependentSource { site });
+            }
         }
         let source_selectors = projection.input_prefix(selectors).expect("ranks checked above");
         let source_shape =
@@ -916,22 +1067,29 @@ impl<'a> Evaluator<'a> {
         sources: Vec<crate::SourceId>,
         shape: Vec<usize>,
     ) -> crate::SourceId {
-        let mut leaves = sources
-            .iter()
-            .flat_map(|source| {
-                self.source_lineages
-                    .get(source)
-                    .map(|lineage| lineage.leaves.clone())
-                    .unwrap_or_else(|| vec![*source])
-            })
-            .collect::<Vec<_>>();
+        let mut has_opaque_source = false;
+        let mut leaves = Vec::new();
+        for source in &sources {
+            match self.source_lineages.get(source) {
+                Some(lineage) if lineage_is_complete(lineage) => {
+                    leaves.extend(lineage.leaves.iter().copied());
+                }
+                Some(lineage) if sources.len() == 1 && lineage.shape == shape => return *source,
+                _ => {
+                    // Preserve an opaque source as one sentinel instead of
+                    // expanding it into a false uniform coordinate function.
+                    has_opaque_source = true;
+                    leaves.push(*source);
+                }
+            }
+        }
         let count = shape.iter().copied().product::<usize>().max(1);
         // A single scalar source entering a family-valued structural node is
         // an index-independent broadcast.  Record the full coordinate
         // function so later identity reindexes can resolve every lane.  This
         // does not merge distinct sources: a multi-leaf lineage is preserved
         // verbatim and must already match the requested family cardinality.
-        if leaves.len() == 1 && count > 1 {
+        if !has_opaque_source && leaves.len() == 1 && count > 1 {
             leaves.resize(count, leaves[0]);
         }
         let canonical = self.canonical_source_for_lineage(SourceLineage { shape, leaves });
@@ -954,14 +1112,18 @@ impl<'a> Evaluator<'a> {
                     .canonical_source_for_lineage(SourceLineage { shape: shape.clone(), leaves });
             }
         }
-        let key = (source, map.normalize(), shape);
+        let key = (source, map.normalize(), shape.clone());
         if let Some(mapped) = self.mapped_sources.get(&key) {
             return *mapped;
         }
         let mapped = crate::SourceId(self.next_source);
         self.next_source = self.next_source.saturating_add(1);
         self.mapped_sources.insert(key, mapped);
-        self.register_lineage(mapped, SourceLineage { shape: Vec::new(), leaves: vec![mapped] });
+        // A structural map with unresolved parameters still has a known
+        // output domain.  Keep one self sentinel rather than enumerating that
+        // domain or pretending that every output coordinate maps to one leaf.
+        // Exact lineage consumers reject this incomplete representation.
+        self.register_lineage(mapped, SourceLineage { shape, leaves: vec![mapped] });
         mapped
     }
 
@@ -1021,7 +1183,8 @@ impl<'a> Evaluator<'a> {
         // identity.
         if let (Some(parent), Some(indices)) = (self.source_lineages.get(&source).cloned(), indices)
         {
-            if indices.len() == parent.shape.len() &&
+            if lineage_is_complete(&parent) &&
+                indices.len() == parent.shape.len() &&
                 indices.iter().enumerate().all(|(axis, index)| *index < parent.shape[axis])
             {
                 let flat =
@@ -1055,14 +1218,20 @@ impl<'a> Evaluator<'a> {
         selectors: Vec<crate::SelectorId>,
         shape: Vec<usize>,
     ) -> crate::SourceId {
-        let key = (source, selectors, shape);
+        let key = (source, selectors, shape.clone());
         if let Some(mapped) = self.gathered_sources.get(&key) {
             return *mapped;
         }
         let mapped = crate::SourceId(self.next_source);
         self.next_source = self.next_source.saturating_add(1);
         self.gathered_sources.insert(key, mapped);
-        self.register_lineage(mapped, SourceLineage { shape: Vec::new(), leaves: vec![mapped] });
+        // An opaque selector still has a statically known output domain.  A
+        // single self leaf is an incomplete sentinel for a multi-coordinate
+        // domain: it preserves rank without claiming that all coordinates
+        // select the same public source or enumerating a potentially huge
+        // family.  Exact and uniform lineage consumers reject incomplete
+        // lineages before inspecting their leaves.
+        self.register_lineage(mapped, SourceLineage { shape, leaves: vec![mapped] });
         mapped
     }
 
@@ -1330,7 +1499,11 @@ impl<'a> Evaluator<'a> {
                 if let Some(facts) = self.derived_scalar_fact(node.kind(), &inputs, &env) {
                     self.scalar_facts.insert(value.view, facts);
                 }
+                if let Some(dependencies) = self.derived_scalar_dependencies(node.kind(), &inputs) {
+                    self.scalar_dependencies.insert(value.view, dependencies);
+                }
             }
+            self.record_family_axis_dependencies(node.kind(), &inputs, &out);
             // Attach pair facts only after all output views are frozen.  This
             // keeps sampler pairing local and avoids any raw-wire side table.
             if matches!(
@@ -2913,8 +3086,7 @@ impl<'a> Evaluator<'a> {
                 }
                 if xs[0].relation.is_some() && *axis + 1 != f.shape.len() {
                     return Err(SimulationError::Relation {
-                        message: "a relation-bearing family may select only its final branch axis"
-                            .into(),
+                        message: "a relation-bearing family may select only its final axis".into(),
                         site: site(),
                     });
                 }
@@ -2939,21 +3111,27 @@ impl<'a> Evaluator<'a> {
                     .iter()
                     .map(|selector| self.selector_for(selector.view))
                     .collect::<Vec<_>>();
+                let relation_projection = xs[0]
+                    .relation
+                    .as_ref()
+                    .map(|relation| self.relation_source_projection(relation, &f.shape, site()))
+                    .transpose()?;
                 let mut relation =
                     xs[0].relation.clone().map(|r| specialize_relation(r, &selectors));
                 if let Some(source) = relation.as_ref().map(|relation| relation.source) {
-                    // A relation-bearing family has a grouped source and the
-                    // selected final axis is only the preimage branch.  It
-                    // must specialize the target, but cannot specialize B[g]
-                    // by the branch selector d.  Non-relation carriers still
-                    // use the ordinary selector mapping.
+                    let projection = relation_projection.expect("relation projection exists");
+                    let relation_output_shape = value_family_shape(&v).unwrap_or_default();
+                    // Selecting the final branch of shared B[g]K[g,d]=T[g,d]
+                    // leaves B[g] unchanged. Selecting the final axis of a
+                    // pointwise relation applies the same selector to B and K.
+                    let source_output_shape = relation_output_shape.clone();
                     let mapped = self.source_after_axis_selection(
                         source,
-                        relation.is_some(),
+                        projection.is_shared(),
                         *axis,
                         f.shape.len(),
                         selectors.clone(),
-                        value_family_shape(&v).unwrap_or_default(),
+                        source_output_shape,
                     );
                     remap_carriers(&mut v, |candidate| {
                         if candidate == source {
@@ -2962,7 +3140,7 @@ impl<'a> Evaluator<'a> {
                             self.gathered_source_for_concrete(
                                 candidate,
                                 selectors.clone(),
-                                Vec::new(),
+                                relation_output_shape.clone(),
                                 None,
                             )
                         }
@@ -2971,11 +3149,12 @@ impl<'a> Evaluator<'a> {
                         relation.source = mapped;
                     }
                 } else {
+                    let output_shape = value_family_shape(&v).unwrap_or_default();
                     remap_carriers(&mut v, |source| {
                         self.gathered_source_for_concrete(
                             source,
                             selectors.clone(),
-                            Vec::new(),
+                            output_shape.clone(),
                             None,
                         )
                     });
@@ -3373,6 +3552,7 @@ impl<'a> Evaluator<'a> {
             for iteration in 0..count {
                 let saved_integers = self.abstract_integers.clone();
                 let saved_integer_facts = self.abstract_integer_facts.clone();
+                let saved_integer_dependencies = self.abstract_integer_dependencies.clone();
                 let saved_loop_indices = self.abstract_loop_indices.clone();
                 let saved_loop_atoms = self.abstract_loop_atoms.clone();
                 let mut loop_env = env.clone();
@@ -3388,6 +3568,7 @@ impl<'a> Evaluator<'a> {
                 apply_abstract_bindings(
                     &mut self.abstract_integers,
                     &mut self.abstract_integer_facts,
+                    &mut self.abstract_integer_dependencies,
                     &spec.bindings,
                     &binding_env,
                     &self.abstract_loop_indices,
@@ -3401,6 +3582,7 @@ impl<'a> Evaluator<'a> {
                 let result = self.scope(stage, graph, &child, &child_occurrence, loop_env, preload);
                 self.abstract_integers = saved_integers;
                 self.abstract_integer_facts = saved_integer_facts;
+                self.abstract_integer_dependencies = saved_integer_dependencies;
                 self.abstract_loop_indices = saved_loop_indices;
                 self.abstract_loop_atoms = saved_loop_atoms;
                 let vals = result?;
@@ -3488,6 +3670,7 @@ impl<'a> Evaluator<'a> {
                     message: "parallel grid cardinality overflows usize".into(),
                     site: None,
                 })?;
+            let mut grid_binder_axes = HashMap::new();
             let vals = if lane_count == 0 {
                 let grid_node = graph
                     .scope(parent)
@@ -3529,11 +3712,16 @@ impl<'a> Evaluator<'a> {
                 // family cardinality.
                 let saved_integers = self.abstract_integers.clone();
                 let saved_integer_facts = self.abstract_integer_facts.clone();
+                let saved_integer_dependencies = self.abstract_integer_dependencies.clone();
                 let saved_loop_indices = self.abstract_loop_indices.clone();
                 let saved_loop_atoms = self.abstract_loop_atoms.clone();
                 let mut grid_env = env.clone();
-                for ((slot, extent), representative) in
-                    spec.index_slots.iter().zip(&grid_shape).zip(std::iter::repeat(0usize))
+                for (axis, ((slot, extent), representative)) in spec
+                    .index_slots
+                    .iter()
+                    .zip(&grid_shape)
+                    .zip(std::iter::repeat(0usize))
+                    .enumerate()
                 {
                     grid_env.loop_indices.insert(*slot, representative.into());
                     self.abstract_loop_indices.insert(
@@ -3543,6 +3731,7 @@ impl<'a> Evaluator<'a> {
                     let atom = self.next_binder_atom;
                     self.next_binder_atom += 1;
                     self.abstract_loop_atoms.insert(*slot, atom);
+                    grid_binder_axes.insert(atom, axis);
                     self.binder_ranges.insert(
                         atom,
                         state::IntegerState::new(0.into(), BigInt::from(extent - 1))?,
@@ -3553,6 +3742,7 @@ impl<'a> Evaluator<'a> {
                 apply_abstract_bindings(
                     &mut self.abstract_integers,
                     &mut self.abstract_integer_facts,
+                    &mut self.abstract_integer_dependencies,
                     &spec.bindings,
                     &binding_env,
                     &self.abstract_loop_indices,
@@ -3664,6 +3854,7 @@ impl<'a> Evaluator<'a> {
                 let result = self.scope(stage, graph, &child, &child_occurrence, grid_env, preload);
                 self.abstract_integers = saved_integers;
                 self.abstract_integer_facts = saved_integer_facts;
+                self.abstract_integer_dependencies = saved_integer_dependencies;
                 self.abstract_loop_indices = saved_loop_indices;
                 self.abstract_loop_atoms = saved_loop_atoms;
                 result?
@@ -3676,6 +3867,7 @@ impl<'a> Evaluator<'a> {
                             message: "missing parallel-grid output".into(),
                             site: None,
                         })?;
+                    let body_view = info.view;
                     // Freeze the symbolic body as one binder-indexed family
                     // view.  The child occurrence remains an implementation
                     // detail and cannot alias another grid's family.
@@ -3701,6 +3893,25 @@ impl<'a> Evaluator<'a> {
                         relation.view = Some(view);
                     }
                     info.view = view;
+                    let dependencies = if lane_count == 0 {
+                        BTreeSet::new()
+                    } else {
+                        self.scalar_dependencies
+                            .get(&body_view)
+                            .and_then(|dependencies| match dependencies {
+                                BinderDependencies::Known(binders) => Some(binders),
+                                BinderDependencies::Unknown => None,
+                            })
+                            .map(|binders| {
+                                binders
+                                    .iter()
+                                    .map(|binder| grid_binder_axes.get(binder).copied())
+                                    .collect::<Option<BTreeSet<_>>>()
+                                    .unwrap_or_else(|| (0..grid_shape.len()).collect())
+                            })
+                            .unwrap_or_else(|| (0..grid_shape.len()).collect())
+                    };
+                    self.family_axis_dependencies.insert(view, dependencies);
                     info.paired_public = paired_public;
                     let mut family_value =
                         FamilyState::new(grid_shape.clone(), info.value.clone())?;
@@ -3731,6 +3942,7 @@ impl<'a> Evaluator<'a> {
             };
             let saved_integers = self.abstract_integers.clone();
             let saved_integer_facts = self.abstract_integer_facts.clone();
+            let saved_integer_dependencies = self.abstract_integer_dependencies.clone();
             if let Some(mxx_ir_core::node::NodeKind::SubgraphCall(spec)) = graph
                 .scope(parent)
                 .and_then(|scope| scope.node(mxx_ir_core::NodeId(n as u64)))
@@ -3739,6 +3951,7 @@ impl<'a> Evaluator<'a> {
                 apply_abstract_bindings(
                     &mut self.abstract_integers,
                     &mut self.abstract_integer_facts,
+                    &mut self.abstract_integer_dependencies,
                     &spec.bindings,
                     env,
                     &self.abstract_loop_indices,
@@ -3750,6 +3963,7 @@ impl<'a> Evaluator<'a> {
             let result = self.scope(stage, graph, &child, &child_occurrence, child_env, preload);
             self.abstract_integers = saved_integers;
             self.abstract_integer_facts = saved_integer_facts;
+            self.abstract_integer_dependencies = saved_integer_dependencies;
             let vals = result?;
             cs.outputs()
                 .iter()
@@ -4082,6 +4296,31 @@ fn eval_int_facts(
     evaluate(&expression.canonicalize(), integers, loop_atoms).map(ScalarFacts::Affine)
 }
 
+fn int_expr_dependencies(
+    expression: &mxx_ir_core::IntExpr,
+    variables: &BTreeMap<String, BinderDependencies>,
+    loop_atoms: &HashMap<u32, u64>,
+) -> BinderDependencies {
+    use mxx_ir_core::IntExpr;
+    match expression {
+        IntExpr::Const(_) => BinderDependencies::Known(BTreeSet::new()),
+        IntExpr::Var(name) => variables.get(name).cloned().unwrap_or(BinderDependencies::Unknown),
+        IntExpr::LoopIndex(slot) => loop_atoms
+            .get(slot)
+            .map(|atom| BinderDependencies::Known(BTreeSet::from([*atom])))
+            .unwrap_or(BinderDependencies::Unknown),
+        IntExpr::Add(left, right) |
+        IntExpr::Sub(left, right) |
+        IntExpr::Mul(left, right) |
+        IntExpr::Div(left, right) |
+        IntExpr::RoundDiv(left, right) => BinderDependencies::union([
+            &int_expr_dependencies(left, variables, loop_atoms),
+            &int_expr_dependencies(right, variables, loop_atoms),
+        ]),
+        IntExpr::Log2Ceil(value) => int_expr_dependencies(value, variables, loop_atoms),
+    }
+}
+
 fn eval_int_interval(
     expression: &mxx_ir_core::IntExpr,
     concrete: &ParamEnv,
@@ -4409,6 +4648,7 @@ fn apply_bindings(
 fn apply_abstract_bindings(
     integers: &mut BTreeMap<String, state::IntegerState>,
     integer_facts: &mut BTreeMap<String, ScalarFacts>,
+    integer_dependencies: &mut BTreeMap<String, BinderDependencies>,
     bindings: &[(String, mxx_ir_core::IntExpr)],
     concrete: &ParamEnv,
     loop_indices: &HashMap<u32, state::IntegerState>,
@@ -4416,6 +4656,7 @@ fn apply_abstract_bindings(
 ) -> Result<(), SimulationError> {
     let parent = integers.clone();
     let parent_facts = integer_facts.clone();
+    let parent_dependencies = integer_dependencies.clone();
     let evaluated = bindings
         .iter()
         .map(|(name, expression)| {
@@ -4432,6 +4673,10 @@ fn apply_abstract_bindings(
         } else {
             integer_facts.remove(name);
         }
+        integer_dependencies.insert(
+            name.clone(),
+            int_expr_dependencies(expression, &parent_dependencies, loop_atoms),
+        );
     }
     Ok(())
 }
@@ -4596,7 +4841,7 @@ fn map_source_leaves(
     output_shape: &[usize],
     env: Option<&ParamEnv>,
 ) -> Option<Vec<crate::SourceId>> {
-    if map.input_indices.len() != parent.shape.len() {
+    if !lineage_is_complete(parent) || map.input_indices.len() != parent.shape.len() {
         return None;
     }
     let count = output_shape.iter().copied().product::<usize>().max(1);
@@ -4623,6 +4868,9 @@ fn uniform_gathered_lineage(
     parent: &SourceLineage,
     output_shape: &[usize],
 ) -> Option<SourceLineage> {
+    if !lineage_is_complete(parent) {
+        return None;
+    }
     let first = parent.leaves.first()?;
     if !parent.leaves.iter().all(|leaf| leaf == first) {
         return None;
@@ -4636,7 +4884,10 @@ fn uniform_axis_selection_lineage(
     axis: usize,
     output_shape: &[usize],
 ) -> Option<SourceLineage> {
-    if axis >= parent.shape.len() || output_shape.len() + 1 != parent.shape.len() {
+    if !lineage_is_complete(parent) ||
+        axis >= parent.shape.len() ||
+        output_shape.len() + 1 != parent.shape.len()
+    {
         return None;
     }
     let expected_shape = parent
@@ -4669,6 +4920,14 @@ fn uniform_axis_selection_lineage(
         leaves.push(selected?);
     }
     Some(SourceLineage { shape: output_shape.to_vec(), leaves })
+}
+
+/// A complete lineage has one source leaf for every coordinate.  Opaque
+/// structural selections intentionally retain only a sentinel leaf, so they
+/// preserve the output rank but cannot be mistaken for an exact or uniform
+/// coordinate function.
+fn lineage_is_complete(lineage: &SourceLineage) -> bool {
+    lineage.leaves.len() == lineage.shape.iter().copied().product::<usize>().max(1)
 }
 
 fn unravel_index(mut flat: usize, shape: &[usize]) -> Vec<usize> {
@@ -6068,6 +6327,7 @@ mod tests {
         apply_abstract_bindings(
             &mut abstract_integers,
             &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             &bindings,
             &env,
             &abstract_loop_indices,
@@ -6107,6 +6367,17 @@ mod tests {
             empty_info_for_type(&WireType::Real, &env).unwrap().value,
             AbstractValue::Real
         ));
+        let multi_axis = mxx_ir_core::IntExpr::Add(
+            Box::new(mxx_ir_core::IntExpr::LoopIndex(0)),
+            Box::new(mxx_ir_core::IntExpr::Mul(
+                Box::new(mxx_ir_core::IntExpr::constant(2)),
+                Box::new(mxx_ir_core::IntExpr::LoopIndex(1)),
+            )),
+        );
+        assert_eq!(
+            int_expr_dependencies(&multi_axis, &BTreeMap::new(), &HashMap::from([(0, 7), (1, 8)]),),
+            BinderDependencies::Known(BTreeSet::from([7, 8]))
+        );
     }
 
     #[test]
@@ -6598,11 +6869,14 @@ mod tests {
                 state::IntegerState::new(1.into(), 2.into()).unwrap(),
             )]),
             abstract_integer_facts: BTreeMap::new(),
+            abstract_integer_dependencies: BTreeMap::new(),
             abstract_loop_indices: HashMap::new(),
             abstract_loop_atoms: HashMap::new(),
             binder_ranges: HashMap::new(),
             next_binder_atom: 0,
             scalar_facts: HashMap::new(),
+            scalar_dependencies: HashMap::new(),
+            family_axis_dependencies: HashMap::new(),
             next_source: 0,
             preimages: HashMap::new(),
             states: HashMap::new(),
@@ -6659,11 +6933,14 @@ mod tests {
             binder_sources: HashMap::new(),
             abstract_integers: BTreeMap::new(),
             abstract_integer_facts: BTreeMap::new(),
+            abstract_integer_dependencies: BTreeMap::new(),
             abstract_loop_indices: HashMap::new(),
             abstract_loop_atoms: HashMap::new(),
             binder_ranges: HashMap::new(),
             next_binder_atom: 0,
             scalar_facts: HashMap::new(),
+            scalar_dependencies: HashMap::new(),
+            family_axis_dependencies: HashMap::new(),
             next_source: 0,
             preimages: HashMap::new(),
             states: HashMap::new(),
@@ -6756,6 +7033,22 @@ mod tests {
             Box::new(mxx_ir_core::IndexExpr::Axis(1)),
         )]);
         let bases = evaluator.mapped_source_for(flat, &flatten_map, vec![3, 2], None);
+        let opaque_map =
+            mxx_ir_core::IndexMap::new([mxx_ir_core::IndexExpr::Parameter("opaque-index".into())]);
+        let opaque_mapped = evaluator.mapped_source_for(flat, &opaque_map, vec![4], None);
+        assert_eq!(
+            evaluator.mapped_source_for(flat, &opaque_map, vec![4], None),
+            opaque_mapped,
+            "one normalized opaque map keeps one canonical source identity",
+        );
+        let opaque_mapped_lineage = evaluator.source_lineages.get(&opaque_mapped).unwrap();
+        assert_eq!(opaque_mapped_lineage.shape, vec![4]);
+        assert!(!lineage_is_complete(opaque_mapped_lineage));
+        assert_eq!(
+            evaluator.lift_source_for_shape(opaque_mapped, vec![4]),
+            opaque_mapped,
+            "lifting an opaque map over its existing domain must preserve its identity",
+        );
         let group = evaluator.mapped_source_for(
             bases,
             &mxx_ir_core::IndexMap::new([
@@ -6790,6 +7083,41 @@ mod tests {
             vec![2],
         );
         assert_eq!(selected, group);
+
+        // An opaque final-axis selection of a pointwise [group, branch]
+        // source retains the group domain without claiming that its lanes are
+        // equal.  The same rule applies to a target's independent carrier.
+        let opaque_pointwise = evaluator.source_after_axis_selection(
+            bases,
+            false,
+            1,
+            2,
+            vec![crate::SelectorId(9)],
+            vec![3],
+        );
+        let opaque_lineage = evaluator.source_lineages.get(&opaque_pointwise).unwrap();
+        assert_eq!(opaque_lineage.shape, vec![3]);
+        assert!(!lineage_is_complete(opaque_lineage));
+        let opaque_target =
+            evaluator.interners.intern_view(vec![crate::ValueId(89)], vec![3, 2], &[]);
+        evaluator.states.insert(
+            opaque_target,
+            MatrixState::new(BigUint::ZERO, 1u8.into(), false)
+                .unwrap()
+                .with_carrier(bases, 1u8.into()),
+        );
+        let selected_target = evaluator
+            .remap_target_after_axis_selection(
+                opaque_target,
+                1,
+                vec![crate::SelectorId(9)],
+                vec![3],
+            )
+            .unwrap();
+        let target_carrier = selected_target.right_carrier.unwrap();
+        let target_lineage = evaluator.source_lineages.get(&target_carrier.source).unwrap();
+        assert_eq!(target_lineage.shape, vec![3]);
+        assert!(!lineage_is_complete(target_lineage));
 
         // Opaque selectors over an ordinary non-uniform family remain
         // distinct even when they descend from the same family root. Only a
@@ -6895,34 +7223,57 @@ mod tests {
 
         let shared_source = evaluator.group_source_for(vec![primitive], vec![2]);
         let shared_relation = RightPreimage { source: shared_source, ..gap_relation };
-        let family_selector = |range: state::IntegerState| Info {
+        let family_selector = |range: state::IntegerState, view| Info {
             value: AbstractValue::Family(
                 FamilyState::new(vec![2, 3], AbstractValue::Integer(range)).unwrap(),
             ),
             ty: None,
             relation: None,
-            view: crate::FamilyViewId(u32::MAX),
+            view,
             paired_public: None,
         };
-        let varying_selector =
-            family_selector(state::IntegerState::new(0.into(), 1.into()).unwrap());
+        let branch_dependent_view =
+            evaluator.interners.intern_view(vec![crate::ValueId(94)], vec![2, 3], &[]);
+        evaluator.family_axis_dependencies.insert(branch_dependent_view, BTreeSet::from([1]));
+        let varying_selector = family_selector(
+            state::IntegerState::new(0.into(), 1.into()).unwrap(),
+            branch_dependent_view,
+        );
         assert!(matches!(
             evaluator.gathered_relation_source_projection(
                 &shared_relation,
                 &[2, 2],
                 &[2, 3],
-                &[varying_selector, family_selector(state::IntegerState::singleton(0))],
+                &[
+                    varying_selector,
+                    family_selector(
+                        state::IntegerState::singleton(0),
+                        crate::FamilyViewId(u32::MAX),
+                    ),
+                ],
                 &[crate::SelectorId(30), crate::SelectorId(31)],
                 None,
             ),
             Err(SimulationError::BranchDependentSource { .. })
         ));
+        let group_dependent_view =
+            evaluator.interners.intern_view(vec![crate::ValueId(95)], vec![2, 3], &[]);
+        evaluator.family_axis_dependencies.insert(group_dependent_view, BTreeSet::from([0]));
         let (source_selectors, source_shape) = evaluator
             .gathered_relation_source_projection(
                 &shared_relation,
                 &[2, 2],
                 &[2, 3],
-                &[integer(0.into()), family_selector(state::IntegerState::singleton(0))],
+                &[
+                    family_selector(
+                        state::IntegerState::new(0.into(), 1.into()).unwrap(),
+                        group_dependent_view,
+                    ),
+                    family_selector(
+                        state::IntegerState::singleton(0),
+                        crate::FamilyViewId(u32::MAX),
+                    ),
+                ],
                 &[crate::SelectorId(30), crate::SelectorId(31)],
                 None,
             )
@@ -6974,7 +7325,7 @@ mod tests {
                 artifact: None,
             },
             vec![],
-            vec![trapdoor_wire],
+            vec![trapdoor_wire.clone()],
         )
         .output(0)
         .unwrap();
@@ -6982,6 +7333,17 @@ mod tests {
             NodeKind::ConstantMatrix {
                 matrix_type: target_type.clone(),
                 value: ConstantMatrix::Zero,
+            },
+            vec![],
+            vec![WireType::Matrix(target_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let carrier_target = NodeHandle::new(
+            NodeKind::Input {
+                name: "carrier-target".into(),
+                wire_type: WireType::Matrix(target_type.clone()),
+                artifact: None,
             },
             vec![],
             vec![WireType::Matrix(target_type.clone())],
@@ -7083,12 +7445,150 @@ mod tests {
         )
         .output(0)
         .unwrap();
+        let group_shape = vec![mxx_ir_core::IntExpr::constant(2)];
+        let grouped_public = NodeHandle::new(
+            NodeKind::FamilyPack { shape: group_shape.clone() },
+            vec![public.clone(), public.clone()],
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(public_type.clone())),
+                shape: group_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let grouped_trapdoor = NodeHandle::new(
+            NodeKind::FamilyPack { shape: group_shape.clone() },
+            vec![trapdoor.clone(), trapdoor.clone()],
+            vec![WireType::Family {
+                element: Box::new(trapdoor_wire.clone()),
+                shape: group_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let relation_shape =
+            vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)];
+        let grouped_target = NodeHandle::new(
+            NodeKind::FamilyPack { shape: relation_shape.clone() },
+            vec![target.clone(), target.clone(), target.clone(), target.clone()],
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(target_type.clone())),
+                shape: relation_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let grouped_preimage = NodeHandle::new(
+            NodeKind::FamilyPreimageSample {
+                matrix_type: output_type.clone(),
+                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
+            },
+            vec![grouped_public.clone(), grouped_trapdoor, grouped_target],
+            vec![WireType::Family {
+                element: Box::new(WireType::Preimage(output_type.clone())),
+                shape: relation_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let selector_body = with_new_construction_scope(|scope| {
+            let group = NodeHandle::new(
+                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(0)),
+                vec![],
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .unwrap();
+            let branch = NodeHandle::new(
+                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(1)),
+                vec![],
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("gather-selector-body", scope, vec![], vec![group, branch]).unwrap()
+        });
+        let selector_families = NodeHandle::parallel_grid(
+            selector_body,
+            vec![],
+            vec![
+                WireType::Family {
+                    element: Box::new(WireType::ConstantInt),
+                    shape: relation_shape.clone(),
+                },
+                WireType::Family {
+                    element: Box::new(WireType::ConstantInt),
+                    shape: relation_shape.clone(),
+                },
+            ],
+            mxx_ir_core::node::ParallelGrid {
+                shape: relation_shape.clone(),
+                index_slots: vec![0, 1],
+                bindings: vec![],
+                input_modes: vec![],
+            },
+        );
+        let varying_gather = NodeHandle::new(
+            NodeKind::FamilyGather { output_shape: relation_shape.clone(), input_rank: 2 },
+            vec![
+                grouped_preimage,
+                selector_families.output(0).unwrap(),
+                selector_families.output(1).unwrap(),
+            ],
+            vec![WireType::Family {
+                element: Box::new(WireType::Preimage(output_type.clone())),
+                shape: relation_shape,
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let varying_gather_group = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 1 },
+            vec![varying_gather, scalar_selector()],
+            vec![WireType::Family {
+                element: Box::new(WireType::Preimage(output_type.clone())),
+                shape: group_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let grouped_public_element = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 0 },
+            vec![grouped_public, scalar_selector()],
+            vec![WireType::Matrix(public_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let varying_gather_element = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 0 },
+            vec![varying_gather_group, scalar_selector()],
+            vec![WireType::Preimage(output_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let varying_gather_applied = NodeHandle::new(
+            NodeKind::ApplyPreimage,
+            vec![grouped_public_element, varying_gather_element],
+            vec![WireType::Matrix(target_type.clone())],
+        )
+        .output(0)
+        .unwrap();
         let preimage = NodeHandle::new(
             NodeKind::PreimageSample {
                 matrix_type: output_type.clone(),
                 max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
             },
-            vec![public.clone(), trapdoor, target.clone()],
+            vec![public.clone(), trapdoor.clone(), target.clone()],
+            vec![WireType::Preimage(output_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let carrier_target_preimage = NodeHandle::new(
+            NodeKind::PreimageSample {
+                matrix_type: output_type.clone(),
+                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
+            },
+            vec![public.clone(), trapdoor, carrier_target],
             vec![WireType::Preimage(output_type.clone())],
         )
         .output(0)
@@ -7124,10 +7624,11 @@ mod tests {
             )
             .unwrap()
         });
-        let pointwise_shape = vec![mxx_ir_core::IntExpr::constant(2)];
+        let pointwise_shape =
+            vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)];
         let pointwise = NodeHandle::parallel_grid(
             pointwise_body,
-            vec![public.clone(), preimage.clone()],
+            vec![public.clone(), carrier_target_preimage],
             vec![
                 WireType::Family {
                     element: Box::new(WireType::Matrix(public_type.clone())),
@@ -7140,7 +7641,7 @@ mod tests {
             ],
             mxx_ir_core::node::ParallelGrid {
                 shape: pointwise_shape.clone(),
-                index_slots: vec![0],
+                index_slots: vec![0, 1],
                 bindings: vec![],
                 input_modes: vec![
                     mxx_ir_core::node::GridInputMode::Broadcast,
@@ -7148,7 +7649,10 @@ mod tests {
                 ],
             },
         );
-        let identity_map = mxx_ir_core::IndexMap::new([mxx_ir_core::IndexExpr::Axis(0)]);
+        let identity_map = mxx_ir_core::IndexMap::new([
+            mxx_ir_core::IndexExpr::Axis(0),
+            mxx_ir_core::IndexExpr::Axis(1),
+        ]);
         let pointwise_public = NodeHandle::new(
             NodeKind::FamilyReindex {
                 output_shape: pointwise_shape.clone(),
@@ -7172,7 +7676,51 @@ mod tests {
         )
         .output(0)
         .unwrap();
-        let static_index = vec![mxx_ir_core::IndexExpr::constant(0)];
+        let pointwise_selector = scalar_selector();
+        let selected_pointwise_public = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 1 },
+            vec![pointwise_public.clone(), pointwise_selector.clone()],
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(public_type.clone())),
+                shape: group_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let selected_pointwise_preimage = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 1 },
+            vec![pointwise_preimage.clone(), pointwise_selector],
+            vec![WireType::Family {
+                element: Box::new(WireType::Preimage(output_type.clone())),
+                shape: group_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let pointwise_group_selector = scalar_selector();
+        let selected_pointwise_public = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 0 },
+            vec![selected_pointwise_public, pointwise_group_selector.clone()],
+            vec![WireType::Matrix(public_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let selected_pointwise_preimage = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 0 },
+            vec![selected_pointwise_preimage, pointwise_group_selector],
+            vec![WireType::Preimage(output_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let pointwise_selected_applied = NodeHandle::new(
+            NodeKind::ApplyPreimage,
+            vec![selected_pointwise_public, selected_pointwise_preimage],
+            vec![WireType::Matrix(target_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let static_index =
+            vec![mxx_ir_core::IndexExpr::constant(0), mxx_ir_core::IndexExpr::constant(0)];
         let pointwise_public = NodeHandle::new(
             NodeKind::FamilyGetStatic { indices: static_index.clone() },
             vec![pointwise_public],
@@ -7234,8 +7782,16 @@ mod tests {
                     GraphOutput { value: pointwise_applied, confidentiality: None },
                 ),
                 (
+                    "pointwise-select".into(),
+                    GraphOutput { value: pointwise_selected_applied, confidentiality: None },
+                ),
+                (
                     "shared-gather".into(),
                     GraphOutput { value: gathered_applied, confidentiality: None },
+                ),
+                (
+                    "varying-shared-gather".into(),
+                    GraphOutput { value: varying_gather_applied, confidentiality: None },
                 ),
             ]),
             vec![],
@@ -7286,10 +7842,25 @@ mod tests {
                         public_matrix_input: "public".into(),
                     },
                 },
+                crate::ExternalInputFact {
+                    stage: stage_id.clone(),
+                    input: "carrier-target".into(),
+                    value: crate::ExternalInputValue::Matrix {
+                        maximum_absolute_coefficient_error: BigUint::ZERO,
+                        maximum_absolute_coefficient_value: None,
+                        is_constant_polynomial: false,
+                    },
+                },
             ],
             limits: crate::SimulationLimits::default(),
         };
-        for output in ["family-static", "pointwise-reindex", "shared-gather"] {
+        for output in [
+            "family-static",
+            "pointwise-reindex",
+            "pointwise-select",
+            "shared-gather",
+            "varying-shared-gather",
+        ] {
             let mut focused = request.clone();
             focused.roots =
                 vec![crate::SimulationRoot { stage: stage_id.clone(), output: output.into() }];

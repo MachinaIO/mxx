@@ -304,6 +304,31 @@ struct SourceLineage {
     leaves: Vec<crate::SourceId>,
 }
 
+/// Projection from a relation-valued family to the public source coordinates
+/// consumed by that relation.  A shared source omits a trailing branch suffix;
+/// a pointwise source has exactly the same rank as the preimage family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RelationSourceProjection {
+    relation_rank: usize,
+    source_rank: usize,
+}
+
+impl RelationSourceProjection {
+    fn input_prefix<T: Clone>(&self, coordinates: &[T]) -> Option<Vec<T>> {
+        (coordinates.len() == self.relation_rank).then(|| coordinates[..self.source_rank].to_vec())
+    }
+
+    fn output_prefix(&self, shape: &[usize]) -> Option<Vec<usize>> {
+        let shared_suffix_rank = self.relation_rank.checked_sub(self.source_rank)?;
+        let source_output_rank = shape.len().checked_sub(shared_suffix_rank)?;
+        Some(shape[..source_output_rank].to_vec())
+    }
+
+    fn is_shared(&self) -> bool {
+        self.source_rank < self.relation_rank
+    }
+}
+
 impl<'a> Evaluator<'a> {
     fn scalar_fact(&self, value: &Info) -> Option<&ScalarFacts> {
         self.scalar_facts.get(&value.view)
@@ -791,6 +816,109 @@ impl<'a> Evaluator<'a> {
         self.next_selector = self.next_selector.saturating_add(1);
         self.selector_views.insert(view, id);
         id
+    }
+
+    fn relation_source_projection(
+        &self,
+        relation: &RightPreimage,
+        relation_shape: &[usize],
+        site: Option<DiagnosticSite>,
+    ) -> Result<RelationSourceProjection, SimulationError> {
+        let source_shape = self
+            .source_lineages
+            .get(&relation.source)
+            .map(|lineage| lineage.shape.clone())
+            .ok_or_else(|| SimulationError::Relation {
+                message: "preimage relation source has no canonical lineage".into(),
+                site: site.clone(),
+            })?;
+        let source_rank = source_shape.len();
+        if source_rank > relation_shape.len() {
+            return Err(SimulationError::Relation {
+                message: "preimage relation source rank exceeds its preimage family rank".into(),
+                site: site.clone(),
+            });
+        }
+        if source_rank != relation_shape.len() &&
+            source_rank.checked_add(1) != Some(relation_shape.len())
+        {
+            return Err(SimulationError::Relation {
+                message:
+                    "preimage relation must be pointwise or omit exactly one final branch axis"
+                        .into(),
+                site: site.clone(),
+            });
+        }
+        if source_shape != relation_shape[..source_rank] {
+            return Err(SimulationError::Relation {
+                message: "preimage relation source shape does not match its group prefix".into(),
+                site: site.clone(),
+            });
+        }
+        if relation
+            .view
+            .and_then(|view| self.view_shape(view))
+            .is_none_or(|shape| shape != relation_shape)
+        {
+            return Err(SimulationError::Relation {
+                message: "preimage relation view rank does not match its value family".into(),
+                site: site.clone(),
+            });
+        }
+        if self.view_shape(relation.target).is_none_or(|shape| shape != relation_shape) {
+            return Err(SimulationError::Relation {
+                message: "preimage relation target rank does not match its value family".into(),
+                site,
+            });
+        }
+        Ok(RelationSourceProjection { relation_rank: relation_shape.len(), source_rank })
+    }
+
+    fn gathered_relation_source_projection(
+        &self,
+        relation: &RightPreimage,
+        relation_shape: &[usize],
+        output_shape: &[usize],
+        selector_values: &[Info],
+        selectors: &[crate::SelectorId],
+        site: Option<DiagnosticSite>,
+    ) -> Result<(Vec<crate::SelectorId>, Vec<usize>), SimulationError> {
+        let projection = self.relation_source_projection(relation, relation_shape, site.clone())?;
+        if selector_values.len() != projection.relation_rank ||
+            selectors.len() != projection.relation_rank
+        {
+            return Err(SimulationError::Relation {
+                message: "preimage gather selector rank does not match its input family".into(),
+                site,
+            });
+        }
+        // The source of B[g] may use only selectors independent of the
+        // trailing preimage branch.  A scalar selector is independent by
+        // construction, and a family whose integer summary is a singleton
+        // denotes that same index at every output coordinate.  A varying
+        // family has no per-axis provenance in this domain, so it fails closed.
+        if projection.is_shared() &&
+            selector_values[..projection.source_rank].iter().any(|selector| {
+                match &selector.value {
+                    AbstractValue::Integer(_) => false,
+                    AbstractValue::Family(family) => !matches!(
+                        family.element.as_ref(),
+                        AbstractValue::Integer(range)
+                            if range.minimum == range.maximum_inclusive
+                    ),
+                    _ => true,
+                }
+            })
+        {
+            return Err(SimulationError::BranchDependentSource { site });
+        }
+        let source_selectors = projection.input_prefix(selectors).expect("ranks checked above");
+        let source_shape =
+            projection.output_prefix(output_shape).ok_or_else(|| SimulationError::Relation {
+                message: "preimage gather output cannot preserve its shared-source suffix".into(),
+                site,
+            })?;
+        Ok((source_selectors, source_shape))
     }
 
     /// Intern a group-indexed source function from its exact coordinate
@@ -2742,6 +2870,23 @@ impl<'a> Evaluator<'a> {
                 let mut value = family_element(&xs[0]).ok_or_else(|| bad("family required"))?;
                 let mut relation = xs[0].relation.clone();
                 let map = mxx_ir_core::IndexMap::new(indices.clone());
+                let source_map = relation
+                    .as_ref()
+                    .map(|relation| {
+                        let projection =
+                            self.relation_source_projection(relation, &f.shape, site())?;
+                        let coordinates =
+                            projection.input_prefix(&map.input_indices).ok_or_else(|| {
+                                SimulationError::Relation {
+                                    message:
+                                        "static preimage projection rank does not match its family"
+                                            .into(),
+                                    site: site(),
+                                }
+                            })?;
+                        Ok::<_, SimulationError>(mxx_ir_core::IndexMap::new(coordinates))
+                    })
+                    .transpose()?;
                 let paired_public = xs[0].paired_public.map(|view| {
                     self.interners.intern_composed_view(
                         vec![view],
@@ -2754,7 +2899,8 @@ impl<'a> Evaluator<'a> {
                     self.mapped_source_for(source, &map, Vec::new(), Some(env))
                 });
                 if let Some(source) = relation_source {
-                    let mapped = self.mapped_source_for(source, &map, Vec::new(), Some(env));
+                    let source_map = source_map.as_ref().expect("relation projection exists");
+                    let mapped = self.mapped_source_for(source, source_map, Vec::new(), Some(env));
                     if let Some(relation) = relation.as_mut() {
                         relation.source = mapped;
                         let old_target = relation.target;
@@ -2982,20 +3128,40 @@ impl<'a> Evaluator<'a> {
                             .ok_or_else(|| bad("invalid family extent"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                if xs[0].relation.is_some() && shape.last().is_some() {
-                    let branch_axis = shape.len() - 1;
-                    // The source of a shared-source relation is defined on
-                    // input group coordinates only.  A group coordinate that
-                    // depends on the output branch would require B[g,d].
-                    if map.input_indices.len() > 1 &&
-                        map.input_indices[..map.input_indices.len() - 1]
-                            .iter()
-                            .any(|expr| index_expr_depends_axis(expr, branch_axis))
-                    {
-                        return Err(SimulationError::BranchDependentSource { site: site() });
-                    }
-                }
                 let mut relation = xs[0].relation.clone();
+                let relation_projection = relation
+                    .as_ref()
+                    .map(|relation| {
+                        let input_shape = value_family_shape(&xs[0].value)
+                            .ok_or_else(|| bad("relation-bearing reindex input must be a family"))?;
+                        let projection =
+                            self.relation_source_projection(relation, &input_shape, site())?;
+                        let source_coordinates = projection
+                            .input_prefix(&map.input_indices)
+                            .ok_or_else(|| SimulationError::Relation {
+                                message: "preimage reindex map rank does not match its input family"
+                                    .into(),
+                                site: site(),
+                            })?;
+                        let source_shape = projection.output_prefix(&shape).ok_or_else(|| {
+                            SimulationError::Relation {
+                                message:
+                                    "preimage reindex output cannot preserve its shared-source suffix"
+                                        .into(),
+                                site: site(),
+                            }
+                        })?;
+                        if projection.is_shared() &&
+                            source_coordinates.iter().any(|expression| {
+                                (source_shape.len()..shape.len())
+                                    .any(|axis| index_expr_depends_axis(expression, axis))
+                            })
+                        {
+                            return Err(SimulationError::BranchDependentSource { site: site() });
+                        }
+                        Ok((mxx_ir_core::IndexMap::new(source_coordinates), source_shape))
+                    })
+                    .transpose()?;
                 let mut value = AbstractValue::Family(FamilyState::new(
                     shape.clone(),
                     family_element(&xs[0]).ok_or_else(|| bad("family required"))?,
@@ -3012,17 +3178,10 @@ impl<'a> Evaluator<'a> {
                     )
                 });
                 if let (Some(relation), Some(source)) = (relation.as_mut(), relation_source) {
-                    let source_rank = self
-                        .source_lineages
-                        .get(&source)
-                        .map(|lineage| lineage.shape.len())
-                        .unwrap_or_else(|| map.input_indices.len().saturating_sub(1));
-                    let group_shape = shape[..shape.len().saturating_sub(1)].to_vec();
-                    let source_map = mxx_ir_core::IndexMap::new(
-                        map.input_indices.iter().take(source_rank).cloned().collect::<Vec<_>>(),
-                    );
+                    let (source_map, source_shape) =
+                        relation_projection.as_ref().expect("relation projection exists");
                     relation.source =
-                        self.mapped_source_for(source, &source_map, group_shape, Some(env));
+                        self.mapped_source_for(source, source_map, source_shape.clone(), Some(env));
                     let old_target = relation.target;
                     let target = self.interners.intern_composed_view(
                         vec![relation.target],
@@ -3100,6 +3259,19 @@ impl<'a> Evaluator<'a> {
                     .collect::<Vec<_>>();
                 let selector_views = xs[1..].iter().map(|selector| selector.view);
                 let mut relation = xs[0].relation.clone();
+                let relation_projection = relation
+                    .as_ref()
+                    .map(|relation| {
+                        self.gathered_relation_source_projection(
+                            relation,
+                            &source_shape,
+                            &shape,
+                            &xs[1..],
+                            &selectors,
+                            site(),
+                        )
+                    })
+                    .transpose()?;
                 let paired_public = xs[0].paired_public.map(|view| {
                     let selector_views = xs[1..].iter().map(|selector| selector.view);
                     self.interners.intern_composed_view(
@@ -3113,7 +3285,13 @@ impl<'a> Evaluator<'a> {
                     self.gathered_source_for(source, selectors.clone(), shape.clone())
                 });
                 if let Some(source) = relation_source {
-                    let mapped = self.gathered_source_for(source, selectors.clone(), shape.clone());
+                    let (source_selectors, source_shape) =
+                        relation_projection.as_ref().expect("relation projection exists");
+                    let mapped = self.gathered_source_for(
+                        source,
+                        source_selectors.clone(),
+                        source_shape.clone(),
+                    );
                     if let Some(relation) = relation.as_mut() {
                         relation.source = mapped;
                         let old_target = relation.target;
@@ -4918,7 +5096,15 @@ fn value_fact(ty: &WireType, f: &ExternalInputValue, env: &ParamEnv) -> Result<I
             if declared != *actual {
                 return Err("family shape mismatch".into());
             }
-            let x = value_fact(element, ef, env)?;
+            // A zero extent makes every element inaccessible at runtime.  Use
+            // the same type-derived bottom summary as an empty ParallelGrid so
+            // the caller's illustrative element bound cannot become an
+            // observable bound for a family with no members.
+            let x = if actual.contains(&0) {
+                empty_info_for_type(element, env).map_err(|error| error.to_string())?
+            } else {
+                value_fact(element, ef, env)?
+            };
             Ok(Info {
                 value: AbstractValue::Family(
                     FamilyState::new(actual.clone(), x.value).map_err(|e| e.to_string())?,
@@ -5130,6 +5316,76 @@ mod tests {
             report.roots[1].maximum_absolute_coefficient_error,
             report.roots[0].maximum_absolute_coefficient_error
         );
+        assert!(report.diagnostics.dropped_carriers.is_empty());
+    }
+
+    #[test]
+    fn zero_extent_external_matrix_family_uses_typed_bottom() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let family_type = WireType::Family {
+            element: Box::new(WireType::Matrix(matrix)),
+            shape: vec![mxx_ir_core::IntExpr::constant(0)],
+        };
+        let input = NodeHandle::new(
+            NodeKind::Input {
+                name: "empty".into(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![family_type],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "empty-external-family",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: input, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let environment = ParamEnv::default();
+        let stage = crate::StageId("empty-external-family".into());
+        let request = SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![crate::SimulationStage {
+                    id: stage.clone(),
+                    production_id: ProductionId {
+                        spec_hash: spec_hash(&graph, &environment).unwrap(),
+                        execution_nonce: [0; 32],
+                    },
+                    graph,
+                }],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
+            external_inputs: vec![crate::ExternalInputFact {
+                stage,
+                input: "empty".into(),
+                value: crate::ExternalInputValue::Family {
+                    shape: vec![0],
+                    // No member exists, so this illustrative element bound is
+                    // intentionally replaced by the matrix typed bottom.
+                    element: Box::new(crate::ExternalInputValue::Matrix {
+                        maximum_absolute_coefficient_error: 7u8.into(),
+                        maximum_absolute_coefficient_value: Some(8u8.into()),
+                        is_constant_polynomial: false,
+                    }),
+                },
+            }],
+            limits: crate::SimulationLimits::default(),
+        };
+
+        let report = run(&request).expect("a validated empty external family must simulate");
+        assert_eq!(report.roots[0].maximum_absolute_coefficient_error, BigUint::ZERO);
         assert!(report.diagnostics.dropped_carriers.is_empty());
     }
 
@@ -7003,6 +7259,86 @@ mod tests {
         let other_bases = evaluator.mapped_source_for(other_flat, &flatten_map, vec![3, 2], None);
         let other_final = evaluator.mapped_source_for(other_bases, &final_map, vec![2], None);
         assert_ne!(final_direct, other_final);
+
+        let relation_view =
+            evaluator.interners.intern_view(vec![crate::ValueId(90)], vec![2, 2], &[]);
+        let target_view =
+            evaluator.interners.intern_view(vec![crate::ValueId(91)], vec![2, 2], &[]);
+        let gap_relation = RightPreimage {
+            source: primitive,
+            target: target_view,
+            view: Some(relation_view),
+            selector: None,
+        };
+        assert!(matches!(
+            evaluator.relation_source_projection(&gap_relation, &[2, 2], None),
+            Err(SimulationError::Relation { .. })
+        ));
+
+        let equal_rank_extent_mismatch = RightPreimage { source: bases, ..gap_relation.clone() };
+        assert!(matches!(
+            evaluator.relation_source_projection(&equal_rank_extent_mismatch, &[2, 2], None,),
+            Err(SimulationError::Relation { .. })
+        ));
+        let mismatched_group = evaluator.group_source_for(vec![primitive], vec![3]);
+        let shared_extent_mismatch =
+            RightPreimage { source: mismatched_group, ..gap_relation.clone() };
+        assert!(matches!(
+            evaluator.relation_source_projection(&shared_extent_mismatch, &[2, 2], None),
+            Err(SimulationError::Relation { .. })
+        ));
+
+        let scalar_relation_view =
+            evaluator.interners.intern_view(vec![crate::ValueId(92)], vec![2], &[]);
+        let scalar_target_view =
+            evaluator.interners.intern_view(vec![crate::ValueId(93)], vec![2], &[]);
+        let scalar_shared_relation = RightPreimage {
+            source: primitive,
+            target: scalar_target_view,
+            view: Some(scalar_relation_view),
+            selector: None,
+        };
+        assert_eq!(
+            evaluator.relation_source_projection(&scalar_shared_relation, &[2], None).unwrap(),
+            RelationSourceProjection { relation_rank: 1, source_rank: 0 }
+        );
+
+        let shared_source = evaluator.group_source_for(vec![primitive], vec![2]);
+        let shared_relation = RightPreimage { source: shared_source, ..gap_relation };
+        let family_selector = |range: state::IntegerState| Info {
+            value: AbstractValue::Family(
+                FamilyState::new(vec![2, 3], AbstractValue::Integer(range)).unwrap(),
+            ),
+            ty: None,
+            relation: None,
+            view: crate::FamilyViewId(u32::MAX),
+            paired_public: None,
+        };
+        let varying_selector =
+            family_selector(state::IntegerState::new(0.into(), 1.into()).unwrap());
+        assert!(matches!(
+            evaluator.gathered_relation_source_projection(
+                &shared_relation,
+                &[2, 2],
+                &[2, 3],
+                &[varying_selector, family_selector(state::IntegerState::singleton(0))],
+                &[crate::SelectorId(30), crate::SelectorId(31)],
+                None,
+            ),
+            Err(SimulationError::BranchDependentSource { .. })
+        ));
+        let (source_selectors, source_shape) = evaluator
+            .gathered_relation_source_projection(
+                &shared_relation,
+                &[2, 2],
+                &[2, 3],
+                &[integer(0.into()), family_selector(state::IntegerState::singleton(0))],
+                &[crate::SelectorId(30), crate::SelectorId(31)],
+                None,
+            )
+            .unwrap();
+        assert_eq!(source_selectors, vec![crate::SelectorId(30)]);
+        assert_eq!(source_shape, vec![2]);
     }
 
     #[test]
@@ -7088,7 +7424,7 @@ mod tests {
         let family_selected = NodeHandle::new(
             NodeKind::FamilySelectAxis { axis: 0 },
             vec![
-                family_preimage,
+                family_preimage.clone(),
                 NodeHandle::new(
                     NodeKind::ConstantInt(0.into()),
                     vec![],
@@ -7101,6 +7437,62 @@ mod tests {
         )
         .output(0)
         .unwrap();
+        let family_static_selected = NodeHandle::new(
+            NodeKind::FamilyGetStatic { indices: vec![mxx_ir_core::IndexExpr::constant(1)] },
+            vec![family_preimage.clone()],
+            vec![WireType::Preimage(output_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let family_static_applied = NodeHandle::new(
+            NodeKind::ApplyPreimage,
+            vec![public.clone(), family_static_selected],
+            vec![WireType::Matrix(target_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let scalar_selector = || {
+            NodeHandle::new(NodeKind::ConstantInt(0.into()), vec![], vec![WireType::ConstantInt])
+                .output(0)
+                .unwrap()
+        };
+        let branch_selector_family = NodeHandle::new(
+            NodeKind::FamilyPack { shape: vec![mxx_ir_core::IntExpr::constant(2)] },
+            vec![scalar_selector(), scalar_selector()],
+            vec![WireType::Family {
+                element: Box::new(WireType::ConstantInt),
+                shape: vec![mxx_ir_core::IntExpr::constant(2)],
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let gathered_preimages = NodeHandle::new(
+            NodeKind::FamilyGather {
+                output_shape: vec![mxx_ir_core::IntExpr::constant(2)],
+                input_rank: 1,
+            },
+            vec![family_preimage.clone(), branch_selector_family],
+            vec![WireType::Family {
+                element: Box::new(WireType::Preimage(output_type.clone())),
+                shape: vec![mxx_ir_core::IntExpr::constant(2)],
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let gathered_preimage = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis: 0 },
+            vec![gathered_preimages, scalar_selector()],
+            vec![WireType::Preimage(output_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let gathered_applied = NodeHandle::new(
+            NodeKind::ApplyPreimage,
+            vec![public.clone(), gathered_preimage],
+            vec![WireType::Matrix(target_type.clone())],
+        )
+        .output(0)
+        .unwrap();
         let preimage = NodeHandle::new(
             NodeKind::PreimageSample {
                 matrix_type: output_type.clone(),
@@ -7108,6 +7500,107 @@ mod tests {
             },
             vec![public.clone(), trapdoor, target.clone()],
             vec![WireType::Preimage(output_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let pointwise_body = with_new_construction_scope(|scope| {
+            let body_public = NodeHandle::new(
+                NodeKind::Input {
+                    name: "body-public".into(),
+                    wire_type: WireType::Matrix(public_type.clone()),
+                    artifact: None,
+                },
+                vec![],
+                vec![WireType::Matrix(public_type.clone())],
+            )
+            .output(0)
+            .unwrap();
+            let body_preimage = NodeHandle::new(
+                NodeKind::Input {
+                    name: "body-preimage".into(),
+                    wire_type: WireType::Preimage(output_type.clone()),
+                    artifact: None,
+                },
+                vec![],
+                vec![WireType::Preimage(output_type.clone())],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new(
+                "pointwise-preimage-body",
+                scope,
+                vec![body_public.clone(), body_preimage.clone()],
+                vec![body_public, body_preimage],
+            )
+            .unwrap()
+        });
+        let pointwise_shape = vec![mxx_ir_core::IntExpr::constant(2)];
+        let pointwise = NodeHandle::parallel_grid(
+            pointwise_body,
+            vec![public.clone(), preimage.clone()],
+            vec![
+                WireType::Family {
+                    element: Box::new(WireType::Matrix(public_type.clone())),
+                    shape: pointwise_shape.clone(),
+                },
+                WireType::Family {
+                    element: Box::new(WireType::Preimage(output_type.clone())),
+                    shape: pointwise_shape.clone(),
+                },
+            ],
+            mxx_ir_core::node::ParallelGrid {
+                shape: pointwise_shape.clone(),
+                index_slots: vec![0],
+                bindings: vec![],
+                input_modes: vec![
+                    mxx_ir_core::node::GridInputMode::Broadcast,
+                    mxx_ir_core::node::GridInputMode::Broadcast,
+                ],
+            },
+        );
+        let identity_map = mxx_ir_core::IndexMap::new([mxx_ir_core::IndexExpr::Axis(0)]);
+        let pointwise_public = NodeHandle::new(
+            NodeKind::FamilyReindex {
+                output_shape: pointwise_shape.clone(),
+                map: identity_map.clone(),
+            },
+            vec![pointwise.output(0).unwrap()],
+            vec![WireType::Family {
+                element: Box::new(WireType::Matrix(public_type.clone())),
+                shape: pointwise_shape.clone(),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let pointwise_preimage = NodeHandle::new(
+            NodeKind::FamilyReindex { output_shape: pointwise_shape.clone(), map: identity_map },
+            vec![pointwise.output(1).unwrap()],
+            vec![WireType::Family {
+                element: Box::new(WireType::Preimage(output_type.clone())),
+                shape: pointwise_shape,
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let static_index = vec![mxx_ir_core::IndexExpr::constant(0)];
+        let pointwise_public = NodeHandle::new(
+            NodeKind::FamilyGetStatic { indices: static_index.clone() },
+            vec![pointwise_public],
+            vec![WireType::Matrix(public_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let pointwise_preimage = NodeHandle::new(
+            NodeKind::FamilyGetStatic { indices: static_index },
+            vec![pointwise_preimage],
+            vec![WireType::Preimage(output_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let pointwise_applied = NodeHandle::new(
+            NodeKind::ApplyPreimage,
+            vec![pointwise_public, pointwise_preimage],
+            vec![WireType::Matrix(target_type.clone())],
         )
         .output(0)
         .unwrap();
@@ -7142,6 +7635,18 @@ mod tests {
                 ("out".into(), GraphOutput { value: applied, confidentiality: None }),
                 ("fallback".into(), GraphOutput { value: fallback, confidentiality: None }),
                 ("family".into(), GraphOutput { value: family_selected, confidentiality: None }),
+                (
+                    "family-static".into(),
+                    GraphOutput { value: family_static_applied, confidentiality: None },
+                ),
+                (
+                    "pointwise-reindex".into(),
+                    GraphOutput { value: pointwise_applied, confidentiality: None },
+                ),
+                (
+                    "shared-gather".into(),
+                    GraphOutput { value: gathered_applied, confidentiality: None },
+                ),
             ]),
             vec![],
             vec![],
@@ -7167,6 +7672,12 @@ mod tests {
                 crate::SimulationRoot { stage: stage_id.clone(), output: "out".into() },
                 crate::SimulationRoot { stage: stage_id.clone(), output: "fallback".into() },
                 crate::SimulationRoot { stage: stage_id.clone(), output: "family".into() },
+                crate::SimulationRoot { stage: stage_id.clone(), output: "family-static".into() },
+                crate::SimulationRoot {
+                    stage: stage_id.clone(),
+                    output: "pointwise-reindex".into(),
+                },
+                crate::SimulationRoot { stage: stage_id.clone(), output: "shared-gather".into() },
             ],
             external_inputs: vec![
                 crate::ExternalInputFact {
@@ -7188,6 +7699,13 @@ mod tests {
             ],
             limits: crate::SimulationLimits::default(),
         };
+        for output in ["family-static", "pointwise-reindex", "shared-gather"] {
+            let mut focused = request.clone();
+            focused.roots =
+                vec![crate::SimulationRoot { stage: stage_id.clone(), output: output.into() }];
+            let result = run(&focused);
+            assert!(result.is_ok(), "{output} failed relation projection: {result:?}");
+        }
         assert!(run(&request).is_ok());
     }
 

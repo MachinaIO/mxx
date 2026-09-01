@@ -17,7 +17,10 @@
             layout_id: [candidate.crt_depth as u8; 32],
             program_id: [candidate.log_ring_dimension as u8; 32],
             pbc_attempts_used: 1,
+            mask_base_p_digit_count: 1,
+            fresh_error_base_p_digit_count: 1,
             bundle: None,
+            average_report: None,
         }
     }
 
@@ -132,6 +135,7 @@
         config.security_bits = 37;
         let policy = average_case_config(&config).unwrap();
         assert_eq!(policy.failure_exponent, 37);
+        assert_eq!(policy.input_domain_log2, 0);
         assert!(policy.allow_average_acceptance);
         assert_eq!(policy, average_case_config(&config).unwrap());
     }
@@ -563,6 +567,7 @@
                 estimator_commit: profile.estimator_commit.clone(),
                 estimator_cost_model: profile.estimator_cost_model.clone(),
                 estimator_shape_model: profile.estimator_shape_model.clone(),
+                average_evidence: None,
             })
         })
         .unwrap();
@@ -649,6 +654,7 @@
             estimator_commit: REVIEWED_ESTIMATOR_COMMIT.to_owned(),
             estimator_cost_model: REVIEWED_ESTIMATOR_COST_MODEL.to_owned(),
             estimator_shape_model: REVIEWED_ESTIMATOR_SHAPE_MODEL.to_owned(),
+            average_evidence: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("support"));
@@ -691,6 +697,7 @@
             estimator_commit: sparse_profile.estimator_commit.clone(),
             estimator_cost_model: sparse_profile.estimator_cost_model.clone(),
             estimator_shape_model: sparse_profile.estimator_shape_model.clone(),
+            average_evidence: None,
         };
         let json = serde_json::to_string(&search_report(&config, &sparse_profile, result)).unwrap();
 
@@ -875,8 +882,8 @@
             &config,
             Candidate { crt_depth: 30, log_ring_dimension: 15, crt_bits: 32, base_bits: 16 },
         );
-        if let Ok(prepared) = result {
-            let checked = check_refresh_bundle(&config, prepared.candidate, &prepared);
+        if let Ok(mut prepared) = result {
+            let checked = check_refresh_bundle(&config, prepared.candidate, &mut prepared);
             assert!(checked.is_ok(), "bundle checker returned {checked:?}");
         }
     }

@@ -1526,6 +1526,7 @@ pub struct RefreshNoiseParameters {
     mask_route_l2_sq_gain: BigUint,
     fresh_error_digit_gains: Vec<Vec<BigUint>>,
     fresh_error_digit_l2_sq_gains: Vec<Vec<BigUint>>,
+    fresh_error_route_gains: Vec<BigUint>,
     fresh_error_route_l2_sq_gains: Vec<BigUint>,
     slots: Vec<RefreshSlotNoiseParameters>,
 }
@@ -1612,6 +1613,7 @@ impl RefreshNoiseParameters {
             mask_route_l2_sq_gain: gains.mask_route_l2_sq_gain,
             fresh_error_digit_gains: gains.fresh_error_digit_gains,
             fresh_error_digit_l2_sq_gains: gains.fresh_error_digit_l2_sq_gains,
+            fresh_error_route_gains: gains.fresh_error_route_gains,
             fresh_error_route_l2_sq_gains: gains.fresh_error_route_l2_sq_gains,
             slots,
         })
@@ -2050,6 +2052,9 @@ pub fn simulate_average_refresh(
         refresh.mask_digit_l2_sq_gains.len() != refresh.mask_base_p_digit_count ||
         refresh.fresh_error_digit_gains.len() != refresh.mask_slot_count ||
         refresh.fresh_error_digit_l2_sq_gains.len() != refresh.mask_slot_count ||
+        refresh.fresh_error_route_gains.len() != refresh.mask_slot_count ||
+        refresh.mask_route_gain.is_zero() ||
+        refresh.fresh_error_route_gains.iter().any(BigUint::is_zero) ||
         refresh.fresh_error_route_l2_sq_gains.len() != refresh.mask_slot_count ||
         refresh.gamma_kappa_l2_sq.len() != refresh.mask_slot_count ||
         refresh
@@ -2090,12 +2095,7 @@ pub fn simulate_average_refresh(
         .cloned()
         .fold(BigUint::zero(), |sum, value| sum + value) *
         BigUint::from(refresh.coefficient_count);
-    let mask_label_l2_sq = refresh.mask_route_l2_sq_gain.clone();
     let mask_digit_variance = AverageVariance::new(mask_digit_variances, BigUint::one())?;
-    // The grouped PRF output is the shared public source for both routes;
-    // retaining it in each independently routed term is conservative and
-    // prevents an unclassified shared-state addition from being cancelled.
-    let mask_variance = mask_digit_variance.add(&prf_variance.scaled(&mask_label_l2_sq));
     let helper_variance = parameters.helper_doubled_variance();
     let mut slots = Vec::with_capacity(refresh.slots.len());
     let mut max_favg = BigUint::zero();
@@ -2115,13 +2115,18 @@ pub fn simulate_average_refresh(
             .cloned()
             .fold(BigUint::zero(), |sum, value| sum + value) *
             BigUint::from(refresh.coefficient_count);
-        let fresh_label_l2_sq = refresh.fresh_error_route_l2_sq_gains[slot].clone();
-        let fresh_variance = AverageVariance::new(fresh_digit_variances, BigUint::one())?
-            .add(&prf_variance.scaled(&fresh_label_l2_sq));
+        // The PRF output is one shared wire reused by the mask and fresh
+        // routes. Until executable provenance proves independence, combine
+        // their scalar L1 gains before squaring.
+        let shared_route_gain = coherent_shared_route_gain(
+            &refresh.mask_route_gain,
+            &refresh.fresh_error_route_gains[slot],
+        );
+        let fresh_variance = AverageVariance::new(fresh_digit_variances, BigUint::one())?;
         let state_gain_sq = &refresh.gamma_kappa_l2_sq[slot];
         let decoder_gain_sq = &decoder_action_gain * &decoder_action_gain;
         let state_term = state_variance.scaled(state_gain_sq);
-        let routed_mask = mask_variance.clone();
+        let routed_mask = mask_digit_variance.clone().add(&prf_variance.scaled(&shared_route_gain));
         let routed_fresh = fresh_variance;
         let decoder_variance = helper_variance.scaled(&(BigUint::from(4u8) * decoder_gain_sq));
         let stochastic_variance =
@@ -2221,6 +2226,11 @@ pub fn simulate_average_refresh(
     })
 }
 
+fn coherent_shared_route_gain(mask_gain_l1: &BigUint, fresh_gain_l1: &BigUint) -> BigUint {
+    let combined = mask_gain_l1 + fresh_gain_l1;
+    &combined * &combined
+}
+
 fn base_p_power(base_p: &BigUint, digits: usize) -> Result<BigUint, NoiseSimulationError> {
     let digits = u32::try_from(digits).map_err(|_| NoiseSimulationError::IntegerConversion)?;
     Ok(base_p.pow(digits))
@@ -2301,6 +2311,98 @@ mod tests {
         assert_eq!(
             p.helper_doubled_variance(),
             AverageVariance::new(BigUint::one(), BigUint::one()).unwrap()
+        );
+    }
+
+    #[test]
+    fn coherent_shared_mask_and_fresh_routes_use_l1_sum_squared() {
+        let conservative = coherent_shared_route_gain(&BigUint::from(2u8), &BigUint::one());
+        assert_eq!(conservative, BigUint::from(9u8));
+        assert!(conservative > BigUint::from(2u8) * BigUint::from(2u8));
+    }
+
+    #[test]
+    fn average_refresh_propagates_coherent_shared_prf_route_into_slot_variance() {
+        let model = parameters();
+        let refresh = RefreshNoiseParameters::from_structural(
+            &model,
+            BigUint::from(15u8),
+            BigUint::from(2u8),
+            BigUint::from(2u8),
+            1,
+            1,
+            0,
+            1,
+            1,
+            vec![BigUint::from(15u8)],
+            BigUint::one(),
+        )
+        .unwrap();
+        let report = simulate_average_refresh(
+            &model,
+            &refresh,
+            AverageVariance::zero(),
+            AverageVariance::new(BigUint::one(), BigUint::one()).unwrap(),
+            &AverageCaseConfig { allow_average_acceptance: true, ..Default::default() },
+        )
+        .unwrap();
+        let digit_variance = AverageVariance::new(
+            refresh.mask_digit_l2_sq_gains.iter().cloned().sum(),
+            BigUint::one(),
+        )
+        .unwrap();
+        let expected = digit_variance.add(
+            &AverageVariance::new(
+                coherent_shared_route_gain(
+                    &refresh.mask_route_gain,
+                    &refresh.fresh_error_route_gains[0],
+                ),
+                BigUint::one(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(report.slots[0].mask_variance, expected);
+    }
+
+    #[test]
+    fn average_refresh_rejects_malformed_shared_route_gains() {
+        let model = parameters();
+        let mut refresh = RefreshNoiseParameters::from_structural(
+            &model,
+            BigUint::from(15u8),
+            BigUint::from(2u8),
+            BigUint::from(2u8),
+            1,
+            1,
+            0,
+            1,
+            1,
+            vec![BigUint::from(15u8)],
+            BigUint::one(),
+        )
+        .unwrap();
+        let mut zero_refresh = refresh.clone();
+        refresh.fresh_error_route_gains.pop();
+        assert!(
+            simulate_average_refresh(
+                &model,
+                &refresh,
+                AverageVariance::zero(),
+                AverageVariance::new(BigUint::one(), BigUint::one()).unwrap(),
+                &AverageCaseConfig { allow_average_acceptance: true, ..Default::default() },
+            )
+            .is_err()
+        );
+        zero_refresh.fresh_error_route_gains = vec![BigUint::zero()];
+        assert!(
+            simulate_average_refresh(
+                &model,
+                &zero_refresh,
+                AverageVariance::zero(),
+                AverageVariance::new(BigUint::one(), BigUint::one()).unwrap(),
+                &AverageCaseConfig { allow_average_acceptance: true, ..Default::default() },
+            )
+            .is_err()
         );
     }
 

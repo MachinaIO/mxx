@@ -107,7 +107,7 @@ mod refresh_setup_gpu_tests;
 extern crate self as mxx_power_lut;
 
 #[cfg(test)]
-mod parameter_search_test_support {
+pub mod parameter_search_test_support {
     include!("parameter_search_test_support.rs");
 
     mod tests {
@@ -116,7 +116,7 @@ mod parameter_search_test_support {
 }
 
 #[cfg(test)]
-mod sparse_lwr_parameter_unit {
+pub mod sparse_lwr_parameter_unit {
     include!("sparse_lwr_parameter_test_support.rs");
 
     mod tests {

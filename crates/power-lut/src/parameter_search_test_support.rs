@@ -21,7 +21,7 @@ use mxx_bgg::{BggSamplerLayout, PreimageCoefficientBound};
 use mxx_dsl::BuiltGraph;
 use mxx_ir_core::{IntExpr, RealExpr, artifact::ProductionId, encoding::spec_hash};
 use mxx_power_lut::{
-    AverageCaseConfig,
+    AverageCaseConfig, PowerLutAverageNoiseReport,
     pbc::{PbcParameters, PbcRootSeed, clear_pbc_inner_product, generate_key_layout},
     prf::{SparseLwrPrfProfile, SparseLwrPrfProgram},
     refresh::RefreshCompiler,
@@ -73,7 +73,7 @@ impl std::fmt::Display for CandidatePreparationError {
 pub fn check_refresh_bundle(
     config: &SearchConfig,
     _candidate: Candidate,
-    prepared: &PreparedCandidate,
+    prepared: &mut PreparedCandidate,
 ) -> Result<bool, String> {
     let bundle = prepared.bundle.as_ref().ok_or_else(|| {
         "the refresh graph validator requires a built simulation bundle".to_owned()
@@ -146,6 +146,7 @@ pub fn check_refresh_bundle(
             average_accepted = average.accepted,
             "AverageCase noise result paired with WorstCase authority"
         );
+        prepared.average_report = Some(average.clone());
         return Ok(average.hard_authority_accepted &&
             average.refresh.domain_accepted &&
             average.refresh.fresh_error_accepted &&
@@ -661,8 +662,11 @@ pub struct PreparedCandidate {
     pub program_id: [u8; 32],
     /// One-based accepted PBC layout retry count (public diagnostics only).
     pub pbc_attempts_used: u32,
+    pub mask_base_p_digit_count: usize,
+    pub fresh_error_base_p_digit_count: usize,
     /// Present for the production search; omitted by mocked ordering tests.
     pub bundle: Option<RefreshParameterSimulationBundle>,
+    pub average_report: Option<PowerLutAverageNoiseReport>,
 }
 
 /// Security values and application-specific noise result for the selected point.
@@ -688,6 +692,46 @@ pub struct SearchResult {
     pub estimator_commit: String,
     pub estimator_cost_model: String,
     pub estimator_shape_model: String,
+    pub average_evidence: Option<AverageAcceptanceEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AverageAcceptanceEvidence {
+    pub setup_identity: String,
+    pub layout_id: String,
+    pub program_id: String,
+    pub input_domain_uniformity_verified: bool,
+    pub mask_digit_count: usize,
+    pub fresh_error_digit_count: usize,
+    pub event_budget_log2: u32,
+    pub input_domain_log2: u32,
+    pub extra_event_log2: u32,
+    pub tail_correction_bits: u32,
+    pub mask_event_count: String,
+    pub fresh_event_count: String,
+    pub joint_event_count: String,
+    pub z_squared: String,
+    pub epsilon_joint: String,
+    pub mask_smudging_max_favg: String,
+    pub mask_smudging_margin: String,
+    pub domain_margin: String,
+    pub hard_authority_accepted: bool,
+    pub correctness_accepted: bool,
+    pub accepted: bool,
+    pub security_authority: String,
+    pub correctness_authority: String,
+    pub heuristics: Vec<String>,
+    pub slots: Vec<AverageSlotEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AverageSlotEvidence {
+    pub slot: usize,
+    pub favg: String,
+    pub squared_margin: String,
+    pub squared_deficit: String,
+    pub rounding_accepted: bool,
+    pub fresh_error_below_plaintext_modulus: bool,
 }
 
 /// One aggregate, non-secret row persisted for a Phase-1 universe that was
@@ -1352,6 +1396,68 @@ pub fn candidates(config: &SearchConfig) -> impl Iterator<Item = Candidate> + '_
     })
 }
 
+fn final_average_evidence(
+    config: &SearchConfig,
+    prepared: &PreparedCandidate,
+    report: &PowerLutAverageNoiseReport,
+) -> Result<Option<AverageAcceptanceEvidence>, String> {
+    if config.noise_model != NoiseSearchModel::AverageCase {
+        return Ok(None);
+    }
+    let policy = average_case_config(config)?;
+    let refresh = &report.refresh;
+    let uniformity_verified = report.prf.p == 2 &&
+        refresh.centered_coordinates &&
+        !refresh.decoder_factor.is_zero() &&
+        report.prf.bucket_variances.len() == report.prf.bucket_count &&
+        report.prf.group_output_variances.len() == report.prf.intermediate_groups;
+    if !uniformity_verified {
+        return Err("AverageCase snapshot does not establish uniform structural input bounds".to_owned());
+    }
+    let event_budget_log2 = refresh
+        .event_budget
+        .log2_events()
+        .map_err(|error| format!("AverageCase event budget: {error}"))?;
+    Ok(Some(AverageAcceptanceEvidence {
+        setup_identity: hex(report.snapshot_identity),
+        layout_id: hex(prepared.layout_id),
+        program_id: hex(prepared.program_id),
+        input_domain_uniformity_verified: uniformity_verified,
+        mask_digit_count: prepared.mask_base_p_digit_count,
+        fresh_error_digit_count: prepared.fresh_error_base_p_digit_count,
+        event_budget_log2,
+        input_domain_log2: policy.input_domain_log2,
+        extra_event_log2: policy.extra_event_log2,
+        tail_correction_bits: policy.tail_correction_bits,
+        mask_event_count: refresh.mask_event_count.to_string(),
+        fresh_event_count: refresh.fresh_event_count.to_string(),
+        joint_event_count: refresh.joint_event_count.to_string(),
+        z_squared: format!("{}/{}", refresh.z_sq.numerator, refresh.z_sq.denominator),
+        epsilon_joint: format!("{}/{}", refresh.epsilon_joint.numerator, refresh.epsilon_joint.denominator),
+        mask_smudging_max_favg: refresh.mask_smudging_max_favg.to_string(),
+        mask_smudging_margin: refresh.mask_smudging_margin.to_string(),
+        domain_margin: refresh.domain_margin.to_string(),
+        hard_authority_accepted: report.hard_authority_accepted,
+        correctness_accepted: report.correctness_accepted,
+        accepted: report.accepted,
+        security_authority: format!("{:?}", report.security_authority),
+        correctness_authority: format!("{:?}", report.correctness_authority),
+        heuristics: refresh.heuristics.iter().map(|item| format!("{item:?}")).collect(),
+        slots: refresh
+            .slots
+            .iter()
+            .map(|slot| AverageSlotEvidence {
+                slot: slot.slot,
+                favg: slot.favg.to_string(),
+                squared_margin: slot.squared_margin.to_string(),
+                squared_deficit: slot.squared_deficit.to_string(),
+                rounding_accepted: slot.rounding_accepted,
+                fresh_error_below_plaintext_modulus: slot.fresh_error_below_plaintext_modulus,
+            })
+            .collect(),
+    }))
+}
+
 /// Runs a finite search with injectable security and checker functions.
 ///
 /// The hooks make the ordering and minimality tests independent of Sage and
@@ -1368,7 +1474,7 @@ pub fn search_with_hooks<Prepare, Security, Checker>(
 where
     Prepare: FnMut(Candidate) -> Result<PreparedCandidate, CandidatePreparationError>,
     Security: FnMut(Candidate) -> Result<u64, String>,
-    Checker: FnMut(&PreparedCandidate) -> Result<bool, String>,
+    Checker: FnMut(&mut PreparedCandidate) -> Result<bool, String>,
 {
     if sparse_profile.q_l != config.sparse_lwr_modulus ||
         sparse_profile.p != config.sparse_lwr_output_modulus ||
@@ -1421,7 +1527,8 @@ where
             }
             Err(CandidatePreparationError::Fatal(error)) => return Err(error),
         };
-        if !checker(&prepared)? {
+        let mut prepared = prepared;
+        if !checker(&mut prepared)? {
             info!(
                 crt_depth = candidate.crt_depth,
                 log_ring_dimension = candidate.log_ring_dimension,
@@ -1452,6 +1559,12 @@ where
             estimator_commit: sparse_profile.estimator_commit.clone(),
             estimator_cost_model: sparse_profile.estimator_cost_model.clone(),
             estimator_shape_model: sparse_profile.estimator_shape_model.clone(),
+            average_evidence: prepared
+                .average_report
+                .as_ref()
+                .map(|report| final_average_evidence(config, &prepared, report))
+                .transpose()?
+                .flatten(),
         });
     }
     Err(NO_CANDIDATE_ERROR.to_owned())
@@ -1765,10 +1878,13 @@ pub fn prepare_candidate(
         ring_dimension,
         bucket_width,
         pbc_attempts_used,
+        mask_base_p_digit_count: mask_digits,
+        fresh_error_base_p_digit_count: fresh_error_digits,
         official_preimage_bound,
         layout_id,
         program_id,
         bundle: Some(bundle),
+        average_report: None,
     })
 }
 
@@ -1912,9 +2028,15 @@ fn select_average_mask_base_p_digit_count(
 /// selector from silently evaluating a different event/failure budget than
 /// the accepted graph.
 fn average_case_config(config: &SearchConfig) -> Result<AverageCaseConfig, String> {
+    // The structural snapshot bounds every centered p=2 transfer from its
+    // public setup/action model; no semantic plaintext or PRF input is used
+    // in the variance arithmetic.  Therefore the checked input-domain factor
+    // is exactly one (log2 factor zero), rather than an implicit default.
+    let input_domain_log2 = 0_u32;
     Ok(AverageCaseConfig {
         failure_exponent: u32::try_from(config.security_bits)
             .map_err(|_| "AverageCase security target does not fit u32".to_owned())?,
+        input_domain_log2,
         allow_average_acceptance: true,
         ..Default::default()
     })

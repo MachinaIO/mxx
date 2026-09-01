@@ -262,8 +262,8 @@ fn validate_external_fact_shape(
 ) -> Result<(), String> {
     match fact {
         ExternalInputValue::Family { shape, element } => {
-            if shape.is_empty() || shape.contains(&0) {
-                return Err("external family shape must be nonempty and concrete".to_owned());
+            if shape.is_empty() {
+                return Err("external family shape must have positive rank".to_owned());
             }
             if matches!(**element, ExternalInputValue::Family { .. }) {
                 return Err("nested external families are unsupported".to_owned());

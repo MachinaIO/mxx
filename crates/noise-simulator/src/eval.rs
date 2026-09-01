@@ -4812,7 +4812,15 @@ fn value_fact(ty: &WireType, f: &ExternalInputValue, env: &ParamEnv) -> Result<I
             if declared != *actual {
                 return Err("family shape mismatch".into());
             }
-            let x = value_fact(element, ef, env)?;
+            // A zero extent makes every element inaccessible at runtime.  Use
+            // the same type-derived bottom summary as an empty ParallelGrid so
+            // the caller's illustrative element bound cannot become an
+            // observable bound for a family with no members.
+            let x = if actual.contains(&0) {
+                empty_info_for_type(element, env).map_err(|error| error.to_string())?
+            } else {
+                value_fact(element, ef, env)?
+            };
             Ok(Info {
                 value: AbstractValue::Family(
                     FamilyState::new(actual.clone(), x.value).map_err(|e| e.to_string())?,
@@ -4922,6 +4930,76 @@ mod tests {
             limits: crate::SimulationLimits::default(),
         };
         let report = run(&request).unwrap();
+        assert_eq!(report.roots[0].maximum_absolute_coefficient_error, BigUint::ZERO);
+        assert!(report.diagnostics.dropped_carriers.is_empty());
+    }
+
+    #[test]
+    fn zero_extent_external_matrix_family_uses_typed_bottom() {
+        let matrix = MatrixType {
+            modulus: mxx_ir_core::IntExpr::constant(17),
+            ring_dimension: mxx_ir_core::IntExpr::constant(4),
+            rows: mxx_ir_core::IntExpr::constant(1),
+            columns: mxx_ir_core::IntExpr::constant(1),
+        };
+        let family_type = WireType::Family {
+            element: Box::new(WireType::Matrix(matrix)),
+            shape: vec![mxx_ir_core::IntExpr::constant(0)],
+        };
+        let input = NodeHandle::new(
+            NodeKind::Input {
+                name: "empty".into(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![family_type],
+        )
+        .output(0)
+        .unwrap();
+        let graph = Graph::freeze(
+            "empty-external-family",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: input, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let environment = ParamEnv::default();
+        let stage = crate::StageId("empty-external-family".into());
+        let request = SimulationRequest {
+            program: crate::SimulationProgram {
+                stages: vec![crate::SimulationStage {
+                    id: stage.clone(),
+                    production_id: ProductionId {
+                        spec_hash: spec_hash(&graph, &environment).unwrap(),
+                        execution_nonce: [0; 32],
+                    },
+                    graph,
+                }],
+            },
+            environment,
+            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
+            external_inputs: vec![crate::ExternalInputFact {
+                stage,
+                input: "empty".into(),
+                value: crate::ExternalInputValue::Family {
+                    shape: vec![0],
+                    // No member exists, so this illustrative element bound is
+                    // intentionally replaced by the matrix typed bottom.
+                    element: Box::new(crate::ExternalInputValue::Matrix {
+                        maximum_absolute_coefficient_error: 7u8.into(),
+                        maximum_absolute_coefficient_value: Some(8u8.into()),
+                        is_constant_polynomial: false,
+                    }),
+                },
+            }],
+            limits: crate::SimulationLimits::default(),
+        };
+
+        let report = run(&request).expect("a validated empty external family must simulate");
         assert_eq!(report.roots[0].maximum_absolute_coefficient_error, BigUint::ZERO);
         assert!(report.diagnostics.dropped_carriers.is_empty());
     }

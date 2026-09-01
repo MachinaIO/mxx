@@ -311,7 +311,9 @@ pub enum StateError {
     InvalidIntegerRange,
     #[error("division or remainder divisor interval contains zero")]
     DivisionRangeContainsZero,
-    #[error("family shape must be nonempty, nonzero, and cannot nest families")]
+    #[error(
+        "family shape must have positive rank, fit usize cardinality, and cannot nest families"
+    )]
     InvalidFamilyShape,
     #[error("sample interval minimum exceeds maximum")]
     InvalidSampleRange,

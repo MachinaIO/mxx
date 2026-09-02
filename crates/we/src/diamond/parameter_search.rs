@@ -1,17 +1,27 @@
 use super::{
-    DiamondWeCompiler, DiamondWeConfig, default_error_max_coefficient_bound,
-    default_preimage_max_coefficient_bound,
+    DiamondDecryptionSemanticRefs, DiamondEncryptionSemanticRefs, DiamondWeCompiler,
+    DiamondWeConfig,
+    correctness::{
+        DiamondCandidateSemanticRefs, DiamondCorrectnessVerdict, check_diamond_candidate,
+    },
+    default_error_max_coefficient_bound, default_preimage_max_coefficient_bound,
     graph::{HASH_KEY_INPUT, MESSAGE_INPUT, NOISY_PLAINTEXT_OUTPUT},
+    representation::{DcrtRuntimeRepresentation, DcrtRuntimeRepresentationError},
 };
 use mxx_gadgets::circuit::{BooleanCircuitError, BooleanCircuitShape};
-use mxx_ir_core::RealExpr;
+use mxx_ir_core::{
+    RealExpr,
+    artifact::{ProductionId, export_validated_manifest},
+    encoding::spec_hash,
+    linked::{LinkedProgramStage, ValidatedLinkedProgram},
+};
 use mxx_noise_simulator::{
     ExternalInputFact, ExternalInputValue, SimulationLimits, SimulationProgram, SimulationRequest,
     SimulationRoot, SimulationStage, StageId, simulate,
 };
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
-use std::{collections::BTreeMap, process::Command, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc, time::Instant};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -32,6 +42,7 @@ pub struct DiamondParameterSearch {
     pub trapdoor_sigma: f64,
     pub error_sigma: f64,
     pub bgg_tag: Vec<u8>,
+    pub correctness_cache_target_directory: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +58,15 @@ pub struct DiamondSelectedParameters {
     /// Simulator upper bound for the absolute coefficient error of the
     /// decryption graph's noisy plaintext output.
     pub noise_bound: BigUint,
+}
+
+impl DiamondSelectedParameters {
+    /// Capture and validate the exact runtime DCRT layout for this semantic candidate.
+    pub fn runtime_representation(
+        &self,
+    ) -> Result<DcrtRuntimeRepresentation, DcrtRuntimeRepresentationError> {
+        DcrtRuntimeRepresentation::from_selected(self)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -75,11 +95,20 @@ pub enum DiamondParameterSearchError {
     Config(String),
     #[error("the Diamond noise simulator could not evaluate the candidate: {0}")]
     SimulatorInfrastructure(String),
+    #[error("the Diamond Lean correctness checker could not verify the candidate: {0}")]
+    CorrectnessInfrastructure(String),
 }
 
 struct Candidate {
     selected: DiamondSelectedParameters,
     correct: bool,
+}
+
+struct CandidateEvaluationInput {
+    simulation: SimulationRequest,
+    linked: ValidatedLinkedProgram,
+    encryption_refs: DiamondEncryptionSemanticRefs,
+    decryption_refs: DiamondDecryptionSemanticRefs,
 }
 
 impl DiamondParameterSearch {
@@ -280,9 +309,9 @@ impl DiamondParameterSearch {
             setup_elapsed_seconds = started.elapsed().as_secs_f64(),
             "constructed Diamond WE simulator candidate"
         );
-        let request = simulation_request(&compiler)?;
+        let evaluation = candidate_evaluation_input(&compiler)?;
         let simulator_started = Instant::now();
-        let report = simulate(&request).map_err(|error| {
+        let report = simulate(&evaluation.simulation).map_err(|error| {
             DiamondParameterSearchError::SimulatorInfrastructure(error.to_string())
         })?;
         let noise_bound = report
@@ -298,11 +327,11 @@ impl DiamondParameterSearch {
                     "simulator report omitted the Diamond residual root".to_owned(),
                 )
             })?;
-        let correct = boolean_interval_accepts(&compiler.config.modulus, noise_bound);
+        let simulator_accepts = boolean_interval_accepts(&compiler.config.modulus, noise_bound);
         info!(
             crt_depth,
             ring_dimension,
-            accepted = correct,
+            prefilter_accepted = simulator_accepts,
             noise_bound = %noise_bound,
             planned_wires = report.diagnostics.planned_wires,
             transfer_steps = report.diagnostics.transfer_steps,
@@ -310,20 +339,39 @@ impl DiamondParameterSearch {
             elapsed_seconds = simulator_started.elapsed().as_secs_f64(),
             "finished Diamond WE noise simulation"
         );
-        Ok(Candidate {
-            selected: DiamondSelectedParameters {
-                parameters,
-                compiler,
-                crt_depth,
-                log_ring_dimension,
-                ring_dimension,
-                modulus: modulus.as_ref().clone(),
-                modulus_bits: modulus.bits() as usize,
-                achieved_security_bits,
-                noise_bound: noise_bound.clone(),
+        let selected = DiamondSelectedParameters {
+            parameters,
+            compiler,
+            crt_depth,
+            log_ring_dimension,
+            ring_dimension,
+            modulus: modulus.as_ref().clone(),
+            modulus_bits: modulus.bits() as usize,
+            achieved_security_bits,
+            noise_bound: noise_bound.clone(),
+        };
+        if !simulator_accepts {
+            return Ok(Candidate { selected, correct: false });
+        }
+        let correctness_started = Instant::now();
+        let verdict = check_diamond_candidate(
+            &self.correctness_cache_target_directory,
+            &evaluation.linked,
+            &selected,
+            DiamondCandidateSemanticRefs {
+                encryption: &evaluation.encryption_refs,
+                decryption: &evaluation.decryption_refs,
             },
-            correct,
-        })
+        );
+        let correct = correctness_verdict_accepts(verdict)?;
+        info!(
+            crt_depth,
+            ring_dimension,
+            accepted = correct,
+            elapsed_seconds = correctness_started.elapsed().as_secs_f64(),
+            "finished Diamond WE Lean correctness check"
+        );
+        Ok(Candidate { selected, correct })
     }
 
     fn validate(&self) -> Result<(), DiamondParameterSearchError> {
@@ -341,6 +389,7 @@ impl DiamondParameterSearch {
             self.crt_modulus_bits == 0 ||
             self.gadget_base_bits >= u64::BITS ||
             self.security_bits == 0 ||
+            !self.correctness_cache_target_directory.is_absolute() ||
             !self.trapdoor_sigma.is_finite() ||
             !self.error_sigma.is_finite() ||
             self.trapdoor_sigma <= 0.0 ||
@@ -352,30 +401,68 @@ impl DiamondParameterSearch {
     }
 }
 
-fn simulation_request(
+fn candidate_evaluation_input(
     compiler: &DiamondWeCompiler,
-) -> Result<SimulationRequest, DiamondParameterSearchError> {
+) -> Result<CandidateEvaluationInput, DiamondParameterSearchError> {
     let environment = compiler
         .circuit_bindings()
         .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
-    let encryption = compiler
+    let encryption_build = compiler
         .build_encryption()
-        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?
-        .graph;
-    let encryption_production = mxx_ir_core::artifact::ProductionId {
-        spec_hash: mxx_ir_core::encoding::spec_hash(&encryption.graph, &environment)
-            .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?,
+        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
+    let encryption_refs = encryption_build.semantic_refs;
+    let encryption = encryption_build.graph;
+    let validated_encryption = encryption.validate(&environment).map_err(|error| {
+        DiamondParameterSearchError::CorrectnessInfrastructure(error.to_string())
+    })?;
+    let encryption_production = ProductionId {
+        spec_hash: spec_hash(&validated_encryption.source, &validated_encryption.bindings)
+            .map_err(|error| {
+                DiamondParameterSearchError::CorrectnessInfrastructure(error.to_string())
+            })?,
         execution_nonce: [0; 32],
     };
-    let decryption = compiler
+    let encryption_manifest =
+        export_validated_manifest(encryption_production.clone(), &validated_encryption).map_err(
+            |error| DiamondParameterSearchError::CorrectnessInfrastructure(error.to_string()),
+        )?;
+    let decryption_build = compiler
         .build_decryption(encryption_production.clone())
-        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?
-        .graph;
-    let decryption_production = mxx_ir_core::artifact::ProductionId {
-        spec_hash: mxx_ir_core::encoding::spec_hash(&decryption.graph, &environment)
-            .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?,
+        .map_err(|error| DiamondParameterSearchError::Config(error.to_string()))?;
+    let decryption_refs = decryption_build.semantic_refs;
+    let decryption = decryption_build.graph;
+    let validated_decryption = decryption
+        .validate_with_manifests(
+            &environment,
+            &BTreeMap::from([(encryption_production.clone(), encryption_manifest.clone())]),
+        )
+        .map_err(|error| {
+            DiamondParameterSearchError::CorrectnessInfrastructure(error.to_string())
+        })?;
+    let decryption_production = ProductionId {
+        spec_hash: spec_hash(&validated_decryption.source, &validated_decryption.bindings)
+            .map_err(|error| {
+                DiamondParameterSearchError::CorrectnessInfrastructure(error.to_string())
+            })?,
         execution_nonce: [0; 32],
     };
+    let decryption_manifest =
+        export_validated_manifest(decryption_production.clone(), &validated_decryption).map_err(
+            |error| DiamondParameterSearchError::CorrectnessInfrastructure(error.to_string()),
+        )?;
+    let linked = ValidatedLinkedProgram::new(vec![
+        LinkedProgramStage::new(
+            encryption_production.clone(),
+            validated_encryption,
+            encryption_manifest,
+        ),
+        LinkedProgramStage::new(
+            decryption_production.clone(),
+            validated_decryption,
+            decryption_manifest,
+        ),
+    ])
+    .map_err(|error| DiamondParameterSearchError::CorrectnessInfrastructure(error.to_string()))?;
     let encrypt = StageId("encrypt".to_owned());
     let decrypt = StageId("decrypt".to_owned());
     let mut external_inputs = Vec::new();
@@ -424,7 +511,7 @@ fn simulation_request(
             1,
         ),
     ]);
-    Ok(SimulationRequest {
+    let simulation = SimulationRequest {
         program: SimulationProgram {
             stages: vec![
                 SimulationStage {
@@ -443,7 +530,8 @@ fn simulation_request(
         roots: vec![SimulationRoot { stage: decrypt, output: NOISY_PLAINTEXT_OUTPUT.to_owned() }],
         external_inputs,
         limits: SimulationLimits::default(),
-    })
+    };
+    Ok(CandidateEvaluationInput { simulation, linked, encryption_refs, decryption_refs })
 }
 
 fn add_circuit_facts(
@@ -497,6 +585,21 @@ fn integer_family_fact(
                 maximum_inclusive: (maximum_inclusive as i64).into(),
             }),
         },
+    }
+}
+
+fn correctness_verdict_accepts(
+    verdict: DiamondCorrectnessVerdict,
+) -> Result<bool, DiamondParameterSearchError> {
+    match verdict {
+        DiamondCorrectnessVerdict::LeanVerified { .. } => Ok(true),
+        DiamondCorrectnessVerdict::Rejected { bound, decoder_threshold } => {
+            info!(%bound, %decoder_threshold, "correctness bound rejected Diamond candidate");
+            Ok(false)
+        }
+        DiamondCorrectnessVerdict::InfrastructureError { error } => {
+            Err(DiamondParameterSearchError::CorrectnessInfrastructure(error))
+        }
     }
 }
 
@@ -579,11 +682,105 @@ mod tests {
             trapdoor_sigma: 4.0,
             error_sigma: 1.0,
             bgg_tag: Vec::new(),
+            correctness_cache_target_directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target"),
+        }
+    }
+
+    fn small_compiler() -> DiamondWeCompiler {
+        DiamondWeCompiler::new(
+            DiamondWeConfig {
+                modulus: 257.into(),
+                ring_dimension: 8,
+                input_count: 1,
+                digit_base: 2,
+                batch_bits: 1,
+                gadget_base: 4.into(),
+                digit_count: 2,
+                trapdoor_sigma: RealExpr::from_integer(4),
+                error_sigma: RealExpr::from_integer(1),
+                error_max_coefficient_bound: 6.into(),
+                preimage_max_coefficient_bound: 26.into(),
+                bgg_tag: b"diamond-parameter-search-test".to_vec(),
+            },
+            BooleanCircuitShape {
+                instance_width: 1,
+                witness_width: 1,
+                depth: 1,
+                max_layer_width: 2,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn correctness_verdict_requires_lean_verification() {
+        assert!(
+            correctness_verdict_accepts(DiamondCorrectnessVerdict::LeanVerified {
+                semantic_identity: crate::diamond::correctness::LeanSemanticIdentity {
+                    ir_version: mxx_ir_core::encoding::IR_VERSION,
+                    linked_program_sha256: [1; 32],
+                },
+                claim_instance_sha256: [2; 32],
+                theorem: "Mxx.We.Golden.DiamondWE.correct".to_owned(),
+                artifact_directory: PathBuf::from("artifact"),
+            })
+            .unwrap()
+        );
+        assert!(
+            !correctness_verdict_accepts(DiamondCorrectnessVerdict::Rejected {
+                bound: 2u8.into(),
+                decoder_threshold: 1u8.into(),
+            })
+            .unwrap()
+        );
+        assert!(matches!(
+            correctness_verdict_accepts(DiamondCorrectnessVerdict::InfrastructureError {
+                error: "Lean failed".to_owned(),
+            }),
+            Err(DiamondParameterSearchError::CorrectnessInfrastructure(error))
+                if error == "Lean failed"
+        ));
+    }
+
+    #[test]
+    fn simulator_and_linked_program_share_production_identities() {
+        let evaluation = candidate_evaluation_input(&small_compiler()).unwrap();
+        evaluation.simulation.validate().unwrap();
+        let simulator_ids = evaluation
+            .simulation
+            .program
+            .stages
+            .iter()
+            .map(|stage| stage.production_id.clone())
+            .collect::<Vec<_>>();
+        let linked_ids = evaluation
+            .linked
+            .stages()
+            .iter()
+            .map(|stage| stage.production_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(simulator_ids, linked_ids);
+        assert_eq!(simulator_ids.len(), 2);
+        for (simulator, linked) in
+            evaluation.simulation.program.stages.iter().zip(evaluation.linked.stages())
+        {
+            assert_eq!(
+                serde_json::to_value(&simulator.graph).unwrap(),
+                serde_json::to_value(&linked.graph.source).unwrap()
+            );
         }
     }
 
     #[test]
-    fn boolean_interval_acceptance_is_owned_by_parameter_search() {
+    fn relative_correctness_cache_target_is_rejected() {
+        let mut search = small_search();
+        search.correctness_cache_target_directory = PathBuf::from("target");
+        assert!(matches!(search.validate(), Err(DiamondParameterSearchError::InvalidRange)));
+    }
+
+    #[test]
+    fn boolean_interval_is_a_simulator_prefilter() {
         assert!(boolean_interval_accepts(&BigInt::from(257_u16), &BigUint::from(1_u8)));
         assert!(!boolean_interval_accepts(&BigInt::from(257_u16), &BigUint::from(100_u8)));
         assert!(!boolean_interval_accepts(&BigInt::from(3_u8), &BigUint::ZERO));
@@ -605,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires lattice-estimator-cli and Sage on PATH"]
+    #[ignore = "requires lattice-estimator-cli, Sage, and the production Lean toolchain"]
     fn small_search_with_lattice_estimator() {
         let selected = small_search().search().unwrap();
         assert!(selected.achieved_security_bits >= 1);

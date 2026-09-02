@@ -2,7 +2,8 @@ use super::{DiamondArtifactNames, DiamondConfigError, DiamondWeConfig};
 use mxx_bgg::{
     BggEncodingCompiler, BggEncodingFamily, BggEncodingWire, BggPublicKeyCompiler,
     BggPublicKeyFamily, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
-    DynamicBooleanBggError, evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
+    BooleanEncodingTrace, DynamicBooleanBggError, FrozenBooleanEncodingTraceEntry,
+    evaluate_boolean_encoding_layers_with_trace, evaluate_boolean_public_key_layers,
 };
 use mxx_dsl::{
     Bool, BuiltGraph, DslContext, DslError, Int, Mat, Parallel, parallel_zip_bundle_result,
@@ -12,10 +13,15 @@ use mxx_gadgets::{
         BOOLEAN_INSTANCE_INPUT, BOOLEAN_WITNESS_INPUT, BooleanCircuitError,
         BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanCircuitShape,
     },
-    input_injector::{DiamondInputInjector, DiamondInputParams, DiamondInputPreprocessError},
+    input_injector::{
+        DiamondInputInjector, DiamondInputParams, DiamondInputPreprocessError,
+        DiamondInputTargetTraceFragment, DiamondInputTargetTraceRefs, DiamondInputTraceFragment,
+        DiamondInputTraceRefs, SelectorMagnitudeTraceFragment, SelectorMagnitudeTraceRefs,
+    },
 };
 use mxx_ir_core::{
-    IndexExpr, IndexMap, IntExpr, ParamEnv,
+    FreezeMap, FreezeResolveError, FrozenValueRef, IndexExpr, IndexMap, IntExpr, ParamEnv,
+    ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
     node::{ConcatAxis, IndexRange},
 };
@@ -25,24 +31,26 @@ pub const HASH_KEY_INPUT: &str = "diamond-hash-key";
 pub const MESSAGE_INPUT: &str = "diamond-message";
 pub const DECODED_OUTPUT: &str = "diamond-decoded";
 pub const NOISY_PLAINTEXT_OUTPUT: &str = "diamond-noisy-plaintext";
+pub(crate) const ENCRYPTION_STAGE_NAME: &str = "diamond-we-encryption";
+pub(crate) const DECRYPTION_STAGE_NAME: &str = "diamond-we-decryption";
 
 #[derive(Clone)]
-struct DiamondGraphParams {
+pub(crate) struct DiamondGraphParams {
     input: DiamondInputParams,
 }
 
 impl DiamondGraphParams {
-    const MODULUS: &'static str = "diamond_modulus";
-    const RING_DIMENSION: &'static str = "diamond_ring_dimension";
-    const INPUT_COUNT: &'static str = "diamond_input_count";
-    const DIGIT_BASE: &'static str = "diamond_digit_base";
-    const BATCH_BITS: &'static str = "diamond_batch_bits";
-    const GADGET_BASE: &'static str = "diamond_gadget_base";
-    const DIGIT_COUNT: &'static str = "diamond_digit_count";
-    const TRAPDOOR_SIGMA: &'static str = "diamond_trapdoor_sigma";
-    const ERROR_SIGMA: &'static str = "diamond_error_sigma";
-    const ERROR_BOUND: &'static str = "diamond_error_max_coefficient_bound";
-    const PREIMAGE_BOUND: &'static str = "diamond_preimage_max_coefficient_bound";
+    pub(crate) const MODULUS: &'static str = "diamond_modulus";
+    pub(crate) const RING_DIMENSION: &'static str = "diamond_ring_dimension";
+    pub(crate) const INPUT_COUNT: &'static str = "diamond_input_count";
+    pub(crate) const DIGIT_BASE: &'static str = "diamond_digit_base";
+    pub(crate) const BATCH_BITS: &'static str = "diamond_batch_bits";
+    pub(crate) const GADGET_BASE: &'static str = "diamond_gadget_base";
+    pub(crate) const DIGIT_COUNT: &'static str = "diamond_digit_count";
+    pub(crate) const TRAPDOOR_SIGMA: &'static str = "diamond_trapdoor_sigma";
+    pub(crate) const ERROR_SIGMA: &'static str = "diamond_error_sigma";
+    pub(crate) const ERROR_BOUND: &'static str = "diamond_error_max_coefficient_bound";
+    pub(crate) const PREIMAGE_BOUND: &'static str = "diamond_preimage_max_coefficient_bound";
 
     fn declare(mut context: DslContext) -> (DslContext, Self) {
         for name in [
@@ -103,12 +111,271 @@ fn padded_witness_public_key_indices(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiamondCircuitSemanticRefs {
+    pub active_gate_counts: FrozenValueRef,
+    pub gate_kinds: FrozenValueRef,
+    pub left_sources: FrozenValueRef,
+    pub right_sources: FrozenValueRef,
+    pub output_sources: FrozenValueRef,
+    pub evaluated_output: FrozenValueRef,
+}
+
+/// Construction-time values retained specifically for the generated Diamond
+/// structural view.  These are frozen by `FreezeMap`; the correctness emitter
+/// never reconstructs a site from a node number or a traversal position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiamondStructuralSiteRefs {
+    pub injector_initial: FrozenValueRef,
+    pub injector_transitions: FrozenValueRef,
+    pub injector_target_trace: DiamondInputTargetTraceRefs,
+    pub selector_magnitude_trace: SelectorMagnitudeTraceRefs,
+    pub injector_final_trapdoor: FrozenValueRef,
+    pub one_preimage: FrozenValueRef,
+    pub k_preimage: FrozenValueRef,
+    pub decoder_preimage: FrozenValueRef,
+    pub public_keys: FrozenValueRef,
+    pub witness_preimages: FrozenValueRef,
+    pub r_decomposition: FrozenValueRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiamondDecryptionSiteRefs {
+    pub injector_initial: FrozenValueRef,
+    pub injector_transitions: FrozenValueRef,
+    pub injector_states: FrozenValueRef,
+    pub injector_loop_output: FrozenValueRef,
+    pub injector_body_output: FrozenValueRef,
+    pub injector_trace: DiamondInputTraceRefs,
+    pub bgg_operations: Vec<FrozenBooleanEncodingTraceEntry>,
+    pub witness_vectors: FrozenValueRef,
+    pub one_projection: FrozenValueRef,
+    pub k_projection: FrozenValueRef,
+    pub decoder_projection: FrozenValueRef,
+    pub public_keys: FrozenValueRef,
+    pub circuit_output: FrozenValueRef,
+    pub one_minus_circuit: FrozenValueRef,
+    pub projected_difference: FrozenValueRef,
+    pub r_decomposition: FrozenValueRef,
+    pub k_plus_projection: FrozenValueRef,
+    pub noisy_plaintext: FrozenValueRef,
+    pub decoded: FrozenValueRef,
+    pub decoder_coefficient: FrozenValueRef,
+    pub decoder_lower_comparison: FrozenValueRef,
+    pub decoder_upper_comparison: FrozenValueRef,
+    pub decoder_lower_bool_to_int: FrozenValueRef,
+    pub decoder_upper_bool_to_int: FrozenValueRef,
+    pub decoder_sum: FrozenValueRef,
+    pub decoder_equals_two: FrozenValueRef,
+    pub decoder_quarter: FrozenValueRef,
+    pub decoder_three_quarter: FrozenValueRef,
+    pub decoder_two: FrozenValueRef,
+    pub decoder_three: FrozenValueRef,
+}
+
+#[derive(Clone)]
+struct DiamondStructuralSiteHandles {
+    injector_initial: ValueHandle,
+    injector_transitions: ValueHandle,
+    injector_target_trace: DiamondInputTargetTraceFragment,
+    selector_magnitude_trace: SelectorMagnitudeTraceFragment,
+    injector_final_trapdoor: ValueHandle,
+    one_preimage: ValueHandle,
+    k_preimage: ValueHandle,
+    decoder_preimage: ValueHandle,
+    public_keys: ValueHandle,
+    witness_preimages: ValueHandle,
+    r_decomposition: ValueHandle,
+}
+
+#[derive(Clone)]
+struct DiamondDecryptionSiteHandles {
+    injector_initial: ValueHandle,
+    injector_transitions: ValueHandle,
+    injector_states: ValueHandle,
+    injector_loop_output: ValueHandle,
+    injector_body_output: ValueHandle,
+    injector_trace: DiamondInputTraceFragment,
+    bgg_trace: BooleanEncodingTrace,
+    witness_vectors: ValueHandle,
+    one_projection: ValueHandle,
+    k_projection: ValueHandle,
+    decoder_projection: ValueHandle,
+    public_keys: ValueHandle,
+    circuit_output: ValueHandle,
+    one_minus_circuit: ValueHandle,
+    projected_difference: ValueHandle,
+    r_decomposition: ValueHandle,
+    k_plus_projection: ValueHandle,
+    noisy_plaintext: ValueHandle,
+    decoded: ValueHandle,
+    decoder_coefficient: ValueHandle,
+    decoder_lower_comparison: ValueHandle,
+    decoder_upper_comparison: ValueHandle,
+    decoder_lower_bool_to_int: ValueHandle,
+    decoder_upper_bool_to_int: ValueHandle,
+    decoder_sum: ValueHandle,
+    decoder_equals_two: ValueHandle,
+    decoder_quarter: ValueHandle,
+    decoder_three_quarter: ValueHandle,
+    decoder_two: ValueHandle,
+    decoder_three: ValueHandle,
+}
+
+impl DiamondStructuralSiteHandles {
+    fn retained_values(&self) -> impl Iterator<Item = ValueHandle> + '_ {
+        let values = vec![
+            &self.injector_initial,
+            &self.injector_transitions,
+            &self.injector_final_trapdoor,
+            &self.one_preimage,
+            &self.k_preimage,
+            &self.decoder_preimage,
+            &self.public_keys,
+            &self.witness_preimages,
+            &self.r_decomposition,
+        ]
+        .into_iter()
+        .cloned()
+        .chain(self.injector_target_trace.clone().into_retained_values())
+        .chain(self.selector_magnitude_trace.clone().into_retained_values())
+        .collect::<Vec<_>>();
+        values.into_iter()
+    }
+
+    fn freeze(
+        &self,
+        freeze_map: &FreezeMap,
+    ) -> Result<DiamondStructuralSiteRefs, FreezeResolveError> {
+        Ok(DiamondStructuralSiteRefs {
+            injector_initial: freeze_map.resolve_typed(&self.injector_initial)?,
+            injector_transitions: freeze_map.resolve_typed(&self.injector_transitions)?,
+            injector_target_trace: self.injector_target_trace.resolve(freeze_map)?,
+            selector_magnitude_trace: self.selector_magnitude_trace.resolve(freeze_map)?,
+            injector_final_trapdoor: freeze_map.resolve_typed(&self.injector_final_trapdoor)?,
+            one_preimage: freeze_map.resolve_typed(&self.one_preimage)?,
+            k_preimage: freeze_map.resolve_typed(&self.k_preimage)?,
+            decoder_preimage: freeze_map.resolve_typed(&self.decoder_preimage)?,
+            public_keys: freeze_map.resolve_typed(&self.public_keys)?,
+            witness_preimages: freeze_map.resolve_typed(&self.witness_preimages)?,
+            r_decomposition: freeze_map.resolve_typed(&self.r_decomposition)?,
+        })
+    }
+}
+
+impl DiamondDecryptionSiteHandles {
+    fn retained_values(&self) -> impl Iterator<Item = ValueHandle> + '_ {
+        let values = vec![
+            &self.injector_initial,
+            &self.injector_transitions,
+            &self.injector_states,
+            &self.injector_loop_output,
+            &self.injector_body_output,
+            &self.witness_vectors,
+            &self.one_projection,
+            &self.k_projection,
+            &self.decoder_projection,
+            &self.public_keys,
+            &self.circuit_output,
+            &self.one_minus_circuit,
+            &self.projected_difference,
+            &self.r_decomposition,
+            &self.k_plus_projection,
+            &self.noisy_plaintext,
+            &self.decoded,
+            &self.decoder_coefficient,
+            &self.decoder_lower_comparison,
+            &self.decoder_upper_comparison,
+            &self.decoder_lower_bool_to_int,
+            &self.decoder_upper_bool_to_int,
+            &self.decoder_sum,
+            &self.decoder_equals_two,
+            &self.decoder_quarter,
+            &self.decoder_three_quarter,
+            &self.decoder_two,
+            &self.decoder_three,
+        ]
+        .into_iter()
+        .cloned()
+        .chain(self.injector_trace.clone().into_retained_values())
+        // BGG routes refer to operands, external producers, and transport
+        // rebinding values in addition to the 30 result handles.
+        .chain(self.bgg_trace.clone().into_retained_values())
+        .collect::<Vec<_>>();
+        values.into_iter()
+    }
+
+    fn freeze(
+        &self,
+        map: &FreezeMap,
+        graph: &mxx_ir_core::Graph,
+    ) -> Result<DiamondDecryptionSiteRefs, FreezeResolveError> {
+        Ok(DiamondDecryptionSiteRefs {
+            injector_initial: map.resolve_typed(&self.injector_initial)?,
+            injector_transitions: map.resolve_typed(&self.injector_transitions)?,
+            injector_states: map.resolve_typed(&self.injector_states)?,
+            injector_loop_output: map.resolve_typed(&self.injector_loop_output)?,
+            injector_body_output: map.resolve_typed(&self.injector_body_output)?,
+            injector_trace: self.injector_trace.resolve(map)?,
+            bgg_operations: {
+                let frozen = self.bgg_trace.resolve_with_graph(map, Some(graph))?;
+                mxx_bgg::BggTraceFragment::validate_frozen_paths(&frozen, graph)
+                    .map_err(|_| FreezeResolveError::Missing)?;
+                frozen
+            },
+            witness_vectors: map.resolve_typed(&self.witness_vectors)?,
+            one_projection: map.resolve_typed(&self.one_projection)?,
+            k_projection: map.resolve_typed(&self.k_projection)?,
+            decoder_projection: map.resolve_typed(&self.decoder_projection)?,
+            public_keys: map.resolve_typed(&self.public_keys)?,
+            circuit_output: map.resolve_typed(&self.circuit_output)?,
+            one_minus_circuit: map.resolve_typed(&self.one_minus_circuit)?,
+            projected_difference: map.resolve_typed(&self.projected_difference)?,
+            r_decomposition: map.resolve_typed(&self.r_decomposition)?,
+            k_plus_projection: map.resolve_typed(&self.k_plus_projection)?,
+            noisy_plaintext: map.resolve_typed(&self.noisy_plaintext)?,
+            decoded: map.resolve_typed(&self.decoded)?,
+            decoder_coefficient: map.resolve_typed(&self.decoder_coefficient)?,
+            decoder_lower_comparison: map.resolve_typed(&self.decoder_lower_comparison)?,
+            decoder_upper_comparison: map.resolve_typed(&self.decoder_upper_comparison)?,
+            decoder_lower_bool_to_int: map.resolve_typed(&self.decoder_lower_bool_to_int)?,
+            decoder_upper_bool_to_int: map.resolve_typed(&self.decoder_upper_bool_to_int)?,
+            decoder_sum: map.resolve_typed(&self.decoder_sum)?,
+            decoder_equals_two: map.resolve_typed(&self.decoder_equals_two)?,
+            decoder_quarter: map.resolve_typed(&self.decoder_quarter)?,
+            decoder_three_quarter: map.resolve_typed(&self.decoder_three_quarter)?,
+            decoder_two: map.resolve_typed(&self.decoder_two)?,
+            decoder_three: map.resolve_typed(&self.decoder_three)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiamondEncryptionSemanticRefs {
+    pub message: FrozenValueRef,
+    pub instance: FrozenValueRef,
+    pub circuit: DiamondCircuitSemanticRefs,
+    pub sites: DiamondStructuralSiteRefs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiamondDecryptionSemanticRefs {
+    pub instance: FrozenValueRef,
+    pub witness: FrozenValueRef,
+    pub circuit: DiamondCircuitSemanticRefs,
+    pub noisy_plaintext: FrozenValueRef,
+    pub decoded: FrozenValueRef,
+    pub sites: DiamondDecryptionSiteRefs,
+}
+
 pub struct DiamondEncryptionGraph {
     pub graph: BuiltGraph,
+    pub semantic_refs: DiamondEncryptionSemanticRefs,
 }
 
 pub struct DiamondDecryptionGraph {
     pub graph: BuiltGraph,
+    pub semantic_refs: DiamondDecryptionSemanticRefs,
 }
 
 struct DiamondEncryptionBuild {
@@ -157,6 +424,45 @@ pub enum DiamondCompileError {
     FamilyWidth,
     #[error("Diamond parameter expression evaluation failed: {0}")]
     ParameterExpression(String),
+    #[error(transparent)]
+    FreezeResolve(#[from] FreezeResolveError),
+}
+
+#[derive(Clone)]
+struct CircuitConstructionRefs {
+    active_gate_counts: ValueHandle,
+    gate_kinds: ValueHandle,
+    left_sources: ValueHandle,
+    right_sources: ValueHandle,
+    output_sources: ValueHandle,
+    evaluated_output: ValueHandle,
+}
+
+impl CircuitConstructionRefs {
+    fn retained_values(&self) -> Vec<ValueHandle> {
+        vec![
+            self.active_gate_counts.clone(),
+            self.gate_kinds.clone(),
+            self.left_sources.clone(),
+            self.right_sources.clone(),
+            self.output_sources.clone(),
+            self.evaluated_output.clone(),
+        ]
+    }
+
+    fn resolve(
+        &self,
+        freeze_map: &FreezeMap,
+    ) -> Result<DiamondCircuitSemanticRefs, FreezeResolveError> {
+        Ok(DiamondCircuitSemanticRefs {
+            active_gate_counts: freeze_map.resolve_typed(&self.active_gate_counts)?,
+            gate_kinds: freeze_map.resolve_typed(&self.gate_kinds)?,
+            left_sources: freeze_map.resolve_typed(&self.left_sources)?,
+            right_sources: freeze_map.resolve_typed(&self.right_sources)?,
+            output_sources: freeze_map.resolve_typed(&self.output_sources)?,
+            evaluated_output: freeze_map.resolve_typed(&self.evaluated_output)?,
+        })
+    }
 }
 
 impl DiamondWeCompiler {
@@ -251,13 +557,15 @@ impl DiamondWeCompiler {
 impl DiamondWeProtocolFamily {
     fn build_encryption(&self) -> Result<DiamondEncryptionBuild, DiamondCompileError> {
         let (context, circuit_params) =
-            BooleanCircuitFamilyParams::declare(DslContext::new("diamond-we-encryption"));
+            BooleanCircuitFamilyParams::declare(DslContext::new(ENCRYPTION_STAGE_NAME));
         let (context, graph_params) = DiamondGraphParams::declare(context);
         let ring = graph_params.input.ring();
         let circuit_data = BooleanCircuitFamilyInputs::protocol_inputs(&context, &circuit_params);
         let instance = context
             .int_family_input(BOOLEAN_INSTANCE_INPUT, circuit_params.max_layer_width.clone());
         let message_input = ring.bool_input(MESSAGE_INPUT);
+        let message_ref = message_input.value_handle().clone();
+        let instance_ref = instance.value_handle().clone();
         let message_int = message_input.to_int();
         let message_zero = ring.zero((1, 1));
         let message_one = ring.identity(1);
@@ -330,6 +638,14 @@ impl DiamondWeProtocolFamily {
             circuit_output_family.matrices.get(circuit_output_index.clone());
         let circuit_output =
             BggPublicKeyWire { matrix: circuit_output_matrix, reveal_plaintext: true };
+        let circuit_refs = CircuitConstructionRefs {
+            active_gate_counts: circuit_data.active_gate_counts.value_handle().clone(),
+            gate_kinds: circuit_data.gate_kinds.value_handle().clone(),
+            left_sources: circuit_data.left_sources.value_handle().clone(),
+            right_sources: circuit_data.right_sources.value_handle().clone(),
+            output_sources: circuit_data.output_sources.value_handle().clone(),
+            evaluated_output: circuit_output.matrix.value_handle().clone(),
+        };
 
         let gadget = ring.gadget(
             1,
@@ -421,7 +737,31 @@ impl DiamondWeProtocolFamily {
         let decoder_sample = decoder_trapdoor.sample_preimage(decoder_target, (state_columns, 1));
         let decoder_preimage = decoder_sample;
 
-        let graph = context
+        // Keep the construction handles that define the application boundary.
+        // They are later resolved by the freeze map and emitted as typed,
+        // occurrence-aware site references.
+        let structural_sites = DiamondStructuralSiteHandles {
+            injector_initial: input_preprocessing.initial.value_handle().clone(),
+            injector_transitions: input_preprocessing.transitions.value_handle().clone(),
+            injector_target_trace: input_preprocessing.target_trace.clone(),
+            selector_magnitude_trace: input_preprocessing.selector_magnitude_trace.clone(),
+            injector_final_trapdoor: input_preprocessing
+                .final_trapdoors
+                .secret_value_handle()
+                .clone(),
+            one_preimage: one_preimage.value_handle().clone(),
+            k_preimage: k_preimage.value_handle().clone(),
+            decoder_preimage: decoder_preimage.value_handle().clone(),
+            public_keys: public_keys.matrices.value_handle().clone(),
+            witness_preimages: witness_preimages.value_handle().clone(),
+            r_decomposition: r_decomposition
+                .clone()
+                .into_preimage_relation()
+                .value_handle()
+                .clone(),
+        };
+
+        let context = context
             .public_family_output(DiamondArtifactNames::INITIAL_STATE, input_preprocessing.initial)?
             .public_preimage_output(DiamondArtifactNames::ONE_PREIMAGE, one_preimage)?
             .public_preimage_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
@@ -438,9 +778,18 @@ impl DiamondWeProtocolFamily {
             .public_preimage_family_output(
                 DiamondArtifactNames::WITNESS_PREIMAGES,
                 witness_preimages,
-            )?
-            .build()?;
-        Ok(DiamondEncryptionBuild { graph: DiamondEncryptionGraph { graph } })
+            )?;
+        let mut retained = vec![message_ref.clone(), instance_ref.clone()];
+        retained.extend(circuit_refs.retained_values());
+        retained.extend(structural_sites.retained_values());
+        let (graph, freeze_map) = context.build_retaining(retained)?;
+        let semantic_refs = DiamondEncryptionSemanticRefs {
+            message: freeze_map.resolve_typed(&message_ref)?,
+            instance: freeze_map.resolve_typed(&instance_ref)?,
+            circuit: circuit_refs.resolve(&freeze_map)?,
+            sites: structural_sites.freeze(&freeze_map)?,
+        };
+        Ok(DiamondEncryptionBuild { graph: DiamondEncryptionGraph { graph, semantic_refs } })
     }
 
     fn build_decryption(
@@ -448,13 +797,14 @@ impl DiamondWeProtocolFamily {
         encryption: ProductionId,
     ) -> Result<DiamondDecryptionBuild, DiamondCompileError> {
         let (context, circuit_params) =
-            BooleanCircuitFamilyParams::declare(DslContext::new("diamond-we-decryption"));
+            BooleanCircuitFamilyParams::declare(DslContext::new(DECRYPTION_STAGE_NAME));
         let (context, graph_params) = DiamondGraphParams::declare(context);
         let ring = graph_params.input.ring();
         let max_state_count = graph_params.input.max_state_count();
         let circuit_data = BooleanCircuitFamilyInputs::protocol_inputs(&context, &circuit_params);
         let instance = context
             .int_family_input(BOOLEAN_INSTANCE_INPUT, circuit_params.max_layer_width.clone());
+        let instance_ref = instance.value_handle().clone();
         let state_columns = graph_params.input.state_columns();
         let public_columns = graph_params.input.digit_count.clone();
         let initial_state = ring.family_artifact_input(
@@ -466,6 +816,7 @@ impl DiamondWeProtocolFamily {
         );
         let witness =
             context.int_family_input(BOOLEAN_WITNESS_INPUT, circuit_params.max_layer_width.clone());
+        let witness_ref = witness.value_handle().clone();
         let witness_size = graph_params.input.witness_size();
         let witness_indices = Parallel::range(witness_size.clone())
             .map_values(|bit| bit.as_int().add(Int::constant(0)))?;
@@ -486,9 +837,15 @@ impl DiamondWeProtocolFamily {
             (state_columns.clone(), state_columns.clone()),
             ArtifactConfidentiality::Public,
         );
+        let initial_state_ref = initial_state.value_handle().clone();
+        let transitions_ref = transitions.value_handle().clone();
         let input_evaluation = DiamondInputInjector::parameterized(graph_params.input.clone())
-            .evaluate(initial_state, witness_digits, transitions)?;
+            .evaluate_with_trace(initial_state, witness_digits, transitions)?;
         let states = input_evaluation.states;
+        let states_ref = states.value_handle().clone();
+        let injector_trace = input_evaluation.trace;
+        let injector_loop_output = injector_trace.loop_handle().clone();
+        let injector_body_output = injector_trace.body_output_handle().clone();
         let public_key_compiler = Self::public_key_compiler(&graph_params);
         let encoding_compiler = BggEncodingCompiler { public_key: public_key_compiler.clone() };
         let public_key_matrices = ring.family_artifact_input(
@@ -498,6 +855,7 @@ impl DiamondWeProtocolFamily {
             (1, public_columns.clone()),
             ArtifactConfidentiality::Public,
         );
+        let public_keys_ref = public_key_matrices.value_handle().clone();
         let public_keys =
             BggPublicKeyFamily { matrices: public_key_matrices, reveal_plaintext: true };
         let one_preimage = ring.preimage_artifact_input(
@@ -524,6 +882,9 @@ impl DiamondWeProtocolFamily {
         let one_vector = initial_projection_state.clone().apply_preimage(one_preimage);
         let k_vector = initial_projection_state.clone().apply_preimage(k_preimage);
         let decoder = initial_projection_state.apply_preimage(decoder_preimage);
+        let one_projection_ref = one_vector.value_handle().clone();
+        let k_projection_ref = k_vector.value_handle().clone();
+        let decoder_projection_ref = decoder.value_handle().clone();
         let one_public_key_matrix = public_keys.matrices.get_static(0);
         let one_plaintext_matrix = ring.identity(1);
         let one_encoding = BggEncodingWire {
@@ -555,6 +916,7 @@ impl DiamondWeProtocolFamily {
             (witness_states, witness_preimages),
             |_, (state, preimage)| Ok::<_, DslError>(state.apply_preimage(preimage)),
         )?;
+        let witness_vectors_ref = witness_vectors.value_handle().clone();
         let witness_public_keys =
             public_keys.matrices.clone().reindex(vec![witness_size.clone()], witness_source_map)?;
         let witness_zero_plaintexts =
@@ -659,7 +1021,7 @@ impl DiamondWeProtocolFamily {
             },
             plaintexts: circuit_plaintexts,
         };
-        let circuit_output_family = evaluate_boolean_encoding_layers(
+        let (circuit_output_family, bgg_trace) = evaluate_boolean_encoding_layers_with_trace(
             &context,
             &circuit_params,
             circuit_data.clone(),
@@ -669,25 +1031,90 @@ impl DiamondWeProtocolFamily {
         )?;
         let circuit_output_index = circuit_data.output_source();
         let circuit_vector = circuit_output_family.vectors.get(circuit_output_index.clone());
+        let circuit_output_ref = circuit_vector.value_handle().clone();
+        let circuit_refs = CircuitConstructionRefs {
+            active_gate_counts: circuit_data.active_gate_counts.value_handle().clone(),
+            gate_kinds: circuit_data.gate_kinds.value_handle().clone(),
+            left_sources: circuit_data.left_sources.value_handle().clone(),
+            right_sources: circuit_data.right_sources.value_handle().clone(),
+            output_sources: circuit_data.output_sources.value_handle().clone(),
+            evaluated_output: circuit_vector.value_handle().clone(),
+        };
         let r_decomposed = ring.preimage_artifact_input(
             encryption,
             DiamondArtifactNames::R_DECOMPOSED,
             (public_columns, 1),
             ArtifactConfidentiality::Public,
         );
+        let r_decomposed_ref = r_decomposed.value_handle().clone();
         // The residual decoder target is R_dec = (C_one-C_out) * R.  Apply the
         // stored decomposition to consume R_dec, then subtract the K and
         // residual projections from the decoder state.
         let one_minus_circuit = one_encoding.vector - circuit_vector;
+        let one_minus_circuit_ref = one_minus_circuit.value_handle().clone();
         let projected_difference = one_minus_circuit.apply_preimage(r_decomposed);
+        let projected_difference_ref = projected_difference.value_handle().clone();
         let k_plus_projection = k_vector + projected_difference;
+        let k_plus_projection_ref = k_plus_projection.value_handle().clone();
         let noisy_plaintext = decoder - k_plus_projection;
-        let decoded = decode_boolean_interval(noisy_plaintext.clone(), graph_params.input.modulus);
-        let graph = context
+        let decoder_result =
+            decode_boolean_interval(noisy_plaintext.clone(), graph_params.input.modulus);
+        let decoded = decoder_result.value;
+        let noisy_plaintext_ref = noisy_plaintext.value_handle().clone();
+        let decoded_ref = decoded.value_handle().clone();
+        let structural_sites = DiamondDecryptionSiteHandles {
+            injector_initial: initial_state_ref,
+            injector_transitions: transitions_ref,
+            injector_states: states_ref,
+            injector_loop_output,
+            injector_body_output,
+            injector_trace,
+            bgg_trace,
+            witness_vectors: witness_vectors_ref,
+            one_projection: one_projection_ref,
+            k_projection: k_projection_ref,
+            decoder_projection: decoder_projection_ref,
+            public_keys: public_keys_ref,
+            circuit_output: circuit_output_ref,
+            one_minus_circuit: one_minus_circuit_ref,
+            projected_difference: projected_difference_ref,
+            r_decomposition: r_decomposed_ref,
+            k_plus_projection: k_plus_projection_ref,
+            noisy_plaintext: noisy_plaintext_ref.clone(),
+            decoded: decoded_ref.clone(),
+            decoder_coefficient: decoder_result.coefficient.value_handle().clone(),
+            decoder_lower_comparison: decoder_result.lower_comparison.value_handle().clone(),
+            decoder_upper_comparison: decoder_result.upper_comparison.value_handle().clone(),
+            decoder_lower_bool_to_int: decoder_result.lower_bool_to_int.value_handle().clone(),
+            decoder_upper_bool_to_int: decoder_result.upper_bool_to_int.value_handle().clone(),
+            decoder_sum: decoder_result.sum.value_handle().clone(),
+            decoder_equals_two: decoder_result.equals_two.value_handle().clone(),
+            decoder_quarter: decoder_result.quarter.value_handle().clone(),
+            decoder_three_quarter: decoder_result.three_quarter.value_handle().clone(),
+            decoder_two: decoder_result.two.value_handle().clone(),
+            decoder_three: decoder_result.three.value_handle().clone(),
+        };
+        let context = context
             .output(NOISY_PLAINTEXT_OUTPUT, noisy_plaintext)?
-            .bool_output(DECODED_OUTPUT, decoded)?
-            .build()?;
-        Ok(DiamondDecryptionBuild { graph: DiamondDecryptionGraph { graph } })
+            .bool_output(DECODED_OUTPUT, decoded)?;
+        let mut retained = vec![
+            instance_ref.clone(),
+            witness_ref.clone(),
+            noisy_plaintext_ref.clone(),
+            decoded_ref.clone(),
+        ];
+        retained.extend(circuit_refs.retained_values());
+        retained.extend(structural_sites.retained_values());
+        let (graph, freeze_map) = context.build_retaining(retained)?;
+        let semantic_refs = DiamondDecryptionSemanticRefs {
+            instance: freeze_map.resolve_typed(&instance_ref)?,
+            witness: freeze_map.resolve_typed(&witness_ref)?,
+            circuit: circuit_refs.resolve(&freeze_map)?,
+            noisy_plaintext: freeze_map.resolve_typed(&noisy_plaintext_ref)?,
+            decoded: freeze_map.resolve_typed(&decoded_ref)?,
+            sites: structural_sites.freeze(&freeze_map, &graph.graph)?,
+        };
+        Ok(DiamondDecryptionBuild { graph: DiamondDecryptionGraph { graph, semantic_refs } })
     }
 
     fn public_key_compiler(params: &DiamondGraphParams) -> BggPublicKeyCompiler {
@@ -715,16 +1142,51 @@ impl DiamondWeProtocolFamily {
     }
 }
 
-fn decode_boolean_interval(noisy_plaintext: Mat, modulus: IntExpr) -> Bool {
+struct DecoderConstruction {
+    value: Bool,
+    coefficient: Int,
+    lower_comparison: Bool,
+    upper_comparison: Bool,
+    lower_bool_to_int: Int,
+    upper_bool_to_int: Int,
+    sum: Int,
+    equals_two: Bool,
+    quarter: Int,
+    three_quarter: Int,
+    two: Int,
+    three: Int,
+}
+
+fn decode_boolean_interval(noisy_plaintext: Mat, modulus: IntExpr) -> DecoderConstruction {
     let coefficient = noisy_plaintext.extract_coefficient(0);
     let quarter = Int::evaluate(IntExpr::RoundDiv(
         Box::new(IntExpr::Sub(Box::new(modulus), Box::new(IntExpr::constant(2)))),
         Box::new(IntExpr::constant(4)),
     ));
-    let upper = quarter.clone().mul(Int::constant(3));
-    let lower_ok = quarter.less_equal(coefficient.clone());
-    let upper_ok = coefficient.less_equal(upper);
-    lower_ok.to_int().add(upper_ok.to_int()).equal(Int::constant(2))
+    let three = Int::constant(3);
+    let three_quarter = quarter.clone().mul(three.clone());
+    let upper = three_quarter.clone();
+    let lower_ok = quarter.clone().less_equal(coefficient.clone());
+    let upper_ok = coefficient.clone().less_equal(upper);
+    let lower_bool_to_int = lower_ok.clone().to_int();
+    let upper_bool_to_int = upper_ok.clone().to_int();
+    let sum = lower_bool_to_int.clone().add(upper_bool_to_int.clone());
+    let two = Int::constant(2);
+    let equals_two = sum.clone().equal(two.clone());
+    DecoderConstruction {
+        value: equals_two.clone(),
+        coefficient,
+        lower_comparison: lower_ok,
+        upper_comparison: upper_ok,
+        lower_bool_to_int,
+        upper_bool_to_int,
+        sum,
+        equals_two,
+        quarter,
+        three_quarter,
+        two,
+        three,
+    }
 }
 
 #[cfg(test)]
@@ -732,8 +1194,11 @@ mod tests {
     use super::*;
     use mxx_ir_core::{
         RealExpr,
-        artifact::{ProductionId, SpecHash, export_validated_manifest},
+        artifact::{ArtifactConfidentiality, ProductionId, SpecHash, export_validated_manifest},
+        encoding::spec_hash,
+        linked::{ConcreteNodePayload, LinkedProgramStage, ValidatedLinkedProgram},
         node::NodeKind,
+        render_lean_program,
         types::WireType,
     };
     use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
@@ -898,6 +1363,272 @@ mod tests {
                 .filter(|node| matches!(node.kind(), NodeKind::ApplyPreimage))
                 .count() >=
                 4
+        );
+    }
+
+    #[test]
+    fn linked_projection_covers_the_reached_diamond_inventory() {
+        let compiler = compiler();
+        let bindings = compiler.circuit_bindings().unwrap();
+        let encryption_build = compiler.build_encryption().unwrap();
+        let encryption_refs = encryption_build.semantic_refs.clone();
+        let encryption = encryption_build.graph;
+        let encryption = encryption.validate(&bindings).unwrap();
+        let encryption_id = ProductionId {
+            spec_hash: spec_hash(&encryption.source, &encryption.bindings).unwrap(),
+            execution_nonce: [41; 32],
+        };
+        let encryption_manifest =
+            export_validated_manifest(encryption_id.clone(), &encryption).unwrap();
+        let encryption_stage_manifest = encryption_manifest.clone();
+
+        let decryption_build = compiler.build_decryption(encryption_id.clone()).unwrap();
+        let decryption_refs = decryption_build.semantic_refs.clone();
+        let decryption = decryption_build.graph;
+        let decryption = decryption
+            .validate_with_manifests(
+                &bindings,
+                &BTreeMap::from([(encryption_id.clone(), encryption_manifest)]),
+            )
+            .unwrap();
+        let decryption_id = ProductionId {
+            spec_hash: spec_hash(&decryption.source, &decryption.bindings).unwrap(),
+            execution_nonce: [42; 32],
+        };
+        let decryption_manifest =
+            export_validated_manifest(decryption_id.clone(), &decryption).unwrap();
+
+        let linked = ValidatedLinkedProgram::new(vec![
+            LinkedProgramStage::new(encryption_id, encryption, encryption_stage_manifest),
+            LinkedProgramStage::new(decryption_id, decryption, decryption_manifest),
+        ])
+        .unwrap();
+        assert!(!linked.artifact_links().is_empty());
+        let projection = linked.semantic_projection().unwrap();
+        assert!(!projection.stages.is_empty());
+        let mut saw_loop = false;
+        let mut saw_grid = false;
+        let mut saw_grid_reindex = false;
+        let mut saw_reindex = false;
+        let mut saw_nontrivial_reindex = false;
+        let mut saw_loop_slot = false;
+        let mut saw_hash_tags = false;
+        let mut saw_artifact_input = false;
+        for stage in &projection.stages {
+            for scope in &stage.scopes {
+                for node in &scope.nodes {
+                    match &node.kind {
+                        ConcreteNodePayload::SequentialLoop(_) => saw_loop = true,
+                        ConcreteNodePayload::ParallelGrid(payload) => {
+                            saw_grid = true;
+                            saw_grid_reindex |= payload.input_modes.iter().any(|mode| {
+                                matches!(mode, mxx_ir_core::ConcreteGridInputMode::Reindex {
+                                    map: mxx_ir_core::ConcreteIndexMap { input_indices, .. }
+                                } if !input_indices.is_empty())
+                            });
+                        }
+                        ConcreteNodePayload::FamilyReindex { map, .. } => {
+                            saw_reindex = true;
+                            saw_nontrivial_reindex |= !map.input_indices.is_empty();
+                        }
+                        ConcreteNodePayload::HashSample {
+                            tag_prefix,
+                            tag_expressions,
+                            tag_decimal_expressions,
+                            tag_u64_le_expressions,
+                            ..
+                        } => {
+                            saw_hash_tags |= !tag_prefix.is_empty() ||
+                                !tag_expressions.is_empty() ||
+                                !tag_decimal_expressions.is_empty() ||
+                                !tag_u64_le_expressions.is_empty();
+                        }
+                        ConcreteNodePayload::Input { artifact: Some(_), .. } => {
+                            saw_artifact_input = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if !scope.structural_slots.is_empty() &&
+                    scope.nodes.iter().any(|node| {
+                        fn contains_slot(expr: &mxx_ir_core::ConcreteStructuralIntExpr) -> bool {
+                            use mxx_ir_core::ConcreteStructuralIntExpr as Expr;
+                            match expr {
+                                Expr::StructuralSlot(_) => true,
+                                Expr::Add(a, b) |
+                                Expr::Sub(a, b) |
+                                Expr::Mul(a, b) |
+                                Expr::ExactDivide(a, b) |
+                                Expr::RoundDivide(a, b) => contains_slot(a) || contains_slot(b),
+                                Expr::Log2Ceil(value) => contains_slot(value),
+                                Expr::Literal(_) => false,
+                            }
+                        }
+                        match &node.kind {
+                            ConcreteNodePayload::FamilyGetStatic { indices } => {
+                                indices.iter().any(|index| {
+                                    fn index_slot(
+                                        expr: &mxx_ir_core::ConcreteIndexMapExpr,
+                                    ) -> bool {
+                                        use mxx_ir_core::ConcreteIndexMapExpr as Expr;
+                                        match expr {
+                                            Expr::StructuralSlot(_) => true,
+                                            Expr::Add(a, b) |
+                                            Expr::Sub(a, b) |
+                                            Expr::Mul(a, b) |
+                                            Expr::EuclideanDivide(a, b) |
+                                            Expr::EuclideanRemainder(a, b) |
+                                            Expr::Equal(a, b) |
+                                            Expr::Less(a, b) |
+                                            Expr::LessEqual(a, b) => index_slot(a) || index_slot(b),
+                                            Expr::Log2Ceil(value) => index_slot(value),
+                                            Expr::Select { selector, branches } => {
+                                                index_slot(selector) ||
+                                                    branches.iter().any(index_slot)
+                                            }
+                                            Expr::Literal(_) | Expr::Axis(_) => false,
+                                        }
+                                    }
+                                    index_slot(index)
+                                })
+                            }
+                            ConcreteNodePayload::EvaluateInt(expr) => contains_slot(expr),
+                            _ => false,
+                        }
+                    })
+                {
+                    saw_loop_slot = true;
+                }
+            }
+        }
+        assert!(saw_loop, "Diamond graph must exercise sequential-loop lowering");
+        assert!(saw_grid, "Diamond graph must exercise parallel-grid lowering");
+        assert!(saw_grid_reindex, "Diamond graph must retain a nontrivial grid reindex map");
+        assert!(saw_reindex, "Diamond graph must exercise family-reindex lowering");
+        assert!(saw_nontrivial_reindex, "Diamond graph must retain family-reindex indices");
+        assert!(saw_loop_slot, "Diamond graph must retain a structural slot in a nested body");
+        assert!(saw_hash_tags, "Diamond graph must retain hash tag expressions");
+        assert!(saw_artifact_input, "decryption must contain a linked artifact input");
+        let link = &linked.artifact_links()[0];
+        assert_eq!(link.consumer_input.artifact_name, link.producer.name);
+        assert_eq!(link.consumer_input.confidentiality, ArtifactConfidentiality::Public);
+        assert_eq!(link.consumer.wire_type, link.producer.wire_type);
+        let rendered = render_lean_program(&linked, "MxxGenerated.DiamondProgram").unwrap();
+        assert_eq!(rendered.linked_program_sha256, linked.semantic_hash().unwrap());
+        assert!(rendered.modules.iter().any(|module| module.source.contains("familyReindex")));
+
+        let selected = crate::diamond::DiamondSelectedParameters {
+            parameters: DCRTPolyParams::new(8, 1, 20, 4),
+            compiler: compiler.clone(),
+            crt_depth: 1,
+            log_ring_dimension: 3,
+            ring_dimension: 8,
+            modulus: 257u16.into(),
+            modulus_bits: 9,
+            achieved_security_bits: 1,
+            noise_bound: 1u8.into(),
+        };
+        let bound = match crate::diamond::correctness::derive_output_noise_bound(&linked, &selected)
+        {
+            Ok(bound) => bound,
+            Err(error) => panic!("unexpected Diamond bound derivation failure: {error}"),
+        };
+        let request = crate::diamond::correctness::DiamondLeanClaimRequest {
+            linked: &linked,
+            program: &rendered,
+            parameters: &selected,
+            bound: &bound,
+            refs: crate::diamond::correctness::DiamondCandidateSemanticRefs {
+                encryption: &encryption_refs,
+                decryption: &decryption_refs,
+            },
+        };
+        let candidate = crate::diamond::correctness::emit_diamond_lean_correctness(
+            &request,
+            crate::diamond::correctness::EmitMode::Check,
+        )
+        .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        candidate.manifest.write(temp.path()).unwrap();
+        let candidate_file = temp.path().join("MxxGenerated/DiamondCandidate.lean");
+        let we_lean =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lean").canonicalize().unwrap();
+        let existing_lean_path = std::process::Command::new("lake")
+            .args(["env", "printenv", "LEAN_PATH"])
+            .current_dir(&we_lean)
+            .output()
+            .unwrap();
+        assert!(existing_lean_path.status.success());
+        let lean_path = format!(
+            "{}:{}",
+            temp.path().display(),
+            String::from_utf8_lossy(&existing_lean_path.stdout).trim()
+        );
+        let lean_executable = std::process::Command::new("lake")
+            .args(["env", "which", "lean"])
+            .current_dir(&we_lean)
+            .output()
+            .unwrap();
+        assert!(lean_executable.status.success());
+        let lean_executable = String::from_utf8(lean_executable.stdout).unwrap();
+        let lean_executable = lean_executable.trim();
+        for module in &rendered.modules {
+            let source = temp.path().join(&module.relative_path);
+            let object = source.with_extension("olean");
+            let compiled = std::process::Command::new(lean_executable)
+                .args([
+                    "--root",
+                    temp.path().to_str().unwrap(),
+                    "-o",
+                    object.to_str().unwrap(),
+                    source.to_str().unwrap(),
+                ])
+                .env("LEAN_PATH", &lean_path)
+                .current_dir(&we_lean)
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "generated Diamond module {} failed to compile:\n{}\n{}",
+                module.module_name,
+                String::from_utf8_lossy(&compiled.stdout),
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+        }
+        let validation_file = temp.path().join("ValidateDiamond.lean");
+        std::fs::write(
+            &validation_file,
+            "import MxxIrCore.Program\nimport MxxGenerated.DiamondProgram\n#eval Mxx.Generated.linkedProgramData.validate\n",
+        )
+        .unwrap();
+        let validation = std::process::Command::new(lean_executable)
+            .args(["--root", temp.path().to_str().unwrap(), validation_file.to_str().unwrap()])
+            .env("LEAN_PATH", &lean_path)
+            .output()
+            .unwrap();
+        assert!(
+            validation.status.success(),
+            "validator diagnostics failed:\n{}\n{}",
+            String::from_utf8_lossy(&validation.stdout),
+            String::from_utf8_lossy(&validation.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&validation.stdout).lines().next(),
+            Some("true"),
+            "validator diagnostics:\n{}",
+            String::from_utf8_lossy(&validation.stdout)
+        );
+        let candidate_check = std::process::Command::new(lean_executable)
+            .args(["--root", temp.path().to_str().unwrap(), candidate_file.to_str().unwrap()])
+            .env("LEAN_PATH", lean_path)
+            .output()
+            .unwrap();
+        assert!(
+            candidate_check.status.success(),
+            "generated Diamond Candidate failed to elaborate:\n{}\n{}",
+            String::from_utf8_lossy(&candidate_check.stdout),
+            String::from_utf8_lossy(&candidate_check.stderr)
         );
     }
 

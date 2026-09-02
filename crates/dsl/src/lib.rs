@@ -7,10 +7,10 @@ use mxx_ir_core::{
     IndexExpr, IndexMap, IntExpr, NodeHandle, ParamEnv, RealExpr, SealMap, SealedSubgraph,
     SubgraphHandle, ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
-    graph::with_new_construction_scope,
+    graph::{current_construction_scope, with_new_construction_scope},
     node::{
-        ArtifactInput, ConstantMatrix, IndexRange, MatrixBinaryOp, NodeKind,
-        ParallelGrid as IrParallelGrid, SampleRange, SequentialLoop,
+        ArtifactInput, ConstantMatrix, GridInputMode as IrParallelGridInputMode, IndexRange,
+        MatrixBinaryOp, NodeKind, ParallelGrid as IrParallelGrid, SampleRange, SequentialLoop,
     },
     types::{MatrixType, WireType},
 };
@@ -2107,6 +2107,125 @@ impl Family<Int> {
         );
         body_value.parallel_families(&node, &mut 0, &count, pending)
     }
+
+    /// Variant of [`parallel_select_mats`] that retains the scalar selection
+    /// node inside the sealed parallel body for proof-only consumers.
+    pub fn parallel_select_mats_with_trace(
+        self,
+        candidates: Vec<Family<Mat>>,
+    ) -> Result<(Family<Mat>, ProofTraceTransport, ParallelSelectTrace), DslError> {
+        if self.shape.len() != 1 || candidates.iter().any(|candidate| candidate.shape.len() != 1) {
+            return Err(DslError::ParallelFamilyRank);
+        }
+        let Some(first) = candidates.first() else {
+            return Err(DslError::Schema);
+        };
+        let count = self.count.clone();
+        if candidates.iter().any(|candidate| {
+            candidate.count != count ||
+                candidate.element_schema.matrix_type != first.element_schema.matrix_type
+        }) {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let matrix_type = first.element_schema.matrix_type.clone();
+        let candidate_count = candidates.len();
+        let (index_slot, body_result) = with_loop_index(|_| {
+            with_new_construction_scope(|scope| {
+                let mut next = 0;
+                let selector = IntType.placeholders_from(&mut next);
+                let branches = (0..candidate_count)
+                    .map(|_| MatType(matrix_type.clone()).placeholders_from(&mut next))
+                    .collect::<Vec<_>>();
+                let mut inputs = selector.flatten();
+                inputs.extend(branches.iter().flat_map(GraphValue::flatten));
+                selector.clone().select(branches.clone()).map(|output| {
+                    let output_handle = output.value_handle().clone();
+                    (output, output_handle, inputs, scope)
+                })
+            })
+        });
+        let (body_value, output_handle, explicit_inputs, scope) = body_result?;
+        let sealed = SubgraphHandle::seal(
+            "parallel-select-mats-trace-body",
+            scope,
+            explicit_inputs.clone(),
+            body_value.flatten(),
+            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+        )?;
+        let tracked_operands = std::iter::once(self.value.clone())
+            .chain(candidates.iter().map(|candidate| candidate.value.clone()))
+            .collect::<Vec<_>>();
+        let mut arguments = vec![self.value];
+        arguments.extend(candidates.iter().map(|candidate| candidate.value.clone()));
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        let argument_count = arguments.len() - sealed.captures.len();
+        let node = NodeHandle::parallel_grid(
+            sealed.handle.clone(),
+            arguments,
+            body_value.parallel_family_types(&count)?,
+            IrParallelGrid {
+                shape: vec![count.clone()],
+                index_slots: vec![index_slot],
+                bindings: Vec::new(),
+                input_modes: (0..argument_count)
+                    .map(|_| mxx_ir_core::node::GridInputMode::Reindex {
+                        map: IndexMap::new([IndexExpr::Axis(0)]),
+                    })
+                    .chain(
+                        (0..sealed.captures.len())
+                            .map(|_| mxx_ir_core::node::GridInputMode::Broadcast),
+                    )
+                    .collect(),
+            },
+        );
+        let pending = Pending::merge(
+            std::iter::once(self.pending)
+                .chain(candidates.into_iter().map(|candidate| candidate.pending))
+                .chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
+        );
+        let output = body_value.parallel_families(&node, &mut 0, &count, pending)?;
+        let producer = sealed.remap.resolve(&output_handle).cloned().ok_or_else(|| {
+            DslError::Freeze(FreezeError::ForeignScope {
+                graph: "parallel select trace producer".to_owned(),
+            })
+        })?;
+        let operands = explicit_inputs
+            .iter()
+            .map(|operand| {
+                sealed.remap.resolve(operand).cloned().ok_or_else(|| {
+                    DslError::Freeze(FreezeError::ForeignScope {
+                        graph: "parallel select trace operand".to_owned(),
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transport = ProofTraceTransport::from_handles(vec![ProofTraceHandle {
+            producer: output_handle,
+            sealed_remapped: producer.clone(),
+        }])
+        .track_handles(tracked_operands)?;
+        Ok((
+            output,
+            transport,
+            ParallelSelectTrace {
+                producer,
+                operands,
+                gate_slot: IntExpr::LoopIndex(index_slot),
+                candidates: (0..candidate_count).map(|index| IntExpr::constant(index)).collect(),
+            },
+        ))
+    }
+}
+
+/// Structural trace for one family selection. The producer and operands are
+/// handles in the sealed parallel-body scope, and `operands` is ordered exactly
+/// as the underlying `Select` node arguments: selector followed by branches.
+#[derive(Clone, Debug)]
+pub struct ParallelSelectTrace {
+    pub producer: ValueHandle,
+    pub operands: Vec<ValueHandle>,
+    pub gate_slot: IntExpr,
+    pub candidates: Vec<IntExpr>,
 }
 
 #[derive(Clone)]
@@ -2621,7 +2740,7 @@ impl Family<Mat> {
     ) -> Result<Self, DslError> {
         // One selector family per source axis defines f(u)=(s_0[u],...,s_{r-1}[u]) and
         // Y[u]=X[f(u)].
-        if output_shape.is_empty() || selectors.is_empty() {
+        if output_shape.is_empty() || selectors.is_empty() || selectors.len() != self.shape.len() {
             return Err(DslError::Schema);
         }
         let mut arguments = vec![self.value];
@@ -2958,6 +3077,32 @@ impl Family<Mat> {
         self,
         body: impl FnOnce(LoopIndex, Mat) -> R,
     ) -> Result<R::Families, DslError> {
+        let (output, trace) = self.parallel_map_values_impl(|index, input| {
+            Ok::<_, DslError>((body(index, input), None))
+        })?;
+        debug_assert!(trace.is_none());
+        Ok(output)
+    }
+
+    /// Proof-only variant of [`parallel_map_values`] that retains selected
+    /// producers from the same sealed closure.  Both methods call the same
+    /// lowering routine, so requesting a trace cannot create a second protocol
+    /// graph or change the executable family value.
+    pub fn parallel_map_values_with_trace<R: ParallelOutput>(
+        self,
+        body: impl FnOnce(LoopIndex, Mat) -> Result<(R, ProofTraceTransport), DslError>,
+    ) -> Result<(R::Families, ProofTraceTransport), DslError> {
+        let (output, trace) = self.parallel_map_values_impl(|index, input| {
+            body(index, input).map(|(output, trace)| (output, Some(trace)))
+        })?;
+        let trace = trace.ok_or(DslError::Schema)?;
+        Ok((output, trace))
+    }
+
+    fn parallel_map_values_impl<R: ParallelOutput>(
+        self,
+        body: impl FnOnce(LoopIndex, Mat) -> Result<(R, Option<ProofTraceTransport>), DslError>,
+    ) -> Result<(R::Families, Option<ProofTraceTransport>), DslError> {
         if self.shape.len() != 1 {
             // This API exposes one flat LoopIndex and ParallelOutput builds a
             // rank-one result. Reject a Cartesian input instead of silently
@@ -2967,19 +3112,20 @@ impl Family<Mat> {
         let outer_family = self.value.clone();
         let count = self.count.clone();
         let element_type = self.element_schema.matrix_type.clone();
-        let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
+        let (index_slot, body_result) = with_loop_index(|index| {
             with_new_construction_scope(|scope| {
                 let input = Mat::source_input("item".to_owned(), element_type, None);
-                let output = body(index, input.clone());
-                (output, input.value, scope)
+                let (output, trace) = body(index, input.clone())?;
+                Ok::<_, DslError>((output, trace, input.value, scope))
             })
         });
+        let (body_value, trace, explicit_input, scope) = body_result?;
         let body_outputs = body_value.flatten();
         let sealed = SubgraphHandle::seal(
             "parallel-map-body",
             scope,
             vec![explicit_input],
-            body_outputs,
+            body_outputs.clone(),
             CapturePolicy::BroadcastScalarsAndArtifactFamilies,
         )?;
         let mut arguments = vec![outer_family];
@@ -3004,7 +3150,42 @@ impl Family<Mat> {
         );
         let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
         let mut next_port = 0;
-        body_value.parallel_families(&node, &mut next_port, &count, pending)
+        let output = body_value.parallel_families(&node, &mut next_port, &count, pending)?;
+        let Some(trace) = trace else {
+            return Ok((output, None));
+        };
+        let exposed_outputs = (0..body_outputs.len())
+            .map(|port| node.output(port as u32).ok_or(DslError::Schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let exposures = body_outputs
+            .iter()
+            .zip(exposed_outputs.iter())
+            .enumerate()
+            .map(|(output_index, (producer, parent_output))| -> Result<_, DslError> {
+                let sealed_producer = sealed.remap.resolve(producer).cloned().ok_or_else(|| {
+                    DslError::Freeze(FreezeError::ForeignScope {
+                        graph: "parallel map trace output is not sealed".to_owned(),
+                    })
+                })?;
+                Ok(ProofTraceExposure {
+                    producer: producer.clone(),
+                    sealed_producer,
+                    parent_output: parent_output.clone(),
+                    output_index,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let trace = trace.map_selected_handles(&sealed.remap)?.with_exposures(exposures);
+        for handle in &trace.handles {
+            if handle.producer.construction_scope() == scope &&
+                sealed.remap.resolve(&handle.producer).is_none()
+            {
+                return Err(DslError::Freeze(FreezeError::ForeignScope {
+                    graph: "unreachable parallel map trace producer".to_owned(),
+                }));
+            }
+        }
+        Ok((output, Some(trace)))
     }
 
     pub fn parallel_threshold_decode_ints(
@@ -3502,6 +3683,43 @@ impl Sequential {
 }
 
 impl SequentialRange {
+    /// Builds a sequential scan and additionally returns one output handle of
+    /// the loop node for structural certificate generation. The handle does
+    /// not alter runtime semantics.
+    pub fn scan_with_loop_handle<S, I>(
+        self,
+        initial: S,
+        invariants: I,
+        body: impl FnOnce(LoopIndex, S, I) -> Result<S, DslError>,
+    ) -> Result<(S, ValueHandle), DslError>
+    where
+        S: GraphValue,
+        I: GraphValue,
+    {
+        let values = self.scan(initial, invariants, body)?;
+        let handle = values.flatten().into_iter().next().ok_or(DslError::Schema)?;
+        Ok((values, handle))
+    }
+
+    /// Variant of [`scan`] that also preserves selected handles created in the
+    /// sealed body scope. Handles are remapped through sealing, so callers can
+    /// freeze them without relying on node traversal or numeric paths.
+    pub fn scan_with_trace_handles<S, I>(
+        self,
+        initial: S,
+        invariants: I,
+        body: impl FnOnce(LoopIndex, S, I) -> Result<(S, ProofTraceTransport), DslError>,
+    ) -> Result<(S, ProofTraceTransport), DslError>
+    where
+        S: GraphValue,
+        I: GraphValue,
+    {
+        let (values, trace) = self.scan_impl(initial, invariants, |index, state, invariants| {
+            body(index, state, invariants).map(|(next, trace)| (next, Some(trace)))
+        })?;
+        Ok((values, trace.ok_or(DslError::Schema)?))
+    }
+
     /// Builds a sequential carried-state loop.
     ///
     /// `invariants` are explicit body inputs so ordinary executable families can be read at a
@@ -3517,6 +3735,23 @@ impl SequentialRange {
         S: GraphValue,
         I: GraphValue,
     {
+        let (values, trace) = self.scan_impl(initial, invariants, |index, state, invariants| {
+            body(index, state, invariants).map(|next| (next, None))
+        })?;
+        debug_assert!(trace.is_none());
+        Ok(values)
+    }
+
+    fn scan_impl<S, I>(
+        self,
+        initial: S,
+        invariants: I,
+        body: impl FnOnce(LoopIndex, S, I) -> Result<(S, Option<ProofTraceTransport>), DslError>,
+    ) -> Result<(S, Option<ProofTraceTransport>), DslError>
+    where
+        S: GraphValue,
+        I: GraphValue,
+    {
         let count = self.count;
         let state_schema = initial.schema();
         let invariant_schema = invariants.schema();
@@ -3524,7 +3759,6 @@ impl SequentialRange {
         if state_types.is_empty() {
             return Err(DslError::Schema);
         }
-
         let (index_slot, body_result) = with_loop_index(|index| {
             with_new_construction_scope(|scope| {
                 let mut next_argument = 0;
@@ -3533,26 +3767,26 @@ impl SequentialRange {
                 let mut explicit_inputs = state.flatten();
                 explicit_inputs.extend(invariant_values.flatten());
                 body(index, state, invariant_values)
-                    .map(|next_state| (next_state, explicit_inputs, scope))
+                    .map(|(next_state, trace)| (next_state, trace, explicit_inputs, scope))
             })
         });
-        let (next_state, explicit_inputs, scope) = body_result?;
+        let (next_state, trace, explicit_inputs, scope) = body_result?;
         if next_state.schema().wire_types() != state_types {
             return Err(DslError::Schema);
         }
+        let state_outputs = next_state.flatten();
         let sealed = SubgraphHandle::seal(
             "sequential-scan-body",
             scope,
             explicit_inputs,
-            next_state.flatten(),
+            state_outputs,
             CapturePolicy::BroadcastScalarsAndArtifactFamilies,
         )?;
-
         let mut arguments = initial.flatten();
         arguments.extend(invariants.flatten());
         arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
         let node = NodeHandle::sequential_loop(
-            sealed.handle.clone(),
+            sealed.handle,
             arguments,
             state_types.clone(),
             SequentialLoop {
@@ -3570,7 +3804,21 @@ impl SequentialRange {
         let values = (0..state_types.len())
             .map(|port| node.output(port as u32).ok_or(DslError::Schema))
             .collect::<Result<Vec<_>, _>>()?;
-        S::from_values(&state_schema, &values, pending)
+        let values = S::from_values(&state_schema, &values, pending)?;
+        let Some(trace) = trace else {
+            return Ok((values, None));
+        };
+        let trace = trace.map_selected_handles(&sealed.remap)?;
+        for handle in &trace.handles {
+            if handle.producer.construction_scope() == scope &&
+                sealed.remap.resolve(&handle.producer).is_none()
+            {
+                return Err(DslError::Freeze(FreezeError::ForeignScope {
+                    graph: "unreachable sequential trace producer".to_owned(),
+                }));
+            }
+        }
+        Ok((values, Some(trace)))
     }
 }
 
@@ -3590,17 +3838,44 @@ impl ParallelRange {
         self,
         body: impl FnOnce(LoopIndex) -> R,
     ) -> Result<R::Families, DslError> {
+        let (output, trace) =
+            self.map_values_impl(|index| Ok::<_, DslError>((body(index), None)))?;
+        debug_assert!(trace.is_none());
+        Ok(output)
+    }
+
+    /// Proof-only variant of [`map_values`] that retains selected producers
+    /// from the same sealed range body. The executable `ParallelGrid` and its
+    /// `parallel-range-body` closure are constructed by the shared lowering
+    /// below, so requesting a trace cannot create a second protocol graph.
+    pub fn map_values_with_trace<R: ParallelOutput>(
+        self,
+        body: impl FnOnce(LoopIndex) -> Result<(R, ProofTraceTransport), DslError>,
+    ) -> Result<(R::Families, ProofTraceTransport), DslError> {
+        let (output, trace) =
+            self.map_values_impl(|index| body(index).map(|(output, trace)| (output, Some(trace))))?;
+        Ok((output, trace.ok_or(DslError::Schema)?))
+    }
+
+    fn map_values_impl<R: ParallelOutput>(
+        self,
+        body: impl FnOnce(LoopIndex) -> Result<(R, Option<ProofTraceTransport>), DslError>,
+    ) -> Result<(R::Families, Option<ProofTraceTransport>), DslError> {
         // A range is the rank-one case: for i in [0,count), evaluate Y[i]=F(i), then wrap each
         // body output in a family of shape [count].
         let count = self.count;
-        let (index_slot, (body_value, scope)) =
-            with_loop_index(|index| with_new_construction_scope(|scope| (body(index), scope)));
+        let (index_slot, body_result) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| {
+                body(index).map(|(body_value, trace)| (body_value, trace, scope))
+            })
+        });
+        let (body_value, trace, scope) = body_result?;
         let body_outputs = body_value.flatten();
         let sealed = SubgraphHandle::seal(
             "parallel-range-body",
             scope,
             Vec::new(),
-            body_outputs,
+            body_outputs.clone(),
             CapturePolicy::BroadcastScalarsAndArtifactFamilies,
         )?;
         let arguments = sealed.captures.iter().map(|capture| capture.outer.clone()).collect();
@@ -3619,7 +3894,33 @@ impl ParallelRange {
             },
         );
         let pending = body_value.pending().remap(&sealed.remap);
-        body_value.parallel_families(&node, &mut 0, &count, pending)
+        let output = body_value.parallel_families(&node, &mut 0, &count, pending)?;
+        let Some(trace) = trace else {
+            return Ok((output, None));
+        };
+        let exposed_outputs = (0..body_outputs.len())
+            .map(|port| node.output(port as u32).ok_or(DslError::Schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let exposures = body_outputs
+            .iter()
+            .zip(exposed_outputs.iter())
+            .enumerate()
+            .map(|(output_index, (producer, parent_output))| -> Result<_, DslError> {
+                let sealed_producer = sealed.remap.resolve(producer).cloned().ok_or_else(|| {
+                    DslError::Freeze(FreezeError::ForeignScope {
+                        graph: "parallel range trace output is not sealed".to_owned(),
+                    })
+                })?;
+                Ok(ProofTraceExposure {
+                    producer: producer.clone(),
+                    sealed_producer,
+                    parent_output: parent_output.clone(),
+                    output_index,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let trace = trace.map_selected_handles(&sealed.remap)?.with_exposures(exposures);
+        Ok((output, Some(trace)))
     }
 
     pub fn try_map_values<R: ParallelOutput>(
@@ -3802,7 +4103,7 @@ fn finish_parallel_zip<R: ParallelOutput>(
         body_name,
         scope,
         explicit_inputs,
-        body_outputs,
+        body_outputs.clone(),
         CapturePolicy::BroadcastScalarsAndArtifactFamilies,
     )?;
     let zipped_count = arguments.len();
@@ -3852,6 +4153,103 @@ pub fn parallel_zip_bundle_result<T: ParallelZipTuple, R: ParallelOutput>(
     families.parallel_zip_tuple_result(body)
 }
 
+/// Two-family zip variant that preserves selected child-body handles through
+/// sealing. This is intended for proof/certificate construction only.
+pub fn parallel_zip_bundle_trace<A, B, R>(
+    families: (Family<A>, Family<B>),
+    body: impl FnOnce(LoopIndex, (A, B)) -> Result<(R, ProofTraceTransport), DslError>,
+) -> Result<(R::Families, ProofTraceTransport), DslError>
+where
+    A: GraphValue,
+    B: GraphValue,
+    R: ParallelOutput,
+{
+    if families.0.shape.len() != 1 || families.1.shape.len() != 1 {
+        return Err(DslError::ParallelZipRank);
+    }
+    if families.0.count != families.1.count {
+        return Err(DslError::FamilyCountMismatch);
+    }
+    let count = families.0.count.clone();
+    let first_schema = families.0.element_schema.schema();
+    let second_schema = families.1.element_schema.schema();
+    let (index_slot, body_result) = with_loop_index(|index| {
+        with_new_construction_scope(|scope| {
+            let mut next = 0;
+            let first = first_schema.placeholders_from(&mut next);
+            let second = second_schema.placeholders_from(&mut next);
+            let mut explicit_inputs = first.flatten();
+            explicit_inputs.extend(second.flatten());
+            let (output, trace) = body(index, (first, second))?;
+            Ok::<_, DslError>((output, trace, explicit_inputs, scope))
+        })
+    });
+    let (body_value, trace, explicit_inputs, scope) = body_result?;
+    if explicit_inputs.len() != 2 {
+        return Err(DslError::Schema);
+    }
+    let body_outputs = body_value.flatten();
+    let sealed = SubgraphHandle::seal(
+        "parallel-zip-trace-body",
+        scope,
+        explicit_inputs,
+        body_outputs.clone(),
+        CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+    )?;
+    let mut arguments = vec![families.0.value, families.1.value];
+    arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+    let node = NodeHandle::parallel_grid(
+        sealed.handle,
+        arguments,
+        body_value.parallel_family_types(&count)?,
+        IrParallelGrid {
+            shape: vec![count.clone()],
+            index_slots: vec![index_slot],
+            bindings: Vec::new(),
+            input_modes: (0..2)
+                .map(|_| IrParallelGridInputMode::Reindex {
+                    map: IndexMap::new([IndexExpr::Axis(0)]),
+                })
+                .chain((0..sealed.captures.len()).map(|_| IrParallelGridInputMode::Broadcast))
+                .collect(),
+        },
+    );
+    let pending = body_value.pending().remap(&sealed.remap);
+    let output = body_value.parallel_families(&node, &mut 0, &count, pending)?;
+    let exposed_outputs = (0..body_outputs.len())
+        .map(|port| node.output(port as u32).ok_or(DslError::Schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let exposures = body_outputs
+        .iter()
+        .zip(exposed_outputs.iter())
+        .enumerate()
+        .map(|(output_index, (producer, parent_output))| -> Result<_, DslError> {
+            let sealed_producer = sealed.remap.resolve(producer).cloned().ok_or_else(|| {
+                DslError::Freeze(FreezeError::ForeignScope {
+                    graph: "parallel zip trace output is not sealed".to_owned(),
+                })
+            })?;
+            Ok(ProofTraceExposure {
+                producer: producer.clone(),
+                sealed_producer,
+                parent_output: parent_output.clone(),
+                output_index,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let trace = trace.map_selected_handles(&sealed.remap)?.with_exposures(exposures);
+    for handle in &trace.handles {
+        if handle.producer.construction_scope() == scope &&
+            sealed.remap.resolve(&handle.producer).is_none()
+        {
+            return Err(DslError::Freeze(FreezeError::ForeignScope {
+                graph: "unreachable parallel trace producer".to_owned(),
+            }));
+        }
+    }
+    Ok((output, trace))
+}
+
 impl LoopIndex {
     pub fn expression(&self) -> IntExpr {
         self.expression.clone()
@@ -3878,6 +4276,251 @@ impl Pending {
 
     fn remap(&self, _map: &SealMap) -> Self {
         Self
+    }
+}
+
+/// An opaque proof-only producer token.  It contains no executable graph output;
+/// the sealed value is routed to its structural scope only when the graph freezes.
+#[derive(Clone, Debug)]
+pub struct ProofTraceHandle {
+    producer: ValueHandle,
+    sealed_remapped: ValueHandle,
+}
+
+/// Exact body producer to parent-grid output correspondence created by a
+/// parallel zip.  The parent output is the executable family wire; the body
+/// producer remains the exact construction handle used by the trace.
+#[derive(Clone, Debug)]
+pub struct ProofTraceExposure {
+    pub producer: ValueHandle,
+    pub sealed_producer: ValueHandle,
+    pub parent_output: ValueHandle,
+    pub output_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ProofTraceAlias {
+    source: ValueHandle,
+    sealed_remapped: ValueHandle,
+}
+
+/// Ordered proof-only trace selections produced by one structural builder.
+#[derive(Clone, Debug, Default)]
+pub struct ProofTraceTransport {
+    handles: Vec<ProofTraceHandle>,
+    aliases: Vec<ProofTraceAlias>,
+    exposures: Vec<ProofTraceExposure>,
+}
+
+impl ProofTraceTransport {
+    fn from_handles(handles: Vec<ProofTraceHandle>) -> Self {
+        Self { handles, aliases: Vec::new(), exposures: Vec::new() }
+    }
+
+    /// Remaps the selected values through one sealed-body map while preserving
+    /// their construction-time producer identities. A producer from a nested
+    /// child scope is already owned by that child and is therefore left at its
+    /// current sealed handle.
+    pub fn map_selected_handles(&self, remap: &SealMap) -> Result<Self, DslError> {
+        let remap_or_preserve_nested = |value: &ValueHandle, kind: &str| {
+            remap
+                .resolve(value)
+                .cloned()
+                .or_else(|| {
+                    (value.construction_scope() != current_construction_scope())
+                        .then(|| value.clone())
+                })
+                .ok_or_else(|| {
+                    DslError::Freeze(FreezeError::ForeignScope {
+                        graph: format!("unresolved proof trace {kind}"),
+                    })
+                })
+        };
+        let handles = self
+            .handles
+            .iter()
+            .map(|handle| -> Result<_, DslError> {
+                Ok(ProofTraceHandle {
+                    producer: handle.producer.clone(),
+                    sealed_remapped: remap_or_preserve_nested(&handle.sealed_remapped, "producer")
+                        .or_else(|_| remap_or_preserve_nested(&handle.producer, "producer"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let aliases = self
+            .aliases
+            .iter()
+            .map(|alias| -> Result<_, DslError> {
+                Ok(ProofTraceAlias {
+                    source: alias.source.clone(),
+                    sealed_remapped: remap_or_preserve_nested(&alias.sealed_remapped, "alias")
+                        .or_else(|_| remap_or_preserve_nested(&alias.source, "alias"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let exposures = self
+            .exposures
+            .iter()
+            .map(|exposure| -> Result<_, DslError> {
+                Ok(ProofTraceExposure {
+                    producer: exposure.producer.clone(),
+                    sealed_producer: remap_or_preserve_nested(
+                        &exposure.sealed_producer,
+                        "exposure producer",
+                    )
+                    .or_else(|_| {
+                        remap_or_preserve_nested(&exposure.producer, "exposure producer")
+                    })?,
+                    parent_output: remap_or_preserve_nested(
+                        &exposure.parent_output,
+                        "exposure output",
+                    )?,
+                    output_index: exposure.output_index,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_handles(handles).with_aliases(aliases).with_exposures(exposures))
+    }
+
+    fn with_aliases(mut self, aliases: Vec<ProofTraceAlias>) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    fn with_exposures(mut self, exposures: Vec<ProofTraceExposure>) -> Self {
+        self.exposures = exposures;
+        self
+    }
+
+    /// Returns exact body-to-parent correspondences recorded by a parallel
+    /// builder. This metadata does not add executable graph roots.
+    pub fn exposures(&self) -> &[ProofTraceExposure] {
+        &self.exposures
+    }
+
+    /// Tracks ordinary graph handles that a domain-specific trace entry uses
+    /// as operands. These aliases carry no role or semantic meaning; they only
+    /// preserve the construction handle through later sealing boundaries.
+    pub fn track_handles(
+        mut self,
+        values: impl IntoIterator<Item = ValueHandle>,
+    ) -> Result<Self, DslError> {
+        let scope = current_construction_scope();
+        for value in values {
+            if value.construction_scope() != scope {
+                return Err(DslError::Freeze(FreezeError::ForeignScope {
+                    graph: "proof trace operand".to_owned(),
+                }));
+            }
+            if !self.aliases.iter().any(|alias| alias.source == value) {
+                self.aliases
+                    .push(ProofTraceAlias { source: value.clone(), sealed_remapped: value });
+            }
+        }
+        Ok(self)
+    }
+
+    /// Combines proof-only selections from several builders without changing
+    /// the executable graph. Each handle is still retained in its original
+    /// sealed structural scope when the enclosing graph is frozen.
+    pub fn merge(values: impl IntoIterator<Item = Self>) -> Self {
+        let mut handles = Vec::new();
+        let mut aliases = Vec::new();
+        let mut exposures = Vec::new();
+        for value in values {
+            handles.extend(value.handles);
+            aliases.extend(value.aliases);
+            exposures.extend(value.exposures);
+        }
+        Self { handles, aliases, exposures }
+    }
+
+    /// Keeps only the selected producers needed by one typed proof view after
+    /// several views shared a structural lowering. Aliases remain available
+    /// for operand resolution, while body-output exposures are retained only
+    /// when their producer belongs to the requested view.
+    pub fn retain_selected(&self, producers: impl IntoIterator<Item = ValueHandle>) -> Self {
+        let producers = producers.into_iter().collect::<Vec<_>>();
+        let selected = |producer: &ValueHandle| producers.iter().any(|value| value == producer);
+        Self {
+            handles: self
+                .handles
+                .iter()
+                .filter(|handle| selected(&handle.producer))
+                .cloned()
+                .collect(),
+            aliases: self.aliases.clone(),
+            exposures: self
+                .exposures
+                .iter()
+                .filter(|exposure| selected(&exposure.producer))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Selects producers from the current structural body.  Captured values
+    /// from an outer scope are rejected before sealing, keeping the token local
+    /// to the body that created it.
+    pub fn select(values: impl IntoIterator<Item = ValueHandle>) -> Result<Self, DslError> {
+        let scope = current_construction_scope();
+        let handles = values
+            .into_iter()
+            .map(|producer| {
+                if producer.construction_scope() != scope {
+                    return Err(DslError::Freeze(FreezeError::ForeignScope {
+                        graph: "proof trace producer".to_owned(),
+                    }));
+                }
+                Ok(ProofTraceHandle { producer: producer.clone(), sealed_remapped: producer })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { handles, aliases: Vec::new(), exposures: Vec::new() })
+    }
+
+    /// Returns the sealed values to be supplied to `build_retaining`.
+    pub fn into_retained_values(self) -> Vec<ValueHandle> {
+        self.handles
+            .into_iter()
+            .map(|handle| handle.sealed_remapped)
+            .chain(self.exposures.into_iter().map(|exposure| exposure.parent_output))
+            .collect()
+    }
+
+    /// Returns the sealed producer handles without consuming this transport.
+    /// This is intended for typed domain manifests that attach operation
+    /// metadata while retaining the same freeze-only producers.
+    pub fn retained_values(&self) -> Vec<ValueHandle> {
+        self.handles
+            .iter()
+            .map(|handle| handle.sealed_remapped.clone())
+            .chain(self.exposures.iter().map(|exposure| exposure.parent_output.clone()))
+            .collect()
+    }
+
+    /// Returns the original construction-time producers in selection order.
+    /// Domain-specific trace fragments use these stable identities for their
+    /// entries and resolve them through the composed transport at the final
+    /// freeze boundary.
+    pub fn selected_handles(&self) -> Vec<ValueHandle> {
+        self.handles.iter().map(|handle| handle.producer.clone()).collect()
+    }
+
+    /// Resolves a construction-time handle through this transport when it was
+    /// explicitly selected. Unselected handles are returned unchanged so a
+    /// domain manifest can retain ordinary graph operands without guessing.
+    pub fn remap_handle(&self, value: &ValueHandle) -> ValueHandle {
+        self.aliases
+            .iter()
+            .find(|alias| alias.source == *value)
+            .map(|alias| alias.sealed_remapped.clone())
+            .or_else(|| {
+                self.handles
+                    .iter()
+                    .find(|handle| handle.producer == *value)
+                    .map(|handle| handle.sealed_remapped.clone())
+            })
+            .unwrap_or_else(|| value.clone())
     }
 }
 
@@ -4182,11 +4825,18 @@ impl DslContext {
     }
 
     pub fn build(self) -> Result<BuiltGraph, DslError> {
-        self.build_with_freeze_map().map(|(graph, _)| graph)
+        self.build_retaining(Vec::new()).map(|(graph, _)| graph)
     }
 
-    #[doc(hidden)]
-    pub fn build_with_freeze_map(self) -> Result<(BuiltGraph, mxx_ir_core::FreezeMap), DslError> {
+    /// Freezes the graph while retaining explicitly registered semantic values.
+    ///
+    /// The returned map is the only supported way to translate construction
+    /// handles into post-freeze wire identities. Values are retained without
+    /// becoming protocol outputs.
+    pub fn build_retaining(
+        self,
+        retained_values: impl IntoIterator<Item = ValueHandle>,
+    ) -> Result<(BuiltGraph, mxx_ir_core::FreezeMap), DslError> {
         let outputs = self
             .outputs
             .into_iter()
@@ -4198,7 +4848,7 @@ impl DslContext {
             self.name,
             self.parameters,
             outputs,
-            Vec::new(),
+            retained_values.into_iter().collect(),
             Vec::new(),
             self.real_constants,
         )?;
@@ -6478,6 +7128,37 @@ mod tests {
     }
 
     #[test]
+    fn matrix_family_gather_requires_one_selector_per_source_axis() {
+        let ring = Ring::new(17, 8);
+        let source = Parallel::grid(vec![IntExpr::constant(2), IntExpr::constant(2)])
+            .map(|_| ring.zero((1, 1)))
+            .unwrap();
+        let selector = || Family::<Int>::pack(vec![Int::constant(0), Int::constant(1)]).unwrap();
+        let output_shape = vec![IntExpr::constant(2)];
+
+        assert!(matches!(
+            source.clone().gather(output_shape.clone(), vec![selector()]),
+            Err(DslError::Schema)
+        ));
+        assert!(matches!(
+            source.clone().gather(output_shape.clone(), vec![selector(), selector(), selector()],),
+            Err(DslError::Schema)
+        ));
+
+        let gathered = source
+            .gather(output_shape.clone(), vec![selector(), selector()])
+            .expect("one selector per rank-two source axis");
+        assert_eq!(gathered.shape(), output_shape);
+        DslContext::new("rank-two-matrix-gather")
+            .public_family_output("gathered", gathered)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+    }
+
+    #[test]
     fn heterogeneous_parallel_zip_uses_one_loop() {
         let context = DslContext::new("heterogeneous-zip");
         let kinds = context.int_family_input("kinds", 2);
@@ -6919,5 +7600,120 @@ mod tests {
             ),
             Err(DslError::CanonicalInputUpperNonMatrix)
         ));
+    }
+
+    #[test]
+    fn proof_trace_transport_composes_parallel_inside_sequential() {
+        let ring = Ring::new(17, 8);
+        let family = ring.input_family("trace-family", 2, (1, 1));
+        let initial = (ring.zero((1, 1)), family.clone());
+        let (state, trace) = Sequential::range(1)
+            .scan_with_trace_handles(initial, Int::constant(0), |_, (state, family), _| {
+                let (next_family, inner_trace) = parallel_zip_bundle_trace(
+                    (family.clone(), family.clone()),
+                    |_, (left, right)| {
+                        let producer = left.clone() + right;
+                        Ok((
+                            producer.clone(),
+                            ProofTraceTransport::select([producer.value_handle().clone()])?,
+                        ))
+                    },
+                )?;
+                Ok(((state, next_family.clone()), inner_trace))
+            })
+            .expect("nested proof trace construction");
+        let output = state.0.clone();
+        assert_eq!(trace.handles.len(), 1);
+        assert_eq!(trace.exposures().len(), 1);
+        assert_eq!(trace.exposures()[0].output_index, 0);
+        let body_producer = trace.handles[0].producer.clone();
+        let sealed_remapped = trace.handles[0].sealed_remapped.clone();
+
+        let mut retained = trace.clone().into_retained_values();
+        retained.push(body_producer.clone());
+        let ordinary_value = output.value.clone();
+        let (built, freeze_map) = DslContext::new("nested-proof-trace")
+            .output("ordinary-output", output)
+            .expect("ordinary output")
+            .build_retaining(retained.clone())
+            .expect("nested traces freeze without foreign scope");
+        mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid nested graph");
+        for value in &retained {
+            let reference = freeze_map.resolve_typed(value).expect("retained typed reference");
+            assert_eq!(reference.wire_type(), value.wire_type());
+        }
+        let body_ref = freeze_map.resolve_typed(&body_producer).unwrap();
+        let sealed_ref = freeze_map.resolve_typed(&sealed_remapped).unwrap();
+        assert_eq!(body_ref.reference(), sealed_ref.reference());
+        assert!(built.graph.scopes().len() >= 3, "root, sequential body, and parallel body");
+        assert!(
+            built.graph.scopes().keys().any(|scope| matches!(
+                scope,
+                mxx_ir_core::FrozenGraphScopeId::SequentialBody { .. }
+            ))
+        );
+        assert!(matches!(
+            sealed_ref.reference().scope,
+            mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }
+        ));
+        let ordinary_output =
+            built.graph.outputs().get("ordinary-output").expect("ordinary output");
+        let ordinary_ref =
+            freeze_map.resolve_typed(&ordinary_value).expect("ordinary typed reference");
+        assert_eq!(ordinary_output.value, ordinary_ref.reference().wire);
+        assert_eq!(ordinary_ref.wire_type(), ordinary_value.wire_type());
+        let loop_node = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::SequentialLoop(_)))
+            .expect("sequential loop");
+        if let NodeKind::SequentialLoop(spec) = loop_node.kind() {
+            assert_eq!(loop_node.output_types().len(), spec.carried_count);
+        }
+
+        let outer_value = ring.zero((1, 1)).value_handle().clone();
+        let rejected = with_new_construction_scope(|_| ProofTraceTransport::select([outer_value]));
+        assert!(matches!(rejected, Err(DslError::Freeze(FreezeError::ForeignScope { .. }))));
+
+        let unreachable = Sequential::range(1).scan_with_trace_handles(
+            (ring.zero((1, 1)), family),
+            Int::constant(0),
+            |_, (state, family), _| {
+                let (next_family, inner_trace) = parallel_zip_bundle_trace(
+                    (family.clone(), family.clone()),
+                    |_, (left, right)| {
+                        let hidden = left.clone() + right;
+                        Ok((left, ProofTraceTransport::select([hidden.value_handle().clone()])?))
+                    },
+                )?;
+                Ok(((state, next_family), inner_trace))
+            },
+        );
+        assert!(matches!(unreachable, Err(DslError::Freeze(_))));
+
+        let output = ring.zero((1, 1));
+        let unreachable_root = ring.zero((1, 1));
+        let result = DslContext::new("unreachable-root-proof")
+            .output("output", output)
+            .expect("output")
+            .build_retaining([unreachable_root.value_handle().clone()]);
+        assert!(matches!(result, Err(DslError::Freeze(FreezeError::ForeignScope { .. }))));
+    }
+
+    #[test]
+    fn proof_trace_transport_rejects_unresolved_exposure() {
+        let ring = Ring::new(17, 8);
+        let value = ring.zero((1, 1)).value_handle().clone();
+        let transport = ProofTraceTransport::from_handles(Vec::new()).with_exposures(vec![
+            ProofTraceExposure {
+                producer: value.clone(),
+                sealed_producer: value.clone(),
+                parent_output: value,
+                output_index: 0,
+            },
+        ]);
+        assert!(transport.map_selected_handles(&SealMap::default()).is_err());
     }
 }

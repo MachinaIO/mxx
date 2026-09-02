@@ -2,11 +2,13 @@
 
 mod artifacts;
 mod config;
+pub mod correctness;
 mod estimate;
 #[cfg(feature = "gpu")]
 mod estimate_gpu;
 mod graph;
 mod parameter_search;
+mod representation;
 mod runtime;
 
 pub use artifacts::DiamondArtifactNames;
@@ -18,12 +20,15 @@ pub use estimate::{DiamondCostEstimate, DiamondEstimateError, estimate_diamond_c
 #[cfg(feature = "gpu")]
 pub use estimate_gpu::{DiamondGpuMeasurementBackend, DiamondGpuMeasurementError};
 pub use graph::{
-    DiamondCompileError, DiamondDecryptionGraph, DiamondEncryptionGraph, DiamondWeCompiler,
+    DiamondCircuitSemanticRefs, DiamondCompileError, DiamondDecryptionGraph,
+    DiamondDecryptionSemanticRefs, DiamondDecryptionSiteRefs, DiamondEncryptionGraph,
+    DiamondEncryptionSemanticRefs, DiamondStructuralSiteRefs, DiamondWeCompiler,
     DiamondWeProtocolFamily,
 };
 pub use parameter_search::{
     DiamondParameterSearch, DiamondParameterSearchError, DiamondSelectedParameters,
 };
+pub use representation::{DcrtRuntimeRepresentation, DcrtRuntimeRepresentationError};
 pub use runtime::{
     DiamondDecryptionResult, DiamondRuntimeError, DiamondWeCiphertext, DiamondWeRuntime,
 };

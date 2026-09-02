@@ -1,6 +1,6 @@
 use crate::{
     artifact::ArtifactConfidentiality,
-    expr::RealExpr,
+    expr::{IntExpr, RealExpr},
     node::{NodeKind, ParallelGrid, SequentialLoop, SubgraphCall},
     types::{NodeId, Port, WireRef, WireType},
 };
@@ -45,6 +45,7 @@ impl SourceLocation {
 }
 
 static NEXT_CONSTRUCTION_SCOPE: AtomicU64 = AtomicU64::new(1);
+static NEXT_FREEZE_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CONSTRUCTION_SCOPES: RefCell<Vec<ConstructionScopeId>> =
@@ -324,7 +325,7 @@ impl SubgraphHandle {
     ) -> Result<SealedSubgraph, FreezeError> {
         let name = name.into();
         if explicit_inputs.iter().any(|value| value.construction_scope() != scope) {
-            return Err(FreezeError::ForeignScope { graph: name });
+            return Err(FreezeError::ForeignScope { graph: name.clone() });
         }
         let mut sealer = ScopeSealer {
             scope,
@@ -350,7 +351,13 @@ impl SubgraphHandle {
                 );
             }
         }
-        Ok(SealedSubgraph { handle, captures: sealer.captured, remap: SealMap { values } })
+        for capture in &sealer.captured {
+            values.insert(
+                (capture.outer.node.identity(), capture.outer.port),
+                capture.placeholder.clone(),
+            );
+        }
+        return Ok(SealedSubgraph { handle, captures: sealer.captured, remap: SealMap { values } });
     }
 
     fn identity(&self) -> usize {
@@ -587,6 +594,7 @@ pub struct Graph {
 }
 
 struct GraphData {
+    freeze_id: u64,
     name: String,
     parameters: Vec<CompileParameter>,
     outputs: BTreeMap<String, OutputRoot>,
@@ -605,12 +613,13 @@ impl Graph {
         real_constants: BTreeMap<String, RealExpr>,
     ) -> Result<(Self, FreezeMap), FreezeError> {
         let name = name.into();
-        let root_values = outputs
-            .values()
-            .map(|output| output.value.clone())
-            .chain(retained_roots)
-            .collect::<Vec<_>>();
-        let mut freeze_map = FreezeMap::default();
+        // Proof selections are references only. They never become executable
+        // roots; every selected value must already be reachable from ordinary
+        // outputs, effects, inputs, or structural child outputs.
+        let retained_roots = retained_roots;
+        let root_values = outputs.values().map(|output| output.value.clone()).collect::<Vec<_>>();
+        let freeze_id = NEXT_FREEZE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut freeze_map = FreezeMap { freeze_id, values: HashMap::new() };
         let mut named = BTreeMap::<String, SubgraphHandle>::new();
         let root = freeze_scope(
             FrozenGraphScopeId::Root,
@@ -646,6 +655,12 @@ impl Graph {
             completed_names.insert(name);
         }
 
+        for value in retained_roots {
+            freeze_map.resolve_typed(&value).map_err(|_| FreezeError::ForeignScope {
+                graph: "unreachable retained proof value".to_owned(),
+            })?;
+        }
+
         let root_scope = scopes.get(&FrozenGraphScopeId::Root).expect("root scope");
         let frozen_outputs = outputs
             .into_iter()
@@ -668,6 +683,7 @@ impl Graph {
         Ok((
             Self {
                 inner: Arc::new(GraphData {
+                    freeze_id,
                     name,
                     parameters,
                     outputs: frozen_outputs,
@@ -682,6 +698,10 @@ impl Graph {
 
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    pub(crate) fn freeze_id(&self) -> u64 {
+        self.inner.freeze_id
     }
 
     pub fn parameters(&self) -> &[CompileParameter] {
@@ -811,12 +831,66 @@ impl FrozenCandidates {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FreezeMap {
+    freeze_id: u64,
     values: HashMap<(NodeIdentity, Port), FrozenCandidates>,
 }
 
+/// A construction-time value resolved to its typed location in a frozen graph.
+///
+/// This identity is produced only by [`FreezeMap`]. Consumers never infer it
+/// from a node's traversal position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenValueRef {
+    freeze_id: u64,
+    reference: ScopedWireRef,
+    wire_type: WireType,
+}
+
+/// A structural expression captured at freeze time.  Parameter substitution and
+/// binder-slot closure are deliberately deferred to the linked-program layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenStructuralIntExpr {
+    freeze_id: u64,
+    expression: IntExpr,
+}
+
+impl FrozenStructuralIntExpr {
+    pub fn expression(&self) -> &IntExpr {
+        &self.expression
+    }
+    pub(crate) fn freeze_id(&self) -> u64 {
+        self.freeze_id
+    }
+    pub(crate) fn new(freeze_id: u64, expression: IntExpr) -> Self {
+        Self { freeze_id, expression }
+    }
+}
+
+impl FrozenValueRef {
+    #[cfg(test)]
+    pub(crate) fn new(freeze_id: u64, reference: ScopedWireRef, wire_type: WireType) -> Self {
+        Self { freeze_id, reference, wire_type }
+    }
+
+    pub(crate) fn freeze_id(&self) -> u64 {
+        self.freeze_id
+    }
+
+    pub fn reference(&self) -> &ScopedWireRef {
+        &self.reference
+    }
+
+    pub fn wire_type(&self) -> &WireType {
+        &self.wire_type
+    }
+}
+
 impl FreezeMap {
+    pub fn freeze_structural_expr(&self, expression: IntExpr) -> FrozenStructuralIntExpr {
+        FrozenStructuralIntExpr::new(self.freeze_id, expression)
+    }
     fn insert(&mut self, value: &ValueHandle, candidate: ScopedWireRef) {
         self.values
             .entry((value.node.identity(), value.port))
@@ -840,6 +914,16 @@ impl FreezeMap {
             }),
             None => Err(FreezeResolveError::Missing),
         }
+    }
+
+    /// Resolves one explicitly retained construction value and preserves its
+    /// declared wire type alongside the stable frozen location.
+    pub fn resolve_typed(&self, value: &ValueHandle) -> Result<FrozenValueRef, FreezeResolveError> {
+        Ok(FrozenValueRef {
+            freeze_id: self.freeze_id,
+            reference: self.resolve_unique(value)?.clone(),
+            wire_type: value.wire_type().clone(),
+        })
     }
 }
 
@@ -1062,6 +1146,7 @@ impl SerializedGraph {
         }
         Ok(Graph {
             inner: Arc::new(GraphData {
+                freeze_id: NEXT_FREEZE_ID.fetch_add(1, Ordering::Relaxed),
                 name: self.name,
                 parameters: self.parameters,
                 outputs: self.outputs,

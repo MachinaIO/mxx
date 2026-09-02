@@ -24,8 +24,11 @@ pub use attribute_encoding::{
     AttributeMatrixEvaluation,
 };
 pub use boolean::{
-    BggEncodingFamily, BggPublicKeyFamily, DynamicBooleanBggError,
-    evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
+    BggEncodingFamily, BggOperandSource, BggPublicKeyFamily, BggTraceAnchor, BggTraceFragment,
+    BggTraceLane, BggTraceRole, BggTraceStep, BggTraceSubrole, BooleanEncodingTrace,
+    BooleanEncodingTraceEntry, DynamicBooleanBggError, FrozenBggOperandSource,
+    FrozenBooleanEncodingTraceEntry, evaluate_boolean_encoding_layers,
+    evaluate_boolean_encoding_layers_with_trace, evaluate_boolean_public_key_layers,
 };
 pub use circuit::{
     CircuitCompileError, NaiveEncodingSlotOperations, NaivePublicKeySlotOperations, NoPublicLookup,

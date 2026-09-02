@@ -21,7 +21,7 @@ use mxx_we::diamond::{
     DiamondGpuMeasurementBackend, DiamondParameterSearch, DiamondWeRuntime, estimate_diamond_cost,
 };
 use num_traits::Signed;
-use std::{env, num::NonZeroUsize, time::Instant};
+use std::{env, num::NonZeroUsize, path::PathBuf, time::Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -94,6 +94,8 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         trapdoor_sigma: 4.0,
         error_sigma: 1.0,
         bgg_tag: b"diamond-we-gpu-integration".to_vec(),
+        correctness_cache_target_directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target"),
     };
 
     info!("starting GPU Diamond WE parameter search and noise simulation");
@@ -116,11 +118,13 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         env_usize("MXX_DIAMOND_WE_GPU_PARALLEL_WIDTH", device_ids.len()).clamp(1, device_ids.len());
     let device_ids = device_ids[..effective_parallel_width].to_vec();
 
-    let (moduli, _, _) = selected.parameters.to_crt();
+    let runtime_representation = selected
+        .runtime_representation()
+        .expect("selected parameters must have a verified runtime representation");
     let gpu_parameters = GpuDCRTPolyParams::new_with_gpu(
-        selected.parameters.ring_dimension(),
-        moduli,
-        selected.parameters.base_bits(),
+        runtime_representation.ring_dimension(),
+        runtime_representation.moduli().to_vec(),
+        runtime_representation.base_bits(),
         device_ids.clone(),
         Some(effective_parallel_width as u32),
     );
@@ -179,9 +183,10 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
     let message = true;
     for iteration in 0..runtime_repetitions {
         let runtime_started = Instant::now();
-        let mut runtime = GpuDiamondWeRuntime::new(
+        let mut runtime = GpuDiamondWeRuntime::new_verified(
             selected.compiler.clone(),
             gpu_parameters.clone(),
+            runtime_representation.clone(),
             MemoryArtifactStore::default(),
         )
         .expect("GPU Diamond WE runtime construction")

@@ -1,5 +1,6 @@
 /target
 **/target/
+**/.lake/
 /lean/.lake/
 /test_data
 /crates/*/test_data

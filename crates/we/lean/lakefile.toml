@@ -1,0 +1,30 @@
+name = "mxx-we"
+version = "0.1.0"
+defaultTargets = ["MxxWe"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxPrimitives"
+path = "../../primitives/lean"
+
+[[require]]
+name = "MxxGadgets"
+path = "../../gadgets/lean"
+
+[[require]]
+name = "MxxBgg"
+path = "../../bgg/lean"
+
+[[require]]
+name = "MxxIrCore"
+path = "../../ir-core/lean"
+
+[[require]]
+name = "MxxRuntime"
+path = "../../runtime/lean"
+
+[[lean_lib]]
+name = "MxxWe"

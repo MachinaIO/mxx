@@ -1,4 +1,7 @@
-use super::{DiamondCompileError, DiamondConfigError, DiamondWeCompiler};
+use super::{
+    DcrtRuntimeRepresentation, DcrtRuntimeRepresentationError, DiamondCompileError,
+    DiamondConfigError, DiamondWeCompiler,
+};
 use crate::WitnessEncryptionRuntime;
 use mxx_gadgets::{
     Poly,
@@ -40,11 +43,13 @@ pub struct DiamondWeRuntime<M, U, H, T, S>
 where
     M: PolyMatrix,
 {
-    pub compiler: DiamondWeCompiler,
-    pub parameters: <M::P as Poly>::Params,
-    pub backend: PolyBackend<M, U, H, T>,
-    pub store: S,
-    pub execution_config: ExecutionConfig,
+    compiler: DiamondWeCompiler,
+    parameters: <M::P as Poly>::Params,
+    /// The exact deployment record checked before backend construction.
+    runtime_representation: DcrtRuntimeRepresentation,
+    backend: PolyBackend<M, U, H, T>,
+    store: S,
+    execution_config: ExecutionConfig,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +68,8 @@ pub enum DiamondRuntimeError {
     Store(String),
     #[error("the runtime parameters do not match the Diamond compiler layout")]
     ParameterMismatch,
+    #[error(transparent)]
+    Representation(#[from] DcrtRuntimeRepresentationError),
     #[error("the supplied instance has the wrong length")]
     InstanceLength,
     #[error("the supplied witness has the wrong length")]
@@ -83,17 +90,34 @@ where
     S: SessionStore,
     PolyBackend<M, U, H, T>: Backend<Matrix = M>,
 {
-    pub fn new(
+    pub fn compiler(&self) -> &DiamondWeCompiler {
+        &self.compiler
+    }
+    pub fn parameters(&self) -> &<M::P as Poly>::Params {
+        &self.parameters
+    }
+    pub fn runtime_representation(&self) -> &DcrtRuntimeRepresentation {
+        &self.runtime_representation
+    }
+
+    /// Construct a runtime only after checking its complete ordered DCRT deployment record.
+    pub fn new_verified(
         compiler: DiamondWeCompiler,
         parameters: <M::P as Poly>::Params,
+        representation: DcrtRuntimeRepresentation,
         store: S,
     ) -> Result<Self, DiamondRuntimeError> {
+        representation.validate_against_params(&parameters)?;
         let modulus: std::sync::Arc<num_bigint::BigUint> = parameters.modulus().into();
+        let gadget_base = 1u64.checked_shl(parameters.base_bits()).ok_or_else(|| {
+            DiamondRuntimeError::Representation(DcrtRuntimeRepresentationError::Invalid(
+                "base bits cannot be represented as a u64 gadget base".to_owned(),
+            ))
+        })?;
         if compiler.config.modulus != num_bigint::BigInt::from(modulus.as_ref().clone()) ||
             compiler.config.ring_dimension != parameters.ring_dimension() as usize ||
             compiler.config.digit_count != parameters.modulus_digits() ||
-            compiler.config.gadget_base !=
-                num_bigint::BigInt::from(1u64 << parameters.base_bits())
+            compiler.config.gadget_base != num_bigint::BigInt::from(gadget_base)
         {
             return Err(DiamondRuntimeError::ParameterMismatch);
         }
@@ -101,9 +125,36 @@ where
             compiler,
             backend: PolyBackend::new_for_execution([parameters.clone()]),
             parameters,
+            runtime_representation: representation,
             store,
             execution_config: ExecutionConfig::default(),
         })
+    }
+
+    /// Return an error if the runtime parameter object no longer matches its deployment record.
+    pub fn validate_representation(
+        &self,
+        representation: &DcrtRuntimeRepresentation,
+    ) -> Result<(), DiamondRuntimeError> {
+        representation.validate_against_params(&self.parameters)?;
+        let gadget_base = 1u64.checked_shl(representation.base_bits()).ok_or_else(|| {
+            DiamondRuntimeError::Representation(DcrtRuntimeRepresentationError::Invalid(
+                "base bits cannot be represented as a u64 gadget base".to_owned(),
+            ))
+        })?;
+        if self.compiler.config.modulus !=
+            num_bigint::BigInt::from(representation.modulus().clone()) ||
+            representation.ring_dimension() as usize != self.compiler.config.ring_dimension ||
+            representation.digit_count() != self.compiler.config.digit_count ||
+            self.compiler.config.gadget_base != num_bigint::BigInt::from(gadget_base)
+        {
+            return Err(DiamondRuntimeError::ParameterMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn validate_runtime_representation(&self) -> Result<(), DiamondRuntimeError> {
+        self.validate_representation(&self.runtime_representation)
     }
 
     pub fn with_execution_config(mut self, execution_config: ExecutionConfig) -> Self {
@@ -128,6 +179,7 @@ where
         hash_key: [u8; 32],
     ) -> Result<DiamondWeCiphertext, DiamondRuntimeError> {
         let total_started = Instant::now();
+        self.validate_runtime_representation()?;
         let validation_started = Instant::now();
         self.validate_public_inputs(circuit, instance)?;
         debug!(
@@ -228,6 +280,7 @@ where
         include_diagnostics: bool,
     ) -> Result<(bool, Option<Vec<num_bigint::BigInt>>), DiamondRuntimeError> {
         let total_started = Instant::now();
+        self.validate_runtime_representation()?;
         let validation_started = Instant::now();
         self.validate_public_inputs(circuit, instance)?;
         if witness.len() != self.compiler.shape.witness_width {
@@ -486,7 +539,32 @@ mod tests {
             },
         )
         .unwrap();
-        TestRuntime::new(compiler, parameters, MemoryArtifactStore::default()).unwrap()
+        let representation = DcrtRuntimeRepresentation::from_params(&parameters).unwrap();
+        TestRuntime::new_verified(
+            compiler,
+            parameters,
+            representation,
+            MemoryArtifactStore::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verified_constructor_rejects_changed_runtime_representation() {
+        let runtime = runtime();
+        let compiler = runtime.compiler.clone();
+        let parameters = runtime.parameters.clone();
+        let changed_parameters = DCRTPolyParams::new(8, 1, 21, 4);
+        let representation = DcrtRuntimeRepresentation::from_params(&changed_parameters).unwrap();
+        assert!(
+            TestRuntime::new_verified(
+                compiler,
+                parameters,
+                representation,
+                MemoryArtifactStore::default(),
+            )
+            .is_err()
+        );
     }
 
     fn and_xor_circuit(output_source: usize) -> BooleanCircuitData {

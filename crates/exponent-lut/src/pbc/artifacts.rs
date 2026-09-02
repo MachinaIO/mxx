@@ -19,13 +19,13 @@ use sha2::{Digest, Sha256};
 
 use super::evaluation::PbcEncodedPublicVector;
 use crate::{
-    PowerLutError,
-    encoding::{PowerLutEncodingSampler, PowerLutSamplingError},
+    ExponentLutError,
+    encoding::{ExponentLutEncodingSampler, ExponentLutSamplingError},
     pbc::{
         PbcError, PbcGeneratedKeyLayout, PbcLayoutId, PbcLocation, PbcPrivateSchedule,
         PbcPublicLayout,
     },
-    rhs::{ManifestRhsMetadata, PowerRhsPackageArtifactNames},
+    rhs::{ExponentRhsPackageArtifactNames, ManifestRhsMetadata},
 };
 use mxx_dsl::{Bytes, Family, HashTag, Mat, Ring};
 use num_bigint::BigInt;
@@ -38,7 +38,7 @@ pub struct PbcSelectorPackageArtifactNames {
     /// Public slot within that bucket.
     pub slot: usize,
     /// The one setup-fixed GSW ciphertext artifact.
-    pub package: PowerRhsPackageArtifactNames,
+    pub package: ExponentRhsPackageArtifactNames,
 }
 
 /// Complete canonical name set for PBC selector packages.
@@ -111,7 +111,7 @@ impl PbcSelectorArtifactNames {
             .map(|(bucket, slot, _)| PbcSelectorPackageArtifactNames {
                 bucket,
                 slot,
-                package: PowerRhsPackageArtifactNames {
+                package: ExponentRhsPackageArtifactNames {
                     gsw_ciphertext: canonical_component_name(
                         layout.layout_id,
                         key_instance_id,
@@ -476,7 +476,7 @@ pub fn canonical_component_name(
     slot: usize,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"mxx-power-lut/pbc/fixed-rhs/v1");
+    hasher.update(b"mxx-exponent-lut/pbc/fixed-rhs/v1");
     hasher.update(layout_id.0);
     hasher.update(key_instance_id);
     hasher.update((bucket as u64).to_le_bytes());
@@ -684,7 +684,7 @@ pub struct PbcStructuralSelectorFamilies {
 /// private schedule, or sampler encoding.  No digit-level companion family is
 /// created.
 pub fn build_structural_selector_families(
-    sampler: &PowerLutEncodingSampler,
+    sampler: &ExponentLutEncodingSampler,
     bits: Family<Mat>,
     source: Mat,
     target: Mat,
@@ -721,7 +721,7 @@ pub fn build_structural_selector_families(
             tag.push(index);
             let package = sampler
                 .sample_cross_secret_rhs(source.clone(), target.clone(), bit, hash_key.clone(), tag)
-                .unwrap_or_else(|error: PowerLutSamplingError| {
+                .unwrap_or_else(|error: ExponentLutSamplingError| {
                     panic!("validated selector sampler failed while building graph: {error}")
                 });
             vec![package.gsw_ciphertext().clone()]
@@ -745,7 +745,7 @@ fn same_secret_shape(value: &Mat, layout: &mxx_bgg::BggSamplerLayout) -> bool {
 
 fn selector_rhs_tag(layout_id: PbcLayoutId, key_instance_id: [u8; 32]) -> HashTag {
     let mut prefix = Vec::with_capacity(32 + 32 + 40);
-    prefix.extend_from_slice(b"mxx-power-lut/pbc/selector-rhs/v1");
+    prefix.extend_from_slice(b"mxx-exponent-lut/pbc/selector-rhs/v1");
     prefix.extend_from_slice(&(layout_id.0.len() as u64).to_le_bytes());
     prefix.extend_from_slice(&layout_id.0);
     prefix.extend_from_slice(&(key_instance_id.len() as u64).to_le_bytes());
@@ -760,7 +760,7 @@ pub(crate) fn canonical_family_name(
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/pbc/family/v1");
+    digest.update(b"mxx-exponent-lut/pbc/family/v1");
     digest.update((role.len() as u64).to_le_bytes());
     digest.update(role.as_bytes());
     digest.update(layout_id.0);
@@ -812,7 +812,7 @@ fn selector_artifact_namespace_from_names(
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/pbc/selector-family-schema/v1");
+    digest.update(b"mxx-exponent-lut/pbc/selector-family-schema/v1");
     digest.update(layout_id.0);
     digest.update(key_instance_id);
     digest.update(metadata_digest);
@@ -839,7 +839,7 @@ pub fn selector_family_artifact_name(artifacts: &PbcSelectorArtifacts, role: &st
 pub fn public_family_artifact_name(encoded: &PbcEncodedPublicVector, role: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/pbc/public-family-artifact/v1");
+    digest.update(b"mxx-exponent-lut/pbc/public-family-artifact/v1");
     digest.update(public_vector_id(encoded));
     digest.update((role.len() as u64).to_le_bytes());
     digest.update(role.as_bytes());
@@ -862,7 +862,7 @@ pub fn selector_bit_family_name(layout: &PbcPublicLayout, key_instance_id: [u8; 
 pub(crate) fn public_vector_id(encoded: &PbcEncodedPublicVector) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/pbc/encoded-public-vector/v1");
+    digest.update(b"mxx-exponent-lut/pbc/encoded-public-vector/v1");
     digest.update(encoded.layout_id.0);
     digest.update((encoded.modulus as u64).to_le_bytes());
     digest.update((encoded.values.len() as u64).to_le_bytes());
@@ -878,13 +878,13 @@ pub(crate) fn public_vector_id(encoded: &PbcEncodedPublicVector) -> [u8; 32] {
 pub(crate) fn validate_manifest_identity(
     manifest: &Manifest,
     production_id: &ProductionId,
-) -> Result<(), PowerLutError> {
+) -> Result<(), ExponentLutError> {
     mxx_ir_core::artifact::validate_manifest(manifest)
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
     if manifest.ir_version != mxx_ir_core::encoding::IR_VERSION ||
         manifest.production_id != *production_id
     {
-        return Err(PowerLutError::InvalidSparseLwrBlock);
+        return Err(ExponentLutError::InvalidSparseLwrBlock);
     }
     Ok(())
 }
@@ -892,28 +892,31 @@ pub(crate) fn validate_manifest_identity(
 pub(crate) fn concrete_matrix_type(
     ring: &Ring,
     shape: impl mxx_dsl::IntoShape,
-) -> Result<mxx_ir_core::types::ConcreteMatrixType, PowerLutError> {
+) -> Result<mxx_ir_core::types::ConcreteMatrixType, ExponentLutError> {
     let matrix = ring.matrix_type(shape);
     let env = mxx_ir_core::ParamEnv::default();
     Ok(mxx_ir_core::types::ConcreteMatrixType {
-        modulus: matrix.modulus.evaluate(&env).map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
+        modulus: matrix
+            .modulus
+            .evaluate(&env)
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
         ring_dimension: matrix
             .ring_dimension
             .evaluate(&env)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .to_usize()
-            .ok_or(PowerLutError::InvalidSparseLwrBlock)?,
+            .ok_or(ExponentLutError::InvalidSparseLwrBlock)?,
         rows: matrix
             .rows
             .evaluate(&env)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .to_usize()
-            .ok_or(PowerLutError::InvalidSparseLwrBlock)?,
+            .ok_or(ExponentLutError::InvalidSparseLwrBlock)?,
         columns: matrix
             .columns
             .evaluate(&env)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .to_usize()
-            .ok_or(PowerLutError::InvalidSparseLwrBlock)?,
+            .ok_or(ExponentLutError::InvalidSparseLwrBlock)?,
     })
 }

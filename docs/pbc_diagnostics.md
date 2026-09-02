@@ -9,9 +9,9 @@ used to obtain it.
 Run a named profile with explicit dimensions and trial count:
 
 ```text
-cargo run -p mxx-power-lut --example pbc_diagnostics -- \
+cargo run -p mxx-exponent-lut --example pbc_diagnostics -- \
   --nu 256 --h 32 --trials 100 --profile Conservative
-cargo run -p mxx-power-lut --example pbc_diagnostics -- \
+cargo run -p mxx-exponent-lut --example pbc_diagnostics -- \
   --nu 256 --h 32 --trials 100 --profile PaperEvaluation --format json
 ```
 
@@ -19,7 +19,7 @@ cargo run -p mxx-power-lut --example pbc_diagnostics -- \
 specify every scheduling parameter explicitly:
 
 ```text
-cargo run -p mxx-power-lut --example pbc_diagnostics -- \
+cargo run -p mxx-exponent-lut --example pbc_diagnostics -- \
   --nu 256 --h 32 --trials 100 --profile Custom \
   --c 3 --k 35 --max-seed-attempts 128 --width-limit 8
 ```

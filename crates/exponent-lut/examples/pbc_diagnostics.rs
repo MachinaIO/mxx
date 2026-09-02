@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, env};
 
-use mxx_power_lut::pbc::{
+use mxx_exponent_lut::pbc::{
     PbcDiagnosticAggregator, PbcDiagnosticSample, PbcError, PbcParameters, PbcProfile, PbcRootSeed,
     measure_key_layout,
 };

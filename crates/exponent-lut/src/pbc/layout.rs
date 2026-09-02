@@ -223,7 +223,7 @@ impl PbcParameters {
 /// Derives the public seed for one retry attempt.
 pub fn derive_attempt_seed(root_seed: PbcRootSeed, attempt: u32) -> PbcLayoutSeed {
     let mut hasher = Sha256::new();
-    hasher.update(b"mxx-power-lut/pbc/layout-seed/v1");
+    hasher.update(b"mxx-exponent-lut/pbc/layout-seed/v1");
     hasher.update(root_seed.0);
     hasher.update(u64::from(attempt).to_le_bytes());
     PbcLayoutSeed(hasher.finalize().into())
@@ -256,7 +256,7 @@ pub fn derive_candidate_buckets(
         let mut nonce = 0u64;
         loop {
             let mut hasher = Sha256::new();
-            hasher.update(b"mxx-power-lut/pbc/candidate/v1");
+            hasher.update(b"mxx-exponent-lut/pbc/candidate/v1");
             hasher.update(seed.0);
             hasher.update(coordinate.to_le_bytes());
             hasher.update(replica.to_le_bytes());
@@ -556,7 +556,7 @@ impl PbcPublicLayout {
             u64::try_from(self.bucket_width).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes(),
         );
         let mut hasher = Sha256::new();
-        hasher.update(b"mxx-power-lut/pbc/layout-id/v1");
+        hasher.update(b"mxx-exponent-lut/pbc/layout-id/v1");
         hasher.update(encoding);
         Ok(PbcLayoutId(hasher.finalize().into()))
     }

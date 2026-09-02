@@ -7,7 +7,7 @@
 //! `X^{(acc+a'_{b}[i]) mod Q}`. Artifact checks are delegated to `artifacts`.
 
 use super::{PbcCell, PbcError, PbcLayoutId, PbcPublicLayout, artifacts::PbcSelectorArtifacts};
-use crate::{PowerLutError, encoding::EncodingSelectorFamily, public_key::PublicSelectorFamily};
+use crate::{ExponentLutError, encoding::EncodingSelectorFamily, public_key::PublicSelectorFamily};
 use mxx_bgg::BggSamplerLayout;
 use mxx_dsl::{DslContext, Family, Mat, Ring};
 use mxx_ir_core::artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId};
@@ -298,7 +298,7 @@ pub fn derive_lwr_vector(
         let mut nonce = 0u64;
         loop {
             let mut hasher = Sha256::new();
-            hasher.update(b"mxx-power-lut/sparse-lwr/vector/v1");
+            hasher.update(b"mxx-exponent-lut/sparse-lwr/vector/v1");
             hasher.update(layout_id.0);
             hasher.update(modulus_u64.to_le_bytes());
             hasher.update(
@@ -444,12 +444,12 @@ impl PbcLayoutFamilies {
         ring: &Ring,
         layout: &PbcPublicLayout,
         encoded: &PbcEncodedPublicVector,
-    ) -> Result<Self, PowerLutError> {
-        layout.validate().map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
-        encoded.validate(layout).map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+    ) -> Result<Self, ExponentLutError> {
+        layout.validate().map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+        encoded.validate(layout).map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let rectangular_count = layout.parameters.bucket_count * layout.bucket_width;
         let package_count = crate::pbc::layout::PbcActiveCellIndex::build(layout)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .len();
         Ok(Self {
             layout_id: layout.layout_id,
@@ -484,12 +484,12 @@ impl PbcLayoutFamilies {
         encoded: &PbcEncodedPublicVector,
         production_id: ProductionId,
         manifest: &Manifest,
-    ) -> Result<Self, PowerLutError> {
+    ) -> Result<Self, ExponentLutError> {
         let mut families = Self::from_layout(context, ring, layout, encoded)?;
         super::artifacts::validate_manifest_identity(manifest, &production_id)?;
         let rectangular_count = families.rectangular_count;
         let package_count = crate::pbc::layout::PbcActiveCellIndex::build(layout)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .len();
         let mask_name = super::artifacts::public_family_artifact_name(encoded, "active-masks");
         let shift_name = super::artifacts::public_family_artifact_name(encoded, "shifts");
@@ -505,7 +505,7 @@ impl PbcLayoutFamilies {
             ArtifactConfidentiality::Public,
             true,
         )
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         super::artifacts::require_family_descriptor(
             manifest,
             &mask_name,
@@ -514,7 +514,7 @@ impl PbcLayoutFamilies {
             ArtifactConfidentiality::Public,
             true,
         )
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         super::artifacts::require_family_descriptor(
             manifest,
             &shift_name,
@@ -523,7 +523,7 @@ impl PbcLayoutFamilies {
             ArtifactConfidentiality::Public,
             true,
         )
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         families.package_indices = ring.family_artifact_input(
             production_id.clone(),
             package_index_name,
@@ -590,24 +590,24 @@ impl PbcSelectorFamilyInputs {
         source_identity: [u8; 32],
         target: &BggSamplerLayout,
         target_identity: [u8; 32],
-    ) -> Result<Self, PowerLutError> {
-        layout.validate().map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+    ) -> Result<Self, ExponentLutError> {
+        layout.validate().map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         if artifacts.layout_id() != layout.layout_id {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let package_count = artifacts.package_count();
         if package_count == 0 {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         artifacts
             .validate_family_binding(layout, source, source_identity, target, target_identity)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let key_instance_id = artifacts.key_instance_id();
         let gsw_shape = (source.secret_dimension, target.public_key_columns());
         let gsw_name = super::artifacts::selector_family_artifact_name(artifacts, "gsw");
 
         let manifest =
-            artifacts.validated_manifest().ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            artifacts.validated_manifest().ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         super::artifacts::require_family_descriptor(
             manifest,
             &gsw_name,
@@ -616,9 +616,9 @@ impl PbcSelectorFamilyInputs {
             ArtifactConfidentiality::Public,
             true,
         )
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let production_id =
-            artifacts.production_id().ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            artifacts.production_id().ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         let gsw = ring.family_artifact_input(
             production_id.clone(),
             gsw_name,
@@ -638,14 +638,14 @@ impl PbcSelectorFamilyInputs {
         layout: &PbcPublicLayout,
         artifacts: &PbcSelectorArtifacts,
         sampler: &BggSamplerLayout,
-    ) -> Result<Self, PowerLutError> {
-        layout.validate().map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+    ) -> Result<Self, ExponentLutError> {
+        layout.validate().map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         if artifacts.layout_id() != layout.layout_id {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let package_count = artifacts.package_count();
         if package_count == 0 {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let key_instance_id = artifacts.key_instance_id();
         let gsw_shape = (sampler.secret_dimension, sampler.public_key_columns());
@@ -661,13 +661,13 @@ impl PbcSelectorFamilyInputs {
         &self.gsw
     }
 
-    /// Converts the fixed-C family to the generic Power-LUT selector binding.
-    pub(crate) fn encoding_family(&self) -> Result<EncodingSelectorFamily, PowerLutError> {
+    /// Converts the fixed-C family to the generic Exponent-LUT selector binding.
+    pub(crate) fn encoding_family(&self) -> Result<EncodingSelectorFamily, ExponentLutError> {
         EncodingSelectorFamily::new(self.gsw.clone())
     }
 
     /// Converts public projections to the public-key OneHot backend binding.
-    pub(crate) fn public_family(&self) -> Result<PublicSelectorFamily, PowerLutError> {
+    pub(crate) fn public_family(&self) -> Result<PublicSelectorFamily, ExponentLutError> {
         PublicSelectorFamily::new(self.gsw.clone())
     }
 }

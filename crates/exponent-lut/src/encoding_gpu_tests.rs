@@ -1,4 +1,4 @@
-//! GPU runtime coverage for the setup-fixed, flat Power-LUT evaluator.
+//! GPU runtime coverage for the setup-fixed, flat Exponent-LUT evaluator.
 //!
 //! These tests deliberately build the private encoding and public projection
 //! through separate compilers.  The expected vector is the concrete BGG+
@@ -6,14 +6,14 @@
 //! private evaluator's output.
 
 use crate::{
-    PowerLutEncodingCompiler, PowerLutPublicKeyCompiler,
+    ExponentLutEncodingCompiler, ExponentLutPublicKeyCompiler,
     encoding::{
-        FlatLutHelper, FlatLutHelperSet, FlatLutMaskBank, FlatLutPublicMaskBank,
-        PowerLutEncodingSampler,
+        ExponentLutEncodingSampler, FlatLutHelper, FlatLutHelperSet, FlatLutMaskBank,
+        FlatLutPublicMaskBank,
     },
-    program::{LutTable, PowerLutProgramBuilder},
-    public_key::{FlatLutPublicHelper, FlatLutPublicHelperSet, PowerLutPublicKeySampler},
-    rhs::PowerRhsPackage,
+    program::{ExponentLutProgramBuilder, LutTable},
+    public_key::{ExponentLutPublicKeySampler, FlatLutPublicHelper, FlatLutPublicHelperSet},
+    rhs::ExponentRhsPackage,
 };
 use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
 use mxx_dsl::{DslContext, Mat, Ring};
@@ -33,9 +33,9 @@ use num_bigint::BigInt;
 use serial_test::serial;
 use std::{collections::BTreeMap, env};
 
-const RING_DIMENSION_ENV: &str = "MXX_POWER_LUT_GPU_RING_DIMENSION";
-const CRT_BITS_ENV: &str = "MXX_POWER_LUT_GPU_CRT_BITS";
-const BASE_BITS_ENV: &str = "MXX_POWER_LUT_GPU_BASE_BITS";
+const RING_DIMENSION_ENV: &str = "MXX_EXPONENT_LUT_GPU_RING_DIMENSION";
+const CRT_BITS_ENV: &str = "MXX_EXPONENT_LUT_GPU_CRT_BITS";
+const BASE_BITS_ENV: &str = "MXX_EXPONENT_LUT_GPU_BASE_BITS";
 
 fn parameter(name: &str, default: u32) -> u32 {
     env::var(name)
@@ -47,10 +47,10 @@ struct Fixture {
     parameters: DCRTPolyParams,
     gpu_parameters: GpuDCRTPolyParams,
     ring: Ring,
-    sampler: PowerLutEncodingSampler,
-    public_sampler: PowerLutPublicKeySampler,
-    compiler: PowerLutEncodingCompiler,
-    public_compiler: PowerLutPublicKeyCompiler,
+    sampler: ExponentLutEncodingSampler,
+    public_sampler: ExponentLutPublicKeySampler,
+    compiler: ExponentLutEncodingCompiler,
+    public_compiler: ExponentLutPublicKeyCompiler,
     mask_secret: Mat,
     payload_secret: Mat,
     hash_key: mxx_dsl::Bytes,
@@ -92,17 +92,17 @@ impl Fixture {
             parameters,
             gpu_parameters,
             ring: ring.clone(),
-            sampler: PowerLutEncodingSampler {
+            sampler: ExponentLutEncodingSampler {
                 layout: layout.clone(),
                 gaussian_sigma: None,
                 gaussian_max_coefficient_bound: None,
             },
-            public_sampler: PowerLutPublicKeySampler { layout },
-            compiler: PowerLutEncodingCompiler::from_public_key(bgg.clone()),
-            public_compiler: PowerLutPublicKeyCompiler::new(bgg),
-            mask_secret: ring.input("power-lut-gpu-mask-secret", (1, 2)),
-            payload_secret: ring.input("power-lut-gpu-payload-secret", (1, 2)),
-            hash_key: ring.bytes_input("power-lut-gpu-hash-key", 32),
+            public_sampler: ExponentLutPublicKeySampler { layout },
+            compiler: ExponentLutEncodingCompiler::from_public_key(bgg.clone()),
+            public_compiler: ExponentLutPublicKeyCompiler::new(bgg),
+            mask_secret: ring.input("exponent-lut-gpu-mask-secret", (1, 2)),
+            payload_secret: ring.input("exponent-lut-gpu-payload-secret", (1, 2)),
+            hash_key: ring.bytes_input("exponent-lut-gpu-hash-key", 32),
         }
     }
 
@@ -190,7 +190,7 @@ impl Fixture {
         (private, public)
     }
 
-    fn rhs(&self, tag: impl Into<mxx_dsl::HashTag>, exponent: usize) -> PowerRhsPackage {
+    fn rhs(&self, tag: impl Into<mxx_dsl::HashTag>, exponent: usize) -> ExponentRhsPackage {
         self.sampler
             .sample_cross_secret_rhs(
                 self.payload_secret.clone(),
@@ -228,20 +228,20 @@ impl Fixture {
             &mut gpu_backend([self.gpu_parameters.clone()]),
             BTreeMap::from([
                 (
-                    "power-lut-gpu-mask-secret".to_owned(),
+                    "exponent-lut-gpu-mask-secret".to_owned(),
                     RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
                         &self.gpu_parameters,
                         &mask,
                     )),
                 ),
                 (
-                    "power-lut-gpu-payload-secret".to_owned(),
+                    "exponent-lut-gpu-payload-secret".to_owned(),
                     RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
                         &self.gpu_parameters,
                         &payload,
                     )),
                 ),
-                ("power-lut-gpu-hash-key".to_owned(), RuntimeValue::Bytes(vec![0x91; 32])),
+                ("exponent-lut-gpu-hash-key".to_owned(), RuntimeValue::Bytes(vec![0x91; 32])),
             ]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -313,7 +313,7 @@ fn test_gpu_flat_unary_exhaustive_inputs_distinct_secrets() {
             mu: fixture.rotation(table[exponent]),
         });
     }
-    fixture.execute("power-lut-flat-unary-gpu", relations);
+    fixture.execute("exponent-lut-flat-unary-gpu", relations);
 }
 
 #[test]
@@ -351,7 +351,7 @@ fn test_gpu_flat_binary_all_u_plus_bv_pairs() {
             });
         }
     }
-    fixture.execute("power-lut-flat-binary-gpu", relations);
+    fixture.execute("exponent-lut-flat-binary-gpu", relations);
 }
 
 #[test]
@@ -400,17 +400,17 @@ fn test_gpu_flat_two_stage_lut_chain() {
         .single_input_lut(&first_public, &second_table, &second_public_helpers)
         .unwrap();
     fixture.execute(
-        "power-lut-flat-chain-gpu",
+        "exponent-lut-flat-chain-gpu",
         vec![Relation { encoded: second, expected_public: second_public, mu: fixture.rotation(0) }],
     );
 }
 
 #[test]
 #[serial(dcrt_runtime)]
-fn test_gpu_flat_generic_power_lut_program() {
+fn test_gpu_flat_generic_exponent_lut_program() {
     let fixture = Fixture::new();
     let table = LutTable::unary(2, 2, unary_table()).unwrap();
-    let mut builder = PowerLutProgramBuilder::new();
+    let mut builder = ExponentLutProgramBuilder::new();
     let input_id = builder.input(2).unwrap();
     let lut_id = builder.lut(table.clone()).unwrap();
     let output_id = builder.unary(builder.input_wire(input_id).unwrap(), lut_id).unwrap();
@@ -445,7 +445,7 @@ fn test_gpu_flat_generic_power_lut_program() {
         )
         .unwrap();
     fixture.execute(
-        "power-lut-flat-program-gpu",
+        "exponent-lut-flat-program-gpu",
         vec![Relation {
             encoded: actual[&output_id].clone(),
             expected_public: expected[&output_id].matrix.clone(),

@@ -17,11 +17,11 @@
 //! plaintext out of the public identity.
 
 use crate::{
-    PowerLutEncodingCompiler, PowerLutError,
-    encoding::{EncodingSelectorFamily, FlatLutHelperSet, PowerLutEncodingSampler},
+    ExponentLutEncodingCompiler, ExponentLutError,
+    encoding::{EncodingSelectorFamily, ExponentLutEncodingSampler, FlatLutHelperSet},
     noise::{
-        AverageCaseConfig, AverageVariance, PowerLutAverageNoiseReport, PowerLutNoiseParameters,
-        PowerLutNoiseReport, PowerLutNoiseSnapshot,
+        AverageCaseConfig, AverageVariance, ExponentLutAverageNoiseReport,
+        ExponentLutNoiseParameters, ExponentLutNoiseReport, ExponentLutNoiseSnapshot,
     },
     pbc::{
         PbcPublicLayout, PbcSelectorArtifactNames, PbcSelectorArtifacts, PbcTrustedSelectorBits,
@@ -29,9 +29,14 @@ use crate::{
     },
     prf::{
         RefreshPrfBatchInputs, SparseLwrPrfHelperBundle, SparseLwrPrfProfile, SparseLwrPrfProgram,
-        SparseLwrPrfTerminalForm, SparseLwrReductionHelpers, SparseLwrTerminalHelpers,
+        SparseLwrPrfPublicHelperBundle, SparseLwrPrfTerminalForm, SparseLwrPublicReductionHelpers,
+        SparseLwrPublicTerminalHelpers, SparseLwrReductionHelpers, SparseLwrTerminalHelpers,
     },
-    program::PowerLutProgramId,
+    program::ExponentLutProgramId,
+    public_key::{
+        ExponentLutPublicKeyCompiler, ExponentLutPublicKeySampler, FlatLutPublicHelper,
+        FlatLutPublicHelperSet, PublicSelectorFamily,
+    },
     refresh::{
         RefreshCompiler, RefreshError, RefreshFreshErrorMaterial, RefreshMaskMaterial,
         RefreshPrfContract, RefreshPrfCoverage, RefreshPrfFamilyMaterial, RefreshSetupManifest,
@@ -61,11 +66,11 @@ pub enum RefreshSetupError {
     /// The refresh declaration or its CRT equations are invalid.
     Refresh(#[from] RefreshError),
     #[error(transparent)]
-    /// A Power-LUT boundary rejected the setup inputs.
-    Power(#[from] PowerLutError),
+    /// A Exponent-LUT boundary rejected the setup inputs.
+    ExponentLut(#[from] ExponentLutError),
     #[error(transparent)]
     /// Sparse-LWR encoding setup sampling failed.
-    Sampling(#[from] crate::encoding::PowerLutSamplingError),
+    Sampling(#[from] crate::encoding::ExponentLutSamplingError),
     #[error(transparent)]
     /// A BGG encoding operation failed while constructing setup.
     Encoding(#[from] mxx_bgg::EncodingCompileError),
@@ -96,7 +101,7 @@ pub enum RefreshSetupError {
 /// Public dimensions and identities used to build one refresh setup.
 ///
 /// The fields describe both the BGG sampler and the CRT refresh.
-/// `lut_width` is the Power-LUT coefficient-sieve width; it is independent of
+/// `lut_width` is the Exponent-LUT coefficient-sieve width; it is independent of
 /// any PBC bucket width. The constructor sets the authoritative decoder bound
 /// policy, and validation is repeated at every producer/import boundary.
 pub struct RefreshSetupParameters {
@@ -115,7 +120,7 @@ pub struct RefreshSetupParameters {
     pub fresh_error_base_p_digit_count: usize,
     /// Statistical security parameter used for the joint mask transcript.
     pub mask_statistical_security_bits: usize,
-    /// Explicit Power-LUT sieve width `W`; this is not the PBC bucket width.
+    /// Explicit Exponent-LUT sieve width `W`; this is not the PBC bucket width.
     pub lut_width: usize,
     /// BGG sampler dimensions shared by setup artifacts.
     pub layout: BggSamplerLayout,
@@ -255,7 +260,7 @@ impl RefreshSetupParameters {
     /// Refresh setup owns `p` and `W`; the caller supplies the concrete
     /// plaintext modulus because a refresh may contain several CRT moduli.
     /// Keeping this check explicit prevents a PBC bucket width from being
-    /// accidentally reused as the Power-LUT domain width.
+    /// accidentally reused as the Exponent-LUT domain width.
     pub fn sparse_lwr_profile(
         &self,
         q_l: usize,
@@ -295,7 +300,7 @@ impl RefreshSetupParameters {
         &self,
         prf_program: SparseLwrPrfProgram,
         pbc_layout: PbcPublicLayout,
-    ) -> Result<PowerLutNoiseSnapshot, RefreshSetupError> {
+    ) -> Result<ExponentLutNoiseSnapshot, RefreshSetupError> {
         self.validate()?;
         let decoder_preimage_bound = self.resolve_decoder_preimage_bound()?;
         let contract = RefreshPrfContract::from_program(&prf_program);
@@ -343,14 +348,14 @@ impl RefreshSetupParameters {
             .map_err(|_| RefreshSetupError::InvalidParameters("decoder bound must be concrete"))?
             .to_biguint()
             .ok_or(RefreshSetupError::InvalidParameters("decoder bound must be positive"))?;
-        let noise_model = PowerLutNoiseParameters::dense(
+        let noise_model = ExponentLutNoiseParameters::dense(
             ring_dimension,
             gadget_base,
             self.layout.digit_count,
             helper_error_bound.clone(),
         )
         .map_err(|_| RefreshSetupError::InvalidParameters("invalid exact noise model"))?;
-        PowerLutNoiseSnapshot::from_setup(
+        ExponentLutNoiseSnapshot::from_setup(
             setup_identity,
             prf_program,
             pbc_layout,
@@ -387,7 +392,7 @@ impl RefreshSetupParameters {
         pbc_layout: PbcPublicLayout,
         candidate_mask_base_p_digit_count: usize,
         config: &AverageCaseConfig,
-    ) -> Result<PowerLutAverageNoiseReport, RefreshSetupError> {
+    ) -> Result<ExponentLutAverageNoiseReport, RefreshSetupError> {
         let mut candidate = self.clone();
         candidate.mask_base_p_digit_count = candidate_mask_base_p_digit_count;
         let snapshot = candidate.build_noise_snapshot(prf_program, pbc_layout)?;
@@ -579,7 +584,7 @@ impl RefreshPrfInputs {
     /// materialized only after those reductions.
     fn aggregate_masks(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         base_p: usize,
     ) -> Result<Vec<BggEncodingWire>, RefreshSetupError> {
         let slot_count = self.masks.len();
@@ -606,8 +611,8 @@ pub struct RefreshPreprocessingRequest {
     pub parameters: RefreshSetupParameters,
     /// PRF mask and fresh-error outputs bound to the same setup identities.
     pub prf: RefreshPrfInputs,
-    /// Private Power-LUT compiler used to aggregate PRF digits.
-    pub compiler: PowerLutEncodingCompiler,
+    /// Private Exponent-LUT compiler used to aggregate PRF digits.
+    pub compiler: ExponentLutEncodingCompiler,
     /// Ciphertext state to be refreshed; plaintext metadata is forbidden.
     pub state: BggEncodingWire,
     /// Secret vector used by the preprocessing equations.
@@ -673,8 +678,8 @@ pub struct RefreshPreprocessingDeclaration {
     pub pbc_layout_id: crate::pbc::PbcLayoutId,
     /// Refresh instance identity.
     pub refresh_id: [u8; 32],
-    /// Sparse-LWR/Power-LUT program identity.
-    pub program_id: PowerLutProgramId,
+    /// Sparse-LWR/Exponent-LUT program identity.
+    pub program_id: ExponentLutProgramId,
     /// Plaintext modulus bound to the sparse-LWR PRF terminal.
     pub prf_q_l: usize,
     /// Raw scalar output modulus bound to the sparse-LWR PRF terminal.
@@ -804,7 +809,7 @@ impl RefreshPreprocessingProducer {
         let a_prime = ring.hash_matrix(
             request.hash_key.clone(),
             HashTag::from(
-                format!("mxx-power-lut/refresh/a-prime/v1/{}", hex(&p.refresh_id)).into_bytes(),
+                format!("mxx-exponent-lut/refresh/a-prime/v1/{}", hex(&p.refresh_id)).into_bytes(),
             ),
             (p.layout.secret_dimension, p.layout.public_key_columns()),
         );
@@ -893,7 +898,7 @@ impl RefreshPreprocessingProducer {
             declaration,
         };
         let names = wires.names.clone();
-        let mut context = DslContext::new("mxx-power-lut-refresh-setup");
+        let mut context = DslContext::new("mxx-exponent-lut-refresh-setup");
         context = add_setup_outputs(context, &wires, &names)?;
         let built = context.build()?;
         let producer_spec_hash = spec_hash(&built.graph, &ParamEnv::default())
@@ -1052,6 +1057,219 @@ fn shared_decoder_base(
         plaintext: None,
     }
 }
+
+/// Public-key-only counterpart of the refresh PRF routing performed online on
+/// complete encodings.  The canonical label order is
+/// `[slot][component][coefficient][base-p digit]`, followed by the shared
+/// fresh-error group.  Keeping this separate is essential for benchmark stage
+/// fidelity: preprocessing must not pull private encoding-vector work into its
+/// graph merely to obtain the public matrices used by the decoder targets.
+fn aggregate_public_refresh_prf(
+    compiler: &ExponentLutPublicKeyCompiler,
+    outputs: Family<Mat>,
+    base_p: usize,
+    slot_count: usize,
+    component_count: usize,
+    coefficient_count: usize,
+    mask_digit_count: usize,
+    fresh_digit_count: usize,
+    scales: Vec<Mat>,
+) -> Result<(Vec<Mat>, Vec<Mat>), RefreshSetupError> {
+    let mask_group = component_count
+        .checked_mul(coefficient_count)
+        .and_then(|value| value.checked_mul(mask_digit_count))
+        .ok_or(RefreshSetupError::InvalidManifest)?;
+    let fresh_group = component_count
+        .checked_mul(coefficient_count)
+        .and_then(|value| value.checked_mul(fresh_digit_count))
+        .ok_or(RefreshSetupError::InvalidManifest)?;
+    let mask_total =
+        slot_count.checked_mul(mask_group).ok_or(RefreshSetupError::InvalidManifest)?;
+    let total = mask_total.checked_add(fresh_group).ok_or(RefreshSetupError::InvalidManifest)?;
+    if slot_count == 0 || scales.len() != slot_count || !family_count_is(&outputs, total)? {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+
+    let mask_indices = Parallel::range(mask_total).map_values(|index| index.as_int())?;
+    let mask_outputs = outputs.clone().parallel_gather(mask_indices)?;
+    let routed_masks = route_public_prf_family(
+        compiler,
+        base_p,
+        mask_outputs,
+        component_count,
+        coefficient_count,
+        mask_digit_count,
+        None,
+    )?;
+    let masks = reduce_public_family_segments(routed_masks, slot_count, mask_group)?;
+
+    let fresh_indices = Parallel::range(fresh_group)
+        .map_values(|index| Int::constant(mask_total).add(index.as_int()))?;
+    let fresh_outputs = outputs.parallel_gather(fresh_indices)?;
+    let repeated_count =
+        fresh_group.checked_mul(slot_count).ok_or(RefreshSetupError::InvalidManifest)?;
+    let repeated_fresh_indices = Parallel::range(repeated_count).map_values(|index| {
+        let flat = index.as_int();
+        let quotient = flat.clone().div(Int::constant(fresh_group));
+        flat.sub(quotient.mul(Int::constant(fresh_group)))
+    })?;
+    let slot_indices = Parallel::range(repeated_count)
+        .map_values(|index| index.as_int().div(Int::constant(fresh_group)))?;
+    let repeated_fresh = fresh_outputs.parallel_gather(repeated_fresh_indices)?;
+    let repeated_scales = Family::pack(scales)?.parallel_gather(slot_indices)?;
+    let routed_fresh = route_public_prf_family(
+        compiler,
+        base_p,
+        repeated_fresh,
+        component_count,
+        coefficient_count,
+        fresh_digit_count,
+        Some(repeated_scales),
+    )?;
+    let fresh = reduce_public_family_segments(routed_fresh, slot_count, fresh_group)?;
+    if !family_count_is(&masks, slot_count)? || !family_count_is(&fresh, slot_count)? {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    Ok((
+        (0..slot_count).map(|slot| masks.get_static(slot)).collect(),
+        (0..slot_count).map(|slot| fresh.get_static(slot)).collect(),
+    ))
+}
+
+fn route_public_prf_family(
+    compiler: &ExponentLutPublicKeyCompiler,
+    base_p: usize,
+    public_keys: Family<Mat>,
+    component_count: usize,
+    coefficient_count: usize,
+    digit_count: usize,
+    scales: Option<Family<Mat>>,
+) -> Result<Family<Mat>, RefreshSetupError> {
+    let has_scales = scales.is_some();
+    let mut families = vec![public_keys];
+    if let Some(scales) = scales {
+        families.push(scales);
+    }
+    Family::<Mat>::try_parallel_zip_many_values(families, |index, mut inputs| {
+        let scale = has_scales.then(|| inputs.pop().expect("scale family"));
+        let public_key = inputs.pop().ok_or(mxx_dsl::DslError::Schema)?;
+        let flat = index.expression();
+        let group_size = component_count
+            .checked_mul(coefficient_count)
+            .and_then(|value| value.checked_mul(digit_count))
+            .ok_or(mxx_dsl::DslError::Schema)?;
+        let group_quotient = mxx_ir_core::IntExpr::Div(
+            Box::new(flat.clone()),
+            Box::new(mxx_ir_core::IntExpr::constant(group_size)),
+        );
+        let within_group = mxx_ir_core::IntExpr::Sub(
+            Box::new(flat),
+            Box::new(mxx_ir_core::IntExpr::Mul(
+                Box::new(group_quotient),
+                Box::new(mxx_ir_core::IntExpr::constant(group_size)),
+            )),
+        )
+        .canonicalize();
+        let digit_quotient = mxx_ir_core::IntExpr::Div(
+            Box::new(within_group.clone()),
+            Box::new(mxx_ir_core::IntExpr::constant(digit_count)),
+        );
+        let digit = mxx_ir_core::IntExpr::Sub(
+            Box::new(within_group.clone()),
+            Box::new(mxx_ir_core::IntExpr::Mul(
+                Box::new(digit_quotient.clone()),
+                Box::new(mxx_ir_core::IntExpr::constant(digit_count)),
+            )),
+        )
+        .canonicalize();
+        let coefficient_quotient = mxx_ir_core::IntExpr::Div(
+            Box::new(digit_quotient.clone()),
+            Box::new(mxx_ir_core::IntExpr::constant(coefficient_count)),
+        );
+        let coefficient = mxx_ir_core::IntExpr::Sub(
+            Box::new(digit_quotient),
+            Box::new(mxx_ir_core::IntExpr::Mul(
+                Box::new(coefficient_quotient),
+                Box::new(mxx_ir_core::IntExpr::constant(coefficient_count)),
+            )),
+        )
+        .canonicalize();
+        let component = mxx_ir_core::IntExpr::Div(
+            Box::new(within_group),
+            Box::new(mxx_ir_core::IntExpr::constant(
+                coefficient_count.checked_mul(digit_count).ok_or(mxx_dsl::DslError::Schema)?,
+            )),
+        )
+        .canonicalize();
+        let public_type = public_key.matrix_type();
+        let ring =
+            mxx_dsl::Ring::new(public_type.modulus.clone(), public_type.ring_dimension.clone());
+        let scalar = ring.constant(
+            (1, 1),
+            mxx_ir_core::node::ConstantMatrix::PowerOfBase {
+                base: mxx_ir_core::IntExpr::constant(base_p),
+                exponent: digit,
+            },
+        ) * ring.constant(
+            (1, 1),
+            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: coefficient },
+        );
+        let route = scalar *
+            ring.constant(
+                (public_type.rows.clone(), 1),
+                mxx_ir_core::node::ConstantMatrix::UnitColumn {
+                    index: mxx_ir_core::IntExpr::constant(1),
+                },
+            ) *
+            ring.constant(
+                (1, public_type.columns.clone()),
+                mxx_ir_core::node::ConstantMatrix::UnitRow { index: component },
+            );
+        let target = match scale {
+            Some(scale) => scale * route,
+            None => route,
+        };
+        Ok(compiler
+            .public_key
+            .matrix_mul(&BggPublicKeyWire { matrix: public_key, reveal_plaintext: false }, &target)
+            .matrix)
+    })
+    .map_err(RefreshSetupError::from)
+}
+
+fn reduce_public_family_segments(
+    family: Family<Mat>,
+    segment_count: usize,
+    segment_size: usize,
+) -> Result<Family<Mat>, RefreshSetupError> {
+    if segment_count == 0 || segment_size == 0 {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    Parallel::range(segment_count)
+        .try_map_values({
+            let family = family.clone();
+            move |segment| {
+                let start = segment.as_int().mul(Int::constant(segment_size));
+                let indices = Parallel::range(segment_size)
+                    .map_values(|index| start.clone().add(index.as_int()))?;
+                let values = family
+                    .clone()
+                    .parallel_gather(indices)
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
+                crate::encoding::balanced_sum_family(values).map_err(|_| mxx_dsl::DslError::Schema)
+            }
+        })
+        .map_err(RefreshSetupError::from)
+}
+
+fn family_count_is(family: &Family<Mat>, expected: usize) -> Result<bool, RefreshSetupError> {
+    Ok(family
+        .count()
+        .evaluate(&ParamEnv::default())
+        .map_err(|_| RefreshSetupError::InvalidManifest)?
+        .to_usize() ==
+        Some(expected))
+}
 impl RefreshPreprocessingDeclaration {
     /// Rejects declarations that cannot represent the supported CRT refresh
     /// layout. This check is repeated at every declaration boundary so a
@@ -1069,7 +1287,7 @@ impl RefreshPreprocessingDeclaration {
     ) -> Result<(), RefreshSetupError> {
         declaration_contract(self).validate_for(parameters)?;
         if self.prf_terminal_form != SparseLwrPrfTerminalForm::RawScalar ||
-            self.program_id == PowerLutProgramId::from_digest([0; 32])
+            self.program_id == ExponentLutProgramId::from_digest([0; 32])
         {
             return Err(RefreshSetupError::IdentityMismatch);
         }
@@ -1383,7 +1601,7 @@ impl RefreshCompiler {
     /// the returned manifest exposes only validated runtime wiring.
     pub fn bind_imported_setup(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         setup: &ImportedRefreshSetup,
     ) -> Result<RefreshSetupManifest, RefreshSetupError> {
         if setup.parameters.refresh.crt_plaintext_moduli != self.crt_plaintext_moduli ||
@@ -1571,7 +1789,7 @@ fn identity_digest(
     struct Payload<'a> {
         schema: &'static str,
         refresh_id: [u8; 32],
-        program_id: PowerLutProgramId,
+        program_id: ExponentLutProgramId,
         prf_q_l: usize,
         prf_p: usize,
         prf_lut_width: usize,
@@ -1597,7 +1815,7 @@ fn identity_digest(
         encoding_error_bound: &'a mxx_ir_core::IntExpr,
     }
     let payload = Payload {
-        schema: "mxx-power-lut/refresh-setup/v7",
+        schema: "mxx-exponent-lut/refresh-setup/v7",
         refresh_id: p.refresh_id,
         program_id: contract.program_id(),
         prf_q_l: contract.q_l(),
@@ -1677,15 +1895,14 @@ fn validate_manifest(
             columns,
         })
     };
-    let check = |name: &str,
-                 confidentiality: ArtifactConfidentiality,
-                 rows: usize,
-                 columns: usize|
+    let check_type = |name: &str,
+                      confidentiality: ArtifactConfidentiality,
+                      artifact_type: ArtifactType|
      -> Result<(), RefreshSetupError> {
         let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
         if artifact.confidentiality != confidentiality ||
             artifact.family_shape.is_some() ||
-            artifact.artifact_type != matrix_type(rows, columns) ||
+            artifact.artifact_type != artifact_type ||
             artifact.layout.is_some() ||
             (confidentiality == ArtifactConfidentiality::Private &&
                 artifact.content_hash.is_some()) ||
@@ -1695,6 +1912,22 @@ fn validate_manifest(
             return Err(RefreshSetupError::InvalidManifest);
         }
         Ok(())
+    };
+    let check =
+        |name: &str, confidentiality: ArtifactConfidentiality, rows: usize, columns: usize| {
+            check_type(name, confidentiality, matrix_type(rows, columns))
+        };
+    let check_preimage = |name: &str, rows: usize, columns: usize| {
+        check_type(
+            name,
+            ArtifactConfidentiality::Private,
+            ArtifactType::Preimage(ConcreteMatrixType {
+                modulus: modulus.clone(),
+                ring_dimension,
+                rows,
+                columns,
+            }),
+        )
     };
     let slots = p.refresh.crt_plaintext_moduli.len();
     let expected_artifact_count = 5usize
@@ -1725,7 +1958,7 @@ fn validate_manifest(
     }
     check(&n.decoder_base_vector, ArtifactConfidentiality::Private, 1, b_columns)?;
     for preimage in &n.preimages {
-        check(preimage, ArtifactConfidentiality::Private, b_columns, cols)?;
+        check_preimage(preimage, b_columns, cols)?;
     }
     mxx_ir_core::artifact::validate_manifest(m).map_err(|_| RefreshSetupError::InvalidManifest)?;
     Ok(())
@@ -1917,7 +2150,7 @@ pub fn build_refresh_verification(
 /// Exact matrix facts exported for request-level external-input validation.
 /// BuiltGraph, declaration, and attestation validation occurs while the
 /// simulation bundle is constructed; these facts do not define operational
-/// noise bounds, which are owned by the Power-LUT noise snapshot.
+/// noise bounds, which are owned by the Exponent-LUT noise snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefreshSimulationMatrixInputMetadata {
     /// Exclusive coefficient bound inferred from the producer matrix, when
@@ -2029,14 +2262,28 @@ impl RefreshParameterSimulationRequest {
     }
 
     /// Builds and validates the three graph stages and their declaration and
-    /// attestation boundary. The resulting Power-LUT noise snapshot is the
+    /// attestation boundary. The resulting Exponent-LUT noise snapshot is the
     /// operational-noise authority for this bundle.
     pub fn build(self) -> Result<RefreshParameterSimulationBundle, RefreshSetupError> {
+        self.build_with_mode(false)
+    }
+
+    /// Builds only the symbolic graphs needed by the GPU cost estimator.
+    /// Simulation/verification graphs and runtime round-trip outputs are not
+    /// constructed on this path.
+    pub fn build_benchmark(self) -> Result<RefreshParameterSimulationBundle, RefreshSetupError> {
+        self.build_with_mode(true)
+    }
+
+    fn build_with_mode(
+        self,
+        benchmark_only: bool,
+    ) -> Result<RefreshParameterSimulationBundle, RefreshSetupError> {
         let setup = self.setup;
         let layout = self.generated_layout.public_layout.clone();
         let ring = setup.layout.ring();
         let hash_key = ring.bytes_input("refresh-parameter-search-hash-key", 32);
-        let sampler = PowerLutEncodingSampler {
+        let sampler = ExponentLutEncodingSampler {
             layout: setup.layout.clone(),
             gaussian_sigma: Some(setup.encoding_error_sigma.clone()),
             gaussian_max_coefficient_bound: Some(setup.encoding_error_bound.clone()),
@@ -2088,6 +2335,23 @@ impl RefreshParameterSimulationRequest {
             .map_err(|_| RefreshSetupError::InvalidManifest)?;
         let selector_production =
             ProductionId { spec_hash: selector_spec_hash, execution_nonce: [0x52; 32] };
+        let selector_validated = selector_graph
+            .validate(&ParamEnv::default())
+            .map_err(|_| RefreshSetupError::InvalidManifest)?;
+        let mut selector_manifest = mxx_ir_core::artifact::export_validated_manifest(
+            selector_production.clone(),
+            &selector_validated,
+        )
+        .map_err(|_| RefreshSetupError::InvalidManifest)?;
+        for artifact in selector_manifest.artifacts.values_mut() {
+            if artifact.confidentiality == ArtifactConfidentiality::Public {
+                artifact.content_hash = Some([0x5a; 32]);
+            }
+        }
+        selector_artifacts
+            .finalize_export_manifest(&mut selector_manifest)
+            .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
+        let selector_manifests = BTreeMap::from([(selector_production.clone(), selector_manifest)]);
         // Resolve each artifact input from the frozen selector producer.  The
         // graph is the source of truth for symbolic dimensions and family
         // counts; the concrete checks below catch an accidentally wired role
@@ -2132,8 +2396,14 @@ impl RefreshParameterSimulationRequest {
             (gsw_matrix.rows.clone(), gsw_matrix.columns.clone()),
             ArtifactConfidentiality::Public,
         );
-        let selectors = EncodingSelectorFamily::new(gsw)?;
-        let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
+        let selectors = EncodingSelectorFamily::new(gsw.clone())?;
+        let public_selectors = PublicSelectorFamily::new(gsw)?;
+        let compiler = ExponentLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
+            ring: ring.clone(),
+            base: setup.layout.gadget_base.clone(),
+            digit_count: setup.layout.digit_count.into(),
+        });
+        let public_compiler = ExponentLutPublicKeyCompiler::new(BggPublicKeyCompiler {
             ring: ring.clone(),
             base: setup.layout.gadget_base.clone(),
             digit_count: setup.layout.digit_count.into(),
@@ -2174,6 +2444,13 @@ impl RefreshParameterSimulationRequest {
             reduction_width.max(rounding_lut.values().len()),
             b"refresh-parameter-search-mask-bank".as_slice(),
         )?;
+        let public_mask_bank = ExponentLutPublicKeySampler { layout: sampler.layout.clone() }
+            .sample_flat_mask_bank(
+                hash_key.clone(),
+                reduction_width.max(rounding_lut.values().len()),
+                b"refresh-parameter-search-mask-bank".as_slice(),
+            )
+            .map_err(|_| RefreshSetupError::InvalidParameters("invalid public PRF mask bank"))?;
         let mut helpers = BTreeMap::from([(
             crate::program::LutId::from_index(0),
             FlatLutHelperSet::new(
@@ -2188,7 +2465,7 @@ impl RefreshParameterSimulationRequest {
                 )?,
             )?,
         )]);
-        let rounding_helpers = sampler.sample_flat_helpers_for_lut(
+        let rounding_helper_values = sampler.sample_flat_helpers_for_lut(
             secret.clone(),
             None,
             hash_key.clone(),
@@ -2196,7 +2473,39 @@ impl RefreshParameterSimulationRequest {
             mask_bank.as_ref(),
             b"refresh-parameter-search-rounding".as_slice(),
         )?;
-        let rounding_helpers = FlatLutHelperSet::new(rounding_lut, rounding_helpers)?;
+        let public_reduction_helpers = FlatLutPublicHelperSet::new(
+            &reduction_lut,
+            helpers
+                .get(&crate::program::LutId::from_index(0))
+                .ok_or(RefreshSetupError::InvalidParameters("missing reduction helpers"))?
+                .iter()
+                .map(|helper| {
+                    FlatLutPublicHelper::with_mask_bank(
+                        helper.sigma(),
+                        helper.switch().public_projection(),
+                        public_mask_bank.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        let public_rounding_helpers = FlatLutPublicHelperSet::new(
+            rounding_lut,
+            rounding_helper_values
+                .iter()
+                .map(|helper| {
+                    FlatLutPublicHelper::with_mask_bank(
+                        helper.sigma(),
+                        helper.switch().public_projection(),
+                        public_mask_bank.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        let public_helper_bundle = SparseLwrPrfPublicHelperBundle {
+            reduction: SparseLwrPublicReductionHelpers::new(public_reduction_helpers),
+            terminal: SparseLwrPublicTerminalHelpers::new(public_rounding_helpers),
+        };
+        let rounding_helpers = FlatLutHelperSet::new(rounding_lut, rounding_helper_values)?;
         let helper_bundle = SparseLwrPrfHelperBundle {
             reduction: SparseLwrReductionHelpers::new(
                 helpers
@@ -2256,6 +2565,13 @@ impl RefreshParameterSimulationRequest {
         })?;
         let input_public_keys =
             selector.parallel_select_mats(vec![fresh_public_keys, state_public_keys])?;
+        let public_outputs = program.compile_pbc_public_key_family_with_batch_and_helpers(
+            &public_compiler,
+            input_public_keys.clone(),
+            &batch,
+            public_selectors,
+            &public_helper_bundle,
+        )?;
         let outputs = program.compile_pbc_encoding_family_typed_with_batch_and_helpers(
             &compiler,
             input_vectors,
@@ -2265,10 +2581,161 @@ impl RefreshParameterSimulationRequest {
             &helper_bundle,
         )?;
         let prf = RefreshPrfInputs::from_pbc_family_outputs(&setup, &program, &batch, &outputs)?;
+
+        // Build the two benchmark stages at the mathematical protocol
+        // boundary. Preprocessing independently evaluates the PRF program on
+        // public keys and samples decoder preimages. Online evaluation
+        // independently evaluates the same program on complete encodings and
+        // consumes preimages as external typed inputs. In particular, the
+        // online graph does not import PRF-derived masks/fresh errors from the
+        // preprocessing graph, and the preprocessing graph contains no
+        // encoding-vector PRF work.
+        let slot_count = setup.refresh.crt_plaintext_moduli.len();
+        let benchmark_scales = (0..slot_count)
+            .map(|slot| Ok(ring.polynomial([setup.refresh.scale_expression(slot)?])))
+            .collect::<Result<Vec<_>, RefreshSetupError>>()?;
+        let (public_masks, public_fresh) = aggregate_public_refresh_prf(
+            &public_compiler,
+            public_outputs,
+            setup.base_p,
+            slot_count,
+            setup.prf_component_count(),
+            setup.coefficient_count,
+            setup.mask_base_p_digit_count,
+            setup.fresh_error_base_p_digit_count,
+            benchmark_scales.clone(),
+        )?;
+        let benchmark_a_prime = ring.hash_matrix(
+            hash_key.clone(),
+            HashTag::from(
+                format!("mxx-exponent-lut/refresh/a-prime/v1/{}", hex(&setup.refresh_id))
+                    .into_bytes(),
+            ),
+            (setup.layout.secret_dimension, setup.layout.public_key_columns()),
+        );
+        let decoder_preimage_bound = setup.resolve_decoder_preimage_bound()?;
+        let benchmark_trapdoor = ring.sample_trapdoor(
+            setup.layout.secret_dimension,
+            setup.decoder_sigma.clone(),
+            setup.layout.gadget_base.clone(),
+            setup.layout.digit_count,
+            decoder_preimage_bound,
+        );
+        let benchmark_public_b = benchmark_trapdoor.public_matrix();
+        let benchmark_decoder_base = shared_decoder_base(
+            &ring,
+            secret_input.clone(),
+            benchmark_public_b.clone(),
+            setup.encoding_error_sigma.clone(),
+            setup.encoding_error_bound.clone(),
+        );
+        let b_columns = setup
+            .component_count
+            .checked_mul(setup.layout.digit_count + 2)
+            .ok_or(RefreshSetupError::InvalidManifest)?;
+        let public_mask_family = Family::pack(public_masks)?;
+        let public_fresh_family = Family::pack(public_fresh)?;
+        let scale_family = Family::pack(benchmark_scales.clone())?;
+        let benchmark_targets = Family::<Mat>::parallel_zip_many_values(
+            vec![public_mask_family, public_fresh_family, scale_family],
+            |_, mut values| {
+                let scale = values.pop().expect("scale family");
+                let fresh = values.pop().expect("fresh family");
+                let mask = values.pop().expect("mask family");
+                let scaled_state = public_compiler.public_key.large_scalar_mul(
+                    &BggPublicKeyWire {
+                        matrix: state.pubkey.matrix.clone(),
+                        reveal_plaintext: false,
+                    },
+                    &scale,
+                );
+                scaled_state.matrix + mask + fresh - scale * benchmark_a_prime.clone()
+            },
+        )?;
+        let benchmark_preimages = benchmark_targets.parallel_map_values(|_, target| {
+            benchmark_trapdoor
+                .sample_preimage(target, (b_columns, setup.layout.public_key_columns()))
+        })?;
+        let mut benchmark_preprocessing_context =
+            DslContext::new("refresh-parameter-benchmark-preprocessing");
+        benchmark_preprocessing_context = benchmark_preprocessing_context
+            .public_output("benchmark-a-prime", benchmark_a_prime.clone())?
+            .public_output("benchmark-public-b", benchmark_public_b.clone())?
+            .private_output("benchmark-decoder-base", benchmark_decoder_base.vector.clone())?;
+        for slot in 0..slot_count {
+            benchmark_preprocessing_context = benchmark_preprocessing_context
+                .private_preimage_output(
+                    format!("benchmark-decoder-preimage-{slot}"),
+                    benchmark_preimages.get_static(slot),
+                )?;
+        }
+        let benchmark_preprocessing_graph = benchmark_preprocessing_context.build()?;
+
+        let online_masks = prf.aggregate_masks(&compiler, setup.base_p)?;
+        let online_fresh = aggregate_refresh_fresh_error_per_slot(
+            &compiler,
+            setup.base_p,
+            &prf.fresh_error,
+            benchmark_scales,
+        )?;
+        let online_a_prime = ring
+            .input("benchmark-a-prime", (setup.component_count, setup.layout.public_key_columns()));
+        let online_public_b = ring.input("benchmark-public-b", (setup.component_count, b_columns));
+        let online_decoder_base = BggEncodingWire {
+            vector: ring.input("benchmark-decoder-base", (1, b_columns)),
+            pubkey: BggPublicKeyWire { matrix: online_public_b.clone(), reveal_plaintext: false },
+            plaintext: None,
+        };
+        let online_preimages = (0..slot_count)
+            .map(|slot| {
+                ring.preimage_input(
+                    format!("benchmark-decoder-preimage-{slot}"),
+                    (b_columns, setup.layout.public_key_columns()),
+                )
+            })
+            .collect();
+        let online_manifest = setup.refresh.bind_imported_wires(
+            &compiler,
+            state.clone(),
+            online_a_prime,
+            online_public_b,
+            online_fresh,
+            online_masks,
+            online_decoder_base,
+            online_preimages,
+        )?;
+        let online_refreshed = setup.refresh.refresh(&compiler, &online_manifest)?;
+        let benchmark_online_graph = DslContext::new("refresh-parameter-benchmark-online-eval")
+            .private_output(
+                "refreshed-encoding-vector",
+                online_refreshed.encoding().vector.clone(),
+            )?
+            .public_output(
+                "refreshed-encoding-public-key",
+                online_refreshed.encoding().pubkey.matrix.clone(),
+            )?
+            .build()?;
+        if benchmark_only {
+            let noise_snapshot = setup.build_noise_snapshot(program, layout)?;
+            let public_identity = *noise_snapshot.setup_identity();
+            return Ok(RefreshParameterSimulationBundle {
+                selector_graph,
+                preprocessing_graph: None,
+                verification_graph: None,
+                benchmark_preprocessing_graph,
+                benchmark_online_graph,
+                preprocessing_manifests: selector_manifests.clone(),
+                verification_manifests: selector_manifests,
+                public_identity,
+                metadata: BTreeMap::new(),
+                targets: Vec::new(),
+                noise_snapshot,
+            });
+        }
         let producer = RefreshPreprocessingProducer::build(RefreshPreprocessingRequest {
             parameters: setup.clone(),
             prf,
-            compiler: PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
+            compiler: ExponentLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
                 ring: ring.clone(),
                 base: setup.layout.gadget_base.clone(),
                 digit_count: setup.layout.digit_count.into(),
@@ -2282,28 +2749,10 @@ impl RefreshParameterSimulationRequest {
         // real refresh consumer; passing `producer.wires` directly would hide
         // missing artifact bindings and accidentally couple the stages by
         // construction-time handles.
-        let selector_validated = selector_graph
-            .validate(&ParamEnv::default())
-            .map_err(|_| RefreshSetupError::InvalidManifest)?;
-        let mut selector_manifest = mxx_ir_core::artifact::export_validated_manifest(
-            selector_production.clone(),
-            &selector_validated,
-        )
-        .map_err(|_| RefreshSetupError::InvalidManifest)?;
-        for artifact in selector_manifest.artifacts.values_mut() {
-            if artifact.confidentiality == ArtifactConfidentiality::Public {
-                artifact.content_hash = Some([0x5a; 32]);
-            }
-        }
-        selector_artifacts
-            .finalize_export_manifest(&mut selector_manifest)
-            .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
+        let preprocessing_manifests = selector_manifests;
         let producer_validated = producer
             .built
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &std::collections::BTreeMap::from([(selector_production, selector_manifest)]),
-            )
+            .validate_with_manifests(&ParamEnv::default(), &preprocessing_manifests)
             .map_err(|_| RefreshSetupError::InvalidManifest)?;
         let producer_spec_hash =
             spec_hash(&producer_validated.source, &producer_validated.bindings)
@@ -2326,12 +2775,14 @@ impl RefreshParameterSimulationRequest {
         }
         producer.finalize_export_manifest(&mut producer_manifest)?;
         let imported = ImportedRefreshSetup::import(
-            producer_production,
+            producer_production.clone(),
             setup.clone(),
             producer.declaration().clone(),
             producer.attestation(),
             &producer_manifest,
         )?;
+        let mut verification_manifests = preprocessing_manifests.clone();
+        verification_manifests.insert(producer_production, producer_manifest);
         let manifest = setup.refresh.bind_imported_setup(&compiler, &imported)?;
         let refreshed = setup.refresh.refresh(&compiler, &manifest)?;
         let verification = build_refresh_verification(
@@ -2372,8 +2823,12 @@ impl RefreshParameterSimulationRequest {
         let preprocessing_graph = producer.built;
         Ok(RefreshParameterSimulationBundle {
             selector_graph,
-            preprocessing_graph,
-            verification_graph,
+            preprocessing_graph: Some(preprocessing_graph),
+            verification_graph: Some(verification_graph),
+            benchmark_preprocessing_graph,
+            benchmark_online_graph,
+            preprocessing_manifests,
+            verification_manifests,
             public_identity,
             metadata,
             targets,
@@ -2691,15 +3146,19 @@ fn same_matrix_type(
 /// The three immutable graph stages plus request-level external-input facts.
 /// BuiltGraph, declaration, and attestation validation occurs during bundle
 /// construction. No schedules, secrets, or raw constructors are exposed, and
-/// the embedded Power-LUT snapshot remains the operational-noise authority.
+/// the embedded Exponent-LUT snapshot remains the operational-noise authority.
 pub struct RefreshParameterSimulationBundle {
     selector_graph: BuiltGraph,
-    preprocessing_graph: BuiltGraph,
-    verification_graph: BuiltGraph,
+    preprocessing_graph: Option<BuiltGraph>,
+    verification_graph: Option<BuiltGraph>,
+    benchmark_preprocessing_graph: BuiltGraph,
+    benchmark_online_graph: BuiltGraph,
+    preprocessing_manifests: std::collections::BTreeMap<ProductionId, Manifest>,
+    verification_manifests: std::collections::BTreeMap<ProductionId, Manifest>,
     public_identity: [u8; 32],
     metadata: std::collections::BTreeMap<String, RefreshSimulationMatrixInputMetadata>,
     targets: Vec<RefreshSimulationDecoderTarget>,
-    noise_snapshot: PowerLutNoiseSnapshot,
+    noise_snapshot: ExponentLutNoiseSnapshot,
 }
 
 impl RefreshParameterSimulationBundle {
@@ -2717,11 +3176,34 @@ impl RefreshParameterSimulationBundle {
     }
     /// Returns the trusted preprocessing producer graph.
     pub fn preprocessing_graph(&self) -> &BuiltGraph {
-        &self.preprocessing_graph
+        self.preprocessing_graph
+            .as_ref()
+            .expect("simulation preprocessing graph is unavailable in a benchmark-only bundle")
+    }
+    /// Returns the selector manifests required to validate preprocessing.
+    pub fn preprocessing_manifests(&self) -> &std::collections::BTreeMap<ProductionId, Manifest> {
+        &self.preprocessing_manifests
     }
     /// Returns the verification graph used when assembling request-level facts.
     pub fn verification_graph(&self) -> &BuiltGraph {
-        &self.verification_graph
+        self.verification_graph
+            .as_ref()
+            .expect("simulation verification graph is unavailable in a benchmark-only bundle")
+    }
+    /// Returns the benchmark preprocessing graph: public-key PRF evaluation
+    /// followed by decoder-target construction and preimage sampling.
+    pub fn benchmark_preprocessing_graph(&self) -> &BuiltGraph {
+        &self.benchmark_preprocessing_graph
+    }
+    /// Returns the benchmark online graph: independent encoding PRF
+    /// evaluation followed by application of externally supplied decoder
+    /// preimages and production of the refreshed encoding.
+    pub fn benchmark_online_graph(&self) -> &BuiltGraph {
+        &self.benchmark_online_graph
+    }
+    /// Returns the preprocessing manifests required to validate online evaluation.
+    pub fn verification_manifests(&self) -> &std::collections::BTreeMap<ProductionId, Manifest> {
+        &self.verification_manifests
     }
     /// Returns exact matrix facts used only for request-level external-input
     /// validation. Operational noise is evaluated by [`Self::simulate_noise`].
@@ -2740,7 +3222,7 @@ impl RefreshParameterSimulationBundle {
     /// identity before any bound is evaluated.
     pub fn simulate_noise(
         &self,
-    ) -> Result<PowerLutNoiseReport, crate::noise::NoiseSimulationError> {
+    ) -> Result<ExponentLutNoiseReport, crate::noise::NoiseSimulationError> {
         if self.noise_snapshot.setup_identity() != &self.public_identity {
             return Err(crate::noise::NoiseSimulationError::InvalidRefresh(
                 "simulation snapshot identity mismatch",
@@ -2754,7 +3236,7 @@ impl RefreshParameterSimulationBundle {
     pub fn simulate_average_noise(
         &self,
         config: &AverageCaseConfig,
-    ) -> Result<PowerLutAverageNoiseReport, crate::noise::NoiseSimulationError> {
+    ) -> Result<ExponentLutAverageNoiseReport, crate::noise::NoiseSimulationError> {
         if self.noise_snapshot.setup_identity() != &self.public_identity {
             return Err(crate::noise::NoiseSimulationError::AverageIdentityMismatch);
         }

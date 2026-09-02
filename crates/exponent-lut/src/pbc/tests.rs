@@ -371,7 +371,7 @@ fn encoded_public_vector_routes_labels_without_reusing_pbc_hash_domain() {
 
 #[test]
 fn selector_names_are_layout_and_key_namespace_bound_but_schedule_independent() {
-    use crate::rhs::PowerRhsPackageArtifactNames;
+    use crate::rhs::ExponentRhsPackageArtifactNames;
     let parameters = PbcParameters::custom(7, 2, 2, 3, 1, None);
     let layout = PbcPublicLayout::build(&parameters, derive_attempt_seed(seed(11), 0), 0).unwrap();
     let package_names = |key_instance_id| {
@@ -384,7 +384,7 @@ fn selector_names_are_layout_and_key_namespace_bound_but_schedule_independent() 
                     (!matches!(cell, PbcCell::Padding)).then_some(PbcSelectorPackageArtifactNames {
                         bucket,
                         slot,
-                        package: PowerRhsPackageArtifactNames {
+                        package: ExponentRhsPackageArtifactNames {
                             gsw_ciphertext: canonical_component_name(
                                 layout.layout_id,
                                 key_instance_id,
@@ -556,7 +556,7 @@ fn trusted_selector_bits_validate_count_order_and_binary_values() {
 
 #[test]
 fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
-    use crate::encoding::PowerLutEncodingSampler;
+    use crate::encoding::ExponentLutEncodingSampler;
     use mxx_bgg::BggSamplerLayout;
     use mxx_dsl::DslContext;
     use mxx_ir_core::node::NodeKind;
@@ -573,7 +573,7 @@ fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
         gadget_base: 2.into(),
     };
     let ring = sampler_layout.ring();
-    let sampler = PowerLutEncodingSampler {
+    let sampler = ExponentLutEncodingSampler {
         layout: sampler_layout.clone(),
         gaussian_sigma: None,
         gaussian_max_coefficient_bound: None,

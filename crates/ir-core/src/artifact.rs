@@ -35,6 +35,9 @@ pub enum ArtifactConfidentiality {
 #[serde(tag = "tag", content = "value")]
 pub enum ArtifactType {
     Matrix(ConcreteMatrixType),
+    /// A relation-bearing preimage matrix.  This remains distinct from an
+    /// ordinary matrix across artifact/checkpoint boundaries.
+    Preimage(ConcreteMatrixType),
     Bytes {
         length: usize,
     },
@@ -56,9 +59,8 @@ pub enum ArtifactType {
 impl ArtifactType {
     pub fn from_wire_type(wire_type: &ConcreteWireType) -> Option<Self> {
         match wire_type {
-            ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
-                Some(Self::Matrix(matrix.clone()))
-            }
+            ConcreteWireType::Matrix(matrix) => Some(Self::Matrix(matrix.clone())),
+            ConcreteWireType::Preimage(matrix) => Some(Self::Preimage(matrix.clone())),
             ConcreteWireType::Bytes { length } => Some(Self::Bytes { length: *length }),
             ConcreteWireType::Trapdoor {
                 matrix,
@@ -247,5 +249,18 @@ mod tests {
             validate_manifest(&manifest),
             Err(ManifestValidationError::PrivateContentHash { name }) if name == "private"
         ));
+    }
+
+    #[test]
+    fn preimage_artifact_type_preserves_relation_marker() {
+        let matrix = ConcreteMatrixType::scalar(17.into(), 8);
+        assert_eq!(
+            ArtifactType::from_wire_type(&ConcreteWireType::Preimage(matrix.clone())),
+            Some(ArtifactType::Preimage(matrix.clone()))
+        );
+        assert_ne!(
+            ArtifactType::from_wire_type(&ConcreteWireType::Preimage(matrix.clone())),
+            ArtifactType::from_wire_type(&ConcreteWireType::Matrix(matrix))
+        );
     }
 }

@@ -1,8 +1,8 @@
-# Power-LUT Noise Models: Worst-Case Authority and Average-Case Estimates
+# Exponent-LUT Noise Models: Worst-Case Authority and Average-Case Estimates
 
 ## Status and scope
 
-This specification defines a future extension of the Power-LUT-specific noise
+This specification defines a future extension of the Exponent-LUT-specific noise
 simulator. It does not change the existing `WorstCase` protocol, its formulas,
 or its acceptance authority. It is deliberately separate from the generic
 `mxx-noise-simulator` graph evaluator. The proposed `AverageCase` channel is an

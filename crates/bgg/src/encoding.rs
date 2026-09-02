@@ -608,13 +608,13 @@ mod tests {
         );
         assert_eq!(
             kinds.iter().filter(|kind| matches!(kind, NodeKind::ApplyPreimage)).count(),
-            1,
-            "the encoding vector must strictly consume its decomposition relation"
+            2,
+            "the encoding vector and public key must consume their decomposition relations"
         );
         assert_eq!(
             kinds.iter().filter(|kind| matches!(kind, NodeKind::MaterializePreimageExact)).count(),
-            1,
-            "the exact public-key product must use guarded materialization"
+            0,
+            "gadget products must remain fused instead of materializing decompositions"
         );
         assert!(kinds.iter().any(|kind| {
             matches!(kind, NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply))

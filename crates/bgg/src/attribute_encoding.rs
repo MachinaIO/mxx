@@ -208,10 +208,7 @@ impl AttributeEncodingCompiler {
                 // its decomposition is consumed on the right, but the target
                 // is not thereby a canonical G encoding.
                 vector_terms.push(output.vector.clone().mul_decomposed(decomposed.clone()));
-                public_terms.push(
-                    output.public_matrix.clone() *
-                        decomposed.into_preimage_relation().materialize_exact(),
-                );
+                public_terms.push(output.public_matrix.clone().mul_decomposed(decomposed));
                 value_terms.push(target * output.attribute.clone());
             }
             vectors.push(sum_matrices(vector_terms));
@@ -247,10 +244,7 @@ impl AttributeEncodingCompiler {
                 let target = self.unit_column(output_rows, row);
                 let decomposed = self.decompose(target.clone());
                 vector_terms.push(output.vector.clone().mul_decomposed(decomposed.clone()));
-                public_terms.push(
-                    output.public_matrix.clone() *
-                        decomposed.into_preimage_relation().materialize_exact(),
-                );
+                public_terms.push(output.public_matrix.clone().mul_decomposed(decomposed));
                 value_terms.push(target * output.attribute.clone());
             }
             vectors.push(sum_matrices(vector_terms));
@@ -327,11 +321,9 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicAttributeLowering<'_> {
         match operation {
             PolyGateKind::Add => Ok(lhs.clone() + rhs.clone()),
             PolyGateKind::Sub => Ok(lhs.clone() - rhs.clone()),
-            PolyGateKind::Mul => Ok(lhs.clone() *
-                self.compiler
-                    .decompose(rhs.clone())
-                    .into_preimage_relation()
-                    .materialize_exact()),
+            PolyGateKind::Mul => {
+                Ok(lhs.clone().mul_decomposed(self.compiler.decompose(rhs.clone())))
+            }
             _ => unsupported(gate, "non-arithmetic gate"),
         }
     }
@@ -359,11 +351,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicAttributeLowering<'_> {
                 .map(num_bigint::BigInt::from)
                 .map(mxx_ir_core::IntExpr::constant),
         );
-        Ok(input.clone() *
-            self.compiler
-                .large_scalar_decomposition(input, scalar)
-                .into_preimage_relation()
-                .materialize_exact())
+        Ok(input.clone().mul_decomposed(self.compiler.large_scalar_decomposition(input, scalar)))
     }
 }
 
@@ -451,8 +439,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
                     // expanded encodings cancel their cross term.
                     vector: lhs.vector.clone().mul_decomposed(decomposed_rhs.clone()) +
                         lhs.attribute.clone() * rhs.vector.clone(),
-                    public_matrix: lhs.public_matrix.clone() *
-                        decomposed_rhs.into_preimage_relation().materialize_exact(),
+                    public_matrix: lhs.public_matrix.clone().mul_decomposed(decomposed_rhs),
                     attribute: lhs.attribute.clone() * rhs.attribute.clone(),
                 })
             }
@@ -496,8 +483,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
         // applied on the right of both vector and public-matrix relations.
         Ok(AttributeEncodingWire {
             vector: input.vector.clone().mul_decomposed(decomposed.clone()),
-            public_matrix: input.public_matrix.clone() *
-                decomposed.into_preimage_relation().materialize_exact(),
+            public_matrix: input.public_matrix.clone().mul_decomposed(decomposed),
             attribute: input.attribute.clone() * scalar,
         })
     }

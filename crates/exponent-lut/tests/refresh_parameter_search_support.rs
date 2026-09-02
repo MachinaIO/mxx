@@ -1,4 +1,4 @@
-//! Sole Sage-backed Power-LUT parameter-search integration target.
+//! Sole Sage-backed Exponent-LUT parameter-search integration target.
 
 use std::{env, path::PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -7,7 +7,7 @@ include!("../src/parameter_search_test_support.rs");
 
 fn install_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("mxx_power_lut=debug,mxx_runtime=debug,info"));
+        .unwrap_or_else(|_| EnvFilter::new("mxx_exponent_lut=debug,mxx_runtime=debug,info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).with_test_writer().try_init();
 }
 
@@ -21,7 +21,7 @@ fn test_refresh_parameter_search() {
     let sage_binary =
         env::var_os("MXX_SAGE_BINARY").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("sage"));
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sparse_lwr_estimator.sage.py");
-    let mut config = SearchConfig::from_env().expect("valid Power-LUT refresh profile");
+    let mut config = SearchConfig::from_env().expect("valid Exponent-LUT refresh profile");
     config.pbc_max_attempts = 128;
     let checkpoint = env::var_os(PHASE1_CHECKPOINT_ENV).map(PathBuf::from);
     let selected = load_or_search_phase1(&config, checkpoint.as_deref(), |u, h, q, p| {
@@ -78,7 +78,7 @@ fn test_refresh_parameter_search() {
     config.crt_bits = result.candidate.crt_bits;
     config.base_bits = result.candidate.base_bits;
     let report = serde_json::to_string_pretty(&search_report(&config, &selected, result)).unwrap();
-    if let Some(path) = env::var_os("MXX_POWER_LUT_REFRESH_SEARCH_OUTPUT") {
+    if let Some(path) = env::var_os("MXX_EXPONENT_LUT_REFRESH_SEARCH_OUTPUT") {
         fs::write(path, report).expect("write search report");
     } else {
         println!("{report}");

@@ -22,6 +22,24 @@ pub struct PreimageRequest<M, T> {
     pub target: Arc<M>,
 }
 
+/// Host-backed consecutive columns of a typed preimage relation.
+///
+/// Each payload is an ordinary backend matrix serialization for the recorded
+/// column range. Keeping the chunks outside `Backend::Matrix` prevents a
+/// sampled `O((log q)^2)` witness from remaining resident on one GPU.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChunkedPreimage {
+    pub matrix_type: ConcreteMatrixType,
+    pub chunks: Vec<PreimageColumnChunk>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreimageColumnChunk {
+    pub start: usize,
+    pub columns: usize,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MatrixMulAccumulateRequest<M> {
     pub products: Vec<(BigInt, Arc<M>, Arc<M>)>,
@@ -180,6 +198,62 @@ pub trait Backend {
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
     }
+    /// Applies a gadget decomposition and multiplication without materializing
+    /// the decomposed right-hand matrix.  Backends must implement this using
+    /// their native column-chunked primitive.
+    fn mul_decompose(
+        &mut self,
+        left: &Self::Matrix,
+        right: &Self::Matrix,
+        small: bool,
+    ) -> Result<Self::Matrix, Self::Error>;
+    fn mul_decompose_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>, bool)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs
+            .into_iter()
+            .map(|(left, right, small)| self.mul_decompose(&left, &right, small))
+            .collect()
+    }
+    /// Applies a host-backed typed preimage one consecutive column chunk at a time.
+    fn apply_chunked_preimage(
+        &mut self,
+        left: &Self::Matrix,
+        preimage: &ChunkedPreimage,
+    ) -> Result<Self::Matrix, Self::Error> {
+        let mut products = Vec::with_capacity(preimage.chunks.len());
+        for chunk in &preimage.chunks {
+            let mut chunk_type = preimage.matrix_type.clone();
+            chunk_type.columns = chunk.columns;
+            let right = self.matrix_from_bytes(&chunk_type, &chunk.bytes)?;
+            products.push(self.multiply(left, &right)?);
+        }
+        let references = products.iter().collect::<Vec<_>>();
+        self.concat(&references, ConcatAxis::Columns)
+    }
+    fn apply_chunked_preimage_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<ChunkedPreimage>)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs
+            .into_iter()
+            .map(|(left, preimage)| self.apply_chunked_preimage(&left, &preimage))
+            .collect()
+    }
+    fn materialize_chunked_preimage(
+        &mut self,
+        preimage: &ChunkedPreimage,
+    ) -> Result<Self::Matrix, Self::Error> {
+        let mut matrices = Vec::with_capacity(preimage.chunks.len());
+        for chunk in &preimage.chunks {
+            let mut chunk_type = preimage.matrix_type.clone();
+            chunk_type.columns = chunk.columns;
+            matrices.push(self.matrix_from_bytes(&chunk_type, &chunk.bytes)?);
+        }
+        let references = matrices.iter().collect::<Vec<_>>();
+        self.concat(&references, ConcatAxis::Columns)
+    }
     fn matrix_mul_accumulate(
         &mut self,
         request: MatrixMulAccumulateRequest<Self::Matrix>,
@@ -333,6 +407,40 @@ pub trait Backend {
         public: &Self::Matrix,
         target: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error>;
+    /// Samples and immediately offloads consecutive preimage column chunks.
+    fn sample_chunked_preimage(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        max_coefficient_bound: &BigInt,
+        trapdoor: &Self::Trapdoor,
+        public: &Self::Matrix,
+        target: &Self::Matrix,
+        column_chunk_width: usize,
+    ) -> Result<ChunkedPreimage, Self::Error> {
+        let request = PreimageRequest {
+            matrix_type: ty.clone(),
+            sigma,
+            gadget_base: gadget_base.clone(),
+            digit_count,
+            max_coefficient_bound: max_coefficient_bound.clone(),
+            trapdoor: Arc::new(trapdoor.clone()),
+            public: Arc::new(public.clone()),
+            target: Arc::new(target.clone()),
+        };
+        let mut batches = self.sample_chunked_preimage_batches_by_placement(
+            vec![(self.active_placement(), vec![request])],
+            column_chunk_width,
+        )?;
+        Ok(batches
+            .pop()
+            .expect("one chunked preimage placement")
+            .1
+            .pop()
+            .expect("one chunked preimage request"))
+    }
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>,
@@ -365,6 +473,100 @@ pub trait Backend {
                 self.sample_preimage_batch(requests).map(|outputs| (placement, outputs))
             })
             .collect();
+        assert!(self.set_active_placement(original), "backend rejected its active placement");
+        result
+    }
+    fn sample_chunked_preimage_batches_by_placement(
+        &mut self,
+        batches: Vec<(usize, Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>)>,
+        column_chunk_width: usize,
+    ) -> Result<Vec<(usize, Vec<ChunkedPreimage>)>, Self::Error> {
+        assert!(column_chunk_width > 0, "preimage column chunk width must be nonzero");
+        let original = self.active_placement();
+        let result = (|| {
+            let mut all_outputs = Vec::with_capacity(batches.len());
+            for (placement, requests) in batches {
+                assert!(self.set_active_placement(placement), "backend rejected its own placement");
+                let Some(first) = requests.first() else {
+                    all_outputs.push((placement, Vec::new()));
+                    continue;
+                };
+                let total_columns = first.matrix_type.columns;
+                let ranges = (0..total_columns)
+                    .step_by(column_chunk_width)
+                    .map(|start| {
+                        let end = (start + column_chunk_width).min(total_columns);
+                        (start, end)
+                    })
+                    .collect::<Vec<_>>();
+                // Offload target columns before sampling. Every sampling wave below restores
+                // only its selected range, so the sampler never receives the full target.
+                let mut staged_targets = Vec::with_capacity(requests.len());
+                for request in &requests {
+                    let mut chunks = Vec::with_capacity(ranges.len());
+                    for &(start, end) in &ranges {
+                        let target = self.slice(
+                            request.target.as_ref(),
+                            None,
+                            Some(&IndexRange { start, end }),
+                        )?;
+                        chunks.push(self.matrix_to_bytes(&target));
+                    }
+                    staged_targets.push(chunks);
+                }
+                let mut outputs = requests
+                    .iter()
+                    .map(|request| ChunkedPreimage {
+                        matrix_type: request.matrix_type.clone(),
+                        chunks: Vec::with_capacity(total_columns.div_ceil(column_chunk_width)),
+                    })
+                    .collect::<Vec<_>>();
+                for (chunk_index, &(start, end)) in ranges.iter().enumerate() {
+                    let columns = end - start;
+                    tracing::debug!(
+                        placement,
+                        chunk_index,
+                        start,
+                        end,
+                        columns,
+                        request_count = requests.len(),
+                        column_chunk_width,
+                        "preimage sampling column wave"
+                    );
+                    let mut chunk_requests = Vec::with_capacity(requests.len());
+                    for (request, target_chunks) in requests.iter().zip(&staged_targets) {
+                        assert_eq!(
+                            request.matrix_type.columns, total_columns,
+                            "chunked preimage batch requires one column count"
+                        );
+                        let mut matrix_type = request.matrix_type.clone();
+                        matrix_type.columns = columns;
+                        let target =
+                            self.matrix_from_bytes(&matrix_type, &target_chunks[chunk_index])?;
+                        chunk_requests.push(PreimageRequest {
+                            matrix_type,
+                            sigma: request.sigma,
+                            gadget_base: request.gadget_base.clone(),
+                            digit_count: request.digit_count,
+                            max_coefficient_bound: request.max_coefficient_bound.clone(),
+                            trapdoor: request.trapdoor.clone(),
+                            public: request.public.clone(),
+                            target: Arc::new(target),
+                        });
+                    }
+                    let sampled = self.sample_preimage_batch(chunk_requests)?;
+                    for (output, matrix) in outputs.iter_mut().zip(sampled) {
+                        output.chunks.push(PreimageColumnChunk {
+                            start,
+                            columns,
+                            bytes: self.matrix_to_bytes(&matrix),
+                        });
+                    }
+                }
+                all_outputs.push((placement, outputs));
+            }
+            Ok(all_outputs)
+        })();
         assert!(self.set_active_placement(original), "backend rejected its active placement");
         result
     }
@@ -430,6 +632,13 @@ pub enum RuntimeValue<B: Backend> {
     Bytes(Vec<u8>),
     TypedBlob(Vec<u8>),
     Matrix(Arc<B::Matrix>),
+    /// A deferred GadgetDecompose result.  The original matrix remains live
+    /// so an adjacent ApplyPreimage can use the backend's fused operation.
+    DeferredGadgetDecomposition {
+        source: Arc<B::Matrix>,
+        small: bool,
+    },
+    ChunkedPreimage(Arc<ChunkedPreimage>),
     Trapdoor {
         secret: Option<Arc<B::Trapdoor>>,
         public: Arc<B::Matrix>,
@@ -473,6 +682,10 @@ impl<B: Backend> Clone for RuntimeValue<B> {
             Self::Bytes(value) => Self::Bytes(value.clone()),
             Self::TypedBlob(value) => Self::TypedBlob(value.clone()),
             Self::Matrix(value) => Self::Matrix(value.clone()),
+            Self::DeferredGadgetDecomposition { source, small } => {
+                Self::DeferredGadgetDecomposition { source: source.clone(), small: *small }
+            }
+            Self::ChunkedPreimage(value) => Self::ChunkedPreimage(value.clone()),
             Self::Trapdoor {
                 secret,
                 public,
@@ -523,6 +736,8 @@ impl<B: Backend> RuntimeValue<B> {
     pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
         match self {
             Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
+            Self::DeferredGadgetDecomposition { source, .. } => Arc::strong_count(source) == 1,
+            Self::ChunkedPreimage(_) => false,
             Self::Trapdoor { secret, public, .. } => {
                 Arc::strong_count(public) == 1 ||
                     secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)

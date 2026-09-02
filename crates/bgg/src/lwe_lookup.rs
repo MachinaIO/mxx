@@ -647,13 +647,13 @@ impl LweLookupCompiler {
                     IntExpr::Div(Box::new(low_shape.0.clone()), Box::new(digit_count.clone())),
                     low_shape.1.clone(),
                 );
-                let low = ring
+                let low_decomposition = ring
                     .hash_matrix(hash_key.clone(), low_tag, low_plain_shape)
-                    .decompose(gadget_base.clone(), digit_count.clone())
-                    .into_preimage_relation();
+                    .decompose(gadget_base.clone(), digit_count.clone());
+                let low = low_decomposition.clone().into_preimage_relation();
                 let extended_input = input_public_key.clone() - gadget.clone() * input_scalar;
                 let target = output_for_loop.clone() - gadget.clone() * output;
-                let adjusted_target = target - extended_input * low.clone().materialize_exact();
+                let adjusted_target = target - extended_input.mul_decomposed(low_decomposition);
                 let high = trapdoor.sample_preimage(adjusted_target, high_shape.clone());
                 (low, high)
             })?;

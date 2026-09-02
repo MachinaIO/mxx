@@ -48,6 +48,12 @@ pub trait MeasurementBackend {
     ) -> Result<NodeMeasurement, Self::Error>;
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64;
+    fn persistent_bytes_for_node(&self, _kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        self.persistent_bytes(wire_type)
+    }
+    fn persistent_alias_argument(&self, _kind: &NodeKind, _output_port: usize) -> Option<usize> {
+        None
+    }
 
     fn loop_index_invariant(&self, _graph: &str, _node: &MeasurementNode<'_>) -> bool {
         true
@@ -219,7 +225,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             .ok_or_else(|| EstimateError::MissingScope(scope_id.clone()))?;
         let mut report = CostReport { maximum_parallelism: 1, ..CostReport::default() };
         let mut completion = BTreeMap::<WireRef, f64>::new();
-        let mut live = BTreeMap::<WireRef, u64>::new();
+        let mut live = BTreeMap::<WireRef, (u64, u64)>::new();
+        let mut next_allocation = 0u64;
 
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
@@ -279,15 +286,39 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
 
             for port in 0..handle.output_types().len() {
                 let wire = WireRef { node: id, port: mxx_ir_core::Port(port as u32) };
-                let bytes = plan
-                    .wire_types
-                    .get(&wire)
-                    .map(|wire_type| self.backend.persistent_bytes(wire_type))
-                    .unwrap_or(0);
-                live.insert(wire, bytes);
+                let allocation = self
+                    .backend
+                    .persistent_alias_argument(handle.kind(), port)
+                    .and_then(|argument| arguments.get(argument))
+                    .and_then(|argument| live.get(argument))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let bytes = if *scope_id != FrozenGraphScopeId::Root &&
+                            matches!(handle.kind(), NodeKind::Input { .. })
+                        {
+                            // Inputs of a lexical child scope borrow the caller's runtime
+                            // values. They do not allocate a second matrix or materialize a
+                            // captured family in the child. The caller accounts for owned
+                            // values, while any lazily indexed family member is accounted for
+                            // by the node that materializes that member.
+                            0
+                        } else {
+                            plan.wire_types
+                                .get(&wire)
+                                .map(|wire_type| {
+                                    self.backend.persistent_bytes_for_node(handle.kind(), wire_type)
+                                })
+                                .unwrap_or(0)
+                        };
+                        let allocation = (next_allocation, bytes);
+                        next_allocation = next_allocation.saturating_add(1);
+                        allocation
+                    });
+                live.insert(wire, allocation);
                 completion.insert(wire, finish);
             }
-            let persistent = live.values().copied().sum::<u64>();
+            let persistent =
+                live.values().copied().collect::<BTreeMap<_, _>>().values().copied().sum::<u64>();
             report.peak_memory_bytes = report
                 .peak_memory_bytes
                 .max(persistent.saturating_add(measurement.workspace_bytes))
@@ -348,11 +379,29 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 let child_bindings = grid_child_bindings(bindings, grid)?;
                 let (one, preimage_work, peak, parallelism) =
                     self.cached_child(child, child_bindings)?;
+                let reindexed_input_bytes = grid
+                    .input_modes
+                    .iter()
+                    .zip(&node.concrete_argument_types)
+                    .filter_map(|(mode, wire_type)| match (mode, wire_type) {
+                        (
+                            mxx_ir_core::node::GridInputMode::Reindex { .. },
+                            ConcreteWireType::Family { element, .. },
+                        ) => Some(self.backend.persistent_bytes(element)),
+                        _ => None,
+                    })
+                    .fold(0u64, u64::saturating_add);
                 let concurrent = (self.config.device_pool_size.max(1) /
                     self.config.per_instance_occupancy.max(1))
                 .max(1);
                 let active = count.min(concurrent);
-                let peak = peak.saturating_mul(active as u64);
+                // Runtime resolves every Reindex input to one concrete family member before
+                // entering the child scope. Child Input nodes borrow that value, but an
+                // artifact-backed family descriptor owns no resident matrix in the parent, so
+                // account for the selected member once per active grid lane at this boundary.
+                // This is conservative for an already-resident ordinary family, whose member
+                // may be a shared backend reference rather than a fresh allocation.
+                let peak = peak.saturating_add(reindexed_input_bytes).saturating_mul(active as u64);
                 Ok((
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
@@ -934,6 +983,56 @@ mod tests {
     }
 
     #[test]
+    fn lazy_decomposition_peak_counts_the_aliased_source_once() {
+        struct AliasBackend;
+
+        impl MeasurementBackend for AliasBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                _node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                Ok(NodeMeasurement::default())
+            }
+
+            fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
+                match wire_type {
+                    ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                        u64::try_from(matrix.rows * matrix.columns).expect("test matrix size")
+                    }
+                    _ => 0,
+                }
+            }
+
+            fn persistent_alias_argument(
+                &self,
+                kind: &NodeKind,
+                output_port: usize,
+            ) -> Option<usize> {
+                (output_port == 0 && matches!(kind, NodeKind::GadgetDecompose { .. })).then_some(0)
+            }
+        }
+
+        let ring = Ring::new(257, 8);
+        let source = ring.input("source", (1, 4));
+        let decomposition = source.decompose(4, 4).into_preimage_relation();
+        let built = DslContext::new("estimate-lazy-decomposition-alias")
+            .preimage_output("decomposition", decomposition)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report =
+            estimate(&validated, &mut AliasBackend, &EstimateConfig::default()).expect("estimate");
+
+        assert_eq!(report.peak_memory_bytes, 4);
+        assert_eq!(report.persistent_bytes_over_time, vec![4, 4]);
+    }
+
+    #[test]
     fn family_preimage_measurement_is_counted_as_preimage_sampling_work() {
         let ring = Ring::new(257, 8);
         let digit_count = 4;
@@ -1028,7 +1127,10 @@ mod tests {
         let validated = parallel_zip_many_graph(3);
         let report =
             estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
-        assert_eq!(report.peak_memory_bytes, 28, "final output is counted by outer liveness only");
+        assert_eq!(
+            report.peak_memory_bytes, 28,
+            "reindexed members are live in the child wave and the final family stays outside"
+        );
     }
 
     #[test]

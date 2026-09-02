@@ -6,8 +6,8 @@
 //! contains only the current fixed-C selector family and flat LUT helpers.
 
 use crate::{
-    PowerLutEncodingCompiler,
-    encoding::{EncodingSelectorFamily, FlatLutHelperSet, PowerLutEncodingSampler},
+    ExponentLutEncodingCompiler,
+    encoding::{EncodingSelectorFamily, ExponentLutEncodingSampler, FlatLutHelperSet},
     pbc::{
         PbcParameters, PbcRootSeed, PbcSelectorArtifactNames, PbcSelectorArtifacts,
         PbcTrustedSelectorBits, build_structural_selector_families, generate_key_layout,
@@ -42,9 +42,9 @@ use mxx_primitives::{
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
 
-const RING_DIMENSION_ENV: &str = "MXX_POWER_LUT_REFRESH_SETUP_GPU_RING_DIMENSION";
-const CRT_BITS_ENV: &str = "MXX_POWER_LUT_REFRESH_SETUP_GPU_CRT_BITS";
-const BASE_BITS_ENV: &str = "MXX_POWER_LUT_REFRESH_SETUP_GPU_BASE_BITS";
+const RING_DIMENSION_ENV: &str = "MXX_EXPONENT_LUT_REFRESH_SETUP_GPU_RING_DIMENSION";
+const CRT_BITS_ENV: &str = "MXX_EXPONENT_LUT_REFRESH_SETUP_GPU_CRT_BITS";
+const BASE_BITS_ENV: &str = "MXX_EXPONENT_LUT_REFRESH_SETUP_GPU_BASE_BITS";
 const DEFAULT_RING_DIMENSION: u32 = 4;
 const DEFAULT_CRT_BITS: u32 = 17;
 const DEFAULT_BASE_BITS: u32 = 16;
@@ -67,7 +67,7 @@ struct Fixture {
     gpu: GpuDCRTPolyParams,
     parameters: RefreshSetupParameters,
     #[cfg(feature = "gpu")]
-    compiler: PowerLutEncodingCompiler,
+    compiler: ExponentLutEncodingCompiler,
     request: RefreshPreprocessingRequest,
     #[cfg(feature = "gpu")]
     selector_graph: mxx_dsl::BuiltGraph,
@@ -107,7 +107,7 @@ impl Fixture {
             gadget_base: (BigInt::from(1u8) << base_bits as usize).into(),
         };
         let ring = layout.ring();
-        let sampler = PowerLutEncodingSampler {
+        let sampler = ExponentLutEncodingSampler {
             layout: layout.clone(),
             gaussian_sigma: Some(1.into()),
             gaussian_max_coefficient_bound: Some(6.into()),
@@ -208,7 +208,7 @@ impl Fixture {
             ArtifactConfidentiality::Public,
         );
         let selectors = EncodingSelectorFamily::new(gsw).expect("fixed-C selector binding");
-        let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
+        let compiler = ExponentLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
             ring: ring.clone(),
             base: layout.gadget_base.clone(),
             digit_count: layout.digit_count.into(),
@@ -395,7 +395,7 @@ impl Fixture {
         let request = RefreshPreprocessingRequest {
             parameters: parameters.clone(),
             prf,
-            compiler: PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
+            compiler: ExponentLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
                 ring: ring.clone(),
                 base: layout.gadget_base.clone(),
                 digit_count: layout.digit_count.into(),

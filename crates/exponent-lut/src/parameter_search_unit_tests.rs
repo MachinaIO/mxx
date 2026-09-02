@@ -19,6 +19,11 @@
             pbc_attempts_used: 1,
             mask_base_p_digit_count: 1,
             fresh_error_base_p_digit_count: 1,
+            prf_component_count: 2,
+            prf_coefficient_count: 1 << candidate.log_ring_dimension,
+            prf_active_count: 1,
+            prf_label_count: 1,
+            prf_value_count: 1,
             bundle: None,
             average_report: None,
         }
@@ -175,18 +180,18 @@
     #[test]
     fn lookup_overlay_applies_the_configured_tiny_profile() {
         let values = std::collections::BTreeMap::from([
-            ("MXX_POWER_LUT_REFRESH_SECURITY_BITS", "1"),
-            ("MXX_POWER_LUT_REFRESH_SPARSE_LWR_UNIVERSE_GRID", "4"),
-            ("MXX_POWER_LUT_REFRESH_SPARSE_LWR_WEIGHT", "1"),
-            ("MXX_POWER_LUT_REFRESH_SPARSE_LWR_MODULUS", "4"),
-            ("MXX_POWER_LUT_REFRESH_SPARSE_LWR_OUTPUT_MODULUS", "2"),
-            ("MXX_POWER_LUT_REFRESH_LUT_WIDTH", "8"),
-            ("MXX_POWER_LUT_REFRESH_CRT_BITS", "4"),
-            ("MXX_POWER_LUT_REFRESH_BASE_BITS", "2"),
-            ("MXX_POWER_LUT_REFRESH_MIN_CRT_DEPTH", "1"),
-            ("MXX_POWER_LUT_REFRESH_MAX_CRT_DEPTH", "1"),
-            ("MXX_POWER_LUT_REFRESH_MIN_LOG_RING_DIMENSION", "5"),
-            ("MXX_POWER_LUT_REFRESH_MAX_LOG_RING_DIMENSION", "5"),
+            ("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS", "1"),
+            ("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_UNIVERSE_GRID", "4"),
+            ("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_WEIGHT", "1"),
+            ("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_MODULUS", "4"),
+            ("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_OUTPUT_MODULUS", "2"),
+            ("MXX_EXPONENT_LUT_REFRESH_LUT_WIDTH", "8"),
+            ("MXX_EXPONENT_LUT_REFRESH_CRT_BITS", "4"),
+            ("MXX_EXPONENT_LUT_REFRESH_BASE_BITS", "2"),
+            ("MXX_EXPONENT_LUT_REFRESH_MIN_CRT_DEPTH", "1"),
+            ("MXX_EXPONENT_LUT_REFRESH_MAX_CRT_DEPTH", "1"),
+            ("MXX_EXPONENT_LUT_REFRESH_MIN_LOG_RING_DIMENSION", "5"),
+            ("MXX_EXPONENT_LUT_REFRESH_MAX_LOG_RING_DIMENSION", "5"),
         ]);
         let config =
             SearchConfig::from_lookup(|name| Ok(values.get(name).map(|value| (*value).to_owned())))
@@ -206,7 +211,7 @@
     #[test]
     fn lookup_overlay_keeps_unset_values_from_reviewed_profile() {
         let config = SearchConfig::from_lookup(|name| {
-            Ok((name == "MXX_POWER_LUT_REFRESH_SECURITY_BITS").then(|| "1".to_owned()))
+            Ok((name == "MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS").then(|| "1".to_owned()))
         })
         .unwrap();
         assert_eq!(config.security_bits, 1);
@@ -221,8 +226,8 @@
     #[test]
     fn lookup_overlay_rejects_invalid_ranges() {
         let invalid_range = std::collections::BTreeMap::from([
-            ("MXX_POWER_LUT_REFRESH_MIN_CRT_DEPTH", "2"),
-            ("MXX_POWER_LUT_REFRESH_MAX_CRT_DEPTH", "1"),
+            ("MXX_EXPONENT_LUT_REFRESH_MIN_CRT_DEPTH", "2"),
+            ("MXX_EXPONENT_LUT_REFRESH_MAX_CRT_DEPTH", "1"),
         ]);
         let error = SearchConfig::from_lookup(|name| {
             Ok(invalid_range.get(name).map(|value| (*value).to_owned()))
@@ -234,8 +239,8 @@
     #[test]
     fn lookup_overlay_propagates_non_unicode_lookup_failure() {
         let error = SearchConfig::from_lookup(|name| {
-            if name == "MXX_POWER_LUT_REFRESH_SECURITY_BITS" {
-                Err("MXX_POWER_LUT_REFRESH_SECURITY_BITS must contain valid UTF-8".to_owned())
+            if name == "MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS" {
+                Err("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS must contain valid UTF-8".to_owned())
             } else {
                 Ok(None)
             }
@@ -395,7 +400,7 @@
     }
 
     fn checkpoint_test_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("mxx-power-lut-{name}-{}.json", std::process::id()))
+        std::env::temp_dir().join(format!("mxx-exponent-lut-{name}-{}.json", std::process::id()))
     }
 
     #[test]

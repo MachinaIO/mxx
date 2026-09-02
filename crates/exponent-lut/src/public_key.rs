@@ -1,4 +1,4 @@
-//! Public-key projection of the setup-fixed Power-LUT evaluator.
+//! Public-key projection of the setup-fixed Exponent-LUT evaluator.
 //!
 //! This path receives only public BGG matrices, fixed GSW ciphertexts, and
 //! public helper matrices. It mirrors the private flat evaluator without
@@ -11,17 +11,17 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    PowerLutError,
+    ExponentLutError,
     encoding::{
         FlatLutPublicMaskBank, balanced_sum_family, canonical_flat_mask_branch_tag,
         canonical_sigma, one_hot_indices_and_masks,
     },
     program::{
-        FamilyRange, LutOutputForm, LutTable, PowerLutMonomialFamily, PowerLutProgram,
+        ExponentLutMonomialFamily, ExponentLutProgram, FamilyRange, LutOutputForm, LutTable,
         ProgramBindings, ProgramFamilyRanges, ProgramInputId, ProgramLoweringBackend,
         ProgramWireId, RhsInputId, lower_program,
     },
-    rhs::PowerRhsPackage,
+    rhs::ExponentRhsPackage,
 };
 use mxx_bgg::BggPublicKeyWire;
 use mxx_dsl::{Bytes, DslError, Family, HashTag, Mat};
@@ -32,7 +32,7 @@ use num_traits::ToPrimitive;
 #[derive(Clone)]
 pub struct FlatLutPublicHelper {
     sigma: usize,
-    switch: PowerRhsPackage,
+    switch: ExponentRhsPackage,
     mask_bank: Arc<FlatLutPublicMaskBank>,
     mask_index: usize,
 }
@@ -49,18 +49,18 @@ impl FlatLutPublicHelperSet {
     pub fn new(
         table: &crate::program::LutTable,
         helpers: Vec<FlatLutPublicHelper>,
-    ) -> Result<Self, PowerLutError> {
+    ) -> Result<Self, ExponentLutError> {
         if table.values().len() != helpers.len() {
-            return Err(PowerLutError::InvalidLut);
+            return Err(ExponentLutError::InvalidLut);
         }
         Ok(Self { table_commitment: table.commitment(), width: helpers.len(), helpers })
     }
     pub(crate) fn resolve(
         &self,
         table: &crate::program::LutTable,
-    ) -> Result<&[FlatLutPublicHelper], PowerLutError> {
+    ) -> Result<&[FlatLutPublicHelper], ExponentLutError> {
         if self.width != table.values().len() || self.table_commitment != table.commitment() {
-            return Err(PowerLutError::InvalidLut);
+            return Err(ExponentLutError::InvalidLut);
         }
         Ok(&self.helpers)
     }
@@ -68,9 +68,9 @@ impl FlatLutPublicHelperSet {
         table_commitment: [u8; 32],
         width: usize,
         helpers: Vec<FlatLutPublicHelper>,
-    ) -> Result<Self, PowerLutError> {
+    ) -> Result<Self, ExponentLutError> {
         if width == 0 || width != helpers.len() {
-            return Err(PowerLutError::InvalidLut);
+            return Err(ExponentLutError::InvalidLut);
         }
         Ok(Self { table_commitment, width, helpers })
     }
@@ -86,22 +86,22 @@ impl FlatLutPublicHelperSet {
 }
 
 impl FlatLutPublicHelper {
-    pub fn new(sigma: usize, switch: PowerRhsPackage, mask: Mat) -> Self {
+    pub fn new(sigma: usize, switch: ExponentRhsPackage, mask: Mat) -> Self {
         let mask_bank = Arc::new(FlatLutPublicMaskBank::single(sigma, mask));
         Self::with_mask_bank(sigma, switch, mask_bank).expect("single public mask branch")
     }
     pub fn with_mask_bank(
         sigma: usize,
-        switch: PowerRhsPackage,
+        switch: ExponentRhsPackage,
         mask_bank: Arc<FlatLutPublicMaskBank>,
-    ) -> Result<Self, PowerLutError> {
-        let mask_index = mask_bank.index_for_sigma(sigma).ok_or(PowerLutError::InvalidLut)?;
+    ) -> Result<Self, ExponentLutError> {
+        let mask_index = mask_bank.index_for_sigma(sigma).ok_or(ExponentLutError::InvalidLut)?;
         Ok(Self { sigma, switch, mask_bank, mask_index })
     }
     pub fn sigma(&self) -> usize {
         self.sigma
     }
-    pub fn switch(&self) -> &PowerRhsPackage {
+    pub fn switch(&self) -> &ExponentRhsPackage {
         &self.switch
     }
     pub fn mask(&self) -> &Mat {
@@ -124,9 +124,9 @@ impl FlatLutPublicHelperRegistry {
         &mut self,
         lut: crate::program::LutId,
         helpers: FlatLutPublicHelperSet,
-    ) -> Result<(), PowerLutError> {
+    ) -> Result<(), ExponentLutError> {
         if self.helpers.insert(lut, helpers).is_some() {
-            Err(PowerLutError::InvalidLut)
+            Err(ExponentLutError::InvalidLut)
         } else {
             Ok(())
         }
@@ -137,8 +137,8 @@ impl FlatLutPublicHelperRegistry {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum PowerLutPublicSamplingError {
-    #[error("invalid public Power-LUT sampler configuration: {0}")]
+pub enum ExponentLutPublicSamplingError {
+    #[error("invalid public Exponent-LUT sampler configuration: {0}")]
     InvalidConfiguration(&'static str),
 }
 
@@ -147,10 +147,10 @@ pub enum PowerLutPublicSamplingError {
 /// selector-C setup material may affect public evaluation; its issuer need not
 /// know selector plaintext, private schedule, or sampler encoding.
 #[derive(Clone)]
-pub struct PowerLutPublicKeySampler {
+pub struct ExponentLutPublicKeySampler {
     pub layout: mxx_bgg::BggSamplerLayout,
 }
-impl PowerLutPublicKeySampler {
+impl ExponentLutPublicKeySampler {
     /// Samples `count` ciphertext-only input public keys from one indexed BGG
     /// family. The sampler's reserved index zero is discarded.
     pub fn sample_input_keys(
@@ -158,9 +158,9 @@ impl PowerLutPublicKeySampler {
         hash_key: Bytes,
         base_tag: impl Into<HashTag>,
         count: usize,
-    ) -> Result<Vec<BggPublicKeyWire>, PowerLutPublicSamplingError> {
+    ) -> Result<Vec<BggPublicKeyWire>, ExponentLutPublicSamplingError> {
         if count == 0 {
-            return Err(PowerLutPublicSamplingError::InvalidConfiguration(
+            return Err(ExponentLutPublicSamplingError::InvalidConfiguration(
                 "input-key count must be positive",
             ));
         }
@@ -181,18 +181,18 @@ impl PowerLutPublicKeySampler {
         hash_key: Bytes,
         max_width: usize,
         tag: impl Into<HashTag>,
-    ) -> Result<Arc<FlatLutPublicMaskBank>, PowerLutPublicSamplingError> {
+    ) -> Result<Arc<FlatLutPublicMaskBank>, ExponentLutPublicSamplingError> {
         let n = self
             .layout
             .ring_dimension
             .evaluate(&ParamEnv::default())
             .ok()
             .and_then(|value| value.to_usize())
-            .ok_or(PowerLutPublicSamplingError::InvalidConfiguration(
+            .ok_or(ExponentLutPublicSamplingError::InvalidConfiguration(
                 "ring dimension must be concrete",
             ))?;
         if max_width == 0 || !max_width.is_power_of_two() || max_width > n || n % max_width != 0 {
-            return Err(PowerLutPublicSamplingError::InvalidConfiguration(
+            return Err(ExponentLutPublicSamplingError::InvalidConfiguration(
                 "mask-bank width must be a power of two dividing the ring dimension",
             ));
         }
@@ -201,13 +201,15 @@ impl PowerLutPublicKeySampler {
         let mut branches = Vec::with_capacity(max_width);
         for j in 0..max_width {
             let sigma = canonical_sigma(j, n, max_width).ok_or(
-                PowerLutPublicSamplingError::InvalidConfiguration("invalid mask-bank sigma"),
+                ExponentLutPublicSamplingError::InvalidConfiguration("invalid mask-bank sigma"),
             )?;
             let key = sampler
                 .sample(hash_key.clone(), canonical_flat_mask_branch_tag(&root, sigma), &[false])
                 .into_iter()
                 .nth(1)
-                .ok_or(PowerLutPublicSamplingError::InvalidConfiguration("mask sample is empty"))?;
+                .ok_or(ExponentLutPublicSamplingError::InvalidConfiguration(
+                    "mask sample is empty",
+                ))?;
             branches.push((sigma, key.matrix));
         }
         Ok(Arc::new(FlatLutPublicMaskBank::from_branches(branches)))
@@ -215,35 +217,35 @@ impl PowerLutPublicKeySampler {
 }
 
 #[derive(Clone)]
-pub struct PowerLutPublicKeyCompiler {
+pub struct ExponentLutPublicKeyCompiler {
     pub public_key: mxx_bgg::BggPublicKeyCompiler,
 }
-impl PowerLutPublicKeyCompiler {
+impl ExponentLutPublicKeyCompiler {
     pub fn new(public_key: mxx_bgg::BggPublicKeyCompiler) -> Self {
         Self { public_key }
     }
     pub(crate) fn compile_program(
         &self,
-        program: &PowerLutProgram,
+        program: &ExponentLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggPublicKeyWire>,
-        rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
+        rhs: &BTreeMap<RhsInputId, ExponentRhsPackage>,
         selectors: &BTreeMap<crate::program::RhsFamilyId, PublicSelectorFamily>,
-        values: &BTreeMap<crate::program::PublicValueFamilyId, PowerLutMonomialFamily>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, ExponentLutMonomialFamily>,
         helpers: &FlatLutPublicHelperMap,
-    ) -> Result<BTreeMap<ProgramWireId, BggPublicKeyWire>, PowerLutError> {
+    ) -> Result<BTreeMap<ProgramWireId, BggPublicKeyWire>, ExponentLutError> {
         let mut ranges = ProgramFamilyRanges::new();
         for (id, family) in selectors {
             ranges.selector(
                 *id,
                 FamilyRange::full(family.count().clone())
-                    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
+                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
             );
         }
         for (id, family) in values {
             ranges.public_values(
                 *id,
                 FamilyRange::full(family.count().clone())
-                    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
+                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
             );
         }
         let bindings = ProgramBindings::new(inputs, rhs, selectors, values, helpers);
@@ -251,19 +253,23 @@ impl PowerLutPublicKeyCompiler {
     }
     pub(crate) fn compile_program_with_ranges(
         &self,
-        program: &PowerLutProgram,
+        program: &ExponentLutProgram,
         inputs: &BTreeMap<ProgramInputId, BggPublicKeyWire>,
-        rhs: &BTreeMap<RhsInputId, PowerRhsPackage>,
+        rhs: &BTreeMap<RhsInputId, ExponentRhsPackage>,
         selectors: &BTreeMap<crate::program::RhsFamilyId, PublicSelectorFamily>,
-        values: &BTreeMap<crate::program::PublicValueFamilyId, PowerLutMonomialFamily>,
+        values: &BTreeMap<crate::program::PublicValueFamilyId, ExponentLutMonomialFamily>,
         ranges: &ProgramFamilyRanges,
         helpers: &FlatLutPublicHelperMap,
-    ) -> Result<BTreeMap<ProgramWireId, BggPublicKeyWire>, PowerLutError> {
+    ) -> Result<BTreeMap<ProgramWireId, BggPublicKeyWire>, ExponentLutError> {
         let bindings = ProgramBindings::new(inputs, rhs, selectors, values, helpers);
         lower_program(program, &bindings, ranges, self)
     }
     /// Setup-fixed Fuse is the public matrix product `A G^{-1}(C)`.
-    pub fn fuse_public(&self, input: &Mat, rhs: &PowerRhsPackage) -> Result<Mat, PowerLutError> {
+    pub fn fuse_public(
+        &self,
+        input: &Mat,
+        rhs: &ExponentRhsPackage,
+    ) -> Result<Mat, ExponentLutError> {
         // Public projection of Fuse: multiply `A` by the digit matrix of C.
         Ok(input.clone().mul_decomposed(
             rhs.gsw_ciphertext()
@@ -276,7 +282,7 @@ impl PowerLutPublicKeyCompiler {
         input: &Mat,
         table: &[usize],
         helpers: &[FlatLutPublicHelper],
-    ) -> Result<Mat, PowerLutError> {
+    ) -> Result<Mat, ExponentLutError> {
         let width = table.len();
         let n = input
             .matrix_type()
@@ -284,8 +290,8 @@ impl PowerLutPublicKeyCompiler {
             .evaluate(&ParamEnv::default())
             .ok()
             .and_then(|value| value.to_usize())
-            .ok_or(PowerLutError::InvalidLut)?;
-        let table = LutTable::unary(width, n, table.to_vec()).map_err(PowerLutError::from)?;
+            .ok_or(ExponentLutError::InvalidLut)?;
+        let table = LutTable::unary(width, n, table.to_vec()).map_err(ExponentLutError::from)?;
         self.single_input_lut_table(input, &table, helpers)
     }
 
@@ -294,7 +300,7 @@ impl PowerLutPublicKeyCompiler {
         input: &Mat,
         table: &LutTable,
         helpers: &[FlatLutPublicHelper],
-    ) -> Result<Mat, PowerLutError> {
+    ) -> Result<Mat, ExponentLutError> {
         let width = table.values().len();
         let n = input
             .matrix_type()
@@ -302,7 +308,7 @@ impl PowerLutPublicKeyCompiler {
             .evaluate(&ParamEnv::default())
             .ok()
             .and_then(|value| value.to_usize())
-            .ok_or(PowerLutError::InvalidLut)?;
+            .ok_or(ExponentLutError::InvalidLut)?;
         if width == 0 ||
             !width.is_power_of_two() ||
             width > n ||
@@ -310,7 +316,7 @@ impl PowerLutPublicKeyCompiler {
             helpers.len() != width ||
             table.values().iter().any(|value| *value >= n)
         {
-            return Err(PowerLutError::InvalidLut);
+            return Err(ExponentLutError::InvalidLut);
         }
         // The branch body computes `mask_j * (A^{\sigma_j} G^{-1}(C_j))`, the
         // public component corresponding to the private Fuse branch.
@@ -319,21 +325,22 @@ impl PowerLutPublicKeyCompiler {
                 .iter()
                 .enumerate()
                 .map(|(j, helper)| {
-                    let expected = canonical_sigma(j, n, width).ok_or(PowerLutError::InvalidLut)?;
+                    let expected =
+                        canonical_sigma(j, n, width).ok_or(ExponentLutError::InvalidLut)?;
                     if helper.sigma() != expected {
-                        return Err(PowerLutError::InvalidLut);
+                        return Err(ExponentLutError::InvalidLut);
                     }
                     Ok(input.clone().ring_automorphism(expected))
                 })
-                .collect::<Result<Vec<_>, PowerLutError>>()?,
+                .collect::<Result<Vec<_>, ExponentLutError>>()?,
         )
-        .map_err(|_| PowerLutError::InvalidLut)?;
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         let switches = Family::pack(
             helpers.iter().map(|helper| helper.switch().gsw_ciphertext().clone()).collect(),
         )
-        .map_err(|_| PowerLutError::InvalidLut)?;
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         let masks = Family::pack(helpers.iter().map(|helper| helper.mask().clone()).collect())
-            .map_err(|_| PowerLutError::InvalidLut)?;
+            .map_err(|_| ExponentLutError::InvalidLut)?;
         let branches =
             Family::try_parallel_zip_many_values(
                 vec![raw_publics, switches, masks],
@@ -353,7 +360,7 @@ impl PowerLutPublicKeyCompiler {
                     let raw = items.pop().ok_or(DslError::Schema)?;
                     // `raw = A^\sigma` is the automorphed public-key matrix; no
                     // payload or plaintext term is formed on this public path.
-                    let rhs = PowerRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
+                    let rhs = ExponentRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
                     // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
                     let fused = raw.mul_decomposed(rhs.gsw_ciphertext().clone().decompose(
                         self.public_key.base.clone(),
@@ -368,20 +375,20 @@ impl PowerLutPublicKeyCompiler {
                     )))
                 },
             )
-            .map_err(|_| PowerLutError::InvalidLut)?;
+            .map_err(|_| ExponentLutError::InvalidLut)?;
         balanced_sum_family(branches)
     }
     pub fn two_input_lut(
         &self,
         lhs: &Mat,
-        rhs: &PowerRhsPackage,
+        rhs: &ExponentRhsPackage,
         lhs_width: usize,
         rhs_width: usize,
         table: &[usize],
         helpers: &[FlatLutPublicHelper],
-    ) -> Result<Mat, PowerLutError> {
-        if table.len() != lhs_width.checked_mul(rhs_width).ok_or(PowerLutError::InvalidLut)? {
-            return Err(PowerLutError::InvalidLut);
+    ) -> Result<Mat, ExponentLutError> {
+        if table.len() != lhs_width.checked_mul(rhs_width).ok_or(ExponentLutError::InvalidLut)? {
+            return Err(ExponentLutError::InvalidLut);
         }
         self.single_input_lut(&self.fuse_public(lhs, rhs)?, table, helpers)
     }
@@ -389,27 +396,27 @@ impl PowerLutPublicKeyCompiler {
     fn two_input_lut_table(
         &self,
         lhs: &Mat,
-        rhs: &PowerRhsPackage,
+        rhs: &ExponentRhsPackage,
         table: &LutTable,
         helpers: &[FlatLutPublicHelper],
-    ) -> Result<Mat, PowerLutError> {
-        let rhs_width = table.rhs_width().ok_or(PowerLutError::InvalidLut)?;
+    ) -> Result<Mat, ExponentLutError> {
+        let rhs_width = table.rhs_width().ok_or(ExponentLutError::InvalidLut)?;
         if table.input_width() == 0 ||
             rhs_width == 0 ||
             table.output_form() != LutOutputForm::Monomial
         {
-            return Err(PowerLutError::InvalidLut);
+            return Err(ExponentLutError::InvalidLut);
         }
         let fused = self.fuse_public(lhs, rhs)?;
         self.single_input_lut_table(&fused, table, helpers)
     }
 }
 
-impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
+impl ProgramLoweringBackend for ExponentLutPublicKeyCompiler {
     type Wire = BggPublicKeyWire;
-    type Rhs = PowerRhsPackage;
+    type Rhs = ExponentRhsPackage;
     type SelectorFamily = PublicSelectorFamily;
-    type PublicValueFamily = PowerLutMonomialFamily;
+    type PublicValueFamily = ExponentLutMonomialFamily;
     type Helper = FlatLutPublicHelper;
     type HelperSet = FlatLutPublicHelperSet;
 
@@ -417,7 +424,7 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
         &self,
         helpers: &'a Self::HelperSet,
         table: &crate::program::LutTable,
-    ) -> Result<&'a [Self::Helper], PowerLutError> {
+    ) -> Result<&'a [Self::Helper], ExponentLutError> {
         helpers.resolve(table)
     }
     fn unary(
@@ -425,9 +432,9 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
         input: Self::Wire,
         table: &crate::program::LutTable,
         helpers: &[Self::Helper],
-    ) -> Result<Self::Wire, PowerLutError> {
+    ) -> Result<Self::Wire, ExponentLutError> {
         if table.rhs_width().is_some() {
-            return Err(PowerLutError::InvalidLut);
+            return Err(ExponentLutError::InvalidLut);
         }
         Ok(BggPublicKeyWire {
             matrix: self.single_input_lut_table(&input.matrix, table, helpers)?,
@@ -440,7 +447,7 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
         rhs: &Self::Rhs,
         table: &crate::program::LutTable,
         helpers: &[Self::Helper],
-    ) -> Result<Self::Wire, PowerLutError> {
+    ) -> Result<Self::Wire, ExponentLutError> {
         Ok(BggPublicKeyWire {
             matrix: self.two_input_lut_table(&lhs.matrix, rhs, table, helpers)?,
             reveal_plaintext: false,
@@ -453,7 +460,7 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
         values: &Self::PublicValueFamily,
         selector_range: &FamilyRange,
         value_range: &FamilyRange,
-    ) -> Result<Self::Wire, PowerLutError> {
+    ) -> Result<Self::Wire, ExponentLutError> {
         // Public projection of one-hot selection is
         // `sum_i m_i * (A G^{-1}(C_i)) * v_i`: `m_i` is the public structural
         // active-lane mask (1 for a real or dummy active cell, 0 for padding
@@ -480,44 +487,44 @@ impl ProgramLoweringBackend for PowerLutPublicKeyCompiler {
             selector_range != value_range ||
             selectors.count() != values.count()
         {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let capacity = selector_range
             .capacity()
             .evaluate(&ParamEnv::default())
             .ok()
             .and_then(|value| value.to_usize())
-            .ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            .ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         let count = mxx_dsl::Int::evaluate(selector_range.count().clone());
         let start = mxx_dsl::Int::evaluate(selector_range.start().clone());
         let (indices, masks) =
             one_hot_indices_and_masks(capacity, count, start, values.element_type().clone())
-                .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let cs = selectors
             .gsw()
             .clone()
             .parallel_gather(indices.clone())
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let vals = values
             .as_family()
             .clone()
             .parallel_gather(indices)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let weighted = Family::try_parallel_zip_many_values(
             vec![cs, vals, masks],
             move |_index, mut items| {
                 let mask = items.pop().ok_or(DslError::Schema)?;
                 let value = items.pop().ok_or(DslError::Schema)?;
                 let c = items.pop().ok_or(DslError::Schema)?;
-                let rhs = PowerRhsPackage::new(c).map_err(|_| DslError::Schema)?;
+                let rhs = ExponentRhsPackage::new(c).map_err(|_| DslError::Schema)?;
                 Ok(self.fuse_public(&input.matrix, &rhs).map_err(|_| DslError::Schema)? *
                     (value * mask))
             },
         )
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         Ok(BggPublicKeyWire {
             matrix: balanced_sum_family(weighted)
-                .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?,
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
             reveal_plaintext: false,
         })
     }
@@ -528,9 +535,9 @@ pub struct PublicSelectorFamily {
     gsw: Family<Mat>,
 }
 impl PublicSelectorFamily {
-    pub fn new(gsw: Family<Mat>) -> Result<Self, PowerLutError> {
+    pub fn new(gsw: Family<Mat>) -> Result<Self, ExponentLutError> {
         if *gsw.count() == IntExpr::constant(0) {
-            Err(PowerLutError::InvalidSparseLwrBlock)
+            Err(ExponentLutError::InvalidSparseLwrBlock)
         } else {
             Ok(Self { gsw })
         }
@@ -544,9 +551,9 @@ impl PublicSelectorFamily {
     pub(crate) fn flattened(&self) -> Vec<Family<Mat>> {
         vec![self.gsw.clone()]
     }
-    pub(crate) fn from_flattened(mut values: Vec<Family<Mat>>) -> Result<Self, PowerLutError> {
+    pub(crate) fn from_flattened(mut values: Vec<Family<Mat>>) -> Result<Self, ExponentLutError> {
         if values.len() != 1 {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         Self::new(values.remove(0))
     }
@@ -555,22 +562,22 @@ impl PublicSelectorFamily {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlatLutPublicHelper, FlatLutPublicHelperSet, PowerLutPublicKeyCompiler,
-        PowerLutPublicKeySampler, PublicSelectorFamily,
+        ExponentLutPublicKeyCompiler, ExponentLutPublicKeySampler, FlatLutPublicHelper,
+        FlatLutPublicHelperSet, PublicSelectorFamily,
     };
     use crate::{
         program::{
-            FamilyRange, LutTable, PBC_MONOMIAL_FAMILY_PROVENANCE, PowerLutMonomialFamily,
+            ExponentLutMonomialFamily, FamilyRange, LutTable, PBC_MONOMIAL_FAMILY_PROVENANCE,
             ProgramLoweringBackend,
         },
-        rhs::PowerRhsPackage,
+        rhs::ExponentRhsPackage,
     };
     use mxx_bgg::BggPublicKeyCompiler;
     use mxx_dsl::{Family, Ring};
 
     #[test]
     fn public_input_sampler_batches_and_rejects_empty_count() {
-        let sampler = PowerLutPublicKeySampler {
+        let sampler = ExponentLutPublicKeySampler {
             layout: mxx_bgg::BggSamplerLayout {
                 modulus: 97.into(),
                 ring_dimension: 4.into(),
@@ -596,13 +603,13 @@ mod tests {
     #[test]
     fn public_fuse_uses_the_setup_fixed_ciphertext() {
         let ring = Ring::new(97, 4);
-        let compiler = PowerLutPublicKeyCompiler::new(BggPublicKeyCompiler {
+        let compiler = ExponentLutPublicKeyCompiler::new(BggPublicKeyCompiler {
             ring: ring.clone(),
             base: 4.into(),
             digit_count: 2.into(),
         });
         let input = ring.zero((2, 2));
-        let rhs = PowerRhsPackage::new(ring.zero((2, 2))).unwrap();
+        let rhs = ExponentRhsPackage::new(ring.zero((2, 2))).unwrap();
         let output = compiler.fuse_public(&input, &rhs).unwrap();
         let expected = input.mul_decomposed(rhs.gsw_ciphertext().clone().decompose(4, 2));
         assert_eq!(output.matrix_type(), expected.matrix_type());
@@ -615,7 +622,7 @@ mod tests {
     #[test]
     fn public_one_hot_selection_returns_the_balanced_sum_without_lut_helpers() {
         let ring = Ring::new(97, 4);
-        let compiler = PowerLutPublicKeyCompiler::new(BggPublicKeyCompiler {
+        let compiler = ExponentLutPublicKeyCompiler::new(BggPublicKeyCompiler {
             ring: ring.clone(),
             base: 4.into(),
             digit_count: 2.into(),
@@ -628,7 +635,7 @@ mod tests {
             Family::pack(vec![ring.zero((2, 2)), ring.zero((2, 2))]).unwrap(),
         )
         .unwrap();
-        let values = PowerLutMonomialFamily::from_trusted(
+        let values = ExponentLutMonomialFamily::from_trusted(
             Family::pack(vec![ring.polynomial([0.into()]), ring.polynomial([1.into()])]).unwrap(),
             &ring,
             PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -636,7 +643,7 @@ mod tests {
         .unwrap();
         let range = FamilyRange::full(2).unwrap();
 
-        let wrong_provenance = PowerLutMonomialFamily::from_trusted(
+        let wrong_provenance = ExponentLutMonomialFamily::from_trusted(
             values.as_family().clone(),
             &ring,
             PBC_MONOMIAL_FAMILY_PROVENANCE + 1,
@@ -647,7 +654,7 @@ mod tests {
                 .one_hot_select(input.clone(), &selectors, &wrong_provenance, &range, &range)
                 .is_err()
         );
-        let wrong_count = PowerLutMonomialFamily::from_trusted(
+        let wrong_count = ExponentLutMonomialFamily::from_trusted(
             Family::pack(vec![ring.polynomial([0.into()])]).unwrap(),
             &ring,
             PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -672,7 +679,7 @@ mod tests {
     #[test]
     fn public_helper_set_rejects_a_different_lut_table() {
         let ring = Ring::new(97, 4);
-        let rhs = PowerRhsPackage::new(ring.zero((2, 2))).unwrap();
+        let rhs = ExponentRhsPackage::new(ring.zero((2, 2))).unwrap();
         let helper = FlatLutPublicHelper::new(1, rhs, ring.zero((2, 2)));
         let table = LutTable::unary(1, 2, vec![0]).unwrap();
         let other = LutTable::unary(1, 2, vec![1]).unwrap();

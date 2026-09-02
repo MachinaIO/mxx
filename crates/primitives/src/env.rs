@@ -1,7 +1,8 @@
 //! Environment-variable helpers owned by the primitive layer.
 
-/// `MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH`: number of RHS columns processed
-/// together by `mul_decompose` and `mul_decompose_small`. Default: 1.
+/// `MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH`: number of consecutive RHS/target columns loaded and
+/// processed together by decomposition products, preimage sampling, and typed-preimage products.
+/// Default: 1.
 pub fn mul_decompose_column_chunk_width() -> usize {
     std::env::var("MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH")
         .ok()

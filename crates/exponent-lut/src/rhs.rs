@@ -1,4 +1,4 @@
-//! Setup-fixed RHS material for Power-LUT.
+//! Setup-fixed RHS material for Exponent-LUT.
 //!
 //! The setup-fixed construction intentionally has one runtime RHS object: the
 //! GSW ciphertext `C`. Older versions stored one BGG encoding for every
@@ -12,7 +12,7 @@
 //! production, public role, concrete matrix type, and sampler identities
 //! without loading private companion encodings.
 
-use crate::encoding::PowerArtifactImportError;
+use crate::encoding::ExponentArtifactImportError;
 use mxx_dsl::Mat;
 use mxx_ir_core::{
     ParamEnv,
@@ -25,7 +25,7 @@ use thiserror::Error;
 
 /// Artifact names for one setup-fixed RHS ciphertext.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PowerRhsPackageArtifactNames {
+pub struct ExponentRhsPackageArtifactNames {
     /// The fixed GSW ciphertext `C`.
     pub gsw_ciphertext: String,
 }
@@ -36,7 +36,7 @@ pub struct PowerRhsPackageArtifactNames {
 /// is prepared, so the public-key projection is allowed to use the same
 /// matrix and computes `A * G^{-1}(C)`.
 #[derive(Clone)]
-pub struct PowerRhsPackage {
+pub struct ExponentRhsPackage {
     gsw_ciphertext: Mat,
 }
 
@@ -97,14 +97,14 @@ impl ManifestSecretMetadata {
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
-pub enum PowerRhsPackageError {
+pub enum ExponentRhsPackageError {
     #[error("RHS ciphertext has an invalid shape")]
     InvalidShape,
 }
 
-impl PowerRhsPackage {
+impl ExponentRhsPackage {
     /// Constructs a package from the one fixed GSW ciphertext.
-    pub(crate) fn new(gsw_ciphertext: Mat) -> Result<Self, PowerRhsPackageError> {
+    pub(crate) fn new(gsw_ciphertext: Mat) -> Result<Self, ExponentRhsPackageError> {
         let matrix_type = gsw_ciphertext.matrix_type();
         let rows =
             matrix_type.rows.evaluate(&ParamEnv::default()).ok().and_then(|value| value.to_usize());
@@ -114,7 +114,7 @@ impl PowerRhsPackage {
             .ok()
             .and_then(|value| value.to_usize());
         if rows != Some(2) || columns.is_none() || columns == Some(0) {
-            return Err(PowerRhsPackageError::InvalidShape);
+            return Err(ExponentRhsPackageError::InvalidShape);
         }
         Ok(Self { gsw_ciphertext })
     }
@@ -124,50 +124,50 @@ impl PowerRhsPackage {
     pub fn artifact_input(
         production_id: ProductionId,
         manifest: &Manifest,
-        names: PowerRhsPackageArtifactNames,
+        names: ExponentRhsPackageArtifactNames,
         expected_source: &mxx_bgg::BggSamplerLayout,
         expected_source_identity: [u8; 32],
         expected_target: &mxx_bgg::BggSamplerLayout,
         expected_target_identity: [u8; 32],
-    ) -> Result<Self, PowerArtifactImportError> {
+    ) -> Result<Self, ExponentArtifactImportError> {
         if manifest.ir_version != mxx_ir_core::encoding::IR_VERSION {
-            return Err(PowerArtifactImportError::InvalidMetadata);
+            return Err(ExponentArtifactImportError::InvalidMetadata);
         }
         if manifest.production_id != production_id {
-            return Err(PowerArtifactImportError::ProductionMismatch);
+            return Err(ExponentArtifactImportError::ProductionMismatch);
         }
         let artifact = manifest
             .artifacts
             .get(&names.gsw_ciphertext)
-            .ok_or(PowerArtifactImportError::MissingArtifact)?;
+            .ok_or(ExponentArtifactImportError::MissingArtifact)?;
         if artifact.confidentiality != ArtifactConfidentiality::Public ||
             artifact.family_shape.is_some()
         {
-            return Err(PowerArtifactImportError::ConfidentialityMismatch);
+            return Err(ExponentArtifactImportError::ConfidentialityMismatch);
         }
         mxx_ir_core::artifact::validate_manifest(manifest)
-            .map_err(|_| PowerArtifactImportError::InvalidMetadata)?;
+            .map_err(|_| ExponentArtifactImportError::InvalidMetadata)?;
         let metadata: ManifestRhsMetadata = serde_json::from_str(
-            artifact.layout.as_deref().ok_or(PowerArtifactImportError::InvalidMetadata)?,
+            artifact.layout.as_deref().ok_or(ExponentArtifactImportError::InvalidMetadata)?,
         )
-        .map_err(|_| PowerArtifactImportError::InvalidMetadata)?;
+        .map_err(|_| ExponentArtifactImportError::InvalidMetadata)?;
         let source = metadata.source.sampler();
         let target = metadata.target.sampler();
         let modulus = source
             .modulus
             .evaluate(&ParamEnv::default())
-            .map_err(|_| PowerArtifactImportError::MatrixTypeMismatch)?;
+            .map_err(|_| ExponentArtifactImportError::MatrixTypeMismatch)?;
         let ring_dimension = source
             .ring_dimension
             .evaluate(&ParamEnv::default())
             .ok()
             .and_then(|value| value.to_usize())
-            .ok_or(PowerArtifactImportError::MatrixTypeMismatch)?;
+            .ok_or(ExponentArtifactImportError::MatrixTypeMismatch)?;
         let target_columns = target
             .secret_dimension
             .checked_mul(target.digit_count)
             .filter(|columns| *columns > 0)
-            .ok_or(PowerArtifactImportError::MatrixTypeMismatch)?;
+            .ok_or(ExponentArtifactImportError::MatrixTypeMismatch)?;
         let expected = ArtifactType::Matrix(ConcreteMatrixType {
             modulus,
             ring_dimension,
@@ -175,14 +175,14 @@ impl PowerRhsPackage {
             columns: target_columns,
         });
         if artifact.artifact_type != expected {
-            return Err(PowerArtifactImportError::MatrixTypeMismatch);
+            return Err(ExponentArtifactImportError::MatrixTypeMismatch);
         }
         if metadata.source.identity != expected_source_identity ||
             metadata.target.identity != expected_target_identity ||
             metadata.source.sampler() != *expected_source ||
             metadata.target.sampler() != *expected_target
         {
-            return Err(PowerArtifactImportError::InvalidMetadata);
+            return Err(ExponentArtifactImportError::InvalidMetadata);
         }
         let ciphertext = source.ring().artifact_input(
             production_id,
@@ -190,7 +190,7 @@ impl PowerRhsPackage {
             (source.secret_dimension, target_columns),
             ArtifactConfidentiality::Public,
         );
-        Self::new(ciphertext).map_err(|_| PowerArtifactImportError::MatrixTypeMismatch)
+        Self::new(ciphertext).map_err(|_| ExponentArtifactImportError::MatrixTypeMismatch)
     }
 
     pub(crate) fn gsw_ciphertext(&self) -> &Mat {
@@ -199,7 +199,7 @@ impl PowerRhsPackage {
 
     /// Returns the public setup-fixed descriptor. The same fixed ciphertext
     /// is intentionally retained because it is an input to public Fuse.
-    pub fn public_projection(&self) -> PowerRhsPackage {
+    pub fn public_projection(&self) -> ExponentRhsPackage {
         self.clone()
     }
 }
@@ -231,7 +231,7 @@ mod tests {
     fn manifest_fixture() -> (
         ProductionId,
         Manifest,
-        PowerRhsPackageArtifactNames,
+        ExponentRhsPackageArtifactNames,
         BggSamplerLayout,
         [u8; 32],
         BggSamplerLayout,
@@ -272,7 +272,7 @@ mod tests {
             content_hash: Some([5; 32]),
             layout: Some(serde_json::to_string(&metadata).unwrap()),
         };
-        let names = PowerRhsPackageArtifactNames { gsw_ciphertext: ARTIFACT_NAME.to_owned() };
+        let names = ExponentRhsPackageArtifactNames { gsw_ciphertext: ARTIFACT_NAME.to_owned() };
         let manifest = Manifest {
             ir_version: mxx_ir_core::encoding::IR_VERSION,
             production_id: production_id.clone(),
@@ -281,10 +281,10 @@ mod tests {
         (production_id, manifest, names, source, source_identity, target, target_identity)
     }
 
-    fn import_fixture() -> (PowerRhsPackage, ProductionId, Manifest) {
+    fn import_fixture() -> (ExponentRhsPackage, ProductionId, Manifest) {
         let (production_id, manifest, names, source, source_identity, target, target_identity) =
             manifest_fixture();
-        let package = PowerRhsPackage::artifact_input(
+        let package = ExponentRhsPackage::artifact_input(
             production_id.clone(),
             &manifest,
             names,
@@ -314,7 +314,7 @@ mod tests {
     fn rejects_wrong_source_identity_or_layout() {
         let (production_id, manifest, names, source, source_identity, target, target_identity) =
             manifest_fixture();
-        let wrong_identity = PowerRhsPackage::artifact_input(
+        let wrong_identity = ExponentRhsPackage::artifact_input(
             production_id.clone(),
             &manifest,
             names.clone(),
@@ -323,10 +323,10 @@ mod tests {
             &target,
             target_identity,
         );
-        assert!(matches!(wrong_identity, Err(PowerArtifactImportError::InvalidMetadata)));
+        assert!(matches!(wrong_identity, Err(ExponentArtifactImportError::InvalidMetadata)));
 
         let wrong_layout = sampler(16);
-        let wrong_layout = PowerRhsPackage::artifact_input(
+        let wrong_layout = ExponentRhsPackage::artifact_input(
             production_id,
             &manifest,
             names,
@@ -335,14 +335,14 @@ mod tests {
             &target,
             target_identity,
         );
-        assert!(matches!(wrong_layout, Err(PowerArtifactImportError::InvalidMetadata)));
+        assert!(matches!(wrong_layout, Err(ExponentArtifactImportError::InvalidMetadata)));
     }
 
     #[test]
     fn rejects_wrong_target_identity_or_layout() {
         let (production_id, manifest, names, source, source_identity, target, target_identity) =
             manifest_fixture();
-        let wrong_identity = PowerRhsPackage::artifact_input(
+        let wrong_identity = ExponentRhsPackage::artifact_input(
             production_id.clone(),
             &manifest,
             names.clone(),
@@ -351,10 +351,10 @@ mod tests {
             &target,
             [9; 32],
         );
-        assert!(matches!(wrong_identity, Err(PowerArtifactImportError::InvalidMetadata)));
+        assert!(matches!(wrong_identity, Err(ExponentArtifactImportError::InvalidMetadata)));
 
         let wrong_layout = sampler(16);
-        let wrong_layout = PowerRhsPackage::artifact_input(
+        let wrong_layout = ExponentRhsPackage::artifact_input(
             production_id,
             &manifest,
             names,
@@ -363,7 +363,7 @@ mod tests {
             &wrong_layout,
             target_identity,
         );
-        assert!(matches!(wrong_layout, Err(PowerArtifactImportError::InvalidMetadata)));
+        assert!(matches!(wrong_layout, Err(ExponentArtifactImportError::InvalidMetadata)));
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
         manifest.artifacts.get_mut(ARTIFACT_NAME).unwrap().confidentiality =
             ArtifactConfidentiality::Private;
         assert!(matches!(
-            PowerRhsPackage::artifact_input(
+            ExponentRhsPackage::artifact_input(
                 production_id.clone(),
                 &manifest,
                 names.clone(),
@@ -382,7 +382,7 @@ mod tests {
                 &target,
                 target_identity,
             ),
-            Err(PowerArtifactImportError::ConfidentialityMismatch)
+            Err(ExponentArtifactImportError::ConfidentialityMismatch)
         ));
 
         let artifact = manifest.artifacts.get_mut(ARTIFACT_NAME).unwrap();
@@ -394,7 +394,7 @@ mod tests {
             columns: 1,
         });
         assert!(matches!(
-            PowerRhsPackage::artifact_input(
+            ExponentRhsPackage::artifact_input(
                 production_id,
                 &manifest,
                 names,
@@ -403,7 +403,7 @@ mod tests {
                 &target,
                 target_identity,
             ),
-            Err(PowerArtifactImportError::MatrixTypeMismatch)
+            Err(ExponentArtifactImportError::MatrixTypeMismatch)
         ));
     }
 
@@ -412,7 +412,7 @@ mod tests {
         let (package, production_id, manifest) = import_fixture();
         let source = sampler(4);
         let ring = source.ring();
-        let compiler = mxx_power_lut_public_compiler(&source);
+        let compiler = mxx_exponent_lut_public_compiler(&source);
         let fused = compiler.fuse_public(&ring.input("public-a", (2, 2)), &package).unwrap();
         let graph = DslContext::new("rhs-public-import")
             .public_output("fused", fused)
@@ -427,10 +427,10 @@ mod tests {
             .unwrap();
     }
 
-    fn mxx_power_lut_public_compiler(
+    fn mxx_exponent_lut_public_compiler(
         layout: &BggSamplerLayout,
-    ) -> crate::public_key::PowerLutPublicKeyCompiler {
-        crate::public_key::PowerLutPublicKeyCompiler::new(BggPublicKeyCompiler {
+    ) -> crate::public_key::ExponentLutPublicKeyCompiler {
+        crate::public_key::ExponentLutPublicKeyCompiler::new(BggPublicKeyCompiler {
             ring: layout.ring(),
             base: layout.gadget_base.clone(),
             digit_count: layout.digit_count.into(),

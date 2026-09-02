@@ -1382,16 +1382,13 @@ fn benchmark_estimation(
         preprocessing_parallel_instances,
         "effective benchmark estimator parallelism"
     );
-    let backends = device_ids
-        .iter()
-        .copied()
-        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
-        .collect();
     let mut backend = GpuNodeMeasurementBackend::new(
-        backends,
+        &gpu_parameters,
+        device_ids.to_vec(),
         harness,
         selected.parameters.to_crt().2,
         preprocessing_column_wave_size,
+        2,
     );
     info!("collecting unique GPU measurement shapes");
     estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)

@@ -91,11 +91,8 @@ impl MaskedHighBitDecoderCompiler {
             let selector = ring
                 .identity(secret_size)
                 .slice(None, Some(IndexRange { start: 0.into(), end: 1.into() }));
-            let top = public_key *
-                selector
-                    .decompose(gadget_base.clone(), digit_count.clone())
-                    .into_preimage_relation()
-                    .materialize_exact();
+            let top = public_key
+                .mul_decomposed(selector.decompose(gadget_base.clone(), digit_count.clone()));
             let target = Mat::concat(ConcatAxis::Rows, vec![top, ring.zero((secret_size, 1))]);
             decoder_trapdoor.sample_preimage(target, (decoder_columns, 1))
         })?;

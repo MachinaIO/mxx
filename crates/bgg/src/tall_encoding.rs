@@ -425,20 +425,18 @@ impl BggTallEncodingCompiler {
         left_matrix: &Mat,
         right_matrix: &Mat,
     ) -> BggPublicKeyWire {
-        let first = left_matrix.clone() *
+        let first = left_matrix.clone().mul_decomposed(
             input
                 .matrix
                 .clone()
-                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                .into_preimage_relation()
-                .materialize_exact();
+                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone()),
+        );
         BggPublicKeyWire {
-            matrix: first *
+            matrix: first.mul_decomposed(
                 right_matrix
                     .clone()
-                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                    .into_preimage_relation()
-                    .materialize_exact(),
+                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone()),
+            ),
             reveal_plaintext: input.reveal_plaintext,
         }
     }

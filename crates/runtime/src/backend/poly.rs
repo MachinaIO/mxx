@@ -1,6 +1,6 @@
 use super::{
-    Backend, HashSampleRequest, IndexRange, MatrixMulAccumulateRequest, PreimageRequest,
-    SampleRange, UniformSampleRequest,
+    Backend, ChunkedPreimage, HashSampleRequest, IndexRange, MatrixMulAccumulateRequest,
+    PreimageRequest, SampleRange, UniformSampleRequest,
 };
 use mxx_ir_core::{
     ParamEnv,
@@ -688,6 +688,112 @@ where
         Ok(M::multiply_batch_out_of_place(inputs))
     }
 
+    fn mul_decompose(&mut self, left: &M, right: &M, small: bool) -> Result<M, Self::Error> {
+        Ok(if small { left.mul_decompose_small(right) } else { left.mul_decompose(right) })
+    }
+
+    fn apply_chunked_preimage(
+        &mut self,
+        left: &M,
+        preimage: &ChunkedPreimage,
+    ) -> Result<M, Self::Error> {
+        if preimage.chunks.is_empty() {
+            return Err(PolyBackendError::EmptyMatrix);
+        }
+        let mut output = M::zero(left.params(), left.row_size(), preimage.matrix_type.columns);
+        let mut expected_start = 0usize;
+        for chunk in &preimage.chunks {
+            if chunk.start != expected_start || chunk.columns == 0 {
+                return Err(PolyBackendError::InvalidInteger);
+            }
+            let right = M::from_compact_bytes(left.params(), &chunk.bytes);
+            if right.row_size() != left.col_size() || right.col_size() != chunk.columns {
+                return Err(PolyBackendError::InvalidInteger);
+            }
+            let product = left.multiply_out_of_place(&right);
+            output.copy_block_from(
+                &product,
+                0,
+                chunk.start,
+                0,
+                0,
+                output.row_size(),
+                chunk.columns,
+            );
+            expected_start = expected_start
+                .checked_add(chunk.columns)
+                .ok_or(PolyBackendError::InvalidInteger)?;
+        }
+        if expected_start != preimage.matrix_type.columns {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        Ok(output)
+    }
+
+    fn apply_chunked_preimage_batch(
+        &mut self,
+        inputs: Vec<(Arc<M>, Arc<ChunkedPreimage>)>,
+    ) -> Result<Vec<M>, Self::Error> {
+        let Some((_first_left, first_preimage)) = inputs.first() else {
+            return Ok(Vec::new());
+        };
+        let chunk_count = first_preimage.chunks.len();
+        tracing::debug!(
+            batch_width = inputs.len(),
+            chunk_count,
+            total_columns = first_preimage.matrix_type.columns,
+            "apply chunked preimage batch"
+        );
+        let mut outputs = inputs
+            .iter()
+            .map(|(left, preimage)| {
+                if preimage.chunks.len() != chunk_count ||
+                    left.col_size() != preimage.matrix_type.rows
+                {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                Ok(M::zero(left.params(), left.row_size(), preimage.matrix_type.columns))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for chunk_index in 0..chunk_count {
+            let first_chunk = &first_preimage.chunks[chunk_index];
+            tracing::debug!(
+                chunk_index,
+                start = first_chunk.start,
+                columns = first_chunk.columns,
+                batch_width = inputs.len(),
+                "apply chunked preimage column wave"
+            );
+            let mut multiply_inputs = Vec::with_capacity(inputs.len());
+            for (left, preimage) in &inputs {
+                let chunk = &preimage.chunks[chunk_index];
+                let right = M::from_compact_bytes(left.params(), &chunk.bytes);
+                if right.row_size() != left.col_size() || right.col_size() != chunk.columns {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                multiply_inputs.push((left.clone(), Arc::new(right)));
+            }
+            #[cfg(test)]
+            self.multiply_batch_sizes.push(multiply_inputs.len());
+            let products = M::multiply_batch_out_of_place(multiply_inputs);
+            for (((_, preimage), output), product) in
+                inputs.iter().zip(outputs.iter_mut()).zip(products)
+            {
+                let chunk = &preimage.chunks[chunk_index];
+                output.copy_block_from(
+                    &product,
+                    0,
+                    chunk.start,
+                    0,
+                    0,
+                    output.row_size(),
+                    chunk.columns,
+                );
+            }
+        }
+        Ok(outputs)
+    }
+
     fn matrix_mul_accumulate_batch(
         &mut self,
         requests: Vec<MatrixMulAccumulateRequest<M>>,
@@ -1245,6 +1351,70 @@ mod tests {
         });
         assert_eq!(draws, 2);
         assert_eq!(sampled, accepted);
+    }
+
+    #[test]
+    fn chunked_preimage_apply_matches_full_product_for_nondivisible_width() {
+        let parameters = DCRTPolyParams::new(4, 1, 10, 5);
+        let polynomial =
+            |value: u8| DCRTPoly::from_biguint_to_constant(&parameters, BigUint::from(value));
+        let left =
+            DCRTPolyMatrix::from_poly_vec(&parameters, vec![vec![polynomial(2), polynomial(3)]]);
+        let right = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![
+                vec![polynomial(1), polynomial(2), polynomial(3)],
+                vec![polynomial(4), polynomial(5), polynomial(6)],
+            ],
+        );
+        let matrix_type = ConcreteMatrixType {
+            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()),
+            ring_dimension: 4,
+            rows: 2,
+            columns: 3,
+        };
+        let chunks = [(0, 2), (2, 3)]
+            .into_iter()
+            .map(|(start, end)| {
+                let chunk = right.slice(0, 2, start, end);
+                crate::backend::PreimageColumnChunk {
+                    start,
+                    columns: end - start,
+                    bytes: chunk.to_compact_bytes(),
+                }
+            })
+            .collect();
+        let preimage = ChunkedPreimage { matrix_type, chunks };
+        let mut backend = cpu_backend([parameters]);
+
+        let actual =
+            backend.apply_chunked_preimage(&left, &preimage).expect("apply chunked preimage");
+        assert_eq!(actual, &left * &right);
+    }
+
+    #[test]
+    fn direct_mul_decompose_matches_explicit_materialization() {
+        let parameters = DCRTPolyParams::new(4, 1, 10, 5);
+        let polynomial =
+            |value: u8| DCRTPoly::from_biguint_to_constant(&parameters, BigUint::from(value));
+        let left = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![vec![polynomial(2), polynomial(3), polynomial(4), polynomial(5)]],
+        );
+        let right = DCRTPolyMatrix::from_poly_vec(
+            &parameters,
+            vec![vec![polynomial(1), polynomial(2)], vec![polynomial(4), polynomial(5)]],
+        );
+        let mut backend = cpu_backend([parameters]);
+
+        let direct = backend.mul_decompose(&left, &right, false).expect("direct decomposition");
+        let explicit = left.multiply_out_of_place(&right.decompose());
+        assert_eq!(direct, explicit);
+
+        let direct_small =
+            backend.mul_decompose(&left, &right, true).expect("direct small decomposition");
+        let explicit_small = left.multiply_out_of_place(&right.small_decompose());
+        assert_eq!(direct_small, explicit_small);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Sparse-LWR PRF application built on the generic Power-LUT program and
+//! Sparse-LWR PRF application built on the generic Exponent-LUT program and
 //! Fuse/LUT core.
 //!
 //! This module owns the sparse-LWR application descriptor and its reusable
@@ -28,18 +28,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    PowerLutEncodingCompiler, PowerLutError,
+    ExponentLutEncodingCompiler, ExponentLutError,
     encoding::{EncodingSelectorFamily, FlatLutHelper, FlatLutHelperMap, FlatLutHelperSet},
     program::{
-        FamilyRange, LutTable, PBC_MONOMIAL_FAMILY_PROVENANCE, PowerLutMonomialFamily,
-        PowerLutProgram, PowerLutProgramBuilder, PowerLutProgramId, ProgramFamilyRanges,
-        ProgramInputId, ProgramValidationError, ProgramWireId, PublicValueFamilyId, RhsFamilyId,
+        ExponentLutMonomialFamily, ExponentLutProgram, ExponentLutProgramBuilder,
+        ExponentLutProgramId, FamilyRange, LutTable, PBC_MONOMIAL_FAMILY_PROVENANCE,
+        ProgramFamilyRanges, ProgramInputId, ProgramValidationError, ProgramWireId,
+        PublicValueFamilyId, RhsFamilyId,
     },
     public_key::{
-        FlatLutPublicHelper, FlatLutPublicHelperMap, FlatLutPublicHelperSet,
-        PowerLutPublicKeyCompiler, PublicSelectorFamily,
+        ExponentLutPublicKeyCompiler, FlatLutPublicHelper, FlatLutPublicHelperMap,
+        FlatLutPublicHelperSet, PublicSelectorFamily,
     },
-    rhs::PowerRhsPackage,
+    rhs::ExponentRhsPackage,
 };
 
 /// Trusted, public description of the refresh PRF batch order.
@@ -59,7 +60,7 @@ pub struct RefreshPrfBatchInputs {
     active_count: usize,
     value_count: usize,
     label_count: usize,
-    program_id: PowerLutProgramId,
+    program_id: ExponentLutProgramId,
     output_wire: ProgramWireId,
 }
 
@@ -76,16 +77,18 @@ impl RefreshPrfBatchInputs {
         profile: SparseLwrPrfProfile,
         labels: &crate::refresh::RefreshPrfLabelIndex,
         program: &SparseLwrPrfProgram,
-    ) -> Result<Self, PowerLutError> {
-        layout.validate().map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+    ) -> Result<Self, ExponentLutError> {
+        layout.validate().map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         if program.profile() != &profile {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let active_count = crate::pbc::PbcActiveCellIndex::build(layout)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .len();
-        let value_count =
-            labels.len().checked_mul(active_count).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+        let value_count = labels
+            .len()
+            .checked_mul(active_count)
+            .ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         let batch_id =
             public_value_batch_id(layout, &profile, labels, active_count, value_count, program)?;
         Ok(Self {
@@ -141,7 +144,7 @@ impl RefreshPrfBatchInputs {
         self.value_count
     }
 
-    pub const fn program_id(&self) -> PowerLutProgramId {
+    pub const fn program_id(&self) -> ExponentLutProgramId {
         self.program_id
     }
     pub const fn output_wire(&self) -> ProgramWireId {
@@ -168,9 +171,9 @@ fn public_value_batch_id(
     active_count: usize,
     value_count: usize,
     program: &SparseLwrPrfProgram,
-) -> Result<PbcPublicValueBatchId, PowerLutError> {
+) -> Result<PbcPublicValueBatchId, ExponentLutError> {
     let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/pbc-public-value-batch/v1");
+    digest.update(b"mxx-exponent-lut/pbc-public-value-batch/v1");
     digest.update(b"order=mask-slot-component-coefficient-digit/fresh-component-coefficient-digit");
     digest.update(b"public-values=canonical-label-pbc-encoding-v1");
     digest.update(layout.layout_id.0);
@@ -202,49 +205,49 @@ fn public_value_batch_id(
 /// `X^a`. This distinction is part of the one-hot gate's public-factor
 /// contract and is therefore documented at the single family declaration
 /// boundary used by both private and public-key lowering.
-type SparseLwrPublicMonomialFamily = PowerLutMonomialFamily;
+type SparseLwrPublicMonomialFamily = ExponentLutMonomialFamily;
 
 fn batch_public_values_family(
     batch: &RefreshPrfBatchInputs,
     ring: &mxx_dsl::Ring,
-) -> Result<SparseLwrPublicMonomialFamily, PowerLutError> {
+) -> Result<SparseLwrPublicMonomialFamily, ExponentLutError> {
     let ring_type = ring.matrix_type((1, 1));
     let ring_dimension = ring_type
         .ring_dimension
         .evaluate(&mxx_ir_core::ParamEnv::default())
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
         .to_usize()
-        .ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+        .ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
     if ring_dimension != batch.profile.ring_dimension {
-        return Err(PowerLutError::InvalidSparseLwrBlock);
+        return Err(ExponentLutError::InvalidSparseLwrBlock);
     }
 
-    batch.layout.validate().map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+    batch.layout.validate().map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
     let active_count = crate::pbc::PbcActiveCellIndex::build(&batch.layout)
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
         .len();
     if batch.active_count != active_count ||
         batch.value_count !=
             batch
                 .len()
                 .checked_mul(active_count)
-                .ok_or(PowerLutError::InvalidSparseLwrBlock)?
+                .ok_or(ExponentLutError::InvalidSparseLwrBlock)?
     {
-        return Err(PowerLutError::InvalidSparseLwrBlock);
+        return Err(ExponentLutError::InvalidSparseLwrBlock);
     }
-    PowerLutMonomialFamily::from_trusted(
+    ExponentLutMonomialFamily::from_trusted(
         ring.input_family(batch.public_input_name(), batch.value_count, (1, 1)),
         ring,
         PBC_MONOMIAL_FAMILY_PROVENANCE,
     )
-    .map_err(|_| PowerLutError::InvalidSparseLwrBlock)
+    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)
 }
 
 /// Concrete sparse-LWR parameters used to construct a PRF program.
 ///
 /// The profile is intentionally value-owned rather than an `IntExpr`: it is
 /// validated before any DSL lowering starts. `q_l` is the plaintext modulus,
-/// `p` is the LWR output modulus, `lut_width` is the logical Power-LUT domain
+/// `p` is the LWR output modulus, `lut_width` is the logical Exponent-LUT domain
 /// width `W`, and `ring_dimension` is the concrete ring dimension `N`.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SparseLwrPrfProfile {
@@ -278,9 +281,9 @@ impl SparseLwrReductionPlan {
         q_l: usize,
         bucket_count: usize,
         ring_dimension: usize,
-    ) -> Result<Self, PowerLutError> {
+    ) -> Result<Self, ExponentLutError> {
         if q_l == 0 || bucket_count == 0 || ring_dimension == 0 {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let cap = ring_dimension.min(4096);
         let mut k = 1usize;
@@ -309,15 +312,16 @@ impl SparseLwrReductionPlan {
             candidate = candidate.saturating_add(1);
         }
         if width == 0 {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let intermediate_groups = (bucket_count - 1) / k;
         let terminal_start =
-            intermediate_groups.checked_mul(k).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
-        let terminal_len =
-            bucket_count.checked_sub(terminal_start).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            intermediate_groups.checked_mul(k).ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
+        let terminal_len = bucket_count
+            .checked_sub(terminal_start)
+            .ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         if terminal_len == 0 || terminal_len > k {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         Ok(Self {
             q_l,
@@ -429,7 +433,7 @@ impl SparseLwrPrfProfile {
         p: usize,
         lut_width: usize,
         ring_dimension: usize,
-    ) -> Result<Self, PowerLutError> {
+    ) -> Result<Self, ExponentLutError> {
         // The bucket reduction and final rounding tables require a domain
         // wide enough for every residue modulo `q_l`.  Check this relation
         // with checked arithmetic so a malformed host parameter cannot wrap
@@ -437,7 +441,7 @@ impl SparseLwrPrfProfile {
         let minimum_lut_width = q_l
             .checked_mul(2)
             .and_then(|value| value.checked_sub(1))
-            .ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            .ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         if q_l == 0 ||
             p < 2 ||
             p > q_l ||
@@ -449,7 +453,7 @@ impl SparseLwrPrfProfile {
             q_l > lut_width ||
             lut_width < minimum_lut_width
         {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         Ok(Self { q_l, p, lut_width, ring_dimension })
     }
@@ -486,7 +490,7 @@ impl SparseLwrPrfProfile {
 #[derive(Clone, Debug)]
 pub struct SparseLwrBucketProgram {
     /// Canonical shared program consumed by both lowerers.
-    pub program: PowerLutProgram,
+    pub program: ExponentLutProgram,
     /// Program input carrying the current bucket accumulator.
     pub input: ProgramInputId,
     /// Hidden one-hot selector family declaration.
@@ -505,7 +509,7 @@ pub struct SparseLwrBucketProgram {
 #[derive(Clone, Debug)]
 pub struct SparseLwrPrfProgram {
     /// Canonical program shared by private and public-key lowering.
-    pub program: PowerLutProgram,
+    pub program: ExponentLutProgram,
     /// Program input carrying the current bucket accumulator.
     pub input: ProgramInputId,
     /// Hidden selector family declaration.
@@ -515,7 +519,7 @@ pub struct SparseLwrPrfProgram {
     /// Output wire of one bucket body. Lowering applies the mandatory final
     /// rounding table to the completed sequential state after this wire.
     pub output: ProgramWireId,
-    /// Logical Power-LUT domain width `W`. This is independent of the number
+    /// Logical Exponent-LUT domain width `W`. This is independent of the number
     /// of cells in one rectangular PBC bucket.
     pub lut_width: usize,
     /// Public rectangular PBC bucket width. This controls family ranges, not
@@ -526,9 +530,9 @@ pub struct SparseLwrPrfProgram {
     profile: SparseLwrPrfProfile,
     /// Shared program for the final LWR rounding operation. Its output is a
     /// raw scalar terminal, not an ordinary monomial PRF value.
-    pub rounding_program: PowerLutProgram,
+    pub rounding_program: ExponentLutProgram,
     /// Composite identity of the bucket and final-rounding programs.
-    composite_id: PowerLutProgramId,
+    composite_id: ExponentLutProgramId,
     /// Input declaration used when invoking the final-rounding program.
     rounding_input: ProgramInputId,
     rounding_output: ProgramWireId,
@@ -539,8 +543,8 @@ pub struct SparseLwrPrfProgram {
     /// bucket count.
     pub plan: SparseLwrReductionPlan,
     /// Selection-only program and unary intermediate-reduction program.
-    pub selection_program: PowerLutProgram,
-    pub reduction_program: PowerLutProgram,
+    pub selection_program: ExponentLutProgram,
+    pub reduction_program: ExponentLutProgram,
     pub selection_input: ProgramInputId,
     pub selection_output: ProgramWireId,
     pub reduction_input: ProgramInputId,
@@ -551,12 +555,12 @@ pub struct SparseLwrPrfProgram {
 #[allow(dead_code)]
 #[allow(dead_code)]
 impl SparseLwrPrfProgram {
-    fn bind_output(&self, label: &[u8]) -> Result<SparseLwrPrfOutput, PowerLutError> {
+    fn bind_output(&self, label: &[u8]) -> Result<SparseLwrPrfOutput, ExponentLutError> {
         SparseLwrPrfOutput::bind_with_id(self.id(), label, self.rounding_output)
-            .map_err(|_| PowerLutError::InvalidLut)
+            .map_err(|_| ExponentLutError::InvalidLut)
     }
 
-    /// Returns the logical Power-LUT domain width `W`.
+    /// Returns the logical Exponent-LUT domain width `W`.
     pub const fn lut_width(&self) -> usize {
         self.lut_width
     }
@@ -572,7 +576,7 @@ impl SparseLwrPrfProgram {
     }
 
     /// Returns the ordinary shared program used for the final rounding step.
-    pub const fn rounding_program(&self) -> &PowerLutProgram {
+    pub const fn rounding_program(&self) -> &ExponentLutProgram {
         &self.rounding_program
     }
 
@@ -599,25 +603,25 @@ impl SparseLwrPrfProgram {
     }
 
     /// Returns the composite identity covering both ordinary programs.
-    pub const fn id(&self) -> PowerLutProgramId {
+    pub const fn id(&self) -> ExponentLutProgramId {
         self.composite_id
     }
 
     /// Checks the complete batch/program binding before any lowering work is
     /// performed.  Keeping this in one predicate prevents one typed lowering
     /// entry point from accidentally accepting a batch for another program.
-    fn validate_batch(&self, batch: &RefreshPrfBatchInputs) -> Result<(), PowerLutError> {
+    fn validate_batch(&self, batch: &RefreshPrfBatchInputs) -> Result<(), ExponentLutError> {
         if batch.layout_id != batch.layout.layout_id ||
             batch.profile != self.profile ||
             batch.program_id != self.id() ||
             batch.output_wire != self.terminal_output_wire()
         {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         Ok(())
     }
 
-    fn validate_widths(&self, ring_dimension: usize) -> Result<(), PowerLutError> {
+    fn validate_widths(&self, ring_dimension: usize) -> Result<(), ExponentLutError> {
         if self.profile.ring_dimension != ring_dimension ||
             self.lut_width == 0 ||
             !self.lut_width.is_power_of_two() ||
@@ -625,7 +629,7 @@ impl SparseLwrPrfProgram {
             ring_dimension % self.lut_width != 0 ||
             self.bucket_width == 0
         {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         Ok(())
     }
@@ -638,16 +642,16 @@ impl SparseLwrPrfProgram {
         &self,
         lwr_modulus: &mxx_ir_core::IntExpr,
         ring_dimension: usize,
-    ) -> Result<(), PowerLutError> {
+    ) -> Result<(), ExponentLutError> {
         self.validate_widths(ring_dimension)?;
         let modulus = lwr_modulus
             .evaluate(&mxx_ir_core::ParamEnv::default())
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         if modulus != BigInt::from(self.profile.q_l) {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         if self.profile.q_l > self.profile.lut_width {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         Ok(())
     }
@@ -662,7 +666,7 @@ impl SparseLwrPrfProgram {
     /// copied into the program or inferred by the lowerer.
     fn lower_private_grouped(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         input: BggEncodingWire,
         offsets: Vec<usize>,
         widths: Vec<usize>,
@@ -672,7 +676,7 @@ impl SparseLwrPrfProgram {
         helpers: &FlatLutHelperMap,
         label: &[u8],
         rounding_helpers: &FlatLutHelperSet,
-    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), PowerLutError> {
+    ) -> Result<(BggEncodingWire, SparseLwrPrfOutput), ExponentLutError> {
         self.validate_widths(concrete_ring_dimension(&input)?)?;
         let plan = &self.plan;
         let lowering_error = RefCell::new(None);
@@ -685,10 +689,10 @@ impl SparseLwrPrfProgram {
                         .scan(state, invariants, |bucket, state, mut flat| {
                             if flat.len() != selector_flat_count + 1 {
                                 *lowering_error.borrow_mut() =
-                                    Some(PowerLutError::InvalidSparseLwrBlock);
+                                    Some(ExponentLutError::InvalidSparseLwrBlock);
                                 return Err(mxx_dsl::DslError::Schema);
                             }
-                            let public_values = PowerLutMonomialFamily::from_trusted(
+                            let public_values = ExponentLutMonomialFamily::from_trusted(
                                 flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
                                 &compiler.bgg.public_key.ring,
                                 PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -719,7 +723,7 @@ impl SparseLwrPrfProgram {
                             let range =
                                 FamilyRange::bounded(start, count, capacity).map_err(|_| {
                                     *lowering_error.borrow_mut() =
-                                        Some(PowerLutError::InvalidSparseLwrBlock);
+                                        Some(ExponentLutError::InvalidSparseLwrBlock);
                                     mxx_dsl::DslError::Schema
                                 })?;
                             let mut ranges = ProgramFamilyRanges::new();
@@ -742,7 +746,7 @@ impl SparseLwrPrfProgram {
                                 .remove(&self.selection_output)
                                 .ok_or_else(|| {
                                     *lowering_error.borrow_mut() =
-                                        Some(PowerLutError::InvalidSparseLwrBlock);
+                                        Some(ExponentLutError::InvalidSparseLwrBlock);
                                     mxx_dsl::DslError::Schema
                                 })?;
                             Ok(selected)
@@ -762,7 +766,8 @@ impl SparseLwrPrfProgram {
                             mxx_dsl::DslError::Schema
                         })?;
                     reduced.get(&self.reduction_output).cloned().ok_or_else(|| {
-                        *lowering_error.borrow_mut() = Some(PowerLutError::InvalidSparseLwrBlock);
+                        *lowering_error.borrow_mut() =
+                            Some(ExponentLutError::InvalidSparseLwrBlock);
                         mxx_dsl::DslError::Schema
                     })
                 })
@@ -770,7 +775,7 @@ impl SparseLwrPrfProgram {
                     lowering_error
                         .borrow_mut()
                         .take()
-                        .unwrap_or(PowerLutError::InvalidSparseLwrBlock)
+                        .unwrap_or(ExponentLutError::InvalidSparseLwrBlock)
                 })?
         };
         let terminal_state = Sequential::range(plan.terminal_len())
@@ -778,7 +783,7 @@ impl SparseLwrPrfProgram {
                 if flat.len() != selector_flat_count + 1 {
                     return Err(mxx_dsl::DslError::Schema);
                 }
-                let public_values = PowerLutMonomialFamily::from_trusted(
+                let public_values = ExponentLutMonomialFamily::from_trusted(
                     flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
                     &compiler.bgg.public_key.ring,
                     PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -816,7 +821,7 @@ impl SparseLwrPrfProgram {
                 Ok(selected)
             })
             .map_err(|_| {
-                lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
+                lowering_error.into_inner().unwrap_or(ExponentLutError::InvalidSparseLwrBlock)
             })?;
         let output =
             self.apply_final_rounding_encoding(compiler, terminal_state, rounding_helpers)?;
@@ -831,7 +836,7 @@ impl SparseLwrPrfProgram {
     /// structural loop and invoke the same immutable program body.
     fn lower_public_grouped(
         &self,
-        compiler: &PowerLutPublicKeyCompiler,
+        compiler: &ExponentLutPublicKeyCompiler,
         input: BggPublicKeyWire,
         offsets: Vec<usize>,
         widths: Vec<usize>,
@@ -841,7 +846,7 @@ impl SparseLwrPrfProgram {
         helpers: &FlatLutPublicHelperMap,
         label: &[u8],
         rounding_helpers: &FlatLutPublicHelperSet,
-    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), PowerLutError> {
+    ) -> Result<(BggPublicKeyWire, SparseLwrPrfOutput), ExponentLutError> {
         self.validate_widths(concrete_ring_dimension_public(&input)?)?;
         let plan = &self.plan;
         let lowering_error = RefCell::new(None);
@@ -855,7 +860,7 @@ impl SparseLwrPrfProgram {
                             if flat.len() != selector_flat_count + 1 {
                                 return Err(mxx_dsl::DslError::Schema);
                             }
-                            let public_values = PowerLutMonomialFamily::from_trusted(
+                            let public_values = ExponentLutMonomialFamily::from_trusted(
                                 flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
                                 &compiler.public_key.ring,
                                 PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -912,7 +917,7 @@ impl SparseLwrPrfProgram {
                     lowering_error
                         .borrow_mut()
                         .take()
-                        .unwrap_or(PowerLutError::InvalidSparseLwrBlock)
+                        .unwrap_or(ExponentLutError::InvalidSparseLwrBlock)
                 })?
         };
         let terminal_state = Sequential::range(plan.terminal_len())
@@ -920,7 +925,7 @@ impl SparseLwrPrfProgram {
                 if flat.len() != selector_flat_count + 1 {
                     return Err(mxx_dsl::DslError::Schema);
                 }
-                let public_values = PowerLutMonomialFamily::from_trusted(
+                let public_values = ExponentLutMonomialFamily::from_trusted(
                     flat.pop().ok_or(mxx_dsl::DslError::Schema)?,
                     &compiler.public_key.ring,
                     PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -957,7 +962,7 @@ impl SparseLwrPrfProgram {
                     .ok_or(mxx_dsl::DslError::Schema)
             })
             .map_err(|_| {
-                lowering_error.into_inner().unwrap_or(PowerLutError::InvalidSparseLwrBlock)
+                lowering_error.into_inner().unwrap_or(ExponentLutError::InvalidSparseLwrBlock)
             })?;
         let output =
             self.apply_final_rounding_public(compiler, terminal_state, rounding_helpers)?;
@@ -967,14 +972,14 @@ impl SparseLwrPrfProgram {
     /// Batched PBC lowering with one explicit terminal rounding helper set.
     fn lower_private_batch(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         input_vectors: Family<Mat>,
         input_public_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: EncodingSelectorFamily,
         helpers: &FlatLutHelperMap,
         rounding_helpers: &FlatLutHelperSet,
-    ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
+    ) -> Result<(Family<Mat>, Family<Mat>), ExponentLutError> {
         self.lower_private_batch_impl(
             compiler,
             input_vectors,
@@ -988,14 +993,14 @@ impl SparseLwrPrfProgram {
 
     fn lower_private_batch_impl(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         input_vectors: Family<Mat>,
         input_public_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: EncodingSelectorFamily,
         helpers: &FlatLutHelperMap,
         rounding_helpers: &FlatLutHelperSet,
-    ) -> Result<(Family<Mat>, Family<Mat>), PowerLutError> {
+    ) -> Result<(Family<Mat>, Family<Mat>), ExponentLutError> {
         // For label `ell`, public values are
         // `(X^{a'_{\ell}[0]},...,X^{a'_{\ell}[m-1]})`. The nested bucket scan keeps
         // `X^acc` as state; OneHot selects C_i and updates it by
@@ -1007,22 +1012,22 @@ impl SparseLwrPrfProgram {
             input_public_keys.count().evaluate(&mxx_ir_core::ParamEnv::default()).ok() !=
                 Some(BigInt::from(label_count))
         {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let layout = &batch.layout;
         let public_values = batch_public_values_family(batch, &compiler.bgg.public_key.ring)?;
         let active = crate::pbc::PbcActiveCellIndex::build(layout)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let widths = active.bucket_active_widths().collect::<Vec<_>>();
         let mut offsets = Vec::with_capacity(widths.len());
         let mut offset = 0usize;
         for width in widths.iter().copied() {
             offsets.push(offset);
-            offset = offset.checked_add(width).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            offset = offset.checked_add(width).ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         }
         let active_count = active.len();
         let expected_values =
-            label_count.checked_mul(active_count).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            label_count.checked_mul(active_count).ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         ensure_family_count(public_values.as_family(), expected_values)?;
 
         let selector_flat = selectors.flattened();
@@ -1103,7 +1108,7 @@ impl SparseLwrPrfProgram {
                 Ok((output.vector, output.pubkey.matrix))
             },
         )
-        .map_err(|_| lowering_error.take().unwrap_or(PowerLutError::InvalidSparseLwrBlock))?;
+        .map_err(|_| lowering_error.take().unwrap_or(ExponentLutError::InvalidSparseLwrBlock))?;
         Ok(outputs)
     }
 
@@ -1112,14 +1117,14 @@ impl SparseLwrPrfProgram {
     /// already executed in the structural label loop.
     fn lower_private_batch_typed(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         input_vectors: Family<Mat>,
         input_public_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: EncodingSelectorFamily,
         helpers: &FlatLutHelperMap,
         rounding_helpers: &FlatLutHelperSet,
-    ) -> Result<PbcSparseLwrEncodingOutputs, PowerLutError> {
+    ) -> Result<PbcSparseLwrEncodingOutputs, ExponentLutError> {
         self.validate_batch(batch)?;
         let (vectors, public_keys) = self.lower_private_batch(
             compiler,
@@ -1132,7 +1137,7 @@ impl SparseLwrPrfProgram {
         )?;
         let reduction_helper_commitment = helpers
             .get(&crate::program::LutId::from_index(0))
-            .ok_or(PowerLutError::InvalidLut)?
+            .ok_or(ExponentLutError::InvalidLut)?
             .metadata()
             .0;
         let terminal_helper_commitment = rounding_helpers.metadata().0;
@@ -1152,13 +1157,13 @@ impl SparseLwrPrfProgram {
     /// even though both programs use local LUT identifier zero.
     pub fn compile_pbc_encoding_family_typed_with_batch_and_helpers(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         input_vectors: Family<Mat>,
         input_public_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: EncodingSelectorFamily,
         helpers: &SparseLwrPrfHelperBundle,
-    ) -> Result<PbcSparseLwrEncodingOutputs, PowerLutError> {
+    ) -> Result<PbcSparseLwrEncodingOutputs, ExponentLutError> {
         self.lower_private_batch_typed(
             compiler,
             input_vectors,
@@ -1176,13 +1181,13 @@ impl SparseLwrPrfProgram {
     /// Public batched PBC lowering with explicit terminal rounding helpers.
     fn lower_public_batch(
         &self,
-        compiler: &PowerLutPublicKeyCompiler,
+        compiler: &ExponentLutPublicKeyCompiler,
         input_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: PublicSelectorFamily,
         helpers: &FlatLutPublicHelperMap,
         rounding_helpers: &FlatLutPublicHelperSet,
-    ) -> Result<Family<Mat>, PowerLutError> {
+    ) -> Result<Family<Mat>, ExponentLutError> {
         self.lower_public_batch_impl(
             compiler,
             input_keys,
@@ -1195,34 +1200,34 @@ impl SparseLwrPrfProgram {
 
     fn lower_public_batch_impl(
         &self,
-        compiler: &PowerLutPublicKeyCompiler,
+        compiler: &ExponentLutPublicKeyCompiler,
         input_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: PublicSelectorFamily,
         helpers: &FlatLutPublicHelperMap,
         rounding_helpers: &FlatLutPublicHelperSet,
-    ) -> Result<Family<Mat>, PowerLutError> {
+    ) -> Result<Family<Mat>, ExponentLutError> {
         let label_count = batch.len();
         if label_count == 0 ||
             input_keys.count().evaluate(&mxx_ir_core::ParamEnv::default()).ok() !=
                 Some(BigInt::from(label_count))
         {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let layout = &batch.layout;
         let public_values = batch_public_values_family(batch, &compiler.public_key.ring)?;
         let active = crate::pbc::PbcActiveCellIndex::build(layout)
-            .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let widths = active.bucket_active_widths().collect::<Vec<_>>();
         let mut offsets = Vec::with_capacity(widths.len());
         let mut offset = 0usize;
         for width in widths.iter().copied() {
             offsets.push(offset);
-            offset = offset.checked_add(width).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            offset = offset.checked_add(width).ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         }
         let active_count = active.len();
         let expected_values =
-            label_count.checked_mul(active_count).ok_or(PowerLutError::InvalidSparseLwrBlock)?;
+            label_count.checked_mul(active_count).ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
         ensure_family_count(public_values.as_family(), expected_values)?;
         let selector_flat = selectors.flattened();
         let selector_flat_count = selector_flat.len();
@@ -1297,7 +1302,7 @@ impl SparseLwrPrfProgram {
                 Ok(output.matrix)
             },
         )
-        .map_err(|_| lowering_error.take().unwrap_or(PowerLutError::InvalidSparseLwrBlock))?;
+        .map_err(|_| lowering_error.take().unwrap_or(ExponentLutError::InvalidSparseLwrBlock))?;
         Ok(outputs)
     }
 
@@ -1305,13 +1310,13 @@ impl SparseLwrPrfProgram {
     /// helper family supplied by setup.
     fn lower_public_batch_typed(
         &self,
-        compiler: &PowerLutPublicKeyCompiler,
+        compiler: &ExponentLutPublicKeyCompiler,
         input_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: PublicSelectorFamily,
         helpers: &FlatLutPublicHelperMap,
         rounding_helpers: &FlatLutPublicHelperSet,
-    ) -> Result<Family<Mat>, PowerLutError> {
+    ) -> Result<Family<Mat>, ExponentLutError> {
         self.validate_batch(batch)?;
         self.lower_public_batch(compiler, input_keys, batch, selectors, helpers, rounding_helpers)
     }
@@ -1319,12 +1324,12 @@ impl SparseLwrPrfProgram {
     /// Typed batched public-key lowering with role-typed helper material.
     pub fn compile_pbc_public_key_family_with_batch_and_helpers(
         &self,
-        compiler: &PowerLutPublicKeyCompiler,
+        compiler: &ExponentLutPublicKeyCompiler,
         input_keys: Family<Mat>,
         batch: &RefreshPrfBatchInputs,
         selectors: PublicSelectorFamily,
         helpers: &SparseLwrPrfPublicHelperBundle,
-    ) -> Result<Family<Mat>, PowerLutError> {
+    ) -> Result<Family<Mat>, ExponentLutError> {
         self.lower_public_batch_typed(
             compiler,
             input_keys,
@@ -1344,14 +1349,14 @@ impl SparseLwrPrfProgram {
     /// sum of rounded partial values.
     fn apply_final_rounding_encoding(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         state: BggEncodingWire,
         rounding_helpers: &FlatLutHelperSet,
-    ) -> Result<BggEncodingWire, PowerLutError> {
+    ) -> Result<BggEncodingWire, ExponentLutError> {
         let table = self
             .rounding_program
             .lut(crate::program::LutId::from_index(0))
-            .ok_or(PowerLutError::InvalidLut)?;
+            .ok_or(ExponentLutError::InvalidLut)?;
         let helpers = FlatLutHelperMap::from([(
             crate::program::LutId::from_index(0),
             rounding_helpers.clone(),
@@ -1365,20 +1370,20 @@ impl SparseLwrPrfProgram {
             &BTreeMap::new(),
             &helpers,
         )?;
-        outputs.get(&self.rounding_output).cloned().ok_or(PowerLutError::InvalidLut)
+        outputs.get(&self.rounding_output).cloned().ok_or(ExponentLutError::InvalidLut)
     }
 
     /// Public-key counterpart of [`Self::apply_final_rounding_encoding`].
     fn apply_final_rounding_public(
         &self,
-        compiler: &PowerLutPublicKeyCompiler,
+        compiler: &ExponentLutPublicKeyCompiler,
         state: BggPublicKeyWire,
         rounding_helpers: &FlatLutPublicHelperSet,
-    ) -> Result<BggPublicKeyWire, PowerLutError> {
+    ) -> Result<BggPublicKeyWire, ExponentLutError> {
         let table = self
             .rounding_program
             .lut(crate::program::LutId::from_index(0))
-            .ok_or(PowerLutError::InvalidLut)?;
+            .ok_or(ExponentLutError::InvalidLut)?;
         let helpers = FlatLutPublicHelperMap::from([(
             crate::program::LutId::from_index(0),
             rounding_helpers.clone(),
@@ -1392,11 +1397,11 @@ impl SparseLwrPrfProgram {
             &BTreeMap::new(),
             &helpers,
         )?;
-        outputs.get(&self.rounding_output).cloned().ok_or(PowerLutError::InvalidLut)
+        outputs.get(&self.rounding_output).cloned().ok_or(ExponentLutError::InvalidLut)
     }
 }
 
-fn concrete_ring_dimension(input: &BggEncodingWire) -> Result<usize, PowerLutError> {
+fn concrete_ring_dimension(input: &BggEncodingWire) -> Result<usize, ExponentLutError> {
     input
         .pubkey
         .matrix
@@ -1405,10 +1410,10 @@ fn concrete_ring_dimension(input: &BggEncodingWire) -> Result<usize, PowerLutErr
         .evaluate(&mxx_ir_core::ParamEnv::default())
         .ok()
         .and_then(|value| value.to_usize())
-        .ok_or(PowerLutError::InvalidSparseLwrBlock)
+        .ok_or(ExponentLutError::InvalidSparseLwrBlock)
 }
 
-fn concrete_ring_dimension_public(input: &BggPublicKeyWire) -> Result<usize, PowerLutError> {
+fn concrete_ring_dimension_public(input: &BggPublicKeyWire) -> Result<usize, ExponentLutError> {
     input
         .matrix
         .matrix_type()
@@ -1416,16 +1421,16 @@ fn concrete_ring_dimension_public(input: &BggPublicKeyWire) -> Result<usize, Pow
         .evaluate(&mxx_ir_core::ParamEnv::default())
         .ok()
         .and_then(|value| value.to_usize())
-        .ok_or(PowerLutError::InvalidSparseLwrBlock)
+        .ok_or(ExponentLutError::InvalidSparseLwrBlock)
 }
 
-fn ensure_family_count(family: &Family<Mat>, expected: usize) -> Result<(), PowerLutError> {
+fn ensure_family_count(family: &Family<Mat>, expected: usize) -> Result<(), ExponentLutError> {
     let count = family
         .count()
         .evaluate(&mxx_ir_core::ParamEnv::default())
-        .map_err(|_| PowerLutError::InvalidSparseLwrBlock)?;
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
     if count != BigInt::from(expected) {
-        return Err(PowerLutError::InvalidSparseLwrBlock);
+        return Err(ExponentLutError::InvalidSparseLwrBlock);
     }
     Ok(())
 }
@@ -1434,7 +1439,8 @@ fn ensure_family_count(family: &Family<Mat>, expected: usize) -> Result<(), Powe
 /// outer label loop can receive every executable graph value explicitly.
 fn flatten_private_helper_families(
     helpers: &FlatLutHelperMap,
-) -> Result<(Vec<Family<Mat>>, Vec<(crate::program::LutId, [u8; 32], Vec<usize>)>), PowerLutError> {
+) -> Result<(Vec<Family<Mat>>, Vec<(crate::program::LutId, [u8; 32], Vec<usize>)>), ExponentLutError>
+{
     let mut flat = Vec::new();
     let mut arities = Vec::with_capacity(helpers.len());
     for (lut, lut_helpers) in helpers {
@@ -1446,7 +1452,7 @@ fn flatten_private_helper_families(
                 helper.mask().vector.clone(),
                 helper.mask().pubkey.matrix.clone(),
             ] {
-                flat.push(Family::pack(vec![matrix]).map_err(|_| PowerLutError::InvalidLut)?);
+                flat.push(Family::pack(vec![matrix]).map_err(|_| ExponentLutError::InvalidLut)?);
             }
         }
     }
@@ -1478,7 +1484,7 @@ fn rebuild_private_helper_families(
             let gsw = take(&mut cursor)?;
             let mask_vector = take(&mut cursor)?;
             let mask_public = take(&mut cursor)?;
-            let switch = PowerRhsPackage::new(gsw).map_err(|_| mxx_dsl::DslError::Schema)?;
+            let switch = ExponentRhsPackage::new(gsw).map_err(|_| mxx_dsl::DslError::Schema)?;
             let mask = BggEncodingWire {
                 vector: mask_vector,
                 pubkey: BggPublicKeyWire { matrix: mask_public, reveal_plaintext: false },
@@ -1499,7 +1505,8 @@ fn rebuild_private_helper_families(
 
 fn flatten_public_helper_families(
     helpers: &FlatLutPublicHelperMap,
-) -> Result<(Vec<Family<Mat>>, Vec<(crate::program::LutId, [u8; 32], Vec<usize>)>), PowerLutError> {
+) -> Result<(Vec<Family<Mat>>, Vec<(crate::program::LutId, [u8; 32], Vec<usize>)>), ExponentLutError>
+{
     let mut flat = Vec::new();
     let mut arities = Vec::with_capacity(helpers.len());
     for (lut, lut_helpers) in helpers {
@@ -1509,7 +1516,7 @@ fn flatten_public_helper_families(
         arities.push((*lut, commitment, lut_helpers.iter().map(|h| h.sigma()).collect()));
         for helper in lut_helpers.iter() {
             for matrix in [helper.switch().gsw_ciphertext().clone(), helper.mask().clone()] {
-                flat.push(Family::pack(vec![matrix]).map_err(|_| PowerLutError::InvalidLut)?);
+                flat.push(Family::pack(vec![matrix]).map_err(|_| ExponentLutError::InvalidLut)?);
             }
         }
     }
@@ -1538,8 +1545,8 @@ fn rebuild_public_helper_families(
                 *cursor += 1;
                 Ok(family.get_static(0))
             };
-            let switch =
-                PowerRhsPackage::new(take(&mut cursor)?).map_err(|_| mxx_dsl::DslError::Schema)?;
+            let switch = ExponentRhsPackage::new(take(&mut cursor)?)
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
             let mask = take(&mut cursor)?;
             lut_helpers.push(FlatLutPublicHelper::new(*sigma, switch, mask));
         }
@@ -1557,9 +1564,9 @@ fn rebuild_public_helper_families(
 fn interpolate_lookup(
     values: &[usize],
     x: mxx_ir_core::IntExpr,
-) -> Result<mxx_ir_core::IntExpr, PowerLutError> {
+) -> Result<mxx_ir_core::IntExpr, ExponentLutError> {
     if values.is_empty() {
-        return Err(PowerLutError::InvalidSparseLwrBlock);
+        return Err(ExponentLutError::InvalidSparseLwrBlock);
     }
     let mut differences = values.iter().map(|&value| BigInt::from(value)).collect::<Vec<_>>();
     let mut factorial = BigInt::from(1u8);
@@ -1600,7 +1607,7 @@ fn build_bucket_program(
     if lut_width == 0 || !lut_width.is_power_of_two() || bucket_width == 0 {
         return Err(ProgramValidationError::WidthMismatch);
     }
-    let mut builder = PowerLutProgramBuilder::new();
+    let mut builder = ExponentLutProgramBuilder::new();
     let input = builder.input(lut_width)?;
     let selector_family = builder.rhs_family(lut_width)?;
     let public_value_family = builder.public_value_family(lut_width)?;
@@ -1615,8 +1622,8 @@ fn build_bucket_program(
 fn build_reduction_program(
     lut_width: usize,
     q_l: usize,
-) -> Result<(PowerLutProgram, ProgramInputId, ProgramWireId), ProgramValidationError> {
-    let mut builder = PowerLutProgramBuilder::new();
+) -> Result<(ExponentLutProgram, ProgramInputId, ProgramWireId), ProgramValidationError> {
+    let mut builder = ExponentLutProgramBuilder::new();
     let input = builder.input(lut_width)?;
     let input_wire = builder.input_wire(input)?;
     let table = builder.lut(LutTable::unary(
@@ -1634,8 +1641,8 @@ fn build_rounding_program(
     lut_width: usize,
     output_width: usize,
     rounding_lut: &[usize],
-) -> Result<(PowerLutProgram, ProgramInputId, ProgramWireId), ProgramValidationError> {
-    let mut builder = PowerLutProgramBuilder::new();
+) -> Result<(ExponentLutProgram, ProgramInputId, ProgramWireId), ProgramValidationError> {
+    let mut builder = ExponentLutProgramBuilder::new();
     let input = builder.input(lut_width)?;
     let input_wire = builder.input_wire(input)?;
     // Rounding produces a scalar digit, not a ring monomial.  The terminal
@@ -1655,12 +1662,12 @@ fn build_rounding_program(
 fn composite_prf_id(
     profile: &SparseLwrPrfProfile,
     plan: &SparseLwrReductionPlan,
-    bucket_program: &PowerLutProgram,
-    reduction_program: &PowerLutProgram,
-    rounding_program: &PowerLutProgram,
-) -> PowerLutProgramId {
+    bucket_program: &ExponentLutProgram,
+    reduction_program: &ExponentLutProgram,
+    rounding_program: &ExponentLutProgram,
+) -> ExponentLutProgramId {
     let mut digest = Sha256::new();
-    digest.update(b"mxx-power-lut/sparse-lwr/prf-program/v4-grouped-reduction");
+    digest.update(b"mxx-exponent-lut/sparse-lwr/prf-program/v4-grouped-reduction");
     digest.update((profile.q_l as u64).to_le_bytes());
     digest.update((profile.p as u64).to_le_bytes());
     digest.update((profile.lut_width as u64).to_le_bytes());
@@ -1673,7 +1680,7 @@ fn composite_prf_id(
     digest.update((plan.terminal_len as u64).to_le_bytes());
     digest.update((plan.lut_width as u64).to_le_bytes());
     digest.update(rounding_program.id().as_bytes());
-    PowerLutProgramId::from_digest(digest.finalize().into())
+    ExponentLutProgramId::from_digest(digest.finalize().into())
 }
 
 impl SparseLwrPrfProgram {
@@ -1687,9 +1694,9 @@ impl SparseLwrPrfProgram {
         profile: SparseLwrPrfProfile,
         bucket_width: usize,
         bucket_count: usize,
-    ) -> Result<Self, PowerLutError> {
+    ) -> Result<Self, ExponentLutError> {
         if bucket_width == 0 || bucket_count == 0 {
-            return Err(PowerLutError::InvalidSparseLwrBlock);
+            return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let plan =
             SparseLwrReductionPlan::derive(profile.q_l, bucket_count, profile.ring_dimension)?;
@@ -1700,14 +1707,14 @@ impl SparseLwrPrfProgram {
                     .p
                     .checked_mul(z % profile.q_l)
                     .map(|value| value / profile.q_l)
-                    .ok_or(PowerLutError::InvalidSparseLwrBlock)
+                    .ok_or(ExponentLutError::InvalidSparseLwrBlock)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bucket = build_bucket_program(w, bucket_width).map_err(PowerLutError::from)?;
+        let bucket = build_bucket_program(w, bucket_width).map_err(ExponentLutError::from)?;
         let (reduction_program, reduction_input, reduction_output) =
-            build_reduction_program(w, profile.q_l).map_err(PowerLutError::from)?;
+            build_reduction_program(w, profile.q_l).map_err(ExponentLutError::from)?;
         let (rounding_program, rounding_input, rounding_output) =
-            build_rounding_program(w, profile.p, &rounding_lut).map_err(PowerLutError::from)?;
+            build_rounding_program(w, profile.p, &rounding_lut).map_err(ExponentLutError::from)?;
         let composite_id = composite_prf_id(
             &profile,
             &plan,
@@ -1744,7 +1751,7 @@ impl SparseLwrPrfProgram {
 
 /// Algebraic contract of a sparse-LWR PRF descriptor.
 ///
-/// Ordinary Power-LUT gates return monomial encodings. The sparse-LWR
+/// Ordinary Exponent-LUT gates return monomial encodings. The sparse-LWR
 /// rounding terminal is intentionally different: it returns the integer
 /// rounding value as a constant ring polynomial. Keeping this distinction in
 /// the descriptor prevents a caller from treating a raw scalar as a normal
@@ -1765,7 +1772,7 @@ pub enum SparseLwrPrfTerminalForm {
 /// private RHS material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SparseLwrPrfOutput {
-    program_id: PowerLutProgramId,
+    program_id: ExponentLutProgramId,
     label_digest: [u8; 32],
     output_wire: ProgramWireId,
     terminal_form: SparseLwrPrfTerminalForm,
@@ -1780,7 +1787,7 @@ pub struct SparseLwrPrfOutput {
 pub struct PbcSparseLwrEncodingOutputs {
     vectors: Family<Mat>,
     public_keys: Family<Mat>,
-    program_id: PowerLutProgramId,
+    program_id: ExponentLutProgramId,
     output_wire: ProgramWireId,
     layout_id: crate::pbc::PbcLayoutId,
     batch_id: PbcPublicValueBatchId,
@@ -1794,14 +1801,14 @@ impl PbcSparseLwrEncodingOutputs {
     fn new(
         vectors: Family<Mat>,
         public_keys: Family<Mat>,
-        program_id: PowerLutProgramId,
+        program_id: ExponentLutProgramId,
         output_wire: ProgramWireId,
         batch: &RefreshPrfBatchInputs,
         reduction_helper_commitment: [u8; 32],
         terminal_helper_commitment: [u8; 32],
     ) -> Self {
         let mut pair_digest = Sha256::new();
-        pair_digest.update(b"mxx-power-lut/pbc-output-family-pair/v1");
+        pair_digest.update(b"mxx-exponent-lut/pbc-output-family-pair/v1");
         pair_digest.update(batch.batch_id.0);
         pair_digest.update(batch.layout_id.0);
         pair_digest.update(program_id.0);
@@ -1839,7 +1846,7 @@ impl PbcSparseLwrEncodingOutputs {
     /// Returns the family-level batch metadata needed by a typed consumer.
     pub(crate) fn family_metadata(
         &self,
-    ) -> (PowerLutProgramId, ProgramWireId, crate::pbc::PbcLayoutId, usize) {
+    ) -> (ExponentLutProgramId, ProgramWireId, crate::pbc::PbcLayoutId, usize) {
         (self.program_id, self.output_wire, self.layout_id, self.batch_count)
     }
 
@@ -1859,12 +1866,12 @@ impl PbcSparseLwrEncodingOutputs {
 
 impl SparseLwrPrfOutput {
     fn bind_with_id(
-        program_id: PowerLutProgramId,
+        program_id: ExponentLutProgramId,
         label: &[u8],
         output_wire: ProgramWireId,
-    ) -> Result<Self, PowerLutError> {
+    ) -> Result<Self, ExponentLutError> {
         let mut digest = Sha256::new();
-        digest.update(b"mxx-power-lut/sparse-lwr/prf-label/v1");
+        digest.update(b"mxx-exponent-lut/sparse-lwr/prf-label/v1");
         digest.update((label.len() as u64).to_le_bytes());
         digest.update(label);
         Ok(Self {
@@ -1876,7 +1883,7 @@ impl SparseLwrPrfOutput {
     }
 
     /// Returns the shared program identity.
-    pub const fn program_id(&self) -> PowerLutProgramId {
+    pub const fn program_id(&self) -> ExponentLutProgramId {
         self.program_id
     }
 
@@ -2011,7 +2018,7 @@ mod tests {
     #[test]
     fn terminal_rounding_rejects_a_helper_set_bound_to_another_table() {
         let ring = Ring::new(97, 4);
-        let compiler = PowerLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
+        let compiler = ExponentLutEncodingCompiler::from_public_key(BggPublicKeyCompiler {
             ring: ring.clone(),
             base: 2.into(),
             digit_count: 2.into(),
@@ -2027,7 +2034,7 @@ mod tests {
             .map(|index| {
                 FlatLutHelper::new(
                     1 + index * 2,
-                    PowerRhsPackage::new(ring.zero((2, 2))).expect("test RHS"),
+                    ExponentRhsPackage::new(ring.zero((2, 2))).expect("test RHS"),
                     BggEncodingWire {
                         vector: ring.zero((1, 2)),
                         pubkey: BggPublicKeyWire {
@@ -2049,7 +2056,7 @@ mod tests {
 
         assert!(matches!(
             program.apply_final_rounding_encoding(&compiler, state, &wrong_set),
-            Err(PowerLutError::InvalidLut)
+            Err(ExponentLutError::InvalidLut)
         ));
     }
 
@@ -2062,7 +2069,7 @@ mod tests {
         // allowing a caller to pair a descriptor with a different program.
         assert!(matches!(
             RefreshPrfBatchInputs::new(&layout, profile_b.clone(), &labels, &program_a),
-            Err(PowerLutError::InvalidSparseLwrBlock)
+            Err(ExponentLutError::InvalidSparseLwrBlock)
         ));
 
         let program_b = SparseLwrPrfProgram::new(
@@ -2078,13 +2085,13 @@ mod tests {
         // lowering entry point, so a forged batch cannot cross that boundary.
         assert!(matches!(
             program_a.validate_batch(&batch),
-            Err(PowerLutError::InvalidSparseLwrBlock)
+            Err(ExponentLutError::InvalidSparseLwrBlock)
         ));
         batch.profile = program_a.profile().clone();
         batch.program_id = program_b.id();
         assert!(matches!(
             program_a.validate_batch(&batch),
-            Err(PowerLutError::InvalidSparseLwrBlock)
+            Err(ExponentLutError::InvalidSparseLwrBlock)
         ));
     }
 

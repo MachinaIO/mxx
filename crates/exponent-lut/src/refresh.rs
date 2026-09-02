@@ -20,7 +20,7 @@
 //! each slot has been decoded.
 
 use crate::{
-    PowerLutEncodingCompiler, PowerLutError,
+    ExponentLutEncodingCompiler, ExponentLutError,
     pbc::PbcLayoutId,
     prf::{PbcSparseLwrEncodingOutputs, SparseLwrPrfProgram, SparseLwrPrfTerminalForm},
 };
@@ -64,8 +64,8 @@ pub enum RefreshError {
     /// A lower-level BGG operation failed.
     Bgg(#[from] mxx_bgg::EncodingCompileError),
     #[error(transparent)]
-    /// A generic Power-LUT operation failed.
-    Power(#[from] PowerLutError),
+    /// A generic Exponent-LUT operation failed.
+    ExponentLut(#[from] ExponentLutError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -313,7 +313,7 @@ impl RefreshPrfLabelIndex {
 /// terminal form authoritative after the fact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RefreshPrfContract {
-    program_id: crate::program::PowerLutProgramId,
+    program_id: crate::program::ExponentLutProgramId,
     output_wire: crate::program::ProgramWireId,
     terminal_form: SparseLwrPrfTerminalForm,
     q_l: usize,
@@ -338,7 +338,7 @@ impl RefreshPrfContract {
     }
 
     pub(crate) const fn from_parts(
-        program_id: crate::program::PowerLutProgramId,
+        program_id: crate::program::ExponentLutProgramId,
         output_wire: crate::program::ProgramWireId,
         terminal_form: SparseLwrPrfTerminalForm,
         q_l: usize,
@@ -375,7 +375,7 @@ impl RefreshPrfContract {
     }
 
     /// Checks that one output descriptor is exactly the contracted terminal.
-    pub(crate) const fn program_id(&self) -> crate::program::PowerLutProgramId {
+    pub(crate) const fn program_id(&self) -> crate::program::ExponentLutProgramId {
         self.program_id
     }
 
@@ -621,7 +621,7 @@ impl RefreshMaskMaterial {
         self.family.as_ref()
     }
 
-    pub(crate) fn program_id(&self) -> crate::program::PowerLutProgramId {
+    pub(crate) fn program_id(&self) -> crate::program::ExponentLutProgramId {
         self.contract.program_id()
     }
 
@@ -688,7 +688,7 @@ impl RefreshFreshErrorMaterial {
         })
     }
 
-    pub(crate) fn program_id(&self) -> crate::program::PowerLutProgramId {
+    pub(crate) fn program_id(&self) -> crate::program::ExponentLutProgramId {
         self.contract.program_id()
     }
 
@@ -722,7 +722,7 @@ impl RefreshFreshErrorMaterial {
 /// each slot's exact `kappa_t` inside the same symbolic route body. The output
 /// is reduced to one scaled fresh encoding per slot.
 pub(crate) fn aggregate_refresh_fresh_error_per_slot(
-    compiler: &PowerLutEncodingCompiler,
+    compiler: &ExponentLutEncodingCompiler,
     base_p: usize,
     material: &RefreshFreshErrorMaterial,
     scales: Vec<Mat>,
@@ -791,7 +791,7 @@ pub(crate) fn aggregate_refresh_fresh_error_per_slot(
 /// then perform one or more structural balanced reductions over its output;
 /// no label is projected to a host value during this phase.
 fn route_prf_family(
-    compiler: &PowerLutEncodingCompiler,
+    compiler: &ExponentLutEncodingCompiler,
     base_p: usize,
     vectors: Family<Mat>,
     public_keys: Family<Mat>,
@@ -901,7 +901,7 @@ fn reduce_family_segments(
 /// Routes all mask slots once and reduces each canonical slot segment to one
 /// encoding. Only the resulting fixed-size CRT-slot vector is materialized.
 pub(crate) fn aggregate_refresh_masks(
-    compiler: &PowerLutEncodingCompiler,
+    compiler: &ExponentLutEncodingCompiler,
     base_p: usize,
     family: &RefreshPrfFamilyMaterial,
     slot_count: usize,
@@ -1038,7 +1038,7 @@ impl RefreshResult {
 
 impl RefreshDeclaration {
     fn validate_parameters(&self) -> Result<(), RefreshError> {
-        if self.owner != "mxx-power-lut" ||
+        if self.owner != "mxx-exponent-lut" ||
             self.setup_identity == [0; 32] ||
             self.plan != "section-7-refresh" ||
             self.value_type != "BggEncodingVector" ||
@@ -1114,7 +1114,7 @@ impl RefreshDecoderPreimage {
         encoding: BggEncodingWire,
         combined_target: &Mat,
     ) -> Result<Self, RefreshError> {
-        crate::ensure_ciphertext_only(&encoding).map_err(RefreshError::Power)?;
+        crate::ensure_ciphertext_only(&encoding).map_err(RefreshError::ExponentLut)?;
         let equation = anchor.equation.as_ref().ok_or(RefreshError::MissingAnchorEquation)?;
         Ok(Self {
             encoding,
@@ -1182,10 +1182,10 @@ impl RefreshScalarPackage {
         b: Mat,
         k: Preimage,
     ) -> Result<Self, RefreshError> {
-        crate::ensure_ciphertext_only(state).map_err(RefreshError::Power)?;
-        crate::ensure_ciphertext_only(&mask).map_err(RefreshError::Power)?;
-        crate::ensure_ciphertext_only(&fresh_error_source).map_err(RefreshError::Power)?;
-        crate::ensure_ciphertext_only(&decoder.encoding).map_err(RefreshError::Power)?;
+        crate::ensure_ciphertext_only(state).map_err(RefreshError::ExponentLut)?;
+        crate::ensure_ciphertext_only(&mask).map_err(RefreshError::ExponentLut)?;
+        crate::ensure_ciphertext_only(&fresh_error_source).map_err(RefreshError::ExponentLut)?;
+        crate::ensure_ciphertext_only(&decoder.encoding).map_err(RefreshError::ExponentLut)?;
         decoder.validate(anchor, &target_public_matrix)?;
         let anchor_product_handle = anchor
             .equation
@@ -1249,7 +1249,7 @@ impl RefreshSetupManifest {
             }
         }
         let mut hash = Sha256::new();
-        hash.update(b"mxx.power-lut.refresh-setup");
+        hash.update(b"mxx.exponent-lut.refresh-setup");
         hash.update(format!("{:?}", state.vector.value_handle()).as_bytes());
         hash.update(format!("{:?}", a_prime.value_handle()).as_bytes());
         for package in &packages {
@@ -1308,7 +1308,7 @@ impl RefreshCompiler {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_imported_wires(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         state: BggEncodingWire,
         a_prime: Mat,
         public_b: Mat,
@@ -1318,7 +1318,7 @@ impl RefreshCompiler {
         preimages: Vec<Preimage>,
     ) -> Result<RefreshSetupManifest, RefreshError> {
         self.validate_layout()?;
-        crate::ensure_ciphertext_only(&state).map_err(RefreshError::Power)?;
+        crate::ensure_ciphertext_only(&state).map_err(RefreshError::ExponentLut)?;
         if masks.len() != self.crt_plaintext_moduli.len() ||
             scaled_freshes.len() != masks.len() ||
             preimages.len() != masks.len() ||
@@ -1335,8 +1335,8 @@ impl RefreshCompiler {
         {
             let base = decoder_base.clone();
             let decoder_base_handle = base.vector.value_handle().clone();
-            crate::ensure_ciphertext_only(&mask).map_err(RefreshError::Power)?;
-            crate::ensure_ciphertext_only(&base).map_err(RefreshError::Power)?;
+            crate::ensure_ciphertext_only(&mask).map_err(RefreshError::ExponentLut)?;
+            crate::ensure_ciphertext_only(&base).map_err(RefreshError::ExponentLut)?;
             if base.pubkey.reveal_plaintext || base.pubkey.matrix.value_handle() != &base_handle {
                 return Err(RefreshError::TargetMismatch);
             }
@@ -1427,7 +1427,7 @@ impl RefreshCompiler {
         let declaration = RefreshDeclaration {
             identity: matrix_identity(output),
             setup_identity: setup.identity,
-            owner: "mxx-power-lut".into(),
+            owner: "mxx-exponent-lut".into(),
             plan: "section-7-refresh".into(),
             value_type: "BggEncodingVector".into(),
             rows,
@@ -1511,7 +1511,7 @@ impl RefreshCompiler {
     /// masks/errors are added before their combined decoder is subtracted.
     pub fn refresh(
         &self,
-        compiler: &PowerLutEncodingCompiler,
+        compiler: &ExponentLutEncodingCompiler,
         setup: &RefreshSetupManifest,
     ) -> Result<RefreshResult, RefreshError> {
         self.validate_layout()?;

@@ -1,8 +1,8 @@
-//! Power-LUT operations built on the generic BGG+ encoding layer.
+//! Exponent-LUT operations built on the generic BGG+ encoding layer.
 //!
 //! The crate has two deliberately separate views of the same computation. The
-//! [`PowerLutEncodingCompiler`] consumes plain BGG encoding wires and private
-//! RHS packages, while [`PowerLutPublicKeyCompiler`] emits the public matrix
+//! [`ExponentLutEncodingCompiler`] consumes plain BGG encoding wires and private
+//! RHS packages, while [`ExponentLutPublicKeyCompiler`] emits the public matrix
 //! projection of each operation. Artifact importers validate setup identity
 //! before producing runtime wires; that validation does not add provenance to
 //! the wires. The role-free RHS material stays in the generic core and
@@ -23,11 +23,11 @@ pub mod public_key;
 pub mod refresh;
 pub mod refresh_setup;
 pub mod rhs;
-use rhs::PowerRhsPackageError;
+use rhs::ExponentRhsPackageError;
 
-pub use encoding::{PowerLutEncodingCompiler, flattened_lut_index};
+pub use encoding::{ExponentLutEncodingCompiler, flattened_lut_index};
 
-pub use encoding::PowerArtifactImportError;
+pub use encoding::ExponentArtifactImportError;
 pub use mxx_bgg::{
     BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout,
     EncodingCompileError, PreimageCoefficientBound,
@@ -36,15 +36,16 @@ pub use noise::{
     AVERAGE_CASE_REPORT_SCHEMA_VERSION, AcceptedUnder, AffineNoiseTransfer, AverageCaseConfig,
     AverageEventBudget, AverageGateNoiseStep, AverageNoiseTransfer, AverageProgramNoiseReport,
     AverageRefreshNoiseReport, AverageRefreshSlotNoiseReport, AverageSparsePrfNoiseReport,
-    AverageVariance, GateNoiseStep, HeuristicId, NoiseMagnitude, NoiseModelKind,
-    NoiseSimulationError, PowerLutAverageNoiseReport, PowerLutNoiseParameters, PowerLutNoiseReport,
-    PowerLutNoiseSnapshot, ProgramNoiseInputs, ProgramNoiseReport, RefreshHardAuthority,
-    RefreshNoiseParameters, RefreshNoiseReport, RefreshSlotNoiseParameters, RefreshSlotNoiseReport,
-    SparsePrfNoiseReport, average_fixed_fuse_transfer, average_fixed_lut_transfer,
-    average_monomial_one_hot_transfer, average_refresh_accepts, average_two_input_lut_transfer,
-    average_variance_transfer, fixed_fuse_transfer, fixed_lut_transfer, monomial_one_hot_transfer,
-    simulate_average_program, simulate_average_refresh, simulate_average_sparse_prf,
-    simulate_program, simulate_refresh, simulate_sparse_prf, two_input_lut_transfer,
+    AverageVariance, ExponentLutAverageNoiseReport, ExponentLutNoiseParameters,
+    ExponentLutNoiseReport, ExponentLutNoiseSnapshot, GateNoiseStep, HeuristicId, NoiseMagnitude,
+    NoiseModelKind, NoiseSimulationError, ProgramNoiseInputs, ProgramNoiseReport,
+    RefreshHardAuthority, RefreshNoiseParameters, RefreshNoiseReport, RefreshSlotNoiseParameters,
+    RefreshSlotNoiseReport, SparsePrfNoiseReport, average_fixed_fuse_transfer,
+    average_fixed_lut_transfer, average_monomial_one_hot_transfer, average_refresh_accepts,
+    average_two_input_lut_transfer, average_variance_transfer, fixed_fuse_transfer,
+    fixed_lut_transfer, monomial_one_hot_transfer, simulate_average_program,
+    simulate_average_refresh, simulate_average_sparse_prf, simulate_program, simulate_refresh,
+    simulate_sparse_prf, two_input_lut_transfer,
 };
 pub use prf::{
     SparseLwrPrfHelperBundle, SparseLwrPrfProfile, SparseLwrPrfProgram,
@@ -52,26 +53,26 @@ pub use prf::{
     SparseLwrPublicTerminalHelpers, SparseLwrReductionHelpers, SparseLwrReductionPlan,
     SparseLwrTerminalHelpers,
 };
-pub use public_key::PowerLutPublicKeyCompiler;
+pub use public_key::ExponentLutPublicKeyCompiler;
 use thiserror::Error;
 
 #[derive(Debug, Error, Eq, PartialEq)]
-/// Errors raised while validating or lowering a Power-LUT operation.
-pub enum PowerLutError {
-    #[error("Power-LUT encoding carries forbidden plaintext metadata")]
-    /// Power-LUT boundaries accept ciphertext-only encoding wires.
+/// Errors raised while validating or lowering an Exponent-LUT operation.
+pub enum ExponentLutError {
+    #[error("Exponent-LUT encoding carries forbidden plaintext metadata")]
+    /// Exponent-LUT boundaries accept ciphertext-only encoding wires.
     PlaintextMetadataForbidden,
     #[error(transparent)]
     /// A generic BGG encoding operation rejected its inputs.
     Bgg(#[from] EncodingCompileError),
     #[error(transparent)]
     /// An RHS package failed material or artifact validation.
-    Rhs(#[from] PowerRhsPackageError),
+    Rhs(#[from] ExponentRhsPackageError),
     #[error(transparent)]
     /// An imported artifact manifest is not compatible with the requested value.
-    Artifact(#[from] PowerArtifactImportError),
+    Artifact(#[from] ExponentArtifactImportError),
     #[error(transparent)]
-    /// A shared Power-LUT program failed validation or lowering.
+    /// A shared Exponent-LUT program failed validation or lowering.
     Program(#[from] program::ProgramValidationError),
     #[error("LUT dimensions, output exponents, or RHS width are invalid")]
     /// A table, exponent, or matrix shape is inconsistent with the operation.
@@ -84,13 +85,13 @@ pub enum PowerLutError {
     MissingRoundingHelpers,
 }
 
-/// Rejects any encoding wire that exposes plaintext metadata at a Power-LUT
+/// Rejects any encoding wire that exposes plaintext metadata at an Exponent-LUT
 /// boundary.  The matrix relation itself remains plain `BggEncodingWire`; the
 /// check is deliberately centralized so callers cannot forge metadata after
 /// setup sampling or PRF evaluation.
-pub(crate) fn ensure_ciphertext_only(encoding: &BggEncodingWire) -> Result<(), PowerLutError> {
+pub(crate) fn ensure_ciphertext_only(encoding: &BggEncodingWire) -> Result<(), ExponentLutError> {
     if encoding.plaintext.is_some() || encoding.pubkey.reveal_plaintext {
-        return Err(PowerLutError::PlaintextMetadataForbidden);
+        return Err(ExponentLutError::PlaintextMetadataForbidden);
     }
     Ok(())
 }
@@ -100,11 +101,14 @@ pub(crate) fn ensure_ciphertext_only(encoding: &BggEncodingWire) -> Result<(), P
 #[cfg(all(test, feature = "gpu"))]
 mod encoding_gpu_tests;
 
+#[cfg(all(test, feature = "gpu"))]
+mod benchmark_estimate_gpu_tests;
+
 #[cfg(test)]
 mod refresh_setup_gpu_tests;
 
 #[cfg(test)]
-extern crate self as mxx_power_lut;
+extern crate self as mxx_exponent_lut;
 
 #[cfg(test)]
 pub mod parameter_search_test_support {

@@ -1,6 +1,6 @@
-//! A validated, host-side Power-LUT computation program.
+//! A validated, host-side Exponent-LUT computation program.
 //!
-//! [`PowerLutProgram`] is the shared description consumed by both private
+//! [`ExponentLutProgram`] is the shared description consumed by both private
 //! encoding and public-key lowerers. It contains only public scheme metadata:
 //! input widths, LUT tables, gate wiring, and explicit RHS/family identifiers.
 //! It does not add an IR node and does not carry private vectors, GSW
@@ -52,7 +52,7 @@ id_type!(ProgramWireId, "Identifier of a program wire, including inputs and gate
 id_type!(RhsInputId, "Identifier of an explicit RHS input package.");
 id_type!(RhsFamilyId, "Identifier of a selector/RHS family declaration.");
 id_type!(PublicValueFamilyId, "Identifier of a public value family declaration.");
-id_type!(LutId, "Identifier of a LUT table in a Power-LUT program.");
+id_type!(LutId, "Identifier of a LUT table in an Exponent-LUT program.");
 id_type!(ProgramGateId, "Identifier of a gate in declaration order.");
 
 /// Provenance descriptor for a trusted monomial public-value family.
@@ -65,14 +65,14 @@ pub(crate) const PBC_MONOMIAL_FAMILY_PROVENANCE: u8 = 1;
 /// non-empty family cardinality; lowerers additionally require the PBC
 /// provenance descriptor before accepting it.
 #[derive(Clone)]
-pub(crate) struct PowerLutMonomialFamily {
+pub(crate) struct ExponentLutMonomialFamily {
     family: Family<Mat>,
     ring_type: mxx_ir_core::types::MatrixType,
     count: IntExpr,
     provenance: u8,
 }
 
-impl PowerLutMonomialFamily {
+impl ExponentLutMonomialFamily {
     pub(crate) fn from_trusted(
         family: Family<Mat>,
         ring: &Ring,
@@ -110,11 +110,11 @@ impl PowerLutMonomialFamily {
     }
 }
 
-/// Canonical SHA-256 identity of a complete Power-LUT program.
+/// Canonical SHA-256 identity of a complete Exponent-LUT program.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct PowerLutProgramId(pub(crate) [u8; 32]);
+pub struct ExponentLutProgramId(pub(crate) [u8; 32]);
 
-impl PowerLutProgramId {
+impl ExponentLutProgramId {
     /// Creates an identity from a caller-owned canonical digest.
     pub(crate) const fn from_digest(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -251,7 +251,7 @@ impl LutTable {
     pub(crate) fn commitment(&self) -> [u8; 32] {
         let bytes = serde_json::to_vec(self).expect("LutTable is serializable");
         let mut digest = Sha256::new();
-        digest.update(b"mxx-power-lut/lut-table/v1");
+        digest.update(b"mxx-exponent-lut/lut-table/v1");
         digest.update(bytes);
         digest.finalize().into()
     }
@@ -532,7 +532,7 @@ pub enum ProgramValidationError {
     MissingRuntimeRhs(RhsInputId),
 }
 
-/// A validated immutable Power-LUT program.
+/// A validated immutable Exponent-LUT program.
 ///
 /// The dataflow is `declared inputs -> wires -> ordered gates -> outputs`.
 /// Its canonical identity covers declarations, tables, gate wiring, and output
@@ -541,8 +541,8 @@ pub enum ProgramValidationError {
 /// returned; callers deserializing this type should still treat untrusted data
 /// as requiring validation at its artifact boundary.
 #[derive(Clone, Debug, Serialize)]
-pub struct PowerLutProgram {
-    id: PowerLutProgramId,
+pub struct ExponentLutProgram {
+    id: ExponentLutProgramId,
     inputs: BTreeMap<ProgramInputId, usize>,
     input_wires: BTreeMap<ProgramInputId, ProgramWireId>,
     rhs_inputs: BTreeMap<RhsInputId, RhsInputDeclaration>,
@@ -554,8 +554,8 @@ pub struct PowerLutProgram {
 }
 
 #[derive(Deserialize)]
-struct PowerLutProgramRepr {
-    id: PowerLutProgramId,
+struct ExponentLutProgramRepr {
+    id: ExponentLutProgramId,
     inputs: BTreeMap<ProgramInputId, usize>,
     input_wires: BTreeMap<ProgramInputId, ProgramWireId>,
     rhs_inputs: BTreeMap<RhsInputId, RhsInputDeclaration>,
@@ -566,12 +566,12 @@ struct PowerLutProgramRepr {
     outputs: Vec<ProgramWireId>,
 }
 
-impl<'de> Deserialize<'de> for PowerLutProgram {
+impl<'de> Deserialize<'de> for ExponentLutProgram {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let repr = PowerLutProgramRepr::deserialize(deserializer)?;
+        let repr = ExponentLutProgramRepr::deserialize(deserializer)?;
         let builder = builder_from_program_parts(
             repr.inputs.clone(),
             repr.input_wires.clone(),
@@ -600,9 +600,9 @@ impl<'de> Deserialize<'de> for PowerLutProgram {
     }
 }
 
-impl PowerLutProgram {
+impl ExponentLutProgram {
     /// Returns the canonical identity of the declarations and gate dataflow.
-    pub const fn id(&self) -> PowerLutProgramId {
+    pub const fn id(&self) -> ExponentLutProgramId {
         self.id
     }
     /// Returns declared input widths keyed by input identifier.
@@ -639,9 +639,9 @@ impl PowerLutProgram {
     }
 }
 
-/// Mutable builder for a validated immutable [`PowerLutProgram`].
+/// Mutable builder for a validated immutable [`ExponentLutProgram`].
 #[derive(Default)]
-pub struct PowerLutProgramBuilder {
+pub struct ExponentLutProgramBuilder {
     inputs: BTreeMap<ProgramInputId, usize>,
     input_wires: BTreeMap<ProgramInputId, ProgramWireId>,
     rhs_inputs: BTreeMap<RhsInputId, RhsInputDeclaration>,
@@ -653,7 +653,7 @@ pub struct PowerLutProgramBuilder {
     outputs: Vec<ProgramWireId>,
 }
 
-impl PowerLutProgramBuilder {
+impl ExponentLutProgramBuilder {
     /// Creates an empty program builder.
     pub fn new() -> Self {
         Self::default()
@@ -818,13 +818,13 @@ impl PowerLutProgramBuilder {
     }
 
     /// Finalizes and canonically identifies the program.
-    pub fn build(self) -> Result<PowerLutProgram, ProgramValidationError> {
+    pub fn build(self) -> Result<ExponentLutProgram, ProgramValidationError> {
         if self.outputs.is_empty() {
             return Err(ProgramValidationError::InvalidOutput);
         }
         validate_builder(&self)?;
         let canonical = canonical_program_bytes(&self);
-        let program = PowerLutProgram {
+        let program = ExponentLutProgram {
             id: canonical_program_id(&canonical),
             inputs: self.inputs,
             input_wires: self.input_wires,
@@ -847,7 +847,7 @@ impl PowerLutProgramBuilder {
     }
 }
 
-fn canonical_program_bytes(builder: &PowerLutProgramBuilder) -> Vec<u8> {
+fn canonical_program_bytes(builder: &ExponentLutProgramBuilder) -> Vec<u8> {
     serde_json::to_vec(&(
         &builder.inputs,
         &builder.input_wires,
@@ -858,7 +858,7 @@ fn canonical_program_bytes(builder: &PowerLutProgramBuilder) -> Vec<u8> {
         &builder.gates,
         &builder.outputs,
     ))
-    .expect("PowerLutProgram declarations are serializable")
+    .expect("ExponentLutProgram declarations are serializable")
 }
 
 fn builder_from_program_parts(
@@ -870,7 +870,7 @@ fn builder_from_program_parts(
     luts: BTreeMap<LutId, LutTable>,
     gates: Vec<ProgramGate>,
     outputs: Vec<ProgramWireId>,
-) -> Result<PowerLutProgramBuilder, ProgramValidationError> {
+) -> Result<ExponentLutProgramBuilder, ProgramValidationError> {
     if inputs.len() != input_wires.len() || outputs.is_empty() {
         return Err(ProgramValidationError::InvalidBuilderState);
     }
@@ -899,7 +899,7 @@ fn builder_from_program_parts(
             return Err(ProgramValidationError::DuplicateIdentifier);
         }
     }
-    let builder = PowerLutProgramBuilder {
+    let builder = ExponentLutProgramBuilder {
         inputs,
         input_wires,
         rhs_inputs,
@@ -917,7 +917,7 @@ fn builder_from_program_parts(
 // Program shape validation.
 
 pub(crate) fn validate_builder(
-    builder: &PowerLutProgramBuilder,
+    builder: &ExponentLutProgramBuilder,
 ) -> Result<(), ProgramValidationError> {
     if builder.inputs.len() != builder.input_wires.len() {
         return Err(ProgramValidationError::InvalidBuilderState);
@@ -1027,9 +1027,9 @@ pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationEr
 
 // Shared runtime binding and traversal.
 
-use crate::PowerLutError;
+use crate::ExponentLutError;
 
-/// Runtime values bound to the declarations of one [`PowerLutProgram`].
+/// Runtime values bound to the declarations of one [`ExponentLutProgram`].
 ///
 /// The type parameters keep the private encoding and public-key paths
 /// separate. In particular, a public binding can use only public key wires,
@@ -1080,14 +1080,14 @@ pub(crate) trait ProgramLoweringBackend {
         &self,
         helpers: &'a Self::HelperSet,
         table: &LutTable,
-    ) -> Result<&'a [Self::Helper], PowerLutError>;
+    ) -> Result<&'a [Self::Helper], ExponentLutError>;
 
     fn unary(
         &self,
         input: Self::Wire,
         table: &LutTable,
         helpers: &[Self::Helper],
-    ) -> Result<Self::Wire, PowerLutError>;
+    ) -> Result<Self::Wire, ExponentLutError>;
 
     fn binary(
         &self,
@@ -1095,7 +1095,7 @@ pub(crate) trait ProgramLoweringBackend {
         rhs: &Self::Rhs,
         table: &LutTable,
         helpers: &[Self::Helper],
-    ) -> Result<Self::Wire, PowerLutError>;
+    ) -> Result<Self::Wire, ExponentLutError>;
 
     /// Selects from paired runtime families and returns their balanced sum.
     /// Selection has no LUT/helper inputs; callers append a unary gate when a
@@ -1107,7 +1107,7 @@ pub(crate) trait ProgramLoweringBackend {
         public_values: &Self::PublicValueFamily,
         selector_range: &FamilyRange,
         public_value_range: &FamilyRange,
-    ) -> Result<Self::Wire, PowerLutError>;
+    ) -> Result<Self::Wire, ExponentLutError>;
 }
 
 /// Resolves declarations and runtime bindings once, then traverses every gate
@@ -1127,7 +1127,7 @@ pub(crate) trait ProgramLoweringBackend {
 /// backend has accepted the gate's shape. Any following LUT is represented by
 /// an ordinary [`ProgramGate::Unary`] gate.
 pub(crate) fn lower_program<B: ProgramLoweringBackend>(
-    program: &PowerLutProgram,
+    program: &ExponentLutProgram,
     bindings: &ProgramBindings<
         '_,
         B::Wire,
@@ -1138,7 +1138,7 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
     >,
     family_ranges: &ProgramFamilyRanges,
     backend: &B,
-) -> Result<BTreeMap<ProgramWireId, B::Wire>, PowerLutError> {
+) -> Result<BTreeMap<ProgramWireId, B::Wire>, ExponentLutError> {
     let mut wires = BTreeMap::new();
     for (input_id, wire_id) in program.input_wires() {
         let value = bindings
@@ -1158,7 +1158,7 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
                     .ok_or(ProgramValidationError::UndefinedWire(*input))?;
                 let table = program.lut(*lut).ok_or(ProgramValidationError::UndefinedLut(*lut))?;
                 validate_unary_table(table)?;
-                let helper_set = bindings.helpers.get(lut).ok_or(PowerLutError::InvalidLut)?;
+                let helper_set = bindings.helpers.get(lut).ok_or(ExponentLutError::InvalidLut)?;
                 let helpers = backend.resolve_helpers(helper_set, table)?;
                 (*output, backend.unary(input, table, helpers)?)
             }
@@ -1175,7 +1175,7 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
                     .rhs_inputs
                     .get(rhs)
                     .ok_or(ProgramValidationError::MissingRuntimeRhs(*rhs))?;
-                let helper_set = bindings.helpers.get(lut).ok_or(PowerLutError::InvalidLut)?;
+                let helper_set = bindings.helpers.get(lut).ok_or(ExponentLutError::InvalidLut)?;
                 let helpers = backend.resolve_helpers(helper_set, table)?;
                 (*output, backend.binary(lhs_value, rhs_value, table, helpers)?)
             }
@@ -1229,7 +1229,7 @@ pub(crate) fn lower_program<B: ProgramLoweringBackend>(
     Ok(wires)
 }
 
-fn validate_unary_table(table: &LutTable) -> Result<(), PowerLutError> {
+fn validate_unary_table(table: &LutTable) -> Result<(), ExponentLutError> {
     if table.rhs_width().is_some() {
         return Err(ProgramValidationError::InvalidLutTable.into());
     }
@@ -1240,7 +1240,7 @@ fn validate_binary_table(
     table: &LutTable,
     lhs_width: usize,
     rhs_width: usize,
-) -> Result<(), PowerLutError> {
+) -> Result<(), ExponentLutError> {
     if table.rhs_width() != Some(rhs_width) || table.input_width() != lhs_width {
         return Err(ProgramValidationError::WidthMismatch.into());
     }
@@ -1254,13 +1254,13 @@ fn validate_binary_table(
 /// The namespace includes only the caller-provided public namespace and the
 /// canonical program identifier. Private artifact names are deliberately not
 /// accepted here.
-pub fn artifact_namespace(program: &PowerLutProgram, public_namespace: &str) -> String {
-    format!("mxx.power-lut.program.{}.{}", public_namespace, program.id().hex())
+pub fn artifact_namespace(program: &ExponentLutProgram, public_namespace: &str) -> String {
+    format!("mxx.exponent-lut.program.{}.{}", public_namespace, program.id().hex())
 }
 
 /// Computes the canonical identifier for a serialized program description.
-pub(crate) fn canonical_program_id(bytes: &[u8]) -> PowerLutProgramId {
-    PowerLutProgramId(Sha256::digest(bytes).into())
+pub(crate) fn canonical_program_id(bytes: &[u8]) -> ExponentLutProgramId {
+    ExponentLutProgramId(Sha256::digest(bytes).into())
 }
 
 #[cfg(test)]
@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn binary_rhs_is_explicit_and_identity_is_canonical() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let lhs = builder.input(2).unwrap();
         let family = builder.rhs_family(2).unwrap();
         let rhs = builder.rhs_input(family, 2, 2).unwrap();
@@ -1278,7 +1278,7 @@ mod tests {
         builder.output(output).unwrap();
         let first = builder.build().unwrap();
 
-        let mut second_builder = PowerLutProgramBuilder::new();
+        let mut second_builder = ExponentLutProgramBuilder::new();
         let lhs = second_builder.input(2).unwrap();
         let family = second_builder.rhs_family(2).unwrap();
         let rhs = second_builder.rhs_input(family, 2, 2).unwrap();
@@ -1292,7 +1292,7 @@ mod tests {
 
     #[test]
     fn one_hot_selection_has_no_lut_and_round_trips_canonical_identity() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let selector_family = builder.rhs_family(2).unwrap();
         let public_value_family = builder.public_value_family(2).unwrap();
@@ -1318,13 +1318,13 @@ mod tests {
         ));
         let encoded = serde_json::to_value(&program).unwrap();
         assert!(encoded["gates"][0].get("lut").is_none());
-        let decoded: PowerLutProgram = serde_json::from_value(encoded).unwrap();
+        let decoded: ExponentLutProgram = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.id(), program.id());
     }
 
     #[test]
     fn one_hot_selection_requires_matching_input_and_value_widths() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let selector_family = builder.rhs_family(2).unwrap();
         let public_value_family = builder.public_value_family(4).unwrap();
@@ -1353,7 +1353,7 @@ mod tests {
                 &self,
                 _helpers: &'a Self::HelperSet,
                 _table: &LutTable,
-            ) -> Result<&'a [Self::Helper], PowerLutError> {
+            ) -> Result<&'a [Self::Helper], ExponentLutError> {
                 panic!("selection-only lowering must not resolve LUT helpers")
             }
 
@@ -1362,7 +1362,7 @@ mod tests {
                 _input: Self::Wire,
                 _table: &LutTable,
                 _helpers: &[Self::Helper],
-            ) -> Result<Self::Wire, PowerLutError> {
+            ) -> Result<Self::Wire, ExponentLutError> {
                 panic!("selection-only test has no unary gates")
             }
 
@@ -1372,7 +1372,7 @@ mod tests {
                 _rhs: &Self::Rhs,
                 _table: &LutTable,
                 _helpers: &[Self::Helper],
-            ) -> Result<Self::Wire, PowerLutError> {
+            ) -> Result<Self::Wire, ExponentLutError> {
                 panic!("selection-only test has no binary gates")
             }
 
@@ -1383,12 +1383,12 @@ mod tests {
                 _public_values: &Self::PublicValueFamily,
                 _selector_range: &FamilyRange,
                 _public_value_range: &FamilyRange,
-            ) -> Result<Self::Wire, PowerLutError> {
+            ) -> Result<Self::Wire, ExponentLutError> {
                 Ok(input + 1)
             }
         }
 
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let selector_family = builder.rhs_family(2).unwrap();
         let public_value_family = builder.public_value_family(2).unwrap();
@@ -1420,13 +1420,13 @@ mod tests {
         let ring = Ring::new(97, 4);
         let valid = Family::pack(vec![ring.zero((1, 1))]).unwrap();
         assert!(
-            PowerLutMonomialFamily::from_trusted(valid, &ring, PBC_MONOMIAL_FAMILY_PROVENANCE,)
+            ExponentLutMonomialFamily::from_trusted(valid, &ring, PBC_MONOMIAL_FAMILY_PROVENANCE,)
                 .is_ok()
         );
         let wrong_ring = Ring::new(97, 8);
         let wrong_ring_family = Family::pack(vec![ring.zero((1, 1))]).unwrap();
         assert!(
-            PowerLutMonomialFamily::from_trusted(
+            ExponentLutMonomialFamily::from_trusted(
                 wrong_ring_family,
                 &wrong_ring,
                 PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -1436,7 +1436,7 @@ mod tests {
         let empty = Family::pack(Vec::<Mat>::new());
         assert!(
             empty.is_err() ||
-                PowerLutMonomialFamily::from_trusted(
+                ExponentLutMonomialFamily::from_trusted(
                     empty.unwrap(),
                     &ring,
                     PBC_MONOMIAL_FAMILY_PROVENANCE,
@@ -1463,7 +1463,7 @@ mod tests {
 
     #[test]
     fn scalar_lut_is_terminal_and_cannot_feed_a_later_gate() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let scalar = builder.lut(LutTable::unary_scalar(2, 2, vec![0, 1]).unwrap()).unwrap();
         let scalar_wire = builder.unary(builder.input_wire(input).unwrap(), scalar).unwrap();
@@ -1476,7 +1476,7 @@ mod tests {
 
     #[test]
     fn scalar_lut_is_accepted_when_it_is_the_terminal_output() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let scalar = builder.lut(LutTable::unary_scalar(2, 2, vec![0, 1]).unwrap()).unwrap();
         let output = builder.unary(builder.input_wire(input).unwrap(), scalar).unwrap();
@@ -1486,7 +1486,7 @@ mod tests {
 
     #[test]
     fn serialized_program_rejects_identity_or_output_form_tampering() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let lut = builder.lut(LutTable::unary(2, 2, vec![0, 1]).unwrap()).unwrap();
         let output = builder.unary(builder.input_wire(input).unwrap(), lut).unwrap();
@@ -1496,11 +1496,11 @@ mod tests {
         let mut wrong_id = serde_json::to_value(&program).unwrap();
         wrong_id["id"] =
             serde_json::Value::Array((0..32).map(|_| serde_json::Value::from(0u8)).collect());
-        assert!(serde_json::from_value::<PowerLutProgram>(wrong_id).is_err());
+        assert!(serde_json::from_value::<ExponentLutProgram>(wrong_id).is_err());
 
         let mut wrong_form = serde_json::to_value(&program).unwrap();
         wrong_form["luts"]["0"]["output_form"] = serde_json::json!("Scalar");
-        let error = serde_json::from_value::<PowerLutProgram>(wrong_form).unwrap_err();
+        let error = serde_json::from_value::<ExponentLutProgram>(wrong_form).unwrap_err();
         assert!(error.to_string().contains("serialized program identity"));
     }
 }

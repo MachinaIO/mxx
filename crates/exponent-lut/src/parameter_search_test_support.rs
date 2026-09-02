@@ -1,7 +1,7 @@
 // Small, deterministic helpers for the ignored Section-7 parameter search.
 //
 // The search is intentionally kept as test-support source. It is a measurement
-// harness, not a new Power-LUT parameter abstraction: production code continues
+// harness, not a new Exponent-LUT parameter abstraction: production code continues
 // to use the ordinary `RefreshSetupParameters`, PBC, PRF program, and checker APIs.
 
 use std::{
@@ -20,9 +20,12 @@ use self::sparse_lwr_parameter_support::{
 use mxx_bgg::{BggSamplerLayout, PreimageCoefficientBound};
 use mxx_dsl::BuiltGraph;
 use mxx_ir_core::{IntExpr, RealExpr, artifact::ProductionId, encoding::spec_hash};
-use mxx_power_lut::{
-    AverageCaseConfig, PowerLutAverageNoiseReport,
-    pbc::{PbcParameters, PbcRootSeed, clear_pbc_inner_product, generate_key_layout},
+use mxx_exponent_lut::{
+    AverageCaseConfig, ExponentLutAverageNoiseReport,
+    pbc::{
+        PbcActiveCellIndex, PbcParameters, PbcRootSeed, clear_pbc_inner_product,
+        generate_key_layout,
+    },
     prf::{SparseLwrPrfProfile, SparseLwrPrfProgram},
     refresh::RefreshCompiler,
     refresh_setup::{
@@ -63,13 +66,13 @@ impl std::fmt::Display for CandidatePreparationError {
 }
 
 /// Validates the frozen refresh stages and then runs the application-specific
-/// Power-LUT noise simulator bound to the constructed setup.
+/// Exponent-LUT noise simulator bound to the constructed setup.
 ///
 /// Parameter-search candidates are intentionally not runtime executions.
 /// `RefreshParameterSimulationRequest::build` validates the BuiltGraph,
 /// declaration, and attestation boundaries. The mxx-noise-simulator request
 /// only validates request-level stage/root/external facts; the embedded
-/// Power-LUT snapshot is the operational-noise authority.
+/// Exponent-LUT snapshot is the operational-noise authority.
 pub fn check_refresh_bundle(
     config: &SearchConfig,
     _candidate: Candidate,
@@ -227,7 +230,7 @@ fn simulation_external_inputs(
     stage_graphs: &[(&str, &BuiltGraph)],
     metadata: &std::collections::BTreeMap<
         String,
-        mxx_power_lut::refresh_setup::RefreshSimulationMatrixInputMetadata,
+        mxx_exponent_lut::refresh_setup::RefreshSimulationMatrixInputMetadata,
     >,
 ) -> Result<Vec<mxx_noise_simulator::ExternalInputFact>, String> {
     let mut facts = Vec::new();
@@ -286,7 +289,7 @@ fn matrix_fact(
     _matrix: &mxx_ir_core::types::MatrixType,
     metadata: &std::collections::BTreeMap<
         String,
-        mxx_power_lut::refresh_setup::RefreshSimulationMatrixInputMetadata,
+        mxx_exponent_lut::refresh_setup::RefreshSimulationMatrixInputMetadata,
     >,
 ) -> Result<mxx_noise_simulator::ExternalInputValue, String> {
     let bound = metadata
@@ -306,7 +309,7 @@ fn matrix_fact(
     })
 }
 
-/// The fixed profile requested for the first Power-LUT refresh search.
+/// The fixed profile requested for the first Exponent-LUT refresh search.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchConfig {
     /// Test-harness noise authority; production defaults to WorstCase.
@@ -410,74 +413,74 @@ impl SearchConfig {
     /// and race-free while preserving the exact environment schema used by
     /// the ignored simulation: security, sparse-LWR grid/weight/moduli, LUT
     /// width, CRT/base bits, and MIN/MAX CRT-depth and ring-dimension bounds.
-    /// Every schema name uses the `MXX_POWER_LUT_REFRESH_` prefix.
+    /// Every schema name uses the `MXX_EXPONENT_LUT_REFRESH_` prefix.
     pub fn from_lookup<L>(lookup: L) -> Result<Self, String>
     where
         L: Fn(&str) -> Result<Option<String>, String>,
     {
         let mut config = Self::reviewed();
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_SECURITY_BITS")? {
-            config.security_bits = parse_lookup_u64("MXX_POWER_LUT_REFRESH_SECURITY_BITS", &value)?;
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS")? {
+            config.security_bits = parse_lookup_u64("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_NOISE_MODEL")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL")? {
             config.noise_model = match value.as_str() {
                 "worst-case" => NoiseSearchModel::WorstCase,
                 "average-case" => NoiseSearchModel::AverageCase,
                 _ => {
                     return Err(
-                        "MXX_POWER_LUT_REFRESH_NOISE_MODEL must be worst-case or average-case"
+                        "MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL must be worst-case or average-case"
                             .to_owned(),
                     )
                 }
             };
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_MASK_STATISTICAL_SECURITY_BITS")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_MASK_STATISTICAL_SECURITY_BITS")? {
             config.mask_statistical_security_bits =
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_MASK_STATISTICAL_SECURITY_BITS", &value)?;
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_MASK_STATISTICAL_SECURITY_BITS", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_SPARSE_LWR_UNIVERSE_GRID")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_UNIVERSE_GRID")? {
             config.sparse_lwr_universe_grid =
-                parse_lookup_grid("MXX_POWER_LUT_REFRESH_SPARSE_LWR_UNIVERSE_GRID", &value)?;
+                parse_lookup_grid("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_UNIVERSE_GRID", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_SPARSE_LWR_WEIGHT")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_WEIGHT")? {
             config.sparse_lwr_weight =
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_SPARSE_LWR_WEIGHT", &value)?;
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_WEIGHT", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_SPARSE_LWR_MODULUS")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_MODULUS")? {
             config.sparse_lwr_modulus =
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_SPARSE_LWR_MODULUS", &value)?;
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_MODULUS", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_SPARSE_LWR_OUTPUT_MODULUS")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_OUTPUT_MODULUS")? {
             config.sparse_lwr_output_modulus =
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_SPARSE_LWR_OUTPUT_MODULUS", &value)?;
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_OUTPUT_MODULUS", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_LUT_WIDTH")? {
-            config.lut_width = parse_lookup_usize("MXX_POWER_LUT_REFRESH_LUT_WIDTH", &value)?;
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_LUT_WIDTH")? {
+            config.lut_width = parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_LUT_WIDTH", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_CRT_BITS")? {
-            config.crt_bits = parse_lookup_usize("MXX_POWER_LUT_REFRESH_CRT_BITS", &value)?;
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_CRT_BITS")? {
+            config.crt_bits = parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_CRT_BITS", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_BASE_BITS")? {
-            config.base_bits = parse_lookup_u32("MXX_POWER_LUT_REFRESH_BASE_BITS", &value)?;
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_BASE_BITS")? {
+            config.base_bits = parse_lookup_u32("MXX_EXPONENT_LUT_REFRESH_BASE_BITS", &value)?;
         }
         config.crt_base_bits_grid = descending_crt_base_bits_grid(config.crt_bits);
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_MIN_CRT_DEPTH")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_MIN_CRT_DEPTH")? {
             config.crt_depths =
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_MIN_CRT_DEPTH", &value)?..=
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_MIN_CRT_DEPTH", &value)?..=
                     *config.crt_depths.end();
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_MAX_CRT_DEPTH")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_MAX_CRT_DEPTH")? {
             config.crt_depths = *config.crt_depths.start()..=
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_MAX_CRT_DEPTH", &value)?;
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_MAX_CRT_DEPTH", &value)?;
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_MIN_LOG_RING_DIMENSION")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_MIN_LOG_RING_DIMENSION")? {
             config.log_ring_dimensions =
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_MIN_LOG_RING_DIMENSION", &value)?..=
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_MIN_LOG_RING_DIMENSION", &value)?..=
                     *config.log_ring_dimensions.end();
         }
-        if let Some(value) = lookup("MXX_POWER_LUT_REFRESH_MAX_LOG_RING_DIMENSION")? {
+        if let Some(value) = lookup("MXX_EXPONENT_LUT_REFRESH_MAX_LOG_RING_DIMENSION")? {
             config.log_ring_dimensions = *config.log_ring_dimensions.start()..=
-                parse_lookup_usize("MXX_POWER_LUT_REFRESH_MAX_LOG_RING_DIMENSION", &value)?;
+                parse_lookup_usize("MXX_EXPONENT_LUT_REFRESH_MAX_LOG_RING_DIMENSION", &value)?;
         }
         config.validate()
     }
@@ -664,9 +667,16 @@ pub struct PreparedCandidate {
     pub pbc_attempts_used: u32,
     pub mask_base_p_digit_count: usize,
     pub fresh_error_base_p_digit_count: usize,
+    /// Exact structural factors of the deferred refresh-PRF batch, retained for
+    /// benchmark diagnostics without expanding the family on the host.
+    pub prf_component_count: usize,
+    pub prf_coefficient_count: usize,
+    pub prf_active_count: usize,
+    pub prf_label_count: usize,
+    pub prf_value_count: usize,
     /// Present for the production search; omitted by mocked ordering tests.
     pub bundle: Option<RefreshParameterSimulationBundle>,
-    pub average_report: Option<PowerLutAverageNoiseReport>,
+    pub average_report: Option<ExponentLutAverageNoiseReport>,
 }
 
 /// Security values and application-specific noise result for the selected point.
@@ -787,7 +797,7 @@ pub struct SelectedSparseLwrProfile {
 /// in memory.  When it names a missing file, the fresh result is written to
 /// that exact path before Phase 2 starts.  An existing file is reused only
 /// after its declaration has an exact match with the current search model.
-pub const PHASE1_CHECKPOINT_ENV: &str = "MXX_POWER_LUT_REFRESH_PHASE1_CHECKPOINT";
+pub const PHASE1_CHECKPOINT_ENV: &str = "MXX_EXPONENT_LUT_REFRESH_PHASE1_CHECKPOINT";
 
 const PHASE1_CHECKPOINT_VERSION: u32 = 1;
 
@@ -1399,7 +1409,7 @@ pub fn candidates(config: &SearchConfig) -> impl Iterator<Item = Candidate> + '_
 fn final_average_evidence(
     config: &SearchConfig,
     prepared: &PreparedCandidate,
-    report: &PowerLutAverageNoiseReport,
+    report: &ExponentLutAverageNoiseReport,
 ) -> Result<Option<AverageAcceptanceEvidence>, String> {
     if config.noise_model != NoiseSearchModel::AverageCase {
         return Ok(None);
@@ -1497,7 +1507,7 @@ where
             log_ring_dimension = candidate.log_ring_dimension,
             crt_bits = candidate.crt_bits,
             base_bits = candidate.base_bits,
-            "evaluating Power-LUT refresh search candidate"
+            "evaluating Exponent-LUT refresh search candidate"
         );
         let bgg = security(candidate)?;
         let achieved = bgg.min(sparse_profile.sparse_lwr_security_bits);
@@ -1534,7 +1544,7 @@ where
                 log_ring_dimension = candidate.log_ring_dimension,
                 crt_bits = candidate.crt_bits,
                 base_bits = candidate.base_bits,
-                "candidate rejected by Power-LUT noise threshold"
+                "candidate rejected by Exponent-LUT noise threshold"
             );
             continue;
         }
@@ -1576,6 +1586,30 @@ where
 pub fn prepare_candidate(
     config: &SearchConfig,
     candidate: Candidate,
+) -> Result<PreparedCandidate, CandidatePreparationError> {
+    prepare_candidate_with_digits_inner(config, candidate, None)
+}
+
+pub fn prepare_candidate_with_fixed_digits(
+    config: &SearchConfig,
+    candidate: Candidate,
+    mask_digits: usize,
+    fresh_error_digits: usize,
+) -> Result<PreparedCandidate, CandidatePreparationError> {
+    if mask_digits == 0 || fresh_error_digits == 0 {
+        return Err("fixed d_m and d_e must be positive".to_owned().into());
+    }
+    prepare_candidate_with_digits_inner(
+        config,
+        candidate,
+        Some((mask_digits, fresh_error_digits)),
+    )
+}
+
+fn prepare_candidate_with_digits_inner(
+    config: &SearchConfig,
+    candidate: Candidate,
+    fixed_digits: Option<(usize, usize)>,
 ) -> Result<PreparedCandidate, CandidatePreparationError> {
     let ring_dimension = 1usize
         .checked_shl(candidate.log_ring_dimension as u32)
@@ -1707,7 +1741,10 @@ pub fn prepare_candidate(
         .map_err(|error| format!("official decoder bound evaluation: {error}"))?
         .to_biguint()
         .ok_or_else(|| "decoder bound must be non-negative".to_owned())?;
-    let noise_model = mxx_power_lut::PowerLutNoiseParameters::dense(
+    let prf_output_bound = if fixed_digits.is_some() {
+        BigUint::zero()
+    } else {
+    let noise_model = mxx_exponent_lut::ExponentLutNoiseParameters::dense(
         ring_dimension,
         layout
             .gadget_base
@@ -1719,7 +1756,7 @@ pub fn prepare_candidate(
         helper_error_bound.clone(),
     )
     .map_err(|error| format!("exact noise model: {error}"))?;
-    let prf_report = mxx_power_lut::noise::simulate_sparse_prf(
+    let prf_report = mxx_exponent_lut::noise::simulate_sparse_prf(
         &program,
         &noise_model,
         &generated.public_layout,
@@ -1791,8 +1828,11 @@ pub fn prepare_candidate(
         terminal_gamma_a_additive_bits = prf_report.terminal_gamma_a_additive_bits,
         "sparse-PRF terminal LUT noise stage during candidate preparation"
     );
-    let prf_output_bound = prf_report.output_bound;
-    let mask_digits = if config.noise_model == NoiseSearchModel::AverageCase {
+    prf_report.output_bound
+    };
+    let mask_digits = if let Some((mask_digits, _)) = fixed_digits {
+        mask_digits
+    } else if config.noise_model == NoiseSearchModel::AverageCase {
         let average_config = average_case_config(config)?;
         select_average_mask_base_p_digit_count(
             &provisional_setup,
@@ -1846,6 +1886,13 @@ pub fn prepare_candidate(
             .to_owned()
             .into());
     }
+    if let Some((expected_mask_digits, expected_fresh_digits)) = fixed_digits {
+        if setup.mask_base_p_digit_count != expected_mask_digits ||
+            setup.fresh_error_base_p_digit_count != expected_fresh_digits
+        {
+            return Err("fixed d_m/d_e do not match constructed setup".to_owned().into());
+        }
+    }
     let official_preimage_bound = setup
         .resolve_decoder_preimage_bound()
         .map_err(|error| format!("official decoder bound: {error}"))?
@@ -1855,12 +1902,34 @@ pub fn prepare_candidate(
         return Err("the reviewed refresh profile was changed".to_owned().into());
     }
     let bucket_width = generated.public_layout.bucket_width;
+    let prf_active_count = PbcActiveCellIndex::build(&generated.public_layout)
+        .map_err(|error| format!("PBC active-cell index: {error}"))?
+        .len();
     let layout_id = generated.public_layout.layout_id.0;
     let pbc_attempts_used = generated.public_layout.accepted_attempt + 1;
     let program_id = *program.id().as_bytes();
+    let prf_component_count = setup.prf_component_count();
+    let prf_coefficient_count = setup.coefficient_count;
+    let prf_label_count = setup
+        .refresh
+        .crt_plaintext_moduli
+        .len()
+        .checked_mul(prf_component_count)
+        .and_then(|value| value.checked_mul(prf_coefficient_count))
+        .and_then(|value| value.checked_mul(mask_digits))
+        .and_then(|mask| {
+            prf_component_count
+                .checked_mul(prf_coefficient_count)
+                .and_then(|value| value.checked_mul(fresh_error_digits))
+                .and_then(|fresh| mask.checked_add(fresh))
+        })
+        .ok_or_else(|| "refresh PRF label count overflows usize".to_owned())?;
+    let prf_value_count = prf_label_count
+        .checked_mul(prf_active_count)
+        .ok_or_else(|| "refresh PRF public-value count overflows usize".to_owned())?;
     let ring = setup.layout.ring();
     let expected_plaintext = ring.polynomial([BigInt::from(0_u8).into()]);
-    let bundle = RefreshParameterSimulationRequest::new(
+    let request = RefreshParameterSimulationRequest::new(
         setup,
         profile,
         generated,
@@ -1870,9 +1939,16 @@ pub fn prepare_candidate(
         expected_plaintext,
         1,
     )
-    .map_err(|error| format!("refresh simulation request: {error}"))?
-    .build()
-    .map_err(|error| format!("refresh simulation graph: {error}"))?;
+    .map_err(|error| format!("refresh simulation request: {error}"))?;
+    let bundle = if fixed_digits.is_some() {
+        request
+            .build_benchmark()
+            .map_err(|error| format!("refresh benchmark graph: {error}"))?
+    } else {
+        request
+            .build()
+            .map_err(|error| format!("refresh simulation graph: {error}"))?
+    };
     Ok(PreparedCandidate {
         candidate,
         ring_dimension,
@@ -1880,6 +1956,11 @@ pub fn prepare_candidate(
         pbc_attempts_used,
         mask_base_p_digit_count: mask_digits,
         fresh_error_base_p_digit_count: fresh_error_digits,
+        prf_component_count,
+        prf_coefficient_count,
+        prf_active_count,
+        prf_label_count,
+        prf_value_count,
         official_preimage_bound,
         layout_id,
         program_id,
@@ -1934,7 +2015,7 @@ fn fresh_error_base_p_digit_count(
 fn select_average_mask_base_p_digit_count(
     setup: &RefreshSetupParameters,
     program: SparseLwrPrfProgram,
-    layout: mxx_power_lut::pbc::PbcPublicLayout,
+    layout: mxx_exponent_lut::pbc::PbcPublicLayout,
     base_p: &BigUint,
     q_l: &BigUint,
     crt_moduli: &[BigUint],
@@ -2132,7 +2213,7 @@ fn select_mask_base_p_digit_count(
             .map_err(|_| CandidatePreparationError::Fatal("mask digit count overflow".into()))?;
         let mask_modulus = base_p.pow(exponent);
         let mask_bound = &mask_modulus - BigUint::one();
-        let gains = mxx_power_lut::noise::refresh_action_gains(
+        let gains = mxx_exponent_lut::noise::refresh_action_gains(
             full_modulus,
             crt_moduli,
             base_p,

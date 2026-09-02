@@ -400,12 +400,7 @@ fn encoding_multiply(
         {
             let base = compiler.public_key.base.clone();
             let digits = compiler.public_key.digit_count.clone();
-            move |_, (key, rhs)| {
-                Ok(key *
-                    rhs.decompose(base.clone(), digits.clone())
-                        .into_preimage_relation()
-                        .materialize_exact())
-            }
+            move |_, (key, rhs)| Ok(key.mul_decomposed(rhs.decompose(base.clone(), digits.clone())))
         },
     )?;
     let first = mxx_dsl::parallel_zip_bundle_result(

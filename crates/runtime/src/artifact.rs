@@ -568,7 +568,7 @@ impl MemoryArtifactStore {
 
 fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> bool {
     match (artifact_type, payload) {
-        (ArtifactType::Matrix(_), ArtifactPayload::Matrix(_)) |
+        (ArtifactType::Matrix(_) | ArtifactType::Preimage(_), ArtifactPayload::Matrix(_)) |
         (ArtifactType::Trapdoor { .. }, ArtifactPayload::Trapdoor { .. }) |
         (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(_)) => true,
         (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes)) => bytes.len() == *length,

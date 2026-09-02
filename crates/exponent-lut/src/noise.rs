@@ -1,6 +1,6 @@
-//! Exact application-specific noise bounds for Power-LUT programs.
+//! Exact application-specific noise bounds for Exponent-LUT programs.
 //!
-//! This module deliberately models the public Power-LUT lowering rather than
+//! This module deliberately models the public Exponent-LUT lowering rather than
 //! re-interpreting the executable IR.  Every operation is represented by an
 //! affine transfer `E -> gain * E + additive`; all arithmetic is exact
 //! `BigUint` arithmetic and no centered-residue cap is applied.
@@ -314,7 +314,7 @@ pub fn average_refresh_accepts(
 use crate::{
     pbc::{PbcActiveCellIndex, PbcPublicLayout},
     prf::SparseLwrPrfProgram,
-    program::{LutId, PowerLutProgram, ProgramGate, ProgramInputId, ProgramWireId, RhsInputId},
+    program::{ExponentLutProgram, LutId, ProgramGate, ProgramInputId, ProgramWireId, RhsInputId},
 };
 
 /// Errors returned by the application-specific bound evaluator.
@@ -385,14 +385,14 @@ impl AffineNoiseTransfer {
     }
 }
 
-/// Common structural parameters for the Power-LUT lowering.
+/// Common structural parameters for the Exponent-LUT lowering.
 ///
 /// The four gains intentionally remain separate named quantities.  The dense
 /// constructor initializes all of them to the same regular-decomposition
 /// value; keeping them separate preserves the operation-specific report
 /// schema without accepting detached caller-supplied gains.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PowerLutNoiseParameters {
+pub struct ExponentLutNoiseParameters {
     ring_dimension: usize,
     secret_dimension: usize,
     gadget_base: BigUint,
@@ -408,7 +408,7 @@ pub struct PowerLutNoiseParameters {
     gamma_selector_l2_sq: BigUint,
 }
 
-impl PowerLutNoiseParameters {
+impl ExponentLutNoiseParameters {
     /// Creates the regular power-of-two dense fallback.
     ///
     /// For `Delta = beta / 2`, the fallback is
@@ -547,7 +547,7 @@ pub struct GateNoiseStep {
     pub active_count: Option<usize>,
 }
 
-/// Full deterministic report for a Power-LUT program.
+/// Full deterministic report for an Exponent-LUT program.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramNoiseReport {
     pub wire_bounds: BTreeMap<ProgramWireId, BigUint>,
@@ -598,8 +598,8 @@ fn variance_ge(left: &AverageVariance, right: &AverageVariance) -> bool {
 /// its monomial support is a PRF-specific structural property, not a generic
 /// program property.
 pub fn simulate_average_program(
-    program: &PowerLutProgram,
-    parameters: &PowerLutNoiseParameters,
+    program: &ExponentLutProgram,
+    parameters: &ExponentLutNoiseParameters,
     inputs: &ProgramNoiseInputs,
 ) -> Result<AverageProgramNoiseReport, NoiseSimulationError> {
     if parameters.secret_dimension != 2 {
@@ -697,11 +697,11 @@ pub fn simulate_average_program(
 
 /// Exact transfer for setup-fixed Fuse with a semantic multiplier action.
 ///
-/// The semantic action gain is supplied explicitly. For the Power-LUT
+/// The semantic action gain is supplied explicitly. For the Exponent-LUT
 /// `Binary` path, RHS values are validated monomials and the caller passes
 /// `1`; no public-value norm is inferred here.
 pub fn fixed_fuse_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     semantic_multiplier_action_gain: BigUint,
 ) -> AffineNoiseTransfer {
     AffineNoiseTransfer {
@@ -713,7 +713,7 @@ pub fn fixed_fuse_transfer(
 /// Average-case transfer for setup-fixed Fuse. The squared action gain is
 /// derived from the same dense public structural model as the worst channel.
 pub fn average_fixed_fuse_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     semantic_multiplier_action_gain: BigUint,
 ) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
     let helper = parameters.helper_doubled_variance();
@@ -726,9 +726,9 @@ pub fn average_fixed_fuse_transfer(
     })
 }
 
-/// Exact transfer for a fixed-LUT branch of the public Power-LUT lowering.
+/// Exact transfer for a fixed-LUT branch of the public Exponent-LUT lowering.
 pub fn fixed_lut_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     lut_width: usize,
 ) -> Result<AffineNoiseTransfer, NoiseSimulationError> {
     if lut_width == 0 {
@@ -746,7 +746,7 @@ pub fn fixed_lut_transfer(
 /// Average-case fixed LUT transfer.  The branch count is linear in variance;
 /// it is not replaced by a square-rooted worst-case bound.
 pub fn average_fixed_lut_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     lut_width: usize,
 ) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
     if lut_width == 0 {
@@ -764,7 +764,7 @@ pub fn average_fixed_lut_transfer(
 }
 
 pub fn average_two_input_lut_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     lut_width: usize,
     semantic_multiplier_action_gain: BigUint,
 ) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
@@ -776,9 +776,9 @@ pub fn average_two_input_lut_transfer(
 /// Exact transfer for a fixed-Fuse followed by fixed-LUT two-input branch.
 ///
 /// `semantic_multiplier_action_gain` is explicit because it is a property of
-/// the public RHS family. Power-LUT monomial RHS values use `1`.
+/// the public RHS family. Exponent-LUT monomial RHS values use `1`.
 pub fn two_input_lut_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     lut_width: usize,
     semantic_multiplier_action_gain: BigUint,
 ) -> Result<AffineNoiseTransfer, NoiseSimulationError> {
@@ -796,7 +796,7 @@ pub fn two_input_lut_transfer(
 /// rectangular family width. This contract is intentionally not part of the
 /// generic [`simulate_program`] API.
 pub fn monomial_one_hot_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     active_count: usize,
     lut_width: usize,
 ) -> Result<AffineNoiseTransfer, NoiseSimulationError> {
@@ -812,7 +812,7 @@ pub fn monomial_one_hot_transfer(
 /// cells contribute independent variance, while the inherited state is
 /// scaled once by the aggregate selector gain.
 pub fn average_monomial_one_hot_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     active_count: usize,
     lut_width: usize,
 ) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
@@ -825,7 +825,7 @@ pub fn average_monomial_one_hot_transfer(
 }
 
 fn average_monomial_selection_transfer(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     active_count: usize,
 ) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
     if active_count == 0 {
@@ -850,19 +850,19 @@ fn compose(first: AffineNoiseTransfer, second: AffineNoiseTransfer) -> AffineNoi
 /// Simulates public `Unary` and `Binary` program gates.
 ///
 /// Generic OneHot gates are rejected because their public-value norm is not a
-/// property of [`PowerLutProgram`]. Use [`simulate_sparse_prf`] for the
+/// property of [`ExponentLutProgram`]. Use [`simulate_sparse_prf`] for the
 /// validated grouped sparse-LWR path.
 pub fn simulate_program(
-    program: &PowerLutProgram,
-    parameters: &PowerLutNoiseParameters,
+    program: &ExponentLutProgram,
+    parameters: &ExponentLutNoiseParameters,
     inputs: &ProgramNoiseInputs,
 ) -> Result<ProgramNoiseReport, NoiseSimulationError> {
     simulate_program_inner(program, parameters, inputs, false)
 }
 
 fn simulate_program_inner(
-    program: &PowerLutProgram,
-    parameters: &PowerLutNoiseParameters,
+    program: &ExponentLutProgram,
+    parameters: &ExponentLutNoiseParameters,
     inputs: &ProgramNoiseInputs,
     _allow_monomial_one_hot: bool,
 ) -> Result<ProgramNoiseReport, NoiseSimulationError> {
@@ -1035,7 +1035,7 @@ pub struct AverageSparsePrfNoiseReport {
 /// terminal receives exactly one rounding LUT.
 pub fn simulate_average_sparse_prf(
     program: &SparseLwrPrfProgram,
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     layout: &PbcPublicLayout,
     initial_variance: AverageVariance,
 ) -> Result<AverageSparsePrfNoiseReport, NoiseSimulationError> {
@@ -1097,7 +1097,7 @@ pub fn simulate_average_sparse_prf(
 /// Simulates one shared sparse-LWR bucket body for each actual active width.
 pub fn simulate_sparse_prf(
     program: &SparseLwrPrfProgram,
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     layout: &PbcPublicLayout,
     initial_bound: BigUint,
 ) -> Result<SparsePrfNoiseReport, NoiseSimulationError> {
@@ -1534,7 +1534,7 @@ pub struct RefreshNoiseParameters {
 impl RefreshNoiseParameters {
     /// Builds route, scale, and decoder gains from the structural model.
     pub(crate) fn from_structural(
-        model: &PowerLutNoiseParameters,
+        model: &ExponentLutNoiseParameters,
         full_modulus: BigUint,
         base_p: BigUint,
         sparse_lwr_modulus: BigUint,
@@ -1699,11 +1699,11 @@ pub struct RefreshHardAuthority {
 /// simulator.  The constructor is crate-visible so setup code, rather than an
 /// external caller, owns the identity and structural parameters.
 #[derive(Clone, Debug)]
-pub struct PowerLutNoiseSnapshot {
+pub struct ExponentLutNoiseSnapshot {
     setup_identity: [u8; 32],
     prf_program: SparseLwrPrfProgram,
     pbc_layout: PbcPublicLayout,
-    model: PowerLutNoiseParameters,
+    model: ExponentLutNoiseParameters,
     refresh: RefreshNoiseParameters,
     initial_state_bound: BigUint,
     initial_average_variance: AverageVariance,
@@ -1711,13 +1711,13 @@ pub struct PowerLutNoiseSnapshot {
 
 /// Combined report returned by a setup-bound simulation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PowerLutNoiseReport {
+pub struct ExponentLutNoiseReport {
     pub prf: SparsePrfNoiseReport,
     pub refresh: RefreshNoiseReport,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PowerLutAverageNoiseReport {
+pub struct ExponentLutAverageNoiseReport {
     pub snapshot_identity: [u8; 32],
     pub prf: AverageSparsePrfNoiseReport,
     pub refresh: AverageRefreshNoiseReport,
@@ -1730,13 +1730,13 @@ pub struct PowerLutAverageNoiseReport {
     pub accepted: bool,
 }
 
-impl PowerLutNoiseSnapshot {
+impl ExponentLutNoiseSnapshot {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_setup(
         setup_identity: [u8; 32],
         prf_program: SparseLwrPrfProgram,
         pbc_layout: PbcPublicLayout,
-        model: PowerLutNoiseParameters,
+        model: ExponentLutNoiseParameters,
         full_modulus: BigUint,
         base_p: BigUint,
         mask_base_p_digit_count: usize,
@@ -1793,7 +1793,7 @@ impl PowerLutNoiseSnapshot {
 
     /// Simulates the complete sparse PRF and refresh using only setup-bound
     /// public layout and structural parameters.
-    pub fn simulate(&self) -> Result<PowerLutNoiseReport, NoiseSimulationError> {
+    pub fn simulate(&self) -> Result<ExponentLutNoiseReport, NoiseSimulationError> {
         let prf = simulate_sparse_prf(
             &self.prf_program,
             &self.model,
@@ -1806,7 +1806,7 @@ impl PowerLutNoiseSnapshot {
             self.initial_state_bound.clone(),
             prf.output_bound.clone(),
         )?;
-        Ok(PowerLutNoiseReport { prf, refresh })
+        Ok(ExponentLutNoiseReport { prf, refresh })
     }
 
     /// Runs AverageCase only when explicitly enabled. Security is deliberately
@@ -1815,7 +1815,7 @@ impl PowerLutNoiseSnapshot {
     pub fn simulate_average(
         &self,
         config: &AverageCaseConfig,
-    ) -> Result<PowerLutAverageNoiseReport, NoiseSimulationError> {
+    ) -> Result<ExponentLutAverageNoiseReport, NoiseSimulationError> {
         if !config.allow_average_acceptance {
             return Err(NoiseSimulationError::AverageAcceptanceDisabled);
         }
@@ -1835,7 +1835,7 @@ impl PowerLutNoiseSnapshot {
         let hard_authority_accepted = refresh.domain_accepted && refresh.fresh_error_accepted;
         let correctness_accepted = refresh.rounding_accepted && refresh.mask_smudging_accepted;
         let accepted = hard_authority_accepted && correctness_accepted;
-        Ok(PowerLutAverageNoiseReport {
+        Ok(ExponentLutAverageNoiseReport {
             snapshot_identity: self.setup_identity,
             prf,
             refresh,
@@ -1850,7 +1850,7 @@ impl PowerLutNoiseSnapshot {
 
 /// Exact refresh simulation with strict per-slot inequalities.
 pub fn simulate_refresh(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     refresh: &RefreshNoiseParameters,
     state_bound: BigUint,
     prf_output_bound: BigUint,
@@ -2029,7 +2029,7 @@ pub struct AverageRefreshNoiseReport {
 /// The p=2 centering transform and decoder factor are derived directly from
 /// the structural refresh inputs; unsupported setups fail closed.
 pub fn simulate_average_refresh(
-    parameters: &PowerLutNoiseParameters,
+    parameters: &ExponentLutNoiseParameters,
     refresh: &RefreshNoiseParameters,
     state_variance: AverageVariance,
     prf_variance: AverageVariance,
@@ -2285,11 +2285,11 @@ mod tests {
         pbc::{
             PbcActiveCellIndex, PbcParameters, PbcPublicLayout, PbcRootSeed, derive_attempt_seed,
         },
-        program::PowerLutProgramBuilder,
+        program::ExponentLutProgramBuilder,
     };
 
-    fn parameters() -> PowerLutNoiseParameters {
-        PowerLutNoiseParameters::dense(8, BigUint::from(4u8), 3, BigUint::from(2u8)).unwrap()
+    fn parameters() -> ExponentLutNoiseParameters {
+        ExponentLutNoiseParameters::dense(8, BigUint::from(4u8), 3, BigUint::from(2u8)).unwrap()
     }
 
     #[test]
@@ -2307,7 +2307,8 @@ mod tests {
             AverageVariance { numerator: BigUint::from(2u8), denominator: BigUint::from(3u8) }
         );
         // beta=2, ell=1 has doubled digit variance one exactly.
-        let p = PowerLutNoiseParameters::dense(8, BigUint::from(2u8), 1, BigUint::one()).unwrap();
+        let p =
+            ExponentLutNoiseParameters::dense(8, BigUint::from(2u8), 1, BigUint::one()).unwrap();
         assert_eq!(
             p.helper_doubled_variance(),
             AverageVariance::new(BigUint::one(), BigUint::one()).unwrap()
@@ -2504,7 +2505,7 @@ mod tests {
         )
         .unwrap();
         let model = parameters();
-        let snapshot = PowerLutNoiseSnapshot::from_setup(
+        let snapshot = ExponentLutNoiseSnapshot::from_setup(
             [9u8; 32],
             program,
             layout,
@@ -2559,7 +2560,7 @@ mod tests {
             layout.parameters.bucket_count,
         )
         .unwrap();
-        let snapshot = PowerLutNoiseSnapshot::from_setup(
+        let snapshot = ExponentLutNoiseSnapshot::from_setup(
             [10u8; 32],
             program,
             layout,
@@ -2602,7 +2603,7 @@ mod tests {
     #[test]
     fn non_power_of_two_base_is_rejected() {
         assert_eq!(
-            PowerLutNoiseParameters::dense(8, BigUint::from(3u8), 3, BigUint::from(2u8)),
+            ExponentLutNoiseParameters::dense(8, BigUint::from(3u8), 3, BigUint::from(2u8)),
             Err(NoiseSimulationError::InvalidGadgetBase)
         );
     }
@@ -2667,7 +2668,7 @@ mod tests {
 
     #[test]
     fn program_simulation_covers_unary_binary_and_fuse() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let family = builder.rhs_family(2).unwrap();
         let rhs = builder.rhs_input(family, 2, 2).unwrap();
@@ -2717,7 +2718,7 @@ mod tests {
     fn secret_dimension_is_checked_by_simulation() {
         let mut parameters = parameters();
         parameters.secret_dimension = 1;
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(2).unwrap();
         let lut = builder.lut(crate::program::LutTable::unary(2, 4, vec![0, 1]).unwrap()).unwrap();
         let output = builder.unary(builder.input_wire(input).unwrap(), lut).unwrap();
@@ -2829,7 +2830,7 @@ mod tests {
 
     #[test]
     fn generic_program_simulation_rejects_one_hot() {
-        let mut builder = PowerLutProgramBuilder::new();
+        let mut builder = ExponentLutProgramBuilder::new();
         let input = builder.input(4).unwrap();
         let selector = builder.rhs_family(4).unwrap();
         let values = builder.public_value_family(4).unwrap();
@@ -2848,7 +2849,8 @@ mod tests {
 
     #[test]
     fn refresh_equality_is_rejected_and_success_resets() {
-        let p = PowerLutNoiseParameters::dense(1, BigUint::from(4u8), 14, BigUint::one()).unwrap();
+        let p =
+            ExponentLutNoiseParameters::dense(1, BigUint::from(4u8), 14, BigUint::one()).unwrap();
         // The largest CRT factor is chosen so its spacing is exactly the
         // strict rounding boundary. Other factors have strictly larger
         // spacing, so the rejection is attributable to equality itself.
@@ -2935,8 +2937,8 @@ mod tests {
 
     #[test]
     fn fresh_error_boundary_is_strict_per_crt_modulus() {
-        let p =
-            PowerLutNoiseParameters::dense(8, BigUint::from(4u8), 2, BigUint::from(2u8)).unwrap();
+        let p = ExponentLutNoiseParameters::dense(8, BigUint::from(4u8), 2, BigUint::from(2u8))
+            .unwrap();
         let refresh = RefreshNoiseParameters::from_structural(
             &p,
             BigUint::from(6u8),
@@ -2970,7 +2972,7 @@ mod tests {
         // max(F_t)=32. For lambda=0 the exact required mask modulus is
         // 2^(0+1)*8*32 = 512 = 2^9.
         let model =
-            PowerLutNoiseParameters::dense(1, BigUint::from(2u8), 2, BigUint::one()).unwrap();
+            ExponentLutNoiseParameters::dense(1, BigUint::from(2u8), 2, BigUint::one()).unwrap();
         let refresh = RefreshNoiseParameters::from_structural(
             &model,
             BigUint::from(6u8),

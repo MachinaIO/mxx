@@ -101,10 +101,8 @@ impl BggPublicKeyCompiler {
         decomposed_rhs: Decomposition,
     ) -> BggPublicKeyWire {
         // If G K_R = A_R, then A_L K_R is the public-key product A_L G^-1(A_R).
-        // Materializing the exact relation makes the rightmost K_R explicit.
         BggPublicKeyWire {
-            matrix: lhs.matrix.clone() *
-                decomposed_rhs.into_preimage_relation().materialize_exact(),
+            matrix: lhs.matrix.clone().mul_decomposed(decomposed_rhs),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
@@ -129,7 +127,7 @@ impl BggPublicKeyCompiler {
         // G K_T = T.  T is only a consumed matrix target, not a claim that it
         // is itself a canonical gadget encoding.
         BggPublicKeyWire {
-            matrix: input.matrix.clone() * decomposed.into_preimage_relation().materialize_exact(),
+            matrix: input.matrix.clone().mul_decomposed(decomposed),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -140,7 +138,7 @@ impl BggPublicKeyCompiler {
         decomposed: Decomposition,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: input.matrix.clone() * decomposed.into_preimage_relation().materialize_exact(),
+            matrix: input.matrix.clone().mul_decomposed(decomposed),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -253,10 +251,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             kinds.iter().filter(|kind| matches!(kind, NodeKind::MaterializePreimageExact)).count(),
-            1,
-            "public-key multiplication must explicitly materialize only an exact target",
+            0,
+            "public-key multiplication must keep gadget decomposition lazy",
         );
-        assert!(!kinds.iter().any(|kind| matches!(kind, NodeKind::ApplyPreimage)));
+        assert_eq!(
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::ApplyPreimage)).count(),
+            1,
+            "public-key multiplication must use the fused mul_decomposed path",
+        );
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use crate::{
     artifact::{ArtifactKey, ArtifactPayload, ArtifactStore},
     backend::{
-        Backend, HashSampleRequest, IndexRange as RuntimeIndexRange, MatrixMulAccumulateRequest,
-        PreimageRequest, RuntimeValue, SampleRange as RuntimeSampleRange, UniformSampleRequest,
+        Backend, ChunkedPreimage, HashSampleRequest, IndexRange as RuntimeIndexRange,
+        MatrixMulAccumulateRequest, PreimageColumnChunk, PreimageRequest, RuntimeValue,
+        SampleRange as RuntimeSampleRange, UniformSampleRequest,
     },
     session::{ArtifactHandle, SessionDescriptor, SessionStore},
     transcript::{DrawSite, RecordedValue, SamplingMode, TranscriptError},
@@ -1407,7 +1408,7 @@ where
     ) -> Result<(), ExecutionError> {
         self.set_placement(placement)?;
         let outputs = match node.kind {
-            NodeKind::MatrixBinary(_) | NodeKind::ApplyPreimage => {
+            NodeKind::MatrixBinary(_) => {
                 let mut inputs = Vec::with_capacity(indices.len());
                 for index in indices {
                     let instance = &mut values[*index];
@@ -1420,12 +1421,88 @@ where
                     NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => {
                         self.backend.sub_batch(inputs)
                     }
-                    NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) | NodeKind::ApplyPreimage => {
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => {
                         self.backend.multiply_batch(inputs)
                     }
                     _ => unreachable!("matrix batch kind checked by caller"),
                 }
                 .map_err(Self::backend_error)?
+            }
+            NodeKind::ApplyPreimage => {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for index in indices {
+                    let instance = &mut values[*index];
+                    let left = self.matrix(instance, node.args[0])?;
+                    let right = self.materialize(instance, node.args[1])?;
+                    inputs.push((left, right));
+                }
+                if inputs.iter().all(|(_, right)| {
+                    matches!(right, RuntimeValue::DeferredGadgetDecomposition { .. })
+                }) {
+                    self.backend
+                        .mul_decompose_batch(
+                            inputs
+                                .into_iter()
+                                .map(|(left, right)| {
+                                    let RuntimeValue::DeferredGadgetDecomposition { source, small } =
+                                        right
+                                    else {
+                                        unreachable!("deferred decomposition batch checked above")
+                                    };
+                                    (left, source, small)
+                                })
+                                .collect(),
+                        )
+                        .map_err(Self::backend_error)?
+                } else if inputs.iter().all(|(_, right)| matches!(right, RuntimeValue::Matrix(_))) {
+                    self.backend
+                        .multiply_batch(
+                            inputs
+                                .into_iter()
+                                .map(|(left, right)| {
+                                    let RuntimeValue::Matrix(right) = right else {
+                                        unreachable!("matrix preimage batch checked above")
+                                    };
+                                    (left, right)
+                                })
+                                .collect(),
+                        )
+                        .map_err(Self::backend_error)?
+                } else if inputs
+                    .iter()
+                    .all(|(_, right)| matches!(right, RuntimeValue::ChunkedPreimage(_)))
+                {
+                    self.backend
+                        .apply_chunked_preimage_batch(
+                            inputs
+                                .into_iter()
+                                .map(|(left, right)| {
+                                    let RuntimeValue::ChunkedPreimage(right) = right else {
+                                        unreachable!("chunked preimage batch checked above")
+                                    };
+                                    (left, right)
+                                })
+                                .collect(),
+                        )
+                        .map_err(Self::backend_error)?
+                } else {
+                    let mut outputs = Vec::with_capacity(inputs.len());
+                    for (left, right) in inputs {
+                        let output = match right {
+                            RuntimeValue::Matrix(right) => self.backend.multiply(&left, &right),
+                            RuntimeValue::DeferredGadgetDecomposition { source, small } => {
+                                self.backend.mul_decompose(&left, &source, small)
+                            }
+                            RuntimeValue::ChunkedPreimage(right) => {
+                                self.backend.apply_chunked_preimage(&left, &right)
+                            }
+                            _ => return Err(ExecutionError::ValueKind(node.args[1])),
+                        }
+                        .map_err(Self::backend_error)?;
+                        outputs.push(output);
+                    }
+                    outputs
+                }
             }
             NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
                 let mut requests = Vec::with_capacity(indices.len());
@@ -1871,6 +1948,24 @@ where
                 let bytes = self.backend.matrix_to_bytes(matrix);
                 Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
             }
+            (RuntimeValue::Matrix(matrix), ArtifactType::Preimage(matrix_type)) => {
+                let preimage = ChunkedPreimage {
+                    matrix_type: matrix_type.clone(),
+                    chunks: vec![PreimageColumnChunk {
+                        start: 0,
+                        columns: matrix_type.columns,
+                        bytes: self.backend.matrix_to_bytes(matrix),
+                    }],
+                };
+                let bytes = encode_chunked_preimage(&preimage);
+                Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
+            }
+            (RuntimeValue::ChunkedPreimage(preimage), ArtifactType::Preimage(matrix_type))
+                if preimage.matrix_type == *matrix_type =>
+            {
+                let bytes = encode_chunked_preimage(preimage);
+                Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
+            }
             (RuntimeValue::Bytes(bytes), ArtifactType::Bytes { length })
                 if bytes.len() == *length =>
             {
@@ -2132,8 +2227,18 @@ where
             }
             NodeKind::ApplyPreimage => {
                 let left = self.matrix(values, node.args[0])?;
-                let right = self.matrix(values, node.args[1])?;
-                let output = self.backend.multiply(&left, &right).map_err(Self::backend_error)?;
+                let right = self.materialize(values, node.args[1])?;
+                let output = match right {
+                    RuntimeValue::Matrix(right) => self.backend.multiply(&left, &right),
+                    RuntimeValue::DeferredGadgetDecomposition { source, small } => {
+                        self.backend.mul_decompose(&left, &source, small)
+                    }
+                    RuntimeValue::ChunkedPreimage(right) => {
+                        self.backend.apply_chunked_preimage(&left, &right)
+                    }
+                    _ => return Err(ExecutionError::ValueKind(node.args[1])),
+                }
+                .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
@@ -2422,17 +2527,31 @@ where
                             .to_owned(),
                     });
                 }
-                let output =
-                    self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+                self.put(
+                    values,
+                    node.id,
+                    0,
+                    RuntimeValue::DeferredGadgetDecomposition { source: input, small: *small },
+                );
             }
             NodeKind::MaterializePreimageExact => {
-                let input = self.matrix(values, node.args[0])?;
-                self.put(values, node.id, 0, RuntimeValue::Matrix(input));
+                let input = self.materialize(values, node.args[0])?;
+                let matrix = match input {
+                    RuntimeValue::Matrix(matrix) => matrix,
+                    RuntimeValue::ChunkedPreimage(preimage) => Arc::new(
+                        self.backend
+                            .materialize_chunked_preimage(&preimage)
+                            .map_err(Self::backend_error)?,
+                    ),
+                    _ => return Err(ExecutionError::ValueKind(node.args[0])),
+                };
+                self.put(values, node.id, 0, RuntimeValue::Matrix(matrix));
             }
             NodeKind::PreimageBinary(operation) => {
-                let left = self.matrix(values, node.args[0])?;
-                let right = self.matrix(values, node.args[1])?;
+                let left_value = self.materialize(values, node.args[0])?;
+                let right_value = self.materialize(values, node.args[1])?;
+                let left = self.materialize_preimage_matrix(left_value, node.args[0])?;
+                let right = self.materialize_preimage_matrix(right_value, node.args[1])?;
                 let output = match operation {
                     mxx_ir_core::node::PreimageBinaryOp::Add => self.backend.add(&left, &right),
                     mxx_ir_core::node::PreimageBinaryOp::RightMultiplyExact |
@@ -2444,17 +2563,56 @@ where
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::PreimageConcatColumns => {
-                let inputs = node
+                let values_in = node
                     .args
                     .iter()
-                    .map(|wire| self.matrix(values, *wire))
+                    .map(|wire| self.materialize(values, *wire))
                     .collect::<Result<Vec<_>, _>>()?;
-                let inputs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
-                let output = self
-                    .backend
-                    .concat(&inputs, mxx_ir_core::node::ConcatAxis::Columns)
-                    .map_err(Self::backend_error)?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+                if values_in.iter().all(|value| matches!(value, RuntimeValue::ChunkedPreimage(_))) {
+                    let mut matrix_type =
+                        self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                    let mut chunks = Vec::new();
+                    let mut start = 0usize;
+                    for value in values_in {
+                        let RuntimeValue::ChunkedPreimage(preimage) = value else {
+                            unreachable!("chunked preimage concat checked above")
+                        };
+                        for chunk in &preimage.chunks {
+                            chunks.push(PreimageColumnChunk {
+                                start,
+                                columns: chunk.columns,
+                                bytes: chunk.bytes.clone(),
+                            });
+                            start = start.checked_add(chunk.columns).ok_or_else(|| {
+                                ExecutionError::Expression {
+                                    node: node.id,
+                                    message: "preimage concat column count overflow".into(),
+                                }
+                            })?;
+                        }
+                    }
+                    matrix_type.columns = start;
+                    self.put(
+                        values,
+                        node.id,
+                        0,
+                        RuntimeValue::ChunkedPreimage(Arc::new(ChunkedPreimage {
+                            matrix_type,
+                            chunks,
+                        })),
+                    );
+                } else {
+                    let mut inputs = Vec::with_capacity(values_in.len());
+                    for (wire, value) in node.args.iter().copied().zip(values_in) {
+                        inputs.push(self.materialize_preimage_matrix(value, wire)?);
+                    }
+                    let references = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                    let output = self
+                        .backend
+                        .concat(&references, mxx_ir_core::node::ConcatAxis::Columns)
+                        .map_err(Self::backend_error)?;
+                    self.put(values, node.id, 0, RuntimeValue::matrix(output));
+                }
             }
             NodeKind::DecompositionEntry { row, column } => {
                 let input = self.matrix(values, node.args[0])?;
@@ -3138,11 +3296,7 @@ where
         let placement = self.backend.active_placement();
         let pending =
             self.prepare_family_preimage_requests(scope_id, env, path, placement, node, values)?;
-        let outputs = self
-            .sample_preimage_requests(&pending)?
-            .into_iter()
-            .map(RuntimeValue::matrix)
-            .collect();
+        let outputs = self.sample_preimage_requests(&pending)?;
         self.put(values, node.id, 0, RuntimeValue::Family(outputs));
         Ok(())
     }
@@ -3173,8 +3327,7 @@ where
         }
         let mut sampled = self.sample_preimage_requests(&pending)?.into_iter();
         for (instance, count) in instance_counts.into_iter().enumerate() {
-            let outputs =
-                sampled.by_ref().take(count).map(RuntimeValue::matrix).collect::<Vec<_>>();
+            let outputs = sampled.by_ref().take(count).collect::<Vec<_>>();
             if outputs.len() != count {
                 return Err(ExecutionError::InvalidBatch(node.id));
             }
@@ -3445,7 +3598,7 @@ where
         }
         let outputs = self.sample_preimage_requests(&pending)?;
         for (instance, output) in destinations.into_iter().zip(outputs) {
-            self.put(&mut values[instance], node.id, 0, RuntimeValue::matrix(output));
+            self.put(&mut values[instance], node.id, 0, output);
         }
         Ok(())
     }
@@ -3453,7 +3606,7 @@ where
     fn sample_preimage_requests(
         &mut self,
         pending: &[PreparedPreimage<B::Matrix, B::Trapdoor>],
-    ) -> Result<Vec<B::Matrix>, ExecutionError> {
+    ) -> Result<Vec<RuntimeValue<B>>, ExecutionError> {
         // Both ordinary loop batches and FamilyPreimageSample use this path,
         // so session recovery, transcript replay, progress accounting, and
         // backend batching cannot diverge between the two representations.
@@ -3469,12 +3622,8 @@ where
                     Some(RecordedValue::Matrix { matrix_type, bytes })
                         if matrix_type == prepared.request.matrix_type =>
                     {
-                        self.set_placement(prepared.placement)?;
-                        outputs[index] = Some(
-                            self.backend
-                                .matrix_from_bytes(&prepared.request.matrix_type, &bytes)
-                                .map_err(Self::backend_error)?,
-                        );
+                        let preimage = decode_chunked_preimage(matrix_type, &bytes)?;
+                        outputs[index] = Some(RuntimeValue::ChunkedPreimage(Arc::new(preimage)));
                     }
                     Some(RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. }) => {
                         return Err(TranscriptError::KindMismatch(prepared.site.clone()).into());
@@ -3484,14 +3633,17 @@ where
             }
             if !missing.is_empty() {
                 let mut sampled = self.sample_preimage_indices(pending, &missing)?;
-                let serialized = self.backend.matrices_to_bytes(
-                    &missing
-                        .iter()
-                        .map(|index| {
+                let serialized = missing
+                    .iter()
+                    .map(|index| {
+                        let RuntimeValue::ChunkedPreimage(preimage) =
                             sampled[*index].as_ref().expect("every missing preimage was sampled")
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                        else {
+                            unreachable!("preimage sampling returns chunked relations")
+                        };
+                        encode_chunked_preimage(preimage)
+                    })
+                    .collect::<Vec<_>>();
                 let entries = missing
                     .iter()
                     .zip(serialized)
@@ -3530,12 +3682,8 @@ where
                         RecordedValue::Matrix { matrix_type, bytes }
                             if matrix_type == prepared.request.matrix_type =>
                         {
-                            self.set_placement(prepared.placement)?;
-                            outputs.push(
-                                self.backend
-                                    .matrix_from_bytes(&prepared.request.matrix_type, &bytes)
-                                    .map_err(Self::backend_error)?,
-                            );
+                            let preimage = decode_chunked_preimage(matrix_type, &bytes)?;
+                            outputs.push(RuntimeValue::ChunkedPreimage(Arc::new(preimage)));
                         }
                         RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. } => {
                             return Err(TranscriptError::KindMismatch(prepared.site.clone()).into());
@@ -3556,13 +3704,15 @@ where
                 .collect()
         };
         if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
-            let serialized = self.backend.matrices_to_bytes(&outputs.iter().collect::<Vec<_>>());
-            for (prepared, bytes) in pending.iter().zip(serialized) {
+            for (prepared, output) in pending.iter().zip(&outputs) {
+                let RuntimeValue::ChunkedPreimage(preimage) = output else {
+                    unreachable!("preimage sampling returns chunked relations")
+                };
                 recorder.record(
                     prepared.site.clone(),
                     RecordedValue::Matrix {
                         matrix_type: prepared.request.matrix_type.clone(),
-                        bytes,
+                        bytes: encode_chunked_preimage(preimage),
                     },
                 )?;
             }
@@ -3574,11 +3724,7 @@ where
         &mut self,
         pending: &[PreparedPreimage<B::Matrix, B::Trapdoor>],
         indices: &[usize],
-    ) -> Result<Vec<Option<B::Matrix>>, ExecutionError> {
-        // A GPU sampler batch has one placement, ring/matrix geometry, sigma,
-        // gadget layout, and candidate bound. Preserve the first-occurrence
-        // order of homogeneous groups, while retaining each request's original
-        // index for stable result reconstruction.
+    ) -> Result<Vec<Option<RuntimeValue<B>>>, ExecutionError> {
         let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<_>>();
         let mut groups = Vec::<(
             PreimageBatchKey,
@@ -3596,19 +3742,34 @@ where
                 groups.push((key, vec![index], vec![pending[index].request.clone()]));
             }
         }
+        let request_wave_width = self.config.max_parallel_instances.get();
+        let mut waves = Vec::new();
+        for (key, group_indices, requests) in groups {
+            let mut entries = group_indices.into_iter().zip(requests);
+            loop {
+                let wave = entries.by_ref().take(request_wave_width).collect::<Vec<_>>();
+                if wave.is_empty() {
+                    break;
+                }
+                let (indices, requests): (Vec<_>, Vec<_>) = wave.into_iter().unzip();
+                waves.push((key.clone(), indices, requests));
+            }
+        }
         let batches =
-            groups.iter().map(|(key, _, requests)| (key.placement, requests.clone())).collect();
+            waves.iter().map(|(key, _, requests)| (key.placement, requests.clone())).collect();
         let sampled_groups = self
             .backend
-            .sample_preimage_batches_by_placement(batches)
+            .sample_chunked_preimage_batches_by_placement(
+                batches,
+                mxx_primitives::env::mul_decompose_column_chunk_width(),
+            )
             .map_err(Self::backend_error)?;
-        for ((key, group_indices, _), (placement, sampled)) in
-            groups.into_iter().zip(sampled_groups)
+        for ((key, group_indices, _), (placement, sampled)) in waves.into_iter().zip(sampled_groups)
         {
             debug_assert_eq!(placement, key.placement);
             self.record_preimages(sampled.len());
             for (index, output) in group_indices.into_iter().zip(sampled) {
-                outputs[index] = Some(output);
+                outputs[index] = Some(RuntimeValue::ChunkedPreimage(Arc::new(output)));
             }
         }
         Ok(outputs)
@@ -3916,8 +4077,43 @@ where
         values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
         wire: WireRef,
     ) -> Result<Arc<B::Matrix>, ExecutionError> {
-        match self.materialize(values, wire)? {
+        let value = self.materialize(values, wire)?;
+        match value {
             RuntimeValue::Matrix(value) => Ok(value),
+            RuntimeValue::DeferredGadgetDecomposition { source, small } => {
+                let output =
+                    self.backend.gadget_decompose(&source, small).map_err(Self::backend_error)?;
+                let output = Arc::new(output);
+                values.insert(wire, RuntimeValue::Matrix(output.clone()));
+                Ok(output)
+            }
+            _ => Err(ExecutionError::ValueKind(wire)),
+        }
+    }
+
+    fn materialize_preimage_matrix(
+        &mut self,
+        value: RuntimeValue<B>,
+        wire: WireRef,
+    ) -> Result<Arc<B::Matrix>, ExecutionError> {
+        match value {
+            RuntimeValue::Matrix(value) => Ok(value),
+            RuntimeValue::ChunkedPreimage(preimage) => {
+                debug!(
+                    columns = preimage.matrix_type.columns,
+                    chunk_count = preimage.chunks.len(),
+                    "typed preimage operation requires full materialization"
+                );
+                self.backend
+                    .materialize_chunked_preimage(&preimage)
+                    .map(Arc::new)
+                    .map_err(Self::backend_error)
+            }
+            RuntimeValue::DeferredGadgetDecomposition { source, small } => self
+                .backend
+                .gadget_decompose(&source, small)
+                .map(Arc::new)
+                .map_err(Self::backend_error),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -4348,6 +4544,14 @@ fn hash_runtime_value<B: Backend>(
             hasher.update([5]);
             hash_sized(hasher, &backend.matrix_to_bytes(value));
         }
+        RuntimeValue::DeferredGadgetDecomposition { source, small } => {
+            hasher.update([13, u8::from(*small)]);
+            hash_sized(hasher, &backend.matrix_to_bytes(source));
+        }
+        RuntimeValue::ChunkedPreimage(value) => {
+            hasher.update([12]);
+            hash_sized(hasher, &encode_chunked_preimage(value));
+        }
         RuntimeValue::Trapdoor {
             secret,
             public,
@@ -4677,6 +4881,10 @@ fn decode_artifact<B: Backend>(
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             Ok(RuntimeValue::matrix(matrix))
         }
+        (ArtifactType::Preimage(matrix_type), ArtifactPayload::Matrix(bytes)) => {
+            let preimage = decode_chunked_preimage(matrix_type, &bytes)?;
+            Ok(RuntimeValue::ChunkedPreimage(Arc::new(preimage)))
+        }
         (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes))
             if bytes.len() == length =>
         {
@@ -4712,6 +4920,77 @@ fn decode_artifact<B: Backend>(
             "stored payload kind does not match artifact descriptor".to_owned(),
         )),
     }
+}
+
+const CHUNKED_PREIMAGE_MAGIC: &[u8; 16] = b"MXXPREIMAGECOLS1";
+
+fn encode_chunked_preimage(preimage: &ChunkedPreimage) -> Vec<u8> {
+    let payload_len = preimage
+        .chunks
+        .iter()
+        .fold(24usize, |length, chunk| length.saturating_add(24).saturating_add(chunk.bytes.len()));
+    let mut bytes = Vec::with_capacity(payload_len);
+    bytes.extend_from_slice(CHUNKED_PREIMAGE_MAGIC);
+    bytes.extend_from_slice(&(preimage.chunks.len() as u64).to_le_bytes());
+    for chunk in &preimage.chunks {
+        bytes.extend_from_slice(&(chunk.start as u64).to_le_bytes());
+        bytes.extend_from_slice(&(chunk.columns as u64).to_le_bytes());
+        bytes.extend_from_slice(&(chunk.bytes.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&chunk.bytes);
+    }
+    bytes
+}
+
+fn decode_chunked_preimage(
+    matrix_type: ConcreteMatrixType,
+    bytes: &[u8],
+) -> Result<ChunkedPreimage, ExecutionError> {
+    if !bytes.starts_with(CHUNKED_PREIMAGE_MAGIC) {
+        return Err(ExecutionError::Manifest("preimage artifact is not column-chunked".to_owned()));
+    }
+    let mut offset = CHUNKED_PREIMAGE_MAGIC.len();
+    let chunk_count = usize::try_from(read_chunk_u64(bytes, &mut offset)?)
+        .map_err(|_| ExecutionError::Manifest("preimage chunk count exceeds usize".into()))?;
+    let mut chunks = Vec::with_capacity(chunk_count);
+    let mut expected_start = 0usize;
+    for _ in 0..chunk_count {
+        let start = usize::try_from(read_chunk_u64(bytes, &mut offset)?)
+            .map_err(|_| ExecutionError::Manifest("preimage chunk offset exceeds usize".into()))?;
+        let columns = usize::try_from(read_chunk_u64(bytes, &mut offset)?)
+            .map_err(|_| ExecutionError::Manifest("preimage chunk width exceeds usize".into()))?;
+        let length = usize::try_from(read_chunk_u64(bytes, &mut offset)?)
+            .map_err(|_| ExecutionError::Manifest("preimage chunk length exceeds usize".into()))?;
+        let end = offset.saturating_add(length);
+        let payload = bytes
+            .get(offset..end)
+            .ok_or_else(|| ExecutionError::Manifest("truncated preimage chunk payload".into()))?
+            .to_vec();
+        offset = end;
+        if start != expected_start || columns == 0 {
+            return Err(ExecutionError::Manifest(
+                "preimage chunks are not a consecutive nonempty partition".into(),
+            ));
+        }
+        expected_start = expected_start
+            .checked_add(columns)
+            .ok_or_else(|| ExecutionError::Manifest("preimage column count overflow".into()))?;
+        chunks.push(PreimageColumnChunk { start, columns, bytes: payload });
+    }
+    if offset != bytes.len() || expected_start != matrix_type.columns {
+        return Err(ExecutionError::Manifest(
+            "preimage chunks do not exactly cover the declared matrix".into(),
+        ));
+    }
+    Ok(ChunkedPreimage { matrix_type, chunks })
+}
+
+fn read_chunk_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, ExecutionError> {
+    let end = offset.saturating_add(8);
+    let field = bytes
+        .get(*offset..end)
+        .ok_or_else(|| ExecutionError::Manifest("truncated preimage chunk metadata".into()))?;
+    *offset = end;
+    Ok(u64::from_le_bytes(field.try_into().expect("eight-byte field")))
 }
 
 #[cfg(test)]
@@ -5432,8 +5711,8 @@ mod tests {
             config,
         )
         .expect("recorded execution");
-        assert_eq!(backend.preimage_batch_calls(), calls_before + 1);
-        assert_eq!(&backend.preimage_batch_sizes()[sizes_before..], &[6]);
+        assert_eq!(backend.preimage_batch_calls(), calls_before + 2);
+        assert_eq!(&backend.preimage_batch_sizes()[sizes_before..], &[3, 3]);
         let first_bytes = {
             let RuntimeValue::Family(values) = first
                 .materialize_output("selected", &backend, &mut first_store)
@@ -5444,8 +5723,8 @@ mod tests {
             values
                 .iter()
                 .map(|value| match value {
-                    RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix.as_ref()),
-                    _ => panic!("recorded family member is not a matrix"),
+                    RuntimeValue::ChunkedPreimage(preimage) => encode_chunked_preimage(preimage),
+                    _ => panic!("recorded family member is not a chunked preimage"),
                 })
                 .collect::<Vec<_>>()
         };
@@ -5476,8 +5755,8 @@ mod tests {
             values
                 .iter()
                 .map(|value| match value {
-                    RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix.as_ref()),
-                    _ => panic!("replayed family member is not a matrix"),
+                    RuntimeValue::ChunkedPreimage(preimage) => encode_chunked_preimage(preimage),
+                    _ => panic!("replayed family member is not a chunked preimage"),
                 })
                 .collect::<Vec<_>>()
         };
@@ -6688,6 +6967,12 @@ mod tests {
             RuntimeValue::Bytes(_) => panic!("empty range output became bytes"),
             RuntimeValue::TypedBlob(_) => panic!("empty range output became a blob"),
             RuntimeValue::Matrix(_) => panic!("empty range output became a matrix"),
+            RuntimeValue::DeferredGadgetDecomposition { .. } => {
+                panic!("empty range output retained a deferred decomposition")
+            }
+            RuntimeValue::ChunkedPreimage(_) => {
+                panic!("empty range output became a chunked preimage")
+            }
             RuntimeValue::Trapdoor { .. } => panic!("empty range output became a trapdoor"),
             RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. } => {
                 panic!("empty range output became a scalar artifact")

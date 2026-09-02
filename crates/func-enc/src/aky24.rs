@@ -31,7 +31,7 @@ use crate::{
         fhe_prg::goldreich::{GoldreichFhePrg, decrypt_bit_decomposed_scalar_outputs},
     },
     lookup::{PltEvaluator, PublicLut},
-    matrix::PolyMatrix,
+    matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallPolyMatrix},
     noise_refresh::{
         NoiseRefresherNaiveVec, debug_sample_prg_encoding_wires, debug_sample_prg_plaintext_wires,
         debug_sample_prg_public_key_wires,
@@ -66,6 +66,7 @@ where
     pub ring_gsw_public_key_error_sigma: Option<f64>,
     pub bgg_tag: Vec<u8>,
     pub trapdoor_sigma: f64,
+    pub preimage_max_coefficient_bound: BigUint,
     pub encoding_error_sigma: Option<f64>,
     pub b_error_sigma: Option<f64>,
     pub b_matrix: M,
@@ -96,6 +97,7 @@ where
         ring_gsw_public_key_error_sigma: Option<f64>,
         bgg_tag: Vec<u8>,
         trapdoor_sigma: f64,
+        preimage_max_coefficient_bound: BigUint,
         encoding_error_sigma: Option<f64>,
         b_matrix: M,
         b_trapdoor: TD,
@@ -124,6 +126,7 @@ where
             ring_gsw_public_key_error_sigma,
             bgg_tag,
             trapdoor_sigma,
+            preimage_max_coefficient_bound,
             encoding_error_sigma,
             b_error_sigma: encoding_error_sigma,
             b_matrix,
@@ -305,7 +308,7 @@ where
 
 impl<M, SH, US, TS, PKPE, PKST, ENCPE, ENCST> Aky24FuncEnc<M, SH, US, TS, PKPE, PKST, ENCPE, ENCST>
 where
-    M: PolyMatrix + Send + Sync + 'static,
+    M: PolyMatrix + PolyMatrixSmallRhs + Send + Sync + 'static,
     M::P: 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     US: PolyUniformSampler<M = M> + Send + Sync,
@@ -448,12 +451,15 @@ where
                             "AKY24 PRF mask keygen refresh preimage sampling started"
                         );
                         let started = Instant::now();
-                        let preimage = trapdoor_sampler.preimage(
+                        let preimage = trapdoor_sampler
+                            .preimage(
                             &params.poly_params,
                             &msk.b_trapdoor,
                             &msk.b_matrix,
                             &refresh_key_slot.matrix,
-                        );
+                            params.preimage_max_coefficient_bound.clone(),
+                        )
+                        .expect("AKY24 refresh preimage sampling");
                         debug!(
                             round_idx,
                             wire_idx,
@@ -462,7 +468,7 @@ where
                             elapsed_ms = started.elapsed().as_millis(),
                             "AKY24 PRF mask keygen refresh preimage sampling finished"
                         );
-                        refresh_preimages.push(preimage.into_compact_bytes());
+                        refresh_preimages.push(preimage.to_canonical_coefficients().unwrap());
                     }
                 }
                 next_seed_wires.push(a_prime);
@@ -569,7 +575,9 @@ where
             .matrix
             .clone();
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
-        let mask_target = target.mul_decompose(&selector);
+        let mask_target = target
+            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 mask selector decomposition"))
+            .expect("AKY24 mask selector product");
         info!(refresh_preimages = refresh_preimages.len(), "AKY24 PRF mask keygen finished");
         (mask_target, refresh_preimages)
     }
@@ -682,9 +690,15 @@ where
                     [preimage_cursor..preimage_cursor + per_wire_decoder_count]
                     .iter()
                     .map(|preimage_bytes| {
-                        let preimage =
-                            M::from_compact_bytes(&params.poly_params, preimage_bytes.as_slice());
-                        ct.c_b.clone() * &preimage
+                        let preimage = M::SmallMatrix::from_canonical_coefficients(
+                            &params.poly_params,
+                            ct.c_b.col_size(),
+                            1,
+                            params.preimage_max_coefficient_bound.clone(),
+                            preimage_bytes,
+                        )
+                        .expect("AKY24 refresh preimage codec");
+                        ct.c_b.clone().multiply_small_rhs(preimage).expect("AKY24 refresh product")
                     })
                     .collect::<Vec<_>>();
                 preimage_cursor += per_wire_decoder_count;
@@ -792,7 +806,10 @@ where
             .map(|encoding_vec| encoding_vec.encoding(0))
             .expect("AKY24 PRF mask final decrypt must produce one output encoding");
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
-        let mask_message = evaluated_encoding.vector.mul_decompose(&selector);
+        let mask_message = evaluated_encoding
+            .vector
+            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 mask selector decomposition"))
+            .expect("AKY24 mask selector product");
         info!("AKY24 PRF mask dec finished");
         mask_message
     }
@@ -801,7 +818,7 @@ where
 impl<M, SH, US, TS, PKPE, PKST, ENCPE, ENCST> FuncEnc
     for Aky24FuncEnc<M, SH, US, TS, PKPE, PKST, ENCPE, ENCST>
 where
-    M: PolyMatrix + Send + Sync + 'static,
+    M: PolyMatrix + PolyMatrixSmallRhs + Send + Sync + 'static,
     M::P: 'static,
     SH: PolyHashSampler<[u8; 32], M = M> + Send + Sync,
     US: PolyUniformSampler<M = M> + Send + Sync,
@@ -1059,7 +1076,9 @@ where
             "AKY24 keygen circuit evaluation finished"
         );
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
-        let preimage_target = evaluated_target.mul_decompose(&selector);
+        let preimage_target = evaluated_target
+            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 target selector decomposition"))
+            .expect("AKY24 target selector product");
         debug!(
             target_rows = preimage_target.row_size(),
             target_cols = preimage_target.col_size(),
@@ -1080,16 +1099,19 @@ where
         );
         let combined_preimage_target = preimage_target + mask_preimage_target;
         info!("AKY24 keygen sampling trapdoor preimage for function output plus PRF mask");
-        let preimage = trapdoor_sampler.preimage(
+        let preimage = trapdoor_sampler
+            .preimage(
             &params.poly_params,
             &msk.b_trapdoor,
             &msk.b_matrix,
             &combined_preimage_target,
-        );
+            params.preimage_max_coefficient_bound.clone(),
+        )
+        .expect("AKY24 function preimage sampling");
         info!(?func, prf_refresh_preimages = prf_refresh_preimages.len(), "AKY24 keygen finished");
         Aky24FuncKey {
             func: *func,
-            preimage_compact_bytes: preimage.into_compact_bytes(),
+            preimage_compact_bytes: preimage.to_canonical_coefficients().unwrap(),
             public_prf_seed,
             prf_refresh_preimage_compact_bytes: prf_refresh_preimages,
             _m: PhantomData,
@@ -1142,7 +1164,10 @@ where
                     .map(|encoding_vec| encoding_vec.encoding(0))
                     .expect("AKY24 DebugIdentity evaluation must produce one output encoding");
                 let selector = g_inverse_identity_selector::<M>(&params.poly_params);
-                let evaluated_message = evaluated_encoding.vector.mul_decompose(&selector);
+                let evaluated_message = evaluated_encoding
+                    .vector
+                    .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 message selector decomposition"))
+                    .expect("AKY24 message selector product");
                 let mask_message = self.dec_prf_mask_encoding(
                     params,
                     ct,
@@ -1153,9 +1178,20 @@ where
                     wire_count,
                 );
                 let combined_message = evaluated_message + mask_message;
-                let output_preimage =
-                    M::from_compact_bytes(&params.poly_params, &fsk.preimage_compact_bytes);
-                let noisy_plaintext = combined_message - &(ct.c_b.clone() * &output_preimage);
+                let output_preimage = M::SmallMatrix::from_canonical_coefficients(
+                    &params.poly_params,
+                    ct.c_b.col_size(),
+                    1,
+                    params.preimage_max_coefficient_bound.clone(),
+                    &fsk.preimage_compact_bytes,
+                )
+                .expect("AKY24 output preimage codec");
+                let output_product = ct
+                    .c_b
+                    .clone()
+                    .multiply_small_rhs(output_preimage)
+                    .expect("AKY24 output product");
+                let noisy_plaintext = combined_message - &output_product;
                 assert_eq!(
                     noisy_plaintext.size(),
                     (1, 1),
@@ -1670,6 +1706,7 @@ mod tests {
             Some(0.0),
             b"aky24_test".to_vec(),
             4.578,
+            BigUint::from(1_000_000u32),
             None,
             b_matrix,
             b_trapdoor,
@@ -1681,6 +1718,11 @@ mod tests {
             1,
             [0x24; 32],
         );
+        let zero_bound_params = Aky24Params {
+            preimage_max_coefficient_bound: BigUint::from(0u8),
+            ..params.clone()
+        };
+        assert_eq!(zero_bound_params.preimage_max_coefficient_bound, BigUint::from(0u8));
         let mut scheme = TestFuncEnc::new(None, None, None, None);
         info!("AKY24 GPU test running setup");
         let (enc_key, master_key) = scheme.setup(&params);

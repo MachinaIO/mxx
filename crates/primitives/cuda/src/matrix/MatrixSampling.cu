@@ -341,9 +341,7 @@ int launch_sample_distribution_multi_limb_kernel(
     uint64_t max_coefficient_bound,
     uint64_t coefficient_modulus,
     GpuRngSeed seed,
-    cudaStream_t stream,
-    const GpuMatrix *,
-    const dim3 *)
+    cudaStream_t stream)
 {
     if (!dst_base)
     {
@@ -484,9 +482,7 @@ static int gpu_matrix_sample_distribution_impl(
             max_coefficient_bound,
             coefficient_modulus,
             seed,
-            limb_stream,
-            out,
-            &limb_id);
+            limb_stream);
         if (status != 0)
         {
             return status;

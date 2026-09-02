@@ -1,6 +1,9 @@
 use crate::{
     element::PolyElem,
-    matrix::{MatrixElem, MatrixParams, PolyMatrix, cpp_matrix::CppMatrix},
+    matrix::{
+        CpuSmallMatrix, MatrixElem, MatrixParams, PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError,
+        cpp_matrix::CppMatrix,
+    },
     parallel_iter,
     poly::{
         Poly, PolyParams,
@@ -247,33 +250,6 @@ impl PolyMatrix for DCRTPolyMatrix {
         output[0].concat_columns(&output[1..].iter().collect::<Vec<_>>())
     }
 
-    fn mul_decompose(&self, other: &Self) -> Self {
-        let log_base_q = self.params.modulus_digits();
-        debug_assert_eq!(self.ncol, other.nrow * log_base_q);
-        let ncol = other.ncol;
-        debug_assert!(ncol > 0, "mul_decompose expects at least one column");
-        let output = (0..ncol).map(|j| self * &other.get_column_matrix_decompose(j)).collect_vec();
-        output[0].concat_columns(&output[1..].iter().collect::<Vec<_>>())
-    }
-
-    fn mul_decompose_small(&self, other: &Self) -> Self {
-        let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
-        debug_assert_eq!(self.ncol, other.nrow * k);
-        let ncol = other.ncol;
-        debug_assert!(ncol > 0, "mul_decompose_small expects at least one column");
-        let output = (0..ncol)
-            .map(|j| {
-                let col = Self::from_poly_vec(
-                    &self.params,
-                    other.get_column(j).into_iter().map(|poly| vec![poly]).collect(),
-                )
-                .small_decompose_owned();
-                self * &col
-            })
-            .collect_vec();
-        output[0].concat_columns(&output[1..].iter().collect::<Vec<_>>())
-    }
-
     fn get_column_matrix_decompose(&self, j: usize) -> Self {
         Self::from_poly_vec(
             &self.params,
@@ -390,6 +366,28 @@ impl PolyMatrix for DCRTPolyMatrix {
     ) -> Vec<Vec<Self::P>> {
         // Delegate to the BaseMatrix implementation
         self.block_entries(rows, cols)
+    }
+}
+
+impl PolyMatrixSmallRhs for DCRTPolyMatrix {
+    type SmallMatrix = CpuSmallMatrix<Self>;
+
+    fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError> {
+        let base = BigUint::from(1u8) << self.params.base_bits();
+        let max_coefficient_bound =
+            if small { &base - BigUint::from(1u8) } else { (&base + BigUint::from(1u8)) >> 1 };
+        let value = if small { self.small_decompose_owned() } else { self.decompose_owned() };
+        CpuSmallMatrix::new(value, max_coefficient_bound)
+    }
+
+    fn multiply_small_rhs(&self, rhs: Self::SmallMatrix) -> Result<Self, SmallMatrixError> {
+        if self.params != *rhs.value().params() {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if self.col_size() != rhs.size().0 {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        Ok(self.multiply_out_of_place(rhs.value()))
     }
 }
 
@@ -585,12 +583,345 @@ impl DCRTPolyMatrix {
 
 #[cfg(test)]
 mod tests {
-    use crate::element::{PolyElem, finite_ring::FinRingElem};
+    use crate::{
+        element::{PolyElem, finite_ring::FinRingElem},
+        matrix::{PolyMatrixSmallRhs, SmallPolyMatrix},
+    };
 
     use super::*;
     use num_bigint::BigUint;
     use rand::{Rng, rng};
     use std::sync::Arc;
+
+    fn constant_matrix(params: &DCRTPolyParams, rows: &[&[u64]]) -> DCRTPolyMatrix {
+        DCRTPolyMatrix::from_poly_vec(
+            params,
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| {
+                            if *value == 0 {
+                                DCRTPoly::const_zero(params)
+                            } else {
+                                DCRTPoly::from_usize_to_constant(params, *value as usize)
+                            }
+                        })
+                        .collect()
+                })
+                .collect::<Vec<Vec<_>>>(),
+        )
+    }
+
+    fn signed_constant_matrix(params: &DCRTPolyParams, rows: &[&[i64]]) -> DCRTPolyMatrix {
+        DCRTPolyMatrix::from_poly_vec(
+            params,
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| {
+                            if *value < 0 {
+                                DCRTPoly::from_biguint_to_constant(
+                                    params,
+                                    params.modulus().as_ref() - BigUint::from(value.unsigned_abs()),
+                                )
+                            } else {
+                                DCRTPoly::from_usize_to_constant(params, *value as usize)
+                            }
+                        })
+                        .collect()
+                })
+                .collect::<Vec<Vec<_>>>(),
+        )
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct MetadataOnlySmallOwner {
+        params: DCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        bound: BigUint,
+    }
+
+    impl SmallPolyMatrix for MetadataOnlySmallOwner {
+        type Params = DCRTPolyParams;
+
+        fn params(&self) -> &Self::Params {
+            &self.params
+        }
+
+        fn max_coefficient_bound(&self) -> &BigUint {
+            &self.bound
+        }
+
+        fn rows(&self) -> usize {
+            self.rows
+        }
+
+        fn columns(&self) -> usize {
+            self.columns
+        }
+
+        fn to_canonical_coefficients(&self) -> Result<Vec<u8>, SmallMatrixError> {
+            Err(SmallMatrixError::PayloadLength)
+        }
+
+        fn from_canonical_coefficients(
+            _params: &Self::Params,
+            _rows: usize,
+            _columns: usize,
+            _max_coefficient_bound: BigUint,
+            _payload: &[u8],
+        ) -> Result<Self, SmallMatrixError> {
+            Err(SmallMatrixError::PayloadLength)
+        }
+    }
+
+    #[test]
+    fn compact_owner_trait_does_not_require_a_full_matrix_field() {
+        let params = DCRTPolyParams::new(4, 2, 17, 2);
+        let owner = MetadataOnlySmallOwner {
+            params: params.clone(),
+            rows: 2,
+            columns: 3,
+            bound: BigUint::from(255u32),
+        };
+        assert!(owner.is_on_params(&params));
+        assert_eq!(owner.size(), (2, 3));
+    }
+
+    #[test]
+    fn cpu_small_matrix_canonical_coefficients_round_trip_and_reject_invalid_payloads() {
+        let params = DCRTPolyParams::new(8, 2, 17, 3);
+        let modulus = params.modulus();
+        let negative_three =
+            DCRTPoly::from_biguint_to_constant(&params, modulus.as_ref() - BigUint::from(3u32));
+        let zero = DCRTPoly::const_zero(&params);
+        let matrix = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![vec![DCRTPoly::from_usize_to_constant(&params, 7)], vec![negative_three]],
+        );
+        let owner = CpuSmallMatrix::new(matrix.clone(), BigUint::from(255u32)).unwrap();
+        let payload = owner.to_canonical_coefficients().unwrap();
+        assert_eq!(payload[0..3], [1, 7, 0]);
+        assert_eq!(payload[16..19], [2, 3, 0]);
+        let decoded = CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+            &params,
+            2,
+            1,
+            BigUint::from(255u32),
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(decoded.value(), &matrix);
+
+        let mut invalid_sign = payload.clone();
+        invalid_sign[0] = 3;
+        assert_eq!(
+            CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+                &params,
+                2,
+                1,
+                BigUint::from(255u32),
+                &invalid_sign,
+            ),
+            Err(SmallMatrixError::InvalidSign)
+        );
+        let mut negative_zero = payload.clone();
+        negative_zero[0] = 2;
+        negative_zero[1] = 0;
+        assert_eq!(
+            CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+                &params,
+                2,
+                1,
+                BigUint::from(255u32),
+                &negative_zero,
+            ),
+            Err(SmallMatrixError::NonCanonicalCoefficient)
+        );
+        let wide_bound = modulus.as_ref().clone();
+        let half_plus_one = (modulus.as_ref() >> 1usize) + BigUint::from(1u8);
+        let wide_width = wide_bound.bits().div_ceil(8).max(1) as usize;
+        let mut above_center = vec![0u8; params.ring_dimension() as usize * (1 + wide_width)];
+        above_center[1..1 + half_plus_one.to_bytes_le().len()]
+            .copy_from_slice(&half_plus_one.to_bytes_le());
+        for sign in [1u8, 2u8] {
+            above_center[0] = sign;
+            assert_eq!(
+                CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+                    &params,
+                    1,
+                    1,
+                    wide_bound.clone(),
+                    &above_center,
+                ),
+                Err(SmallMatrixError::NonCanonicalCoefficient)
+            );
+        }
+        assert_eq!(
+            CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+                &params,
+                2,
+                1,
+                BigUint::from(255u32),
+                &payload[..payload.len() - 1],
+            ),
+            Err(SmallMatrixError::PayloadLength)
+        );
+        let mut out_of_bound = payload.clone();
+        out_of_bound[1] = 8;
+        out_of_bound[2] = 0;
+        assert_eq!(
+            CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+                &params,
+                2,
+                1,
+                BigUint::from(7u32),
+                &out_of_bound,
+            ),
+            Err(SmallMatrixError::BoundExceeded)
+        );
+        assert_eq!(
+            CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+                &params,
+                2,
+                1,
+                BigUint::from(256u32),
+                &payload,
+            ),
+            Err(SmallMatrixError::PayloadLength)
+        );
+        let zero_owner = CpuSmallMatrix::new(
+            DCRTPolyMatrix::from_poly_vec(&params, vec![vec![zero]]),
+            BigUint::ZERO,
+        )
+        .unwrap();
+        assert!(zero_owner.to_canonical_coefficients().unwrap().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn cpu_small_matrix_constructor_enforces_centered_inclusive_bound() {
+        let params = DCRTPolyParams::new(8, 2, 17, 3);
+        let modulus = params.modulus();
+        let positive_boundary = constant_matrix(&params, &[&[3]]);
+        assert!(CpuSmallMatrix::new(positive_boundary, BigUint::from(3u32)).is_ok());
+
+        let negative_boundary = signed_constant_matrix(&params, &[&[-3]]);
+        let negative_owner = CpuSmallMatrix::new(negative_boundary, BigUint::from(3u32)).unwrap();
+        let payload = negative_owner.to_canonical_coefficients().unwrap();
+        assert_eq!(payload[0..3], [2, 3, 0]);
+
+        let positive_out_of_bound = constant_matrix(&params, &[&[4]]);
+        assert_eq!(
+            CpuSmallMatrix::new(positive_out_of_bound, BigUint::from(3u32)),
+            Err(SmallMatrixError::BoundExceeded)
+        );
+
+        let negative_out_of_bound = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![vec![DCRTPoly::from_biguint_to_constant(
+                &params,
+                modulus.as_ref() - BigUint::from(4u32),
+            )]],
+        );
+        assert_eq!(
+            CpuSmallMatrix::new(negative_out_of_bound, BigUint::from(3u32)),
+            Err(SmallMatrixError::BoundExceeded)
+        );
+    }
+
+    #[test]
+    fn cpu_small_matrix_constructor_rejects_coefficient_modulus_mismatch() {
+        let matrix_params = DCRTPolyParams::new(4, 1, 17, 2);
+        let coefficient_params = DCRTPolyParams::new(4, 2, 17, 2);
+        let foreign_coefficient = DCRTPoly::from_usize_to_constant(&coefficient_params, 1);
+        let matrix = DCRTPolyMatrix::from_poly_vec(&matrix_params, vec![vec![foreign_coefficient]]);
+
+        assert_eq!(
+            CpuSmallMatrix::new(matrix, BigUint::from(1u8)),
+            Err(SmallMatrixError::CoefficientModulusMismatch)
+        );
+    }
+
+    #[test]
+    fn cpu_small_matrix_metadata_decomposition_and_multiply_are_typed() {
+        let params = DCRTPolyParams::new(4, 2, 17, 2);
+        let matrix = constant_matrix(&params, &[&[1, 1, 2], &[3, 2, 3]]);
+        let owner = CpuSmallMatrix::new(matrix.clone(), BigUint::from(3u32)).unwrap();
+        owner.validate_metadata(&params, 2, 3, &BigUint::from(3u32)).unwrap();
+        assert_eq!(
+            owner.validate_metadata(&params, 1, 3, &BigUint::from(3u32)),
+            Err(SmallMatrixError::ShapeMismatch)
+        );
+        assert_eq!(
+            owner.validate_metadata(&params, 2, 3, &BigUint::from(4u32)),
+            Err(SmallMatrixError::BoundMismatch)
+        );
+        let other_params = DCRTPolyParams::new(4, 2, 17, 3);
+        assert_eq!(
+            owner.validate_metadata(&other_params, 2, 3, &BigUint::from(3u32)),
+            Err(SmallMatrixError::ParameterMismatch)
+        );
+
+        let source = DCRTPolyMatrix::from_poly_vec(
+            &params,
+            vec![vec![DCRTPoly::from_usize_to_constant(&params, 5)]],
+        );
+        let regular = source.clone().gadget_decompose(false).unwrap();
+        let small = source.gadget_decompose(true).unwrap();
+        assert_eq!(regular.size(), (18, 1));
+        assert_eq!(regular.max_coefficient_bound(), &BigUint::from(2u32));
+        assert_eq!(small.size(), (9, 1));
+        assert_eq!(small.max_coefficient_bound(), &BigUint::from(3u32));
+
+        let lhs = constant_matrix(&params, &[&[1, 2, 3], &[4, 5, 6]]);
+        let rhs = constant_matrix(&params, &[&[1, 2], &[2, 1], &[3, 1]]);
+        let expected = lhs.clone() * rhs.clone();
+        let actual =
+            lhs.multiply_small_rhs(CpuSmallMatrix::new(rhs, BigUint::from(3u32)).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        let wrong_shape = constant_matrix(&params, &[&[1, 2], &[2, 1]]);
+        assert_eq!(
+            lhs.multiply_small_rhs(CpuSmallMatrix::new(wrong_shape, BigUint::from(3u32)).unwrap()),
+            Err(SmallMatrixError::ShapeMismatch)
+        );
+        assert_eq!(
+            lhs.multiply_small_rhs(
+                CpuSmallMatrix::new(
+                    constant_matrix(&other_params, &[&[1, 2], &[2, 1], &[3, 1]]),
+                    BigUint::from(3u32),
+                )
+                .unwrap()
+            ),
+            Err(SmallMatrixError::ParameterMismatch)
+        );
+    }
+
+    #[test]
+    fn cpu_small_matrix_multiply_round_trip_handles_signed_multicolumn_boundary_values() {
+        let params = DCRTPolyParams::new(4, 2, 17, 2);
+        let lhs = constant_matrix(&params, &[&[1, 2, 3], &[4, 5, 6]]);
+        let rhs = signed_constant_matrix(&params, &[&[255, -255], &[-1, 2], &[0, -255]]);
+        let expected = lhs.clone() * rhs.clone();
+        let owner = CpuSmallMatrix::new(rhs, BigUint::from(255u32)).unwrap();
+        let payload = owner.to_canonical_coefficients().unwrap();
+        let decoded = CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+            &params,
+            3,
+            2,
+            BigUint::from(255u32),
+            &payload,
+        )
+        .unwrap();
+        let actual = lhs.multiply_small_rhs(decoded).unwrap();
+        assert_eq!(actual, expected);
+
+        let zero_rhs = constant_matrix(&params, &[&[0, 0], &[0, 0], &[0, 0]]);
+        let expected_zero = lhs.clone() * zero_rhs.clone();
+        let actual_zero =
+            lhs.multiply_small_rhs(CpuSmallMatrix::new(zero_rhs, BigUint::ZERO).unwrap()).unwrap();
+        assert_eq!(actual_zero, expected_zero);
+    }
 
     #[test]
     fn test_matrix_gadget_matrix() {
@@ -897,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_mul_decompose_small_relation() {
+    fn test_matrix_small_rhs_relation() {
         let params = DCRTPolyParams::new(4, 2, 17, 3);
         let n = 2usize;
         let r = 3usize;
@@ -939,7 +1270,7 @@ mod tests {
         let g_small = DCRTPolyMatrix::small_gadget_matrix(&params, n);
         let left = a.clone() * &g_small;
         let expected = a * &b;
-        let actual = left.mul_decompose_small(&b);
+        let actual = left.multiply_small_rhs(b.clone().gadget_decompose(true).unwrap()).unwrap();
 
         assert_eq!(actual, expected);
     }

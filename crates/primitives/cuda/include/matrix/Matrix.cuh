@@ -78,3 +78,4 @@ struct GpuMatrix
 #include "matrix/MatrixSerde.cuh"
 #include "matrix/MatrixTrapdoor.cuh"
 #include "matrix/MatrixUtils.cuh"
+#include "matrix/MatrixSmallRhs.cuh"

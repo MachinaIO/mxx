@@ -1,23 +1,85 @@
 use super::{Backend, IndexRange, MatrixMulAccumulateRequest, PreimageRequest, SampleRange};
 use mxx_ir_core::{
     ParamEnv,
-    node::{ConcatAxis, ConstantMatrix, HashVariant},
+    artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
+    node::{ConcatAxis, ConstantMatrix},
     types::ConcreteMatrixType,
 };
 use mxx_primitives::{
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    matrix::{
+        PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix,
+        dcrt_poly::DCRTPolyMatrix,
+    },
     poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        bounds::matrix_within_coefficient_bound, hash::DCRTPolyHashSampler,
-        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
+        hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
+        uniform::DCRTPolyUniformSampler,
     },
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, ToPrimitive, Zero};
+use rayon::prelude::*;
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use thiserror::Error;
+
+const SMALL_MATRIX_MAGIC: &[u8; 4] = b"SMR1";
+
+fn small_matrix_semantic_tag(kind: SmallMatrixSemanticKind) -> u8 {
+    match kind {
+        SmallMatrixSemanticKind::Generic => 0,
+        SmallMatrixSemanticKind::Preimage => 1,
+    }
+}
+
+fn take_small_matrix_bytes<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], PolyBackendError> {
+    let end = offset
+        .checked_add(length)
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("header length overflows"))?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("header is truncated"))?;
+    *offset = end;
+    Ok(value)
+}
+
+fn read_small_matrix_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, PolyBackendError> {
+    let raw: [u8; 4] = take_small_matrix_bytes(bytes, offset, 4)?
+        .try_into()
+        .expect("four-byte slice has fixed width");
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_small_matrix_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, PolyBackendError> {
+    let raw: [u8; 8] = take_small_matrix_bytes(bytes, offset, 8)?
+        .try_into()
+        .expect("eight-byte slice has fixed width");
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn bounded_schema_parts(
+    schema: &ConcreteBoundedMatrixSchema,
+) -> Result<(BigUint, usize, usize), PolyBackendError> {
+    let bound = schema
+        .max_coefficient_bound
+        .to_biguint()
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("bound is negative"))?;
+    let magnitude_bytes = usize::try_from(bound.bits().div_ceil(8))
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("bound width overflows"))?
+        .max(1);
+    let coefficient_count = schema
+        .matrix
+        .rows
+        .checked_mul(schema.matrix.columns)
+        .and_then(|count| count.checked_mul(schema.matrix.ring_dimension))
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("coefficient count overflows"))?;
+    Ok((bound, magnitude_bytes, coefficient_count))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RingKey {
@@ -37,8 +99,10 @@ pub enum PolyBackendError {
     InvalidInteger,
     #[error("trapdoor deserialization failed")]
     TrapdoorDeserialization,
-    #[error("matrix is empty")]
-    EmptyMatrix,
+    #[error(transparent)]
+    SmallMatrix(#[from] SmallMatrixError),
+    #[error("invalid small-matrix artifact: {0}")]
+    InvalidSmallMatrixArtifact(&'static str),
     #[error(
         "declared gadget layout base={declared_base}, digits={declared_digits} does not match backend base={backend_base}, digits={backend_digits}"
     )]
@@ -60,25 +124,46 @@ where
     _marker: PhantomData<(M, U, H, T)>,
 }
 
-fn rejection_resample_candidate<T>(
-    mut sample: impl FnMut() -> T,
-    mut accepts: impl FnMut(&T) -> bool,
-) -> T {
-    loop {
-        let candidate = sample();
-        if accepts(&candidate) {
-            return candidate;
-        }
+fn validate_regular_gadget_layout_for_params<P: PolyParams>(
+    parameters: &P,
+    gadget_base: &BigInt,
+    digit_count: usize,
+) -> Result<(), PolyBackendError> {
+    let backend_base = BigInt::one() << parameters.base_bits() as usize;
+    let backend_digits = parameters.modulus_digits();
+    if gadget_base != &backend_base || digit_count != backend_digits {
+        return Err(PolyBackendError::GadgetLayoutMismatch {
+            declared_base: gadget_base.clone(),
+            declared_digits: digit_count,
+            backend_base,
+            backend_digits,
+        });
     }
+    Ok(())
 }
 
-fn sample_bounded_candidate<M: PolyMatrix>(
-    max_coefficient_bound: &BigUint,
-    sample: impl FnMut() -> M,
-) -> M {
-    rejection_resample_candidate(sample, |candidate| {
-        matrix_within_coefficient_bound(candidate, max_coefficient_bound)
-    })
+fn sample_preimage_with_parameters<M, T>(
+    parameters: &<M::P as Poly>::Params,
+    request: PreimageRequest<M, T::Trapdoor>,
+) -> Result<M::SmallMatrix, PolyBackendError>
+where
+    M: PolyMatrixSmallRhs,
+    T: PolyTrapdoorSampler<M = M>,
+{
+    validate_regular_gadget_layout_for_params(
+        parameters,
+        &request.gadget_base,
+        request.digit_count,
+    )?;
+    let max_coefficient_bound =
+        request.max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
+    Ok(T::new(parameters, request.sigma).preimage(
+        parameters,
+        request.trapdoor.as_ref(),
+        request.public.as_ref(),
+        request.target.as_ref(),
+        max_coefficient_bound,
+    )?)
 }
 
 pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
@@ -251,8 +336,7 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
-    #[cfg(feature = "gpu")]
-    pub(super) fn parameters_at(
+    fn parameters_at(
         &self,
         placement: usize,
         matrix_type: &ConcreteMatrixType,
@@ -267,22 +351,12 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
-    pub(super) fn validate_regular_gadget_layout(
+    fn validate_regular_gadget_layout(
         parameters: &<M::P as Poly>::Params,
         gadget_base: &BigInt,
         digit_count: usize,
     ) -> Result<(), PolyBackendError> {
-        let backend_base = BigInt::one() << parameters.base_bits() as usize;
-        let backend_digits = parameters.modulus_digits();
-        if gadget_base != &backend_base || digit_count != backend_digits {
-            return Err(PolyBackendError::GadgetLayoutMismatch {
-                declared_base: gadget_base.clone(),
-                declared_digits: digit_count,
-                backend_base,
-                backend_digits,
-            });
-        }
-        Ok(())
+        validate_regular_gadget_layout_for_params(parameters, gadget_base, digit_count)
     }
 
     fn expected_gadget_layout(parameters: &<M::P as Poly>::Params, small: bool) -> (BigInt, usize) {
@@ -311,6 +385,24 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
+    fn parameters_for_small_matrix(
+        &self,
+        matrix: &M::SmallMatrix,
+    ) -> Result<&<M::P as Poly>::Params, PolyBackendError>
+    where
+        M: PolyMatrixSmallRhs,
+    {
+        let parameters = matrix.params();
+        let modulus: Arc<BigUint> = parameters.modulus().into();
+        let key = RingKey {
+            modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
+            ring_dimension: parameters.ring_dimension() as usize,
+        };
+        self.parameters[self.active_placement]
+            .get(&key)
+            .ok_or(PolyBackendError::MissingParameters(key))
+    }
+
     fn ring_integer(
         parameters: &<M::P as Poly>::Params,
         value: &BigInt,
@@ -325,13 +417,14 @@ where
 
 impl<M, U, H, T> Backend for PolyBackend<M, U, H, T>
 where
-    M: CrtRecomposeMatrix + 'static,
+    M: CrtRecomposeMatrix + PolyMatrixSmallRhs + 'static,
     U: PolyUniformSampler<M = M>,
     H: PolyHashSampler<[u8; 32], M = M>,
     T: PolyTrapdoorSampler<M = M>,
     T::Trapdoor: Clone + std::fmt::Debug,
 {
     type Matrix = M;
+    type SmallMatrix = M::SmallMatrix;
     type Trapdoor = T::Trapdoor;
     type Error = PolyBackendError;
 
@@ -365,6 +458,28 @@ where
 
     fn matrix_is_on_active_placement(&self, value: &M) -> bool {
         self.parameters_for_matrix(value).is_ok_and(|target| value.params() == target)
+    }
+
+    fn small_matrix_to_active_placement(
+        &mut self,
+        value: &M::SmallMatrix,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        let target = self.parameters_for_small_matrix(value)?;
+        if value.params() == target {
+            return Ok(value.clone());
+        }
+        let payload = value.to_canonical_coefficients()?;
+        Ok(M::SmallMatrix::from_canonical_coefficients(
+            target,
+            value.rows(),
+            value.columns(),
+            value.max_coefficient_bound().clone(),
+            &payload,
+        )?)
+    }
+
+    fn small_matrix_is_on_active_placement(&self, value: &M::SmallMatrix) -> bool {
+        self.parameters_for_small_matrix(value).is_ok_and(|target| value.params() == target)
     }
 
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
@@ -409,6 +524,45 @@ where
             outputs[index] = Some(copied);
         }
         Ok(outputs)
+    }
+
+    fn small_matrix_to_placements(
+        &mut self,
+        value: &M::SmallMatrix,
+    ) -> Result<Vec<Option<M::SmallMatrix>>, Self::Error> {
+        let source = value.params();
+        let modulus: Arc<BigUint> = source.modulus().into();
+        let key = RingKey {
+            modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
+            ring_dimension: source.ring_dimension() as usize,
+        };
+        let targets = self
+            .parameters
+            .iter()
+            .map(|parameters| {
+                parameters.get(&key).ok_or_else(|| PolyBackendError::MissingParameters(key.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut payload = None;
+        targets
+            .into_iter()
+            .map(|target| {
+                if source == target {
+                    return Ok(None);
+                }
+                let payload = match &payload {
+                    Some(payload) => payload,
+                    None => payload.insert(value.to_canonical_coefficients()?),
+                };
+                Ok(Some(M::SmallMatrix::from_canonical_coefficients(
+                    target,
+                    value.rows(),
+                    value.columns(),
+                    value.max_coefficient_bound().clone(),
+                    payload,
+                )?))
+            })
+            .collect()
     }
 
     fn trapdoor_to_active_placement(
@@ -707,56 +861,57 @@ where
         ty: &ConcreteMatrixType,
         key: [u8; 32],
         tag: &[u8],
-        variant: HashVariant,
-        gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<M, Self::Error> {
         let parameters = self.parameters(ty)?;
-        let sampler = H::new();
-        Ok(match variant {
-            HashVariant::Plain => {
-                if gadget_layout.is_some() {
-                    return Err(PolyBackendError::InvalidInteger);
-                }
-                sampler.sample_hash(
-                    parameters,
-                    key,
-                    tag,
-                    ty.rows,
-                    ty.columns,
-                    DistType::FinRingDist,
-                )
-            }
-            HashVariant::Decomposed => {
-                let (base, digits) = gadget_layout.ok_or(PolyBackendError::InvalidInteger)?;
-                self.validate_gadget_layout(ty, base, digits, false)?;
-                if ty.rows % digits != 0 {
-                    return Err(PolyBackendError::InvalidInteger);
-                }
-                sampler.sample_hash_decomposed(
-                    parameters,
-                    key,
-                    tag,
-                    ty.rows / digits,
-                    ty.columns,
-                    DistType::FinRingDist,
-                )
-            }
-            HashVariant::SmallDecomposed => {
-                let (base, digits) = gadget_layout.ok_or(PolyBackendError::InvalidInteger)?;
-                self.validate_gadget_layout(ty, base, digits, true)?;
-                if ty.rows % digits != 0 {
-                    return Err(PolyBackendError::InvalidInteger);
-                }
-                sampler.sample_hash_small_decomposed(
-                    parameters,
-                    key,
-                    tag,
-                    ty.rows / digits,
-                    ty.columns,
-                    DistType::FinRingDist,
-                )
-            }
-        })
+        Ok(H::new().sample_hash(parameters, key, tag, ty.rows, ty.columns, DistType::FinRingDist))
+    }
+
+    fn sample_hash_decomposed(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        key: [u8; 32],
+        tag: &[u8],
+        gadget_base: &BigInt,
+        digit_count: usize,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        self.validate_gadget_layout(ty, gadget_base, digit_count, false)?;
+        if digit_count == 0 || !ty.rows.is_multiple_of(digit_count) {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let parameters = self.parameters(ty)?;
+        let source = H::new().sample_hash(
+            parameters,
+            key,
+            tag,
+            ty.rows / digit_count,
+            ty.columns,
+            DistType::FinRingDist,
+        );
+        Ok(source.gadget_decompose(false)?)
+    }
+
+    fn sample_hash_small_decomposed(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        key: [u8; 32],
+        tag: &[u8],
+        gadget_base: &BigInt,
+        digit_count: usize,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        self.validate_gadget_layout(ty, gadget_base, digit_count, true)?;
+        if digit_count == 0 || !ty.rows.is_multiple_of(digit_count) {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let parameters = self.parameters(ty)?;
+        let source = H::new().sample_hash(
+            parameters,
+            key,
+            tag,
+            ty.rows / digit_count,
+            ty.columns,
+            DistType::FinRingDist,
+        );
+        Ok(source.gadget_decompose(true)?)
     }
 
     fn validate_gadget_layout(
@@ -803,87 +958,60 @@ where
         trapdoor: &T::Trapdoor,
         public: &M,
         target: &M,
-    ) -> Result<M, Self::Error> {
+    ) -> Result<M::SmallMatrix, Self::Error> {
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
         let max_coefficient_bound =
             max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         let sampler = T::new(parameters, sigma);
-        Ok(sample_bounded_candidate(&max_coefficient_bound, || {
-            sampler.preimage(parameters, trapdoor, public, target)
-        }))
+        Ok(sampler.preimage(parameters, trapdoor, public, target, max_coefficient_bound)?)
     }
 
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<PreimageRequest<M, T::Trapdoor>>,
-    ) -> Result<Vec<M>, Self::Error> {
+    ) -> Result<Vec<M::SmallMatrix>, Self::Error> {
         self.preimage_batch_calls += 1;
-        #[cfg(not(feature = "gpu"))]
-        {
-            requests
-                .into_iter()
-                .map(|request| {
-                    self.sample_preimage(
-                        &request.matrix_type,
-                        request.sigma,
-                        &request.gadget_base,
-                        request.digit_count,
-                        &request.max_coefficient_bound,
-                        &request.trapdoor,
-                        &request.public,
-                        &request.target,
-                    )
-                })
-                .collect()
-        }
-        #[cfg(feature = "gpu")]
-        {
-            super::poly_gpu::sample_preimage_batch(self, requests)
-        }
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let parameters = self.parameters(&first.matrix_type)?;
+        requests
+            .into_iter()
+            .map(|request| sample_preimage_with_parameters::<M, T>(parameters, request))
+            .collect()
     }
 
     fn sample_preimage_batches_by_placement(
         &mut self,
         batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
-    ) -> Result<Vec<(usize, Vec<M>)>, Self::Error> {
+    ) -> Result<Vec<(usize, Vec<M::SmallMatrix>)>, Self::Error> {
         self.preimage_batch_calls += batches.len();
-        #[cfg(feature = "gpu")]
-        {
-            super::poly_gpu::sample_preimage_batches_by_placement(self, batches)
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            let original = self.active_placement;
-            let result = batches
-                .into_iter()
-                .map(|(placement, requests)| {
-                    self.active_placement = placement;
-                    requests
-                        .into_iter()
-                        .map(|request| {
-                            self.sample_preimage(
-                                &request.matrix_type,
-                                request.sigma,
-                                &request.gadget_base,
-                                request.digit_count,
-                                &request.max_coefficient_bound,
-                                request.trapdoor.as_ref(),
-                                request.public.as_ref(),
-                                request.target.as_ref(),
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|outputs| (placement, outputs))
-                })
-                .collect();
-            self.active_placement = original;
-            result
-        }
+        let prepared = batches
+            .into_iter()
+            .map(|(placement, requests)| {
+                let first = requests.first().ok_or(PolyBackendError::InvalidInteger)?;
+                Ok((placement, self.parameters_at(placement, &first.matrix_type)?, requests))
+            })
+            .collect::<Result<Vec<_>, PolyBackendError>>()?;
+        prepared
+            .into_par_iter()
+            .map(|(placement, parameters, requests)| {
+                requests
+                    .into_iter()
+                    .map(|request| sample_preimage_with_parameters::<M, T>(parameters, request))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|outputs| (placement, outputs))
+            })
+            .collect()
     }
 
-    fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M, Self::Error> {
-        Ok(if small { value.small_decompose() } else { value.decompose() })
+    fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M::SmallMatrix, Self::Error> {
+        Ok(value.clone().gadget_decompose(small)?)
+    }
+
+    fn multiply_small_rhs(&mut self, lhs: &M, rhs: &M::SmallMatrix) -> Result<M, Self::Error> {
+        Ok(lhs.multiply_small_rhs(rhs.clone())?)
     }
 
     fn extract_coefficient(&mut self, value: &M, position: usize) -> Result<BigInt, Self::Error> {
@@ -979,6 +1107,168 @@ where
         Ok(M::from_compact_bytes(self.parameters(ty)?, bytes))
     }
 
+    fn small_matrix_to_bytes(
+        &self,
+        value: &M::SmallMatrix,
+        expected_schema: &ConcreteBoundedMatrixSchema,
+        semantic_kind: SmallMatrixSemanticKind,
+    ) -> Result<Vec<u8>, Self::Error> {
+        let parameters = self.parameters(&expected_schema.matrix)?;
+        let (bound, magnitude_bytes, coefficient_count) = bounded_schema_parts(expected_schema)?;
+        value.validate_metadata(
+            parameters,
+            expected_schema.matrix.rows,
+            expected_schema.matrix.columns,
+            &bound,
+        )?;
+        let payload = value.to_canonical_coefficients()?;
+        let encoded_width = 1usize
+            .checked_add(magnitude_bytes)
+            .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
+        let expected_payload_length = coefficient_count
+            .checked_mul(encoded_width)
+            .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("payload length overflows"))?;
+        if payload.len() != expected_payload_length {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+                "owner returned a payload with the wrong length",
+            ));
+        }
+        let bound_bytes = {
+            let bytes = bound.to_bytes_le();
+            if bytes.is_empty() { vec![0] } else { bytes }
+        };
+        if bound_bytes.len() != magnitude_bytes {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+                "bound width is not canonical",
+            ));
+        }
+        let rows = u64::try_from(expected_schema.matrix.rows)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("row count overflows"))?;
+        let columns = u64::try_from(expected_schema.matrix.columns)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("column count overflows"))?;
+        let ring_dimension =
+            u64::try_from(expected_schema.matrix.ring_dimension).map_err(|_| {
+                PolyBackendError::InvalidSmallMatrixArtifact("ring dimension overflows")
+            })?;
+        let bound_length = u32::try_from(bound_bytes.len())
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("bound width overflows"))?;
+        let magnitude_width = u32::try_from(magnitude_bytes).map_err(|_| {
+            PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows")
+        })?;
+        let coefficient_count = u64::try_from(coefficient_count).map_err(|_| {
+            PolyBackendError::InvalidSmallMatrixArtifact("coefficient count overflows")
+        })?;
+        let header_length = 4usize
+            .checked_add(1)
+            .and_then(|length| length.checked_add(8 * 3))
+            .and_then(|length| length.checked_add(4))
+            .and_then(|length| length.checked_add(bound_bytes.len()))
+            .and_then(|length| length.checked_add(4 + 8))
+            .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("header length overflows"))?;
+        let mut bytes =
+            Vec::with_capacity(header_length.checked_add(payload.len()).ok_or(
+                PolyBackendError::InvalidSmallMatrixArtifact("artifact length overflows"),
+            )?);
+        bytes.extend_from_slice(SMALL_MATRIX_MAGIC);
+        bytes.push(small_matrix_semantic_tag(semantic_kind));
+        bytes.extend_from_slice(&rows.to_le_bytes());
+        bytes.extend_from_slice(&columns.to_le_bytes());
+        bytes.extend_from_slice(&ring_dimension.to_le_bytes());
+        bytes.extend_from_slice(&bound_length.to_le_bytes());
+        bytes.extend_from_slice(&bound_bytes);
+        bytes.extend_from_slice(&magnitude_width.to_le_bytes());
+        bytes.extend_from_slice(&coefficient_count.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
+    }
+
+    fn small_matrix_from_bytes(
+        &self,
+        expected_schema: &ConcreteBoundedMatrixSchema,
+        bytes: &[u8],
+        expected_semantic_kind: SmallMatrixSemanticKind,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        let (bound, magnitude_bytes, coefficient_count) = bounded_schema_parts(expected_schema)?;
+        let mut offset = 0usize;
+        if take_small_matrix_bytes(bytes, &mut offset, SMALL_MATRIX_MAGIC.len())? !=
+            SMALL_MATRIX_MAGIC
+        {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact("magic does not match"));
+        }
+        let semantic_kind = *take_small_matrix_bytes(bytes, &mut offset, 1)?
+            .first()
+            .expect("one-byte slice is nonempty");
+        if semantic_kind != small_matrix_semantic_tag(expected_semantic_kind) {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+                "semantic kind does not match",
+            ));
+        }
+        let expected_rows = u64::try_from(expected_schema.matrix.rows)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("row count overflows"))?;
+        let expected_columns = u64::try_from(expected_schema.matrix.columns)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("column count overflows"))?;
+        let expected_ring_dimension = u64::try_from(expected_schema.matrix.ring_dimension)
+            .map_err(|_| {
+                PolyBackendError::InvalidSmallMatrixArtifact("ring dimension overflows")
+            })?;
+        if read_small_matrix_u64(bytes, &mut offset)? != expected_rows ||
+            read_small_matrix_u64(bytes, &mut offset)? != expected_columns ||
+            read_small_matrix_u64(bytes, &mut offset)? != expected_ring_dimension
+        {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact("matrix shape does not match"));
+        }
+        let bound_length = usize::try_from(read_small_matrix_u32(bytes, &mut offset)?)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("bound width overflows"))?;
+        if bound_length != magnitude_bytes {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact("bound width does not match"));
+        }
+        let encoded_bound = take_small_matrix_bytes(bytes, &mut offset, bound_length)?;
+        if BigUint::from_bytes_le(encoded_bound) != bound ||
+            (bound.is_zero() && encoded_bound != [0]) ||
+            (!bound.is_zero() && encoded_bound.last() == Some(&0))
+        {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+                "bound is not canonical or does not match",
+            ));
+        }
+        let encoded_magnitude_bytes = usize::try_from(read_small_matrix_u32(bytes, &mut offset)?)
+            .map_err(|_| {
+            PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows")
+        })?;
+        if encoded_magnitude_bytes != magnitude_bytes {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+                "coefficient width does not match",
+            ));
+        }
+        let encoded_coefficient_count = read_small_matrix_u64(bytes, &mut offset)?;
+        let expected_coefficient_count = u64::try_from(coefficient_count).map_err(|_| {
+            PolyBackendError::InvalidSmallMatrixArtifact("coefficient count overflows")
+        })?;
+        if encoded_coefficient_count != expected_coefficient_count {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+                "coefficient count does not match",
+            ));
+        }
+        let encoded_width = 1usize
+            .checked_add(magnitude_bytes)
+            .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
+        let payload_length = coefficient_count
+            .checked_mul(encoded_width)
+            .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("payload length overflows"))?;
+        let payload = take_small_matrix_bytes(bytes, &mut offset, payload_length)?;
+        if offset != bytes.len() {
+            return Err(PolyBackendError::InvalidSmallMatrixArtifact("artifact has trailing bytes"));
+        }
+        let parameters = self.parameters(&expected_schema.matrix)?;
+        Ok(M::SmallMatrix::from_canonical_coefficients(
+            parameters,
+            expected_schema.matrix.rows,
+            expected_schema.matrix.columns,
+            bound,
+            payload,
+        )?)
+    }
+
     fn trapdoor_to_bytes(&self, value: &T::Trapdoor) -> Vec<u8> {
         T::trapdoor_to_bytes(value)
     }
@@ -1027,26 +1317,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_candidate_sampling_retries_without_clipping() {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5);
-        let candidate = |value: u8| {
-            DCRTPolyMatrix::from_poly_vec_row(
-                &parameters,
-                vec![DCRTPoly::from_biguint_to_constant(&parameters, BigUint::from(value))],
-            )
-        };
-        let rejected = candidate(7);
-        let accepted = candidate(2);
-        let mut draws = 0;
-        let sampled = sample_bounded_candidate(&BigUint::from(2u8), || {
-            draws += 1;
-            if draws == 1 { rejected.clone() } else { accepted.clone() }
-        });
-        assert_eq!(draws, 2);
-        assert_eq!(sampled, accepted);
-    }
-
-    #[test]
     fn decomposed_hash_uses_the_explicit_backend_layout() {
         let parameters = DCRTPolyParams::new(4, 1, 10, 5);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -1060,24 +1330,88 @@ mod tests {
         let tag = b"runtime-explicit-layout";
         let mut backend = cpu_backend([parameters]);
 
-        let plain = backend
-            .sample_hash(&plain_type, key, tag, HashVariant::Plain, None)
-            .expect("plain hash");
+        let plain = backend.sample_hash(&plain_type, key, tag).expect("plain hash");
         let decomposed = backend
-            .sample_hash(&decomposed_type, key, tag, HashVariant::Decomposed, Some((&base, digits)))
+            .sample_hash_decomposed(&decomposed_type, key, tag, &base, digits)
             .expect("decomposed hash");
         let small_decomposed = backend
-            .sample_hash(
-                &decomposed_type,
-                key,
-                tag,
-                HashVariant::SmallDecomposed,
-                Some((&base, digits)),
-            )
+            .sample_hash_small_decomposed(&decomposed_type, key, tag, &base, digits)
             .expect("small decomposed hash");
 
-        assert_eq!(decomposed, plain.decompose());
-        assert_eq!(small_decomposed, plain.small_decompose());
+        assert_eq!(decomposed.value(), &plain.decompose());
+        assert_eq!(small_decomposed.value(), &plain.small_decompose());
+
+        let gadget = DCRTPolyMatrix::gadget_matrix(decomposed.value().params(), plain_type.rows);
+        assert_eq!(
+            backend
+                .multiply_small_rhs(&gadget, &decomposed)
+                .expect("multiply compact regular decomposition"),
+            plain
+        );
+    }
+
+    #[test]
+    fn compact_artifact_codec_keeps_semantics_external_and_rejects_malformed_payloads() {
+        let parameters = DCRTPolyParams::new(4, 1, 16, 8);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let digits = parameters.modulus_digits();
+        let base = BigInt::from(1u8) << parameters.base_bits();
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: ConcreteMatrixType { modulus, ring_dimension: 4, rows: digits, columns: 2 },
+            max_coefficient_bound: &base - BigInt::one(),
+        };
+        let mut backend = cpu_backend([parameters]);
+        let value = backend
+            .sample_hash_small_decomposed(
+                &schema.matrix,
+                [9u8; 32],
+                b"compact-codec",
+                &base,
+                digits,
+            )
+            .expect("compact hash decomposition");
+
+        let generic = backend
+            .small_matrix_to_bytes(&value, &schema, SmallMatrixSemanticKind::Generic)
+            .expect("encode generic compact matrix");
+        let preimage = backend
+            .small_matrix_to_bytes(&value, &schema, SmallMatrixSemanticKind::Preimage)
+            .expect("encode preimage compact matrix");
+        assert_eq!(&generic[..4], SMALL_MATRIX_MAGIC);
+        assert_eq!(generic[4], 0);
+        assert_eq!(preimage[4], 1);
+        assert_eq!(generic[5..], preimage[5..]);
+        assert_eq!(
+            backend
+                .small_matrix_from_bytes(&schema, &generic, SmallMatrixSemanticKind::Generic,)
+                .expect("decode generic compact matrix"),
+            value
+        );
+        assert!(
+            backend
+                .small_matrix_from_bytes(&schema, &generic, SmallMatrixSemanticKind::Preimage,)
+                .is_err()
+        );
+
+        let mut trailing = generic.clone();
+        trailing.push(0);
+        assert!(
+            backend
+                .small_matrix_from_bytes(&schema, &trailing, SmallMatrixSemanticKind::Generic,)
+                .is_err()
+        );
+
+        assert_eq!(schema.max_coefficient_bound, BigInt::from(255u16));
+        let bound_width = 1usize;
+        let payload_offset = 45 + bound_width;
+        let mut negative_zero = generic;
+        negative_zero[payload_offset] = 2;
+        negative_zero[payload_offset + 1] = 0;
+        assert!(
+            backend
+                .small_matrix_from_bytes(&schema, &negative_zero, SmallMatrixSemanticKind::Generic,)
+                .is_err()
+        );
     }
 }
 

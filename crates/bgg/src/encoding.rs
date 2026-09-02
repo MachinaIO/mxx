@@ -146,10 +146,10 @@ impl BggEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone() * decomposed_rhs + rhs.vector.clone() * plaintext,
+            vector: decomposed_rhs.mul_small_rhs(lhs.vector.clone()) +
+                rhs.vector.clone() * plaintext,
             pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
@@ -166,7 +166,7 @@ impl BggEncodingCompiler {
     pub fn large_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
         let decomposed = self.public_key.large_scalar_decomposition(&input.pubkey, scalar);
         BggEncodingWire {
-            vector: input.vector.clone() * decomposed.clone(),
+            vector: decomposed.clone().mul_small_rhs(input.vector.clone()),
             pubkey: self.public_key.large_scalar_mul_with_decomposition(&input.pubkey, decomposed),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
@@ -175,10 +175,9 @@ impl BggEncodingCompiler {
     pub fn matrix_mul(&self, input: &BggEncodingWire, target: &Mat) -> BggEncodingWire {
         let decomposed = target
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         BggEncodingWire {
-            vector: input.vector.clone() * decomposed,
+            vector: decomposed.mul_small_rhs(input.vector.clone()),
             pubkey: self.public_key.matrix_mul(&input.pubkey, target),
             plaintext: None,
         }
@@ -329,7 +328,7 @@ mod tests {
         node::{ConcatAxis, NodeKind},
     };
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -467,7 +466,11 @@ mod tests {
             kinds.iter().filter(|kind| matches!(kind, NodeKind::GadgetDecompose { .. })).count(),
             2
         );
-        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
+        assert_eq!(
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::MatrixMulSmallRhs)).count(),
+            2
+        );
+        assert!(!kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixScale { .. })));
 
         built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
@@ -532,10 +535,19 @@ mod tests {
             ]),
         );
 
-        let expected_vector =
-            lhs_vector.mul_decompose(&rhs_public) + rhs_vector * lhs_plaintext.entry(0, 0);
+        let expected_vector = lhs_vector
+            .clone()
+            .multiply_small_rhs(rhs_public.clone().gadget_decompose(false).unwrap())
+            .unwrap() +
+            rhs_vector * lhs_plaintext.entry(0, 0);
         assert_eq!(matrix_output(&result, "vector"), &expected_vector);
-        assert_eq!(matrix_output(&result, "public"), &lhs_public.mul_decompose(&rhs_public));
+        assert_eq!(
+            matrix_output(&result, "public"),
+            &lhs_public
+                .clone()
+                .multiply_small_rhs(rhs_public.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
         assert_eq!(matrix_output(&result, "plaintext"), &(lhs_plaintext * rhs_plaintext));
     }
     #[test]

@@ -6,6 +6,7 @@ namespace
         const uint8_t *widths,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
         size_t limb_count,
         uint32_t n,
         size_t poly_count)
@@ -15,7 +16,7 @@ namespace
         const size_t matrix_limb = blockIdx.z;
         const size_t limb = matrix_limb % limb_count;
         uint8_t *base = bases[matrix_limb];
-        const uint64_t modulus = gpu_ntt_const_moduli[limb];
+        const uint64_t modulus = moduli[limb];
         const uint64_t value = matrix_load_limb_u64(
             base, blockIdx.y, coefficient, strides[limb], widths[limb]);
         const size_t twiddle_index = limb * static_cast<size_t>(n) + coefficient;
@@ -61,6 +62,7 @@ namespace
         const uint8_t *widths,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
@@ -75,7 +77,7 @@ namespace
         const uint32_t j = butterfly % half;
         const uint32_t index = group * len + j;
         uint8_t *base = bases[matrix_limb];
-        const uint64_t modulus = gpu_ntt_const_moduli[limb];
+        const uint64_t modulus = moduli[limb];
         const uint32_t twiddle_exponent = 2U * (n / len) * j;
         const size_t twiddle_index =
             limb * static_cast<size_t>(n) + twiddle_exponent;
@@ -102,6 +104,7 @@ namespace
         uint8_t *const *outputs,
         const size_t *strides,
         const uint8_t *widths,
+        const uint64_t *moduli,
         size_t limb_count,
         uint32_t n,
         size_t poly_count)
@@ -111,7 +114,7 @@ namespace
         const size_t matrix_limb = blockIdx.z;
         const size_t limb = matrix_limb % limb_count;
         const uint32_t index = butterfly * 2;
-        const uint64_t modulus = gpu_ntt_const_moduli[limb];
+        const uint64_t modulus = moduli[limb];
         const uint64_t lower = matrix_load_limb_u64(
             inputs[matrix_limb], blockIdx.y, index, strides[limb], widths[limb]);
         const uint64_t upper = matrix_load_limb_u64(
@@ -131,6 +134,9 @@ namespace
         const uint8_t *widths,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
+        const uint64_t *n_inv,
+        const uint64_t *n_inv_shoup,
         size_t limb_count,
         uint32_t n,
         size_t poly_count)
@@ -140,13 +146,13 @@ namespace
         const size_t matrix_limb = blockIdx.z;
         const size_t limb = matrix_limb % limb_count;
         uint8_t *base = bases[matrix_limb];
-        const uint64_t modulus = gpu_ntt_const_moduli[limb];
+        const uint64_t modulus = moduli[limb];
         const uint64_t value = matrix_load_limb_u64(
             base, blockIdx.y, coefficient, strides[limb], widths[limb]);
         const uint64_t scaled = mul_mod_shoup_u64(
             value,
-            gpu_ntt_const_n_inv[limb],
-            gpu_ntt_const_n_inv_shoup[limb],
+            n_inv[limb],
+            n_inv_shoup[limb],
             modulus);
         const size_t twiddle_index = limb * static_cast<size_t>(n) + coefficient;
         const uint64_t twist = twiddles[twiddle_index];
@@ -186,11 +192,11 @@ int run_matrix_transform_batch(
     const size_t limb_count = static_cast<size_t>(first->level + 1);
     const size_t poly_count = matrix_poly_count(first);
     if (!is_power_of_two_u32(n) || n < 2 || limb_count == 0 || poly_count == 0)
-        return set_error("invalid matrix shape in gpu_matrix_intt_batch");
+        return set_error("invalid matrix shape in gpu_matrix_transform_batch");
     uint32_t log_n = 0;
     for (uint32_t value = n; value > 1; value >>= 1) ++log_n;
     if (matrix_count * limb_count > 65535 || poly_count > 65535)
-        return set_error("gpu_matrix_intt_batch exceeds CUDA grid dimensions");
+        return set_error("gpu_matrix_transform_batch exceeds CUDA grid dimensions");
     const auto &limb_ids = first->ctx->limb_gpu_ids;
     if (limb_ids.size() < limb_count) return set_error("missing batch INTT limb mapping");
     std::vector<uint8_t *> bases(matrix_count * limb_count);
@@ -226,7 +232,7 @@ int run_matrix_transform_batch(
                 !matrix_limb_metadata_by_id(matrix, limb_id, &stride, &width) ||
                 !matrix_limb_metadata_by_id(source, limb_id, &source_stride, &source_width) ||
                 source_device != limb_device || source_stride != stride || source_width != width)
-                return set_error("invalid limb in gpu_matrix_intt_batch");
+                return set_error("invalid limb in gpu_matrix_transform_batch");
             if (device < 0)
             {
                 device = limb_device;
@@ -234,7 +240,7 @@ int run_matrix_transform_batch(
                     return set_error("missing batch INTT stream");
             }
             else if (limb_device != device)
-                return set_error("gpu_matrix_intt_batch requires one placement");
+                return set_error("gpu_matrix_transform_batch requires one placement");
             if (matrix_index == 0)
             {
                 strides[limb] = stride;
@@ -255,7 +261,8 @@ int run_matrix_transform_batch(
     if (constants.device != device || constants.ring_dimension != n ||
         constants.limb_count < limb_count || !constants.twiddle_inverse ||
         !constants.twiddle_forward || !constants.twiddle_shoup_inverse ||
-        !constants.twiddle_shoup_forward)
+        !constants.twiddle_shoup_forward || !constants.moduli ||
+        !constants.n_inv || !constants.n_inv_shoup)
         return set_error("incompatible batch INTT constants");
     const uint64_t *twiddles =
         forward ? constants.twiddle_forward : constants.twiddle_inverse;
@@ -310,6 +317,7 @@ int run_matrix_transform_batch(
             device_widths,
             twiddles,
             twiddle_shoup,
+            constants.moduli,
             limb_count,
             n,
             poly_count);
@@ -340,6 +348,7 @@ int run_matrix_transform_batch(
             device_bases,
             device_strides,
             device_widths,
+            constants.moduli,
             limb_count,
             n,
             poly_count);
@@ -359,6 +368,7 @@ int run_matrix_transform_batch(
             device_widths,
             twiddles,
             twiddle_shoup,
+            constants.moduli,
             limb_count, n, len, poly_count);
         error = cudaGetLastError();
         if (error != cudaSuccess)
@@ -381,6 +391,9 @@ int run_matrix_transform_batch(
             device_widths,
             twiddles,
             twiddle_shoup,
+            constants.moduli,
+            constants.n_inv,
+            constants.n_inv_shoup,
             limb_count,
             n,
             poly_count);
@@ -417,16 +430,6 @@ int run_matrix_transform_batch(
     release();
     return 0;
 }
-}
-
-extern "C" int gpu_matrix_intt_batch(GpuMatrix *const *matrices, size_t matrix_count)
-{
-    return run_matrix_transform_batch(matrices, nullptr, matrix_count, false);
-}
-
-extern "C" int gpu_matrix_ntt_batch(GpuMatrix *const *matrices, size_t matrix_count)
-{
-    return run_matrix_transform_batch(matrices, nullptr, matrix_count, true);
 }
 
 extern "C" int gpu_matrix_intt_out_of_place_batch(

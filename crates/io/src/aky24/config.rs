@@ -21,6 +21,8 @@ pub struct Aky24IoConfig {
     pub input_size: usize,
     pub gadget_base: BigInt,
     pub digit_count: usize,
+    /// Inclusive coefficient bound for compact preimages produced by B.1.
+    pub preimage_max_coefficient_bound: BigInt,
     /// The Appendix B.1 high/low decomposition divisor `M`.
     pub modulus_split: BigInt,
     pub trapdoor_sigma: RealExpr,
@@ -62,6 +64,8 @@ pub enum Aky24ConfigError {
     InvalidModulusSplit,
     #[error("the AKY24 attribute encoding requires a binary gadget covering the modulus")]
     InvalidBinaryGadget,
+    #[error("the AKY24 compact preimage coefficient bound must be non-negative")]
+    InvalidPreimageBound,
 }
 
 impl Aky24IoConfig {
@@ -78,6 +82,9 @@ impl Aky24IoConfig {
             self.function.output_bits == 0
         {
             return Err(Aky24ConfigError::NonPositiveParameter);
+        }
+        if self.preimage_max_coefficient_bound < BigInt::from(0) {
+            return Err(Aky24ConfigError::InvalidPreimageBound);
         }
         let bindings = ParamEnv::default();
         if [
@@ -138,6 +145,7 @@ mod tests {
             input_size: 8,
             gadget_base: 2.into(),
             digit_count: 9,
+            preimage_max_coefficient_bound: 1_000_000.into(),
             modulus_split: 1.into(),
             trapdoor_sigma: RealExpr::from_integer(4),
             secret_sigma: RealExpr::from_integer(2),
@@ -219,5 +227,13 @@ mod tests {
         unevaluable.trapdoor_sigma =
             RealExpr::Div(Box::new(RealExpr::from_integer(1)), Box::new(RealExpr::from_integer(0)));
         assert_eq!(unevaluable.validate(), Err(Aky24ConfigError::InvalidGaussianSigma));
+    }
+
+    #[test]
+    fn preimage_bound_is_explicit_and_non_negative() {
+        let mut invalid = config();
+        invalid.preimage_max_coefficient_bound = (-1).into();
+        assert_eq!(invalid.validate(), Err(Aky24ConfigError::InvalidPreimageBound));
+        assert_eq!(config().preimage_max_coefficient_bound, 1_000_000.into());
     }
 }

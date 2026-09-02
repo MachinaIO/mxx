@@ -1688,6 +1688,7 @@ mod tests {
             input_size: 8,
             gadget_base: 2.into(),
             digit_count: 9,
+            preimage_max_coefficient_bound: 1_000_000.into(),
             modulus_split: 1.into(),
             trapdoor_sigma: RealExpr::from_integer(4),
             secret_sigma: RealExpr::from_integer(2),

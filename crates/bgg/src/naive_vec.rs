@@ -76,15 +76,19 @@ impl NaiveBggVecCompiler {
         }
         let vector_compiler = self.public_key.clone();
         let reveal = input.pubkey_reveal_plaintext;
-        let factors =
-            input.pubkeys.clone().parallel_zip(scalars.clone(), move |_, matrix, scalar| {
+        let factors = mxx_dsl::parallel_zip_bundle(
+            (input.pubkeys.clone(), scalars.clone()),
+            move |_, (matrix, scalar)| {
                 vector_compiler.large_scalar_decomposition(
                     &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
                     &scalar,
                 )
-            })?;
-        let vectors =
-            input.vectors.clone().parallel_zip(factors, |_, vector, factor| vector * factor)?;
+            },
+        )?;
+        let vectors = mxx_dsl::parallel_zip_bundle(
+            (input.vectors.clone(), factors),
+            |_, (vector, factor)| factor.mul_small_rhs(vector),
+        )?;
         let key_compiler = self.public_key.clone();
         let pubkeys =
             input.pubkeys.clone().parallel_zip(scalars.clone(), move |_, matrix, scalar| {
@@ -184,11 +188,14 @@ impl NaiveBggVecCompiler {
             lhs.plaintexts.clone().ok_or(NaiveVecCompileError::MissingLeftPlaintext)?;
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        let decomposed_rhs = rhs.pubkeys.clone().parallel_map(move |_, matrix| {
-            matrix.decompose(base.clone(), digits.clone()).as_mat()
-        })?;
-        let first =
-            lhs.vectors.clone().parallel_zip(decomposed_rhs, |_, left, right| left * right)?;
+        let decomposed_rhs = rhs
+            .pubkeys
+            .clone()
+            .parallel_map_values(move |_, matrix| matrix.decompose(base.clone(), digits.clone()))?;
+        let first = mxx_dsl::parallel_zip_bundle(
+            (lhs.vectors.clone(), decomposed_rhs),
+            |_, (left, right)| right.mul_small_rhs(left),
+        )?;
         let second = rhs
             .vectors
             .clone()
@@ -234,9 +241,11 @@ impl NaiveBggVecCompiler {
         validate_encoding(input)?;
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        let decomposed = target.clone().decompose(base, digits).as_mat();
-        let vectors =
-            input.vectors.clone().parallel_map(move |_, value| value * decomposed.clone())?;
+        let decomposed = target.clone().decompose(base, digits);
+        let vectors = input
+            .vectors
+            .clone()
+            .parallel_map(move |_, value| decomposed.clone().mul_small_rhs(value))?;
         let key_compiler = self.public_key.clone();
         let target_for_keys = target.clone();
         let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
@@ -349,7 +358,7 @@ impl NaiveBggVecCompiler {
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding(input)?;
         let vector_factor = if large {
-            let rows = input.pubkeys.clone().parallel_map({
+            let rows = input.pubkeys.clone().parallel_map_values({
                 let compiler = self.public_key.clone();
                 let scalar = scalar.clone();
                 move |_, matrix| {
@@ -367,9 +376,10 @@ impl NaiveBggVecCompiler {
             None
         };
         let vectors = match vector_factor {
-            Some(factors) => {
-                input.vectors.clone().parallel_zip(factors, |_, value, factor| value * factor)?
-            }
+            Some(factors) => mxx_dsl::parallel_zip_bundle(
+                (input.vectors.clone(), factors),
+                |_, (value, factor)| factor.mul_small_rhs(value),
+            )?,
             None => {
                 let scalar = scalar.clone();
                 input.vectors.clone().parallel_map(move |_, value| value * scalar.clone())?
@@ -605,7 +615,7 @@ mod tests {
     use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -828,8 +838,20 @@ mod tests {
                 ("target".to_owned(), RuntimeValue::matrix(target.clone())),
             ]),
         );
-        assert_eq!(matrix_output(&result, "vector"), &vector.mul_decompose(&target));
-        assert_eq!(matrix_output(&result, "public"), &public.mul_decompose(&target));
+        assert_eq!(
+            matrix_output(&result, "vector"),
+            &vector
+                .clone()
+                .multiply_small_rhs(target.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            matrix_output(&result, "public"),
+            &public
+                .clone()
+                .multiply_small_rhs(target.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
         assert!(output.plaintexts.is_none());
     }
     #[test]

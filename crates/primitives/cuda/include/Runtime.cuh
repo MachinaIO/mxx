@@ -69,14 +69,10 @@ struct GpuNttDeviceConstants
     uint64_t *twiddle_inverse; // limb-major layout: [limb][exponent]
     uint64_t *twiddle_shoup_forward;
     uint64_t *twiddle_shoup_inverse;
+    uint64_t *moduli;
+    uint64_t *n_inv;
+    uint64_t *n_inv_shoup;
 };
-
-#if defined(__CUDACC__)
-extern __constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint64_t gpu_ntt_const_n_inv_shoup[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint32_t gpu_ntt_const_limb_count;
-#endif
 
 struct GpuContext
 {

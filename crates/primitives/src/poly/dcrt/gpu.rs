@@ -38,6 +38,33 @@ pub(crate) struct GpuMatrixOpaque {
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
+pub(crate) struct GpuSmallMatrixOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GpuSmallMatrixAllocationReportRaw {
+    pub lhs_eval_bytes: usize,
+    pub compact_rhs_bytes: usize,
+    pub full_output_bytes: usize,
+    pub expanded_rhs_workspace_bytes: usize,
+    pub event_overhead_bytes: usize,
+    pub high_water_bytes: usize,
+    pub full_expanded_rhs_bytes: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GpuMatrixAllocationBytesRaw {
+    pub data_bytes: usize,
+    pub aux_bytes: usize,
+    pub event_bytes: usize,
+    pub total_bytes: usize,
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
 pub(crate) struct GpuP1CovarianceCacheOpaque {
     _private: [u8; 0],
 }
@@ -93,6 +120,14 @@ unsafe extern "C" {
         format: c_int,
         out_mat: *mut *mut GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_query_allocation_bytes(
+        ctx: *const GpuContextOpaque,
+        level: c_int,
+        rows: usize,
+        cols: usize,
+        format: c_int,
+        out: *mut GpuMatrixAllocationBytesRaw,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_destroy(mat: *mut GpuMatrixOpaque);
     pub(crate) fn gpu_matrix_wait(mat: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
@@ -137,13 +172,6 @@ unsafe extern "C" {
         out_max_coeff_bits: *mut u16,
         out_bytes_per_coeff: *mut u16,
         out_payload_lengths: *mut usize,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_batch_within_coefficient_bound(
-        matrices: *const *const GpuMatrixOpaque,
-        matrix_count: usize,
-        bound_words: *const u64,
-        bound_word_count: usize,
-        accepted_out: *mut u8,
     ) -> c_int;
     pub(crate) fn gpu_matrix_load_compact_bytes(
         mat: *mut GpuMatrixOpaque,
@@ -318,18 +346,63 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
-    pub(crate) fn gpu_matrix_intt_batch(
-        matrices: *const *mut GpuMatrixOpaque,
-        matrix_count: usize,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_intt_out_of_place_batch(
         outputs: *const *mut GpuMatrixOpaque,
         inputs: *const *const GpuMatrixOpaque,
         matrix_count: usize,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_ntt_batch(
-        matrices: *const *mut GpuMatrixOpaque,
-        matrix_count: usize,
+    pub(crate) fn gpu_small_matrix_create(
+        ctx: *mut GpuContextOpaque,
+        rows: usize,
+        cols: usize,
+        magnitude_bytes: usize,
+        bound_words: *const u64,
+        bound_word_count: usize,
+        out: *mut *mut GpuSmallMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_destroy(mat: *mut GpuSmallMatrixOpaque);
+    pub(crate) fn gpu_small_matrix_copy(
+        out: *mut GpuSmallMatrixOpaque,
+        src: *const GpuSmallMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_load_coefficients(
+        mat: *mut GpuSmallMatrixOpaque,
+        payload: *const u8,
+        payload_len: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_store_coefficients(
+        mat: *const GpuSmallMatrixOpaque,
+        payload: *mut u8,
+        payload_len: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_decompose_base(
+        src: *const GpuMatrixOpaque,
+        base_bits: u32,
+        small_mode: c_int,
+        max_coefficient_bound: *const u64,
+        bound_word_count: usize,
+        out: *mut GpuSmallMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_pack_checked_tile(
+        dst: *mut GpuSmallMatrixOpaque,
+        src: *const GpuMatrixOpaque,
+        dst_row: usize,
+        dst_col: usize,
+        rows: usize,
+        cols: usize,
+        bound_words: *const u64,
+        bound_word_count: usize,
+        accepted_out: *mut i32,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_mul_small_rhs(
+        out: *mut GpuMatrixOpaque,
+        lhs_eval: *const GpuMatrixOpaque,
+        rhs_small: *const GpuSmallMatrixOpaque,
+        ct: usize,
+        kt: usize,
+        ell: usize,
+        residency_budget_bytes: usize,
+        allocation_report: *mut GpuSmallMatrixAllocationReportRaw,
     ) -> c_int;
     fn gpu_device_synchronize() -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
@@ -711,6 +784,34 @@ impl GpuDCRTPolyParams {
 
     pub(crate) fn ctx_raw(&self) -> *mut GpuContextOpaque {
         self.ctx.raw_ptr()
+    }
+
+    pub(crate) fn matrix_allocation_bytes(
+        &self,
+        level: usize,
+        rows: usize,
+        columns: usize,
+        is_ntt: bool,
+    ) -> Result<GpuMatrixAllocationBytesRaw, String> {
+        if level >= self.crt_depth {
+            return Err("matrix allocation query level exceeds CRT depth".to_string());
+        }
+        let mut allocation = GpuMatrixAllocationBytesRaw::default();
+        let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        let status = unsafe {
+            gpu_matrix_query_allocation_bytes(
+                self.ctx_raw(),
+                level as c_int,
+                rows,
+                columns,
+                format,
+                &mut allocation,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(allocation)
     }
 
     pub(crate) fn modulus_for_level(&self, level: usize) -> BigUint {
@@ -1320,6 +1421,79 @@ mod tests {
 
     fn gpu_poly_from_cpu(poly: &DCRTPoly, gpu_params: &GpuDCRTPolyParams) -> GpuDCRTPoly {
         GpuDCRTPoly::from_coeffs(gpu_params, &poly.coeffs())
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_allocation_query_is_stable_and_checked() {
+        gpu_device_sync();
+        let params = gpu_params_from_cpu(&gpu_test_params());
+        let device = *params.gpu_ids().first().expect("GPU test requires one device");
+        let before = gpu_memory_info(device).expect("query device memory before");
+        let first = params
+            .matrix_allocation_bytes(params.crt_depth() - 1, 2, 3, true)
+            .expect("first allocation query");
+        let second = params
+            .matrix_allocation_bytes(params.crt_depth() - 1, 2, 3, true)
+            .expect("second allocation query");
+        let after = gpu_memory_info(device).expect("query device memory after");
+
+        assert_eq!(first, second);
+        assert_eq!(before, after, "allocation query must not change device memory");
+        assert_eq!(first.total_bytes, first.data_bytes + first.aux_bytes + first.event_bytes);
+        assert!(first.data_bytes > 0);
+        assert!(first.aux_bytes > 0);
+        assert!(first.event_bytes > 0);
+        const RUNTIME_MAX_AUX_LIMBS: usize = 64;
+        let matrix_count = 2 * 3;
+        let expected_aux = RUNTIME_MAX_AUX_LIMBS *
+            (4 + 4 * params.dnum as usize) *
+            matrix_count *
+            std::mem::size_of::<*mut u8>();
+        assert_eq!(
+            first.aux_bytes, expected_aux,
+            "query must cover the complete context aux slab so checked operations cannot fall back"
+        );
+        assert!(
+            params.matrix_allocation_bytes(params.crt_depth() - 1, usize::MAX, 2, true).is_err(),
+            "overflow must fail through the shared CUDA planner"
+        );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_allocation_query_uses_partition_decomposition_metadata() {
+        let devices = detected_gpu_device_ids();
+        if devices.len() < 2 {
+            return;
+        }
+        let cpu = DCRTPolyParams::new(128, 4, 17, 1);
+        let (moduli, _, _) = cpu.to_crt();
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            cpu.ring_dimension(),
+            moduli,
+            cpu.base_bits(),
+            devices[..2].to_vec(),
+            Some(2),
+        );
+        assert_ne!(params.dnum as usize, params.crt_depth());
+        let allocation = params
+            .matrix_allocation_bytes(params.crt_depth() - 1, 3, 2, true)
+            .expect("multi-partition allocation query");
+        assert_eq!(
+            allocation.total_bytes,
+            allocation.data_bytes + allocation.aux_bytes + allocation.event_bytes
+        );
+        assert!(allocation.data_bytes > 0 && allocation.aux_bytes > 0);
+        const RUNTIME_MAX_AUX_LIMBS: usize = 64;
+        let matrix_count = 3 * 2;
+        let per_partition_aux =
+            RUNTIME_MAX_AUX_LIMBS * (4 + 4) * matrix_count * std::mem::size_of::<*mut u8>();
+        assert_eq!(
+            allocation.aux_bytes,
+            2 * per_partition_aux,
+            "each nonempty partition must query its complete no-fallback aux slab"
+        );
     }
 
     #[test]

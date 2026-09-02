@@ -15,20 +15,20 @@ use mxx_bgg::{
     AttributeEncodingCompiler, AttributeEncodingWire, AttributeEvaluationError,
     AttributeMatrixEvaluation,
 };
-use mxx_dsl::{Bool, Family, Int, Mat, Ring, Trapdoor};
+use mxx_dsl::{Bool, Family, Int, Mat, Preimage, Ring, Trapdoor};
 #[cfg(test)]
 use mxx_gadgets::circuit_gadgets::fhe_prg::goldreich::GoldreichGraph;
 use mxx_gadgets::{
-    Poly,
     circuit::{
-        ArithmeticCircuitLowering, CircuitLowerError, CircuitLoweringTypes, GateInstance,
-        PolyCircuit, PolyGateKind, PublicLookupLowering, SlotOperationLowering, gate::GateId,
-        lower_circuit,
+        gate::GateId, lower_circuit, ArithmeticCircuitLowering, CircuitLowerError,
+        CircuitLoweringTypes, GateInstance, PolyCircuit, PolyGateKind, PublicLookupLowering,
+        SlotOperationLowering,
     },
+    Poly,
 };
 use mxx_ir_core::{
-    IntExpr, ParamEnv,
     node::{ConcatAxis, IndexRange},
+    IntExpr, ParamEnv,
 };
 use num_bigint::BigInt;
 use thiserror::Error;
@@ -174,7 +174,7 @@ pub(crate) struct PrivatePrfeEncryptionCoins {
 
 #[derive(Clone)]
 pub(crate) struct PrivatePrfeFunctionKeyWire {
-    pub preimage: Mat,
+    pub preimage: Preimage,
     pub output_count: usize,
 }
 
@@ -297,6 +297,7 @@ impl PrivatePrfeLayerWires {
             config.trapdoor_sigma.clone(),
             config.gadget_base.clone(),
             config.digit_count,
+            config.preimage_max_coefficient_bound.clone(),
         );
         let b_public = b_trapdoor.public_matrix();
         Ok(Self {
@@ -664,10 +665,8 @@ impl PrivatePrfeLayerWires {
         )?;
         let target = self.combine_high_low(high, low, SECRET_ROWS, output_count)?;
         let b_rows = IntExpr::constant(SECRET_ROWS * (self.config.digit_count + 2));
-        let preimage = self
-            .b_trapdoor
-            .sample_preimage(target, (b_rows, IntExpr::constant(output_count)))
-            .as_mat();
+        let preimage =
+            self.b_trapdoor.sample_preimage(target, (b_rows, IntExpr::constant(output_count)));
         Ok(PrivatePrfeFunctionKeyWire { preimage, output_count })
     }
 
@@ -694,7 +693,7 @@ impl PrivatePrfeLayerWires {
         let high = self.evaluate_ciphertext_matrix(veval_high, ciphertext, public_inputs)?;
         let low = self.evaluate_ciphertext_matrix(veval_low, ciphertext, public_inputs)?;
         let evaluated = self.combine_high_low(high.vector, low.vector, 1, output_count)?;
-        let z = ciphertext.c_b.clone() * key.preimage.clone() - evaluated;
+        let z = key.preimage.clone().mul_small_rhs(ciphertext.c_b.clone()) - evaluated;
         Ok(z.threshold_decode_bools(2, output_count))
     }
 
@@ -1298,17 +1297,17 @@ mod tests {
     use crate::aky24::config::Aky24GoldreichPrf;
     use mxx_dsl::DslContext;
     use mxx_gadgets::circuit_gadgets::fhe_prg::goldreich::GoldreichGraphGeneration;
-    use mxx_ir_core::{ParamEnv, RealExpr};
+    use mxx_ir_core::{node::NodeKind, types::WireType, ParamEnv, RealExpr};
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{dcrt_poly::DCRTPolyMatrix, PolyMatrix},
         poly::{
-            Poly as ConcretePoly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+            Poly as ConcretePoly, PolyParams,
         },
     };
     use mxx_runtime::{
-        Backend, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
+        artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
+        transcript::SamplingMode, Backend, RuntimeValue,
     };
     use std::collections::BTreeMap;
 
@@ -1319,6 +1318,7 @@ mod tests {
             input_size: 8,
             gadget_base: BigInt::from(1u64 << parameters.base_bits()),
             digit_count: parameters.modulus_digits(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
             modulus_split: 1.into(),
             trapdoor_sigma: RealExpr::from_integer(4),
             secret_sigma: RealExpr::from_integer(2),
@@ -1363,12 +1363,22 @@ mod tests {
             .unwrap();
         let low = zero_veval(input_count);
         let key = layer.keygen(&high, &low, &[]).unwrap();
+        assert_eq!(
+            key.preimage.max_coefficient_bound(),
+            &IntExpr::constant(config.preimage_max_coefficient_bound.clone()),
+        );
         let decoded = layer.decrypt(&high, &low, &ciphertext, &key, &[]).unwrap();
         let graph = DslContext::new("aky24-private-prfe-nonzero-noise")
             .bool_output("decoded", decoded[0].clone())
             .unwrap()
             .build()
             .unwrap();
+        let nodes = graph.graph.root_scope().nodes();
+        assert!(nodes.iter().any(|node| {
+            matches!(node.kind(), NodeKind::MatrixMulSmallRhs) &&
+                matches!(node.output_types(), [WireType::Matrix(_)])
+        }));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
         let validated = graph.validate(&ParamEnv::default()).unwrap();
         let result = execute(
             &validated,
@@ -1486,7 +1496,11 @@ mod tests {
         let encoded_message = message
             .into_iter()
             .map(|bit| {
-                if bit { layer.compiler.ring.identity(1) } else { layer.compiler.ring.zero((1, 1)) }
+                if bit {
+                    layer.compiler.ring.identity(1)
+                } else {
+                    layer.compiler.ring.zero((1, 1))
+                }
             })
             .collect::<Vec<_>>();
         let ciphertext = layer

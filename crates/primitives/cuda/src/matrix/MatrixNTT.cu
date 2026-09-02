@@ -1,8 +1,3 @@
-__constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint64_t gpu_ntt_const_n_inv_shoup[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint32_t gpu_ntt_const_limb_count;
-
 namespace
 {
     constexpr uint32_t kTransformThreads = 256;
@@ -40,6 +35,7 @@ namespace
         const uint8_t *limb_coeff_bytes,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
         size_t limb_count,
         uint32_t n,
         size_t poly_offset)
@@ -58,11 +54,7 @@ namespace
         uint8_t *const base = limb_bases[limb_idx];
         const size_t stride_bytes = limb_stride_bytes[limb_idx];
         const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
-        if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
-        {
-            return;
-        }
-        const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
+        const uint64_t modulus = moduli[limb_idx];
         const size_t twiddle_idx = limb_idx * static_cast<size_t>(n) + coeff_idx;
         const uint64_t tw = twiddles[twiddle_idx];
         const uint64_t src = matrix_load_limb_u64(base, poly_idx, coeff_idx, stride_bytes, coeff_bytes);
@@ -79,6 +71,9 @@ namespace
         uint8_t *const *limb_bases,
         const size_t *limb_stride_bytes,
         const uint8_t *limb_coeff_bytes,
+        const uint64_t *moduli,
+        const uint64_t *n_inv,
+        const uint64_t *n_inv_shoup,
         size_t limb_count,
         uint32_t n,
         size_t poly_offset)
@@ -97,12 +92,8 @@ namespace
         uint8_t *const base = limb_bases[limb_idx];
         const size_t stride_bytes = limb_stride_bytes[limb_idx];
         const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
-        if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
-        {
-            return;
-        }
-        const uint64_t factor = gpu_ntt_const_n_inv[limb_idx];
-        const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
+        const uint64_t factor = n_inv[limb_idx];
+        const uint64_t modulus = moduli[limb_idx];
         const uint64_t src = matrix_load_limb_u64(base, poly_idx, coeff_idx, stride_bytes, coeff_bytes);
         matrix_store_limb_u64(
             base,
@@ -113,7 +104,7 @@ namespace
             mul_mod_shoup_u64(
                 src,
                 factor,
-                gpu_ntt_const_n_inv_shoup[limb_idx],
+                n_inv_shoup[limb_idx],
                 modulus));
     }
 
@@ -158,6 +149,7 @@ namespace
         const uint8_t *limb_coeff_bytes,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
@@ -182,11 +174,7 @@ namespace
         uint8_t *const base = limb_bases[limb_idx];
         const size_t stride_bytes = limb_stride_bytes[limb_idx];
         const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
-        if (limb_idx >= static_cast<size_t>(gpu_ntt_const_limb_count))
-        {
-            return;
-        }
-        const uint64_t modulus = gpu_ntt_const_moduli[limb_idx];
+        const uint64_t modulus = moduli[limb_idx];
         const uint32_t twiddle_exponent = 2U * (n / len) * j;
         const size_t twiddle_idx =
             limb_idx * static_cast<size_t>(n) + twiddle_exponent;
@@ -223,13 +211,14 @@ namespace
         const uint8_t *limb_coeff_bytes,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
         cudaStream_t stream)
     {
         if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
-            !twiddles || !twiddle_shoup)
+            !twiddles || !twiddle_shoup || !moduli)
         {
             return set_error("null metadata in launch_twist_for_all_limbs");
         }
@@ -255,6 +244,7 @@ namespace
                 limb_coeff_bytes,
                 twiddles,
                 twiddle_shoup,
+                moduli,
                 limb_count,
                 n,
                 offset);
@@ -271,12 +261,16 @@ namespace
         uint8_t *const *limb_bases,
         const size_t *limb_stride_bytes,
         const uint8_t *limb_coeff_bytes,
+        const uint64_t *moduli,
+        const uint64_t *n_inv,
+        const uint64_t *n_inv_shoup,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
         cudaStream_t stream)
     {
-        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes)
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
+            !moduli || !n_inv || !n_inv_shoup)
         {
             return set_error("null metadata in launch_scale_for_all_limbs");
         }
@@ -300,6 +294,9 @@ namespace
                 limb_bases,
                 limb_stride_bytes,
                 limb_coeff_bytes,
+                moduli,
+                n_inv,
+                n_inv_shoup,
                 limb_count,
                 n,
                 offset);
@@ -365,6 +362,7 @@ namespace
         const uint8_t *limb_coeff_bytes,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
         size_t limb_count,
         uint32_t n,
         uint32_t len,
@@ -372,7 +370,7 @@ namespace
         cudaStream_t stream)
     {
         if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
-            !twiddles || !twiddle_shoup)
+            !twiddles || !twiddle_shoup || !moduli)
         {
             return set_error("null metadata in launch_stage_for_all_limbs");
         }
@@ -399,6 +397,7 @@ namespace
                 limb_coeff_bytes,
                 twiddles,
                 twiddle_shoup,
+                moduli,
                 limb_count,
                 n,
                 len,
@@ -563,7 +562,9 @@ namespace
         if (!device_constants.twiddle_forward ||
             !device_constants.twiddle_inverse ||
             !device_constants.twiddle_shoup_forward ||
-            !device_constants.twiddle_shoup_inverse)
+            !device_constants.twiddle_shoup_inverse ||
+            !device_constants.moduli || !device_constants.n_inv ||
+            !device_constants.n_inv_shoup)
         {
             return set_error("null per-device NTT constants in run_matrix_transform_u64");
         }
@@ -678,6 +679,7 @@ namespace
                 limb_coeff_bytes_device,
                 twiddles,
                 twiddle_shoup,
+                device_constants.moduli,
                 limb_count,
                 n,
                 poly_count,
@@ -709,6 +711,7 @@ namespace
                     limb_coeff_bytes_device,
                     twiddles,
                     twiddle_shoup,
+                    device_constants.moduli,
                     limb_count,
                     n,
                     len,
@@ -748,6 +751,7 @@ namespace
                     limb_coeff_bytes_device,
                     twiddles,
                     twiddle_shoup,
+                    device_constants.moduli,
                     limb_count,
                     n,
                     len,
@@ -763,6 +767,9 @@ namespace
                 limb_bases_device,
                 limb_stride_bytes_device,
                 limb_coeff_bytes_device,
+                device_constants.moduli,
+                device_constants.n_inv,
+                device_constants.n_inv_shoup,
                 limb_count,
                 n,
                 poly_count,
@@ -778,6 +785,7 @@ namespace
                 limb_coeff_bytes_device,
                 twiddles,
                 twiddle_shoup,
+                device_constants.moduli,
                 limb_count,
                 n,
                 poly_count,

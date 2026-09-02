@@ -27,12 +27,6 @@ extern "C"
         size_t words_per_poly,
         GpuEventSet **out_events);
 
-    int gpu_matrix_batch_within_coefficient_bound(
-        const GpuMatrix *const *matrices,
-        size_t matrix_count,
-        const uint64_t *bound_words,
-        size_t bound_word_count,
-        uint8_t *accepted_out);
 
     int gpu_matrix_store_compact_bytes(
         GpuMatrix *mat,

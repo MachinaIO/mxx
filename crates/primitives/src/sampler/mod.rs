@@ -1,4 +1,7 @@
-use crate::{matrix::PolyMatrix, poly::Poly};
+use crate::{
+    matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError},
+    poly::Poly,
+};
 use num_bigint::BigUint;
 
 pub mod bounds;
@@ -152,7 +155,7 @@ pub trait PolyUniformSampler {
 }
 
 pub trait PolyTrapdoorSampler {
-    type M: PolyMatrix;
+    type M: PolyMatrixSmallRhs;
     type Trapdoor: Send + Sync;
 
     fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self;
@@ -176,38 +179,8 @@ pub trait PolyTrapdoorSampler {
         trapdoor: &Self::Trapdoor,
         public_matrix: &Self::M,
         target: &Self::M,
-    ) -> Self::M;
-
-    #[cfg(feature = "gpu")]
-    fn preimage_batched_sharded<'a>(
-        &self,
-        requests: Vec<crate::sampler::trapdoor::GpuPreimageRequest<'a, Self::M, Self::Trapdoor>>,
-    ) -> Vec<(usize, Self::M)>
-    where
-        Self::Trapdoor: Send + Sync + 'a,
-        Self::M: 'a,
-    {
-        requests
-            .into_iter()
-            .map(|request| {
-                let out = loop {
-                    let candidate = self.preimage(
-                        request.params,
-                        request.trapdoor,
-                        request.public_matrix,
-                        &request.target,
-                    );
-                    if bounds::matrix_within_coefficient_bound(
-                        &candidate,
-                        &request.max_coefficient_bound,
-                    ) {
-                        break candidate;
-                    }
-                };
-                (request.entry_idx, out)
-            })
-            .collect()
-    }
+        max_coefficient_bound: BigUint,
+    ) -> Result<<Self::M as PolyMatrixSmallRhs>::SmallMatrix, SmallMatrixError>;
 
     // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.
     // [B,C]D = U.

@@ -2,7 +2,8 @@
 
 use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
 use mxx_dsl::{
-    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending, Ring,
+    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending,
+    Preimage, Ring,
 };
 use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
@@ -84,8 +85,7 @@ impl BggPublicKeyCompiler {
 
     /// Builds `lhs * G^-1(rhs)` directly in the executable core DAG.
     pub fn mul(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
-        let decomposed =
-            rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        let decomposed = rhs.matrix.clone().decompose(self.base.clone(), self.digit_count.clone());
         self.mul_with_decomposition(lhs, rhs, decomposed)
     }
 
@@ -93,10 +93,10 @@ impl BggPublicKeyCompiler {
         &self,
         lhs: &BggPublicKeyWire,
         rhs: &BggPublicKeyWire,
-        decomposed_rhs: Mat,
+        decomposed_rhs: Preimage,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: lhs.matrix.clone() * decomposed_rhs,
+            matrix: decomposed_rhs.mul_small_rhs(lhs.matrix.clone()),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
@@ -114,10 +114,9 @@ impl BggPublicKeyCompiler {
     }
 
     pub fn matrix_mul(&self, input: &BggPublicKeyWire, target: &Mat) -> BggPublicKeyWire {
-        let decomposed =
-            target.clone().decompose(self.base.clone(), self.digit_count.clone()).as_mat();
+        let decomposed = target.clone().decompose(self.base.clone(), self.digit_count.clone());
         BggPublicKeyWire {
-            matrix: input.matrix.clone() * decomposed,
+            matrix: decomposed.mul_small_rhs(input.matrix.clone()),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -125,18 +124,22 @@ impl BggPublicKeyCompiler {
     pub(crate) fn large_scalar_mul_with_decomposition(
         &self,
         input: &BggPublicKeyWire,
-        decomposed: Mat,
+        decomposed: Preimage,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: input.matrix.clone() * decomposed,
+            matrix: decomposed.mul_small_rhs(input.matrix.clone()),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
 
-    pub(crate) fn large_scalar_decomposition(&self, input: &BggPublicKeyWire, scalar: &Mat) -> Mat {
+    pub(crate) fn large_scalar_decomposition(
+        &self,
+        input: &BggPublicKeyWire,
+        scalar: &Mat,
+    ) -> Preimage {
         let rows = input.matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
-        (gadget * scalar.clone()).decompose(self.base.clone(), self.digit_count.clone()).as_mat()
+        (gadget * scalar.clone()).decompose(self.base.clone(), self.digit_count.clone())
     }
 }
 
@@ -214,9 +217,9 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
     use mxx_dsl::DslContext;
-    use mxx_ir_core::ParamEnv;
+    use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
     use mxx_runtime::RuntimeValue;
@@ -235,6 +238,13 @@ mod tests {
             .expect("output")
             .build()
             .expect("build");
+        let nodes =
+            built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert_eq!(
+            nodes.iter().filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)).count(),
+            1
+        );
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
         mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid graph");
     }
 
@@ -326,7 +336,19 @@ mod tests {
 
         assert_eq!(matrix_output(&result, "add"), &(lhs_value.clone() + rhs_value.clone()));
         assert_eq!(matrix_output(&result, "sub"), &(lhs_value.clone() - rhs_value.clone()));
-        assert_eq!(matrix_output(&result, "mul"), &lhs_value.mul_decompose(&rhs_value));
-        assert_eq!(matrix_output(&result, "matrix-mul"), &lhs_value.mul_decompose(&target_value));
+        assert_eq!(
+            matrix_output(&result, "mul"),
+            &lhs_value
+                .clone()
+                .multiply_small_rhs(rhs_value.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            matrix_output(&result, "matrix-mul"),
+            &lhs_value
+                .clone()
+                .multiply_small_rhs(target_value.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
     }
 }

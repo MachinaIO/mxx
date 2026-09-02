@@ -119,7 +119,16 @@ pub struct IntType;
 pub struct BoolType;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PreimageType(pub MatrixType);
+pub struct SmallMatrixType {
+    pub matrix: MatrixType,
+    pub max_coefficient_bound: IntExpr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PreimageType {
+    pub matrix: MatrixType,
+    pub max_coefficient_bound: IntExpr,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TrapdoorType {
@@ -137,18 +146,8 @@ pub struct TrapdoorFamilyType {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct MatFamilyType {
-    pub element: MatrixType,
-    pub count: IntExpr,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct IntFamilyType {
-    pub count: IntExpr,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct BoolFamilyType {
+pub struct FamilyType<S> {
+    pub element: S,
     pub count: IntExpr,
 }
 
@@ -209,16 +208,54 @@ impl Ring {
     }
 
     #[track_caller]
+    pub fn small_matrix_input(
+        &self,
+        name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> SmallMatrix {
+        SmallMatrix::source_input(
+            name.into(),
+            self.matrix_type(shape),
+            max_coefficient_bound.into(),
+            None,
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_artifact_input(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> SmallMatrix {
+        let artifact_name = artifact_name.into();
+        SmallMatrix::source_input(
+            artifact_name.clone(),
+            self.matrix_type(shape),
+            max_coefficient_bound.into(),
+            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+        )
+    }
+
+    #[track_caller]
     pub fn preimage_artifact_input(
         &self,
         production_id: ProductionId,
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
         confidentiality: ArtifactConfidentiality,
     ) -> Preimage {
         let artifact_name = artifact_name.into();
         let matrix_type = self.matrix_type(shape);
-        let wire_type = WireType::Preimage(matrix_type.clone());
+        let max_coefficient_bound = max_coefficient_bound.into();
+        let wire_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
         let node = NodeHandle::new(
             NodeKind::Input {
                 name: artifact_name.clone(),
@@ -231,6 +268,7 @@ impl Ring {
         Preimage {
             value: node.output(0).expect("preimage artifact input"),
             matrix_type,
+            max_coefficient_bound,
             pending: Pending::default(),
         }
     }
@@ -336,9 +374,13 @@ impl Ring {
             .canonicalize(),
         });
         let public_artifact_name = public_artifact_name.into();
-        let public = Family::source_input(
+        let public = Family::<Mat>::source_input(
             format!("artifact:{public_artifact_name}"),
-            matrix_type.clone(),
+            Mat::source_input(
+                "__trapdoor-family-public-schema".to_owned(),
+                matrix_type.clone(),
+                None,
+            ),
             count.clone(),
             Some(ArtifactInput {
                 production_id: production_id.clone(),
@@ -375,7 +417,56 @@ impl Ring {
         shape: impl IntoShape,
     ) -> Family<Mat> {
         let element = self.matrix_type(shape);
-        Family::source_input(name.into(), element, count.into(), None)
+        Family::<Mat>::source_input(
+            name.into(),
+            Mat::source_input("__family-element".to_owned(), element, None),
+            count.into(),
+            None,
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_input_family(
+        &self,
+        name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Family<SmallMatrix> {
+        Family::<SmallMatrix>::source_input(
+            name.into(),
+            SmallMatrix::source_input(
+                "__small-matrix-family-element".to_owned(),
+                self.matrix_type(shape),
+                max_coefficient_bound.into(),
+                None,
+            ),
+            count.into(),
+            None,
+        )
+    }
+
+    #[track_caller]
+    pub fn preimage_input_family(
+        &self,
+        name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Family<Preimage> {
+        let matrix_type = self.matrix_type(shape);
+        let max_coefficient_bound = max_coefficient_bound.into();
+        Family::<Preimage>::source_input(
+            name.into(),
+            Preimage::source_input(
+                "__preimage-family-element".to_owned(),
+                matrix_type,
+                max_coefficient_bound,
+                None,
+            ),
+            count.into(),
+            None,
+        )
     }
 
     #[track_caller]
@@ -388,9 +479,59 @@ impl Ring {
         confidentiality: ArtifactConfidentiality,
     ) -> Family<Mat> {
         let artifact_name = artifact_name.into();
-        Family::source_input(
+        Family::<Mat>::source_input(
             format!("artifact:{artifact_name}"),
-            self.matrix_type(shape),
+            Mat::source_input("__family-element".to_owned(), self.matrix_type(shape), None),
+            count.into(),
+            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_family_artifact_input(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> Family<SmallMatrix> {
+        let artifact_name = artifact_name.into();
+        Family::<SmallMatrix>::source_input(
+            format!("artifact:{artifact_name}"),
+            SmallMatrix::source_input(
+                "__small-matrix-family-element".to_owned(),
+                self.matrix_type(shape),
+                max_coefficient_bound.into(),
+                None,
+            ),
+            count.into(),
+            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+        )
+    }
+
+    #[track_caller]
+    pub fn preimage_family_artifact_input(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> Family<Preimage> {
+        let artifact_name = artifact_name.into();
+        let matrix_type = self.matrix_type(shape);
+        let max_coefficient_bound = max_coefficient_bound.into();
+        Family::<Preimage>::source_input(
+            format!("artifact:{artifact_name}"),
+            Preimage::source_input(
+                "__preimage-family-element".to_owned(),
+                matrix_type,
+                max_coefficient_bound,
+                None,
+            ),
             count.into(),
             Some(ArtifactInput { production_id, artifact_name, confidentiality }),
         )
@@ -516,8 +657,8 @@ impl Ring {
         shape: impl IntoShape,
         base: impl Into<IntExpr>,
         digit_count: impl Into<IntExpr>,
-    ) -> Mat {
-        self.hash(
+    ) -> SmallMatrix {
+        self.hash_bounded(
             key,
             tag,
             shape,
@@ -525,6 +666,72 @@ impl Ring {
             Some(base.into()),
             Some(digit_count.into()),
         )
+    }
+
+    #[track_caller]
+    pub fn hash_small_decomposed(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        shape: impl IntoShape,
+        base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+    ) -> SmallMatrix {
+        self.hash_bounded(
+            key,
+            tag,
+            shape,
+            HashVariant::SmallDecomposed,
+            Some(base.into()),
+            Some(digit_count.into()),
+        )
+    }
+
+    #[track_caller]
+    fn hash_bounded(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        shape: impl IntoShape,
+        variant: HashVariant,
+        base: Option<IntExpr>,
+        digit_count: Option<IntExpr>,
+    ) -> SmallMatrix {
+        let matrix_type = self.matrix_type(shape);
+        let tag = tag.into();
+        let base = base.expect("bounded hash requires a gadget base");
+        let max_coefficient_bound = if matches!(variant, HashVariant::SmallDecomposed) {
+            IntExpr::Sub(Box::new(base.clone()), Box::new(IntExpr::constant(1))).canonicalize()
+        } else {
+            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2))).canonicalize()
+        };
+        let pending = Pending::merge([key.pending.clone(), tag.pending]);
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
+        let wire_type = WireType::SmallMatrix {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::HashSample {
+                matrix_type: matrix_type.clone(),
+                variant,
+                tag_prefix: tag.prefix,
+                tag_expressions: tag.binary,
+                tag_decimal_expressions: tag.decimal,
+                tag_u64_le_expressions: tag.u64_le,
+                base: Some(base),
+                digit_count,
+            },
+            arguments,
+            vec![wire_type],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("bounded hash output"),
+            matrix_type,
+            max_coefficient_bound,
+            pending,
+        }
     }
 
     #[track_caller]
@@ -790,6 +997,26 @@ impl Mat {
         &self.matrix_type
     }
 
+    #[track_caller]
+    pub fn mul_small_rhs(self, rhs: SmallMatrix) -> Self {
+        let output_type = MatrixType {
+            rows: self.matrix_type.rows.clone(),
+            columns: rhs.matrix_type.columns.clone(),
+            ..self.matrix_type.clone()
+        };
+        let pending = Pending::merge([self.pending.clone(), rhs.pending.clone()]);
+        let node = NodeHandle::new(
+            NodeKind::MatrixMulSmallRhs,
+            vec![self.value, rhs.value],
+            vec![WireType::Matrix(output_type.clone())],
+        );
+        Self {
+            value: node.output(0).expect("small RHS multiplication"),
+            matrix_type: output_type,
+            pending,
+        }
+    }
+
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }
@@ -870,12 +1097,26 @@ impl Mat {
             ..self.matrix_type.clone()
         };
         let pending = self.pending;
+        let max_coefficient_bound = if small {
+            IntExpr::Sub(Box::new(base.clone()), Box::new(IntExpr::constant(1))).canonicalize()
+        } else {
+            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2))).canonicalize()
+        };
         let node = NodeHandle::new(
             NodeKind::GadgetDecompose { base, small, digit_count },
             vec![self.value],
-            vec![WireType::Preimage(ty.clone())],
+            vec![WireType::Preimage {
+                matrix: ty.clone(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+            }],
         );
-        Preimage { value: node.output(0).expect("decomposition"), matrix_type: ty, pending }
+        let preimage = Preimage {
+            value: node.output(0).expect("decomposition"),
+            matrix_type: ty,
+            max_coefficient_bound,
+            pending,
+        };
+        preimage
     }
 
     #[track_caller]
@@ -1046,26 +1287,65 @@ impl Neg for Mat {
 pub struct Preimage {
     value: ValueHandle,
     matrix_type: MatrixType,
+    max_coefficient_bound: IntExpr,
     pending: Pending,
 }
 
 impl Preimage {
+    fn source_input(
+        name: String,
+        matrix_type: MatrixType,
+        max_coefficient_bound: IntExpr,
+        artifact: Option<ArtifactInput>,
+    ) -> Self {
+        let wire_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::Input { name, wire_type: wire_type.clone(), artifact },
+            Vec::new(),
+            vec![wire_type],
+        );
+        Self {
+            value: node.output(0).expect("preimage input"),
+            matrix_type,
+            max_coefficient_bound,
+            pending: Pending::default(),
+        }
+    }
+
     #[doc(hidden)]
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }
 
-    pub fn as_mat(self) -> Mat {
-        let matrix_type = self.matrix_type;
-        Mat::from_node(
-            NodeKind::MatrixScale { scalar: IntExpr::constant(1) },
-            vec![Mat {
-                value: self.value,
-                matrix_type: matrix_type.clone(),
-                pending: self.pending,
-            }],
-            matrix_type,
-        )
+    pub fn matrix_type(&self) -> &MatrixType {
+        &self.matrix_type
+    }
+
+    pub fn max_coefficient_bound(&self) -> &IntExpr {
+        &self.max_coefficient_bound
+    }
+
+    #[track_caller]
+    pub fn mul_small_rhs(self, lhs: Mat) -> Mat {
+        let output_type = MatrixType {
+            rows: lhs.matrix_type.rows.clone(),
+            columns: self.matrix_type.columns.clone(),
+            ..lhs.matrix_type.clone()
+        };
+        let pending = Pending::merge([lhs.pending.clone(), self.pending.clone()]);
+        let node = NodeHandle::new(
+            NodeKind::MatrixMulSmallRhs,
+            vec![lhs.value, self.value],
+            vec![WireType::Matrix(output_type.clone())],
+        );
+        Mat {
+            value: node.output(0).expect("preimage multiplication"),
+            matrix_type: output_type,
+            pending,
+        }
     }
 }
 
@@ -1088,6 +1368,10 @@ impl Trapdoor {
         self.public.clone()
     }
 
+    pub fn preimage_max_coefficient_bound(&self) -> &IntExpr {
+        &self.preimage_max_coefficient_bound
+    }
+
     #[track_caller]
     pub fn sample_preimage(&self, target: Mat, shape: impl IntoShape) -> Preimage {
         let shape = shape.into_shape();
@@ -1100,9 +1384,18 @@ impl Trapdoor {
                 max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
             },
             vec![self.public.value.clone(), self.value.clone(), target.value],
-            vec![WireType::Preimage(ty.clone())],
+            vec![WireType::Preimage {
+                matrix: ty.clone(),
+                max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            }],
         );
-        Preimage { value: node.output(0).expect("preimage"), matrix_type: ty, pending }
+        let preimage = Preimage {
+            value: node.output(0).expect("preimage"),
+            matrix_type: ty,
+            max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            pending,
+        };
+        preimage
     }
 }
 
@@ -1206,7 +1499,7 @@ impl TrapdoorFamily {
                 let index = IntType.placeholders();
                 let public = Family::<Mat>::source_input(
                     "gather-trapdoor-public".to_owned(),
-                    schema.matrix.clone(),
+                    Mat::source_input("__family-element".to_owned(), schema.matrix.clone(), None),
                     source_count.clone(),
                     None,
                 );
@@ -1547,72 +1840,9 @@ impl Family<Bool> {
     pub fn pack_bools(values: Vec<Bool>) -> Result<Self, DslError> {
         Self::pack(values)
     }
-
-    pub fn get_static(&self, index: impl Into<IntExpr>) -> Bool {
-        let element_type = family_element_wire_type(&self.value).unwrap_or(WireType::Bool);
-        let node = NodeHandle::new(
-            NodeKind::FamilyGetStatic { index: index.into() },
-            vec![self.value.clone()],
-            vec![element_type],
-        );
-        Bool {
-            value: node.output(0).expect("boolean family element"),
-            pending: self.pending.clone(),
-        }
-    }
-
-    pub fn get(&self, index: Int) -> Bool {
-        scalar_family_get(self, index, WireType::Bool, |value, pending| Bool { value, pending })
-    }
-
-    pub fn parallel_map(
-        self,
-        body: impl FnOnce(LoopIndex, Bool) -> Bool,
-    ) -> Result<Self, DslError> {
-        scalar_parallel_map(self, "parallel-map-bool-body", WireType::Bool, body)
-    }
-
-    pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
-        scalar_parallel_gather(
-            self,
-            indices,
-            "parallel-gather-bool-body",
-            WireType::Bool,
-            |value, pending| Bool { value, pending },
-        )
-    }
 }
 
 impl Family<Int> {
-    pub fn count(&self) -> &IntExpr {
-        &self.count
-    }
-
-    pub fn get_static(&self, index: impl Into<IntExpr>) -> Int {
-        scalar_family_get_static(self, index.into(), WireType::Int, |value, pending| Int {
-            value,
-            pending,
-        })
-    }
-
-    pub fn get(&self, index: Int) -> Int {
-        scalar_family_get(self, index, WireType::Int, |value, pending| Int { value, pending })
-    }
-
-    pub fn parallel_map(self, body: impl FnOnce(LoopIndex, Int) -> Int) -> Result<Self, DslError> {
-        scalar_parallel_map(self, "parallel-map-int-body", WireType::Int, body)
-    }
-
-    pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
-        scalar_parallel_gather(
-            self,
-            indices,
-            "parallel-gather-int-body",
-            WireType::Int,
-            |value, pending| Int { value, pending },
-        )
-    }
-
     /// Packs consecutive little-endian bit segments into integers.
     ///
     /// Segments are evaluated independently by a parallel loop. Within one segment, a sequential
@@ -1794,11 +2024,23 @@ pub struct Family<T> {
 }
 
 #[doc(hidden)]
-pub trait FamilyElement: GraphValue {
+pub trait FamilyElement: GraphValue + Clone {
     fn normalize_for_family(self) -> Self;
 }
 
 impl FamilyElement for Mat {
+    fn normalize_for_family(self) -> Self {
+        self
+    }
+}
+
+impl FamilyElement for SmallMatrix {
+    fn normalize_for_family(self) -> Self {
+        self
+    }
+}
+
+impl FamilyElement for Preimage {
     fn normalize_for_family(self) -> Self {
         self
     }
@@ -1889,192 +2131,27 @@ fn select_scalar<'a>(
     Ok((node.output(0).expect("scalar select output"), pending))
 }
 
-fn scalar_family_get_static<T>(
-    family: &Family<T>,
-    index: IntExpr,
-    fallback_wire_type: WireType,
-    parts: impl Fn(ValueHandle, Pending) -> T,
-) -> T {
-    let node = NodeHandle::new(
-        NodeKind::FamilyGetStatic { index },
-        vec![family.value.clone()],
-        vec![family_element_wire_type(&family.value).unwrap_or(fallback_wire_type)],
-    );
-    parts(node.output(0).expect("scalar family element"), family.pending.clone())
-}
-
-fn scalar_family_get<T>(
-    family: &Family<T>,
-    index: Int,
-    fallback_wire_type: WireType,
-    parts: impl Fn(ValueHandle, Pending) -> T,
-) -> T {
-    let pending = Pending::merge([family.pending.clone(), index.pending]);
-    let node = NodeHandle::new(
-        NodeKind::FamilyGetDynamic,
-        vec![family.value.clone(), index.value],
-        vec![family_element_wire_type(&family.value).unwrap_or(fallback_wire_type)],
-    );
-    parts(node.output(0).expect("dynamic scalar family element"), pending)
-}
-
-fn scalar_parallel_map<T>(
-    family: Family<T>,
-    body_name: &'static str,
-    wire_type: WireType,
-    body: impl FnOnce(LoopIndex, T) -> T,
-) -> Result<Family<T>, DslError>
-where
-    T: ParallelOutput<Families = Family<T>> + FamilyElement + GraphValue + Clone,
-    T::Schema: GraphValueSchema<Value = T>,
-{
-    let count = family.count.clone();
-    let schema = family.element_schema.schema();
-    let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
-        with_new_construction_scope(|scope| {
-            let input = schema.placeholders();
-            let input_values = input.flatten();
-            let [input_value] = input_values.as_slice() else {
-                panic!("scalar family item schema must contain one value")
-            };
-            let output = body(index, input);
-            (output.normalize_for_family(), input_value.clone(), scope)
-        })
-    });
-    let sealed = SubgraphHandle::seal(
-        body_name,
-        scope,
-        vec![explicit_input],
-        body_value.flatten(),
-        CapturePolicy::BroadcastScalarsAndArtifactFamilies,
-    )?;
-    let mut arguments = vec![family.value];
-    let mut modes = vec![LoopInputMode::Zip];
-    arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
-    modes.extend((0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast));
-    let node = NodeHandle::parallel_loop(
-        sealed.handle.clone(),
-        arguments,
-        vec![WireType::IndexedFamily { element: Box::new(wire_type), count: count.clone() }],
-        ParallelLoop {
-            count: count.clone(),
-            minimum_count: 0,
-            index_slot,
-            bindings: Vec::new(),
-            input_modes: modes,
-        },
-    );
-    let pending = Pending::merge([family.pending, body_value.pending().remap(&sealed.remap)]);
-    body_value.parallel_families(&node, &mut 0, &count, pending)
-}
-
-fn scalar_parallel_gather<T>(
-    source: Family<T>,
-    indices: Family<Int>,
-    body_name: &'static str,
-    wire_type: WireType,
-    parts: impl Fn(ValueHandle, Pending) -> T + Copy,
-) -> Result<Family<T>, DslError>
-where
-    T: ParallelOutput<Families = Family<T>> + GraphValue + Clone,
-{
-    let source_count = source.count.clone();
-    let output_count = indices.count.clone();
-    let source_element_type = family_element_wire_type(&source.value).unwrap_or(wire_type.clone());
-    let (index_slot, (body_value, explicit_inputs, scope)) = with_loop_index(|_| {
-        with_new_construction_scope(|scope| {
-            let index = IntType.placeholders();
-            let family_wire_type = WireType::IndexedFamily {
-                element: Box::new(source_element_type.clone()),
-                count: source_count.clone(),
-            };
-            let family_node = NodeHandle::new(
-                NodeKind::Input {
-                    name: "gather-source".to_owned(),
-                    wire_type: family_wire_type.clone(),
-                    artifact: None,
-                },
-                Vec::new(),
-                vec![family_wire_type],
-            );
-            let placeholder_value = NodeHandle::new(
-                NodeKind::Input {
-                    name: "gather-element".to_owned(),
-                    wire_type: source_element_type.clone(),
-                    artifact: None,
-                },
-                Vec::new(),
-                vec![source_element_type.clone()],
-            )
-            .output(0)
-            .expect("gather element");
-            let family = Family {
-                value: family_node.output(0).expect("gather family"),
-                element_schema: parts(placeholder_value, Pending::default()),
-                count: source_count,
-                pending: Pending::default(),
-            };
-            let output =
-                scalar_family_get(&family, index.clone(), source_element_type.clone(), parts);
-            (output, vec![index.value, family.value], scope)
-        })
-    });
-    let sealed = SubgraphHandle::seal(
-        body_name,
-        scope,
-        explicit_inputs,
-        body_value.flatten(),
-        CapturePolicy::BroadcastScalarsAndArtifactFamilies,
-    )?;
-    let node = NodeHandle::parallel_loop(
-        sealed.handle.clone(),
-        vec![indices.value, source.value],
-        vec![WireType::IndexedFamily {
-            element: Box::new(source_element_type),
-            count: output_count.clone(),
-        }],
-        ParallelLoop {
-            count: output_count.clone(),
-            minimum_count: 0,
-            index_slot,
-            bindings: Vec::new(),
-            input_modes: vec![LoopInputMode::Zip, LoopInputMode::Broadcast],
-        },
-    );
-    let pending = Pending::merge([
-        indices.pending,
-        source.pending,
-        body_value.pending().remap(&sealed.remap),
-    ]);
-    body_value.parallel_families(&node, &mut 0, &output_count, pending)
-}
-
-fn family_element_wire_type(value: &ValueHandle) -> Option<WireType> {
-    let WireType::IndexedFamily { element, .. } = value.wire_type() else {
-        return None;
-    };
-    Some((**element).clone())
-}
-
-impl Family<Mat> {
+impl<T: FamilyElement> Family<T> {
     fn source_input(
         name: String,
-        matrix_type: MatrixType,
+        element_schema: T,
         count: IntExpr,
         artifact: Option<ArtifactInput>,
     ) -> Self {
-        let element_type = WireType::Matrix(matrix_type.clone());
-        let family_type =
-            WireType::IndexedFamily { element: Box::new(element_type), count: count.clone() };
+        let element_wire_types = element_schema.schema().wire_types();
+        assert_eq!(element_wire_types.len(), 1, "family elements must have one wire");
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(element_wire_types.into_iter().next().expect("family wire")),
+            count: count.clone(),
+        };
         let node = NodeHandle::new(
             NodeKind::Input { name, wire_type: family_type.clone(), artifact },
             Vec::new(),
             vec![family_type],
         );
-        let placeholder = Mat::source_input("__family_element".to_owned(), matrix_type, None);
         Self {
             value: node.output(0).expect("family"),
-            element_schema: placeholder,
+            element_schema,
             count,
             pending: Pending::default(),
         }
@@ -2084,45 +2161,18 @@ impl Family<Mat> {
         &self.count
     }
 
-    pub fn element_type(&self) -> &MatrixType {
-        &self.element_schema.matrix_type
-    }
-
-    pub fn get_static(&self, index: impl Into<IntExpr>) -> Mat {
-        let node = NodeHandle::new(
-            NodeKind::FamilyGetStatic { index: index.into() },
-            vec![self.value.clone()],
-            vec![WireType::Matrix(self.element_schema.matrix_type.clone())],
-        );
-        Mat {
-            value: node.output(0).expect("family element"),
-            matrix_type: self.element_schema.matrix_type.clone(),
-            pending: self.pending.clone(),
-        }
-    }
-
-    pub fn get(&self, index: Int) -> Mat {
-        let pending = Pending::merge([self.pending.clone(), index.pending]);
-        let node = NodeHandle::new(
-            NodeKind::FamilyGetDynamic,
-            vec![self.value.clone(), index.value],
-            vec![WireType::Matrix(self.element_schema.matrix_type.clone())],
-        );
-        Mat {
-            value: node.output(0).expect("dynamic family element"),
-            matrix_type: self.element_schema.matrix_type.clone(),
-            pending,
-        }
-    }
-
-    /// Selects one same-shaped matrix family without materializing the other branches.
+    /// Selects one same-schema family without materializing the other branches.
     pub fn select(selector: Int, branches: Vec<Self>) -> Result<Self, DslError> {
         let Some(first) = branches.first() else {
             return Err(DslError::Schema);
         };
+        let first_wire_types = first.element_schema.schema().wire_types();
+        let [first_wire_type] = first_wire_types.as_slice() else {
+            return Err(DslError::Schema);
+        };
         if branches.iter().any(|branch| {
             branch.count != first.count ||
-                branch.element_schema.matrix_type != first.element_schema.matrix_type
+                branch.element_schema.schema().wire_types() != first_wire_types
         }) {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -2133,7 +2183,7 @@ impl Family<Mat> {
         let mut arguments = vec![selector.value];
         arguments.extend(branches.iter().map(|branch| branch.value.clone()));
         let family_type = WireType::IndexedFamily {
-            element: Box::new(WireType::Matrix(first.element_schema.matrix_type.clone())),
+            element: Box::new(first_wire_type.clone()),
             count: first.count.clone(),
         };
         let node = NodeHandle::new(
@@ -2142,28 +2192,110 @@ impl Family<Mat> {
             vec![family_type],
         );
         Ok(Self {
-            value: node.output(0).expect("selected matrix family"),
+            value: node.output(0).expect("selected family"),
             element_schema: first.element_schema.clone(),
             count: first.count.clone(),
             pending,
         })
     }
 
-    pub fn parallel_map(self, body: impl FnOnce(LoopIndex, Mat) -> Mat) -> Result<Self, DslError> {
-        self.parallel_map_values(body)
+    pub fn get_static(&self, index: impl Into<IntExpr>) -> T {
+        let schema = self.element_schema.schema();
+        let wire_types = schema.wire_types();
+        assert_eq!(wire_types.len(), 1, "family elements must have one wire");
+        let node = NodeHandle::new(
+            NodeKind::FamilyGetStatic { index: index.into() },
+            vec![self.value.clone()],
+            wire_types,
+        );
+        T::from_values(&schema, &[node.output(0).expect("family element")], self.pending.clone())
+            .expect("family element schema")
     }
 
-    pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
+    pub fn get(&self, index: Int) -> T {
+        let schema = self.element_schema.schema();
+        let wire_types = schema.wire_types();
+        assert_eq!(wire_types.len(), 1, "family elements must have one wire");
+        let pending = Pending::merge([self.pending.clone(), index.pending]);
+        let node = NodeHandle::new(
+            NodeKind::FamilyGetDynamic,
+            vec![self.value.clone(), index.value],
+            wire_types,
+        );
+        T::from_values(&schema, &[node.output(0).expect("family element")], pending)
+            .expect("family element schema")
+    }
+
+    pub fn parallel_map_values<R: ParallelOutput>(
+        self,
+        body: impl FnOnce(LoopIndex, T) -> R,
+    ) -> Result<R::Families, DslError>
+    where
+        T::Schema: GraphValueSchema<Value = T>,
+    {
+        let outer_family = self.value.clone();
+        let count = self.count.clone();
+        let schema = self.element_schema.schema();
+        let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| {
+                let input = schema.placeholders();
+                let output = body(index, input.clone());
+                (output, input.flatten(), scope)
+            })
+        });
+        let body_outputs = body_value.flatten();
+        let sealed = SubgraphHandle::seal(
+            "parallel-map-family-body",
+            scope,
+            explicit_input,
+            body_outputs,
+            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+        )?;
+        let mut arguments = vec![outer_family];
+        let mut modes = vec![LoopInputMode::Zip];
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        modes.extend((0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast));
+        let family_outputs = body_value.parallel_family_types(&count)?;
+        let node = NodeHandle::parallel_loop(
+            sealed.handle,
+            arguments,
+            family_outputs,
+            ParallelLoop {
+                count: count.clone(),
+                minimum_count: 0,
+                index_slot,
+                bindings: Vec::new(),
+                input_modes: modes,
+            },
+        );
+        let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
+        let mut next_port = 0;
+        body_value.parallel_families(&node, &mut next_port, &count, pending)
+    }
+
+    pub fn parallel_map(self, body: impl FnOnce(LoopIndex, T) -> T) -> Result<Self, DslError>
+    where
+        T: ParallelOutput<Families = Family<T>>,
+        T::Schema: GraphValueSchema<Value = T>,
+    {
+        self.parallel_map_values(|index, value| body(index, value).normalize_for_family())
+    }
+
+    pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError>
+    where
+        T: ParallelOutput<Families = Family<T>>,
+        T::Schema: GraphValueSchema<Value = T>,
+    {
         let source_count = self.count.clone();
         let output_count = indices.count.clone();
-        let matrix_type = self.element_schema.matrix_type.clone();
+        let element_schema = self.element_schema.schema();
         let (index_slot, (body_value, explicit_inputs, scope)) = with_loop_index(|_| {
             with_new_construction_scope(|scope| {
                 let index = IntType.placeholders();
-                let source = Family::<Mat>::source_input(
+                let source = Family::<T>::source_input(
                     "gather-source".to_owned(),
-                    matrix_type,
-                    source_count,
+                    element_schema.placeholders(),
+                    source_count.clone(),
                     None,
                 );
                 let output = source.get(index.clone());
@@ -2171,7 +2303,7 @@ impl Family<Mat> {
             })
         });
         let sealed = SubgraphHandle::seal(
-            "parallel-gather-mat-body",
+            "parallel-gather-family-body",
             scope,
             explicit_inputs,
             body_value.flatten(),
@@ -2195,6 +2327,48 @@ impl Family<Mat> {
             body_value.pending().remap(&sealed.remap),
         ]);
         body_value.parallel_families(&node, &mut 0, &output_count, pending)
+    }
+}
+
+impl<T> ParallelOutput for T
+where
+    T: FamilyElement,
+    T::Schema: GraphValueSchema<Value = T>,
+{
+    type Families = Family<T>;
+
+    fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
+        let mut element_types = self.schema().wire_types();
+        if element_types.len() != 1 {
+            return Err(DslError::Schema);
+        }
+        Ok(vec![WireType::IndexedFamily {
+            element: Box::new(element_types.pop().expect("one-wire family element")),
+            count: count.clone(),
+        }])
+    }
+
+    fn parallel_families(
+        self,
+        node: &NodeHandle,
+        next_port: &mut u32,
+        count: &IntExpr,
+        pending: Pending,
+    ) -> Result<Self::Families, DslError> {
+        let value = node.output(*next_port).ok_or(DslError::Schema)?;
+        *next_port += 1;
+        Ok(Family {
+            value,
+            element_schema: self.schema().placeholders(),
+            count: count.clone(),
+            pending,
+        })
+    }
+}
+
+impl Family<Mat> {
+    pub fn element_type(&self) -> &MatrixType {
+        &self.element_schema.matrix_type
     }
 
     pub fn parallel_zip_many_values<R: ParallelOutput>(
@@ -2296,7 +2470,7 @@ impl Family<Mat> {
                     .map(|(index, (matrix_type, count))| {
                         Family::<Mat>::source_input(
                             format!("broadcast-family-{index}"),
-                            matrix_type,
+                            Mat::source_input("__family-element".to_owned(), matrix_type, None),
                             count,
                             None,
                         )
@@ -2344,50 +2518,6 @@ impl Family<Mat> {
                 .chain(broadcast.into_iter().map(|family| family.pending))
                 .chain(std::iter::once(body_value.pending().remap(&sealed.remap))),
         );
-        let mut next_port = 0;
-        body_value.parallel_families(&node, &mut next_port, &count, pending)
-    }
-
-    pub fn parallel_map_values<R: ParallelOutput>(
-        self,
-        body: impl FnOnce(LoopIndex, Mat) -> R,
-    ) -> Result<R::Families, DslError> {
-        let outer_family = self.value.clone();
-        let count = self.count.clone();
-        let element_type = self.element_schema.matrix_type.clone();
-        let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
-            with_new_construction_scope(|scope| {
-                let input = Mat::source_input("item".to_owned(), element_type, None);
-                let output = body(index, input.clone());
-                (output, input.value, scope)
-            })
-        });
-        let body_outputs = body_value.flatten();
-        let sealed = SubgraphHandle::seal(
-            "parallel-map-body",
-            scope,
-            vec![explicit_input],
-            body_outputs,
-            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
-        )?;
-        let mut arguments = vec![outer_family];
-        let mut modes = vec![LoopInputMode::Zip];
-        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
-        modes.extend((0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast));
-        let family_outputs = body_value.parallel_family_types(&count)?;
-        let node = NodeHandle::parallel_loop(
-            sealed.handle.clone(),
-            arguments,
-            family_outputs,
-            ParallelLoop {
-                count: count.clone(),
-                minimum_count: 0,
-                index_slot,
-                bindings: Vec::new(),
-                input_modes: modes,
-            },
-        );
-        let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
         let mut next_port = 0;
         body_value.parallel_families(&node, &mut next_port, &count, pending)
     }
@@ -3080,6 +3210,125 @@ pub fn parallel_zip_bundle<T: ParallelZipTuple, R: ParallelOutput>(
     families.parallel_zip_tuple(body)
 }
 
+/// Builds a zipped loop whose body receives three zipped elements and three
+/// explicitly broadcast family arguments. Broadcast families are formal
+/// inputs of the sealed body, so accidental outer-family captures are
+/// rejected rather than silently captured.
+pub fn parallel_zip_bundle_with_broadcast<A, B, C, D, E, F, R: ParallelOutput>(
+    zipped: (Family<A>, Family<B>, Family<C>),
+    broadcast: (Family<D>, Family<E>, Family<F>),
+    body: impl FnOnce(LoopIndex, (A, B, C), (Family<D>, Family<E>, Family<F>)) -> R,
+) -> Result<R::Families, DslError>
+where
+    A: GraphValue,
+    B: GraphValue,
+    C: GraphValue,
+    D: FamilyElement,
+    E: FamilyElement,
+    F: FamilyElement,
+{
+    if zipped.0.count != zipped.1.count || zipped.0.count != zipped.2.count {
+        return Err(DslError::FamilyCountMismatch);
+    }
+    let count = zipped.0.count.clone();
+    let broadcast_counts =
+        (broadcast.0.count.clone(), broadcast.1.count.clone(), broadcast.2.count.clone());
+    let schemas = (
+        zipped.0.element_schema.schema(),
+        zipped.1.element_schema.schema(),
+        zipped.2.element_schema.schema(),
+    );
+    let broadcast_schemas = (
+        broadcast.0.element_schema.clone(),
+        broadcast.1.element_schema.clone(),
+        broadcast.2.element_schema.clone(),
+    );
+    let (index_slot, body_result) = with_loop_index(|index| {
+        with_new_construction_scope(|scope| {
+            let mut next = 0;
+            let a = schemas.0.placeholders_from(&mut next);
+            let b = schemas.1.placeholders_from(&mut next);
+            let c = schemas.2.placeholders_from(&mut next);
+            let d = Family::<D>::source_input(
+                "broadcast-0".to_owned(),
+                broadcast_schemas.0.clone(),
+                broadcast_counts.0.clone(),
+                None,
+            );
+            let e = Family::<E>::source_input(
+                "broadcast-1".to_owned(),
+                broadcast_schemas.1.clone(),
+                broadcast_counts.1.clone(),
+                None,
+            );
+            let f = Family::<F>::source_input(
+                "broadcast-2".to_owned(),
+                broadcast_schemas.2.clone(),
+                broadcast_counts.2.clone(),
+                None,
+            );
+            let mut explicit_inputs = a.flatten();
+            explicit_inputs.extend(b.flatten());
+            explicit_inputs.extend(c.flatten());
+            explicit_inputs.extend(d.flatten());
+            explicit_inputs.extend(e.flatten());
+            explicit_inputs.extend(f.flatten());
+            let output = body(index, (a, b, c), (d, e, f));
+            Ok::<_, DslError>((output, explicit_inputs, scope))
+        })
+    });
+    let (body_value, explicit_inputs, scope) = body_result?;
+    let sealed = SubgraphHandle::seal(
+        "parallel-zip-broadcast-body",
+        scope,
+        explicit_inputs,
+        body_value.flatten(),
+        CapturePolicy::Reject,
+    )?;
+    let remapped_pending = body_value.pending().remap(&sealed.remap);
+    let mut arguments = vec![
+        zipped.0.value,
+        zipped.1.value,
+        zipped.2.value,
+        broadcast.0.value,
+        broadcast.1.value,
+        broadcast.2.value,
+    ];
+    let modes = vec![
+        LoopInputMode::Zip,
+        LoopInputMode::Zip,
+        LoopInputMode::Zip,
+        LoopInputMode::Broadcast,
+        LoopInputMode::Broadcast,
+        LoopInputMode::Broadcast,
+    ];
+    arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+    let mut modes = modes;
+    modes.extend((0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast));
+    let node = NodeHandle::parallel_loop(
+        sealed.handle,
+        arguments,
+        body_value.parallel_family_types(&count)?,
+        ParallelLoop {
+            count: count.clone(),
+            minimum_count: 0,
+            index_slot,
+            bindings: Vec::new(),
+            input_modes: modes,
+        },
+    );
+    let pending = Pending::merge([
+        zipped.0.pending,
+        zipped.1.pending,
+        zipped.2.pending,
+        broadcast.0.pending,
+        broadcast.1.pending,
+        broadcast.2.pending,
+        remapped_pending,
+    ]);
+    body_value.parallel_families(&node, &mut 0, &count, pending)
+}
+
 pub fn parallel_zip_bundle_result<T: ParallelZipTuple, R: ParallelOutput>(
     families: T,
     body: impl FnOnce(LoopIndex, T::Items) -> Result<R, DslError>,
@@ -3333,8 +3582,12 @@ impl DslContext {
         }
     }
 
-    pub fn output(mut self, name: impl Into<String>, mat: Mat) -> Result<Self, DslError> {
-        self.insert_output(name.into(), mat, None)?;
+    pub fn output<V: GraphValue>(
+        mut self,
+        name: impl Into<String>,
+        value: V,
+    ) -> Result<Self, DslError> {
+        self.insert_graph_value(name.into(), value, None)?;
         Ok(self)
     }
 
@@ -3353,8 +3606,12 @@ impl DslContext {
         Ok(self)
     }
 
-    pub fn public_output(mut self, name: impl Into<String>, mat: Mat) -> Result<Self, DslError> {
-        self.insert_output(name.into(), mat, Some(ArtifactConfidentiality::Public))?;
+    pub fn public_output<V: GraphValue>(
+        mut self,
+        name: impl Into<String>,
+        value: V,
+    ) -> Result<Self, DslError> {
+        self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Public))?;
         Ok(self)
     }
 
@@ -3372,8 +3629,12 @@ impl DslContext {
         Ok(self)
     }
 
-    pub fn private_output(mut self, name: impl Into<String>, mat: Mat) -> Result<Self, DslError> {
-        self.insert_output(name.into(), mat, Some(ArtifactConfidentiality::Private))?;
+    pub fn private_output<V: GraphValue>(
+        mut self,
+        name: impl Into<String>,
+        value: V,
+    ) -> Result<Self, DslError> {
+        self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Private))?;
         Ok(self)
     }
 
@@ -3405,23 +3666,16 @@ impl DslContext {
         Ok(self)
     }
 
-    fn insert_output(
+    fn insert_graph_value<V: GraphValue>(
         &mut self,
         name: String,
-        mat: Mat,
+        value: V,
         confidentiality: Option<ArtifactConfidentiality>,
     ) -> Result<(), DslError> {
-        if self
-            .outputs
-            .insert(
-                name.clone(),
-                PendingOutput { value: mat.value, pending: mat.pending, confidentiality },
-            )
-            .is_some()
-        {
-            return Err(DslError::DuplicateOutput(name));
-        }
-        Ok(())
+        let pending = value.pending();
+        let values = value.flatten();
+        let [value] = values.as_slice() else { return Err(DslError::Schema) };
+        self.insert_pending_output(name, value.clone(), pending, confidentiality)
     }
 
     pub fn family_output(
@@ -3448,24 +3702,6 @@ impl DslContext {
         family: Family<Bool>,
     ) -> Result<Self, DslError> {
         self.insert_pending_output(name.into(), family.value, family.pending, None)?;
-        Ok(self)
-    }
-
-    pub fn public_family_output(
-        mut self,
-        name: impl Into<String>,
-        family: Family<Mat>,
-    ) -> Result<Self, DslError> {
-        self.insert_family_output(name.into(), family, Some(ArtifactConfidentiality::Public))?;
-        Ok(self)
-    }
-
-    pub fn private_family_output(
-        mut self,
-        name: impl Into<String>,
-        family: Family<Mat>,
-    ) -> Result<Self, DslError> {
-        self.insert_family_output(name.into(), family, Some(ArtifactConfidentiality::Private))?;
         Ok(self)
     }
 
@@ -3689,38 +3925,6 @@ pub trait ParallelOutput: GraphValue {
     ) -> Result<Self::Families, DslError>;
 }
 
-impl ParallelOutput for Mat {
-    type Families = Family<Mat>;
-
-    fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
-        Ok(vec![WireType::IndexedFamily {
-            element: Box::new(WireType::Matrix(self.matrix_type.clone())),
-            count: count.clone(),
-        }])
-    }
-
-    fn parallel_families(
-        self,
-        node: &NodeHandle,
-        next_port: &mut u32,
-        count: &IntExpr,
-        pending: Pending,
-    ) -> Result<Self::Families, DslError> {
-        let value = node.output(*next_port).ok_or(DslError::Schema)?;
-        *next_port += 1;
-        Ok(Family {
-            value,
-            element_schema: Mat {
-                value: self.value,
-                matrix_type: self.matrix_type,
-                pending: Pending::default(),
-            },
-            count: count.clone(),
-            pending,
-        })
-    }
-}
-
 impl ParallelOutput for Trapdoor {
     type Families = TrapdoorFamily;
 
@@ -3762,36 +3966,6 @@ impl ParallelOutput for Trapdoor {
         })
     }
 }
-
-macro_rules! scalar_parallel_output {
-    ($value:ty, $wire_type:expr) => {
-        impl ParallelOutput for $value {
-            type Families = Family<$value>;
-
-            fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
-                Ok(vec![WireType::IndexedFamily {
-                    element: Box::new($wire_type),
-                    count: count.clone(),
-                }])
-            }
-
-            fn parallel_families(
-                self,
-                node: &NodeHandle,
-                next_port: &mut u32,
-                count: &IntExpr,
-                pending: Pending,
-            ) -> Result<Self::Families, DslError> {
-                let value = node.output(*next_port).ok_or(DslError::Schema)?;
-                *next_port += 1;
-                Ok(Family { value, element_schema: self, count: count.clone(), pending })
-            }
-        }
-    };
-}
-
-scalar_parallel_output!(Int, WireType::Int);
-scalar_parallel_output!(Bool, WireType::Bool);
 
 impl<A: ParallelOutput, B: ParallelOutput> ParallelOutput for (A, B) {
     type Families = (A::Families, B::Families);
@@ -4051,6 +4225,105 @@ impl GraphValueSchema for BytesType {
     }
 }
 
+#[derive(Clone)]
+pub struct SmallMatrix {
+    value: ValueHandle,
+    matrix_type: MatrixType,
+    max_coefficient_bound: IntExpr,
+    pending: Pending,
+}
+
+impl SmallMatrix {
+    fn source_input(
+        name: String,
+        matrix_type: MatrixType,
+        max_coefficient_bound: IntExpr,
+        artifact: Option<ArtifactInput>,
+    ) -> Self {
+        let wire_type = WireType::SmallMatrix {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::Input { name, wire_type: wire_type.clone(), artifact },
+            Vec::new(),
+            vec![wire_type],
+        );
+        Self {
+            value: node.output(0).expect("small matrix input"),
+            matrix_type,
+            max_coefficient_bound,
+            pending: Pending::default(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn value_handle(&self) -> &ValueHandle {
+        &self.value
+    }
+
+    pub fn matrix_type(&self) -> &MatrixType {
+        &self.matrix_type
+    }
+
+    pub fn max_coefficient_bound(&self) -> &IntExpr {
+        &self.max_coefficient_bound
+    }
+}
+
+impl GraphValue for SmallMatrix {
+    type Schema = SmallMatrixType;
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        vec![self.value.clone()]
+    }
+
+    fn pending(&self) -> Pending {
+        self.pending.clone()
+    }
+
+    fn schema(&self) -> Self::Schema {
+        SmallMatrixType {
+            matrix: self.matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }
+    }
+
+    fn from_values(
+        schema: &Self::Schema,
+        values: &[ValueHandle],
+        pending: Pending,
+    ) -> Result<Self, DslError> {
+        let [value] = values else { return Err(DslError::Schema) };
+        Ok(Self {
+            value: value.clone(),
+            matrix_type: schema.matrix.clone(),
+            max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            pending,
+        })
+    }
+}
+
+impl GraphValueSchema for SmallMatrixType {
+    type Value = SmallMatrix;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        SmallMatrix::source_input(
+            argument_name(next, "small-matrix"),
+            self.matrix.clone(),
+            self.max_coefficient_bound.clone(),
+            None,
+        )
+    }
+
+    fn wire_types(&self) -> Vec<WireType> {
+        vec![WireType::SmallMatrix {
+            matrix: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }]
+    }
+}
+
 impl GraphValue for Preimage {
     type Schema = PreimageType;
 
@@ -4063,7 +4336,10 @@ impl GraphValue for Preimage {
     }
 
     fn schema(&self) -> Self::Schema {
-        PreimageType(self.matrix_type.clone())
+        PreimageType {
+            matrix: self.matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }
     }
 
     fn from_values(
@@ -4072,7 +4348,12 @@ impl GraphValue for Preimage {
         pending: Pending,
     ) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
-        Ok(Self { value: value.clone(), matrix_type: schema.0.clone(), pending })
+        Ok(Self {
+            value: value.clone(),
+            matrix_type: schema.matrix.clone(),
+            max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            pending,
+        })
     }
 }
 
@@ -4080,7 +4361,10 @@ impl GraphValueSchema for PreimageType {
     type Value = Preimage;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        let wire_type = WireType::Preimage(self.0.clone());
+        let wire_type = WireType::Preimage {
+            matrix: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        };
         let node = NodeHandle::new(
             NodeKind::Input {
                 name: argument_name(next, "preimage"),
@@ -4092,13 +4376,17 @@ impl GraphValueSchema for PreimageType {
         );
         Preimage {
             value: node.output(0).expect("preimage argument"),
-            matrix_type: self.0.clone(),
+            matrix_type: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
             pending: Pending::default(),
         }
     }
 
     fn wire_types(&self) -> Vec<WireType> {
-        vec![WireType::Preimage(self.0.clone())]
+        vec![WireType::Preimage {
+            matrix: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }]
     }
 }
 
@@ -4242,9 +4530,9 @@ impl GraphValueSchema for TrapdoorFamilyType {
     type Value = TrapdoorFamily;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        let public = Family::source_input(
+        let public = Family::<Mat>::source_input(
             argument_name(next, "trapdoor-public-family"),
-            self.element.matrix.clone(),
+            Mat::source_input("__family-element".to_owned(), self.element.matrix.clone(), None),
             self.count.clone(),
             None,
         );
@@ -4269,8 +4557,11 @@ impl GraphValueSchema for TrapdoorFamilyType {
     }
 }
 
-impl GraphValue for Family<Mat> {
-    type Schema = MatFamilyType;
+impl<T> GraphValue for Family<T>
+where
+    T: FamilyElement,
+{
+    type Schema = FamilyType<T::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         vec![self.value.clone()]
@@ -4281,10 +4572,7 @@ impl GraphValue for Family<Mat> {
     }
 
     fn schema(&self) -> Self::Schema {
-        MatFamilyType {
-            element: self.element_schema.matrix_type.clone(),
-            count: self.count.clone(),
-        }
+        FamilyType { element: self.element_schema.schema(), count: self.count.clone() }
     }
 
     fn from_values(
@@ -4295,119 +4583,39 @@ impl GraphValue for Family<Mat> {
         let [value] = values else { return Err(DslError::Schema) };
         Ok(Self {
             value: value.clone(),
-            element_schema: Mat::source_input(
-                "__family-element-schema".to_owned(),
-                schema.element.clone(),
-                None,
-            ),
+            element_schema: schema.element.placeholders(),
             count: schema.count.clone(),
             pending,
         })
     }
 }
 
-impl GraphValueSchema for MatFamilyType {
-    type Value = Family<Mat>;
+impl<S> GraphValueSchema for FamilyType<S>
+where
+    S: GraphValueSchema,
+    S::Value: FamilyElement,
+{
+    type Value = Family<S::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        Family::source_input(
+        let element_schema = self.element.clone();
+        Family::<S::Value>::source_input(
             argument_name(next, "family"),
-            self.element.clone(),
+            element_schema.placeholders_from(next),
             self.count.clone(),
             None,
         )
     }
 
     fn wire_types(&self) -> Vec<WireType> {
+        let mut element_types = self.element.wire_types();
+        assert_eq!(element_types.len(), 1, "family elements must have one wire");
         vec![WireType::IndexedFamily {
-            element: Box::new(WireType::Matrix(self.element.clone())),
+            element: Box::new(element_types.pop().expect("family wire")),
             count: self.count.clone(),
         }]
     }
 }
-
-macro_rules! scalar_family_graph_value {
-    ($value:ty, $schema:ident, $wire_type:expr) => {
-        impl GraphValue for Family<$value> {
-            type Schema = $schema;
-
-            fn flatten(&self) -> Vec<ValueHandle> {
-                vec![self.value.clone()]
-            }
-            fn pending(&self) -> Pending {
-                self.pending.clone()
-            }
-            fn schema(&self) -> Self::Schema {
-                $schema { count: self.count.clone() }
-            }
-            fn from_values(
-                schema: &Self::Schema,
-                values: &[ValueHandle],
-                pending: Pending,
-            ) -> Result<Self, DslError> {
-                let [value] = values else { return Err(DslError::Schema) };
-                let element_schema = <$value as GraphValueSchemaValue>::placeholder();
-                Ok(Self {
-                    value: value.clone(),
-                    element_schema,
-                    count: schema.count.clone(),
-                    pending,
-                })
-            }
-        }
-
-        impl GraphValueSchema for $schema {
-            type Value = Family<$value>;
-            fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-                let wire_type = WireType::IndexedFamily {
-                    element: Box::new($wire_type),
-                    count: self.count.clone(),
-                };
-                let node = NodeHandle::new(
-                    NodeKind::Input {
-                        name: argument_name(next, "family"),
-                        wire_type: wire_type.clone(),
-                        artifact: None,
-                    },
-                    Vec::new(),
-                    vec![wire_type],
-                );
-                let element_schema = <$value as GraphValueSchemaValue>::placeholder();
-                Family {
-                    value: node.output(0).expect("family argument"),
-                    element_schema,
-                    count: self.count.clone(),
-                    pending: Pending::default(),
-                }
-            }
-            fn wire_types(&self) -> Vec<WireType> {
-                vec![WireType::IndexedFamily {
-                    element: Box::new($wire_type),
-                    count: self.count.clone(),
-                }]
-            }
-        }
-    };
-}
-
-trait GraphValueSchemaValue: GraphValue {
-    fn placeholder() -> Self;
-}
-
-impl GraphValueSchemaValue for Int {
-    fn placeholder() -> Self {
-        IntType.placeholders()
-    }
-}
-
-impl GraphValueSchemaValue for Bool {
-    fn placeholder() -> Self {
-        BoolType.placeholders()
-    }
-}
-
-scalar_family_graph_value!(Int, IntFamilyType, WireType::Int);
-scalar_family_graph_value!(Bool, BoolFamilyType, WireType::Bool);
 
 impl<A: GraphValue, B: GraphValue> GraphValue for (A, B) {
     type Schema = (A::Schema, B::Schema);
@@ -4720,6 +4928,7 @@ pub use mxx_ir_core::node::ConcatAxis;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_bigint::BigInt;
 
     #[test]
     fn executable_arithmetic_builds_and_validates() {
@@ -4728,6 +4937,154 @@ mod tests {
         let output = input.clone() + input;
         let built = DslContext::new("sum").output("sum", output).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn small_rhs_graph_preserves_bounded_kind_and_has_no_scale_erasure() {
+        let ring = Ring::new(17, 8);
+        let lhs = ring.input("lhs", (2, 3));
+        let rhs = ring.small_matrix_input("rhs", (3, 4), 7);
+        let output = lhs.mul_small_rhs(rhs);
+        let built =
+            DslContext::new("small-rhs").output("product", output).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let nodes = built.graph.root_scope().nodes();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
+        assert!(nodes.iter().any(|node| {
+            node.output_types().iter().any(|wire| {
+                matches!(
+                    wire,
+                    WireType::SmallMatrix { max_coefficient_bound, .. }
+                        if *max_coefficient_bound == IntExpr::constant(7)
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn preimage_rhs_graph_preserves_relation_typed_multiplication() {
+        let ring = Ring::new(17, 8);
+        let lhs = ring.input("lhs", (2, 3));
+        let trapdoor = ring.sample_trapdoor(1, 1, 4, 1, 3);
+        let rhs = trapdoor.sample_preimage(ring.zero((1, 4)), (3, 4));
+        let output = rhs.mul_small_rhs(lhs);
+        let built =
+            DslContext::new("preimage-rhs").output("product", output).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let nodes = built.graph.root_scope().nodes();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. })));
+    }
+
+    #[test]
+    fn gadget_modes_are_relation_typed_and_hash_modes_are_generic_bounded() {
+        let ring = Ring::new(17, 8);
+        let key = ring.bytes_input("key", 32);
+        let input = ring.input("input", (1, 1));
+        let regular = input.clone().decompose(4, 2);
+        let unsigned = input.small_decompose(4, 2);
+        assert!(matches!(
+            regular.value_handle().wire_type(),
+            WireType::Preimage { max_coefficient_bound, .. }
+                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 2.into()
+        ));
+        assert!(matches!(
+            unsigned.value_handle().wire_type(),
+            WireType::Preimage { max_coefficient_bound, .. }
+                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 3.into()
+        ));
+
+        let balanced_hash = ring.hash_decomposed(key.clone(), tag!("balanced"), (2, 2), 4, 2);
+        let unsigned_hash = ring.hash_small_decomposed(key, tag!("unsigned"), (2, 2), 4, 2);
+        assert!(matches!(
+            balanced_hash.value_handle().wire_type(),
+            WireType::SmallMatrix { max_coefficient_bound, .. }
+                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 2.into()
+        ));
+        assert!(matches!(
+            unsigned_hash.value_handle().wire_type(),
+            WireType::SmallMatrix { max_coefficient_bound, .. }
+                if max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap() == 3.into()
+        ));
+    }
+
+    #[test]
+    fn gadget_bounds_and_validation_edges_are_fixed() {
+        let ring = Ring::new(17, 8);
+        let input = ring.input("input", (1, 1));
+        let regular = input.clone().decompose(3, 2);
+        let unsigned = input.clone().small_decompose(3, 2);
+        assert_eq!(regular.max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap(), 2.into());
+        assert_eq!(
+            unsigned.max_coefficient_bound.evaluate(&ParamEnv::default()).unwrap(),
+            2.into()
+        );
+
+        for base in [1, 0, -1] {
+            let built = DslContext::new("invalid-gadget-base")
+                .output("value", ring.input("input", (1, 1)).decompose(base, 2))
+                .unwrap()
+                .build()
+                .unwrap();
+            assert!(built.validate(&ParamEnv::default()).is_err());
+        }
+        for digits in [0, -1] {
+            let built = DslContext::new("invalid-gadget-digits")
+                .output("value", ring.input("input", (1, 1)).decompose(3, digits))
+                .unwrap()
+                .build()
+                .unwrap();
+            assert!(built.validate(&ParamEnv::default()).is_err());
+        }
+
+        let huge_rows = BigInt::from(usize::MAX);
+        let built = DslContext::new("gadget-row-overflow")
+            .output("value", ring.input("input", (huge_rows, 1)).decompose(3, 2))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(built.validate(&ParamEnv::default()).is_err());
+    }
+
+    #[test]
+    fn bounded_families_keep_their_element_wire_kinds() {
+        let ring = Ring::new(17, 8);
+        let small = ring.small_matrix_input_family("small", 2, (2, 2), 3);
+        let preimage = ring.preimage_input_family("preimage", 2, (2, 2), 3);
+        let small_static = small.get_static(0);
+        let preimage_dynamic = preimage.get(Int::constant(1));
+        let mapped_small = small.clone().parallel_map(|_, value| value).unwrap();
+        let mapped_preimage = preimage.clone().parallel_map(|_, value| value).unwrap();
+        let built = DslContext::new("bounded-families")
+            .output("small", mapped_small)
+            .unwrap()
+            .output("preimage", mapped_preimage)
+            .unwrap()
+            .output("small-static", small_static)
+            .unwrap()
+            .output("preimage-dynamic", preimage_dynamic)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        assert!(matches!(
+            small.get_static(0).value_handle().wire_type(),
+            WireType::SmallMatrix { .. }
+        ));
+        assert!(matches!(
+            preimage.get_static(0).value_handle().wire_type(),
+            WireType::Preimage { .. }
+        ));
+        let mut all_nodes = built.graph.scopes().values().flat_map(|scope| scope.nodes());
+        assert!(
+            all_nodes.clone().any(|node| matches!(node.kind(), NodeKind::FamilyGetStatic { .. }))
+        );
+        assert!(all_nodes.clone().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)));
+        assert!(all_nodes.any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
     }
 
     #[test]
@@ -4817,7 +5174,7 @@ mod tests {
         let ring = Ring::new(257, 8);
         let input = ring.input("input", (1, 1));
         let regular = DslContext::new("regular-decomposition")
-            .output("value", input.clone().decompose(4, 4).as_mat())
+            .output("value", input.clone().decompose(4, 4))
             .unwrap()
             .build()
             .unwrap();
@@ -4827,7 +5184,7 @@ mod tests {
         assert!(serialized.contains("\"small\":false"));
 
         let small = DslContext::new("small-decomposition")
-            .output("value", input.clone().small_decompose(4, 4).as_mat())
+            .output("value", input.clone().small_decompose(4, 4))
             .unwrap()
             .build()
             .unwrap();
@@ -4835,7 +5192,7 @@ mod tests {
         assert!(serde_json::to_string(&small.graph).unwrap().contains("\"small\":true"));
 
         let invalid = DslContext::new("negative-decomposition-base")
-            .output("value", input.decompose(-4, 4).as_mat())
+            .output("value", input.decompose(-4, 4))
             .unwrap()
             .build()
             .unwrap();
@@ -4949,16 +5306,16 @@ mod tests {
             .parallel_zip_mat_values(targets, |_, trapdoor, target| {
                 trapdoor
                     .sample_preimage(target, (trapdoor.public_matrix().matrix_type.columns, 1))
-                    .as_mat()
+                    .mul_small_rhs(trapdoor.public_matrix())
             })
             .unwrap();
         let built = DslContext::new("parameterized-trapdoor-families")
             .int_parameter("count")
-            .public_family_output("public", trapdoors.public_matrices())
+            .public_output("public", trapdoors.public_matrices())
             .unwrap()
             .private_trapdoor_family_output("trapdoors", trapdoors)
             .unwrap()
-            .private_family_output("preimages", preimages)
+            .private_output("preimages", preimages)
             .unwrap()
             .build()
             .unwrap();
@@ -4992,7 +5349,7 @@ mod tests {
         let indices = Family::<Int>::pack(vec![Int::constant(2), Int::constant(0)]).unwrap();
         let gathered = trapdoors.parallel_gather(indices).unwrap();
         let built = DslContext::new("trapdoor-family-gather")
-            .public_family_output("public", gathered.public_matrices())
+            .public_output("public", gathered.public_matrices())
             .unwrap()
             .private_trapdoor_family_output("secret", gathered)
             .unwrap()
@@ -5016,7 +5373,7 @@ mod tests {
         let targets = Parallel::range(3).map(|_| ring.zero((1, 1))).unwrap();
         assert!(matches!(
             trapdoors.parallel_zip_mat_values(targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (6, 1)).as_mat()
+                trapdoor.sample_preimage(target, (6, 1)).mul_small_rhs(trapdoor.public_matrix())
             }),
             Err(DslError::FamilyCountMismatch)
         ));
@@ -5068,7 +5425,7 @@ mod tests {
         )
         .unwrap();
         let context = DslContext::new("parallel-zip-many-with-broadcast");
-        let built = context.public_family_output("output", output).unwrap().build().unwrap();
+        let built = context.public_output("output", output).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
         let loop_spec = built
             .graph
@@ -5109,10 +5466,85 @@ mod tests {
     }
 
     #[test]
+    fn heterogeneous_zip_bundle_with_broadcast_is_explicit_and_fail_closed() {
+        let ring = Ring::new(17, 8);
+        let context = DslContext::new("heterogeneous-zip-broadcast");
+        let zipped = (
+            ring.input_family("rows", 2, (1, 1)),
+            context.int_family_input("indices", 2),
+            ring.input_family("targets", 2, (1, 1)),
+        );
+        let broadcast = (
+            ring.small_matrix_input_family("small", 3, (1, 1), 7),
+            ring.preimage_input_family("preimages", 4, (1, 1), 11),
+            ring.input_family("matrices", 5, (1, 1)),
+        );
+        let output = parallel_zip_bundle_with_broadcast(
+            zipped,
+            broadcast,
+            |index, (row, _index, target), (small, preimages, matrices)| {
+                let _ = small.get(index.as_int());
+                let _ = preimages.get(index.as_int());
+                let _ = matrices.get(index.as_int());
+                row + target
+            },
+        )
+        .unwrap();
+        let built = context.public_output("output", output).unwrap().build().unwrap();
+        let loop_node = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+            .expect("parallel loop");
+        let NodeKind::ParallelLoop(spec) = loop_node.kind() else { unreachable!() };
+        assert_eq!(
+            spec.input_modes,
+            vec![
+                LoopInputMode::Zip,
+                LoopInputMode::Zip,
+                LoopInputMode::Zip,
+                LoopInputMode::Broadcast,
+                LoopInputMode::Broadcast,
+                LoopInputMode::Broadcast,
+            ]
+        );
+        assert!(
+            matches!(loop_node.arguments()[3].wire_type(), WireType::IndexedFamily { element, count } if *count == 3.into() && matches!(element.as_ref(), WireType::SmallMatrix { max_coefficient_bound, .. } if *max_coefficient_bound == 7.into()))
+        );
+        assert!(
+            matches!(loop_node.arguments()[4].wire_type(), WireType::IndexedFamily { element, count } if *count == 4.into() && matches!(element.as_ref(), WireType::Preimage { max_coefficient_bound, .. } if *max_coefficient_bound == 11.into()))
+        );
+        assert!(
+            matches!(loop_node.arguments()[5].wire_type(), WireType::IndexedFamily { element, count } if *count == 5.into() && matches!(element.as_ref(), WireType::Matrix(_)))
+        );
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let foreign = ring.input_family("foreign", 2, (1, 1));
+        let negative_context = DslContext::new("heterogeneous-zip-broadcast-negative");
+        let rejected = parallel_zip_bundle_with_broadcast(
+            (
+                ring.input_family("rows2", 2, (1, 1)),
+                negative_context.int_family_input("indices2", 2),
+                ring.input_family("targets2", 2, (1, 1)),
+            ),
+            (
+                ring.small_matrix_input_family("small2", 2, (1, 1), 7),
+                ring.preimage_input_family("preimages2", 2, (1, 1), 11),
+                ring.input_family("matrices2", 2, (1, 1)),
+            ),
+            move |_, (row, _, _), _| row + foreign.get_static(0),
+        );
+        assert!(rejected.is_err(), "ordinary family capture must be rejected");
+    }
+
+    #[test]
     fn try_define_accepts_a_formal_nonartifact_family() {
         let ring = Ring::new(17, 8);
         let matrix_type = MatType(ring.matrix_type((1, 1)));
-        let family_type = MatFamilyType { element: ring.matrix_type((1, 1)), count: 2.into() };
+        let family_type =
+            FamilyType { element: MatType(ring.matrix_type((1, 1))), count: 2.into() };
         let subgraph = Subgraph::<(Mat, Family<Mat>), Mat>::try_define(
             "formal-matrix-family",
             (matrix_type.clone(), family_type.clone()),
@@ -5257,8 +5689,46 @@ mod tests {
         let left = Family::pack(vec![ring.zero((1, 1)), one.clone()]).unwrap();
         let right = Family::pack(vec![one, ring.zero((1, 1))]).unwrap();
         let selected = Family::select(selector, vec![left, right]).unwrap();
-        let built = context.public_family_output("selected", selected).unwrap().build().unwrap();
+        let built = context.public_output("selected", selected).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn preimage_family_select_preserves_bound_and_rejects_schema_mismatches() {
+        let ring = Ring::new(17, 8);
+        let context = DslContext::new("select-preimage-family");
+        let selector = context.int_family_input("selector", 1).get_static(0);
+        let left = ring.preimage_input_family("left", 2, (2, 3), 7);
+        let right = ring.preimage_input_family("right", 2, (2, 3), 7);
+        let selected = Family::select(selector.clone(), vec![left, right]).unwrap();
+        assert!(matches!(
+            selected.value_handle().wire_type(),
+            WireType::IndexedFamily { element, count }
+                if matches!(
+                    element.as_ref(),
+                    WireType::Preimage { max_coefficient_bound, .. }
+                        if *max_coefficient_bound == IntExpr::constant(7)
+                ) && *count == IntExpr::constant(2)
+        ));
+        let built = context.public_output("selected", selected).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let bound_mismatch = Family::select(
+            selector.clone(),
+            vec![
+                ring.preimage_input_family("bound-left", 2, (2, 3), 7),
+                ring.preimage_input_family("bound-right", 2, (2, 3), 8),
+            ],
+        );
+        assert!(matches!(bound_mismatch, Err(DslError::FamilyCountMismatch)));
+        let count_mismatch = Family::select(
+            selector,
+            vec![
+                ring.preimage_input_family("count-left", 2, (2, 3), 7),
+                ring.preimage_input_family("count-right", 3, (2, 3), 7),
+            ],
+        );
+        assert!(matches!(count_mismatch, Err(DslError::FamilyCountMismatch)));
     }
 
     #[test]

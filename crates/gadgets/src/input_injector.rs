@@ -1,7 +1,7 @@
 //! BGG-independent input-injection preprocessing shared by Diamond applications.
 
 use mxx_dsl::{
-    DslError, Family, Int, Mat, Parallel, Ring, Sequential, TrapdoorFamily,
+    DslError, Family, Int, Mat, Parallel, Preimage, Ring, Sequential, TrapdoorFamily,
     parallel_zip_bundle_result,
 };
 use mxx_ir_core::{IntExpr, RealExpr, node::ConcatAxis};
@@ -75,7 +75,7 @@ pub struct DiamondInputPreprocessing {
     /// The initial input-injection vector p.
     pub p: Mat,
     /// Rectangular transition family indexed by `(level, digit, state)`.
-    pub transitions: Family<Mat>,
+    pub transitions: Family<Preimage>,
     /// Trapdoors for the final state bases, returned for application-specific projections.
     pub final_trapdoors: TrapdoorFamily,
 }
@@ -350,7 +350,7 @@ impl DiamondInputInjector {
             },
         )?;
         let transitions = sources.parallel_zip_mat_values(targets, |_, source, target| {
-            source.sample_preimage(target, (state_columns.clone(), state_columns.clone())).as_mat()
+            source.sample_preimage(target, (state_columns.clone(), state_columns.clone()))
         })?;
         let final_indices = Parallel::range(max_state_count.clone()).map_values(|state| {
             Int::evaluate(IntExpr::Mul(
@@ -373,7 +373,7 @@ impl DiamondInputInjector {
         &self,
         initial_state: Mat,
         input_digits: Family<Int>,
-        transitions: Family<Mat>,
+        transitions: Family<Preimage>,
     ) -> Result<DiamondInputEvaluation, DiamondInputPreprocessError> {
         let level_count = self.params.input_count.clone();
         let digit_base = self.params.digit_base.clone();
@@ -424,7 +424,7 @@ impl DiamondInputInjector {
                     })?;
                 let selected = transitions.parallel_gather(transition_indices)?;
                 parallel_zip_bundle_result((source_states, selected), |_, (state, transition)| {
-                    Ok(state * transition)
+                    Ok(transition.mul_small_rhs(state))
                 })
             },
         )?;
@@ -444,7 +444,7 @@ fn regular_selector(secret: Mat) -> Mat {
 mod tests {
     use super::*;
     use mxx_dsl::DslContext;
-    use mxx_ir_core::{ParamEnv, node::NodeKind};
+    use mxx_ir_core::{ParamEnv, node::NodeKind, types::WireType};
 
     fn config() -> DiamondInputConfig {
         DiamondInputConfig {
@@ -471,23 +471,25 @@ mod tests {
             injector.preprocess(ring.input("message", (1, 1))).expect("preprocessing");
         assert_eq!(preprocessing.transitions.count(), &IntExpr::constant(12));
         assert_eq!(preprocessing.final_trapdoors.count(), &IntExpr::constant(3));
+        let transition = preprocessing.transitions.get_static(11);
+        assert!(matches!(transition.value_handle().wire_type(), WireType::Preimage { .. }));
+        let transition_product = transition.clone().mul_small_rhs(preprocessing.p.clone());
 
         let built = DslContext::new("diamond-input-preprocessing")
             .output("p", preprocessing.p)
             .unwrap()
-            .output("transition", preprocessing.transitions.get_static(11))
+            .output("transition", transition)
+            .unwrap()
+            .output("transition-product", transition_product)
             .unwrap()
             .build()
             .unwrap();
         let validated = built.validate(&ParamEnv::default()).unwrap();
-        assert!(
-            validated
-                .source
-                .scopes()
-                .values()
-                .flat_map(|scope| scope.nodes())
-                .any(|node| matches!(node.kind(), NodeKind::PreimageSample { .. }))
-        );
+        let nodes =
+            validated.source.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::PreimageSample { .. })));
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
     }
 
     #[test]

@@ -25,6 +25,14 @@ int matrix_track_limb_consumer(
     const dim3 &limb_id,
     int consumer_device,
     cudaStream_t consumer_stream);
+// Register a read-only consumer without modifying the source's producer event.
+// The source release stream waits on a per-consumer event, so concurrent
+// consumers can safely share a const/Arc-owned matrix.
+int matrix_track_limb_consumer_readonly(
+    const GpuMatrix *src,
+    const dim3 &limb_id,
+    int consumer_device,
+    cudaStream_t consumer_stream);
 int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream);
 bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr);
 size_t matrix_align_up_size(size_t value, size_t alignment);

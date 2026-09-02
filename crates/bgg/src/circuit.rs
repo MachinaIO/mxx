@@ -932,9 +932,12 @@ mod tests {
         node::NodeKind,
         types::MatrixType,
     };
-    use mxx_primitives::poly::{
-        PolyParams,
-        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    use mxx_primitives::{
+        poly::{
+            PolyParams,
+            dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+        },
+        sampler::bounds::default_preimage_cutoff,
     };
     use num_bigint::{BigInt, BigUint};
 
@@ -1120,6 +1123,14 @@ mod tests {
     fn lookup_and_slot_providers_compose_in_one_circuit() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let digit_count = parameters.modulus_digits();
+        let preimage_max_coefficient_bound = default_preimage_cutoff(
+            parameters.ring_dimension(),
+            digit_count + 2,
+            digit_count,
+            1u32 << parameters.base_bits(),
+            4.578,
+        )
+        .expect("default preimage cutoff should be computable");
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
         let transferred = circuit.slot_transfer_gate(input_gate, &[(0, None)]);
@@ -1146,6 +1157,9 @@ mod tests {
             high_matrix_type: matrix_type(&parameters, digit_count + 2, digit_count),
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
             digit_count: IntExpr::constant(digit_count),
+            preimage_max_coefficient_bound: IntExpr::constant(BigInt::from(
+                preimage_max_coefficient_bound,
+            )),
         };
         let invocation = LweLookupInvocation::bind(
             lookup.clone(),

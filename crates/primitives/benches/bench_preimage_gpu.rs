@@ -9,6 +9,8 @@ const SIGMA: f64 = 4.578;
 const TRAPDOOR_SIZE: usize = 1;
 #[cfg(feature = "gpu")]
 const TARGET_COLS: usize = 50;
+#[cfg(feature = "gpu")]
+const PREIMAGE_BOUND_BITS: usize = 48;
 
 #[cfg(feature = "gpu")]
 fn bench_gpu_preimage() {
@@ -26,6 +28,7 @@ fn bench_gpu_preimage() {
             trapdoor::GpuDCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
         },
     };
+    use num_bigint::BigUint;
 
     gpu_device_sync();
     let _ = tracing_subscriber::fmt::try_init();
@@ -50,12 +53,20 @@ fn bench_gpu_preimage() {
 
     gpu_device_sync();
     let start = Instant::now();
-    let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+    let preimage = trapdoor_sampler
+        .preimage(
+            &params,
+            &trapdoor,
+            &public_matrix,
+            &target,
+            BigUint::from(1u8) << PREIMAGE_BOUND_BITS,
+        )
+        .expect("bounded compact GPU preimage sampling failed");
     gpu_device_sync();
     let elapsed = start.elapsed();
     black_box(preimage);
 
-    info!("GPU DCRT preimage: {:?}", elapsed);
+    info!("GPU compact bounded DCRT preimage: {:?}", elapsed);
 }
 
 #[cfg(not(feature = "gpu"))]

@@ -39,6 +39,7 @@ fn test_gpu_aky24_io_parameter_search_and_round_trip() {
         input_size: 5,
         gadget_base: BigInt::from(2),
         digit_count: 9,
+        preimage_max_coefficient_bound: 1_000_000.into(),
         modulus_split: BigInt::from(1),
         trapdoor_sigma: RealExpr::from_f64_exact(4.578).unwrap(),
         secret_sigma: RealExpr::from_integer(2),

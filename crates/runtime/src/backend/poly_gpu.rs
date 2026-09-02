@@ -1,5 +1,29 @@
 use super::poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError};
 use num_traits::ToPrimitive;
+use std::{collections::BTreeMap, marker::PhantomData};
+
+impl<M, U, H, T> PolyBackend<M, U, H, T>
+where
+    M: mxx_primitives::matrix::PolyMatrix,
+{
+    pub(crate) fn new_with_placements(
+        placements: Vec<Vec<<M::P as mxx_primitives::poly::Poly>::Params>>,
+    ) -> Self {
+        assert!(!placements.is_empty(), "a backend needs at least one placement");
+        let mut backend = Self {
+            parameters: (0..placements.len()).map(|_| BTreeMap::new()).collect(),
+            active_placement: 0,
+            preimage_batch_calls: 0,
+            _marker: PhantomData,
+        };
+        for (placement, parameters) in placements.into_iter().enumerate() {
+            for parameters in parameters {
+                backend.register_at(placement, parameters);
+            }
+        }
+        backend
+    }
+}
 
 impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
     fn crt_recompose_levels(

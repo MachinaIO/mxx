@@ -308,8 +308,10 @@ __global__ void matrix_fill_gadget_multi_limb_kernel(
     const size_t poly_idx = idx / n;
     const size_t coeff_idx = idx - poly_idx * n;
 
+    // Gadget entries are constant polynomials. Write their evaluation directly
+    // to every slot so constructing the matrix does not require a full NTT.
     uint64_t value = 0;
-    if (coeff_idx == 0 && rows > 0 && cols > 0 && log_base_q > 0)
+    if (rows > 0 && cols > 0 && log_base_q > 0)
     {
         size_t row = poly_idx / cols;
         size_t col = poly_idx - row * cols;
@@ -504,12 +506,6 @@ static int gpu_matrix_fill_gadget_impl(
         }
     }
 
-    out->format = GPU_POLY_FORMAT_COEFF;
-    status = gpu_matrix_ntt_all(out);
-    if (status != 0)
-    {
-        return status;
-    }
     out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }

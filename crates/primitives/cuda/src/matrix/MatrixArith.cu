@@ -2717,7 +2717,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     const size_t count = lhs->rows * lhs->cols;
     if (count == 0)
     {
-        out->format = GPU_POLY_FORMAT_EVAL;
+        out->format = lhs->format;
         return 0;
     }
 
@@ -2730,7 +2730,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     const int N = lhs->ctx->N;
     if (N <= 0)
     {
-        out->format = GPU_POLY_FORMAT_EVAL;
+        out->format = lhs->format;
         return 0;
     }
     auto &limb_map = lhs->ctx->limb_gpu_ids;
@@ -2752,7 +2752,7 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         return status;
     }
 
-    out->format = GPU_POLY_FORMAT_EVAL;
+    out->format = lhs->format;
     return 0;
 }
 

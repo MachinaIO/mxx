@@ -17,10 +17,7 @@ use mxx_primitives::{
         PolyMatrix, SmallPolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
     },
-    poly::{
-        PolyParams,
-        dcrt::gpu::{GpuDCRTPolyParams, gpu_device_sync},
-    },
+    poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
     sampler::trapdoor::GpuDCRTTrapdoor,
 };
 use mxx_runtime::{
@@ -69,13 +66,7 @@ impl ReadyOutput {
                 public.wait_until_ready();
                 secret.wait_until_ready();
             }
-            // Compact GPU matrices carry their own stream-ordered write event.  The
-            // compact API deliberately does not expose a host wait; dropping this owner
-            // queues its release after that event without materializing a full DCRT matrix.
-            Self::SmallMatrix(matrix) => {
-                gpu_device_sync();
-                drop(matrix);
-            }
+            Self::SmallMatrix(matrix) => matrix.wait_until_ready(),
             Self::Host => {}
         }
     }

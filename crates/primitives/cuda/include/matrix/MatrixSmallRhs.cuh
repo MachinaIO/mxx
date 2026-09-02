@@ -29,6 +29,7 @@ int gpu_small_matrix_create(
     size_t bound_word_count,
     GpuSmallMatrix **out);
 void gpu_small_matrix_destroy(GpuSmallMatrix *mat);
+int gpu_small_matrix_wait(const GpuSmallMatrix *mat);
 int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src);
 int gpu_small_matrix_load_coefficients(
     GpuSmallMatrix *mat,

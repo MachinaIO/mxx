@@ -439,3 +439,10 @@ extern "C" int gpu_matrix_intt_out_of_place_batch(
 {
     return run_matrix_transform_batch(outputs, inputs, matrix_count, false);
 }
+
+extern "C" int gpu_matrix_ntt_in_place_batch(
+    GpuMatrix *const *matrices,
+    size_t matrix_count)
+{
+    return run_matrix_transform_batch(matrices, nullptr, matrix_count, true);
+}

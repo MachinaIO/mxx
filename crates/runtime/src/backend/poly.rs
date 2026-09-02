@@ -118,10 +118,10 @@ pub struct PolyBackend<M, U, H, T>
 where
     M: PolyMatrix,
 {
-    parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
-    active_placement: usize,
-    preimage_batch_calls: usize,
-    _marker: PhantomData<(M, U, H, T)>,
+    pub(super) parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
+    pub(super) active_placement: usize,
+    pub(super) preimage_batch_calls: usize,
+    pub(super) _marker: PhantomData<(M, U, H, T)>,
 }
 
 fn validate_regular_gadget_layout_for_params<P: PolyParams>(
@@ -286,28 +286,11 @@ where
         }
     }
 
-    #[cfg(feature = "gpu")]
-    pub(crate) fn new_with_placements(placements: Vec<Vec<<M::P as Poly>::Params>>) -> Self {
-        assert!(!placements.is_empty(), "a backend needs at least one placement");
-        let mut backend = Self {
-            parameters: (0..placements.len()).map(|_| BTreeMap::new()).collect(),
-            active_placement: 0,
-            preimage_batch_calls: 0,
-            _marker: PhantomData,
-        };
-        for (placement, parameters) in placements.into_iter().enumerate() {
-            for parameters in parameters {
-                backend.register_at(placement, parameters);
-            }
-        }
-        backend
-    }
-
     fn register(&mut self, parameters: <M::P as Poly>::Params) {
         self.register_at(self.active_placement, parameters);
     }
 
-    fn register_at(&mut self, placement: usize, parameters: <M::P as Poly>::Params) {
+    pub(super) fn register_at(&mut self, placement: usize, parameters: <M::P as Poly>::Params) {
         let modulus: Arc<BigUint> = parameters.modulus().into();
         let key = RingKey {
             modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
@@ -879,7 +862,7 @@ where
             return Err(PolyBackendError::InvalidInteger);
         }
         let parameters = self.parameters(ty)?;
-        let source = H::new().sample_hash(
+        let source = H::new().sample_hash_gadget_source(
             parameters,
             key,
             tag,
@@ -903,7 +886,7 @@ where
             return Err(PolyBackendError::InvalidInteger);
         }
         let parameters = self.parameters(ty)?;
-        let source = H::new().sample_hash(
+        let source = H::new().sample_hash_gadget_source(
             parameters,
             key,
             tag,

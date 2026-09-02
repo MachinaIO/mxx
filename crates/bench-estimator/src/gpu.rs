@@ -18,7 +18,7 @@ use mxx_primitives::{
         PolyMatrix, SmallPolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
     },
-    poly::dcrt::gpu::{gpu_device_sync, gpu_memory_info},
+    poly::dcrt::gpu::gpu_memory_info,
     sampler::trapdoor::gpu::GpuDCRTTrapdoor,
 };
 use mxx_runtime::{
@@ -89,7 +89,7 @@ impl GpuMeasurementOutput {
             Self::Matrix(value) => value.wait_until_ready(),
             // Compact outputs must be fenced before the timed callback returns; retain the
             // compact owner and do not materialize it as a full DCRT matrix.
-            Self::SmallMatrix(_value) => gpu_device_sync(),
+            Self::SmallMatrix(value) => value.wait_until_ready(),
         }
     }
 }
@@ -934,6 +934,7 @@ impl GpuNodeMeasurementBackend {
                 .sample_trapdoor(matrix, sigma, gadget_base, *digit_count)
                 .map_err(|error| GpuMeasurementError(error.to_string()))?;
             public.wait_until_ready();
+            trapdoor.wait_until_ready();
             Some((
                 public,
                 trapdoor,

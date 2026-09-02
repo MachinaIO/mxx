@@ -54,6 +54,21 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         dist: DistType,
     ) -> Self::M;
 
+    /// Samples the matrix that will immediately be gadget-decomposed.
+    /// Backends may preserve a coefficient-domain result to avoid a redundant
+    /// transform; the default keeps the ordinary sampling semantics.
+    fn sample_hash_gadget_source<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+    ) -> Self::M {
+        self.sample_hash(params, key, tag, nrow, ncol, dist)
+    }
+
     /// Samples the conceptual matrix returned by `sample_hash(..., total_ncol, ...)`, then returns
     /// only the requested column window `[col_start, col_start + col_len)`.
     fn sample_hash_columns<B: AsRef<[u8]>>(

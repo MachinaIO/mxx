@@ -351,6 +351,10 @@ unsafe extern "C" {
         inputs: *const *const GpuMatrixOpaque,
         matrix_count: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_ntt_in_place_batch(
+        matrices: *const *mut GpuMatrixOpaque,
+        matrix_count: usize,
+    ) -> c_int;
     pub(crate) fn gpu_small_matrix_create(
         ctx: *mut GpuContextOpaque,
         rows: usize,
@@ -361,6 +365,7 @@ unsafe extern "C" {
         out: *mut *mut GpuSmallMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_small_matrix_destroy(mat: *mut GpuSmallMatrixOpaque);
+    pub(crate) fn gpu_small_matrix_wait(mat: *const GpuSmallMatrixOpaque) -> c_int;
     pub(crate) fn gpu_small_matrix_copy(
         out: *mut GpuSmallMatrixOpaque,
         src: *const GpuSmallMatrixOpaque,
@@ -1329,16 +1334,42 @@ impl Poly for GpuDCRTPoly {
 
 impl_binop_with_refs!(GpuDCRTPoly => Add::add(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    let lhs = self.ensure_eval_domain();
-    let rhs = rhs.ensure_eval_domain();
-    GpuDCRTPoly::from_inner(&lhs.inner + &rhs.inner)
+    match (self.is_ntt(), rhs.is_ntt()) {
+        (true, true) => GpuDCRTPoly::from_inner(&self.inner + &rhs.inner),
+        (true, false) => {
+            let rhs = rhs.ensure_eval_domain();
+            GpuDCRTPoly::from_inner(&self.inner + &rhs.inner)
+        }
+        (false, true) => {
+            let lhs = self.ensure_eval_domain();
+            GpuDCRTPoly::from_inner(&lhs.inner + &rhs.inner)
+        }
+        (false, false) => {
+            let mut out = GpuDCRTPoly::from_inner(&self.inner + &rhs.inner);
+            out.ntt_in_place();
+            out
+        }
+    }
 });
 
 impl_binop_with_refs!(GpuDCRTPoly => Sub::sub(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
     self.assert_compatible(rhs);
-    let lhs = self.ensure_eval_domain();
-    let rhs = rhs.ensure_eval_domain();
-    GpuDCRTPoly::from_inner(&lhs.inner - &rhs.inner)
+    match (self.is_ntt(), rhs.is_ntt()) {
+        (true, true) => GpuDCRTPoly::from_inner(&self.inner - &rhs.inner),
+        (true, false) => {
+            let rhs = rhs.ensure_eval_domain();
+            GpuDCRTPoly::from_inner(&self.inner - &rhs.inner)
+        }
+        (false, true) => {
+            let lhs = self.ensure_eval_domain();
+            GpuDCRTPoly::from_inner(&lhs.inner - &rhs.inner)
+        }
+        (false, false) => {
+            let mut out = GpuDCRTPoly::from_inner(&self.inner - &rhs.inner);
+            out.ntt_in_place();
+            out
+        }
+    }
 });
 
 impl_binop_with_refs!(GpuDCRTPoly => Mul::mul(self, rhs: &GpuDCRTPoly) -> GpuDCRTPoly {
@@ -1360,8 +1391,7 @@ impl Neg for &GpuDCRTPoly {
     type Output = GpuDCRTPoly;
 
     fn neg(self) -> Self::Output {
-        let zero = GpuDCRTPoly::const_zero(self.params_ref());
-        &zero - self
+        GpuDCRTPoly::from_inner(self.inner.negate_direct())
     }
 }
 
@@ -1445,11 +1475,19 @@ mod tests {
         assert!(first.aux_bytes > 0);
         assert!(first.event_bytes > 0);
         const RUNTIME_MAX_AUX_LIMBS: usize = 64;
+        #[repr(C)]
+        struct DeviceDescriptorLayout {
+            base: *mut u8,
+            stride: usize,
+            width: u8,
+        }
         let matrix_count = 2 * 3;
-        let expected_aux = RUNTIME_MAX_AUX_LIMBS *
+        let expected_aux_slab = RUNTIME_MAX_AUX_LIMBS *
             (4 + 4 * params.dnum as usize) *
             matrix_count *
             std::mem::size_of::<*mut u8>();
+        let expected_aux =
+            expected_aux_slab + params.crt_depth() * std::mem::size_of::<DeviceDescriptorLayout>();
         assert_eq!(
             first.aux_bytes, expected_aux,
             "query must cover the complete context aux slab so checked operations cannot fall back"
@@ -1559,10 +1597,21 @@ mod tests {
         let poly2 = GpuDCRTPoly::from_coeffs(&gpu_params, &coeffs2);
 
         let sum = poly1.clone() + poly2.clone();
+        let mut poly1_eval = poly1.clone();
+        poly1_eval.ntt_in_place();
+        let mut poly2_eval = poly2.clone();
+        poly2_eval.ntt_in_place();
+        let mixed_sum_left = &poly1_eval + &poly2;
+        let mixed_sum_right = &poly1 + &poly2_eval;
+        let eval_sum = &poly1_eval + &poly2_eval;
         let product = &poly1 * &poly2;
 
         let neg_poly2 = poly2.clone().neg();
+        let neg_poly2_eval = -&poly2_eval;
         let difference = poly1.clone() - poly2.clone();
+        let mixed_difference_left = &poly1_eval - &poly2;
+        let mixed_difference_right = &poly1 - &poly2_eval;
+        let eval_difference = &poly1_eval - &poly2_eval;
 
         let mut poly_add_assign = poly1.clone();
         poly_add_assign += poly2.clone();
@@ -1571,7 +1620,24 @@ mod tests {
         poly_mul_assign *= poly2.clone();
 
         assert!(sum != poly1, "Sum should differ from original poly1");
+        assert!(sum.is_ntt(), "coefficient addition must return evaluation format");
+        assert!(mixed_sum_left.is_ntt() && mixed_sum_right.is_ntt() && eval_sum.is_ntt());
+        assert_eq!(mixed_sum_left, sum);
+        assert_eq!(mixed_sum_right, sum);
+        assert_eq!(eval_sum, sum);
         assert!(neg_poly2 != poly2, "Negated polynomial should differ from original");
+        assert!(!neg_poly2.is_ntt(), "negation must preserve coefficient format");
+        assert!(neg_poly2_eval.is_ntt(), "negation must preserve evaluation format");
+        assert_eq!(neg_poly2_eval, neg_poly2);
+        assert!(difference.is_ntt(), "coefficient subtraction must return evaluation format");
+        assert!(
+            mixed_difference_left.is_ntt() &&
+                mixed_difference_right.is_ntt() &&
+                eval_difference.is_ntt()
+        );
+        assert_eq!(mixed_difference_left, difference);
+        assert_eq!(mixed_difference_right, difference);
+        assert_eq!(eval_difference, difference);
         assert_eq!(difference + poly2, poly1, "p1 - p2 + p2 should be p1");
 
         assert_eq!(poly_add_assign, sum, "+= result should match separate +");

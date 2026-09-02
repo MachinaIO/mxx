@@ -1,5 +1,27 @@
 namespace
 {
+    struct DeviceDescriptorInit
+    {
+        uint8_t *base;
+        size_t stride;
+        size_t count;
+        uint8_t widths[GPU_RUNTIME_MAX_LIMBS];
+        size_t offsets[GPU_RUNTIME_MAX_LIMBS];
+    };
+
+    __global__ void initialize_device_descriptors(
+        GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors,
+        DeviceDescriptorInit init)
+    {
+        const size_t limb = blockIdx.x * blockDim.x + threadIdx.x;
+        if (limb >= init.count)
+        {
+            return;
+        }
+        descriptors[limb] = GpuMatrix::SharedLimbBuffer::DeviceDescriptor{
+            init.base + init.offsets[limb], init.stride, init.widths[limb]};
+    }
+
     bool checked_mul_size(size_t a, size_t b, size_t *out)
     {
         if (!out)
@@ -182,6 +204,15 @@ namespace
                 {
                     return set_error("matrix aux allocation overflow in matrix allocation plan");
                 }
+                size_t descriptor_bytes = 0;
+                if (!checked_mul_size(
+                        partition.local_limb_count,
+                        sizeof(GpuMatrix::SharedLimbBuffer::DeviceDescriptor),
+                        &descriptor_bytes) ||
+                    !checked_add_size(partition.aux_bytes, descriptor_bytes, &partition.aux_bytes))
+                {
+                    return set_error("matrix device descriptor allocation overflow");
+                }
 
                 size_t partition_event_count = 0;
                 size_t partition_event_bytes = 0;
@@ -334,6 +365,7 @@ namespace
             if (partition_idx < mat->shared_limb_buffers.size())
             {
                 mat->shared_limb_buffers[partition_idx].ptr = nullptr;
+                mat->shared_limb_buffers[partition_idx].device_descriptors = nullptr;
             }
             if (partition_idx < mat->shared_aux_buffers.size())
             {
@@ -521,49 +553,29 @@ extern "C" int gpu_matrix_create(
         err = cudaMallocAsync(&aux_base, partition.aux_bytes, alloc_stream);
         if (err != cudaSuccess)
         {
+            const cudaError_t allocation_error = err;
+            cudaFreeAsync(base, alloc_stream);
             destroy_matrix_contents(mat);
             delete mat;
-            return set_error(err);
+            return set_error(allocation_error);
         }
 
-        cudaEvent_t alloc_ready = nullptr;
-        err = cudaEventCreateWithFlags(&alloc_ready, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error(err);
-        }
-        err = cudaEventRecord(alloc_ready, alloc_stream);
-        if (err != cudaSuccess)
-        {
-            cudaEventDestroy(alloc_ready);
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error(err);
-        }
-
+        auto *device_descriptors = reinterpret_cast<GpuMatrix::SharedLimbBuffer::DeviceDescriptor *>(
+            reinterpret_cast<uint8_t *>(aux_base) +
+            partition.aux_slots_total * sizeof(void *));
+        DeviceDescriptorInit descriptor_init{};
+        descriptor_init.base = base;
+        descriptor_init.stride = partition.bytes_per_poly;
+        descriptor_init.count = partition.local_limb_count;
         for (size_t limb_idx = 0; limb_idx < partition.local_limb_count; ++limb_idx)
         {
-            auto &state = exec_states[limb_idx];
-            if (!state.stream || state.stream == alloc_stream)
-            {
-                continue;
-            }
-            err = cudaStreamWaitEvent(state.stream, alloc_ready, 0);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(alloc_ready);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error(err);
-            }
+            descriptor_init.offsets[limb_idx] = partition.limb_offsets_bytes[limb_idx];
+            descriptor_init.widths[limb_idx] = partition.limb_coeff_bytes[limb_idx];
         }
-        cudaEventDestroy(alloc_ready);
-
         mat->shared_limb_buffers[partition_idx] = GpuMatrix::SharedLimbBuffer{
             ctx->gpu_ids[partition_idx],
             base,
+            device_descriptors,
             partition.local_limb_count,
             partition.bytes_per_poly,
             partition.data_bytes,
@@ -575,6 +587,60 @@ extern "C" int gpu_matrix_create(
             aux_base,
             partition.aux_slots_per_poly,
             partition.aux_slots_total};
+        auto fail_after_descriptor_enqueue = [&](cudaError_t failure) -> int {
+            // Only an error path may block here. Until the post-allocation
+            // events are installed, the older limb events do not protect the
+            // descriptor initialization from asynchronous owner cleanup.
+            cudaStreamSynchronize(alloc_stream);
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error(failure);
+        };
+        initialize_device_descriptors<<<1, static_cast<unsigned int>(partition.local_limb_count), 0, alloc_stream>>>(
+            device_descriptors, descriptor_init);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            return fail_after_descriptor_enqueue(err);
+        }
+
+        cudaEvent_t alloc_ready = nullptr;
+        err = cudaEventCreateWithFlags(&alloc_ready, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            return fail_after_descriptor_enqueue(err);
+        }
+        err = cudaEventRecord(alloc_ready, alloc_stream);
+        if (err != cudaSuccess)
+        {
+            cudaEventDestroy(alloc_ready);
+            return fail_after_descriptor_enqueue(err);
+        }
+
+        for (size_t limb_idx = 0; limb_idx < partition.local_limb_count; ++limb_idx)
+        {
+            auto &state = exec_states[limb_idx];
+            if (!state.stream)
+            {
+                continue;
+            }
+            if (state.stream != alloc_stream)
+            {
+                err = cudaStreamWaitEvent(state.stream, alloc_ready, 0);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(alloc_ready);
+                    return fail_after_descriptor_enqueue(err);
+                }
+            }
+            err = cudaEventRecord(state.write_done, state.stream);
+            if (err != cudaSuccess)
+            {
+                cudaEventDestroy(alloc_ready);
+                return fail_after_descriptor_enqueue(err);
+            }
+        }
+        cudaEventDestroy(alloc_ready);
     }
 
     *out = mat;

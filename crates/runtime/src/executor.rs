@@ -579,7 +579,14 @@ where
                 args: scope.arguments(handle).expect("validated node belongs to its scope"),
             };
             if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {
-                self.execute_preimage_batch(scope_id, &paths, &placements, &node, &mut values)?;
+                self.execute_preimage_batch(
+                    scope_id,
+                    &envs,
+                    &paths,
+                    &placements,
+                    &node,
+                    &mut values,
+                )?;
             } else if envs.len() > 1 &&
                 self.execute_parallel_matrix_node_by_placement(
                     &placements,
@@ -1685,7 +1692,7 @@ where
                     },
                 );
             }
-            NodeKind::PreimageSample { .. } => {
+            NodeKind::PreimageSample { max_coefficient_bound, .. } => {
                 let public = self.matrix(values, node.args[0])?;
                 let (secret, trapdoor_public, _, sigma, gadget_base, digit_count, gadget_small) =
                     self.trapdoor(values, node.args[1])?;
@@ -1697,7 +1704,11 @@ where
                 let target = self.matrix(values, node.args[2])?;
                 let target_type = self.matrix_type(scope_id, path, node.args[2])?;
                 let wire = WireRef { node: node.id, port: Port(0) };
-                let (schema, semantic_kind) = self.bounded_matrix_schema(scope_id, path, wire)?;
+                let (mut schema, semantic_kind) =
+                    self.bounded_matrix_schema(scope_id, path, wire)?;
+                schema.max_coefficient_bound = max_coefficient_bound
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?;
                 if semantic_kind != SmallMatrixSemanticKind::Preimage {
                     return Err(ExecutionError::Manifest(
                         "preimage sampler output is not relation typed".to_owned(),
@@ -2205,11 +2216,13 @@ where
     fn execute_preimage_batch(
         &mut self,
         scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
         paths: &[Vec<InstantiationFrame>],
         placements: &[usize],
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
     ) -> Result<(), ExecutionError> {
+        debug_assert_eq!(envs.len(), values.len());
         struct Pending<M, T> {
             instance: usize,
             placement: usize,
@@ -2232,7 +2245,7 @@ where
             }
             let target = self.matrix(&mut values[instance], node.args[2])?;
             let wire = WireRef { node: node.id, port: Port(0) };
-            let (schema, semantic_kind) =
+            let (mut schema, semantic_kind) =
                 self.bounded_matrix_schema(scope_id, &paths[instance], wire)?;
             if semantic_kind != SmallMatrixSemanticKind::Preimage {
                 return Err(ExecutionError::Manifest(
@@ -2249,9 +2262,12 @@ where
                 self.put(&mut values[instance], node.id, 0, RuntimeValue::small_matrix(value));
                 continue;
             }
-            let NodeKind::PreimageSample { .. } = node.kind else {
+            let NodeKind::PreimageSample { max_coefficient_bound, .. } = node.kind else {
                 unreachable!("preimage batch only handles preimage nodes")
             };
+            schema.max_coefficient_bound = max_coefficient_bound
+                .evaluate(&envs[instance])
+                .map_err(|error| self.expression_error(node.id, error))?;
             pending.push(Pending {
                 instance,
                 placement: placements[instance],

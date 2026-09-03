@@ -28,50 +28,15 @@ fn positive_usize(name: &str, default: usize) -> Result<usize, String> {
     }
 }
 
-fn optional_positive_usize(name: &str) -> Result<Option<usize>, String> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse::<usize>()
-            .map_err(|_| format!("{name} must be a positive unsigned integer, got {value:?}"))
-            .and_then(|parsed| {
-                if parsed == 0 { Err(format!("{name} must be positive")) } else { Ok(Some(parsed)) }
-            }),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+/// `MXX_GPU_VRAM_PERCENT`: percentage of each GPU's total VRAM available to
+/// one GPU operation. Default: 80.
+pub fn gpu_vram_percent() -> Result<u32, String> {
+    let percent = positive_usize("MXX_GPU_VRAM_PERCENT", 80)?;
+    if percent <= 100 {
+        Ok(percent as u32)
+    } else {
+        Err(format!("MXX_GPU_VRAM_PERCENT must be between 1 and 100, got {percent}"))
     }
-}
-
-/// Maximum bytes reserved for one compact small-matrix operation.
-pub fn gpu_small_matrix_residency_bytes() -> Result<usize, String> {
-    positive_usize("MXX_GPU_SMALL_MATRIX_RESIDENCY_BYTES", 1 << 30)
-}
-
-/// Fixed reserve for CUDA allocator fragmentation, opaque event resources,
-/// and pinned sampler-control storage. This is subtracted from the configured
-/// residency budget before admitting any queried owners or workspaces.
-pub fn gpu_small_matrix_allocator_headroom_bytes() -> Result<usize, String> {
-    positive_usize("MXX_GPU_SMALL_MATRIX_ALLOCATOR_HEADROOM_BYTES", 64 << 20)
-}
-
-/// Explicit debug/benchmark override for the automatic small-RHS tile
-/// scheduler. `None` means that production code should choose a safe tile
-/// from the residency budget and operation shape.
-pub fn mul_small_rhs_tile_columns() -> Result<Option<usize>, String> {
-    optional_positive_usize("MXX_MUL_SMALL_RHS_TILE_COLUMNS")
-}
-
-/// Explicit debug/benchmark override for the automatic small-RHS wave
-/// scheduler. `None` means that production code should choose a safe wave
-/// from the residency budget and operation shape.
-pub fn mul_small_rhs_k_tile() -> Result<Option<usize>, String> {
-    optional_positive_usize("MXX_MUL_SMALL_RHS_K_TILE")
-}
-
-/// Explicit debug/benchmark override for the automatic small-RHS wave
-/// scheduler. `None` means that production code should choose a safe wave
-/// from the residency budget and operation shape.
-pub fn mul_small_rhs_limb_wave() -> Result<Option<usize>, String> {
-    optional_positive_usize("MXX_MUL_SMALL_RHS_LIMB_WAVE")
 }
 
 /// Maximum number of sampler attempts for each target-column tile.
@@ -84,7 +49,7 @@ pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::positive_usize;
+    use super::{gpu_vram_percent, positive_usize};
 
     #[test]
     #[serial_test::serial]
@@ -98,6 +63,23 @@ mod tests {
         assert!(positive_usize(name, 64).is_err());
         unsafe { std::env::set_var(name, "-1") };
         assert!(positive_usize(name, 64).is_err());
+        unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gpu_vram_percent_accepts_only_one_through_one_hundred() {
+        let name = "MXX_GPU_VRAM_PERCENT";
+        unsafe { std::env::remove_var(name) };
+        assert_eq!(gpu_vram_percent().unwrap(), 80);
+        for value in ["1", "37", "100"] {
+            unsafe { std::env::set_var(name, value) };
+            assert_eq!(gpu_vram_percent().unwrap(), value.parse().unwrap());
+        }
+        for value in ["0", "101", "-1", "invalid"] {
+            unsafe { std::env::set_var(name, value) };
+            assert!(gpu_vram_percent().is_err());
+        }
         unsafe { std::env::remove_var(name) };
     }
 }

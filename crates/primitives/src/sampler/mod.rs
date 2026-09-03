@@ -94,19 +94,10 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         self.sample_hash(params, key, tag, nrow, total_ncol, dist).slice_columns(col_start, col_end)
     }
 
-    fn sample_hash_decomposed<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        ncol: usize,
-        dist: DistType,
-    ) -> Self::M {
-        self.sample_hash(params, key, tag, nrow, ncol, dist).decompose_owned()
-    }
-
-    fn sample_hash_decomposed_columns<B: AsRef<[u8]>>(
+    /// Samples a column window that will immediately be gadget-decomposed.
+    /// Backends may preserve a coefficient-domain result to avoid a redundant
+    /// transform while retaining the global column domain separation.
+    fn sample_hash_gadget_source_columns<B: AsRef<[u8]>>(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         key: [u8; 32],
@@ -118,34 +109,6 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         dist: DistType,
     ) -> Self::M {
         self.sample_hash_columns(params, key, tag, nrow, total_ncol, col_start, col_len, dist)
-            .decompose_owned()
-    }
-
-    fn sample_hash_small_decomposed<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        ncol: usize,
-        dist: DistType,
-    ) -> Self::M {
-        self.sample_hash(params, key, tag, nrow, ncol, dist).small_decompose_owned()
-    }
-
-    fn sample_hash_small_decomposed_columns<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        total_ncol: usize,
-        col_start: usize,
-        col_len: usize,
-        dist: DistType,
-    ) -> Self::M {
-        self.sample_hash_columns(params, key, tag, nrow, total_ncol, col_start, col_len, dist)
-            .small_decompose_owned()
     }
 }
 

@@ -1185,6 +1185,41 @@ where
         inputs: &BTreeMap<String, RuntimeValue<B>>,
         values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
     ) -> Result<(), ExecutionError> {
+        #[cfg(feature = "gpu")]
+        {
+            if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
+                let argument_types = node
+                    .args
+                    .iter()
+                    .map(|wire| {
+                        self.validated_wire_type(scope_id, *wire).cloned().ok_or_else(|| {
+                            ExecutionError::MissingMetadata(WireId {
+                                instantiation_path: path.to_vec(),
+                                wire: *wire,
+                            })
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut output_types = self
+                    .validated
+                    .scope(scope_id)
+                    .into_iter()
+                    .flat_map(|scope| scope.wire_types.iter())
+                    .filter(|(wire, _)| wire.node == node.id)
+                    .map(|(wire, ty)| (wire.port, ty.clone()))
+                    .collect::<Vec<_>>();
+                output_types.sort_by_key(|(port, _)| *port);
+                let output_types = output_types.into_iter().map(|(_, ty)| ty).collect::<Vec<_>>();
+                let operation = crate::gpu_calibration::gpu_calibration_operation_identity(
+                    node.kind,
+                    &argument_types,
+                    &output_types,
+                    env,
+                )
+                .map_err(ExecutionError::Backend)?;
+                self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
+            }
+        }
         match &node.kind {
             NodeKind::Input { name, wire_type: _, artifact } => {
                 if let Some(artifact) = artifact {
@@ -4771,6 +4806,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn trapdoor_families_sample_preimages_and_persist_each_member() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());

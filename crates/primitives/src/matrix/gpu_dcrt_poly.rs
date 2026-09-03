@@ -15,8 +15,9 @@ use crate::{
                 gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
                 gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
                 gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
-                gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal, gpu_matrix_fill_gadget,
-                gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_small_gadget,
+                gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
+                gpu_matrix_fill_gadget_columns, gpu_matrix_fill_identity_columns,
+                gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_unit_row_columns,
                 gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all,
                 gpu_matrix_intt_out_of_place_batch, gpu_matrix_load_compact_bytes,
                 gpu_matrix_load_rns_batch, gpu_matrix_mul, gpu_matrix_mul_accumulate_batch,
@@ -28,9 +29,12 @@ use crate::{
                 gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
                 gpu_matrix_store_compact_bytes_batch, gpu_matrix_store_const_coeff_batch,
                 gpu_matrix_store_rns_batch, gpu_matrix_sub, gpu_matrix_wait, gpu_small_matrix_copy,
-                gpu_small_matrix_create, gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
-                gpu_small_matrix_load_coefficients, gpu_small_matrix_pack_checked_tile,
-                gpu_small_matrix_store_coefficients, gpu_small_matrix_wait,
+                gpu_small_matrix_copy_columns, gpu_small_matrix_create,
+                gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
+                gpu_small_matrix_load_coefficients, gpu_small_matrix_prepare_preimage_hard_cutoff,
+                gpu_small_matrix_store_coefficients,
+                gpu_small_matrix_try_pack_preimage_hard_cutoff_tile, gpu_small_matrix_view_columns,
+                gpu_small_matrix_wait,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
@@ -72,6 +76,7 @@ pub struct GpuSmallMatrix {
     rows: usize,
     columns: usize,
     magnitude_bytes: usize,
+    resident_payload_bytes: usize,
     max_coefficient_bound: BigUint,
     raw: *mut GpuSmallMatrixOpaque,
 }
@@ -79,8 +84,9 @@ pub struct GpuSmallMatrix {
 /// Accounting for one compact-RHS multiplication. `lhs_eval_bytes` and
 /// `full_output_bytes` are complete authoritative owner allocations, including
 /// their data, auxiliary slabs, and deterministic event handles. The expanded
-/// RHS field remains explicit so callers can assert that no full RHS is
-/// materialized.
+/// RHS fields describe the full expanded evaluation workspace for the current
+/// runtime shard. The runtime is responsible for ensuring this shard has at
+/// most its calibrated column width.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GpuSmallMatrixAllocationReport {
     pub lhs_eval_bytes: usize,
@@ -99,11 +105,11 @@ pub struct GpuSmallMatrixSamplerAllocationReport {
     pub candidate_bytes: usize,
     pub perturbation_bytes: usize,
     pub check_scratch_bytes: usize,
+    pub hard_cutoff_plan_bytes: usize,
     pub packed_staging_bytes: usize,
     pub sampler_event_bytes: usize,
     pub device_acceptance_control_bytes: usize,
     pub pinned_host_acceptance_control_bytes: usize,
-    pub allocator_headroom_bytes: usize,
     pub sampler_peak_bytes: usize,
 }
 
@@ -115,97 +121,21 @@ impl GpuSmallMatrixSamplerAllocationReport {
 
 impl GpuSmallMatrixAllocationReport {
     pub fn fits_budget(&self, budget_bytes: usize) -> bool {
-        self.full_expanded_rhs_bytes == 0 && self.high_water_bytes <= budget_bytes
+        self.high_water_bytes <= budget_bytes
     }
 }
 
-fn small_rhs_admission_budget(
+fn validate_small_rhs_budget(
     report: &GpuSmallMatrixAllocationReport,
     budget_bytes: usize,
-    allocator_headroom_bytes: usize,
-) -> Result<usize, SmallMatrixError> {
-    let admission_budget = budget_bytes.checked_sub(allocator_headroom_bytes).ok_or(
-        SmallMatrixError::ResourceExhausted {
-            requested_bytes: allocator_headroom_bytes,
-            budget_bytes,
-        },
-    )?;
-    if report.fits_budget(admission_budget) {
-        return Ok(admission_budget);
+) -> Result<(), SmallMatrixError> {
+    if report.fits_budget(budget_bytes) {
+        return Ok(());
     }
-    let requested_bytes = report
-        .high_water_bytes
-        .checked_add(allocator_headroom_bytes)
-        .ok_or(SmallMatrixError::DimensionOverflow)?;
-    Err(SmallMatrixError::ResourceExhausted { requested_bytes, budget_bytes })
-}
-
-fn small_rhs_tile_schedule(
-    lhs: &GpuDCRTPolyMatrix,
-    rhs: &GpuSmallMatrix,
-    budget_bytes: usize,
-    allocator_headroom_bytes: usize,
-    tile_columns_override: Option<usize>,
-    k_tile_override: Option<usize>,
-    limb_wave_override: Option<usize>,
-) -> Result<(usize, usize, usize), SmallMatrixError> {
-    if rhs.rows == 0 || rhs.columns == 0 || lhs.params.crt_depth() == 0 {
-        return Err(SmallMatrixError::ShapeMismatch);
-    }
-    let admission_budget = budget_bytes.checked_sub(allocator_headroom_bytes).ok_or(
-        SmallMatrixError::ResourceExhausted {
-            requested_bytes: allocator_headroom_bytes,
-            budget_bytes,
-        },
-    )?;
-    let minimum_report = rhs.allocation_report(lhs, 1, 1, 1)?;
-    if !minimum_report.fits_budget(admission_budget) {
-        return Err(small_rhs_admission_budget(
-            &minimum_report,
-            budget_bytes,
-            allocator_headroom_bytes,
-        )
-        .unwrap_err());
-    }
-    let fixed_bytes = minimum_report
-        .high_water_bytes
-        .checked_sub(minimum_report.expanded_rhs_workspace_bytes)
-        .ok_or(SmallMatrixError::DimensionOverflow)?;
-    let available_bytes =
-        admission_budget.checked_sub(fixed_bytes).ok_or(SmallMatrixError::ResourceExhausted {
-            requested_bytes: fixed_bytes,
-            budget_bytes: admission_budget,
-        })?;
-    let bytes_per_workspace_product = (rhs.params.ring_dimension() as usize)
-        .checked_mul(std::mem::size_of::<u64>())
-        .ok_or(SmallMatrixError::DimensionOverflow)?;
-    let capacity_product = available_bytes / bytes_per_workspace_product;
-    if capacity_product == 0 {
-        return Err(SmallMatrixError::ResourceExhausted {
-            requested_bytes: fixed_bytes
-                .checked_add(bytes_per_workspace_product)
-                .ok_or(SmallMatrixError::DimensionOverflow)?,
-            budget_bytes: admission_budget,
-        });
-    }
-
-    // Keep the automatic schedule on one column at a time. This is the
-    // column-chunk-one invariant that prevents a D x D expanded RHS even
-    // when a generous budget would otherwise permit it. Explicit column
-    // overrides remain available for controlled debugging/benchmark
-    // comparisons.
-    let column_limit = tile_columns_override.unwrap_or(1).min(rhs.columns);
-    let k_limit = k_tile_override.unwrap_or(rhs.rows).min(rhs.rows);
-    let limb_limit =
-        limb_wave_override.unwrap_or(lhs.params.crt_depth()).min(lhs.params.crt_depth());
-    let tile_columns = column_limit.min(capacity_product).max(1);
-    let k_tile = k_limit.min(capacity_product / tile_columns).max(1);
-    let used_product =
-        tile_columns.checked_mul(k_tile).ok_or(SmallMatrixError::DimensionOverflow)?;
-    let limb_wave = limb_limit.min(capacity_product / used_product).max(1);
-    let report = rhs.allocation_report(lhs, tile_columns, k_tile, limb_wave)?;
-    small_rhs_admission_budget(&report, budget_bytes, allocator_headroom_bytes)?;
-    Ok((tile_columns, k_tile, limb_wave))
+    Err(SmallMatrixError::ResourceExhausted {
+        requested_bytes: report.high_water_bytes,
+        budget_bytes,
+    })
 }
 
 unsafe impl Send for GpuSmallMatrix {}
@@ -243,6 +173,13 @@ impl Clone for GpuSmallMatrix {
             rows: self.rows,
             columns: self.columns,
             magnitude_bytes: self.magnitude_bytes,
+            resident_payload_bytes: Self::payload_len(
+                self.rows,
+                self.columns,
+                self.params.ring_dimension(),
+                self.magnitude_bytes,
+            )
+            .expect("validated compact clone payload"),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
             raw,
         }
@@ -275,11 +212,59 @@ impl PartialEq for GpuSmallMatrix {
 
 impl Eq for GpuSmallMatrix {}
 
+pub struct GpuSmallMatrixColumnView<'a> {
+    value: GpuSmallMatrix,
+    _source: std::marker::PhantomData<&'a GpuSmallMatrix>,
+}
+
+impl AsRef<GpuSmallMatrix> for GpuSmallMatrixColumnView<'_> {
+    fn as_ref(&self) -> &GpuSmallMatrix {
+        &self.value
+    }
+}
+
 impl GpuSmallMatrix {
     /// Wait only for this compact owner's last write event.
     pub fn wait_until_ready(&self) {
         let status = unsafe { gpu_small_matrix_wait(self.raw) };
         check_status(status, "gpu_small_matrix_wait");
+    }
+
+    pub fn slice_columns(&self, start: usize, end: usize) -> Self {
+        assert!(start < end && end <= self.columns, "invalid compact column range");
+        let out = Self::new_empty(
+            &self.params,
+            self.rows,
+            end - start,
+            self.max_coefficient_bound.clone(),
+        )
+        .expect("validated compact slice allocation");
+        let status = unsafe { gpu_small_matrix_copy_columns(out.raw, self.raw, start) };
+        check_status(status, "gpu_small_matrix_copy_columns");
+        out
+    }
+
+    /// Borrows a compact column range without allocating or copying payload.
+    /// The lifetime keeps the source owner alive until all use of the view has
+    /// been enqueued and its consumer event has reached the release stream.
+    pub fn column_view(&self, start: usize, end: usize) -> GpuSmallMatrixColumnView<'_> {
+        assert!(start < end && end <= self.columns, "invalid compact column range");
+        let mut raw = ptr::null_mut();
+        let status =
+            unsafe { gpu_small_matrix_view_columns(self.raw, start, end - start, &mut raw) };
+        check_status(status, "gpu_small_matrix_view_columns");
+        GpuSmallMatrixColumnView {
+            value: GpuSmallMatrix {
+                params: self.params.clone(),
+                rows: self.rows,
+                columns: end - start,
+                magnitude_bytes: self.magnitude_bytes,
+                resident_payload_bytes: self.resident_payload_bytes,
+                max_coefficient_bound: self.max_coefficient_bound.clone(),
+                raw,
+            },
+            _source: std::marker::PhantomData,
+        }
     }
 
     fn bound_words(bound: &BigUint) -> Vec<u64> {
@@ -372,6 +357,7 @@ impl GpuSmallMatrix {
             rows,
             columns,
             magnitude_bytes,
+            resident_payload_bytes: payload_bytes,
             max_coefficient_bound,
             raw,
         })
@@ -446,11 +432,11 @@ impl GpuSmallMatrix {
         candidate_bytes: usize,
         perturbation_bytes: usize,
         check_scratch_bytes: usize,
+        hard_cutoff_plan_bytes: usize,
         packed_staging_bytes: usize,
         sampler_event_bytes: usize,
         device_acceptance_control_bytes: usize,
         pinned_host_acceptance_control_bytes: usize,
-        allocator_headroom_bytes: usize,
     ) -> Result<GpuSmallMatrixSamplerAllocationReport, SmallMatrixError> {
         let compact_destination_bytes = self
             .rows
@@ -463,11 +449,11 @@ impl GpuSmallMatrix {
             .and_then(|value| value.checked_add(candidate_bytes))
             .and_then(|value| value.checked_add(perturbation_bytes))
             .and_then(|value| value.checked_add(check_scratch_bytes))
+            .and_then(|value| value.checked_add(hard_cutoff_plan_bytes))
             .and_then(|value| value.checked_add(packed_staging_bytes))
             .and_then(|value| value.checked_add(sampler_event_bytes))
             .and_then(|value| value.checked_add(device_acceptance_control_bytes))
             .and_then(|value| value.checked_add(pinned_host_acceptance_control_bytes))
-            .and_then(|value| value.checked_add(allocator_headroom_bytes))
             .ok_or(SmallMatrixError::DimensionOverflow)?;
         Ok(GpuSmallMatrixSamplerAllocationReport {
             persistent_bytes,
@@ -475,20 +461,19 @@ impl GpuSmallMatrix {
             candidate_bytes,
             perturbation_bytes,
             check_scratch_bytes,
+            hard_cutoff_plan_bytes,
             packed_staging_bytes,
             sampler_event_bytes,
             device_acceptance_control_bytes,
             pinned_host_acceptance_control_bytes,
-            allocator_headroom_bytes,
             sampler_peak_bytes,
         })
     }
 
-    /// Checks and packs one coefficient-domain candidate tile in a single
-    /// full-CRT device pass, returning only the acceptance decision to the
-    /// adaptive sampler. A rejected tile is unspecified until the next attempt
-    /// overwrites it; callers must not expose the destination before success.
-    pub fn try_pack_checked_tile(
+    /// Checks and packs one coefficient-domain preimage tile using an exact
+    /// anchor or partial-CRT hard cutoff, returning only the decision to the
+    /// adaptive sampler. Rejection never publishes the private staging tile.
+    pub fn try_pack_preimage_hard_cutoff_tile(
         &mut self,
         source: &GpuDCRTPolyMatrix,
         dst_row: usize,
@@ -505,7 +490,7 @@ impl GpuSmallMatrix {
         if source.params.ctx_raw() != self.params.ctx_raw() {
             return Err(SmallMatrixError::ContextMismatch);
         }
-        assert!(!source.is_ntt, "compact checked pack requires a coefficient-domain source");
+        assert!(!source.is_ntt, "preimage hard-cutoff pack requires a coefficient-domain source");
         if source.row_size() != rows ||
             source.col_size() != columns ||
             dst_row.checked_add(rows).is_none_or(|end| end > self.rows) ||
@@ -518,7 +503,7 @@ impl GpuSmallMatrix {
         let words = Self::bound_words(&self.max_coefficient_bound);
         let mut accepted = [0i32; 1];
         let status = unsafe {
-            gpu_small_matrix_pack_checked_tile(
+            gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
                 self.raw,
                 source.raw,
                 dst_row,
@@ -530,16 +515,20 @@ impl GpuSmallMatrix {
                 accepted.as_mut_ptr(),
             )
         };
-        check_status(status, "gpu_small_matrix_pack_checked_tile");
+        check_status(status, "gpu_small_matrix_try_pack_preimage_hard_cutoff_tile");
         Ok(accepted[0] != 0)
+    }
+
+    /// Allocates and uploads the immutable CRT hard-cutoff plan once, before
+    /// preimage retry sampling begins. Other compact matrices do not carry it.
+    pub fn prepare_preimage_hard_cutoff(&mut self) {
+        let status = unsafe { gpu_small_matrix_prepare_preimage_hard_cutoff(self.raw) };
+        check_status(status, "gpu_small_matrix_prepare_preimage_hard_cutoff");
     }
 
     pub fn allocation_report(
         &self,
         lhs: &GpuDCRTPolyMatrix,
-        tile_columns: usize,
-        k_tile: usize,
-        limb_wave: usize,
     ) -> Result<GpuSmallMatrixAllocationReport, SmallMatrixError> {
         let lhs_allocation = self
             .params
@@ -552,9 +541,6 @@ impl GpuSmallMatrix {
         self.allocation_report_from_planner_totals(
             lhs_allocation.total_bytes,
             output_allocation.total_bytes,
-            tile_columns,
-            k_tile,
-            limb_wave,
         )
     }
 
@@ -562,26 +548,20 @@ impl GpuSmallMatrix {
         &self,
         lhs_allocation_bytes: usize,
         output_allocation_bytes: usize,
-        tile_columns: usize,
-        k_tile: usize,
-        limb_wave: usize,
     ) -> Result<GpuSmallMatrixAllocationReport, SmallMatrixError> {
         let n = self.params.ring_dimension() as usize;
         let limbs = self.params.crt_depth();
         let word_bytes = std::mem::size_of::<u64>();
-        let compact_rhs_bytes = self
-            .rows
-            .checked_mul(self.columns)
-            .and_then(|value| value.checked_mul(n))
-            .and_then(|value| value.checked_mul(1 + self.magnitude_bytes))
-            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        if self.rows == 0 || self.columns == 0 || limbs == 0 {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let compact_rhs_bytes = self.resident_payload_bytes;
         // Matrix owners persist their device descriptors in their auxiliary
         // allocation; a single-placement limb index is derived in-kernel.
         let metadata_bytes = 0usize;
         let expanded_rhs_workspace_bytes = limbs
-            .min(limb_wave)
-            .checked_mul(k_tile.min(self.rows))
-            .and_then(|value| value.checked_mul(tile_columns.min(self.columns)))
+            .checked_mul(self.rows)
+            .and_then(|value| value.checked_mul(self.columns))
             .and_then(|value| value.checked_mul(n))
             .and_then(|value| value.checked_mul(word_bytes))
             .ok_or(SmallMatrixError::DimensionOverflow)?;
@@ -606,7 +586,7 @@ impl GpuSmallMatrix {
             expanded_rhs_workspace_bytes,
             event_overhead_bytes,
             high_water_bytes,
-            full_expanded_rhs_bytes: 0,
+            full_expanded_rhs_bytes: expanded_rhs_workspace_bytes,
         })
     }
 }
@@ -701,7 +681,7 @@ impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
         Ok(out)
     }
 
-    fn multiply_small_rhs(&self, rhs: Self::SmallMatrix) -> Result<Self, SmallMatrixError> {
+    fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError> {
         if self.params.gpu_ids() != rhs.params.gpu_ids() {
             return Err(SmallMatrixError::DeviceMismatch);
         }
@@ -717,51 +697,24 @@ impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
         if self.level + 1 != self.params.crt_depth() || !self.is_ntt {
             return Err(SmallMatrixError::InvalidConfig);
         }
-        let budget = crate::env::gpu_small_matrix_residency_bytes()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let allocator_headroom_bytes = crate::env::gpu_small_matrix_allocator_headroom_bytes()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let tile_columns_override = crate::env::mul_small_rhs_tile_columns()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let k_tile_override =
-            crate::env::mul_small_rhs_k_tile().map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let limb_wave_override =
-            crate::env::mul_small_rhs_limb_wave().map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let (tile_columns, k_tile, limb_wave) = small_rhs_tile_schedule(
-            self,
-            &rhs,
-            budget,
-            allocator_headroom_bytes,
-            tile_columns_override,
-            k_tile_override,
-            limb_wave_override,
-        )?;
-        let report = rhs.allocation_report(self, tile_columns, k_tile, limb_wave)?;
-        let admission_budget =
-            small_rhs_admission_budget(&report, budget, allocator_headroom_bytes)?;
+        let budget = self.params.vram_budget_bytes();
+        let report = rhs.allocation_report(self)?;
+        validate_small_rhs_budget(&report, budget)?;
         let out =
             Self::new_empty_with_state(&self.params, self.nrow, rhs.columns, self.level, true);
         let mut raw_report = GpuSmallMatrixAllocationReportRaw::default();
         let status = unsafe {
-            gpu_matrix_mul_small_rhs(
-                out.raw,
-                self.raw,
-                rhs.raw,
-                tile_columns,
-                k_tile,
-                limb_wave,
-                admission_budget,
-                &mut raw_report,
-            )
+            gpu_matrix_mul_small_rhs(out.raw, self.raw, rhs.raw, budget, &mut raw_report)
         };
         if status == 2 {
             return Err(SmallMatrixError::ResourceExhausted {
                 requested_bytes: raw_report.high_water_bytes,
-                budget_bytes: admission_budget,
+                budget_bytes: budget,
             });
         }
         check_status(status, "gpu_matrix_mul_small_rhs");
-        if raw_report.full_expanded_rhs_bytes != 0 || raw_report.high_water_bytes > admission_budget
+        if raw_report.full_expanded_rhs_bytes != raw_report.expanded_rhs_workspace_bytes ||
+            raw_report.high_water_bytes > budget
         {
             return Err(SmallMatrixError::InvalidConfig);
         }
@@ -981,6 +934,117 @@ impl GpuDCRTPolyMatrix {
     pub(crate) fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
         let level = params.crt_depth().saturating_sub(1);
         Self::new_empty_with_state(params, nrow, ncol, level, true)
+    }
+
+    /// Constructs a contiguous global-column range of an identity matrix.
+    /// The result keeps all `full_size` rows and is already in evaluation form.
+    pub fn identity_columns(
+        params: &GpuDCRTPolyParams,
+        full_size: usize,
+        global_column_start: usize,
+        local_columns: usize,
+    ) -> Self {
+        assert!(
+            global_column_start <= full_size && local_columns <= full_size - global_column_start,
+            "identity column range must fit the full matrix"
+        );
+        let out = Self::new_empty(params, full_size, local_columns);
+        let status =
+            unsafe { gpu_matrix_fill_identity_columns(out.raw, full_size, global_column_start) };
+        check_status(status, "gpu_matrix_fill_identity_columns");
+        out
+    }
+
+    /// Constructs a contiguous range of a one-hot row using global columns.
+    pub fn unit_row_columns(
+        params: &GpuDCRTPolyParams,
+        total_columns: usize,
+        unit_index: usize,
+        global_column_start: usize,
+        local_columns: usize,
+    ) -> Self {
+        assert!(unit_index < total_columns, "unit row index must be in range");
+        assert!(
+            global_column_start <= total_columns &&
+                local_columns <= total_columns - global_column_start,
+            "unit row column range must fit the full row"
+        );
+        let out = Self::new_empty(params, 1, local_columns);
+        let status = unsafe {
+            gpu_matrix_fill_unit_row_columns(
+                out.raw,
+                total_columns,
+                unit_index,
+                global_column_start,
+            )
+        };
+        check_status(status, "gpu_matrix_fill_unit_row_columns");
+        out
+    }
+
+    /// Constructs a contiguous global-column range of a gadget matrix without
+    /// materializing the full matrix or performing an NTT.
+    pub fn gadget_columns(
+        params: &GpuDCRTPolyParams,
+        size: usize,
+        small: bool,
+        global_column_start: usize,
+        local_columns: usize,
+    ) -> Self {
+        let digits_per_tower = params.crt_bits().div_ceil(params.base_bits() as usize);
+        let columns_per_row = if small {
+            digits_per_tower
+        } else {
+            digits_per_tower.checked_mul(params.crt_depth()).expect("gadget column count overflow")
+        };
+        let total_columns =
+            size.checked_mul(columns_per_row).expect("gadget column count overflow");
+        assert!(
+            global_column_start <= total_columns &&
+                local_columns <= total_columns - global_column_start,
+            "gadget column range must fit the full matrix"
+        );
+        let out = Self::new_empty(params, size, local_columns);
+        let status = unsafe {
+            gpu_matrix_fill_gadget_columns(
+                out.raw,
+                params.base_bits(),
+                i32::from(small),
+                size,
+                global_column_start,
+            )
+        };
+        check_status(status, "gpu_matrix_fill_gadget_columns");
+        out
+    }
+
+    #[cfg(test)]
+    fn multiply_small_rhs_with_budget_for_test(
+        &self,
+        rhs: &GpuSmallMatrix,
+        budget: usize,
+    ) -> Result<Self, SmallMatrixError> {
+        if self.params != rhs.params || self.params.ctx_raw() != rhs.params.ctx_raw() {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if self.ncol != rhs.rows {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        let out =
+            Self::new_empty_with_state(&self.params, self.nrow, rhs.columns, self.level, true);
+        let mut report = GpuSmallMatrixAllocationReportRaw::default();
+        let status =
+            unsafe { gpu_matrix_mul_small_rhs(out.raw, self.raw, rhs.raw, budget, &mut report) };
+        if status == 2 {
+            return Err(SmallMatrixError::ResourceExhausted {
+                requested_bytes: report.high_water_bytes,
+                budget_bytes: budget,
+            });
+        }
+        if status != 0 {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        Ok(out)
     }
 
     pub(crate) fn level(&self) -> usize {
@@ -1598,6 +1662,58 @@ impl GpuDCRTPolyMatrix {
         max_coefficient_bound: u64,
         seed: GpuRngSeed,
     ) -> Self {
+        Self::sample_distribution_columns_with_state(
+            params,
+            nrow,
+            total_ncol,
+            col_start,
+            col_len,
+            dist,
+            sigma,
+            max_coefficient_bound,
+            seed,
+            true,
+        )
+    }
+
+    pub(crate) fn sample_distribution_columns_coeff(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: GpuMatrixSampleDist,
+        sigma: f64,
+        max_coefficient_bound: u64,
+        seed: GpuRngSeed,
+    ) -> Self {
+        Self::sample_distribution_columns_with_state(
+            params,
+            nrow,
+            total_ncol,
+            col_start,
+            col_len,
+            dist,
+            sigma,
+            max_coefficient_bound,
+            seed,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_distribution_columns_with_state(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: GpuMatrixSampleDist,
+        sigma: f64,
+        max_coefficient_bound: u64,
+        seed: GpuRngSeed,
+        is_ntt: bool,
+    ) -> Self {
         let col_end = col_start
             .checked_add(col_len)
             .expect("sample_distribution_columns column range overflow");
@@ -1608,7 +1724,8 @@ impl GpuDCRTPolyMatrix {
             col_len,
             total_ncol
         );
-        let out = Self::new_empty(params, nrow, col_len);
+        let level = params.crt_depth().saturating_sub(1);
+        let out = Self::new_empty_with_state(params, nrow, col_len, level, is_ntt);
         if nrow == 0 || col_len == 0 {
             return out;
         }
@@ -2918,10 +3035,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             return Self::new_zero(params, 0, 0);
         }
         let log_base_q = params.modulus_digits();
-        let out = Self::new_empty(params, size, size * log_base_q);
-        let status = unsafe { gpu_matrix_fill_gadget(out.raw, params.base_bits()) };
-        check_status(status, "gpu_matrix_fill_gadget");
-        out
+        Self::gadget_columns(params, size, false, 0, size * log_base_q)
     }
 
     fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self {
@@ -2929,10 +3043,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             return Self::new_zero(params, 0, 0);
         }
         let k = params.crt_bits().div_ceil(params.base_bits() as usize);
-        let out = Self::new_empty(params, size, size * k);
-        let status = unsafe { gpu_matrix_fill_small_gadget(out.raw, params.base_bits()) };
-        check_status(status, "gpu_matrix_fill_small_gadget");
-        out
+        Self::gadget_columns(params, size, true, 0, size * k)
     }
 
     fn decompose(&self) -> Self {
@@ -4082,6 +4193,44 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_range_constant_columns_match_full_global_layout() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
+        let params = gpu_params_from_cpu(&cpu_params);
+
+        let identity = GpuDCRTPolyMatrix::identity(&params, 5, None);
+        assert_eq!(
+            GpuDCRTPolyMatrix::identity_columns(&params, 5, 2, 2),
+            identity.slice_columns(2, 4)
+        );
+
+        let unit_row = GpuDCRTPolyMatrix::unit_row_vector(&params, 7, 3);
+        assert_eq!(
+            GpuDCRTPolyMatrix::unit_row_columns(&params, 7, 3, 2, 3),
+            unit_row.slice_columns(2, 5)
+        );
+        assert_eq!(
+            GpuDCRTPolyMatrix::unit_row_columns(&params, 7, 3, 4, 2),
+            unit_row.slice_columns(4, 6)
+        );
+
+        for small in [false, true] {
+            let full = if small {
+                GpuDCRTPolyMatrix::small_gadget_matrix(&params, 3)
+            } else {
+                GpuDCRTPolyMatrix::gadget_matrix(&params, 3)
+            };
+            let columns_per_row = full.col_size() / 3;
+            let start = columns_per_row - 1;
+            assert_eq!(
+                GpuDCRTPolyMatrix::gadget_columns(&params, 3, small, start, 3),
+                full.slice_columns(start, start + 3)
+            );
+        }
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_matrix_zero_compact_bytes_roundtrip() {
         gpu_device_sync();
         let params = gpu_test_params();
@@ -4202,9 +4351,11 @@ mod tests {
         let second = ring_dimension * (1 + width);
         payload[second] = 2;
         payload[second + 1] = 255;
+        let expected_payload = payload.clone();
         let owner = GpuSmallMatrix::from_canonical_coefficients(&gpu_params, 1, 2, bound, &payload)
             .unwrap();
-        assert_eq!(owner.to_canonical_coefficients().unwrap(), payload);
+        drop(payload);
+        assert_eq!(owner.to_canonical_coefficients().unwrap(), expected_payload);
         assert_eq!(owner.magnitude_width(), width);
         let zero_payload = vec![0u8; 2 * ring_dimension * 2];
         let zero_owner = GpuSmallMatrix::from_canonical_coefficients(
@@ -4225,18 +4376,17 @@ mod tests {
         let output_plan =
             gpu_params.matrix_allocation_bytes(lhs.level, lhs.nrow, owner.columns, true).unwrap();
         assert!(lhs_plan.aux_bytes > 0 && output_plan.aux_bytes > 0);
-        let report = owner.allocation_report(&lhs, 3, 2, 1).unwrap();
+        let report = owner.allocation_report(&lhs).unwrap();
         assert_eq!(report.lhs_eval_bytes, lhs_plan.total_bytes);
         assert_eq!(report.full_output_bytes, output_plan.total_bytes);
-        assert_eq!(report.full_expanded_rhs_bytes, 0);
+        assert_eq!(report.full_expanded_rhs_bytes, report.expanded_rhs_workspace_bytes);
         assert!(report.event_overhead_bytes > 0);
         assert!(report.high_water_bytes >= report.event_overhead_bytes);
         let sampler_report =
-            owner.sampler_allocation_report(11, 13, 17, 19, 0, 2, 3, 5, 23).unwrap();
+            owner.sampler_allocation_report(11, 13, 17, 19, 23, 29, 2, 3, 5).unwrap();
         assert_eq!(sampler_report.sampler_event_bytes, 2);
         assert_eq!(sampler_report.device_acceptance_control_bytes, 3);
         assert_eq!(sampler_report.pinned_host_acceptance_control_bytes, 5);
-        assert_eq!(sampler_report.allocator_headroom_bytes, 23);
         assert_eq!(
             sampler_report.sampler_peak_bytes,
             sampler_report.persistent_bytes +
@@ -4244,18 +4394,18 @@ mod tests {
                 sampler_report.candidate_bytes +
                 sampler_report.perturbation_bytes +
                 sampler_report.check_scratch_bytes +
+                sampler_report.hard_cutoff_plan_bytes +
                 sampler_report.packed_staging_bytes +
                 sampler_report.sampler_event_bytes +
                 sampler_report.device_acceptance_control_bytes +
-                sampler_report.pinned_host_acceptance_control_bytes +
-                sampler_report.allocator_headroom_bytes
+                sampler_report.pinned_host_acceptance_control_bytes
         );
         assert!(matches!(
             owner.sampler_allocation_report(usize::MAX, 1, 0, 0, 0, 0, 0, 0, 0),
             Err(SmallMatrixError::DimensionOverflow)
         ));
         assert!(matches!(
-            owner.allocation_report_from_planner_totals(usize::MAX, 1, 1, 1, 1),
+            owner.allocation_report_from_planner_totals(usize::MAX, 1),
             Err(SmallMatrixError::DimensionOverflow)
         ));
 
@@ -4281,7 +4431,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_small_rhs_admission_subtracts_headroom_and_reports_exact_total() {
+    fn test_gpu_small_rhs_budget_validation_reports_exact_required_bytes() {
         let report = GpuSmallMatrixAllocationReport {
             lhs_eval_bytes: 11,
             compact_rhs_bytes: 13,
@@ -4291,20 +4441,76 @@ mod tests {
             high_water_bytes: 83,
             full_expanded_rhs_bytes: 0,
         };
-        assert_eq!(small_rhs_admission_budget(&report, 100, 17).unwrap(), 83);
+        assert_eq!(validate_small_rhs_budget(&report, 83), Ok(()));
         assert!(matches!(
-            small_rhs_admission_budget(&report, 99, 17),
-            Err(SmallMatrixError::ResourceExhausted { requested_bytes: 100, budget_bytes: 99 })
-        ));
-        assert!(matches!(
-            small_rhs_admission_budget(&report, 16, 17),
-            Err(SmallMatrixError::ResourceExhausted { requested_bytes: 17, budget_bytes: 16 })
+            validate_small_rhs_budget(&report, 82),
+            Err(SmallMatrixError::ResourceExhausted { requested_bytes: 83, budget_bytes: 82 })
         ));
     }
 
     #[test]
     #[sequential]
-    fn test_gpu_small_matrix_checked_pack_accepts_rejects_and_reuses_destination() {
+    fn test_gpu_small_rhs_cuda_report_matches_planner_at_exact_budget() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let lhs = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &params,
+            vec![GpuDCRTPoly::const_one(&params), GpuDCRTPoly::const_one(&params)],
+        );
+        let coefficient_width = 2usize;
+        let payload = vec![0u8; 2 * 3 * params.ring_dimension() as usize * coefficient_width];
+        let rhs =
+            GpuSmallMatrix::from_canonical_coefficients(&params, 2, 3, BigUint::ZERO, &payload)
+                .unwrap();
+        let expected = rhs.allocation_report(&lhs).unwrap();
+        assert!(
+            lhs.multiply_small_rhs_with_budget_for_test(&rhs, expected.high_water_bytes).is_ok()
+        );
+        let below = expected.high_water_bytes - 1;
+        assert_eq!(
+            lhs.multiply_small_rhs_with_budget_for_test(&rhs, below),
+            Err(SmallMatrixError::ResourceExhausted {
+                requested_bytes: expected.high_water_bytes,
+                budget_bytes: below,
+            })
+        );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_small_rhs_workspace_expands_exactly_one_runtime_shard() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let dimension = 4usize;
+        let lhs = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &params,
+            (0..dimension).map(|_| GpuDCRTPoly::const_one(&params)).collect(),
+        );
+        let payload = vec![0u8; dimension * dimension * params.ring_dimension() as usize * 2];
+        let rhs = GpuSmallMatrix::from_canonical_coefficients(
+            &params,
+            dimension,
+            dimension,
+            BigUint::ZERO,
+            &payload,
+        )
+        .unwrap();
+
+        let report = rhs.allocation_report(&lhs).unwrap();
+        let shard_workspace_bytes = params.crt_depth() *
+            dimension *
+            dimension *
+            params.ring_dimension() as usize *
+            std::mem::size_of::<u64>();
+        assert_eq!(report.expanded_rhs_workspace_bytes, shard_workspace_bytes);
+        assert_eq!(report.full_expanded_rhs_bytes, shard_workspace_bytes);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_hard_cutoff_pack_accepts_rejects_and_reuses_destination() {
         gpu_device_sync();
         let cpu_params = DCRTPolyParams::new(32, 1, 17, 2);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
@@ -4328,15 +4534,19 @@ mod tests {
             &zero_payload,
         )
         .unwrap();
-        assert!(accepted.try_pack_checked_tile(&accepted_source, 0, 0, 1, 1).unwrap());
-        assert!(accepted.try_pack_checked_tile(&accepted_source, 0, 0, 1, 1).unwrap());
+        accepted.prepare_preimage_hard_cutoff();
+        assert!(accepted.try_pack_preimage_hard_cutoff_tile(&accepted_source, 0, 0, 1, 1).unwrap());
+        assert!(accepted.try_pack_preimage_hard_cutoff_tile(&accepted_source, 0, 0, 1, 1).unwrap());
         assert!(accepted.to_canonical_coefficients().unwrap().iter().any(|byte| *byte != 0));
 
         let mut rejected =
             GpuSmallMatrix::from_canonical_coefficients(&gpu_params, 1, 1, bound, &zero_payload)
                 .unwrap();
-        assert!(!rejected.try_pack_checked_tile(&rejected_source, 0, 0, 1, 1).unwrap());
-        assert!(rejected.try_pack_checked_tile(&accepted_source, 0, 0, 1, 1).unwrap());
+        rejected.prepare_preimage_hard_cutoff();
+        assert!(
+            !rejected.try_pack_preimage_hard_cutoff_tile(&rejected_source, 0, 0, 1, 1).unwrap()
+        );
+        assert!(rejected.try_pack_preimage_hard_cutoff_tile(&accepted_source, 0, 0, 1, 1).unwrap());
         assert_eq!(
             rejected.to_canonical_coefficients().unwrap(),
             accepted.to_canonical_coefficients().unwrap()
@@ -4345,8 +4555,8 @@ mod tests {
 
     #[test]
     #[sequential]
-    #[should_panic(expected = "compact checked pack requires a coefficient-domain source")]
-    fn test_gpu_small_matrix_checked_pack_requires_coefficient_source() {
+    #[should_panic(expected = "preimage hard-cutoff pack requires a coefficient-domain source")]
+    fn test_gpu_preimage_hard_cutoff_pack_requires_coefficient_source() {
         gpu_device_sync();
         let gpu_params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
         let eval_source = GpuDCRTPolyMatrix::from_poly_vec_row(
@@ -4363,12 +4573,12 @@ mod tests {
         )
         .unwrap();
 
-        let _ = destination.try_pack_checked_tile(&eval_source, 0, 0, 1, 1);
+        let _ = destination.try_pack_preimage_hard_cutoff_tile(&eval_source, 0, 0, 1, 1);
     }
 
     #[test]
     #[sequential]
-    fn test_gpu_small_matrix_checked_pack_rejects_when_limb_zero_alone_would_accept() {
+    fn test_gpu_preimage_hard_cutoff_rejects_when_anchor_residue_alone_would_accept() {
         gpu_device_sync();
         let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
@@ -4384,14 +4594,57 @@ mod tests {
         )
         .into_coeff_domain();
         let mut destination = GpuSmallMatrix::new_empty(&gpu_params, 1, 1, BigUint::ZERO).unwrap();
-        assert!(!destination.try_pack_checked_tile(&source, 0, 0, 1, 1).unwrap());
+        destination.prepare_preimage_hard_cutoff();
+        assert!(!destination.try_pack_preimage_hard_cutoff_tile(&source, 0, 0, 1, 1).unwrap());
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_hard_cutoff_partial_crt_accepts_inclusive_signed_endpoints() {
+        gpu_device_sync();
+        let params = GpuDCRTPolyParams::new(32, vec![65_537, 67_073], 2);
+        let bound = BigUint::from(40_000u32);
+        assert!(params.moduli().iter().all(|modulus| BigUint::from(*modulus) <= &bound << 1));
+        assert!(BigUint::from(params.moduli()[0]) * params.moduli()[1] > (&bound << 1));
+
+        let negative_bound = params.modulus().as_ref() - &bound;
+        let endpoints = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &params,
+            vec![
+                GpuDCRTPoly::from_biguint_to_constant(&params, bound.clone()),
+                GpuDCRTPoly::from_biguint_to_constant(&params, negative_bound),
+            ],
+        )
+        .into_coeff_domain();
+        let mut packed = GpuSmallMatrix::new_empty(&params, 1, 2, bound.clone()).unwrap();
+        packed.prepare_preimage_hard_cutoff();
+        assert!(packed.try_pack_preimage_hard_cutoff_tile(&endpoints, 0, 0, 1, 2).unwrap());
+        let payload = packed.to_canonical_coefficients().unwrap();
+        let width = 1 + packed.magnitude_width();
+        assert_eq!(payload[0], 1);
+        assert_eq!(BigUint::from_bytes_le(&payload[1..width]), bound);
+        let second_poly = params.ring_dimension() as usize * width;
+        assert_eq!(payload[second_poly], 2);
+        assert_eq!(BigUint::from_bytes_le(&payload[second_poly + 1..second_poly + width]), bound);
+
+        let above = &bound + BigUint::from(1u8);
+        let rejected_source = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &params,
+            vec![GpuDCRTPoly::from_biguint_to_constant(&params, above)],
+        )
+        .into_coeff_domain();
+        let mut rejected = GpuSmallMatrix::new_empty(&params, 1, 1, bound).unwrap();
+        rejected.prepare_preimage_hard_cutoff();
+        assert!(
+            !rejected.try_pack_preimage_hard_cutoff_tile(&rejected_source, 0, 0, 1, 1).unwrap()
+        );
     }
 
     #[test]
     #[sequential]
     fn test_gpu_small_rhs_multiply_matches_full_dcrt_with_all_tile_tails() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let mut random = rng();
         let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
@@ -4418,115 +4671,36 @@ mod tests {
             &payload_owner.to_canonical_coefficients().unwrap(),
         )
         .unwrap();
-        unsafe {
-            std::env::set_var("MXX_MUL_SMALL_RHS_TILE_COLUMNS", "2");
-            std::env::set_var("MXX_MUL_SMALL_RHS_K_TILE", "2");
-            std::env::set_var("MXX_MUL_SMALL_RHS_LIMB_WAVE", "1");
-        }
-        let actual = lhs.multiply_small_rhs(rhs).unwrap();
-        unsafe {
-            std::env::remove_var("MXX_MUL_SMALL_RHS_TILE_COLUMNS");
-            std::env::remove_var("MXX_MUL_SMALL_RHS_K_TILE");
-            std::env::remove_var("MXX_MUL_SMALL_RHS_LIMB_WAVE");
-        }
+        let actual = lhs.multiply_small_rhs(&rhs).unwrap();
         assert_eq!(actual.to_cpu_matrix(), expected);
     }
 
     #[test]
-    #[ignore = "focused local-GPU schedule comparison"]
     #[sequential]
-    fn test_gpu_small_rhs_auto_schedule_benchmark() {
+    fn test_gpu_small_rhs_zero_copy_column_view_matches_compact_slice() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let mut random = rng();
         let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
-        let rhs_cpu = DCRTPolyMatrix::from_poly_vec(
-            &cpu_params,
-            (0..3)
-                .map(|_| {
-                    (0..5)
-                        .map(|_| {
-                            DCRTPoly::from_usize_to_constant(&cpu_params, random.random_range(0..4))
-                        })
-                        .collect()
-                })
-                .collect(),
-        );
+        let rhs_cpu = random_cpu_matrix(&cpu_params, 3, 5, &mut random);
+        let expected = &lhs_cpu * &rhs_cpu.slice_columns(1, 4);
         let lhs = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &lhs_cpu);
-        let payload_owner = CpuSmallMatrix::new(rhs_cpu, BigUint::from(3u32)).unwrap();
+        let payload_owner =
+            CpuSmallMatrix::new(rhs_cpu, cpu_params.modulus().as_ref().clone()).unwrap();
         let rhs = GpuSmallMatrix::from_canonical_coefficients(
             &gpu_params,
             3,
             5,
-            BigUint::from(3u32),
+            payload_owner.max_coefficient_bound().clone(),
             &payload_owner.to_canonical_coefficients().unwrap(),
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("MXX_MUL_SMALL_RHS_TILE_COLUMNS");
-            std::env::remove_var("MXX_MUL_SMALL_RHS_K_TILE");
-            std::env::remove_var("MXX_MUL_SMALL_RHS_LIMB_WAVE");
-        }
-        let budget = crate::env::gpu_small_matrix_residency_bytes().unwrap();
-        let headroom = crate::env::gpu_small_matrix_allocator_headroom_bytes().unwrap();
-        let auto_schedule =
-            small_rhs_tile_schedule(&lhs, &rhs, budget, headroom, None, None, None).unwrap();
-        let auto_report =
-            rhs.allocation_report(&lhs, auto_schedule.0, auto_schedule.1, auto_schedule.2).unwrap();
-        let forced_schedule = (1, 1, 1);
-        let forced_report = rhs
-            .allocation_report(&lhs, forced_schedule.0, forced_schedule.1, forced_schedule.2)
-            .unwrap();
-        assert_eq!(forced_report.full_expanded_rhs_bytes, 0);
-        assert_eq!(auto_report.full_expanded_rhs_bytes, 0);
-        println!(
-            "small-rhs shape=(2x3)*(3x5), N=32, L=2 forced schedule={forced_schedule:?} allocation={forced_report:?} auto schedule={auto_schedule:?} allocation={auto_report:?}"
-        );
-        let run = |auto: bool| -> f64 {
-            unsafe {
-                if !auto {
-                    std::env::set_var("MXX_MUL_SMALL_RHS_TILE_COLUMNS", "1");
-                    std::env::set_var("MXX_MUL_SMALL_RHS_K_TILE", "1");
-                    std::env::set_var("MXX_MUL_SMALL_RHS_LIMB_WAVE", "1");
-                } else {
-                    std::env::remove_var("MXX_MUL_SMALL_RHS_TILE_COLUMNS");
-                    std::env::remove_var("MXX_MUL_SMALL_RHS_K_TILE");
-                    std::env::remove_var("MXX_MUL_SMALL_RHS_LIMB_WAVE");
-                }
-            }
-            let start = std::time::Instant::now();
-            let _ = lhs.multiply_small_rhs(rhs.clone()).unwrap();
-            gpu_device_sync();
-            start.elapsed().as_secs_f64()
-        };
-        let _ = run(false);
-        let _ = run(true);
-        let mut forced_samples = Vec::with_capacity(10);
-        let mut auto_samples = Vec::with_capacity(10);
-        for round in 0..10 {
-            if round % 2 == 0 {
-                forced_samples.push(run(false));
-                auto_samples.push(run(true));
-            } else {
-                auto_samples.push(run(true));
-                forced_samples.push(run(false));
-            }
-        }
-        let summarize = |label: &str, samples: &[f64]| {
-            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-            let mut sorted = samples.to_vec();
-            sorted.sort_by(f64::total_cmp);
-            let median = (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0;
-            println!("small-rhs {label} samples={samples:?} mean={mean:.6}s median={median:.6}s");
-        };
-        summarize("forced-1x1x1", &forced_samples);
-        summarize("auto", &auto_samples);
-        unsafe {
-            std::env::remove_var("MXX_MUL_SMALL_RHS_TILE_COLUMNS");
-            std::env::remove_var("MXX_MUL_SMALL_RHS_K_TILE");
-            std::env::remove_var("MXX_MUL_SMALL_RHS_LIMB_WAVE");
-        }
+        let view = rhs.column_view(1, 4);
+        let report = view.as_ref().allocation_report(&lhs).unwrap();
+        assert_eq!(report.compact_rhs_bytes, rhs.resident_payload_bytes);
+        let actual = lhs.multiply_small_rhs(view.as_ref()).unwrap();
+        assert_eq!(actual.to_cpu_matrix(), expected);
     }
 
     #[test]
@@ -4896,7 +5070,7 @@ mod tests {
         let g_small = GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, n);
         let left = a.clone() * &g_small;
         let expected = a * &b;
-        let actual = left.multiply_small_rhs(b.clone().gadget_decompose(true).unwrap()).unwrap();
+        let actual = left.multiply_small_rhs(&b.clone().gadget_decompose(true).unwrap()).unwrap();
 
         assert_eq!(actual, expected);
     }

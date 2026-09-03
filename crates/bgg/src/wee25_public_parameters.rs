@@ -342,7 +342,7 @@ mod tests {
                     let expected = gadget.clone() * &j - &(w * bottom);
                     assert_eq!(
                         b.clone()
-                            .multiply_small_rhs(small_matrix_output(
+                            .multiply_small_rhs(&small_matrix_output(
                                 &result,
                                 &format!("top-{digit_row}-{part}-{block}"),
                             ))

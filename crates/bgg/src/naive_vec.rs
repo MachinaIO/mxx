@@ -842,14 +842,14 @@ mod tests {
             matrix_output(&result, "vector"),
             &vector
                 .clone()
-                .multiply_small_rhs(target.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
                 .unwrap()
         );
         assert_eq!(
             matrix_output(&result, "public"),
             &public
                 .clone()
-                .multiply_small_rhs(target.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
                 .unwrap()
         );
         assert!(output.plaintexts.is_none());

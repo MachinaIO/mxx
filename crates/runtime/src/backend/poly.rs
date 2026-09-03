@@ -81,6 +81,146 @@ fn bounded_schema_parts(
     Ok((bound, magnitude_bytes, coefficient_count))
 }
 
+#[cfg(feature = "gpu")]
+pub(super) fn decode_small_matrix_artifact<'a>(
+    expected_schema: &ConcreteBoundedMatrixSchema,
+    bytes: &'a [u8],
+    expected_semantic_kind: SmallMatrixSemanticKind,
+) -> Result<(BigUint, &'a [u8]), PolyBackendError> {
+    let (bound, magnitude_bytes, coefficient_count) = bounded_schema_parts(expected_schema)?;
+    let mut offset = 0usize;
+    if take_small_matrix_bytes(bytes, &mut offset, SMALL_MATRIX_MAGIC.len())? != SMALL_MATRIX_MAGIC
+    {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("magic does not match"));
+    }
+    let semantic_kind = take_small_matrix_bytes(bytes, &mut offset, 1)?[0];
+    if semantic_kind != small_matrix_semantic_tag(expected_semantic_kind) {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("semantic kind does not match"));
+    }
+    let rows = read_small_matrix_u64(bytes, &mut offset)?;
+    let columns = read_small_matrix_u64(bytes, &mut offset)?;
+    let ring_dimension = read_small_matrix_u64(bytes, &mut offset)?;
+    if rows !=
+        u64::try_from(expected_schema.matrix.rows)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("row count overflows"))? ||
+        columns !=
+            u64::try_from(expected_schema.matrix.columns).map_err(|_| {
+                PolyBackendError::InvalidSmallMatrixArtifact("column count overflows")
+            })? ||
+        ring_dimension !=
+            u64::try_from(expected_schema.matrix.ring_dimension).map_err(|_| {
+                PolyBackendError::InvalidSmallMatrixArtifact("ring dimension overflows")
+            })?
+    {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("matrix shape does not match"));
+    }
+    let bound_length = usize::try_from(read_small_matrix_u32(bytes, &mut offset)?)
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("bound width overflows"))?;
+    if bound_length != magnitude_bytes {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("bound width does not match"));
+    }
+    let encoded_bound = take_small_matrix_bytes(bytes, &mut offset, bound_length)?;
+    if BigUint::from_bytes_le(encoded_bound) != bound ||
+        (bound.is_zero() && encoded_bound != [0]) ||
+        (!bound.is_zero() && encoded_bound.last() == Some(&0))
+    {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+            "bound is not canonical or does not match",
+        ));
+    }
+    let encoded_magnitude_bytes = usize::try_from(read_small_matrix_u32(bytes, &mut offset)?)
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
+    if encoded_magnitude_bytes != magnitude_bytes {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+            "coefficient width does not match",
+        ));
+    }
+    let encoded_count = read_small_matrix_u64(bytes, &mut offset)?;
+    if encoded_count !=
+        u64::try_from(coefficient_count).map_err(|_| {
+            PolyBackendError::InvalidSmallMatrixArtifact("coefficient count overflows")
+        })?
+    {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+            "coefficient count does not match",
+        ));
+    }
+    let encoded_width = 1usize
+        .checked_add(magnitude_bytes)
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
+    let payload_length = coefficient_count
+        .checked_mul(encoded_width)
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("payload length overflows"))?;
+    let payload = take_small_matrix_bytes(bytes, &mut offset, payload_length)?;
+    if offset != bytes.len() {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("artifact has trailing bytes"));
+    }
+    Ok((bound, payload))
+}
+
+#[cfg(feature = "gpu")]
+pub(super) fn encode_small_matrix_artifact(
+    expected_schema: &ConcreteBoundedMatrixSchema,
+    payload: &[u8],
+    semantic_kind: SmallMatrixSemanticKind,
+) -> Result<Vec<u8>, PolyBackendError> {
+    let (bound, magnitude_bytes, coefficient_count) = bounded_schema_parts(expected_schema)?;
+    let encoded_width = 1usize
+        .checked_add(magnitude_bytes)
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
+    if payload.len() !=
+        coefficient_count
+            .checked_mul(encoded_width)
+            .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("payload length overflows"))?
+    {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("payload length does not match"));
+    }
+    let bound_bytes = {
+        let bytes = bound.to_bytes_le();
+        if bytes.is_empty() { vec![0] } else { bytes }
+    };
+    let mut bytes = Vec::with_capacity(49 + bound_bytes.len() + payload.len());
+    bytes.extend_from_slice(SMALL_MATRIX_MAGIC);
+    bytes.push(small_matrix_semantic_tag(semantic_kind));
+    bytes.extend_from_slice(
+        &u64::try_from(expected_schema.matrix.rows)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("row count overflows"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u64::try_from(expected_schema.matrix.columns)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("column count overflows"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u64::try_from(expected_schema.matrix.ring_dimension)
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("ring dimension overflows"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(bound_bytes.len())
+            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("bound width overflows"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&bound_bytes);
+    bytes.extend_from_slice(
+        &u32::try_from(magnitude_bytes)
+            .map_err(|_| {
+                PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows")
+            })?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u64::try_from(coefficient_count)
+            .map_err(|_| {
+                PolyBackendError::InvalidSmallMatrixArtifact("coefficient count overflows")
+            })?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RingKey {
     pub modulus: BigInt,
@@ -103,6 +243,10 @@ pub enum PolyBackendError {
     SmallMatrix(#[from] SmallMatrixError),
     #[error("invalid small-matrix artifact: {0}")]
     InvalidSmallMatrixArtifact(&'static str),
+    #[error("GPU fleet calibration failed: {0}")]
+    GpuCalibration(String),
+    #[error("the requested GPU placement is unavailable through a direct device or peer copy")]
+    UnsupportedPlacement,
     #[error(
         "declared gadget layout base={declared_base}, digits={declared_digits} does not match backend base={backend_base}, digits={backend_digits}"
     )]
@@ -304,6 +448,22 @@ where
     /// bounded-wave batch path from scalar fallback execution.
     pub fn preimage_batch_calls(&self) -> usize {
         self.preimage_batch_calls
+    }
+
+    /// Copies a complete matrix to the active GPU placement without host
+    /// staging. Fleet-internal resharding uses this strict path so an
+    /// unavailable direct or peer transfer is reported instead of silently
+    /// materializing the matrix in CPU memory.
+    #[cfg(feature = "gpu")]
+    pub(super) fn matrix_to_active_placement_peer_only(
+        &self,
+        value: &M,
+    ) -> Result<M, PolyBackendError> {
+        let target = self.parameters_for_matrix(value)?;
+        if value.params() == target {
+            return Ok(value.clone());
+        }
+        value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
     }
 
     pub(super) fn parameters(
@@ -994,7 +1154,7 @@ where
     }
 
     fn multiply_small_rhs(&mut self, lhs: &M, rhs: &M::SmallMatrix) -> Result<M, Self::Error> {
-        Ok(lhs.multiply_small_rhs(rhs.clone())?)
+        Ok(lhs.multiply_small_rhs(rhs)?)
     }
 
     fn extract_coefficient(&mut self, value: &M, position: usize) -> Result<BigInt, Self::Error> {

@@ -665,7 +665,7 @@ pub trait PolyMatrixSmallRhs: PolyMatrix {
     type SmallMatrix: SmallPolyMatrix<Params = <Self::P as Poly>::Params>;
 
     fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError>;
-    fn multiply_small_rhs(&self, rhs: Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
+    fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
 }
 
 impl<M> SmallPolyMatrix for CpuSmallMatrix<M>

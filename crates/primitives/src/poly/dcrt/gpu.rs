@@ -103,10 +103,35 @@ unsafe extern "C" {
         gpu_ids: *const c_int,
         gpu_ids_len: usize,
         stream_pool_size: usize,
+        vram_percent: u32,
         out_ctx: *mut *mut GpuContextOpaque,
     ) -> c_int;
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
     fn gpu_context_get_N(ctx: *const GpuContextOpaque, out_n: *mut c_int) -> c_int;
+    fn gpu_context_get_vram_budget_bytes(
+        ctx: *const GpuContextOpaque,
+        out_bytes: *mut usize,
+    ) -> c_int;
+    fn gpu_default_mempool_get_usage(
+        device: c_int,
+        out_used_current_bytes: *mut usize,
+        out_used_high_bytes: *mut usize,
+        out_reserved_current_bytes: *mut usize,
+    ) -> c_int;
+    fn gpu_default_mempool_reset_used_high(device: c_int) -> c_int;
+    fn gpu_device_context_state(
+        device: c_int,
+        out_count: *mut usize,
+        out_generation: *mut u64,
+    ) -> c_int;
+    fn gpu_device_get_identity(
+        device: c_int,
+        out_name: *mut c_char,
+        name_capacity: usize,
+        out_compute_major: *mut c_int,
+        out_compute_minor: *mut c_int,
+        out_total_global_memory: *mut usize,
+    ) -> c_int;
     fn gpu_context_fence_releases(ctx: *const GpuContextOpaque) -> c_int;
 
     pub(crate) fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
@@ -266,8 +291,24 @@ unsafe extern "C" {
         rows: usize,
         cols: usize,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_fill_gadget(out: *mut GpuMatrixOpaque, base_bits: u32) -> c_int;
-    pub(crate) fn gpu_matrix_fill_small_gadget(out: *mut GpuMatrixOpaque, base_bits: u32) -> c_int;
+    pub(crate) fn gpu_matrix_fill_identity_columns(
+        out: *mut GpuMatrixOpaque,
+        full_size: usize,
+        global_column_start: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_fill_unit_row_columns(
+        out: *mut GpuMatrixOpaque,
+        total_columns: usize,
+        unit_index: usize,
+        global_column_start: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_fill_gadget_columns(
+        out: *mut GpuMatrixOpaque,
+        base_bits: u32,
+        small: c_int,
+        full_size: usize,
+        global_column_start: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_fill_small_decomposed_identity_chunk(
         out: *mut GpuMatrixOpaque,
         scalar_by_digit: *const GpuMatrixOpaque,
@@ -370,6 +411,17 @@ unsafe extern "C" {
         out: *mut GpuSmallMatrixOpaque,
         src: *const GpuSmallMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_small_matrix_copy_columns(
+        out: *mut GpuSmallMatrixOpaque,
+        src: *const GpuSmallMatrixOpaque,
+        source_column_start: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_view_columns(
+        src: *const GpuSmallMatrixOpaque,
+        source_column_start: usize,
+        columns: usize,
+        out: *mut *mut GpuSmallMatrixOpaque,
+    ) -> c_int;
     pub(crate) fn gpu_small_matrix_load_coefficients(
         mat: *mut GpuSmallMatrixOpaque,
         payload: *const u8,
@@ -388,7 +440,10 @@ unsafe extern "C" {
         bound_word_count: usize,
         out: *mut GpuSmallMatrixOpaque,
     ) -> c_int;
-    pub(crate) fn gpu_small_matrix_pack_checked_tile(
+    pub(crate) fn gpu_small_matrix_prepare_preimage_hard_cutoff(
+        mat: *mut GpuSmallMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         dst: *mut GpuSmallMatrixOpaque,
         src: *const GpuMatrixOpaque,
         dst_row: usize,
@@ -403,9 +458,6 @@ unsafe extern "C" {
         out: *mut GpuMatrixOpaque,
         lhs_eval: *const GpuMatrixOpaque,
         rhs_small: *const GpuSmallMatrixOpaque,
-        ct: usize,
-        kt: usize,
-        ell: usize,
         residency_budget_bytes: usize,
         allocation_report: *mut GpuSmallMatrixAllocationReportRaw,
     ) -> c_int;
@@ -454,6 +506,69 @@ pub struct GpuMemoryInfo {
     pub total: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMempoolUsage {
+    pub used_current: usize,
+    pub used_high: usize,
+    pub reserved_current: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuDeviceMemoryUsage {
+    pub total: usize,
+    /// Physical device memory unavailable to a new async allocation. Cached,
+    /// unused pages in the default pool are excluded because the pool can
+    /// reuse them without increasing physical residency.
+    pub resident: usize,
+    pub live_contexts: usize,
+    pub context_generation: u64,
+}
+
+fn allocator_resident_bytes(physical: GpuMemoryInfo, pool: GpuMempoolUsage) -> usize {
+    let Some(physical_used) = physical.total.checked_sub(physical.free) else {
+        return physical.total;
+    };
+    let Some(persistent_outside_pool) = physical_used.checked_sub(pool.reserved_current) else {
+        return physical.total;
+    };
+    persistent_outside_pool
+        .checked_add(pool.used_current)
+        .unwrap_or(physical.total)
+        .min(physical.total)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuDeviceIdentity {
+    pub name: String,
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    pub total_global_memory: usize,
+}
+
+/// Returns stable hardware properties used to scope reusable calibration data.
+/// This CUDA runtime query does not synchronize device work.
+pub fn gpu_device_identity(device: i32) -> Result<GpuDeviceIdentity, String> {
+    let mut name = [0 as c_char; 256];
+    let mut compute_major = 0;
+    let mut compute_minor = 0;
+    let mut total_global_memory = 0;
+    let status = unsafe {
+        gpu_device_get_identity(
+            device,
+            name.as_mut_ptr(),
+            name.len(),
+            &mut compute_major,
+            &mut compute_minor,
+            &mut total_global_memory,
+        )
+    };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
+    Ok(GpuDeviceIdentity { name, compute_major, compute_minor, total_global_memory })
+}
+
 /// Returns the CUDA allocator-visible memory counters for one detected device.
 pub fn gpu_memory_info(device: i32) -> Result<GpuMemoryInfo, String> {
     let mut free = 0;
@@ -463,6 +578,53 @@ pub fn gpu_memory_info(device: i32) -> Result<GpuMemoryInfo, String> {
         return Err(last_error_string());
     }
     Ok(GpuMemoryInfo { free, total })
+}
+
+/// Returns the default CUDA memory pool's logical current usage and high-water
+/// mark for one device. This query does not synchronize device work.
+pub fn gpu_default_mempool_usage(device: i32) -> Result<GpuMempoolUsage, String> {
+    let mut used_current = 0;
+    let mut used_high = 0;
+    let mut reserved_current = 0;
+    let status = unsafe {
+        gpu_default_mempool_get_usage(
+            device,
+            &mut used_current,
+            &mut used_high,
+            &mut reserved_current,
+        )
+    };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    Ok(GpuMempoolUsage { used_current, used_high, reserved_current })
+}
+
+/// Returns a conservative physical residency baseline and the number of live
+/// mxx CUDA contexts on one device. Unlike the pool's logical used counter,
+/// this includes persistent `cudaMalloc` allocations such as NTT tables.
+pub fn gpu_device_memory_usage(device: i32) -> Result<GpuDeviceMemoryUsage, String> {
+    let physical = gpu_memory_info(device)?;
+    let pool = gpu_default_mempool_usage(device)?;
+    let resident = allocator_resident_bytes(physical, pool);
+    let mut live_contexts = 0;
+    let mut context_generation = 0;
+    let status =
+        unsafe { gpu_device_context_state(device, &mut live_contexts, &mut context_generation) };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    Ok(GpuDeviceMemoryUsage { total: physical.total, resident, live_contexts, context_generation })
+}
+
+/// Resets the default CUDA memory pool's used-memory high-water mark to its
+/// current usage. This operation does not synchronize device work.
+pub fn gpu_default_mempool_reset_high_water(device: i32) -> Result<(), String> {
+    let status = unsafe { gpu_default_mempool_reset_used_high(device) };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    Ok(())
 }
 
 fn available_gpu_ids() -> Vec<i32> {
@@ -596,6 +758,7 @@ struct DeviceContextCacheKey {
     moduli: Vec<u64>,
     base_bits: u32,
     device_id: i32,
+    vram_percent: u32,
 }
 
 fn single_device_context_cache() -> &'static Mutex<HashMap<DeviceContextCacheKey, Weak<GpuContext>>>
@@ -615,6 +778,7 @@ pub struct GpuDCRTPolyParams {
     base_bits: u32,
     gpu_ids: Vec<i32>,
     dnum: u32,
+    vram_percent: u32,
     ctx: Arc<GpuContext>,
 }
 
@@ -627,6 +791,7 @@ impl Debug for GpuDCRTPolyParams {
             .field("base_bits", &self.base_bits)
             .field("gpu_ids", &self.gpu_ids)
             .field("dnum", &self.dnum)
+            .field("vram_percent", &self.vram_percent)
             .finish()
     }
 }
@@ -637,7 +802,8 @@ impl PartialEq for GpuDCRTPolyParams {
             self.moduli == other.moduli &&
             self.base_bits == other.base_bits &&
             self.gpu_ids == other.gpu_ids &&
-            self.dnum == other.dnum
+            self.dnum == other.dnum &&
+            self.vram_percent == other.vram_percent
     }
 }
 
@@ -696,6 +862,7 @@ impl PolyParams for GpuDCRTPolyParams {
             base_bits: self.base_bits,
             gpu_ids: vec![device_id],
             dnum: 1,
+            vram_percent: self.vram_percent,
             ctx,
         }
     }
@@ -712,6 +879,7 @@ impl GpuDCRTPolyParams {
             moduli: self.moduli.clone(),
             base_bits: self.base_bits,
             device_id,
+            vram_percent: self.vram_percent,
         };
 
         if let Some(existing) = {
@@ -723,7 +891,8 @@ impl GpuDCRTPolyParams {
         }
 
         let log_n = log2_u32(self.ring_dimension);
-        let created = Arc::new(GpuContext::create(log_n, &self.moduli, &[device_id], 1));
+        let created =
+            Arc::new(GpuContext::create(log_n, &self.moduli, &[device_id], 1, self.vram_percent));
 
         let cache = single_device_context_cache();
         let mut guard = cache.lock().expect("single_device_context_cache mutex poisoned");
@@ -755,8 +924,10 @@ impl GpuDCRTPolyParams {
         let modulus = moduli.iter().fold(BigUint::one(), |acc, m| acc * m);
         let dnum =
             dnum.unwrap_or_else(|| if gpu_ids.is_empty() { 1 } else { gpu_ids.len() as u32 });
+        let vram_percent = crate::env::gpu_vram_percent()
+            .unwrap_or_else(|error| panic!("invalid GPU VRAM percentage: {error}"));
         let log_n = log2_u32(ring_dimension);
-        let ctx = Arc::new(GpuContext::create(log_n, &moduli, &gpu_ids, dnum));
+        let ctx = Arc::new(GpuContext::create(log_n, &moduli, &gpu_ids, dnum, vram_percent));
 
         Self {
             ring_dimension,
@@ -767,6 +938,7 @@ impl GpuDCRTPolyParams {
             base_bits,
             gpu_ids,
             dnum,
+            vram_percent,
             ctx,
         }
     }
@@ -789,6 +961,10 @@ impl GpuDCRTPolyParams {
 
     pub(crate) fn ctx_raw(&self) -> *mut GpuContextOpaque {
         self.ctx.raw_ptr()
+    }
+
+    pub fn vram_budget_bytes(&self) -> usize {
+        self.ctx.vram_budget_bytes
     }
 
     pub(crate) fn matrix_allocation_bytes(
@@ -848,6 +1024,7 @@ pub struct GpuContext {
     pub moduli: Vec<u64>,
     pub gpu_ids: Vec<i32>,
     pub dnum: u32,
+    pub vram_budget_bytes: usize,
 }
 
 /// # Safety
@@ -856,12 +1033,12 @@ unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
 
 impl GpuContext {
-    fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32) -> Self {
+    fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32, vram_percent: u32) -> Self {
         info!(
             "{}",
             format!(
-                "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}",
-                log_n, moduli, gpu_ids, dnum
+                "Creating GPU context with log_n={}, moduli={:?}, gpu_ids={:?}, dnum={}, vram_percent={}",
+                log_n, moduli, gpu_ids, dnum, vram_percent
             )
         );
         let l = moduli.len().saturating_sub(1) as u32;
@@ -881,6 +1058,7 @@ impl GpuContext {
                 gpu_ids_ptr,
                 gpu_ids_len,
                 crate::env::cuda_stream_pool_size(),
+                vram_percent,
                 &mut ctx_ptr as *mut *mut GpuContextOpaque,
             )
         };
@@ -891,7 +1069,18 @@ impl GpuContext {
         check_status(status, "gpu_context_get_N");
         let n = if n_out > 0 { n_out as usize } else { 1usize << log_n };
 
-        Self { raw: ctx_ptr, n, moduli: moduli.to_vec(), gpu_ids: gpu_ids.to_vec(), dnum }
+        let mut vram_budget_bytes = 0usize;
+        let status = unsafe { gpu_context_get_vram_budget_bytes(ctx_ptr, &mut vram_budget_bytes) };
+        check_status(status, "gpu_context_get_vram_budget_bytes");
+
+        Self {
+            raw: ctx_ptr,
+            n,
+            moduli: moduli.to_vec(),
+            gpu_ids: gpu_ids.to_vec(),
+            dnum,
+            vram_budget_bytes,
+        }
     }
 
     pub(crate) fn raw_ptr(&self) -> *mut GpuContextOpaque {
@@ -1451,6 +1640,48 @@ mod tests {
 
     fn gpu_poly_from_cpu(poly: &DCRTPoly, gpu_params: &GpuDCRTPolyParams) -> GpuDCRTPoly {
         GpuDCRTPoly::from_coeffs(gpu_params, &poly.coeffs())
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_context_caches_configured_vram_percentage() {
+        let name = "MXX_GPU_VRAM_PERCENT";
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, "37") };
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+
+        let device = *params.gpu_ids().first().expect("GPU test requires one device");
+        let total_bytes = gpu_memory_info(device).expect("query device memory").total;
+        let expected_budget = (total_bytes / 100) * 37 + ((total_bytes % 100) * 37) / 100;
+        assert_eq!(params.vram_budget_bytes(), expected_budget);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_default_mempool_usage_and_high_water_reset() {
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        let device = *params.gpu_ids().first().expect("GPU test requires one device");
+        gpu_default_mempool_reset_high_water(device).expect("reset default mempool high-water");
+        let usage = gpu_default_mempool_usage(device).expect("query default mempool usage");
+        assert!(usage.used_high >= usage.used_current);
+        assert!(usage.reserved_current >= usage.used_current);
+        let memory = gpu_device_memory_usage(device).expect("query allocator-aware device memory");
+        assert_eq!(memory.total, gpu_memory_info(device).unwrap().total);
+        assert!(memory.resident >= usage.used_current);
+        assert!(memory.live_contexts >= 1);
+    }
+
+    #[test]
+    fn allocator_residency_includes_non_pool_allocations_without_charging_cached_pool_pages() {
+        let physical = GpuMemoryInfo { free: 600, total: 1_000 };
+        let pool = GpuMempoolUsage { used_current: 100, used_high: 300, reserved_current: 250 };
+        assert_eq!(allocator_resident_bytes(physical, pool), 250);
+        let inconsistent = GpuMempoolUsage { reserved_current: 500, ..pool };
+        assert_eq!(allocator_resident_bytes(physical, inconsistent), physical.total);
     }
 
     #[test]

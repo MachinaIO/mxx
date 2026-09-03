@@ -13,18 +13,16 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType},
 };
 use mxx_primitives::{
-    matrix::{
-        PolyMatrix, SmallPolyMatrix,
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
-    },
+    matrix::{SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix},
     poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
-    sampler::trapdoor::GpuDCRTTrapdoor,
 };
 use mxx_runtime::{
     Backend,
     backend::{
         IndexRange, SampleRange,
-        poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+        poly_gpu::{
+            GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor, gpu_backend_on,
+        },
     },
 };
 use num_bigint::BigInt;
@@ -52,9 +50,9 @@ pub enum DiamondGpuMeasurementError {
 }
 
 enum ReadyOutput {
-    Matrix(GpuDCRTPolyMatrix),
-    SmallMatrix(GpuSmallMatrix),
-    Trapdoor { public: GpuDCRTPolyMatrix, secret: GpuDCRTTrapdoor },
+    Matrix(GpuFleetMatrix),
+    SmallMatrix(GpuFleetSmallMatrix),
+    Trapdoor { public: GpuFleetMatrix, secret: GpuFleetTrapdoor },
     Host,
 }
 
@@ -80,10 +78,10 @@ pub struct DiamondGpuMeasurementBackend {
     parameters: GpuDCRTPolyParams,
     device_ids: Vec<i32>,
     harness: MeasurementHarnessConfig,
-    matrix_cache: BTreeMap<(usize, ConcreteMatrixType), Arc<GpuDCRTPolyMatrix>>,
-    small_matrix_cache: BTreeMap<(usize, ConcreteWireType), Arc<GpuSmallMatrix>>,
+    matrix_cache: BTreeMap<(usize, ConcreteMatrixType), Arc<GpuFleetMatrix>>,
+    small_matrix_cache: BTreeMap<(usize, ConcreteWireType), Arc<GpuFleetSmallMatrix>>,
     trapdoor_cache:
-        BTreeMap<(usize, ConcreteWireType), (Arc<GpuDCRTPolyMatrix>, Arc<GpuDCRTTrapdoor>)>,
+        BTreeMap<(usize, ConcreteWireType), (Arc<GpuFleetMatrix>, Arc<GpuFleetTrapdoor>)>,
     measurements: BTreeMap<String, NodeMeasurement>,
     crt_depth: usize,
 }
@@ -114,7 +112,7 @@ impl DiamondGpuMeasurementBackend {
     fn matrix(
         &mut self,
         ty: &ConcreteMatrixType,
-    ) -> Result<Arc<GpuDCRTPolyMatrix>, DiamondGpuMeasurementError> {
+    ) -> Result<Arc<GpuFleetMatrix>, DiamondGpuMeasurementError> {
         let key = (self.backend.active_placement(), ty.clone());
         if !self.matrix_cache.contains_key(&key) {
             let value = self
@@ -134,7 +132,7 @@ impl DiamondGpuMeasurementBackend {
         &mut self,
         ty: &ConcreteWireType,
         bindings: &ParamEnv,
-    ) -> Result<(Arc<GpuDCRTPolyMatrix>, Arc<GpuDCRTTrapdoor>), DiamondGpuMeasurementError> {
+    ) -> Result<(Arc<GpuFleetMatrix>, Arc<GpuFleetTrapdoor>), DiamondGpuMeasurementError> {
         let ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. } = ty else {
             return Err(DiamondGpuMeasurementError::TrapdoorArgument);
         };
@@ -159,7 +157,7 @@ impl DiamondGpuMeasurementBackend {
     fn small_matrix(
         &mut self,
         ty: &ConcreteWireType,
-    ) -> Result<Arc<GpuSmallMatrix>, DiamondGpuMeasurementError> {
+    ) -> Result<Arc<GpuFleetSmallMatrix>, DiamondGpuMeasurementError> {
         let (matrix, max_coefficient_bound) = match ty {
             ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
             ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
@@ -204,7 +202,8 @@ impl DiamondGpuMeasurementBackend {
                 &vec![0u8; payload_len],
             )
             .map_err(Self::backend_error)?;
-            self.small_matrix_cache.insert(key.clone(), Arc::new(value));
+            self.small_matrix_cache
+                .insert(key.clone(), Arc::new(GpuFleetSmallMatrix::from_matrix(value)));
         }
         Ok(Arc::clone(self.small_matrix_cache.get(&key).expect("inserted compact matrix")))
     }
@@ -721,7 +720,7 @@ impl DiamondGpuMeasurementBackend {
                     let target_ty = ConcreteMatrixType {
                         modulus: output.modulus.clone(),
                         ring_dimension: output.ring_dimension,
-                        rows: public.row_size(),
+                        rows: public.size().0,
                         columns: output.columns,
                     };
                     let target = this.matrix(&target_ty)?;

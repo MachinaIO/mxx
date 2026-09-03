@@ -43,6 +43,10 @@ name = "bench_matrix_mul_gpu"
 harness = false
 
 [[bench]]
+name = "bench_small_rhs_gpu"
+harness = false
+
+[[bench]]
 name = "bench_preimage_cpu"
 harness = false
 

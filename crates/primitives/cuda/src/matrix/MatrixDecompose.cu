@@ -294,7 +294,8 @@ __global__ void matrix_fill_gadget_multi_limb_kernel(
     uint64_t modulus,
     uint32_t limb_idx,
     size_t rows,
-    size_t cols,
+    size_t local_cols,
+    size_t global_column_start,
     size_t log_base_q,
     uint32_t digits_per_tower,
     uint32_t base_bits)
@@ -311,10 +312,10 @@ __global__ void matrix_fill_gadget_multi_limb_kernel(
     // Gadget entries are constant polynomials. Write their evaluation directly
     // to every slot so constructing the matrix does not require a full NTT.
     uint64_t value = 0;
-    if (rows > 0 && cols > 0 && log_base_q > 0)
+    if (rows > 0 && local_cols > 0 && log_base_q > 0)
     {
-        size_t row = poly_idx / cols;
-        size_t col = poly_idx - row * cols;
+        size_t row = poly_idx / local_cols;
+        size_t col = global_column_start + poly_idx - row * local_cols;
         size_t block_start = row * log_base_q;
         if (col >= block_start && col < block_start + log_base_q)
         {
@@ -331,7 +332,7 @@ __global__ void matrix_fill_gadget_multi_limb_kernel(
     matrix_store_limb_u64(dst_base, poly_idx, coeff_idx, dst_stride_bytes, dst_coeff_bytes, value);
 }
 
-int launch_fill_gadget_multi_limb_kernel(
+static int launch_fill_gadget_multi_limb_kernel(
     uint8_t *dst_base,
     size_t poly_count,
     size_t n,
@@ -341,12 +342,11 @@ int launch_fill_gadget_multi_limb_kernel(
     uint32_t limb_idx,
     size_t rows,
     size_t cols,
+    size_t global_column_start,
     size_t log_base_q,
     uint32_t digits_per_tower,
     uint32_t base_bits,
-    cudaStream_t stream,
-    const GpuMatrix *,
-    const dim3 *)
+    cudaStream_t stream)
 {
     if (!dst_base)
     {
@@ -370,6 +370,7 @@ int launch_fill_gadget_multi_limb_kernel(
         limb_idx,
         rows,
         cols,
+        global_column_start,
         log_base_q,
         digits_per_tower,
         base_bits);
@@ -381,11 +382,113 @@ int launch_fill_gadget_multi_limb_kernel(
     return 0;
 }
 
+__global__ void matrix_fill_sparse_constant_columns_kernel(
+    uint8_t *dst_base,
+    size_t poly_count,
+    size_t n,
+    size_t dst_stride_bytes,
+    uint8_t dst_coeff_bytes,
+    size_t local_cols,
+    size_t global_column_start,
+    size_t unit_index,
+    bool identity)
+{
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = poly_count * n;
+    if (idx >= total) return;
+    const size_t poly_idx = idx / n;
+    const size_t coeff_idx = idx - poly_idx * n;
+    const size_t row = poly_idx / local_cols;
+    const size_t global_col = global_column_start + poly_idx - row * local_cols;
+    const uint64_t value = identity ? static_cast<uint64_t>(row == global_col)
+                                    : static_cast<uint64_t>(global_col == unit_index);
+    matrix_store_limb_u64(
+        dst_base, poly_idx, coeff_idx, dst_stride_bytes, dst_coeff_bytes, value);
+}
 
-static int gpu_matrix_fill_gadget_impl(
+static int gpu_matrix_fill_sparse_constant_columns_impl(
+    GpuMatrix *out,
+    size_t total_columns,
+    size_t unit_index,
+    size_t global_column_start,
+    bool identity)
+{
+    if (!out || !out->ctx || out->level < 0)
+        return set_error("invalid ranged constant output");
+    if ((identity && out->rows != total_columns) || (!identity && out->rows != 1) ||
+        (!identity && unit_index >= total_columns) || global_column_start > total_columns ||
+        out->cols > total_columns - global_column_start)
+        return set_error("invalid ranged constant shape or column range");
+    if (out->cols != 0 && out->rows > std::numeric_limits<size_t>::max() / out->cols)
+        return set_error("ranged constant polynomial count overflow");
+    const size_t poly_count = out->rows * out->cols;
+    if (poly_count == 0)
+    {
+        out->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+    const size_t limb_count = static_cast<size_t>(out->level + 1);
+    if (out->ctx->limb_gpu_ids.size() < limb_count)
+        return set_error("missing ranged constant limb mapping");
+    const size_t n = static_cast<size_t>(out->ctx->N);
+    constexpr int threads = 256;
+    if (poly_count > std::numeric_limits<size_t>::max() / n)
+        return set_error("ranged constant coefficient count overflow");
+    const size_t total = poly_count * n;
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 limb_id = out->ctx->limb_gpu_ids[limb];
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        size_t stride = 0;
+        uint8_t width = 0;
+        if (matrix_limb_device(out, limb_id, &device) != 0 ||
+            matrix_limb_stream(out, limb_id, &stream) != 0 ||
+            !matrix_limb_metadata_by_id(out, limb_id, &stride, &width))
+            return 1;
+        uint8_t *base = matrix_limb_ptr_by_id(out, 0, limb_id);
+        if (device < 0 || !stream || !base)
+            return set_error("invalid ranged constant limb");
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) return set_error(err);
+        matrix_fill_sparse_constant_columns_kernel<<<
+            (total + threads - 1) / threads, threads, 0, stream>>>(
+                base, poly_count, n, stride, width, out->cols,
+                global_column_start, unit_index, identity);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return set_error(err);
+        if (matrix_record_limb_write(out, limb_id, stream) != 0) return 1;
+    }
+    out->format = GPU_POLY_FORMAT_EVAL;
+    return 0;
+}
+
+extern "C" int gpu_matrix_fill_identity_columns(
+    GpuMatrix *out,
+    size_t full_size,
+    size_t global_column_start)
+{
+    return gpu_matrix_fill_sparse_constant_columns_impl(
+        out, full_size, 0, global_column_start, true);
+}
+
+extern "C" int gpu_matrix_fill_unit_row_columns(
+    GpuMatrix *out,
+    size_t total_columns,
+    size_t unit_index,
+    size_t global_column_start)
+{
+    return gpu_matrix_fill_sparse_constant_columns_impl(
+        out, total_columns, unit_index, global_column_start, false);
+}
+
+
+static int gpu_matrix_fill_gadget_columns_impl(
     GpuMatrix *out,
     uint32_t base_bits,
-    bool small)
+    bool small,
+    size_t full_size,
+    size_t global_column_start)
 {
     if (!out)
     {
@@ -398,6 +501,10 @@ static int gpu_matrix_fill_gadget_impl(
 
     const size_t rows = out->rows;
     const size_t cols = out->cols;
+    if (rows != full_size || (cols != 0 && rows > std::numeric_limits<size_t>::max() / cols))
+    {
+        return set_error("invalid ranged gadget output shape");
+    }
     const size_t count = rows * cols;
     if (count == 0)
     {
@@ -438,9 +545,14 @@ static int gpu_matrix_fill_gadget_impl(
     const size_t log_base_q =
         small ? static_cast<size_t>(digits_per_tower)
               : static_cast<size_t>(digits_per_tower) * crt_depth;
-    if (cols != rows * log_base_q)
+    if (full_size != 0 && log_base_q > std::numeric_limits<size_t>::max() / full_size)
     {
-        return set_error("output size mismatch in gpu_matrix_fill_gadget");
+        return set_error("ranged gadget column count overflow");
+    }
+    const size_t full_cols = full_size * log_base_q;
+    if (global_column_start > full_cols || cols > full_cols - global_column_start)
+    {
+        return set_error("output range mismatch in gpu_matrix_fill_gadget");
     }
     int status = 0;
     for (int limb = 0; limb <= level; ++limb)
@@ -489,12 +601,11 @@ static int gpu_matrix_fill_gadget_impl(
             small ? 0u : static_cast<uint32_t>(limb),
             rows,
             cols,
+            global_column_start,
             log_base_q,
             digits_per_tower,
             base_bits,
-            limb_stream,
-            out,
-            &limb_id);
+            limb_stream);
         if (status != 0)
         {
             return status;
@@ -510,18 +621,17 @@ static int gpu_matrix_fill_gadget_impl(
     return 0;
 }
 
-extern "C" int gpu_matrix_fill_gadget(
+extern "C" int gpu_matrix_fill_gadget_columns(
     GpuMatrix *out,
-    uint32_t base_bits)
+    uint32_t base_bits,
+    int small,
+    size_t full_size,
+    size_t global_column_start)
 {
-    return gpu_matrix_fill_gadget_impl(out, base_bits, false);
-}
-
-extern "C" int gpu_matrix_fill_small_gadget(
-    GpuMatrix *out,
-    uint32_t base_bits)
-{
-    return gpu_matrix_fill_gadget_impl(out, base_bits, true);
+    if (small != 0 && small != 1)
+        return set_error("invalid ranged gadget mode");
+    return gpu_matrix_fill_gadget_columns_impl(
+        out, base_bits, small != 0, full_size, global_column_start);
 }
 
 __global__ void matrix_fill_small_decomposed_identity_chunk_all_limbs_kernel(

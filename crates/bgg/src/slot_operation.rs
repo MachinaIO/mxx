@@ -1441,7 +1441,7 @@ mod artifact {
                     let (start, end) = static_range(&range);
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(small_matrix_output(
+                            .multiply_small_rhs(&small_matrix_output(
                                 &result,
                                 &format!("slot_b0_{chunk}_{slot}")
                             ))
@@ -1458,7 +1458,7 @@ mod artifact {
                         .concat_rows(&[&-(secret.clone() * &gadget.slice_columns(start, end))]);
                     assert_eq!(
                         b1.clone()
-                            .multiply_small_rhs(small_matrix_output(
+                            .multiply_small_rhs(&small_matrix_output(
                                 &result,
                                 &format!("slot_b1_{chunk}_{slot}")
                             ))
@@ -1488,7 +1488,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(small_matrix_output(
+                            .multiply_small_rhs(&small_matrix_output(
                                 &result,
                                 &format!("gate_transfer_{chunk}_{destination}"),
                             ))
@@ -1511,7 +1511,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(small_matrix_output(
+                            .multiply_small_rhs(&small_matrix_output(
                                 &result,
                                 &format!("gate_reduce_{chunk}_{destination}"),
                             ))

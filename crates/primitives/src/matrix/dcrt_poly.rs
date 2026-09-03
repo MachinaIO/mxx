@@ -380,7 +380,7 @@ impl PolyMatrixSmallRhs for DCRTPolyMatrix {
         CpuSmallMatrix::new(value, max_coefficient_bound)
     }
 
-    fn multiply_small_rhs(&self, rhs: Self::SmallMatrix) -> Result<Self, SmallMatrixError> {
+    fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError> {
         if self.params != *rhs.value().params() {
             return Err(SmallMatrixError::ParameterMismatch);
         }
@@ -877,17 +877,18 @@ mod tests {
         let lhs = constant_matrix(&params, &[&[1, 2, 3], &[4, 5, 6]]);
         let rhs = constant_matrix(&params, &[&[1, 2], &[2, 1], &[3, 1]]);
         let expected = lhs.clone() * rhs.clone();
-        let actual =
-            lhs.multiply_small_rhs(CpuSmallMatrix::new(rhs, BigUint::from(3u32)).unwrap()).unwrap();
+        let actual = lhs
+            .multiply_small_rhs(&CpuSmallMatrix::new(rhs, BigUint::from(3u32)).unwrap())
+            .unwrap();
         assert_eq!(actual, expected);
         let wrong_shape = constant_matrix(&params, &[&[1, 2], &[2, 1]]);
         assert_eq!(
-            lhs.multiply_small_rhs(CpuSmallMatrix::new(wrong_shape, BigUint::from(3u32)).unwrap()),
+            lhs.multiply_small_rhs(&CpuSmallMatrix::new(wrong_shape, BigUint::from(3u32)).unwrap()),
             Err(SmallMatrixError::ShapeMismatch)
         );
         assert_eq!(
             lhs.multiply_small_rhs(
-                CpuSmallMatrix::new(
+                &CpuSmallMatrix::new(
                     constant_matrix(&other_params, &[&[1, 2], &[2, 1], &[3, 1]]),
                     BigUint::from(3u32),
                 )
@@ -913,13 +914,13 @@ mod tests {
             &payload,
         )
         .unwrap();
-        let actual = lhs.multiply_small_rhs(decoded).unwrap();
+        let actual = lhs.multiply_small_rhs(&decoded).unwrap();
         assert_eq!(actual, expected);
 
         let zero_rhs = constant_matrix(&params, &[&[0, 0], &[0, 0], &[0, 0]]);
         let expected_zero = lhs.clone() * zero_rhs.clone();
         let actual_zero =
-            lhs.multiply_small_rhs(CpuSmallMatrix::new(zero_rhs, BigUint::ZERO).unwrap()).unwrap();
+            lhs.multiply_small_rhs(&CpuSmallMatrix::new(zero_rhs, BigUint::ZERO).unwrap()).unwrap();
         assert_eq!(actual_zero, expected_zero);
     }
 
@@ -1270,7 +1271,7 @@ mod tests {
         let g_small = DCRTPolyMatrix::small_gadget_matrix(&params, n);
         let left = a.clone() * &g_small;
         let expected = a * &b;
-        let actual = left.multiply_small_rhs(b.clone().gadget_decompose(true).unwrap()).unwrap();
+        let actual = left.multiply_small_rhs(&b.clone().gadget_decompose(true).unwrap()).unwrap();
 
         assert_eq!(actual, expected);
     }

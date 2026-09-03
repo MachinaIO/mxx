@@ -537,7 +537,7 @@ mod tests {
 
         let expected_vector = lhs_vector
             .clone()
-            .multiply_small_rhs(rhs_public.clone().gadget_decompose(false).unwrap())
+            .multiply_small_rhs(&rhs_public.clone().gadget_decompose(false).unwrap())
             .unwrap() +
             rhs_vector * lhs_plaintext.entry(0, 0);
         assert_eq!(matrix_output(&result, "vector"), &expected_vector);
@@ -545,7 +545,7 @@ mod tests {
             matrix_output(&result, "public"),
             &lhs_public
                 .clone()
-                .multiply_small_rhs(rhs_public.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&rhs_public.clone().gadget_decompose(false).unwrap())
                 .unwrap()
         );
         assert_eq!(matrix_output(&result, "plaintext"), &(lhs_plaintext * rhs_plaintext));

@@ -1020,7 +1020,7 @@ mod tests {
             matrix_output(&result, "product-public"),
             &left_public
                 .clone()
-                .multiply_small_rhs(right_public.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
                 .unwrap()
         );
         for slot in 0..slots {
@@ -1032,7 +1032,7 @@ mod tests {
                 matrix_output(&result, &format!("product-row-{slot}")),
                 &(left_rows[slot]
                     .clone()
-                    .multiply_small_rhs(right_public.clone().gadget_decompose(false).unwrap())
+                    .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
                     .unwrap() +
                     right_rows[slot].clone() * left_plaintexts[slot].entry(0, 0))
             );
@@ -1157,21 +1157,21 @@ mod tests {
             matrix_output(&result, "public"),
             &a_forward
                 .clone()
-                .multiply_small_rhs(input_public.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
                 .unwrap()
-                .multiply_small_rhs(a_backward.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
                 .unwrap()
         );
         for destination in 0..slots {
             let source = (destination + slots - 1) % slots;
             let step1 = c_forward[destination]
                 .clone()
-                .multiply_small_rhs(input_public.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
                 .unwrap() +
                 input_rows[source].clone();
             let expected = step1
                 .clone()
-                .multiply_small_rhs(a_backward.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
                 .unwrap() +
                 c_backward[source].clone() * plaintexts[source].entry(0, 0);
             assert_eq!(matrix_output(&result, &format!("row-{destination}")), &expected);

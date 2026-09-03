@@ -71,18 +71,37 @@ use mxx_primitives::{
         Poly, PolyParams,
         dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
     },
-    sampler::{
-        gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
-        trapdoor::GpuDCRTPolyTrapdoorSampler,
-    },
 };
 
-pub type GpuDcrtBackend = PolyBackend<
-    GpuDCRTPolyMatrix,
-    GpuDCRTPolyUniformSampler,
-    GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
-    GpuDCRTPolyTrapdoorSampler,
->;
+mod fleet;
+pub use fleet::{
+    GpuColumnShard, GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
+};
+
+#[cfg(test)]
+pub(super) fn wait_for_gpu_test_context_quiescence(device: i32) {
+    use mxx_primitives::poly::dcrt::gpu::{gpu_device_memory_usage, gpu_device_sync};
+    use std::time::{Duration, Instant};
+
+    // The named serial-test lock protects test bodies, but event-ordered owners
+    // from the preceding body can outlive the lock briefly.  Drain completed
+    // device work at this test-only boundary and wait for those owners to drop
+    // before a calibration test creates its context.
+    gpu_device_sync();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let usage = gpu_device_memory_usage(device).expect("query GPU test context state");
+        if usage.live_contexts == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "previous GPU test contexts did not quiesce: device={device}, live_contexts={}",
+            usage.live_contexts
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 pub fn gpu_backend(parameters: impl IntoIterator<Item = GpuDCRTPolyParams>) -> GpuDcrtBackend {
     let parameters = parameters.into_iter().collect::<Vec<_>>();
@@ -104,7 +123,7 @@ pub fn gpu_backend_on(
             parameters.iter().map(|parameters| parameters.params_for_device(device_id)).collect()
         })
         .collect();
-    GpuDcrtBackend::new_with_placements(placements)
+    GpuDcrtBackend::new(placements)
 }
 
 pub(super) fn new_for_execution_on<M, U, H, T>(
@@ -142,8 +161,10 @@ mod crt_tests {
     use num_bigint::{BigInt, BigUint, Sign};
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(gpu_context)]
     fn gpu_crt_recompose_matches_direct_residues_five_times() {
+        let device = detected_gpu_device_ids()[0];
+        wait_for_gpu_test_context_quiescence(device);
         // Fixed primes avoid constructing an OpenFHE parameter object (and its
         // process-global transform/cache state) in this GPU correctness oracle.
         // Each prime is 1 mod 2N for N = 32.

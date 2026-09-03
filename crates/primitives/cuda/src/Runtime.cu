@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <condition_variable>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -199,6 +200,9 @@ private:
 namespace
 {
     thread_local std::string last_error;
+    constexpr size_t MAX_TRACKED_GPU_DEVICES = 256;
+    std::atomic<size_t> live_context_counts[MAX_TRACKED_GPU_DEVICES]{};
+    std::atomic<uint64_t> context_generations[MAX_TRACKED_GPU_DEVICES]{};
 
     int set_error(const char *msg)
     {
@@ -676,6 +680,51 @@ namespace
         }
     }
 
+    size_t minimum_device_memory_budget_bytes(
+        const std::vector<int> &gpu_list,
+        uint32_t percent)
+    {
+        int original_device = 0;
+        cudaError_t err = cudaGetDevice(&original_device);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+
+        size_t minimum_budget = std::numeric_limits<size_t>::max();
+        for (int device : gpu_list)
+        {
+            err = cudaSetDevice(device);
+            if (err == cudaSuccess)
+            {
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                err = cudaMemGetInfo(&free_bytes, &total_bytes);
+                if (err == cudaSuccess)
+                {
+                    // Split the calculation before multiplication to preserve
+                    // floor(total_bytes * percent / 100) without overflowing.
+                    const size_t budget =
+                        (total_bytes / 100) * static_cast<size_t>(percent) +
+                        ((total_bytes % 100) * static_cast<size_t>(percent)) / 100;
+                    minimum_budget = std::min(minimum_budget, budget);
+                    continue;
+                }
+            }
+
+            const std::string error = cudaGetErrorString(err);
+            cudaSetDevice(original_device);
+            throw std::runtime_error(error);
+        }
+
+        err = cudaSetDevice(original_device);
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        return minimum_budget;
+    }
+
     GpuNttDeviceConstants make_empty_ntt_device_constants(
         int device,
         size_t limb_count,
@@ -857,6 +906,7 @@ extern "C"
         const int *gpu_ids,
         size_t gpu_ids_len,
         size_t stream_pool_size,
+        uint32_t vram_percent,
         GpuContext **out_ctx)
     {
         GpuContext *gpu_ctx = nullptr;
@@ -879,6 +929,10 @@ extern "C"
             {
                 return set_error("logN must be between 1 and 30");
             }
+            if (vram_percent == 0 || vram_percent > 100)
+            {
+                return set_error("GPU VRAM percentage must be between 1 and 100");
+            }
 
             std::vector<int> gpu_list;
             if (gpu_ids_len == 0 || !gpu_ids)
@@ -891,6 +945,8 @@ extern "C"
             }
 
             validate_gpu_list(gpu_list);
+            const size_t vram_budget_bytes =
+                minimum_device_memory_budget_bytes(gpu_list, vram_percent);
             configure_default_mempool_release_threshold(gpu_list);
             const uint32_t resolved_dnum =
                 dnum == 0 ? static_cast<uint32_t>(gpu_list.size()) : dnum;
@@ -983,6 +1039,7 @@ extern "C"
             gpu_ctx->gpu_ids = std::move(gpu_list);
             gpu_ctx->dnum = resolved_dnum;
             gpu_ctx->max_aux_limbs = GPU_RUNTIME_MAX_LIMBS;
+            gpu_ctx->vram_budget_bytes = vram_budget_bytes;
             gpu_ctx->garner_inverse_table = std::move(inverse_table);
             gpu_ctx->limb_gpu_ids = std::move(limb_gpu_ids);
             gpu_ctx->limb_prime_ids = std::move(limb_prime_ids);
@@ -1048,6 +1105,22 @@ extern "C"
                     &device_constants);
                 gpu_ctx->ntt_device_constants.push_back(device_constants);
             }
+            for (int device : gpu_ctx->gpu_ids)
+            {
+                if (device < 0 || static_cast<size_t>(device) >= MAX_TRACKED_GPU_DEVICES)
+                {
+                    throw std::runtime_error("GPU device ordinal exceeds live-context counter capacity");
+                }
+            }
+            for (int device : gpu_ctx->gpu_ids)
+            {
+                live_context_counts[static_cast<size_t>(device)].fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                context_generations[static_cast<size_t>(device)].fetch_add(
+                    1,
+                    std::memory_order_release);
+            }
             *out_ctx = gpu_ctx;
             return 0;
         }
@@ -1079,9 +1152,19 @@ extern "C"
         {
             return;
         }
+        const std::vector<int> gpu_ids = ctx->gpu_ids;
         destroy_context_streams(ctx);
         free_ntt_device_constants(ctx->ntt_device_constants);
         delete ctx;
+        for (int device : gpu_ids)
+        {
+            live_context_counts[static_cast<size_t>(device)].fetch_sub(
+                1,
+                std::memory_order_relaxed);
+            context_generations[static_cast<size_t>(device)].fetch_add(
+                1,
+                std::memory_order_release);
+        }
     }
 
     int gpu_context_fence_releases(const GpuContext *ctx)
@@ -1180,6 +1263,138 @@ extern "C"
             return set_error("invalid gpu_context_get_N arguments");
         }
         *out_N = ctx->N;
+        return 0;
+    }
+
+    int gpu_context_get_vram_budget_bytes(const GpuContext *ctx, size_t *out_bytes)
+    {
+        if (!ctx || !out_bytes)
+        {
+            return set_error("invalid gpu_context_get_vram_budget_bytes arguments");
+        }
+        *out_bytes = ctx->vram_budget_bytes;
+        return 0;
+    }
+
+    int gpu_default_mempool_get_usage(
+        int device,
+        size_t *out_used_current_bytes,
+        size_t *out_used_high_bytes,
+        size_t *out_reserved_current_bytes)
+    {
+        if (device < 0 || !out_used_current_bytes || !out_used_high_bytes ||
+            !out_reserved_current_bytes)
+        {
+            return set_error("invalid gpu_default_mempool_get_usage arguments");
+        }
+        cudaMemPool_t pool = nullptr;
+        cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        uint64_t used_current = 0;
+        uint64_t used_high = 0;
+        uint64_t reserved_current = 0;
+        err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used_current);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &used_high);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved_current);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        if (used_current > std::numeric_limits<size_t>::max() ||
+            used_high > std::numeric_limits<size_t>::max() ||
+            reserved_current > std::numeric_limits<size_t>::max())
+        {
+            return set_error("default mempool usage does not fit size_t");
+        }
+        *out_used_current_bytes = static_cast<size_t>(used_current);
+        *out_used_high_bytes = static_cast<size_t>(used_high);
+        *out_reserved_current_bytes = static_cast<size_t>(reserved_current);
+        return 0;
+    }
+
+    int gpu_device_context_state(int device, size_t *out_count, uint64_t *out_generation)
+    {
+        if (device < 0 || static_cast<size_t>(device) >= MAX_TRACKED_GPU_DEVICES ||
+            !out_count || !out_generation)
+        {
+            return set_error("invalid gpu_device_context_state arguments");
+        }
+        const size_t index = static_cast<size_t>(device);
+        const uint64_t generation_before =
+            context_generations[index].load(std::memory_order_acquire);
+        const size_t count = live_context_counts[index].load(std::memory_order_acquire);
+        const uint64_t generation_after =
+            context_generations[index].load(std::memory_order_acquire);
+        *out_count = generation_before == generation_after
+            ? count
+            : std::numeric_limits<size_t>::max();
+        *out_generation = generation_after;
+        return 0;
+    }
+
+    int gpu_default_mempool_reset_used_high(int device)
+    {
+        if (device < 0 || static_cast<size_t>(device) >= MAX_TRACKED_GPU_DEVICES)
+        {
+            return set_error("invalid gpu_default_mempool_reset_used_high device");
+        }
+        if (live_context_counts[static_cast<size_t>(device)].load(std::memory_order_acquire) != 1)
+        {
+            return set_error(
+                "default mempool high-water reset requires exactly one live mxx context");
+        }
+        cudaMemPool_t pool = nullptr;
+        cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        uint64_t reset = 0;
+        err = cudaMemPoolSetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &reset);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        return 0;
+    }
+
+    int gpu_device_get_identity(
+        int device,
+        char *out_name,
+        size_t name_capacity,
+        int *out_compute_major,
+        int *out_compute_minor,
+        size_t *out_total_global_memory)
+    {
+        if (device < 0 || !out_name || name_capacity == 0 || !out_compute_major ||
+            !out_compute_minor || !out_total_global_memory)
+        {
+            return set_error("invalid gpu_device_get_identity arguments");
+        }
+        cudaDeviceProp properties{};
+        cudaError_t err = cudaGetDeviceProperties(&properties, device);
+        if (err != cudaSuccess)
+        {
+            return set_error(cudaGetErrorString(err));
+        }
+        const size_t source_length = strnlen(properties.name, sizeof(properties.name));
+        const size_t copied = std::min(source_length, name_capacity - 1);
+        memcpy(out_name, properties.name, copied);
+        out_name[copied] = '\0';
+        *out_compute_major = properties.major;
+        *out_compute_minor = properties.minor;
+        *out_total_global_memory = properties.totalGlobalMem;
         return 0;
     }
 

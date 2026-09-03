@@ -252,25 +252,13 @@ impl GpuDCRTPolyTrapdoorSampler {
         {
             return Err(SmallMatrixError::DeviceMismatch);
         }
-        let budget = crate::env::gpu_small_matrix_residency_bytes()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let allocator_headroom_bytes = crate::env::gpu_small_matrix_allocator_headroom_bytes()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let admission_budget = budget.checked_sub(allocator_headroom_bytes).ok_or(
-            SmallMatrixError::ResourceExhausted {
-                requested_bytes: allocator_headroom_bytes,
-                budget_bytes: budget,
-            },
-        )?;
+        let budget = params.vram_budget_bytes();
         let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
             .map_err(|_| SmallMatrixError::WidthOverflow)?
             .max(1);
         let attempts = crate::env::gpu_preimage_max_tile_attempts()
             .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let mut tile_columns = crate::env::mul_small_rhs_tile_columns()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?
-            .unwrap_or(1)
-            .min(columns);
+        let mut tile_columns = columns;
         let persistent_bytes = [
             public_matrix,
             target,
@@ -295,28 +283,23 @@ impl GpuDCRTPolyTrapdoorSampler {
         let coefficient_words = usize::try_from(params.modulus().bits().div_ceil(64))
             .map_err(|_| SmallMatrixError::DimensionOverflow)?
             .max(1);
-        let pack_check_scratch = limbs
-            .checked_mul(
-                std::mem::size_of::<*const u8>() +
-                    std::mem::size_of::<usize>() +
-                    std::mem::size_of::<u8>() +
-                    std::mem::size_of::<u64>(),
-            )
-            .and_then(|bytes| {
-                limbs
-                    .checked_mul(limbs)
-                    .and_then(|entries| entries.checked_mul(std::mem::size_of::<u64>()))
-                    .and_then(|garner| bytes.checked_add(garner))
-            })
+        let hard_cutoff_plan_bytes = limbs
+            .checked_mul(limbs)
+            .and_then(|entries| entries.checked_mul(std::mem::size_of::<u64>()))
             .and_then(|bytes| {
                 coefficient_words
                     .checked_mul(3 * std::mem::size_of::<u64>())
                     .and_then(|words| bytes.checked_add(words))
             })
+            .and_then(|bytes| {
+                limbs
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .and_then(|subset| bytes.checked_add(subset))
+            })
             .ok_or(SmallMatrixError::DimensionOverflow)?;
         // The device decision word and its pinned host mirror are explicit;
-        // opaque page/event/allocator costs are covered by the separate fixed
-        // headroom rather than pretending sizeof(handle) measures them.
+        // Device and host control words remain explicit in the allocation
+        // report rather than approximating opaque implementation overhead.
         let device_acceptance_control_bytes = std::mem::size_of::<i32>();
         let pinned_host_acceptance_control_bytes = std::mem::size_of::<i32>();
         let sampler_event_bytes = 2 * std::mem::size_of::<usize>();
@@ -328,6 +311,11 @@ impl GpuDCRTPolyTrapdoorSampler {
             let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
             let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
             let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
+            let packed_staging = k
+                .checked_mul(tile_columns)
+                .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
+                .and_then(|value| value.checked_mul(1 + magnitude_bytes))
+                .ok_or(SmallMatrixError::DimensionOverflow)?;
             let live = persistent_bytes
                 .checked_add(compact_bytes)
                 .and_then(|v| v.checked_add(candidate))
@@ -335,12 +323,13 @@ impl GpuDCRTPolyTrapdoorSampler {
                 .and_then(|v| v.checked_add(residual))
                 .and_then(|v| v.checked_add(z_hat))
                 .and_then(|v| v.checked_add(target_tile))
-                .and_then(|v| v.checked_add(pack_check_scratch))
+                .and_then(|v| v.checked_add(hard_cutoff_plan_bytes))
+                .and_then(|v| v.checked_add(packed_staging))
                 .and_then(|v| v.checked_add(device_acceptance_control_bytes))
                 .and_then(|v| v.checked_add(pinned_host_acceptance_control_bytes))
                 .and_then(|v| v.checked_add(sampler_event_bytes))
                 .ok_or(SmallMatrixError::DimensionOverflow)?;
-            if residency_fits(live, admission_budget) {
+            if residency_fits(live, budget) {
                 break;
             }
             tile_columns -= 1;
@@ -357,8 +346,9 @@ impl GpuDCRTPolyTrapdoorSampler {
             columns,
             max_coefficient_bound,
             magnitude_bytes,
-            admission_budget,
+            budget,
         )?;
+        destination.prepare_preimage_hard_cutoff();
         let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
         let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
             .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
@@ -366,22 +356,25 @@ impl GpuDCRTPolyTrapdoorSampler {
         let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
         let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
         let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
-        let check_scratch = residual
-            .checked_add(z_hat)
-            .and_then(|bytes| bytes.checked_add(pack_check_scratch))
+        let packed_staging = k
+            .checked_mul(tile_columns)
+            .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
+            .and_then(|value| value.checked_mul(1 + magnitude_bytes))
             .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let check_scratch =
+            residual.checked_add(z_hat).ok_or(SmallMatrixError::DimensionOverflow)?;
         let report = destination.sampler_allocation_report(
             persistent_bytes.checked_add(target_tile).ok_or(SmallMatrixError::DimensionOverflow)?,
             candidate,
             perturbation,
             check_scratch,
-            0,
+            hard_cutoff_plan_bytes,
+            packed_staging,
             // Full-matrix queries include their deterministic handles. These
             // are the compact owner and decision-event handles only.
             sampler_event_bytes,
             device_acceptance_control_bytes,
             pinned_host_acceptance_control_bytes,
-            allocator_headroom_bytes,
         )?;
         if !residency_fits(report.sampler_peak_bytes, budget) {
             return Err(SmallMatrixError::ResourceExhausted {
@@ -395,11 +388,11 @@ impl GpuDCRTPolyTrapdoorSampler {
             candidate_bytes = report.candidate_bytes,
             perturbation_bytes = report.perturbation_bytes,
             check_scratch_bytes = report.check_scratch_bytes,
+            hard_cutoff_plan_bytes = report.hard_cutoff_plan_bytes,
             packed_staging_bytes = report.packed_staging_bytes,
             sampler_event_bytes = report.sampler_event_bytes,
             device_acceptance_control_bytes = report.device_acceptance_control_bytes,
             pinned_host_acceptance_control_bytes = report.pinned_host_acceptance_control_bytes,
-            allocator_headroom_bytes = report.allocator_headroom_bytes,
             sampler_peak_bytes = report.sampler_peak_bytes,
             budget_bytes = budget,
             "gpu preimage compact sampler residency"
@@ -416,7 +409,7 @@ impl GpuDCRTPolyTrapdoorSampler {
                     &tile_target,
                 )
                 .into_coeff_domain();
-                let accepted = destination.try_pack_checked_tile(
+                let accepted = destination.try_pack_preimage_hard_cutoff_tile(
                     &candidate,
                     0,
                     column_start,
@@ -769,7 +762,7 @@ mod tests {
             .expect("compact preimage should be sampled");
         assert_eq!(compact.rows_count(), public_matrix.col_size());
         assert_eq!(compact.columns_count(), target.col_size());
-        assert_eq!(public_matrix.multiply_small_rhs(compact).unwrap(), target);
+        assert_eq!(public_matrix.multiply_small_rhs(&compact).unwrap(), target);
     }
 
     #[test]
@@ -802,34 +795,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[sequential]
-    fn test_gpu_compact_preimage_rejects_k_by_one_budget_before_allocation() {
-        gpu_device_sync();
-        let size = 2usize;
-        let cpu_params = gpu_test_params();
-        let params = gpu_params_from_cpu(&cpu_params);
-        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (trapdoor, public_matrix) = sampler.trapdoor(&params, size);
-        let target = GpuDCRTPolyMatrix::identity(&params, size, None).slice_columns(0, 1);
-        let previous = std::env::var_os("MXX_GPU_SMALL_MATRIX_RESIDENCY_BYTES");
-        unsafe { std::env::set_var("MXX_GPU_SMALL_MATRIX_RESIDENCY_BYTES", "1") };
-        let result = sampler.bounded_preimage(
-            &params,
-            &trapdoor,
-            &public_matrix,
-            &target,
-            BigUint::from(1u32) << 20,
-        );
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("MXX_GPU_SMALL_MATRIX_RESIDENCY_BYTES", value)
-            },
-            None => unsafe { std::env::remove_var("MXX_GPU_SMALL_MATRIX_RESIDENCY_BYTES") },
-        }
-        assert!(matches!(result, Err(SmallMatrixError::ResourceExhausted { .. })));
-    }
-
     fn canonical_maximum(payload: &[u8], magnitude_bytes: usize) -> BigUint {
         let width = 1 + magnitude_bytes;
         payload
@@ -857,9 +822,10 @@ mod tests {
             inspection_bound,
         )
         .expect("canonical inspection owner");
+        canonical.prepare_preimage_hard_cutoff();
         assert!(
             canonical
-                .try_pack_checked_tile(
+                .try_pack_preimage_hard_cutoff_tile(
                     &candidate,
                     0,
                     0,
@@ -916,13 +882,14 @@ mod tests {
         let mut destination =
             GpuSmallMatrix::new_empty(&params, public_matrix.col_size(), 1, low_maximum.clone())
                 .expect("bounded destination");
+        destination.prepare_preimage_hard_cutoff();
         let mut candidates = [Some(high_candidate), Some(low_candidate)].into_iter();
         let mut attempt_count = 0usize;
         let outcome = bounded_retry(2, || {
             attempt_count += 1;
             let candidate =
                 candidates.next().flatten().expect("retry must consume exactly two candidates");
-            let accepted = destination.try_pack_checked_tile(
+            let accepted = destination.try_pack_preimage_hard_cutoff_tile(
                 &candidate,
                 0,
                 0,
@@ -934,7 +901,7 @@ mod tests {
         });
         assert!(outcome.is_ok());
         assert_eq!(attempt_count, 2);
-        assert_eq!(public_matrix.multiply_small_rhs(destination).unwrap(), target);
+        assert_eq!(public_matrix.multiply_small_rhs(&destination).unwrap(), target);
         params.fence_released_memory();
     }
 
@@ -1052,7 +1019,7 @@ mod tests {
                 permissive_preimage_bound(&params),
             )
             .expect("permissive bound should accept a preimage");
-        let product = public_matrix.multiply_small_rhs(preimage).unwrap();
+        let product = public_matrix.multiply_small_rhs(&preimage).unwrap();
         assert_eq!(product, target);
     }
 
@@ -1081,7 +1048,7 @@ mod tests {
                 .expect("permissive bound should accept a preimage");
             assert_eq!(preimage.columns_count(), chunk_width);
             assert_eq!(
-                public_matrix.multiply_small_rhs(preimage).unwrap(),
+                public_matrix.multiply_small_rhs(&preimage).unwrap(),
                 target,
                 "fused preimage relation failed for runtime chunk width {chunk_width}"
             );
@@ -1124,8 +1091,8 @@ mod tests {
             )
             .expect("permissive bound should accept the second preimage");
 
-        assert_eq!(public_matrix.multiply_small_rhs(first_preimage).unwrap(), first_target);
-        assert_eq!(public_matrix.multiply_small_rhs(second_preimage).unwrap(), second_target);
+        assert_eq!(public_matrix.multiply_small_rhs(&first_preimage).unwrap(), first_target);
+        assert_eq!(public_matrix.multiply_small_rhs(&second_preimage).unwrap(), second_target);
     }
 
     #[test]
@@ -1155,9 +1122,10 @@ mod tests {
             bound.clone(),
         )
         .expect("plain compact owner");
+        plain.prepare_preimage_hard_cutoff();
         assert!(
             plain
-                .try_pack_checked_tile(
+                .try_pack_preimage_hard_cutoff_tile(
                     &z_plain_full.clone().into_coeff_domain(),
                     0,
                     0,
@@ -1169,7 +1137,7 @@ mod tests {
         let sampled = trapdoor_sampler
             .preimage(&params, &trapdoor, &public_matrix, &target, bound)
             .expect("permissive bound should accept a sampled preimage");
-        assert_eq!(public_matrix.multiply_small_rhs(sampled.clone()).unwrap(), target);
+        assert_eq!(public_matrix.multiply_small_rhs(&sampled).unwrap(), target);
         assert_ne!(
             sampled.to_canonical_coefficients().unwrap(),
             plain.to_canonical_coefficients().unwrap(),
@@ -1240,7 +1208,7 @@ mod tests {
 
         for (preimage, target) in outputs.into_iter().zip(&targets) {
             assert_eq!(preimage.max_coefficient_bound(), &cutoff);
-            assert_eq!(public_matrix.multiply_small_rhs(preimage).unwrap(), *target);
+            assert_eq!(public_matrix.multiply_small_rhs(&preimage).unwrap(), *target);
         }
     }
 
@@ -1278,7 +1246,7 @@ mod tests {
                 maximum <= preimage_bound,
                 "preimage coeff exceeds maximum coefficient bound at sample={sample_idx}, maximum={maximum}, bound={preimage_bound}"
             );
-            assert_eq!(public_matrix.multiply_small_rhs(preimage).unwrap(), target);
+            assert_eq!(public_matrix.multiply_small_rhs(&preimage).unwrap(), target);
         }
     }
 
@@ -1398,7 +1366,7 @@ mod tests {
                 .preimage(&src_params, &trapdoor, &public_matrix, &target, preimage_bound.clone())
                 .expect("bounded source-device preimage");
             assert_eq!(
-                public_matrix.multiply_small_rhs(preimage.clone()).unwrap(),
+                public_matrix.multiply_small_rhs(&preimage).unwrap(),
                 target,
                 "source-device preimage relation failed on device {}",
                 src_device
@@ -1430,7 +1398,7 @@ mod tests {
             .expect("restore compact preimage on destination device");
 
             assert_eq!(
-                public_matrix.multiply_small_rhs(preimage.clone()).unwrap(),
+                public_matrix.multiply_small_rhs(&preimage).unwrap(),
                 target,
                 "cross-device restored preimage relation failed (src_device={}, dst_device={})",
                 case.src_device,

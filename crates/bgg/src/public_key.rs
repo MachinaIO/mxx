@@ -340,14 +340,14 @@ mod tests {
             matrix_output(&result, "mul"),
             &lhs_value
                 .clone()
-                .multiply_small_rhs(rhs_value.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&rhs_value.clone().gadget_decompose(false).unwrap())
                 .unwrap()
         );
         assert_eq!(
             matrix_output(&result, "matrix-mul"),
             &lhs_value
                 .clone()
-                .multiply_small_rhs(target_value.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&target_value.clone().gadget_decompose(false).unwrap())
                 .unwrap()
         );
     }

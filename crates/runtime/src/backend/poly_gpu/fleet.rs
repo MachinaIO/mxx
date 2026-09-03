@@ -1370,6 +1370,91 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires at least two GPUs"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_two_device_small_rhs_waves_match_single_device_canonical_output() {
+        let detected = detected_gpu_device_ids();
+        assert!(detected.len() >= 2, "this ignored test requires at least two detected GPUs");
+        let devices = &detected[..2];
+        for &device in devices {
+            super::super::wait_for_gpu_test_context_quiescence(device);
+        }
+
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let gadget_base = BigInt::from(1u8) << parameters.base_bits();
+        let operation = [117u8; 32];
+        let hash_key: [u8; 32] = rand::random();
+        let mut fleet = super::super::gpu_backend_on([parameters.clone()], devices.iter().copied());
+        assert!(
+            fleet.devices.iter().map(|(device, _)| *device).eq(devices.iter().copied()),
+            "test backend must use exactly the first two detected GPUs"
+        );
+        fleet.set_column_widths_for_operation(
+            operation,
+            GpuColumnWidths { gpu0: 1, nonzero: Some(1) },
+        );
+        fleet.select_operation(operation).unwrap();
+
+        let source_type = ConcreteMatrixType {
+            modulus: modulus.clone(),
+            ring_dimension: 32,
+            rows: 1,
+            columns: 9,
+        };
+        let source = fleet.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
+        assert!(source.shards().len() > devices.len(), "test must use multiple waves");
+        assert!(
+            devices
+                .iter()
+                .all(|device| { source.shards().iter().any(|shard| shard.device_id == *device) })
+        );
+
+        let decomposed = fleet.gadget_decompose(&source, false).unwrap();
+        let digits = parameters.modulus_digits();
+        let gadget_type = ConcreteMatrixType { rows: 1, columns: digits, ..source_type.clone() };
+        let gadget = fleet
+            .constant_matrix(
+                &gadget_type,
+                &ConstantMatrix::Gadget {
+                    base: IntExpr::constant(gadget_base.clone()),
+                    small: false,
+                },
+                &ParamEnv::default(),
+            )
+            .unwrap();
+        let fleet_output = fleet.multiply_small_rhs(&gadget, &decomposed).unwrap();
+        assert!(fleet_output.shards().len() > devices.len());
+        assert!(
+            devices
+                .iter()
+                .all(|device| fleet_output.shards().iter().any(|shard| shard.device_id == *device))
+        );
+        let fleet_source_bytes = fleet.matrix_to_bytes(&source);
+        let fleet_output_bytes = fleet.matrix_to_bytes(&fleet_output);
+        assert_eq!(fleet_output_bytes, fleet_source_bytes);
+
+        let mut single = super::super::gpu_backend_on([parameters], [devices[0]]);
+        single.set_column_widths_for_operation(
+            operation,
+            GpuColumnWidths { gpu0: source_type.columns, nonzero: None },
+        );
+        single.select_operation(operation).unwrap();
+        let single_source =
+            single.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
+        let single_decomposed = single.gadget_decompose(&single_source, false).unwrap();
+        let single_gadget = single
+            .constant_matrix(
+                &gadget_type,
+                &ConstantMatrix::Gadget { base: IntExpr::constant(gadget_base), small: false },
+                &ParamEnv::default(),
+            )
+            .unwrap();
+        let single_output = single.multiply_small_rhs(&single_gadget, &single_decomposed).unwrap();
+        assert_eq!(fleet_output_bytes, single.matrix_to_bytes(&single_output));
+    }
+
+    #[test]
     #[serial_test::serial(gpu_context)]
     fn gpu_runtime_miss_records_a_profile_and_cache_hit_defers_width_derivation() {
         let device = detected_gpu_device_ids()[0];

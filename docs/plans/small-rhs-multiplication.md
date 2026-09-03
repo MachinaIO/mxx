@@ -83,7 +83,7 @@ This migration does not:
 
 - preserve backward compatibility with old APIs, artifacts, environment
   variables, or type-erasing conversions;
-- redesign Exponent-LUT's application-specific noise authority;
+- redesign an application's noise authority;
 - improve or otherwise expand the generic noise simulator;
 - add a CPU fallback for failed GPU execution;
 - cache values that depend on an unavailable secret;
@@ -103,10 +103,9 @@ The implementation follows the workspace dependency direction:
 - `mxx-runtime` owns lazy artifact access, placement, execution, and value
   lifetime;
 - `mxx-bgg` and reusable gadgets consume the typed operation;
-- `mxx-exponent-lut` owns its program-specific use and application-specific
-  simulation;
+- application crates own their program-specific use and simulation;
 - `mxx-noise-simulator` depends only on lower-level IR and must never depend on
-  Exponent-LUT; and
+  an application crate; and
 - application crates do not depend on one another.
 
 GPU-specific Rust code must live in a file whose name contains `gpu`. CUDA

@@ -7,7 +7,6 @@ members = [
     "crates/noise-simulator",
     "crates/bench-estimator",
     "crates/bgg",
-    "crates/exponent-lut",
     "crates/primitives",
     "crates/gadgets",
     "crates/func-enc",

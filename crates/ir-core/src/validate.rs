@@ -490,7 +490,7 @@ fn validate_node(
     let inferred = match node.kind {
         NodeKind::Input { wire_type, artifact, .. } => {
             require_arity(scope, node, 0)?;
-            let declared = concrete_wire(wire_type, env, scope, node.id)?;
+            let declared = concretize_wire_type(wire_type, env, scope, node.id)?;
             if let Some(artifact) = artifact {
                 let manifest = manifests.get(&artifact.production_id).ok_or_else(|| {
                     ValidationError::MissingManifest(artifact.production_id.clone())
@@ -1049,7 +1049,7 @@ fn validate_node(
         NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => node
             .output_types
             .iter()
-            .map(|ty| concrete_wire(ty, env, scope, node.id))
+            .map(|ty| concretize_wire_type(ty, env, scope, node.id))
             .collect::<Result<Vec<_>, _>>()?,
         NodeKind::FamilyPack { count } => {
             let count = positive_usize(count.evaluate(env)?, "family count", scope, node.id)?;
@@ -1115,7 +1115,7 @@ fn validate_node(
     let declared = node
         .output_types
         .iter()
-        .map(|ty| concrete_wire(ty, env, scope, node.id))
+        .map(|ty| concretize_wire_type(ty, env, scope, node.id))
         .collect::<Result<Vec<_>, _>>()?;
     if inferred != declared {
         return node_error(
@@ -1411,7 +1411,12 @@ fn require_arity(
     }
 }
 
-fn concrete_wire(
+/// Evaluates a symbolic wire type under one concrete execution environment.
+///
+/// The scope and node identify the originating graph location in validation
+/// errors. Runtime calibration uses this to preserve loop-dependent shapes and
+/// coefficient bounds when several instances share one execution wave.
+pub fn concretize_wire_type(
     ty: &WireType,
     env: &ParamEnv,
     scope: &FrozenGraphScopeId,
@@ -1467,7 +1472,7 @@ fn concrete_wire(
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.evaluate(env)?,
         },
         WireType::IndexedFamily { element, count } => {
-            let element = concrete_wire(element, env, scope, node)?;
+            let element = concretize_wire_type(element, env, scope, node)?;
             if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
                 return node_error(scope, node, "nested indexed families are unsupported");
             }

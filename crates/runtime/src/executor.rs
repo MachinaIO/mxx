@@ -579,87 +579,88 @@ where
                 args: scope.arguments(handle).expect("validated node belongs to its scope"),
             };
             #[cfg(feature = "gpu")]
-            {
+            let calibration_groups =
                 if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
-                    let argument_types = node
+                    let declared_argument_types = node
                         .args
                         .iter()
                         .map(|wire| {
-                            self.validated_wire_type(scope_id, *wire).cloned().ok_or_else(|| {
-                                ExecutionError::MissingMetadata(WireId {
-                                    instantiation_path: paths[0].clone(),
-                                    wire: *wire,
+                            scope
+                                .node(wire.node)
+                                .and_then(|producer| {
+                                    producer.output_types().get(wire.port.0 as usize)
                                 })
-                            })
+                                .cloned()
+                                .ok_or_else(|| {
+                                    ExecutionError::MissingMetadata(WireId {
+                                        instantiation_path: paths[0].clone(),
+                                        wire: *wire,
+                                    })
+                                })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let mut output_types = self
-                        .validated
-                        .scope(scope_id)
-                        .into_iter()
-                        .flat_map(|scope| scope.wire_types.iter())
-                        .filter(|(wire, _)| wire.node == node.id)
-                        .map(|(wire, ty)| (wire.port, ty.clone()))
-                        .collect::<Vec<_>>();
-                    output_types.sort_by_key(|(port, _)| *port);
-                    let output_types =
-                        output_types.into_iter().map(|(_, ty)| ty).collect::<Vec<_>>();
-                    if crate::gpu_calibration::gpu_operation_is_column_separable_for_types(
-                        node.kind,
-                        &argument_types,
-                    ) {
-                        let operation = crate::gpu_calibration::gpu_calibration_operation_identity(
-                            node.kind,
-                            &argument_types,
-                            &output_types,
-                            &envs[0],
-                        )
-                        .map_err(ExecutionError::Backend)?;
-                        self.backend
-                            .select_gpu_operation(operation)
-                            .map_err(Self::backend_error)?;
-                    }
-                }
-            }
-            if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {
-                self.execute_preimage_batch(
-                    scope_id,
-                    &envs,
-                    &paths,
-                    &placements,
-                    &node,
-                    &mut values,
-                )?;
-            } else if envs.len() > 1 &&
-                self.execute_parallel_matrix_node_by_placement(
-                    &placements,
-                    &envs,
-                    &node,
-                    &mut values,
-                )?
-            {
-            } else if matches!(node.kind, NodeKind::Select { .. }) {
-                for index in 0..envs.len() {
-                    self.set_placement(placements[index])?;
-                    self.execute_select(
-                        &envs[index],
-                        &node,
-                        schedule,
-                        position,
-                        &mut values[index],
-                    )?;
-                }
-            } else {
-                for index in 0..envs.len() {
-                    self.set_placement(placements[index])?;
-                    self.execute_node(
+                    crate::gpu_calibration::gpu_calibration_groups(
                         scope_id,
-                        &envs[index],
-                        &paths[index],
+                        node.id,
+                        node.kind,
+                        &declared_argument_types,
+                        handle.output_types(),
+                        &envs,
+                    )
+                    .map_err(ExecutionError::Backend)?
+                } else {
+                    vec![(None, (0..envs.len()).collect())]
+                };
+            #[cfg(not(feature = "gpu"))]
+            let calibration_groups: Vec<(Option<[u8; 32]>, Vec<usize>)> =
+                vec![(None, (0..envs.len()).collect())];
+
+            for (operation, indices) in calibration_groups {
+                if let Some(operation) = operation {
+                    self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
+                }
+                if matches!(node.kind, NodeKind::PreimageSample { .. }) && indices.len() > 1 {
+                    self.execute_preimage_batch(
+                        scope_id,
+                        &envs,
+                        &paths,
+                        &placements,
                         &node,
-                        &inputs[index],
-                        &mut values[index],
+                        &mut values,
+                        &indices,
                     )?;
+                } else if indices.len() > 1 &&
+                    self.execute_parallel_matrix_node_by_placement(
+                        &placements,
+                        &envs,
+                        &node,
+                        &mut values,
+                        &indices,
+                    )?
+                {
+                } else if matches!(node.kind, NodeKind::Select { .. }) {
+                    for index in indices {
+                        self.set_placement(placements[index])?;
+                        self.execute_select(
+                            &envs[index],
+                            &node,
+                            schedule,
+                            position,
+                            &mut values[index],
+                        )?;
+                    }
+                } else {
+                    for index in indices {
+                        self.set_placement(placements[index])?;
+                        self.execute_node(
+                            scope_id,
+                            &envs[index],
+                            &paths[index],
+                            &node,
+                            &inputs[index],
+                            &mut values[index],
+                        )?;
+                    }
                 }
             }
             for index in 0..envs.len() {
@@ -720,6 +721,7 @@ where
         envs: &[ParamEnv],
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        candidate_indices: &[usize],
     ) -> Result<bool, ExecutionError> {
         if !matches!(
             node.kind,
@@ -731,10 +733,10 @@ where
             return Ok(false);
         }
         for placement in 0..self.backend.placement_count() {
-            let indices = placements
+            let indices = candidate_indices
                 .iter()
-                .enumerate()
-                .filter_map(|(index, assigned)| (*assigned == placement).then_some(index))
+                .copied()
+                .filter(|index| placements[*index] == placement)
                 .collect::<Vec<_>>();
             if !indices.is_empty() {
                 self.execute_parallel_matrix_node(placement, envs, node, values, &indices)?;
@@ -2264,6 +2266,7 @@ where
         placements: &[usize],
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        indices: &[usize],
     ) -> Result<(), ExecutionError> {
         debug_assert_eq!(envs.len(), values.len());
         struct Pending<M, T> {
@@ -2276,7 +2279,7 @@ where
         }
 
         let mut pending = Vec::new();
-        for instance in 0..values.len() {
+        for &instance in indices {
             self.set_placement(placements[instance])?;
             let public = self.matrix(&mut values[instance], node.args[0])?;
             let (secret, trapdoor_public, _, sigma, gadget_base, digit_count, gadget_small) =

@@ -25,6 +25,6 @@ pub use graph::{
 };
 pub use types::{NodeId, Port, WireRef, WireType};
 pub use validate::{
-    LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError, validate,
-    validate_structure, validate_with_manifests,
+    LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError, concretize_wire_type,
+    validate, validate_structure, validate_with_manifests,
 };

@@ -274,11 +274,37 @@ int run_matrix_transform_batch(
     const uint8_t **device_sources = nullptr;
     size_t *device_strides = nullptr;
     uint8_t *device_widths = nullptr;
+    std::vector<void *> pinned_metadata;
+    pinned_metadata.reserve(sources ? 4 : 3);
+    auto allocate_pinned_metadata = [&](const void *source, size_t bytes, void **out) {
+        if (!source || bytes == 0 || !out)
+        {
+            return cudaErrorInvalidValue;
+        }
+        *out = nullptr;
+        cudaError_t allocation_status = cudaHostAlloc(out, bytes, cudaHostAllocPortable);
+        if (allocation_status == cudaSuccess)
+        {
+            std::memcpy(*out, source, bytes);
+            pinned_metadata.push_back(*out);
+        }
+        return allocation_status;
+    };
     auto release = [&]() {
         if (device_widths) cudaFreeAsync(device_widths, stream);
         if (device_strides) cudaFreeAsync(device_strides, stream);
         if (device_sources) cudaFreeAsync(device_sources, stream);
         if (device_bases) cudaFreeAsync(device_bases, stream);
+        if (!pinned_metadata.empty())
+        {
+            (void)gpu_defer_pinned_frees(
+                first->ctx,
+                device,
+                stream,
+                pinned_metadata.data(),
+                pinned_metadata.size());
+            pinned_metadata.clear();
+        }
     };
     if (error == cudaSuccess) error = cudaMallocAsync(
         reinterpret_cast<void **>(&device_bases), bases.size() * sizeof(uint8_t *), stream);
@@ -289,16 +315,28 @@ int run_matrix_transform_batch(
     if (error == cudaSuccess && sources) error = cudaMallocAsync(
         reinterpret_cast<void **>(&device_sources),
         source_bases.size() * sizeof(uint8_t *), stream);
+    void *pinned_bases = nullptr;
+    void *pinned_strides = nullptr;
+    void *pinned_widths = nullptr;
+    void *pinned_sources = nullptr;
+    if (error == cudaSuccess) error = allocate_pinned_metadata(
+        bases.data(), bases.size() * sizeof(uint8_t *), &pinned_bases);
+    if (error == cudaSuccess) error = allocate_pinned_metadata(
+        strides.data(), strides.size() * sizeof(size_t), &pinned_strides);
+    if (error == cudaSuccess) error = allocate_pinned_metadata(
+        widths.data(), widths.size(), &pinned_widths);
+    if (error == cudaSuccess && sources) error = allocate_pinned_metadata(
+        source_bases.data(), source_bases.size() * sizeof(uint8_t *), &pinned_sources);
     if (error == cudaSuccess) error = cudaMemcpyAsync(
-        device_bases, bases.data(), bases.size() * sizeof(uint8_t *),
+        device_bases, pinned_bases, bases.size() * sizeof(uint8_t *),
         cudaMemcpyHostToDevice, stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(
-        device_strides, strides.data(), strides.size() * sizeof(size_t),
+        device_strides, pinned_strides, strides.size() * sizeof(size_t),
         cudaMemcpyHostToDevice, stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(
-        device_widths, widths.data(), widths.size(), cudaMemcpyHostToDevice, stream);
+        device_widths, pinned_widths, widths.size(), cudaMemcpyHostToDevice, stream);
     if (error == cudaSuccess && sources) error = cudaMemcpyAsync(
-        device_sources, source_bases.data(), source_bases.size() * sizeof(uint8_t *),
+        device_sources, pinned_sources, source_bases.size() * sizeof(uint8_t *),
         cudaMemcpyHostToDevice, stream);
     if (error != cudaSuccess)
     {

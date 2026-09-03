@@ -135,27 +135,21 @@ where
 #[cfg(test)]
 mod crt_tests {
     use super::*;
-    use crate::backend::poly::crt_recompose_cpu;
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-        poly::{
-            Poly, PolyParams,
-            dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams, poly::DCRTPoly},
-        },
+        matrix::PolyMatrix,
+        poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPoly},
     };
-    use num_bigint::{BigInt, BigUint};
+    use num_bigint::{BigInt, BigUint, Sign};
 
     #[test]
     #[serial_test::serial]
-    fn gpu_crt_recompose_matches_cpu_five_times() {
-        let cpu_parameters = DCRTPolyParams::new(32, 5, 17, 8);
-        let (moduli, _, _) = cpu_parameters.to_crt();
-        let gpu_parameters = GpuDCRTPolyParams::new(
-            cpu_parameters.ring_dimension(),
-            moduli,
-            cpu_parameters.base_bits(),
-        );
-        let q = cpu_parameters.modulus().as_ref().clone();
+    fn gpu_crt_recompose_matches_direct_residues_five_times() {
+        // Fixed primes avoid constructing an OpenFHE parameter object (and its
+        // process-global transform/cache state) in this GPU correctness oracle.
+        // Each prime is 1 mod 2N for N = 32.
+        let moduli = vec![131_009, 130_817, 129_793, 129_281, 128_833];
+        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8);
+        let q = moduli.iter().map(|modulus| BigUint::from(*modulus)).product::<BigUint>();
         assert!(q.bits() > 64, "test must exercise a multi-word ring modulus");
         let q_minus_one = &q - BigUint::from(1u8);
         let half_q_low = (&q / BigUint::from(2u8)).to_u64_digits()[0];
@@ -167,49 +161,86 @@ mod crt_tests {
             .expect("test parameters must produce a low-word carry while adding Q/2");
         let plaintext_moduli = vec![BigInt::from(overflowing_plaintext_modulus), BigInt::from(19)];
         let reconstruction_coefficients = vec![BigInt::from(-23), BigInt::from(29)];
-        let cpu_levels = plaintext_moduli
+        let level_coefficients = plaintext_moduli
             .iter()
             .enumerate()
             .map(|(level, plaintext_modulus)| {
                 let plaintext_modulus = plaintext_modulus.to_biguint().unwrap();
-                DCRTPolyMatrix::from_poly_vec_row(
-                    &cpu_parameters,
-                    (0..5)
-                        .map(|column| {
-                            let coefficients = (0..cpu_parameters.ring_dimension() as usize)
-                                .map(|index| {
-                                    let ordinal = level + column + index;
-                                    match ordinal % 5 {
-                                        0 => BigUint::from(0u8),
-                                        1 => &q - BigUint::from(1u8),
-                                        2 => &q / BigUint::from(2u8),
-                                        3 => {
-                                            let bucket = BigUint::from((ordinal % 7) + 1);
-                                            (&q * (BigUint::from(2u8) * bucket + 1u8)) /
-                                                (BigUint::from(2u8) * &plaintext_modulus)
-                                        }
-                                        _ => {
-                                            (BigUint::from(7919usize * (ordinal + 1)) +
-                                                BigUint::from(104729usize * (column + 1))) %
-                                                &q
-                                        }
+                (0..5)
+                    .map(|column| {
+                        (0..gpu_parameters.ring_dimension() as usize)
+                            .map(|index| {
+                                let ordinal = level + column + index;
+                                match ordinal % 5 {
+                                    0 => BigUint::from(0u8),
+                                    1 => &q - BigUint::from(1u8),
+                                    2 => &q / BigUint::from(2u8),
+                                    3 => {
+                                        let bucket = BigUint::from((ordinal % 7) + 1);
+                                        (&q * (BigUint::from(2u8) * bucket + 1u8)) /
+                                            (BigUint::from(2u8) * &plaintext_modulus)
                                     }
-                                })
-                                .collect::<Vec<_>>();
-                            DCRTPoly::from_biguints(&cpu_parameters, &coefficients)
-                        })
-                        .collect(),
-                )
+                                    _ => {
+                                        (BigUint::from(7919usize * (ordinal + 1)) +
+                                            BigUint::from(104729usize * (column + 1))) %
+                                            &q
+                                    }
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let expected =
-            crt_recompose_cpu(&cpu_levels, &plaintext_moduli, &reconstruction_coefficients)
-                .unwrap();
+
+        let q_signed = BigInt::from_biguint(Sign::Plus, q.clone());
+        let expected_coefficients = (0..5)
+            .map(|column| {
+                (0..gpu_parameters.ring_dimension() as usize)
+                    .map(|index| {
+                        let accumulated = level_coefficients
+                            .iter()
+                            .zip(&plaintext_moduli)
+                            .zip(&reconstruction_coefficients)
+                            .fold(BigInt::from(0u8), |acc, ((level, modulus), reconstruction)| {
+                                let value =
+                                    BigInt::from_biguint(Sign::Plus, level[column][index].clone());
+                                let rounded =
+                                    ((modulus * value + &q_signed / 2u8) / &q_signed) % modulus;
+                                acc + rounded * reconstruction
+                            });
+                        ((accumulated % &q_signed) + &q_signed) % &q_signed
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut expected_rns_bytes = Vec::new();
+        for polynomial in &expected_coefficients {
+            for modulus in &moduli {
+                let modulus = BigInt::from(*modulus);
+                for coefficient in polynomial {
+                    let residue = ((coefficient % &modulus) + &modulus) % &modulus;
+                    expected_rns_bytes.extend_from_slice(
+                        &u64::try_from(residue).expect("residue must fit in u64").to_le_bytes(),
+                    );
+                }
+            }
+        }
 
         for _ in 0..5 {
-            let gpu_levels = cpu_levels
+            let gpu_levels = level_coefficients
                 .iter()
-                .map(|level| GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, level))
+                .map(|level| {
+                    GpuDCRTPolyMatrix::from_poly_vec_row(
+                        &gpu_parameters,
+                        level
+                            .iter()
+                            .map(|coefficients| {
+                                GpuDCRTPoly::from_biguints(&gpu_parameters, coefficients)
+                            })
+                            .collect(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let actual = <GpuDCRTPolyMatrix as CrtRecomposeMatrix>::crt_recompose_levels(
                 &gpu_levels,
@@ -217,9 +248,12 @@ mod crt_tests {
                 &reconstruction_coefficients,
             )
             .unwrap();
-            assert_eq!(actual.to_cpu_matrix(), expected);
+            let snapshot = actual.to_coefficient_rns_snapshot_for_test();
+            assert_eq!((snapshot.nrow(), snapshot.ncol()), (1, 5));
+            assert_eq!(snapshot.level(), moduli.len() - 1);
+            assert!(!snapshot.is_ntt());
+            assert_eq!(snapshot.bytes(), expected_rns_bytes);
         }
-        gpu_device_sync();
     }
 }
 

@@ -584,6 +584,22 @@ namespace
         uint8_t **limb_bases_device = nullptr;
         size_t *limb_stride_bytes_device = nullptr;
         uint8_t *limb_coeff_bytes_device = nullptr;
+        std::vector<void *> pinned_metadata;
+        pinned_metadata.reserve(3);
+        auto allocate_pinned_metadata = [&](const void *source, size_t bytes, void **out) {
+            if (!source || bytes == 0 || !out)
+            {
+                return cudaErrorInvalidValue;
+            }
+            *out = nullptr;
+            cudaError_t allocation_status = cudaHostAlloc(out, bytes, cudaHostAllocPortable);
+            if (allocation_status == cudaSuccess)
+            {
+                std::memcpy(*out, source, bytes);
+                pinned_metadata.push_back(*out);
+            }
+            return allocation_status;
+        };
         const uint64_t *twiddles =
             Forward ? device_constants.twiddle_forward : device_constants.twiddle_inverse;
         const uint64_t *twiddle_shoup = Forward ?
@@ -609,6 +625,16 @@ namespace
             {
                 cudaFreeAsync(limb_coeff_bytes_device, dispatch_stream);
                 limb_coeff_bytes_device = nullptr;
+            }
+            if (!pinned_metadata.empty())
+            {
+                (void)gpu_defer_pinned_frees(
+                    mat->ctx,
+                    dispatch_device,
+                    dispatch_stream,
+                    pinned_metadata.data(),
+                    pinned_metadata.size());
+                pinned_metadata.clear();
             }
         };
 
@@ -637,9 +663,25 @@ namespace
             return set_error(err);
         }
 
+        void *pinned_limb_bases = nullptr;
+        void *pinned_limb_strides = nullptr;
+        void *pinned_limb_widths = nullptr;
+        err = allocate_pinned_metadata(limb_bases.data(), ptr_bytes, &pinned_limb_bases);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                limb_stride_bytes.data(), stride_bytes, &pinned_limb_strides);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                limb_coeff_bytes.data(), coeff_bytes_bytes, &pinned_limb_widths);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
         err = cudaMemcpyAsync(
             limb_bases_device,
-            limb_bases.data(),
+            pinned_limb_bases,
             ptr_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
@@ -650,7 +692,7 @@ namespace
         }
         err = cudaMemcpyAsync(
             limb_stride_bytes_device,
-            limb_stride_bytes.data(),
+            pinned_limb_strides,
             stride_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
@@ -661,7 +703,7 @@ namespace
         }
         err = cudaMemcpyAsync(
             limb_coeff_bytes_device,
-            limb_coeff_bytes.data(),
+            pinned_limb_widths,
             coeff_bytes_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);

@@ -2022,6 +2022,23 @@ namespace
         size_t *dst_stride_bytes_device = nullptr;
         uint8_t *src_coeff_bytes_device = nullptr;
         uint8_t *dst_coeff_bytes_device = nullptr;
+        std::vector<void *> pinned_metadata;
+        pinned_metadata.reserve(6);
+        auto allocate_pinned_metadata = [&](const void *source, size_t bytes, void **out_ptr) {
+            if (!source || bytes == 0 || !out_ptr)
+            {
+                return cudaErrorInvalidValue;
+            }
+            *out_ptr = nullptr;
+            cudaError_t allocation_status =
+                cudaHostAlloc(out_ptr, bytes, cudaHostAllocPortable);
+            if (allocation_status == cudaSuccess)
+            {
+                std::memcpy(*out_ptr, source, bytes);
+                pinned_metadata.push_back(*out_ptr);
+            }
+            return allocation_status;
+        };
         auto cleanup = [&]()
         {
             if (dispatch_device >= 0)
@@ -2057,6 +2074,16 @@ namespace
             {
                 cudaFreeAsync(const_cast<uint8_t **>(src_bases_device), dispatch_stream);
                 src_bases_device = nullptr;
+            }
+            if (!pinned_metadata.empty())
+            {
+                (void)gpu_defer_pinned_frees(
+                    src->ctx,
+                    dispatch_device,
+                    dispatch_stream,
+                    pinned_metadata.data(),
+                    pinned_metadata.size());
+                pinned_metadata.clear();
             }
         };
 
@@ -2097,9 +2124,36 @@ namespace
             return set_error(err);
         }
 
+        void *pinned_src_bases = nullptr;
+        void *pinned_dst_bases = nullptr;
+        void *pinned_src_strides = nullptr;
+        void *pinned_dst_strides = nullptr;
+        void *pinned_src_widths = nullptr;
+        void *pinned_dst_widths = nullptr;
+        err = allocate_pinned_metadata(src_bases.data(), ptr_bytes, &pinned_src_bases);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(dst_bases.data(), ptr_bytes, &pinned_dst_bases);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                src_stride_bytes.data(), stride_bytes, &pinned_src_strides);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                dst_stride_bytes.data(), stride_bytes, &pinned_dst_strides);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                src_coeff_bytes.data(), coeff_bytes_bytes, &pinned_src_widths);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                dst_coeff_bytes.data(), coeff_bytes_bytes, &pinned_dst_widths);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
         err = cudaMemcpyAsync(
             src_bases_device,
-            src_bases.data(),
+            pinned_src_bases,
             ptr_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
@@ -2110,7 +2164,7 @@ namespace
         }
         err = cudaMemcpyAsync(
             dst_bases_device,
-            dst_bases.data(),
+            pinned_dst_bases,
             ptr_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
@@ -2121,7 +2175,7 @@ namespace
         }
         err = cudaMemcpyAsync(
             src_stride_bytes_device,
-            src_stride_bytes.data(),
+            pinned_src_strides,
             stride_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
@@ -2132,7 +2186,7 @@ namespace
         }
         err = cudaMemcpyAsync(
             dst_stride_bytes_device,
-            dst_stride_bytes.data(),
+            pinned_dst_strides,
             stride_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
@@ -2143,7 +2197,7 @@ namespace
         }
         err = cudaMemcpyAsync(
             src_coeff_bytes_device,
-            src_coeff_bytes.data(),
+            pinned_src_widths,
             coeff_bytes_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);
@@ -2154,7 +2208,7 @@ namespace
         }
         err = cudaMemcpyAsync(
             dst_coeff_bytes_device,
-            dst_coeff_bytes.data(),
+            pinned_dst_widths,
             coeff_bytes_bytes,
             cudaMemcpyHostToDevice,
             dispatch_stream);

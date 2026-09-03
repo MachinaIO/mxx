@@ -505,9 +505,7 @@ impl GpuSmallMatrix {
         if source.params.ctx_raw() != self.params.ctx_raw() {
             return Err(SmallMatrixError::ContextMismatch);
         }
-        if source.is_ntt {
-            return Err(SmallMatrixError::InvalidConfig);
-        }
+        assert!(!source.is_ntt, "compact checked pack requires a coefficient-domain source");
         if source.row_size() != rows ||
             source.col_size() != columns ||
             dst_row.checked_add(rows).is_none_or(|end| end > self.rows) ||
@@ -1912,6 +1910,13 @@ impl GpuDCRTPolyMatrix {
             bytes_per_poly,
             bytes,
         }
+    }
+
+    /// Returns coefficient-domain RNS bytes for tests that need to inspect the
+    /// GPU result without constructing an OpenFHE-backed CPU polynomial.
+    #[doc(hidden)]
+    pub fn to_coefficient_rns_snapshot_for_test(&self) -> GpuDCRTMatrixRnsSnapshot {
+        self.clone().into_coeff_domain().to_rns_snapshot()
     }
 
     pub fn from_rns_snapshot(
@@ -4336,6 +4341,29 @@ mod tests {
             rejected.to_canonical_coefficients().unwrap(),
             accepted.to_canonical_coefficients().unwrap()
         );
+    }
+
+    #[test]
+    #[sequential]
+    #[should_panic(expected = "compact checked pack requires a coefficient-domain source")]
+    fn test_gpu_small_matrix_checked_pack_requires_coefficient_source() {
+        gpu_device_sync();
+        let gpu_params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        let eval_source = GpuDCRTPolyMatrix::from_poly_vec_row(
+            &gpu_params,
+            vec![GpuDCRTPoly::from_usize_to_constant(&gpu_params, 2)],
+        );
+        let zero_payload = vec![0u8; gpu_params.ring_dimension() as usize * 2];
+        let mut destination = GpuSmallMatrix::from_canonical_coefficients(
+            &gpu_params,
+            1,
+            1,
+            BigUint::from(2u32),
+            &zero_payload,
+        )
+        .unwrap();
+
+        let _ = destination.try_pack_checked_tile(&eval_source, 0, 0, 1, 1);
     }
 
     #[test]

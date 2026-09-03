@@ -16,7 +16,6 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, ConcreteWireType},
 };
 use mxx_primitives::{
-    env::gpu_vram_percent,
     matrix::{
         PolyMatrix, PolyMatrixColumnSource, SmallPolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
@@ -328,6 +327,8 @@ pub struct GpuNodeMeasurementBackend {
     workers: Vec<GpuMeasurementWorker>,
     harness: MeasurementHarnessConfig,
     crt_depth: usize,
+    /// Setup-time snapshot. Measurement and calibration must not reread process environment.
+    vram_percent: u32,
     calibration_registry: GpuCalibrationRegistry,
     measurements: HashMap<[u8; 32], NodeMeasurement>,
     pending: HashMap<[u8; 32], PendingMeasurement>,
@@ -342,14 +343,29 @@ impl GpuNodeMeasurementBackend {
         crt_depth: usize,
     ) -> Self {
         assert!(!backends.is_empty(), "GPU measurement requires at least one backend");
+        let vram_percent = backends[0].0.vram_percent();
+        assert!(
+            backends.iter().all(|(backend, _)| backend.vram_percent() == vram_percent),
+            "all GPU measurement contexts must use the same VRAM percentage"
+        );
         let workers = backends
             .into_iter()
             .map(|(backend, device_id)| GpuMeasurementWorker { backend, device_id })
             .collect();
+        Self::from_workers(workers, harness, crt_depth, vram_percent)
+    }
+
+    fn from_workers(
+        workers: Vec<GpuMeasurementWorker>,
+        harness: MeasurementHarnessConfig,
+        crt_depth: usize,
+        vram_percent: u32,
+    ) -> Self {
         Self {
             workers,
             harness,
             crt_depth,
+            vram_percent,
             calibration_registry: GpuCalibrationRegistry::new(),
             measurements: HashMap::new(),
             pending: HashMap::new(),
@@ -688,7 +704,7 @@ impl GpuNodeMeasurementBackend {
             .iter()
             .map(|worker| Self::device_memory(worker.device_id))
             .collect::<Result<Vec<_>, _>>()?;
-        let vram_percent = gpu_vram_percent().map_err(GpuMeasurementError)?;
+        let vram_percent = self.vram_percent;
         let representative_device =
             mxx_primitives::poly::dcrt::gpu::gpu_device_identity(self.workers[0].device_id)
                 .map_err(GpuMeasurementError)?;
@@ -2727,6 +2743,29 @@ mod tests {
         types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId},
     };
     use num_bigint::BigInt;
+
+    #[test]
+    #[serial_test::serial]
+    fn gpu_backend_keeps_the_setup_time_vram_percentage() {
+        let name = "MXX_GPU_VRAM_PERCENT";
+        let original = std::env::var_os(name);
+        unsafe { std::env::set_var(name, "37") };
+        let backend = GpuNodeMeasurementBackend::from_workers(
+            Vec::new(),
+            crate::harness::MeasurementHarnessConfig::default(),
+            1,
+            37,
+        );
+
+        unsafe { std::env::set_var(name, "91") };
+        let captured = backend.vram_percent;
+        match original {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+
+        assert_eq!(captured, 37);
+    }
 
     #[test]
     fn shared_cuda_pool_is_an_explicit_measurement_error() {

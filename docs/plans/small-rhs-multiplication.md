@@ -2,10 +2,13 @@
 
 ## Status
 
-This document is the implementation plan for integrating MachinaIO/mxx pull
-request 150 into the current branch. Its all-column compact small-matrix owner
-is retained. Only representations expanded into DCRT/NTT form, and temporary
-full-DCRT preimage target/candidate matrices, are column-tiled.
+Replace the conceptual `mul_decomposed`/`apply_preimage` data flow for
+small-coefficient right-hand sides with one explicit `mul_small_rhs` operation.
+The operation receives a full-evaluation left-hand-side matrix and a compact
+small-RHS value, and returns a full-evaluation matrix. Each primitive call
+receives exactly one runtime shard of at most W columns and processes all of its
+columns, K rows, and CRT limbs concurrently. Larger logical matrices are split
+only by the runtime fleet.
 
 The reviewed upstream revisions are:
 
@@ -193,13 +196,151 @@ converted to an ordinary `Mat` merely to access multiplication.
 
 ### Matrix multiplication node
 
-Add one node:
+Define one canonical signed coefficient representation for all CPU/GPU
+boundaries.  The exact linear coefficient index is
+`((row * columns + column) * N + coefficient)`, where `N` is the ring
+dimension.  Each coefficient is a signed integer in `[-B, B]` and has no
+alternate residue representative.  Encode one complete sign byte (`0` for
+zero, `1` for non-negative, `2` for negative), followed by exactly
+`magnitude_bytes = max(1, ceil(bit_length(B) / 8))` little-endian magnitude
+bytes.  Thus `B=255` uses one magnitude byte; zero has sign `0` and an all-zero
+magnitude, while a nonzero value must have sign `1` or `2` and a nonzero
+magnitude.  The encoded coefficient count is `rows * columns * N`, and the
+payload length is exactly `count * (1 + magnitude_bytes)`.  Reject negative
+zero, non-canonical width, values outside `[-B,B]`, trailing bytes, dimension
+overflow, and a payload whose declared bound differs from the IR bound.
+
+Introduce one current compact coefficient payload/codec for both semantic
+kinds, rather than mapping preimages to `ArtifactType::Matrix`; delete old
+formats without compatibility decoders.  Artifact descriptors remain distinct:
+use `ArtifactType::SmallMatrix` for generic bounded values and
+`ArtifactType::Preimage` for relation-bearing values.  A generic descriptor
+must never import as a relation-bearing `Preimage`; the descriptor is validated
+against the producing wire type before decoding.  There is one codec and one
+payload layout, not duplicate storage formats.  Define
+`SmallMatrixSemanticKind` in the IR artifact layer with exactly `Generic` and
+`Preimage` values; it is an encode/decode argument and header field, never
+backend-owner state.  The fixed header is, in order:
+four ASCII magic bytes `SMR1`,
+`semantic_kind:u8` (`0` = generic `SmallMatrix`, `1` = `Preimage`),
+`rows:u64`, `columns:u64`, `ring_dimension:u64`, `bound_len:u32`, the
+non-negative canonical BigInt bound as exactly `bound_len` little-endian
+magnitude bytes, `magnitude_bytes:u32`, and `coefficient_count:u64`; all
+integer fields are little-endian.  For the bound, `bound_len` is exactly
+`max(1, ceil(bit_length(B)/8))`; zero is one zero byte and a nonzero bound has
+no leading zero byte.  The payload follows with exactly
+`coefficient_count * (1 + magnitude_bytes)` bytes under the linear index above.
+The payload need not carry modulus data: the decoder uses the complete expected
+concrete schema and does not recompute modulus products, NTT parameters,
+relation facts, content hashes, or bounds.
+The artifact layer hashes exactly this header plus payload (including
+dimensions and bound) when a public content hash is required; any content-hash
+verification remains the existing artifact-store check and is not repeated by
+the codec.  Public hashes remain allowed and private hashes remain forbidden.
+CPU store/load and
+GPU store/load must produce identical canonical bytes and reject malformed
+input before allocating a large destination.  `encode_artifact` passes the
+descriptor's complete `ConcreteBoundedMatrixSchema` and semantic kind to
+`small_matrix_to_bytes`; `decode_artifact` passes the complete expected schema
+and kind to `small_matrix_from_bytes`.  Encode validates owner shape, modulus,
+ring dimension, and inclusive bound against that schema using contract
+assertions and validated owner metadata only; it performs no expensive
+recomputation.  Decode performs O(1) checks of header rows, columns, ring
+dimension, bound, coefficient width/count, and semantic kind exactly against
+the expected schema before a large allocation, then constructs the owner with
+the expected backend parameters, device, context, and placement; it never
+derives them from the payload.  The mandatory decode
+copy pass simultaneously decodes each coefficient and checks its canonical
+sign/magnitude and `[-B,B]` range; there is no second payload scan or repeated
+norm check.  The manifest layout records the same current format; it is not a
+version-negotiation mechanism.
+
+## GPU representation and operation
+
+`GpuSmallMatrix` owns exactly: opaque compact-device handle, rows, columns,
+ring dimension, coefficient bit/byte width, bound metadata, device/context
+identity, and the completion/release event ownership required by the existing
+stream pool.  It contains no CRT-limb pointer array, `level`, `is_ntt`, NTT
+state, or host matrix clone.  The opaque CUDA object stores packed signed
+coefficients in a single coefficient-major buffer.  Host-to-device load and
+device-to-host store use async copies and per-stream event sets; destruction
+queues release after the event, and no wrapper that only launches device work
+waits for the device.
+
+Add one Rust wrapper and one FFI entry point,
+`gpu_matrix_mul_small_rhs(out, lhs_eval, rhs_small, residency_budget_bytes,
+allocation_report)`. The runtime passes one already-sharded compact RHS with
+`C <= W` columns. The wrapper validates contexts, device, dimensions, the exact
+residency requirement, and that `lhs_eval` is full DCRT evaluation format. It
+allocates one full-evaluation `m x C` output and launches asynchronously.
+
+The primitive has no independent column, K, or limb tiling. A single in-place
+workspace holds exactly `L*K*C*N` evaluation words for the runtime shard. One
+enqueue sequence unpacks every coefficient, embeds it independently modulo all
+CRT primes, transforms every local RHS polynomial in place, and accumulates the
+full K dot product. There is no host loop over RHS columns, K ranges, or limb
+ranges, no second expanded buffer, and no multiply-time compact D2D copy.
+Larger logical matrices are divided at producer/load boundaries or exposed by
+lifetime-bound zero-copy views of existing compact shards.
+
+The coefficient array can be shared across primes, but NTT evaluations cannot
+generally be shared across CRT primes because each prime has a distinct
+modulus and transform.  Reduce products/accumulators modulo each prime at
+each safe step; use checked `u128`/CUDA modular multiplication and reject
+unsupported modulus or bit-width instead of allowing integer overflow.
+
+The one stream enqueues unpack, NTT, and accumulation in dependency order.
+The returned completion event covers all launches and registers/retains the
+`lhs_eval`, compact RHS, `rhs_eval` workspace, and full output until every
+queued kernel finishes; the release event then permits asynchronous
+destruction.  Each later consumer waits on that producer event through the
+existing backend event model before reading or reusing any of those values.
+There is no
+`cudaDeviceSynchronize`, device-wide synchronization, host polling, or
+host-side blocking loop. Existing release-stream fencing remains the only
+permitted deferred-resource fence. Runtime calibration derives the only widths,
+`W_gpu0` and `W_nonzero`; the primitive does not derive another tile. At context
+setup, cache a per-device budget using `MXX_GPU_VRAM_PERCENT`, which
+accepts an integer from 1 through 100 and defaults to 80. Do not maintain
+separate byte-budget, allocator-headroom, column-width, K-tile, or limb-wave
+environment controls. Fleet-wide calibration and scheduling follow
+`docs/plans/fleet-wide-gpu-column-sharding.md`.
+
+The normal success path also contains no `cudaStreamSynchronize`. Error
+unwinding uses a completion-event fence; only failure to create or record that
+safety event may fall back to a stream fence so queued work cannot outlive
+temporary storage returned to the allocator.
+The enqueue sequence uses scalar launch arguments and one final completion event,
+not C-sized device pointer/event arrays, so its metadata remains bounded.
+
+In `crates/primitives/src/env.rs`, add exactly one sampler control,
+`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`, parsed as a positive integer by
+`gpu_preimage_max_tile_attempts()`.  An unset variable defaults to `64`,
+deliberately replacing the current unbounded retry loop; a zero, negative, or
+malformed value is an error, not a fallback and not an alias.  This setting is
+primitive-owned and applies per target-column tile.
+
+Let `L` be active CRT limbs, `N` the ring dimension, `m` the lhs rows, `K` the
+RHS rows, `C <= W` the current runtime-shard columns, `b_s = 8*(1 +
+magnitude_bytes)` compact coefficient bits, `w_q` the bytes per evaluation
+word, and `event_metadata_bits` the measured event/launch metadata. The measured
+per-device primitive peak bound is:
 
 ```text
-MatrixMulSmallRhs(lhs: Matrix, rhs: SmallMatrix | Preimage) -> Matrix
+peak_bits <= 8*L*m*K*N*w_q                  // resident lhs evaluation
+           + K*C*N*b_s                       // compact runtime shard
+           + 8*L*m*C*N*w_q                   // one full shard output
+           + 8*L*K*C*N*w_q                   // one in-place shard RHS eval
+           + event_metadata_bits.
 ```
 
-Validation requires:
+The implementation reports each term and overhead from the allocator probe and
+rejects the shard before launch unless the complete formula fits the device
+budget. The full logical column count never enters this allocation: only the
+runtime-selected `C <= W` shard does. Delete
+`MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH` and both
+`mul_decompose` implementations and timing scaffolding; no old environment
+variable may silently control the new operation.
 
 - equal ring dimension and modulus parameters;
 - `lhs.columns == rhs.rows`;
@@ -207,12 +348,198 @@ Validation requires:
 - an output shape of `lhs.rows x rhs.columns`; and
 - no implicit decomposition, sampling, scaling, or relation conversion.
 
-This node means ordinary ring-matrix multiplication. Its bounded RHS changes
-representation and implementation strategy, not its algebra.
+Let `D = ceil(crt_bits / base_bits) * crt_depth`, `N` be the ring dimension,
+and `C <= W` be one runtime shard. The full logical matrix may have many such
+shards, but only one shard per active device is expanded at a time.
 
-### DSL API
+| Resident object | Order | Status | Required handling |
+| --- | --- | --- | --- |
+| Full-DCRT lhs evaluation (`m x K`) | `O(crt_bits * crt_depth * N * mK)` bits | Allowed when `mK = O(D)` | Keep the production evaluation lhs resident. |
+| Full-DCRT output (`m x C`) | `O(crt_bits * crt_depth * N * mC)` bits | Allowed when `mC = O(D)` | Allocate the one full output required by the API; do not make a second full output. |
+| Compact logical RHS (`K x total_C`) | `O(b_s * N * K*total_C)` bits | Allowed only as separately owned compact runtime shards | Producers and artifact loaders create `C <= W` shards; multiplication never joins them. |
+| Expanded DCRT/NTT shard (`K x C`) | `O(crt_bits * crt_depth * N * KC)` bits | Allowed exactly when the complete shard peak fits the role budget | Expand all `L`, `K`, and `C` in one primitive call, then release by event. |
+| Decomposed full-DCRT RHS plus compact RHS | Expanded term plus compact term | Forbidden | No producer or serializer may materialise both representations. |
+| NTT workspace for one shard | `8*L*K*C*N*w_q` bits | Allowed exactly when `8*L*K*C*N*w_q <= remaining_budget_bits` | Runtime calibration bounds only `C=W`; the primitive always uses full K and L. |
 
-Expose one conceptual API:
+The shape-general peak formula reports the resident compact source allocation
+and exact `L*K*C*N` expanded workspace. Define
+`remaining_budget_bits = configured_budget_bits - (lhs_bits + compact_rhs_bits
++ output_bits + event_metadata_bits)` and reject a configuration unless it is
+non-negative and satisfies `8*L*K*C*N*w_q <= remaining_budget_bits`. For a
+`D x D` logical small RHS, the runtime chooses W from the measured role budget
+and executes `ceil(D / W)` shard waves. It never creates an expanded allocation
+covering columns outside the current shard. If a single-column shard cannot
+fit, fail with a resource error; do not introduce hidden K/limb tiling.
+
+## Kernel-level optimization contract
+
+These optimizations apply to `mul_small_rhs`, direct compact gadget
+decomposition, and bounded preimage packing. The historical name
+`mul_decomposed` describes only the operation being replaced; neither
+`mul_decomposed` nor `apply_preimage` is restored as an API.
+
+### Compact expansion and NTT
+
+For an NTT stage of size `N`, exactly `N / 2` butterflies are launched. The
+grid is therefore:
+
+```text
+ceil((N / 2) / threads_per_block)
+```
+
+The compact expansion kernel combines signed-magnitude decoding, independent
+embedding into the active CRT limb, and the forward-NTT twist. It writes the
+twisted evaluation workspace once; a separate unpack output and twist pass are
+not materialized. The memory-oriented compact kernels may process two through
+four coefficients per thread when alignment and a tail-safe loop permit it.
+The staged NTT butterfly kernel stays simple and does not acquire an unrelated
+grid-stride packing loop.
+
+The implementation keeps the existing `uint64_t` evaluation workspace. It does
+not introduce a second 32-bit or packed-width NTT implementation. The two bit
+reversals may be replaced with a DIF/DIT pairing only after profiling shows they
+remain material after the low-risk changes. A shared-memory hierarchical NTT is
+also profile-gated and is not part of the baseline implementation.
+
+### Exact lazy dot accumulation
+
+The matrix dot-product kernel may defer modular reduction across the full K only
+when the host proves the unsigned 128-bit accumulator cannot overflow. For a
+limb modulus `q` and `t` accumulated products, including a previously reduced
+accumulator, the required bound is:
+
+```text
+t * (q - 1)^2 + (q - 1) <= 2^128 - 1
+```
+
+This predicate is evaluated with checked host arithmetic for every limb in the
+wave. If every limb is safe, the lazy kernel accumulates all `t` products in an
+unsigned 128-bit value and reduces once. Otherwise the operation uses the
+general per-term modular kernel. No supported modulus, shape, tail tile, or K
+value may rely on the commonly expected `q < 2^52` and `t <= 180` without
+checking it. Those values are merely a sufficient common case whose sum is
+below `2^112`.
+
+### Preimage hard-cutoff check and pack
+
+The checked conversion used by bounded preimage sampling is named for its
+semantics, for example `try_pack_preimage_hard_cutoff_tile`. It accepts a
+coefficient-domain candidate and performs the exact inclusive test
+`abs(coefficient) <= B` while writing the canonical compact sign-and-magnitude
+payload. Rejected attempt storage is private and fully overwritten before the
+next attempt; no rejected payload becomes a runtime value or artifact. Only the
+acceptance decision crosses the device-to-host boundary during rejection
+sampling.
+
+The conversion selects one of two exact CRT plans from the active moduli and
+bound. The plan and its constants are prepared once for the context/bound and
+reused across attempts.
+
+The single-anchor fast path selects a limb `s` satisfying:
+
+```text
+q_s > 2B
+```
+
+For each coefficient it takes the centered lift `y` of the anchor residue,
+checks `abs(y) <= B`, verifies every other active residue equals `y mod q_i`,
+and packs `y` in the same kernel. The verification of all limbs is mandatory:
+an anchor residue alone does not prove that the full CRT value is small.
+
+If no single modulus is large enough, choose the smallest deterministic subset
+`S` whose product `P_S` satisfies `P_S > 2B`. Reconstruct the centered `y`
+modulo `P_S`, check the bound, verify it against every remaining active limb,
+and pack it. The subset reconstruction is quadratic in `|S|`; reducing its
+multiword result into the remaining limbs makes the general bound
+`O(|S|^2 + |S|L)`, which is effectively linear in `L` when the selected subset
+is small. Failure to find a representable plan is an explicit configuration or
+width error, never acceptance based on an incomplete CRT check.
+
+Direct gadget decomposition already produces bounded compact digits without
+first creating a full DCRT matrix. That path is the trusted-by-construction
+producer and remains direct. Do not add a generic `pack_trusted_bounded` API
+until a real production caller owns the required centered-coefficient contract.
+Similarly, do not add an ambiguous full-DCRT `compact_from_matrix` conversion.
+Artifact decoding checks the expected schema and canonical compact payload; it
+does not rerun CRT reconstruction or the preimage norm computation.
+
+### Required correctness and performance evidence
+
+Focused GPU tests cover 32-, 40-, and 51-bit CRT primes; zero, positive,
+negative, `B`, `-B`, and `B + 1`; single-anchor acceptance and cross-limb false
+positive rejection; partial-CRT reconstruction; lazy and fallback dot kernels;
+nondivisible packing work; full-K/full-limb shard multiplication and tail shards; accepted
+preimage relation and exact cutoff; and the rule that rejected candidates are
+never published. Fleet tests additionally cover the same cases across unequal
+GPU-0 and nonzero-device shard widths.
+
+Performance comparison uses the same parameters and records candidate
+generation, cutoff-and-pack, acceptance wait, compact expansion/twist, bit
+reversal, NTT stages, dot accumulation, launch overhead, peer copies,
+per-device peak VRAM, and total wall latency. Timed GPU boundaries wait on the
+specific completion event or result owner. Host enqueue duration and an
+unrelated generic matrix benchmark are not accepted as small-RHS execution
+latency. DIF/DIT or shared-memory NTT work starts only if this breakdown shows
+that NTT or bit reversal remains a dominant cost.
+
+### Final compact-path comparison
+
+The predecessor tiled implementation and the final single-W implementation were
+measured on one NVIDIA GeForce RTX 4080 SUPER (16,376 MiB, driver 580.173.02,
+CUDA toolkit 13.1). The baseline is commit
+`8306aeac39c200068dbe710d6d52d24f47208071`. Both trees used the same public
+`gadget_decompose(true)` followed by `multiply_small_rhs` sequence, the same
+completion waits, and five samples. Parameters were `N=1024`, CRT depth 4, 28
+CRT bits, 8 base bits, two LHS rows, four target rows, and 32 target columns.
+The final path therefore used `C=W=32`, `K=16`, and `L=4` in one primitive
+call. Median results were:
+
+| Metric | Baseline | Current implementation | Change |
+|---|---:|---:|---:|
+| Compact decomposition | 1.009475 ms | 1.086690 ms | 7.65% slower |
+| Small-RHS multiplication | 1.896549 ms | 0.810891 ms | 2.339x faster |
+| End to end | 2.940860 ms | 1.972733 ms | 1.491x faster |
+| Incremental default-mempool high-water | 1,048,576 B | 15,466,496 B | 14.75x larger |
+
+The final allocation report recorded a 1,048,576-byte compact RHS, a
+2,359,432-byte full output owner, a 16,777,216-byte expanded RHS workspace, and
+a 21,365,048-byte modeled complete high-water. The allocator reported
+21,364,928 bytes at its absolute high-water after a 5,898,432-byte baseline.
+The incremental values in the table are CUDA default asynchronous-pool
+counters, not total physical-device usage, so they compare allocator-visible
+incremental residency only. Runtime capacity calibration separately combines
+this incremental cost with allocator-aware physical residency as specified in
+`docs/plans/fleet-wide-gpu-column-sharding.md`.
+
+Raw baseline `(decomposition, multiplication, end-to-end)` samples in seconds
+were:
+
+```text
+(0.001009475, 0.001931164, 0.002940860)
+(0.001113571, 0.001874608, 0.002988449)
+(0.001056183, 0.001900767, 0.002957110)
+(0.001001851, 0.001876210, 0.002878221)
+(0.000991682, 0.001896549, 0.002888471)
+```
+
+Raw final samples were:
+
+```text
+(0.000952998, 0.000803637, 0.001757206)
+(0.000972625, 0.000810891, 0.001784107)
+(0.001347283, 0.000722413, 0.002070477)
+(0.001216085, 0.000859271, 0.002075897)
+(0.001086690, 0.000885501, 0.001972733)
+```
+
+The exact build command in both trees was:
+
+```text
+cargo bench -p mxx-primitives --bench bench_small_rhs_gpu --features gpu --no-run -j8
+```
+
+The resulting binary was executed five times without changing its environment.
+The benchmark entry point is `crates/primitives/benches/bench_small_rhs_gpu.rs`.
 
 ```rust
 lhs.mul_small_rhs(rhs)
@@ -222,11 +549,54 @@ Use a sealed `BoundedRhs` trait, or an equivalent closed typed interface, so
 only `SmallMatrix` and `Preimage` are accepted. Do not accept an ordinary
 `Mat`, a raw matrix identifier, or an unvalidated coefficient buffer.
 
-Delete old `Preimage::as_mat`, scale-by-one erasure, `apply_preimage`, expanded
-preimage multiplication, and `mul_decomposed` paths after all call sites have
-migrated. No compatibility wrapper or legacy decoder remains.
+Use the actual `GpuContext` allocation plan for every full `GpuMatrix`; do not
+estimate it from a symbolic limb count.  Add one side-effect-free
+`gpu_matrix_query_allocation_bytes(ctx, level, rows, columns, format)` API and
+make it and `gpu_matrix_create` consume the same checked planner in
+`MatrixData.cu`.  The planner sums each nonempty partition once, using its
+active local limbs, two allocated coefficient/evaluation regions, its actual
+`ctx->decomp_counts_by_partition[partition]`, and `ctx->max_aux_limbs` pointer
+slab.  Its result separates `data_bytes`, `aux_bytes`, deterministic persistent
+and allocation-ready event-handle bytes, and their checked total.  The query
+must not change devices, advance streams, create events, or allocate memory.
+Opaque CUDA event storage and allocator fragmentation are not predictable by
+this query.  Validate the complete percentage-derived budget against allocator
+high-water measurements; do not introduce a second fixed headroom budget.
 
-### Producers and exact bounds
+Let `T_candidate`, `T_perturb`, and `T_check` name the actual candidate,
+perturbation, and centered-norm-check owners.  Count each named owner exactly
+once from either the shared full-matrix allocation query or its actual raw
+allocation; a distributed candidate is one owner, not one global allocation
+per GPU, and it must not be included again inside `check_scratch`.  Include
+residual, `z_hat`, perturbation blocks, target tile, any packed staging buffer,
+the persistent public/trapdoor/target values, the persistent compact
+all-column destination, the acceptance flag, and deterministic event handles
+in `sampler_peak_bits`.  Define
+`sampler_remaining_budget_bits = configured_budget_bits -
+(persistent_public_bits + persistent_trapdoor_bits + persistent_target_bits +
+compact_destination_bits + acceptance_flag_bits + sampler_event_bits)` and
+require the checked inequality
+`candidate_bits + perturbation_bits + check_scratch_bits +
+packed_staging_bits <= sampler_remaining_budget_bits` before choosing `C_s`;
+report `sampler_peak_bits` as that sum plus all persistent terms.  The compact
+destination term is exactly `K*C*N*b_s` bits for all accepted columns.
+No full `K*C` expanded candidate is permitted.  For each candidate tile,
+perform the authoritative full-CRT centered-norm check, then immediately pack
+an accepted tile into the compact all-column destination and release the
+expanded candidate, perturbation, and check scratch by stream/event order.
+Copy only the compact acceptance flag D2H.  Count each acceptance-flag D2H
+decision as one attempt.  At the adaptive decision boundary, the sampler
+control stream may wait for that flag copy, choose a retry, and enqueue the
+next draw; this is the sole sampler exception to the no-host-wait GPU rule.
+Rejected draws must wait for stream-ordered release/reuse before their buffers
+are reused.  After exactly `gpu_preimage_max_tile_attempts()` attempts for a
+column tile, return a fail-closed sampler error naming the tile and exact
+attempt count, but only after event-safe cleanup.  CPU
+sampling may keep its existing reference representation but must apply the
+same inclusive bound before returning its compact owner.  Matrix/device-only
+wrappers and `mul_small_rhs` remain asynchronous.  A host wait is permitted
+outside adaptive control only when a caller explicitly requests canonical D2H
+artifact bytes, at the artifact store return boundary described above.
 
 Every producer declares its output type and exact inclusive bound:
 
@@ -248,12 +618,74 @@ unsigned bound is `beta-1`. Do not infer a bound
 by scanning a payload after import, and do not substitute a gadget-digit bound
 for a sampled-preimage cutoff.
 
-## Runtime data model
+1. **IR/DSL contract:** `crates/ir-core/src/types.rs`, `node.rs`,
+   `validate.rs`, `artifact.rs`, `constraints.rs`, `crates/dsl/src/lib.rs`.
+   Add distinct bounded `SmallMatrix` and relation-typed `Preimage` schemas
+   plus `MatrixMulSmallRhs`; delete `Preimage::as_mat`; update graph schemas,
+   shape checks, serde, and the DSL's `SmallMatrix`/`Preimage` family,
+   artifact-input, public-output, and import APIs.
+2. **CPU small-owner foundation:** `crates/primitives/src/matrix/mod.rs`,
+   `crates/primitives/src/matrix/dcrt_poly.rs`, and their focused tests.
+   Add companion `SmallPolyMatrix` and `PolyMatrixSmallRhs` traits, the thin
+   semantic-kind-free `CpuSmallMatrix<M>` owner, canonical signed coefficient
+   payload encode/decode, CPU gadget/hash/preimage producers where their
+   primitive APIs naturally belong, and trusted ordinary multiplication for
+   `multiply_small_rhs`.  Keep `SmallPolyMatrix` metadata/placement/codec-only:
+   it must not require a full-matrix associated type or materialization API;
+   those remain inherent to the CPU owner.  Validate the complete shape/parameter/bound contract
+   once with checked arithmetic; do not add an SMR1 header, semantic-kind
+   field, duplicate matrix clone, or compatibility serializer.  GPU storage
+   and runtime orchestration are deliberately deferred to slices 3 and 4.
+3. **Backend/runtime ownership:** `crates/runtime/src/backend.rs`,
+   `backend/poly.rs`, `backend/poly_gpu.rs`, `backend.rs`'s runtime-value
+   implementations, `executor.rs`, `artifact.rs`, `session.rs`, and
+   `transcript.rs` where value kind/hash handling is shared.  Add the
+   associated `SmallMatrix` API, `RuntimeValue::SmallMatrix`, placement and
+   family/staging paths, direct compact artifact codecs, and explicit node
+   execution.  Remove matrix-only matches that would erase Preimage.
+4. **GPU compact owner/FFI:** `crates/primitives/src/matrix/gpu_dcrt_poly.rs`,
+   `poly/dcrt/gpu.rs`, `env.rs`, CUDA declarations in
+   `cuda/include/matrix/Matrix*.cuh`, and implementations in
+   `cuda/src/matrix/Matrix*.cu` (keep CUDA bodies in `src`).  Add the compact
+   owner, explicit regular/unsigned decomposition mode in the FFI, async serde,
+   producer paths, one FFI multiply operation, event rules,
+   checked modular accumulation, and allocator accounting.  Remove
+   `mul_decompose`, `mul_decompose_small`, per-column copies, and old timing
+   logs/env parsing.
+5. **Correctness compile plumbing (scope-limited):**
+   `crates/correctness/src/operational_noise/lower.rs`,
+   `normal_form.rs`, `arena.rs`, and `job.rs` only where exhaustive matches
+   require the new node/type.  Lower the new node as ordinary multiply and
+   preserve existing relation/bound semantics.  Do not edit simulator
+   formulas, error-term modeling, or noise accuracy behavior; no simulator
+   redesign is part of this task.
+6. **Application call sites:** migrate every RHS use in
+   `crates/bgg/src/{attribute_encoding,boolean,encoding,masked_decoder,
+   lwe_lookup,naive_vec,noise_refresh,public_key,slot_operation,tall_encoding,
+   wee25_commitment,wee25_opening,wee25_public_parameters}.rs`,
+   `crates/gadgets/src/input_injector.rs`,
+   `crates/we/src/diamond/{graph,estimate,estimate_gpu}.rs`, and
+   `crates/io/src/{diamond/graph.rs,aky24/prfe.rs}`.  Replace `.as_mat()` at
+   each actual small-RHS consumer with `mul_small_rhs`; preserve ordinary
+   matrix operations where the RHS is not bounded.  Update application
+   artifact declarations and family imports rather than adding adapters.
+7. **Estimator/benchmarks:** `crates/bench-estimator/src/{lib.rs,gpu.rs,
+   harness.rs}`, primitive benches, and owning WE estimators.  Measure the same
+   one-call production path, compact RHS bytes, exact `L*K*W*N` workspace, and
+   full-output persistence; remove estimates that count Preimage as full DCRT.
 
 ### Full logical artifact and all-column compact owner
 
-An `O((log q)^2)` bounded matrix is represented by one full compact artifact
-and one full compact CPU/GPU owner:
+No integration tests are part of this plan.  Each implementation slice must
+first pass `cargo +nightly fmt --all`, focused unit tests for its
+crate, and CPU/GPU `--no-run` compilation as applicable.  Then run all
+workspace unit tests with and without GPU features using `--lib` unit-only
+commands.  The only permitted exclusions are individual, explicitly named
+`mxx-gadgets` unit tests; each excluded test must have its own recorded
+`>20`-minute elapsed run as evidence.  Do not exclude a whole crate or command
+without naming the tests.  GPU tests run outside the sandbox and are repeated
+with identical commands (3--5 repetitions for smoke/correctness, and the
+repository-required repeated run for synchronization-sensitive tests).
 
 ```text
 SmallMatrixArtifact {
@@ -280,711 +712,16 @@ limb. This all-column compact allocation is intentional and is the mechanism
 that makes the quadratic matrix resident. It contains no full-DCRT limb array,
 NTT representation, or host matrix clone.
 
-Column tiling applies only when a bounded subset is expanded to DCRT/NTT form
-for multiplication, or when a full-DCRT target/candidate is loaded during
-preimage sampling. It does not split the persistent compact small matrix.
-
-The runtime value keeps validated wire semantics separately from the shared
-backend owner:
-
-```text
-RuntimeValue::SmallMatrix(...)
-```
-
-Both `ConcreteSmallMatrix` and `ConcretePreimage` use this storage variant,
-but runtime metadata retains which wire kind was validated. A kind mismatch is
-an error, not a conversion attempt.
-
-At every externally supplied input, lazy/staged artifact materialization, and
-family-element boundary, compare the compact owner's complete metadata against
-the validated concrete wire schema: modulus parameters, ring dimension, rows,
-columns, inclusive coefficient bound, context/placement identity where
-applicable, and semantic kind. Checking only the runtime enum variant is
-insufficient. Reject a mismatch before executing `MatrixMulSmallRhs`; noise
-lowering must never use a smaller declared bound than the value owner carries.
-
-### Artifact identity
-
-Artifact identity includes:
-
-- semantic kind (`SmallMatrix` or `Preimage`);
-- complete matrix parameters and dimensions;
-- the inclusive coefficient bound;
-- canonical encoding version implied by the current schema; and
-- canonical bytes for all columns.
-
-Artifact identity excludes:
-
-- `C_t`, `K_t`, and `ell`;
-- GPU count, placement, and stream assignment;
-- cache location; and
-- the order in which DCRT workspace tiles were evaluated.
-
-No old artifact version is accepted. The migration replaces rather than
-negotiates with old payloads.
-
-## Canonical coefficient encoding
-
-### Signed coefficient representation
-
-Each coefficient uses:
-
-```text
-sign: u8
-magnitude: exactly magnitude_bytes little-endian bytes
-```
-
-where:
-
-- `sign = 0` means zero and requires an all-zero magnitude;
-- `sign = 1` means a positive nonzero value;
-- `sign = 2` means a negative nonzero value; and
-- `magnitude_bytes = max(1, ceil(bit_length(B) / 8))`.
-
-Reject negative zero, noncanonical sign values, noncanonical width, values
-outside `[-B, B]`, overflow, trailing bytes, and schema mismatches before a
-large allocation.
-
-### Canonical row-major payload
-
-The canonical coefficient index is:
-
-\[
-  ((row \cdot columns + column) \cdot N + coefficient).
-\]
-
-This is the updated PR's canonical compact payload. CPU and GPU codecs use the
-same full-matrix layout. Preimage sampling kernels may scatter an accepted
-target-column tile into its global columns of this all-column destination; the
-persistent artifact is never defined by the temporary tile order.
-
-The canonical header is, in order:
-
-```text
-magic:               [u8; 4] = "SMR1"
-semantic_kind:       u8      // 0 = generic SmallMatrix, 1 = Preimage
-rows:                u64 little-endian
-columns:             u64 little-endian
-ring_dimension:      u64 little-endian
-bound_length:        u32 little-endian
-bound:               bound_length canonical little-endian magnitude bytes
-magnitude_bytes:     u32 little-endian
-coefficient_count:   u64 little-endian
-payload:             coefficient_count canonical signed coefficients
-```
-
-The non-negative bound uses exactly
-`max(1, ceil(bit_length(B)/8))` bytes; zero is one zero byte and a nonzero
-bound has no high zero byte. `coefficient_count` must equal
-`rows*columns*N` under checked arithmetic. This is the only accepted format;
-`SMR1` is a format discriminator, not a version-negotiation mechanism.
-
-The artifact layer validates the complete expected schema before decoding
-payload coefficients. Existing artifact-store hashing remains authoritative;
-the compact codec does not add a second commitment or require recomputation by
-a trusted local caller.
-
-## Primitive/backend API
-
-Introduce one backend-owned all-column compact matrix abstraction:
-
-```text
-small_matrix_from_bytes(schema, semantic_kind, bytes) -> SmallMatrix
-small_matrix_to_bytes(value, schema, semantic_kind) -> bytes
-multiply_small_rhs(lhs_eval, rhs_small) -> Matrix
-sample_preimage_small(public_input, target, bound) -> SmallMatrix
-```
-
-The CPU backend may use a compact host representation. The GPU backend uses a
-distinct `GpuSmallMatrix` owner; it must not put compact-state flags or a host
-clone inside `GpuDCRTPolyMatrix`.
-
-`PolyTrapdoorSampler::M` implements the common bounded-RHS primitive contract.
-Its preimage operation returns the compact associated owner directly. Delete
-the public expanded-preimage path and duplicate sampler-side compatibility
-traits. Keep a separately meaningful full-matrix primitive such as
-`preimage_extend` only if its algebra genuinely requires full-matrix output;
-it must not route through or masquerade as the compact preimage API.
-
-## Persistent GPU matrix descriptors
-
-Adopt the updated PR's persistent descriptor design for ordinary DCRT
-matrices. Each local limb has a device-resident descriptor containing the
-base pointer, stride/offset, and coefficient width needed by kernels. Allocate
-and initialize descriptors with the matrix owner, account for their exact
-bytes, and release them with the owner's event lifetime.
-
-Small-RHS multiplication must consume these persistent descriptors directly.
-It must not rebuild and copy pointer, stride, width, or global-limb arrays for
-every operation. Kernels derive local addresses from the descriptor and
-checked partition-local indices.
-
-Because this changes generic `GpuMatrix` allocation and accounting, implement
-it as an independently validated primitive checkpoint. Verify active-level
-mapping and nonuniform multi-GPU limb partitions before depending on it from
-the compact operation.
-
-## Small-RHS multiplication with tiled DCRT expansion
-
-### Preconditions
-
-The left-hand side is a full DCRT matrix in evaluation form. The output is one
-full `m x C` DCRT evaluation matrix when that size is within the configured
-budget. The RHS remains compact until a bounded workspace tile is embedded
-for a specific CRT-limb wave.
-
-If the full output itself cannot fit, use the existing bounded outer
-family/output wave or return a resource error. Do not silently change output
-dimensions or spill through an undocumented path.
-
-### Execution schedule
-
-For each target-column range `J` with `|J| = C_t`:
-
-1. select `S[:, J]` from the already resident all-column compact owner;
-2. retain `A` and the complete compact `S` through an owner event;
-3. for each limb wave of width `ell` and reduction tile of width `K_t`:
-   1. unpack centered signed coefficients;
-   2. embed each coefficient independently modulo each active CRT prime;
-   3. apply an in-place batched NTT for that prime;
-   4. multiply the matching `A` tile and accumulate into `Y[:, J]` modulo the
-      prime;
-4. record one completion event covering every launch for `J`;
-5. make later consumers wait on that event; and
-6. release or reuse the expanded workspace only after the event.
-
-Use one in-place RHS evaluation workspace of shape
-`ell x K_t x C_t x N`. The output tile is the accumulator; do not allocate a
-second full output or a second RHS wave. The first reduction tile initializes
-the output tile, and later tiles add into it.
-
-The Rust/FFI boundary is one operation for the complete all-column compact RHS,
-not one call per column, limb, or polynomial. A single CUDA call may enqueue
-bounded internal column/reduction/limb tiles, but it must not wait for device
-completion before returning. Kernels process all columns and limbs in the
-current tile rather than launching once per element.
-
-### Arithmetic correctness
-
-Compact coefficients are signed integers, not residues under a single shared
-prime. Embed the same integer separately under every CRT modulus. NTT results
-cannot be reused across distinct CRT primes. Products and accumulators use the
-existing checked modular arithmetic for each prime; unsupported widths or
-overflow risks return errors.
-
-The compact kernel uses the canonical row-major index:
-
-\[
-  ((rhs\_row \cdot rhs\_columns + rhs\_column)N + coefficient).
-\]
-
-## Column-streamed preimage sampling
-
-Let the target have `C` columns. Sampling executes:
-
-```text
-for J in target.column_ranges(C_t):
-    load target[:, J]
-    sample a relation-valid preimage for all rows and columns in J
-    check the full-CRT centered coefficient bound
-    pack the accepted tile into columns J of one all-column compact destination
-    release target, candidate, and scratch through events
-```
-
-Rows are not independently tiled when the preimage equation couples them. A
-column tile contains every row required by that relation. If one full-row,
-one-column candidate cannot fit, return a resource error rather than changing
-the relation.
-
-Only the all-column compact destination, one candidate tile, perturbation
-state, norm-check scratch, and one target tile may coexist. A full expanded
-`K x C` candidate is forbidden.
-
-The authoritative cutoff is inclusive and is checked in centered full-CRT
-coordinates before packing. A rejected draw is released safely before buffer
-reuse. The sampler may copy only the small acceptance result to the host at
-the adaptive retry boundary. After the configured maximum attempts for a
-column tile, return an error naming its global range and exact attempt count.
-
-The conservative `default_preimage_cutoff` is also the minimum accepted API
-bound. If the requested inclusive bound is smaller, reject the request before
-sampling with `PreimageBoundTooSmall { requested, minimum }`. The bounded retry
-loop is used only for requests satisfying
-`requested >= default_preimage_cutoff`; those requests either produce a
-relation-valid sample within the requested cutoff or return the tile-specific
-exhaustion error after exactly the configured number of attempts.
-
-### Determinism independent of streaming
-
-Sampling randomness must be indexed by stable logical coordinates, for
-example:
-
-```text
-(seed, sampler/domain tag, target identity,
- global column, row, coefficient, attempt)
-```
-
-It must not be consumed from a stream whose position depends on `C_t`, GPU
-count, scheduling, or retry activity in a different column range. The same
-inputs therefore produce the same full canonical output for every legal wave
-configuration.
-
-## Decomposition and hash-source domain
-
-Add an explicit producer hook equivalent to
-`sample_hash_gadget_source`. The GPU implementation may create the source in
-coefficient form when decomposition consumes coefficients immediately. This
-avoids sample-to-NTT followed by NTT-to-coefficient conversion without changing
-the hash seed, domain-separation tag, or logical sampled matrix.
-
-Gadget decomposition writes directly into the compact row-major owner. It
-must not first produce a full DCRT decomposition and then serialize it.
-
-Tests must establish that coefficient-source and evaluation-source routes
-produce the same logical source and decomposition. This optimization remains
-a representation change, not a new hash construction.
-
-## DCRT domain rules
-
-Adopt the updated PR's domain discipline as a generic primitive checkpoint:
-
-- expose batched in-place NTT for complete matrix batches;
-- make coefficient versus evaluation form explicit in every constructor and
-  sampling result;
-- normalize add/sub operands before combining them;
-- preserve the correct result format in low-level CUDA arithmetic;
-- load all-evaluation inputs without a transform;
-- combine all-coefficient inputs before one batched transform;
-- separate and then combine mixed-domain inputs; and
-- generate constant gadget evaluation values directly when valid.
-
-Matrices remain in evaluation form by default. No comparison, concatenation,
-addition, or multiplication consumes mixed formats silently. These changes
-have a wider blast radius than small-RHS multiplication and must not be
-imported by replacing whole files without focused equivalence tests.
-
-## Asynchrony, waiting, and lifetime
-
-Adopt owner-local completion waits from the updated PR:
-
-- a GPU wrapper that only launches device work returns without blocking;
-- every output owner records the event covering its final write;
-- consumers wait through stream events, not host/device-wide synchronization;
-- benchmarks and host serialization call `wait_until_ready()` only on the
-  owner whose result they observe;
-- normal execution uses neither `cudaDeviceSynchronize` nor
-  `cudaStreamSynchronize`; and
-- a stream wait is permitted only on an allocation/error path where unfinished
-  asynchronous initialization must be fenced before safe cleanup.
-
-Allocation streams initialize persistent descriptors once. Other streams wait
-on the owner's allocation event. Failure paths release partially created
-owners without racing descriptor initialization.
-
-## Memory contract
-
-### Multiplication peak
-
-Let `E` include checked event, descriptor, allocator, and fixed headroom bytes.
-The multiplication peak is bounded by:
-
-\[
-\begin{aligned}
-  Peak_{mul} \le{}& Bytes(A_{eval})
-   + K C N s_B \\
-   + Bytes(Y_{eval}) \\
-   &+ \sum_{i\in limb\ wave} K_t C_t N w_i
-   + E.
-\end{aligned}
-\]
-
-The `K*C*N*s_B` term is the intended resident all-column compact owner. There
-is no `L*K*C*N*w` all-column expanded DCRT/NTT RHS term: only the selected
-`K_t*C_t` expanded workspace is materialized for each limb wave.
-
-The runtime selects positive `C_t`, `K_t`, and `ell` satisfying the exact byte
-budget after subtracting the measured allocations for the left-hand side, the
-all-column compact RHS, output, descriptors, and reserve. Defaults begin with
-one expanded target column, then increase parallelism only while the exact
-allocation remains within the budget.
-
-### Sampling peak
-
-The sampling peak includes exactly once:
-
-- persistent public/trapdoor inputs that truly remain resident;
-- one expanded target column tile;
-- one expanded relation-valid candidate chunk;
-- perturbation and norm-check scratch;
-- one all-column compact accepted-result destination;
-- acceptance/event metadata; and
-- allocator/headroom reserve.
-
-It excludes a full expanded target and full expanded preimage. The compact
-accepted preimage is intentionally resident as one all-column owner and is
-counted exactly once as `K*C*N*s_B`.
-Each owner is counted once even if its CRT limbs are distributed internally.
-
-### Allocation queries
-
-The side-effect-free allocation query and actual allocation must share one
-checked planner. Reports separate data, auxiliary descriptor, deterministic
-event, workspace, and reserve bytes. The query may not change devices, advance
-streams, allocate memory, or create events. Physical acceptance additionally
-uses allocator high-water measurements because fragmentation and opaque CUDA
-state cannot be predicted exactly.
-
-## Configuration
-
-Reuse existing environment variables when their meaning is identical. Add a
-new variable only when no existing control has the same production meaning.
-Primitive-owned controls live in `crates/primitives/src/env.rs`.
-
-The required controls are:
-
-```text
-MXX_MUL_SMALL_RHS_TILE_COLUMNS
-MXX_MUL_SMALL_RHS_K_TILE
-MXX_MUL_SMALL_RHS_LIMB_WAVE
-MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS
-```
-
-Delete `MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH` with the legacy decomposition
-path. Although both old and new controls mention columns, the old variable
-governs a per-column public operation, while the new control governs only the
-internal DCRT/NTT expansion or sampler tile of one all-column compact
-operation. Reusing it would silently preserve the obsolete execution
-contract. The new column-tile default is `1`.
-
-`MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS` defaults to `64` when unset. All explicit
-values must be positive checked integers. Invalid values are errors, not
-fallbacks. Tile and wave settings affect peak memory and performance only;
-they never affect artifact bytes or mathematical results.
-
-## Benchmark and estimator contract
-
-The benchmark must call the production functions and reproduce production
-load, compute, event wait, and store boundaries.
-
-It must not reduce rows, columns, CRT depth, ring dimension, or gadget digit
-count. For an operation with multiple target columns:
-
-1. construct/load the complete production compact owner, then benchmark one
-   internal expanded column tile with the exact full row and reduction
-   dimensions;
-2. record raw chunk latency, chunk width, and maximum parallelism;
-3. compute the full operation time as the sum over the actual number of column
-   chunks; and
-4. when `C_t = 1`, report the explicit one-column latency and
-   `one_column_latency * C` total.
-
-This follows the repository measurement contract: latency is one wave, while
-total time includes every required wave, chunk, and slot. Setup, preprocess,
-and online evaluation must charge the operation to the phase where the
-corresponding public-key or encoding computation actually runs.
-
-Reports distinguish:
-
-- transmitted data such as hash keys and required RHS ciphertexts;
-- deterministic cache data derivable from transmitted/setup inputs;
-- persistent storage bytes for the full compact artifact;
-- resident VRAM for the all-column compact owner;
-- expanded workspace bytes;
-- output bytes;
-- raw stage latencies;
-- chunk/wave counts;
-- total time; and
-- allocator high-water memory.
-
-No estimator may count a preimage as both compact storage and expanded DCRT
-storage. No enqueue-only timing is accepted: wait on the measured result owner
-at the observation boundary.
-
-## Noise-simulator scope
-
-Make only the changes required for exhaustive matching and existing semantics:
-
-- recognize `MatrixMulSmallRhs`;
-- apply the existing ordinary bounded-RHS multiplication transfer using the
-  declared inclusive coefficient bound and exact dimensions;
-- preserve preimage relation metadata where current lowering requires it; and
-- add no decomposition or sampling error term to the multiplication node.
-
-Do not redesign the generic simulator, add a second graph evaluator, expand
-its reporting, or make it an Exponent-LUT acceptance authority. Exponent-LUT's
-application-specific simulator remains responsible for its program operations
-and refresh threshold.
-
-For an input error matrix with per-coefficient bound `E_A`, the exact
-right-action transfer is expressed through
-
-\[
-  \gamma(S) = \max_j \sum_{k=0}^{K-1} \lVert S_{k,j}\rVert_1,
-  \qquad
-  E_Y \le \gamma(S)E_A.
-\]
-
-When only the declared entrywise bound is available, use
-
-\[
-  \gamma(S) \le KNB,
-  \qquad
-  E_Y \le KNB E_A.
-\]
-
-Do not multiply an error bound by `q`, `q/q_t`, or a raw encoded scalar when
-the actual action is bounded by a gadget-decomposition or monomial norm.
-
-## Cache semantics
-
-Cacheability is determined by value dependence, not by representation.
-
-- Data depending only on public setup, public keys, deterministic hash inputs,
-  or the separately allowed secret key `t` may be cached under the current
-  working assumption.
-- Data depending on a not-yet-selected encoding secret `s`, or on a value with
-  `s` already multiplied from the left, is not preprocess-cacheable.
-- A decomposed helper public key may be cached when its complete inputs are
-  cacheable.
-- A runtime cache entry records complete logical identity and schema, never a
-  wave-local node number or tile width.
-
-Storage accounting labels cache bytes separately from bytes that must be sent.
-Online evaluation consumes reusable RHS public-key decompositions from cache
-and must not recompute the corresponding public-key program for each encoding.
-
-## File ownership and implementation slices
-
-Implementation is divided into independently reviewable checkpoints. Start
-each checkpoint from the corresponding PR implementation whenever it applies.
-An entire PR file may be adopted when its current-branch ownership and behavior
-match this plan; otherwise transplant the largest compatible hunks and keep the
-local changes limited to explicit semantic or integration differences.
-
-### 1. IR and DSL contract
-
-Primary ownership:
-
-- `crates/ir-core/src/` type, node, validation, family, and artifact modules;
-- `crates/dsl/src/` typed construction APIs.
-
-Add bounded wire schemas, `MatrixMulSmallRhs`, sealed typed APIs, full shape
-validation, family preservation, and row-major artifact metadata. Delete
-type-erasing and legacy APIs only after repository-wide call-site migration is
-prepared.
-
-### 2. CPU compact foundation
-
-Primary ownership:
-
-- `crates/primitives/src/matrix/` CPU matrix modules;
-- sampler and decomposition traits where already owned.
-
-Add the all-column compact host owner, canonical row-major codec, exact bound checks,
-trusted ordinary multiplication, and direct compact producer paths. Use
-existing matrix arithmetic as the correctness reference.
-
-### 3. Runtime and artifacts
-
-Primary ownership:
-
-- `crates/runtime/src/backend.rs`;
-- `crates/runtime/src/backend/poly.rs`;
-- `crates/runtime/src/backend/poly_gpu.rs`;
-- executor, artifact, session, placement, and runtime-value modules.
-
-Add the shared all-column bounded owner, whole-artifact loading and storing,
-`RuntimeValue::SmallMatrix`, placement rules, and node execution. GPU-only Rust
-stays in `poly_gpu.rs`. Preserve full logical wire identity through indexed
-families and artifacts.
-
-### 4. Generic GPU matrix foundation from PR 150
-
-Primary ownership:
-
-- GPU DCRT Rust modules;
-- `crates/primitives/cuda/include/matrix/` declarations;
-- `crates/primitives/cuda/src/matrix/` implementations.
-
-Port persistent descriptors, owner-local waits, allocation accounting, batched
-NTT, explicit domain handling, and event-safe allocation cleanup. Validate this
-slice before compact multiplication depends on it.
-
-### 5. GPU compact owner and multiplication
-
-Add the all-column compact device owner, canonical row-major codec, one
-whole-owner FFI operation whose implementation internally tiles expansion,
-checked per-prime embedding, bounded NTT workspace, accumulation, and event
-lifetime. Remove per-operation descriptor uploads and full-DCRT RHS
-materialization.
-
-### 6. Column-streamed preimage and decomposition producers
-
-Add target-tile loading, stable-coordinate randomness, full-row candidate
-tiles, bounded retry, full-CRT centered checks, immediate packing into the
-proper columns of one all-column compact destination, and one final whole-owner
-store. Add coefficient-domain hash sources and direct compact gadget
-decomposition.
-
-### 7. Lowering and application migration
-
-Update only required correctness/noise exhaustive matches. Then migrate BGG,
-gadgets, WE, IO, and Exponent-LUT call sites according to their actual RHS
-semantics. Ordinary matrix multiplication remains ordinary; only declared
-bounded RHS values use `mul_small_rhs`.
-
-The currently known call-site audit includes:
-
-- `crates/noise-simulator/src/eval.rs`;
-- `crates/bgg/src/attribute_encoding.rs`;
-- `crates/bgg/src/boolean.rs`;
-- `crates/bgg/src/encoding.rs`;
-- `crates/bgg/src/lwe_lookup.rs`;
-- `crates/bgg/src/masked_decoder.rs`;
-- `crates/bgg/src/naive_vec.rs`;
-- `crates/bgg/src/noise_refresh.rs`;
-- `crates/bgg/src/public_key.rs`;
-- `crates/bgg/src/slot_operation.rs`;
-- `crates/bgg/src/tall_encoding.rs`;
-- `crates/bgg/src/wee25_opening.rs`;
-- `crates/gadgets/src/input_injector.rs`;
-- `crates/we/src/diamond/graph.rs`;
-- `crates/io/src/aky24/prfe.rs`;
-- `crates/io/src/diamond/graph.rs`;
-- `crates/func-enc/src/aky24.rs`;
-- `crates/exponent-lut/src/encoding.rs`;
-- `crates/exponent-lut/src/public_key.rs`;
-- `crates/exponent-lut/src/refresh.rs`; and
-- `crates/exponent-lut/src/refresh_setup.rs`.
-
-Re-run the repository-wide search immediately before migration because this
-list is evidence from the current branch, not a permanently closed allowlist.
-
-### 8. Estimator and benchmark migration
-
-Use the production whole-compact-owner functions with internally tiled DCRT
-expansion, exact parameter set, real storage flow, owner-local observation
-waits, and full column count. Separate
-transmission, cache, persistent storage, resident VRAM, and expanded workspace.
-
-### 9. Legacy deletion
-
-After all call sites and artifacts migrate, delete old APIs, obsolete
-environment variables, serializers, expanded preimage routes, timing
-scaffolding, and compatibility code. Retain only the new internal tile controls
-listed in the Configuration section; do not retain or alias the obsolete
-public-operation column-chunk control. A repository-wide search must find no
-live old path.
-
-## Validation plan
-
-### Static and CPU gates
-
-- `cargo +nightly fmt --all`;
-- warning-free CPU workspace library no-run build;
-- focused IR validation, serde, artifact, runtime, and CPU primitive tests;
-- full workspace unit tests where their runtime is practical; and
-- no integration tests unless explicitly requested.
-
-Required CPU tests cover:
-
-- exact bound endpoints and rejection above the bound;
-- negative, zero, and maximum coefficients;
-- malformed sign, width, count, shape, modulus, ring dimension, and semantic
-  kind;
-- row-major offsets and complete canonical artifact round trips;
-- internal expansion tile widths producing identical output and artifact bytes;
-- generic bounded matrix versus preimage type rejection;
-- multi-column ordinary-multiplication equivalence; and
-- exact preimage relation preservation;
-- loop-dependent bounds evaluated separately for each parallel instance;
-- batches with distinct evaluated bounds remaining distinct; and
-- external bounded owners rejected when any parameter, shape, bound, or
-  semantic-kind metadata differs from the validated wire schema.
-
-### GPU compile and repeated tests
-
-- warning-free workspace library no-run build with GPU features;
-- GPU tests outside the sandbox;
-- identical-command repeated runs for asynchronous/event-sensitive tests;
-- no CPU fallback; and
-- no weakening of existing tests.
-
-Required GPU tests cover:
-
-- persistent descriptor initialization, accounting, and cleanup;
-- nonuniform multi-GPU partitions and active-level limb mapping;
-- owner-local wait fencing only the requested result;
-- all-coefficient, all-evaluation, and mixed-domain construction;
-- direct gadget evaluation and coefficient-domain hash-source equivalence;
-- row-major all-column compact CPU/GPU round trip;
-- `mul_small_rhs` equivalence with trusted full-DCRT multiplication across
-  distinct CRT primes;
-- `C_t = 1` and larger legal tiles producing identical results;
-- preimage output independent of tile width and GPU scheduling;
-- cutoffs below the conservative default returning `PreimageBoundTooSmall`
-  without launching a sampling attempt;
-- retry, exact retry exhaustion, and event-safe candidate reuse; and
-- allocator query versus actual high-water memory.
-
-### Performance evidence
-
-On the same device, parameters, build, and artifact flow, record:
-
-- the prior implementation's latency and peak;
-- one-column and selected multi-column chunk latency;
-- total full-column time;
-- persistent descriptor bytes;
-- all-column compact owner bytes;
-- expanded workspace bytes;
-- output bytes;
-- maximum parallelism; and
-- physical allocator high-water memory.
-
-Increase column, reduction, and limb parallelism up to the VRAM budget only
-after the baseline result is captured. A performance estimate is not GPU
-runtime validation.
-
-## Acceptance criteria
-
-The migration is complete only when all of the following are true:
-
-1. every bounded RHS has an explicit inclusive bound and typed semantic kind;
-2. no ordinary matrix can enter `MatrixMulSmallRhs` without validation;
-3. an `O((log q)^2)` logical RHS or preimage may be resident only in compact
-   low-bit form; its all-column DCRT/NTT expansion is never resident;
-4. no full DCRT/NTT RHS or full expanded preimage is materialized;
-5. all input and output mathematical dimensions are unchanged;
-6. persisted compact artifacts are canonical row-major and independent of
-   wave configuration;
-7. sampling results are deterministic under legal chunking changes;
-8. multiplication embeds and transforms coefficients independently for each
-   CRT prime;
-9. GPU matrix descriptors are persistent and included in allocation reports;
-10. normal GPU execution has no device-wide or stream-wide synchronization;
-11. benchmark estimates use the production path and report full total time;
-12. transmission, deterministic cache, storage, VRAM, and workspace are
-    reported separately;
-13. the generic noise simulator received only the minimal semantic update;
-14. legacy APIs, formats, controls, and compatibility shims are absent;
-15. formatting, compile, unit, repeated GPU, and performance gates pass; and
-16. an independent implementation review confirms that the integrated change
-    preserves the specified algebra, bounds, memory order, and event lifetime.
-
-## Explicit zero-old-use gate
-
-After migration, repository-wide searches over source, tests, benches, and
-documentation outside this plan must show no live use of:
-
-```text
-Preimage::as_mat
-apply_preimage
-mul_decomposed
-mul_decompose
-mul_decompose_small
-mul_decompose_column_chunk_width
-MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH
-```
-
-Any conceptually equivalent expanded or type-erasing replacement also fails
-this gate, even if it has a different name.
+Final gates are CPU/GPU no-run builds with no new warnings attributable to this
+change, nightly formatting, all allowed unit tests, repeated GPU tests,
+estimator consistency, the measured
+before/after report, clean diff review, and an independent new Sol review of
+the implementation and evidence.  Roll back a slice if its gate fails; retain
+the diagnostic artifact and exact failure rather than restoring a compatibility
+path.  Completion requires explicit confirmation that no old API, env var,
+artifact format, type-erasing conversion, per-column operation, hidden sync,
+or unbounded DCRT RHS temporary remains.  Add a repository-wide zero-old-use
+gate (`rg` over source, benches, tests, and docs outside this plan) proving
+there are no `Preimage::as_mat`, `mul_decompose`,
+`mul_decompose_small`, `apply_preimage`, or
+`MXX_MUL_DECOMPOSE_COLUMN_CHUNK_WIDTH` uses.

@@ -855,10 +855,6 @@ mod tests {
         )
     }
 
-    fn gadget_multiply(lhs: &DCRTPolyMatrix, rhs: &DCRTPolyMatrix) -> DCRTPolyMatrix {
-        lhs.multiply_small_rhs(rhs.clone().gadget_decompose(false).unwrap()).unwrap()
-    }
-
     fn public_matrix(
         parameters: &DCRTPolyParams,
         rows: usize,
@@ -1052,7 +1048,10 @@ mod tests {
         );
         assert_eq!(
             matrix_output(&result, "product-public"),
-            &gadget_multiply(&left_public, &right_public)
+            &left_public
+                .clone()
+                .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
+                .unwrap()
         );
         for slot in 0..slots {
             assert_eq!(
@@ -1061,7 +1060,10 @@ mod tests {
             );
             assert_eq!(
                 matrix_output(&result, &format!("product-row-{slot}")),
-                &(gadget_multiply(&left_rows[slot], &right_public) +
+                &(left_rows[slot]
+                    .clone()
+                    .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
+                    .unwrap() +
                     right_rows[slot].clone() * left_plaintexts[slot].entry(0, 0))
             );
             assert_eq!(
@@ -1183,13 +1185,24 @@ mod tests {
         let result = execute_graph(built, parameters, inputs);
         assert_eq!(
             matrix_output(&result, "public"),
-            &gadget_multiply(&gadget_multiply(&a_forward, &input_public), &a_backward)
+            &a_forward
+                .clone()
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
+                .unwrap()
         );
         for destination in 0..slots {
             let source = (destination + slots - 1) % slots;
-            let step1 = gadget_multiply(&c_forward[destination], &input_public) +
+            let step1 = c_forward[destination]
+                .clone()
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
+                .unwrap() +
                 input_rows[source].clone();
-            let expected = gadget_multiply(&step1, &a_backward) +
+            let expected = step1
+                .clone()
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
+                .unwrap() +
                 c_backward[source].clone() * plaintexts[source].entry(0, 0);
             assert_eq!(matrix_output(&result, &format!("row-{destination}")), &expected);
             assert_eq!(

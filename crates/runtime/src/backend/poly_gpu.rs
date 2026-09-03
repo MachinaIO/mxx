@@ -104,7 +104,7 @@ use mxx_primitives::{
     },
 };
 
-pub type GpuDcrtBackend = PolyBackend<
+type SingleGpuBackend = PolyBackend<
     GpuDCRTPolyMatrix,
     GpuDCRTPolyUniformSampler,
     GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
@@ -122,12 +122,10 @@ fn random_gpu_seeds(count: usize) -> Vec<mxx_primitives::poly::dcrt::gpu::GpuRng
 }
 
 fn gpu_uniform_batch(
-    backend: &mut GpuDcrtBackend,
+    backend: &mut SingleGpuBackend,
     requests: Vec<UniformSampleRequest>,
 ) -> Result<Vec<GpuDCRTPolyMatrix>, PolyBackendError> {
-    let Some(first) = requests.first() else {
-        return Ok(Vec::new());
-    };
+    let Some(first) = requests.first() else { return Ok(Vec::new()) };
     let parameters = backend.parameters(&first.matrix_type)?;
     let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
     let expected_range = (BigInt::from(0), modulus - BigInt::from(1));
@@ -153,12 +151,10 @@ fn gpu_uniform_batch(
 }
 
 fn gpu_hash_batch(
-    backend: &mut GpuDcrtBackend,
+    backend: &mut SingleGpuBackend,
     requests: Vec<HashSampleRequest>,
 ) -> Result<Vec<GpuDCRTPolyMatrix>, PolyBackendError> {
-    let Some(first) = requests.first() else {
-        return Ok(Vec::new());
-    };
+    let Some(first) = requests.first() else { return Ok(Vec::new()) };
     let parameters = backend.parameters(&first.matrix_type)?;
     if requests.iter().any(|request| {
         request.matrix_type != first.matrix_type ||
@@ -180,16 +176,39 @@ fn gpu_hash_batch(
     (outputs.len() == requests.len()).then_some(outputs).ok_or(PolyBackendError::InvalidInteger)
 }
 
-impl
-    PolyBackend<
-        GpuDCRTPolyMatrix,
-        GpuDCRTPolyUniformSampler,
-        GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
-        GpuDCRTPolyTrapdoorSampler,
-    >
-{
+impl SingleGpuBackend {
     fn enable_gpu_sampling_batch(&mut self) {
         self.set_sampling_batch_dispatch(gpu_uniform_batch, gpu_hash_batch);
+    }
+}
+
+mod fleet;
+pub use fleet::{
+    GpuColumnShard, GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
+};
+
+#[cfg(test)]
+pub(super) fn wait_for_gpu_test_context_quiescence(device: i32) {
+    use mxx_primitives::poly::dcrt::gpu::{gpu_device_memory_usage, gpu_device_sync};
+    use std::time::{Duration, Instant};
+
+    // The named serial-test lock protects test bodies, but event-ordered owners
+    // from the preceding body can outlive the lock briefly.  Drain completed
+    // device work at this test-only boundary and wait for those owners to drop
+    // before a calibration test creates its context.
+    gpu_device_sync();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let usage = gpu_device_memory_usage(device).expect("query GPU test context state");
+        if usage.live_contexts == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "previous GPU test contexts did not quiesce: device={device}, live_contexts={}",
+            usage.live_contexts
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -213,9 +232,7 @@ pub fn gpu_backend_on(
             parameters.iter().map(|parameters| parameters.params_for_device(device_id)).collect()
         })
         .collect();
-    let mut backend = GpuDcrtBackend::new_with_placements(placements);
-    backend.enable_gpu_sampling_batch();
-    backend
+    GpuDcrtBackend::new(placements)
 }
 
 pub(super) fn new_for_execution_on<M, U, H, T>(
@@ -363,19 +380,15 @@ mod crt_tests {
     use super::*;
     use mxx_primitives::{
         matrix::PolyMatrix,
-        poly::{
-            Poly, PolyParams,
-            dcrt::{
-                gpu::{GpuDCRTPoly, gpu_device_sync},
-                params::DCRTPolyParams,
-            },
-        },
+        poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPoly},
     };
     use num_bigint::{BigInt, BigUint, Sign};
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(gpu_context)]
     fn gpu_crt_recompose_matches_direct_residues_five_times() {
+        let device = detected_gpu_device_ids()[0];
+        wait_for_gpu_test_context_quiescence(device);
         // Fixed primes avoid constructing an OpenFHE parameter object (and its
         // process-global transform/cache state) in this GPU correctness oracle.
         // Each prime is 1 mod 2N for N = 32.
@@ -400,7 +413,7 @@ mod crt_tests {
                 let plaintext_modulus = plaintext_modulus.to_biguint().unwrap();
                 (0..5)
                     .map(|column| {
-                        (0..cpu_parameters.ring_dimension() as usize)
+                        (0..gpu_parameters.ring_dimension() as usize)
                             .map(|index| {
                                 let ordinal = level + column + index;
                                 match ordinal % 5 {
@@ -424,53 +437,48 @@ mod crt_tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        // Derive the expected value independently from the operation's
-        // coefficient-wise nearest-scale rule.  In particular, this covers
-        // canonical residues for negative centered errors and values close to
-        // the half-interval without relying on a concurrently initialized CPU
-        // transform cache as the GPU test's reference value.
-        let q_int = BigInt::from_biguint(Sign::Plus, q.clone());
+
+        let q_signed = BigInt::from_biguint(Sign::Plus, q.clone());
         let expected_coefficients = (0..5)
             .map(|column| {
-                (0..cpu_parameters.ring_dimension() as usize)
+                (0..gpu_parameters.ring_dimension() as usize)
                     .map(|index| {
                         let accumulated = level_coefficients
                             .iter()
                             .zip(&plaintext_moduli)
                             .zip(&reconstruction_coefficients)
-                            .fold(BigInt::from(0), |acc, ((level, modulus), coefficient)| {
+                            .fold(BigInt::from(0u8), |acc, ((level, modulus), reconstruction)| {
                                 let value =
                                     BigInt::from_biguint(Sign::Plus, level[column][index].clone());
-                                let rounded = ((modulus * value + &q_int / 2u8) / &q_int) % modulus;
-                                acc + rounded * coefficient
+                                let rounded =
+                                    ((modulus * value + &q_signed / 2u8) / &q_signed) % modulus;
+                                acc + rounded * reconstruction
                             });
-                        (((accumulated % &q_int) + &q_int) % &q_int)
-                            .to_biguint()
-                            .expect("expected CRT coefficient is nonnegative")
+                        ((accumulated % &q_signed) + &q_signed) % &q_signed
                     })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let expected_rns = expected_coefficients
-            .iter()
-            .flat_map(|coefficients| {
-                gpu_parameters.moduli().iter().flat_map(|modulus| {
-                    let modulus = BigUint::from(*modulus);
-                    coefficients.iter().flat_map(move |coefficient| {
-                        let digits = (coefficient % &modulus).to_u64_digits();
-                        digits.first().copied().unwrap_or(0).to_le_bytes()
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut expected_rns_bytes = Vec::new();
+        for polynomial in &expected_coefficients {
+            for modulus in &moduli {
+                let modulus = BigInt::from(*modulus);
+                for coefficient in polynomial {
+                    let residue = ((coefficient % &modulus) + &modulus) % &modulus;
+                    expected_rns_bytes.extend_from_slice(
+                        &u64::try_from(residue).expect("residue must fit in u64").to_le_bytes(),
+                    );
+                }
+            }
+        }
 
         for _ in 0..5 {
             let gpu_levels = level_coefficients
                 .iter()
-                .map(|columns| {
+                .map(|level| {
                     GpuDCRTPolyMatrix::from_poly_vec_row(
                         &gpu_parameters,
-                        columns
+                        level
                             .iter()
                             .map(|coefficients| {
                                 GpuDCRTPoly::from_biguints(&gpu_parameters, coefficients)
@@ -485,29 +493,18 @@ mod crt_tests {
                 &reconstruction_coefficients,
             )
             .unwrap();
-            let actual_snapshot = actual.to_coefficient_rns_snapshot();
-            assert!(!actual_snapshot.is_ntt());
-            if actual_snapshot.bytes() != expected_rns {
-                let mismatch = actual_snapshot
-                    .bytes()
-                    .iter()
-                    .zip(&expected_rns)
-                    .position(|(actual, expected)| actual != expected)
-                    .expect("mismatched snapshots must have a differing byte");
-                panic!(
-                    "raw GPU CRT mismatch at byte {mismatch}: actual={}, expected={}",
-                    actual_snapshot.bytes()[mismatch],
-                    expected_rns[mismatch]
-                );
-            }
+            let snapshot = actual.to_coefficient_rns_snapshot_for_test();
+            assert_eq!((snapshot.nrow(), snapshot.ncol()), (1, 5));
+            assert_eq!(snapshot.level(), moduli.len() - 1);
+            assert!(!snapshot.is_ntt());
+            assert_eq!(snapshot.bytes(), expected_rns_bytes);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Backend;
-    use crate::backend::poly::CpuDcrtBackend;
+    use crate::backend::{Backend, poly::CpuDcrtBackend};
     use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
 
     #[test]

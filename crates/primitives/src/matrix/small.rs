@@ -416,7 +416,7 @@ pub trait PolyMatrixSmallRhs: PolyMatrix {
         max_coefficient_bound: BigUint,
     ) -> Result<Self::SmallMatrix, SmallMatrixError>;
     fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError>;
-    fn multiply_small_rhs(&self, rhs: Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
+    fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
 }
 
 fn checked_ring_dimension<P: PolyParams>(params: &P) -> Result<usize, SmallMatrixError> {
@@ -563,7 +563,7 @@ mod tests {
         let expected = &lhs * &rhs;
         let compact = rhs.gadget_decompose(true).unwrap();
         let left = &lhs * &DCRTPolyMatrix::small_gadget_matrix(&params, lhs.col_size());
-        let actual = left.multiply_small_rhs(compact).unwrap();
+        let actual = left.multiply_small_rhs(&compact).unwrap();
         assert_eq!(actual, expected);
     }
 

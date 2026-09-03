@@ -147,6 +147,11 @@ pub trait Backend {
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Selects setup-time GPU calibration for the next primitive.
+    fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn placement_count(&self) -> usize {
         1
     }

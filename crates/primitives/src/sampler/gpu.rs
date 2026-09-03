@@ -44,7 +44,6 @@ impl PolyUniformSampler for GpuDCRTPolyUniformSampler {
         sample_gpu_matrix_native(params, nrow, ncol, dist)
     }
 }
-
 impl GpuDCRTPolyUniformSampler {
     /// Samples one matrix using an explicit stable seed.  The caller owns
     /// domain separation; this method does not incorporate tile or batch
@@ -128,6 +127,23 @@ where
     ) -> Self::M {
         let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
         sample_gpu_matrix_with_seed_columns(
+            params, nrow, total_ncol, col_start, col_len, dist, seed,
+        )
+    }
+
+    fn sample_hash_gadget_source_columns<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        total_ncol: usize,
+        col_start: usize,
+        col_len: usize,
+        dist: DistType,
+    ) -> Self::M {
+        let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
+        sample_gpu_matrix_with_seed_columns_coeff(
             params, nrow, total_ncol, col_start, col_len, dist, seed,
         )
     }
@@ -342,56 +358,72 @@ fn sample_gpu_matrix_with_seed_columns(
     dist: DistType,
     seed: GpuRngSeed,
 ) -> GpuDCRTPolyMatrix {
-    if nrow == 0 || col_len == 0 {
-        return GpuDCRTPolyMatrix::zero(params, nrow, col_len);
-    }
-    match dist {
-        DistType::FinRingDist => GpuDCRTPolyMatrix::sample_distribution_columns(
-            params,
-            nrow,
-            total_ncol,
-            col_start,
-            col_len,
-            GpuMatrixSampleDist::Uniform,
-            0.0,
-            u64::MAX,
-            seed,
-        ),
-        DistType::GaussDist { sigma, max_coefficient_bound } => {
+    sample_gpu_matrix_with_seed_columns_format(
+        params, nrow, total_ncol, col_start, col_len, dist, seed, true,
+    )
+}
+
+fn sample_gpu_matrix_with_seed_columns_coeff(
+    params: &GpuDCRTPolyParams,
+    nrow: usize,
+    total_ncol: usize,
+    col_start: usize,
+    col_len: usize,
+    dist: DistType,
+    seed: GpuRngSeed,
+) -> GpuDCRTPolyMatrix {
+    sample_gpu_matrix_with_seed_columns_format(
+        params, nrow, total_ncol, col_start, col_len, dist, seed, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_gpu_matrix_with_seed_columns_format(
+    params: &GpuDCRTPolyParams,
+    nrow: usize,
+    total_ncol: usize,
+    col_start: usize,
+    col_len: usize,
+    dist: DistType,
+    seed: GpuRngSeed,
+    is_ntt: bool,
+) -> GpuDCRTPolyMatrix {
+    let sample = |dist, sigma, max_coefficient_bound| {
+        if is_ntt {
             GpuDCRTPolyMatrix::sample_distribution_columns(
                 params,
                 nrow,
                 total_ncol,
                 col_start,
                 col_len,
-                GpuMatrixSampleDist::Gauss,
+                dist,
                 sigma,
-                gpu_coefficient_cutoff(max_coefficient_bound.as_ref()),
+                max_coefficient_bound,
+                seed,
+            )
+        } else {
+            GpuDCRTPolyMatrix::sample_distribution_columns_coeff(
+                params,
+                nrow,
+                total_ncol,
+                col_start,
+                col_len,
+                dist,
+                sigma,
+                max_coefficient_bound,
                 seed,
             )
         }
-        DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution_columns(
-            params,
-            nrow,
-            total_ncol,
-            col_start,
-            col_len,
-            GpuMatrixSampleDist::Bit,
-            0.0,
-            u64::MAX,
-            seed,
+    };
+    match dist {
+        DistType::FinRingDist => sample(GpuMatrixSampleDist::Uniform, 0.0, u64::MAX),
+        DistType::GaussDist { sigma, max_coefficient_bound } => sample(
+            GpuMatrixSampleDist::Gauss,
+            sigma,
+            gpu_coefficient_cutoff(max_coefficient_bound.as_ref()),
         ),
-        DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution_columns(
-            params,
-            nrow,
-            total_ncol,
-            col_start,
-            col_len,
-            GpuMatrixSampleDist::Ternary,
-            0.0,
-            u64::MAX,
-            seed,
-        ),
+        DistType::BitDist => sample(GpuMatrixSampleDist::Bit, 0.0, u64::MAX),
+        DistType::TernaryDist => sample(GpuMatrixSampleDist::Ternary, 0.0, u64::MAX),
     }
 }
 
@@ -620,6 +652,19 @@ mod tests {
         let chunk =
             sampler.sample_hash_columns(&params, key, tag, 4, 9, 2, 3, DistType::FinRingDist);
         assert_eq!(chunk, full.slice_columns(2, 5));
+
+        let gadget_source = sampler.sample_hash_gadget_source_columns(
+            &params,
+            key,
+            tag,
+            4,
+            9,
+            2,
+            3,
+            DistType::FinRingDist,
+        );
+        assert!(!gadget_source.is_ntt());
+        assert_eq!(gadget_source.ensure_eval_domain(), chunk);
 
         let decomposed = sampler.sample_hash_decomposed_columns(
             &params,

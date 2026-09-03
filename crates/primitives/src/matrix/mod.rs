@@ -33,12 +33,19 @@ pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {
 ///
 /// Implementations may be backed by host staging bytes or persistent storage;
 /// callers must not assume that the complete expanded matrix is resident.
-pub trait PolyMatrixColumnSource<M>: Debug + Send + Sync
-where
-    M: PolyMatrix,
-{
+pub trait PolyMatrixColumnSource<M>: Debug + Send + Sync {
     fn row_size(&self) -> usize;
     fn col_size(&self) -> usize;
+
+    /// Global offset of local column zero in the logical matrix.
+    ///
+    /// Column-partitioned backends override this so deterministic samplers
+    /// derive the same per-column randomness regardless of tiling or device
+    /// placement.
+    fn global_column_start(&self) -> usize {
+        0
+    }
+
     fn load_columns(&self, start: usize, end: usize) -> M;
 }
 

@@ -13,18 +13,16 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType},
 };
 use mxx_primitives::{
-    matrix::{
-        PolyMatrix, PolyMatrixSmallRhs,
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
-    },
-    poly::dcrt::gpu::GpuDCRTPolyParams,
-    sampler::trapdoor::GpuDCRTTrapdoor,
+    matrix::{SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix},
+    poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
 };
 use mxx_runtime::{
     Backend,
     backend::{
         IndexRange, PreimageRequest, SampleRange,
-        poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+        poly_gpu::{
+            GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor, gpu_backend_on,
+        },
     },
 };
 use num_bigint::BigInt;
@@ -52,10 +50,10 @@ pub enum DiamondGpuMeasurementError {
 }
 
 enum ReadyOutput {
-    Matrix(GpuDCRTPolyMatrix),
-    SmallMatrix(GpuSmallMatrix),
-    SmallMatrices(Vec<GpuSmallMatrix>),
-    Trapdoor { public: GpuDCRTPolyMatrix, secret: GpuDCRTTrapdoor },
+    Matrix(GpuFleetMatrix),
+    SmallMatrix(GpuFleetSmallMatrix),
+    SmallMatrices(Vec<GpuFleetSmallMatrix>),
+    Trapdoor { public: GpuFleetMatrix, secret: GpuFleetTrapdoor },
     Host,
 }
 
@@ -83,10 +81,13 @@ impl ReadyOutput {
 /// `mxx-bench-estimator`.
 pub struct DiamondGpuMeasurementBackend {
     backend: GpuDcrtBackend,
+    parameters: GpuDCRTPolyParams,
+    device_ids: Vec<i32>,
     harness: MeasurementHarnessConfig,
-    matrix_cache: BTreeMap<(usize, ConcreteMatrixType), Arc<GpuDCRTPolyMatrix>>,
+    matrix_cache: BTreeMap<(usize, ConcreteMatrixType), Arc<GpuFleetMatrix>>,
+    small_matrix_cache: BTreeMap<(usize, ConcreteWireType), Arc<GpuFleetSmallMatrix>>,
     trapdoor_cache:
-        BTreeMap<(usize, ConcreteWireType), (Arc<GpuDCRTPolyMatrix>, Arc<GpuDCRTTrapdoor>)>,
+        BTreeMap<(usize, ConcreteWireType), (Arc<GpuFleetMatrix>, Arc<GpuFleetTrapdoor>)>,
     measurements: BTreeMap<String, NodeMeasurement>,
     crt_depth: usize,
 }
@@ -112,10 +113,13 @@ impl DiamondGpuMeasurementBackend {
         harness: MeasurementHarnessConfig,
     ) -> Self {
         Self {
+            parameters: parameters.clone(),
+            device_ids: device_ids.to_vec(),
             crt_depth: parameters.crt_depth(),
             backend: gpu_backend_on([parameters], device_ids.iter().copied()),
             harness,
             matrix_cache: BTreeMap::new(),
+            small_matrix_cache: BTreeMap::new(),
             trapdoor_cache: BTreeMap::new(),
             measurements: BTreeMap::new(),
         }
@@ -128,7 +132,7 @@ impl DiamondGpuMeasurementBackend {
     fn matrix(
         &mut self,
         ty: &ConcreteMatrixType,
-    ) -> Result<Arc<GpuDCRTPolyMatrix>, DiamondGpuMeasurementError> {
+    ) -> Result<Arc<GpuFleetMatrix>, DiamondGpuMeasurementError> {
         let key = (self.backend.active_placement(), ty.clone());
         if !self.matrix_cache.contains_key(&key) {
             let value = self
@@ -148,7 +152,7 @@ impl DiamondGpuMeasurementBackend {
         &mut self,
         ty: &ConcreteWireType,
         bindings: &ParamEnv,
-    ) -> Result<(Arc<GpuDCRTPolyMatrix>, Arc<GpuDCRTTrapdoor>), DiamondGpuMeasurementError> {
+    ) -> Result<(Arc<GpuFleetMatrix>, Arc<GpuFleetTrapdoor>), DiamondGpuMeasurementError> {
         let ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. } = ty else {
             return Err(DiamondGpuMeasurementError::TrapdoorArgument);
         };
@@ -170,6 +174,59 @@ impl DiamondGpuMeasurementBackend {
         Ok((Arc::clone(public), Arc::clone(secret)))
     }
 
+    fn small_matrix(
+        &mut self,
+        ty: &ConcreteWireType,
+    ) -> Result<Arc<GpuFleetSmallMatrix>, DiamondGpuMeasurementError> {
+        let (matrix, max_coefficient_bound) = match ty {
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                (matrix, max_coefficient_bound)
+            }
+            _ => return Err(DiamondGpuMeasurementError::MatrixArgument),
+        };
+        let key = (self.backend.active_placement(), ty.clone());
+        if !self.small_matrix_cache.contains_key(&key) {
+            let device_id =
+                *self.device_ids.get(self.backend.active_placement()).ok_or_else(|| {
+                    DiamondGpuMeasurementError::Expression("invalid GPU placement".to_owned())
+                })?;
+            let params = self.parameters.params_for_device(device_id);
+            let bound = max_coefficient_bound.to_biguint().ok_or_else(|| {
+                DiamondGpuMeasurementError::Expression(
+                    "compact matrix coefficient bound is not nonnegative".to_owned(),
+                )
+            })?;
+            let magnitude_bytes = usize::try_from(bound.bits().div_ceil(8))
+                .map_err(|_| {
+                    DiamondGpuMeasurementError::Expression(
+                        "compact matrix bound is too wide".to_owned(),
+                    )
+                })?
+                .max(1);
+            let payload_len = matrix
+                .rows
+                .checked_mul(matrix.columns)
+                .and_then(|value| value.checked_mul(matrix.ring_dimension))
+                .and_then(|value| value.checked_mul(1 + magnitude_bytes))
+                .ok_or_else(|| {
+                    DiamondGpuMeasurementError::Expression(
+                        "compact matrix payload size overflow".to_owned(),
+                    )
+                })?;
+            let value = GpuSmallMatrix::from_canonical_coefficients(
+                &params,
+                matrix.rows,
+                matrix.columns,
+                bound,
+                &vec![0u8; payload_len],
+            )
+            .map_err(Self::backend_error)?;
+            self.small_matrix_cache
+                .insert(key.clone(), Arc::new(GpuFleetSmallMatrix::from_matrix(value)));
+        }
+        Ok(Arc::clone(self.small_matrix_cache.get(&key).expect("inserted compact matrix")))
+    }
     fn matrix_argument<'a>(
         node: &'a MeasurementNode<'_>,
         index: usize,
@@ -200,9 +257,10 @@ impl DiamondGpuMeasurementBackend {
         &mut self,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
-    ) -> Result<GpuSmallMatrix, DiamondGpuMeasurementError> {
-        let rhs = node.argument_types.get(1).ok_or(DiamondGpuMeasurementError::MatrixArgument)?;
-        let (rhs, declared_bound) = match rhs {
+    ) -> Result<GpuFleetSmallMatrix, DiamondGpuMeasurementError> {
+        let rhs_wire =
+            node.argument_types.get(1).ok_or(DiamondGpuMeasurementError::MatrixArgument)?;
+        let (rhs, declared_bound) = match rhs_wire {
             ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
             ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
                 (matrix, max_coefficient_bound)
@@ -292,24 +350,9 @@ impl DiamondGpuMeasurementBackend {
                 .map_err(Self::backend_error);
         }
 
-        // Isolated preimage measurements still receive a compact representative with the exact
-        // declared bound. Build only a zero-valued pre-decomposition source, then compact it with
-        // that bound; the source is discarded before multiplication and is never an expanded RHS.
-        let source_type = rhs.clone();
-        let source = self
-            .backend
-            .sample_uniform(
-                &source_type,
-                &SampleRange { minimum: BigInt::from(0), maximum: BigInt::from(0) },
-            )
-            .map_err(Self::backend_error)?;
-        let bound = declared_bound.to_biguint().ok_or_else(|| {
-            DiamondGpuMeasurementError::Expression(
-                "bounded RHS coefficient bound must be nonnegative".to_owned(),
-            )
-        })?;
-        <GpuDCRTPolyMatrix as PolyMatrixSmallRhs>::compact_from_matrix(source, bound)
-            .map_err(Self::backend_error)
+        // Non-hash bounded inputs use the same exact-bound compact fixture cache as other
+        // estimator operands. This keeps the representative in compact form across the fleet.
+        Ok(self.small_matrix(rhs_wire)?.as_ref().clone())
     }
 
     fn evaluate_matrix_type(
@@ -805,7 +848,7 @@ impl DiamondGpuMeasurementBackend {
                     let target_ty = ConcreteMatrixType {
                         modulus: output.modulus.clone(),
                         ring_dimension: output.ring_dimension,
-                        rows: public.row_size(),
+                        rows: public.size().0,
                         columns: output.columns,
                     };
                     let target = this.matrix(&target_ty)?;

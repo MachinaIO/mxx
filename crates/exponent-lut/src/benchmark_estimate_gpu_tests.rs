@@ -13,18 +13,16 @@ use mxx_bench_estimator::{
     harness::MeasurementHarnessConfig,
 };
 use mxx_ir_core::ParamEnv;
-use mxx_primitives::{
-    env::mul_small_rhs_tile_columns,
-    poly::{
-        PolyParams,
-        dcrt::{
-            gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
-            params::DCRTPolyParams,
-        },
+use mxx_primitives::poly::{
+    PolyParams,
+    dcrt::{
+        gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+        params::DCRTPolyParams,
     },
 };
+use mxx_runtime::backend::poly::gpu::gpu_backend_on;
 use serde::Deserialize;
-use std::{env, fs, num::NonZeroUsize, path::PathBuf, time::Instant};
+use std::{env, fs, path::PathBuf, time::Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -369,32 +367,27 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     let warm_up_iterations = optional_usize("MXX_EXPONENT_LUT_BENCH_WARMUPS", 1);
     let measured_iterations = optional_usize("MXX_EXPONENT_LUT_BENCH_ITERATIONS", 2);
     assert!(measured_iterations > 0, "benchmark iterations must be positive");
-    let parallel_instances = NonZeroUsize::new(optional_usize(
-        "MXX_EXPONENT_LUT_BENCH_PARALLEL_INSTANCES",
-        device_ids.len(),
-    ))
-    .expect("parallel instance count must be positive");
-    let column_tile_width = mul_small_rhs_tile_columns()
-        .expect("MXX_MUL_SMALL_RHS_TILE_COLUMNS must be a positive integer")
-        .unwrap_or(1);
-    let estimate_config =
-        EstimateConfig { device_pool_size: parallel_instances.get(), per_instance_occupancy: 1 };
+    // Every measured primitive owns the complete GPU fleet. Its calibrated column width and
+    // speedup are already included in the measured latency, so the graph estimator must not
+    // apply device parallelism a second time.
+    let estimate_config = EstimateConfig { device_pool_size: 1, per_instance_occupancy: 1 };
+    let backends = device_ids
+        .iter()
+        .copied()
+        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
+        .collect();
     let mut backend = GpuNodeMeasurementBackend::new(
-        &gpu_parameters,
-        device_ids.clone(),
+        backends,
         MeasurementHarnessConfig {
             warm_up_iterations,
             measured_iterations,
             ..MeasurementHarnessConfig::default()
         },
         crt_depth,
-        column_tile_width,
     );
     info!(
         gpu_count = device_ids.len(),
         ?device_ids,
-        parallel_instances = parallel_instances.get(),
-        column_tile_width,
         warm_up_iterations,
         measured_iterations,
         "Exponent-LUT benchmark estimator configuration"

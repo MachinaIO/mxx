@@ -2,33 +2,26 @@
 
 #include "matrix/Matrix.cuh"
 
-int launch_fill_gadget_multi_limb_kernel(
-    uint64_t *dst_base,
-    size_t poly_count,
-    size_t n,
-    size_t dst_stride,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    size_t rows,
-    size_t cols,
-    size_t log_base_q,
-    uint32_t digits_per_tower,
-    uint32_t base_bits,
-    cudaStream_t stream,
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id);
-
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
-    int gpu_matrix_fill_gadget(
+    int gpu_matrix_fill_identity_columns(
         GpuMatrix *out,
-        uint32_t base_bits);
-    int gpu_matrix_fill_small_gadget(
+        size_t full_size,
+        size_t global_column_start);
+    int gpu_matrix_fill_unit_row_columns(
         GpuMatrix *out,
-        uint32_t base_bits);
+        size_t total_columns,
+        size_t unit_index,
+        size_t global_column_start);
+    int gpu_matrix_fill_gadget_columns(
+        GpuMatrix *out,
+        uint32_t base_bits,
+        int small,
+        size_t full_size,
+        size_t global_column_start);
     int gpu_matrix_fill_small_decomposed_identity_chunk(
         GpuMatrix *out,
         const GpuMatrix *scalar_by_digit,

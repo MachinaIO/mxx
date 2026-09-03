@@ -229,17 +229,15 @@ impl Fixture {
             BTreeMap::from([
                 (
                     "exponent-lut-gpu-mask-secret".to_owned(),
-                    RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
-                        &self.gpu_parameters,
-                        &mask,
-                    )),
+                    RuntimeValue::matrix(
+                        GpuDCRTPolyMatrix::from_cpu_matrix(&self.gpu_parameters, &mask).into(),
+                    ),
                 ),
                 (
                     "exponent-lut-gpu-payload-secret".to_owned(),
-                    RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
-                        &self.gpu_parameters,
-                        &payload,
-                    )),
+                    RuntimeValue::matrix(
+                        GpuDCRTPolyMatrix::from_cpu_matrix(&self.gpu_parameters, &payload).into(),
+                    ),
                 ),
                 ("exponent-lut-gpu-hash-key".to_owned(), RuntimeValue::Bytes(vec![0x91; 32])),
             ]),

@@ -840,11 +840,17 @@ mod tests {
         );
         assert_eq!(
             matrix_output(&result, "vector"),
-            &vector.multiply_small_rhs(target.clone().gadget_decompose(false).unwrap()).unwrap()
+            &vector
+                .clone()
+                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
+                .unwrap()
         );
         assert_eq!(
             matrix_output(&result, "public"),
-            &public.multiply_small_rhs(target.clone().gadget_decompose(false).unwrap()).unwrap()
+            &public
+                .clone()
+                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
+                .unwrap()
         );
         assert!(output.plaintexts.is_none());
     }

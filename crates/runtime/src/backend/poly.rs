@@ -38,6 +38,12 @@ pub struct RingKey {
 pub enum PolyBackendError {
     #[error(transparent)]
     SmallMatrix(#[from] SmallMatrixError),
+    #[error("invalid small-matrix artifact: {0}")]
+    InvalidSmallMatrixArtifact(&'static str),
+    #[error("GPU fleet calibration failed: {0}")]
+    GpuCalibration(String),
+    #[error("the requested GPU placement is unavailable through a direct device or peer copy")]
+    UnsupportedPlacement,
     #[error("no concrete polynomial parameters registered for {0:?}")]
     MissingParameters(RingKey),
     #[error("uniform range [{minimum}, {maximum}] is not supported by existing samplers")]
@@ -289,6 +295,22 @@ where
     /// bounded-wave batch path from scalar fallback execution.
     pub fn preimage_batch_calls(&self) -> usize {
         self.preimage_batch_calls
+    }
+
+    /// Copies a complete matrix to the active GPU placement without host
+    /// staging. Fleet-internal resharding must fail if direct or peer transfer
+    /// is unavailable; silently staging through the CPU would invalidate the
+    /// calibrated device-memory and transfer model.
+    #[cfg(feature = "gpu")]
+    pub(super) fn matrix_to_active_placement_peer_only(
+        &self,
+        value: &M,
+    ) -> Result<M, PolyBackendError> {
+        let target = self.parameters_for_matrix(value)?;
+        if value.params() == target {
+            return Ok(value.clone());
+        }
+        value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
     }
 
     #[cfg(test)]
@@ -709,7 +731,7 @@ where
 
     fn multiply_small_rhs(&mut self, left: &M, right: &M::SmallMatrix) -> Result<M, Self::Error> {
         self.parameters_for_matrix(left)?;
-        Ok(left.multiply_small_rhs(right.clone())?)
+        Ok(left.multiply_small_rhs(right)?)
     }
 
     fn multiply_small_rhs_batch(

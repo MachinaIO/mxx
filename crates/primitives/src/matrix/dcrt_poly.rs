@@ -122,7 +122,7 @@ impl PolyMatrixSmallRhs for DCRTPolyMatrix {
         )
     }
 
-    fn multiply_small_rhs(&self, rhs: Self::SmallMatrix) -> Result<Self, SmallMatrixError> {
+    fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError> {
         if self.params != *rhs.params() {
             return Err(SmallMatrixError::ParameterMismatch);
         }

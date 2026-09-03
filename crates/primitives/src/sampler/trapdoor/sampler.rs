@@ -27,7 +27,6 @@ static GAUSS_SAMP_GQ_ARB_BASE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 fn preimage_c(base: u32, sigma: f64) -> f64 {
     (base as f64 + 1.0) * sigma
 }
-
 fn preimage_smoothing_parameter(base: u32, sigma: f64, d: usize, n: usize, k: usize) -> f64 {
     SPECTRAL_CONSTANT *
         (base as f64 + 1.0) *

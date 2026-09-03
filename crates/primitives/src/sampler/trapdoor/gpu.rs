@@ -234,6 +234,7 @@ impl GpuDCRTPolyTrapdoorSampler {
         let d = public_matrix.row_size();
         let rows = public_matrix.col_size();
         let columns = target.col_size();
+        let target_global_column_start = target.global_column_start();
         if rows == 0 || columns == 0 || target.row_size() != d {
             return Err(SmallMatrixError::ShapeMismatch);
         }
@@ -250,24 +251,13 @@ impl GpuDCRTPolyTrapdoorSampler {
             return Err(SmallMatrixError::DeviceMismatch);
         }
 
-        let budget = crate::env::gpu_small_matrix_residency_bytes()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let headroom = crate::env::gpu_small_matrix_allocator_headroom_bytes()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let admission_budget =
-            budget.checked_sub(headroom).ok_or(SmallMatrixError::ResourceExhausted {
-                requested_bytes: headroom,
-                budget_bytes: budget,
-            })?;
+        let budget = params.vram_budget_bytes();
         let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
             .map_err(|_| SmallMatrixError::WidthOverflow)?
             .max(1);
         let attempts = crate::env::gpu_preimage_max_tile_attempts()
             .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let mut tile_columns = crate::env::mul_small_rhs_tile_columns()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?
-            .unwrap_or(1)
-            .min(columns);
+        let mut tile_columns = columns;
         let matrix_bytes = |matrix: &GpuDCRTPolyMatrix| {
             params
                 .matrix_allocation_bytes(
@@ -292,16 +282,41 @@ impl GpuDCRTPolyTrapdoorSampler {
         .try_fold(0usize, |sum, bytes| {
             sum.checked_add(bytes?).ok_or(SmallMatrixError::DimensionOverflow)
         })?;
-        let cache_first_call = trapdoor
-            .p1_covariance_cache
-            .lock()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?
-            .is_none();
-        let (cache_persistent_bytes, cache_workspace_bytes) =
-            GpuDCRTPolyMatrix::p1_covariance_cache_allocation_bytes(params, d)?;
-        let persistent_bytes = persistent_bytes
-            .checked_add(cache_persistent_bytes)
+        let limbs = params.crt_depth();
+        let coefficient_words = usize::try_from(params.modulus().bits().div_ceil(64))
+            .map_err(|_| SmallMatrixError::DimensionOverflow)?
+            .max(1);
+        let hard_cutoff_plan_bytes = limbs
+            .checked_mul(limbs)
+            .and_then(|entries| entries.checked_mul(std::mem::size_of::<u64>()))
+            .and_then(|bytes| {
+                coefficient_words
+                    .checked_mul(3 * std::mem::size_of::<u64>())
+                    .and_then(|words| bytes.checked_add(words))
+            })
+            .and_then(|bytes| {
+                limbs
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .and_then(|subset| bytes.checked_add(subset))
+            })
             .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let sampler_event_bytes = 4usize
+            .checked_add(
+                4usize
+                    .checked_mul(params.crt_depth())
+                    .ok_or(SmallMatrixError::DimensionOverflow)?,
+            )
+            .and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let mut destination = GpuSmallMatrix::new_empty_checked(
+            params,
+            rows,
+            columns,
+            max_coefficient_bound,
+            magnitude_bytes,
+            budget,
+        )?;
+        let mut selected_report = None;
         while tile_columns > 0 {
             let padded_columns = padded_tile_columns(tile_columns, d)?;
             let candidate = matrix_bytes_for(params, rows, tile_columns)?;
@@ -329,46 +344,31 @@ impl GpuDCRTPolyTrapdoorSampler {
                 0
             };
             let candidate_workspace = candidate
-                .checked_add(residual)
-                .and_then(|value| value.checked_add(z_hat))
-                .and_then(|value| value.checked_add(target_tile))
-                .and_then(|value| value.checked_add(sampled_integer_bytes))
+                .checked_add(sampled_integer_bytes)
                 .and_then(|value| value.checked_add(sampled_workspace_bytes))
                 .ok_or(SmallMatrixError::DimensionOverflow)?;
-            // The report's candidate field is the aggregate of the mutually
-            // exclusive correction workspaces. The perturbation field above
-            // is the one phase where p1, p2, and tp2 are simultaneously live.
-            // Keeping these aggregates separate avoids counting any matrix in
-            // two report terms while still admitting the true peak.
-            let report = GpuSmallMatrix::sampler_allocation_report_for_shape(
-                params,
-                rows,
-                columns,
-                magnitude_bytes,
-                persistent_bytes,
+            let check_scratch =
+                residual.checked_add(z_hat).ok_or(SmallMatrixError::DimensionOverflow)?;
+            let packed_staging = rows
+                .checked_mul(tile_columns)
+                .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
+                .and_then(|value| value.checked_mul(1 + magnitude_bytes))
+                .ok_or(SmallMatrixError::DimensionOverflow)?;
+            let report = destination.sampler_allocation_report(
+                persistent_bytes
+                    .checked_add(target_tile)
+                    .ok_or(SmallMatrixError::DimensionOverflow)?,
                 candidate_workspace,
                 perturbation,
-                pack_check_scratch_bytes(params)?,
-                0,
-                (4usize
-                    .checked_add(
-                        4usize
-                            .checked_mul(params.crt_depth())
-                            .ok_or(SmallMatrixError::DimensionOverflow)?,
-                    )
-                    .ok_or(SmallMatrixError::DimensionOverflow)?)
-                .checked_mul(std::mem::size_of::<usize>())
-                .ok_or(SmallMatrixError::DimensionOverflow)?,
+                check_scratch,
+                hard_cutoff_plan_bytes,
+                packed_staging,
+                sampler_event_bytes,
                 std::mem::size_of::<i32>(),
                 std::mem::size_of::<i32>(),
-                headroom,
             )?;
-            let first_call_peak = if cache_first_call { cache_workspace_bytes } else { 0 };
-            let sampler_peak = report
-                .sampler_peak_bytes
-                .checked_add(first_call_peak)
-                .ok_or(SmallMatrixError::DimensionOverflow)?;
-            if sampler_peak <= budget {
+            if report.fits_budget(budget) {
+                selected_report = Some(report);
                 break;
             }
             tile_columns -= 1;
@@ -379,14 +379,24 @@ impl GpuDCRTPolyTrapdoorSampler {
                 budget_bytes: budget,
             });
         }
-        let mut destination = GpuSmallMatrix::new_empty_checked(
-            params,
-            rows,
-            columns,
-            max_coefficient_bound,
-            magnitude_bytes,
-            admission_budget,
-        )?;
+        let report = selected_report.ok_or(SmallMatrixError::InvalidConfig)?;
+        destination.prepare_preimage_hard_cutoff();
+        tracing::debug!(
+            persistent_bytes = report.persistent_bytes,
+            compact_destination_bytes = report.compact_destination_bytes,
+            candidate_bytes = report.candidate_bytes,
+            perturbation_bytes = report.perturbation_bytes,
+            check_scratch_bytes = report.check_scratch_bytes,
+            hard_cutoff_plan_bytes = report.hard_cutoff_plan_bytes,
+            packed_staging_bytes = report.packed_staging_bytes,
+            sampler_event_bytes = report.sampler_event_bytes,
+            device_acceptance_control_bytes = report.device_acceptance_control_bytes,
+            pinned_host_acceptance_control_bytes = report.pinned_host_acceptance_control_bytes,
+            sampler_peak_bytes = report.sampler_peak_bytes,
+            budget_bytes = budget,
+            tile_columns,
+            "gpu preimage compact sampler residency"
+        );
         for column_start in (0..columns).step_by(tile_columns) {
             let column_end = (column_start + tile_columns).min(columns);
             let column_count = column_end - column_start;
@@ -402,7 +412,12 @@ impl GpuDCRTPolyTrapdoorSampler {
             // is essential: a rejected column must not resample neighboring
             // columns merely because they share a storage tile.
             for local_column in 0..column_count {
-                let global_column = column_start + local_column;
+                let local_column_index = column_start
+                    .checked_add(local_column)
+                    .ok_or(SmallMatrixError::DimensionOverflow)?;
+                let global_column = target_global_column_start
+                    .checked_add(local_column_index)
+                    .ok_or(SmallMatrixError::DimensionOverflow)?;
                 let single_target = tile_target.slice_columns(local_column, local_column + 1);
                 let mut accepted = false;
                 for attempt in 0..attempts {
@@ -416,17 +431,24 @@ impl GpuDCRTPolyTrapdoorSampler {
                         column_seed.to_bytes(),
                     );
                     let candidate = candidate.into_coeff_domain();
-                    accepted =
-                        destination.try_pack_checked_tile(&candidate, 0, global_column, rows, 1)?;
+                    accepted = destination.try_pack_preimage_hard_cutoff_tile(
+                        &candidate,
+                        0,
+                        local_column_index,
+                        rows,
+                        1,
+                    )?;
                     drop(candidate);
                     if accepted {
                         break;
                     }
                 }
                 if !accepted {
+                    let column_end =
+                        global_column.checked_add(1).ok_or(SmallMatrixError::DimensionOverflow)?;
                     return Err(SmallMatrixError::AttemptExhausted {
                         column_start: global_column,
-                        column_end: global_column + 1,
+                        column_end,
                         attempts,
                     });
                 }
@@ -434,40 +456,6 @@ impl GpuDCRTPolyTrapdoorSampler {
         }
         Ok(destination)
     }
-}
-
-fn pack_check_scratch_bytes(params: &GpuDCRTPolyParams) -> Result<usize, SmallMatrixError> {
-    let limbs = params.crt_depth();
-    let total_bits = params.moduli().iter().try_fold(0usize, |sum, modulus| {
-        sum.checked_add(64usize.saturating_sub(modulus.leading_zeros() as usize))
-            .ok_or(SmallMatrixError::DimensionOverflow)
-    })?;
-    let words = total_bits
-        .checked_add(63)
-        .ok_or(SmallMatrixError::DimensionOverflow)?
-        .checked_div(64)
-        .ok_or(SmallMatrixError::DimensionOverflow)?
-        .max(1);
-    let limb_metadata = limbs
-        .checked_mul(
-            std::mem::size_of::<*const u8>() +
-                std::mem::size_of::<usize>() +
-                std::mem::size_of::<u8>() +
-                std::mem::size_of::<u64>(),
-        )
-        .ok_or(SmallMatrixError::DimensionOverflow)?;
-    let garner = limbs
-        .checked_mul(limbs)
-        .and_then(|value| value.checked_mul(std::mem::size_of::<u64>()))
-        .ok_or(SmallMatrixError::DimensionOverflow)?;
-    let word_tables = 3usize
-        .checked_mul(words)
-        .and_then(|value| value.checked_mul(std::mem::size_of::<u64>()))
-        .ok_or(SmallMatrixError::DimensionOverflow)?;
-    limb_metadata
-        .checked_add(garner)
-        .and_then(|value| value.checked_add(word_tables))
-        .ok_or(SmallMatrixError::DimensionOverflow)
 }
 
 fn matrix_bytes_for(

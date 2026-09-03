@@ -49,7 +49,6 @@ where
         attempt = attempt.wrapping_add(1);
     }
 }
-
 pub struct DCRTPolyHashSampler<H: OutputSizeUser + digest::Digest> {
     _h: PhantomData<H>,
 }

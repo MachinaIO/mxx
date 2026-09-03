@@ -31,6 +31,15 @@ int gpu_small_matrix_create(
 void gpu_small_matrix_destroy(GpuSmallMatrix *mat);
 int gpu_small_matrix_wait(const GpuSmallMatrix *mat);
 int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src);
+int gpu_small_matrix_copy_columns(
+    GpuSmallMatrix *out,
+    const GpuSmallMatrix *src,
+    size_t source_column_start);
+int gpu_small_matrix_view_columns(
+    const GpuSmallMatrix *src,
+    size_t source_column_start,
+    size_t columns,
+    GpuSmallMatrix **out);
 int gpu_small_matrix_load_coefficients(
     GpuSmallMatrix *mat,
     const uint8_t *payload,
@@ -46,7 +55,8 @@ int gpu_small_matrix_decompose_base(
     const uint64_t *max_coefficient_bound,
     size_t bound_word_count,
     GpuSmallMatrix *out);
-int gpu_small_matrix_pack_checked_tile(
+int gpu_small_matrix_prepare_preimage_hard_cutoff(GpuSmallMatrix *mat);
+int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
     GpuSmallMatrix *dst,
     const GpuMatrix *src,
     size_t dst_row,
@@ -60,9 +70,6 @@ int gpu_matrix_mul_small_rhs(
     GpuMatrix *out,
     const GpuMatrix *lhs_eval,
     const GpuSmallMatrix *rhs_small,
-    size_t ct,
-    size_t kt,
-    size_t ell,
     size_t residency_budget_bytes,
     GpuSmallMatrixAllocationReport *allocation_report);
 

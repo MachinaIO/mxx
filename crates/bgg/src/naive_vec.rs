@@ -84,7 +84,7 @@ impl NaiveBggVecCompiler {
             (input.vectors.clone(), input.pubkeys.clone(), scalars.clone()),
             move |_, (vector, matrix, scalar)| {
                 let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
-                Ok(vector.mul_decomposed(vector_compiler.large_scalar_decomposition(&key, &scalar)))
+                Ok(vector.mul_small_rhs(vector_compiler.large_scalar_decomposition(&key, &scalar)))
             },
         )?;
         let key_compiler = self.public_key.clone();
@@ -191,7 +191,7 @@ impl NaiveBggVecCompiler {
         let digits = self.public_key.digit_count.clone();
         let first =
             lhs.vectors.clone().parallel_zip(rhs.pubkeys.clone(), move |_, left, right| {
-                left.mul_decomposed(right.decompose(base.clone(), digits.clone()))
+                left.mul_small_rhs(right.decompose(base.clone(), digits.clone()))
             })?;
         let second = rhs
             .vectors
@@ -242,7 +242,7 @@ impl NaiveBggVecCompiler {
         // consumes the current carrier; it does not call T a canonical G
         // encoding.
         let vectors = input.vectors.clone().parallel_map(move |_, value| {
-            value.mul_decomposed(target.clone().decompose(base.clone(), digits.clone()))
+            value.mul_small_rhs(target.clone().decompose(base.clone(), digits.clone()))
         })?;
         let key_compiler = self.public_key.clone();
         let target_for_keys = target.clone();
@@ -362,7 +362,7 @@ impl NaiveBggVecCompiler {
             let reveal = input.pubkey_reveal_plaintext;
             input.vectors.clone().parallel_zip(input.pubkeys.clone(), move |_, value, matrix| {
                 let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
-                value.mul_decomposed(compiler.large_scalar_decomposition(&key, scalar))
+                value.mul_small_rhs(compiler.large_scalar_decomposition(&key, scalar))
             })?
         } else {
             let scalar = scalar.clone();
@@ -615,7 +615,7 @@ mod tests {
     use mxx_dsl::{DslContext, Ring};
     use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -838,8 +838,14 @@ mod tests {
                 ("target".to_owned(), RuntimeValue::matrix(target.clone())),
             ]),
         );
-        assert_eq!(matrix_output(&result, "vector"), &vector.mul_decompose(&target));
-        assert_eq!(matrix_output(&result, "public"), &public.mul_decompose(&target));
+        assert_eq!(
+            matrix_output(&result, "vector"),
+            &vector.multiply_small_rhs(target.clone().gadget_decompose(false).unwrap()).unwrap()
+        );
+        assert_eq!(
+            matrix_output(&result, "public"),
+            &public.multiply_small_rhs(target.clone().gadget_decompose(false).unwrap()).unwrap()
+        );
         assert!(output.plaintexts.is_none());
     }
     #[test]

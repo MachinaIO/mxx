@@ -19,6 +19,7 @@ pub struct MaskedHighBitDecoderCompiler {
     pub digit_count: usize,
     pub gadget_base: IntExpr,
     pub trapdoor_sigma: RealExpr,
+    pub preimage_max_coefficient_bound: IntExpr,
     pub coefficient_count: usize,
 }
 
@@ -92,7 +93,7 @@ impl MaskedHighBitDecoderCompiler {
                 .identity(secret_size)
                 .slice(None, Some(IndexRange { start: 0.into(), end: 1.into() }));
             let top = public_key
-                .mul_decomposed(selector.decompose(gadget_base.clone(), digit_count.clone()));
+                .mul_small_rhs(selector.decompose(gadget_base.clone(), digit_count.clone()));
             let target = Mat::concat(ConcatAxis::Rows, vec![top, ring.zero((secret_size, 1))]);
             decoder_trapdoor.sample_preimage(target, (decoder_columns, 1))
         })?;
@@ -118,6 +119,7 @@ impl MaskedHighBitDecoderCompiler {
                 MASKED_DECODER_PREIMAGES,
                 vec![IntExpr::constant(artifacts.slot_count)],
                 (self.decoder_columns(), 1),
+                self.preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
             ))
     }
@@ -149,9 +151,8 @@ impl MaskedHighBitDecoderCompiler {
             let selector = ring
                 .identity(secret_size)
                 .slice(None, Some(IndexRange { start: 0.into(), end: 1.into() }));
-            decoder_state.clone().apply_preimage(preimage) -
-                vector
-                    .mul_decomposed(selector.decompose(gadget_base.clone(), digit_count.clone())) +
+            decoder_state.clone().mul_small_rhs(preimage) -
+                vector.mul_small_rhs(selector.decompose(gadget_base.clone(), digit_count.clone())) +
                 bottom
         })?;
         if output_bool {
@@ -212,6 +213,7 @@ mod tests {
             digit_count,
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
             trapdoor_sigma: RealExpr::from_integer(5),
+            preimage_max_coefficient_bound: IntExpr::constant(1_000_000),
             coefficient_count: parameters.ring_dimension() as usize,
         };
         let slot_count = 3usize;

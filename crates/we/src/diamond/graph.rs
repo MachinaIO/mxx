@@ -413,8 +413,7 @@ impl DiamondWeProtocolFamily {
         // R is consumed through its explicit decomposition.  The residual
         // public target is T_dec = K_first + (A_one-A_circuit)R, retaining the
         // source matrix product before the decoder preimage is sampled.
-        let projected_difference = difference.matrix *
-            r_decomposition.clone().into_preimage_relation().materialize_exact();
+        let projected_difference = difference.matrix.mul_small_rhs(r_decomposition.clone());
         let decoder_public_key = k_public_key_first + projected_difference;
         let decoder_target = top_row * decoder_public_key;
         let decoder_trapdoor = projection_trapdoor;
@@ -426,10 +425,7 @@ impl DiamondWeProtocolFamily {
             .public_preimage_output(DiamondArtifactNames::ONE_PREIMAGE, one_preimage)?
             .public_preimage_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
             .public_preimage_output(DiamondArtifactNames::DECODER_PREIMAGE, decoder_preimage)?
-            .public_preimage_output(
-                DiamondArtifactNames::R_DECOMPOSED,
-                r_decomposition.into_preimage_relation(),
-            )?
+            .public_preimage_output(DiamondArtifactNames::R_DECOMPOSED, r_decomposition)?
             .public_family_output(DiamondArtifactNames::PUBLIC_KEYS, public_keys.matrices)?
             .public_preimage_family_output(
                 DiamondArtifactNames::TRANSITIONS,
@@ -484,6 +480,7 @@ impl DiamondWeProtocolFamily {
                 graph_params.input.digit_base.clone(),
             ],
             (state_columns.clone(), state_columns.clone()),
+            graph_params.input.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let input_evaluation = DiamondInputInjector::parameterized(graph_params.input.clone())
@@ -504,26 +501,29 @@ impl DiamondWeProtocolFamily {
             encryption.clone(),
             DiamondArtifactNames::ONE_PREIMAGE,
             (state_columns.clone(), public_columns.clone()),
+            graph_params.input.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let k_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::K_PREIMAGE,
             (state_columns.clone(), 1),
+            graph_params.input.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let decoder_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::DECODER_PREIMAGE,
             (state_columns.clone(), 1),
+            graph_params.input.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         // Applying each preimage is the online projection step: state * K
         // consumes the corresponding encryption-time target relation.
         let initial_projection_state = states.get_static(0);
-        let one_vector = initial_projection_state.clone().apply_preimage(one_preimage);
-        let k_vector = initial_projection_state.clone().apply_preimage(k_preimage);
-        let decoder = initial_projection_state.apply_preimage(decoder_preimage);
+        let one_vector = initial_projection_state.clone().mul_small_rhs(one_preimage);
+        let k_vector = initial_projection_state.clone().mul_small_rhs(k_preimage);
+        let decoder = initial_projection_state.mul_small_rhs(decoder_preimage);
         let one_public_key_matrix = public_keys.matrices.get_static(0);
         let one_plaintext_matrix = ring.identity(1);
         let one_encoding = BggEncodingWire {
@@ -537,6 +537,7 @@ impl DiamondWeProtocolFamily {
             DiamondArtifactNames::WITNESS_PREIMAGES,
             vec![witness_size.clone()],
             (state_columns.clone(), public_columns.clone()),
+            graph_params.input.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         // This is a static coordinate map, not a runtime selector. Reusing the
@@ -549,11 +550,11 @@ impl DiamondWeProtocolFamily {
         )]);
         let witness_states =
             states.reindex(vec![witness_size.clone()], witness_source_map.clone())?;
-        // Witness states are projected by explicit ApplyPreimage operations;
+        // Witness states are projected by explicit bounded small-RHS operations;
         // the preimage artifact is consumed on the right of each state row.
         let witness_vectors = parallel_zip_bundle_result(
             (witness_states, witness_preimages),
-            |_, (state, preimage)| Ok::<_, DslError>(state.apply_preimage(preimage)),
+            |_, (state, preimage)| Ok::<_, DslError>(state.mul_small_rhs(preimage)),
         )?;
         let witness_public_keys =
             public_keys.matrices.clone().reindex(vec![witness_size.clone()], witness_source_map)?;
@@ -673,13 +674,18 @@ impl DiamondWeProtocolFamily {
             encryption,
             DiamondArtifactNames::R_DECOMPOSED,
             (public_columns, 1),
+            IntExpr::RoundDiv(
+                Box::new(graph_params.input.gadget_base.clone()),
+                Box::new(IntExpr::constant(2)),
+            )
+            .canonicalize(),
             ArtifactConfidentiality::Public,
         );
         // The residual decoder target is R_dec = (C_one-C_out) * R.  Apply the
         // stored decomposition to consume R_dec, then subtract the K and
         // residual projections from the decoder state.
         let one_minus_circuit = one_encoding.vector - circuit_vector;
-        let projected_difference = one_minus_circuit.apply_preimage(r_decomposed);
+        let projected_difference = one_minus_circuit.mul_small_rhs(r_decomposed);
         let k_plus_projection = k_vector + projected_difference;
         let noisy_plaintext = decoder - k_plus_projection;
         let decoded = decode_boolean_interval(noisy_plaintext.clone(), graph_params.input.modulus);
@@ -857,7 +863,7 @@ mod tests {
                 .node(output.node)
                 .expect("projection artifact output node")
                 .output_types()[output.port.0 as usize];
-            assert!(matches!(output_type, WireType::Preimage(_)), "{name} lost its relation");
+            assert!(matches!(output_type, WireType::Preimage { .. }), "{name} lost its relation");
         }
 
         let witness_output =
@@ -871,7 +877,7 @@ mod tests {
         assert!(matches!(
             witness_type,
             WireType::Family { element, .. }
-                if matches!(element.as_ref(), WireType::Preimage(_))
+                if matches!(element.as_ref(), WireType::Preimage { .. })
         ));
         assert!(
             encryption
@@ -879,8 +885,8 @@ mod tests {
                 .root_scope()
                 .nodes()
                 .iter()
-                .any(|node| matches!(node.kind(), NodeKind::MaterializePreimageExact)),
-            "the exact public-key projection must use the guarded materialization path"
+                .any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)),
+            "the exact public-key projection must use the bounded small-RHS path"
         );
 
         let production = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [9; 32] };
@@ -895,7 +901,7 @@ mod tests {
                 .root_scope()
                 .nodes()
                 .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::ApplyPreimage))
+                .filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs))
                 .count() >=
                 4
         );

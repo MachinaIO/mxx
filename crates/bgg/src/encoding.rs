@@ -154,10 +154,10 @@ impl BggEncodingCompiler {
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         // For C_L = s_L A_L - x_L s_L G + e_L and the decomposition
         // G K_R = A_R, the two terms C_L K_R + x_L C_R cancel the
-        // cross term and leave an encoding of x_L x_R.  `mul_decomposed`
+        // cross term and leave an encoding of x_L x_R.  `mul_small_rhs`
         // keeps K_R as the rightmost carrier consumed by C_L.
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone().mul_decomposed(decomposed_rhs) +
+            vector: lhs.vector.clone().mul_small_rhs(decomposed_rhs) +
                 plaintext * rhs.vector.clone(),
             pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
@@ -181,7 +181,7 @@ impl BggEncodingCompiler {
         // C_x G^-1(tG) is the carrier-preserving form of t C_x, while the
         // metadata records the ordinary plaintext product t x.
         BggEncodingWire {
-            vector: input.vector.clone().mul_decomposed(decomposed.clone()),
+            vector: input.vector.clone().mul_small_rhs(decomposed.clone()),
             pubkey: self.public_key.large_scalar_mul_with_decomposition(&input.pubkey, decomposed),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
@@ -195,7 +195,7 @@ impl BggEncodingCompiler {
         // decomposition is used only to consume the input carrier; it does not
         // assert that the projected target itself is a canonical G encoding.
         BggEncodingWire {
-            vector: input.vector.clone().mul_decomposed(decomposed),
+            vector: input.vector.clone().mul_small_rhs(decomposed),
             pubkey: self.public_key.matrix_mul(&input.pubkey, target),
             plaintext: None,
         }
@@ -468,7 +468,7 @@ mod tests {
         node::{ConcatAxis, NodeKind},
     };
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -607,14 +607,9 @@ mod tests {
             2
         );
         assert_eq!(
-            kinds.iter().filter(|kind| matches!(kind, NodeKind::ApplyPreimage)).count(),
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::MatrixMulSmallRhs)).count(),
             2,
-            "the encoding vector and public key must consume their decomposition relations"
-        );
-        assert_eq!(
-            kinds.iter().filter(|kind| matches!(kind, NodeKind::MaterializePreimageExact)).count(),
-            0,
-            "gadget products must remain fused instead of materializing decompositions"
+            "the encoding vector and public key must consume their bounded decomposition relations"
         );
         assert!(kinds.iter().any(|kind| {
             matches!(kind, NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply))
@@ -684,10 +679,17 @@ mod tests {
             ]),
         );
 
-        let expected_vector =
-            lhs_vector.mul_decompose(&rhs_public) + rhs_vector * lhs_plaintext.entry(0, 0);
+        let expected_vector = lhs_vector
+            .multiply_small_rhs(rhs_public.clone().gadget_decompose(false).unwrap())
+            .unwrap() +
+            rhs_vector * lhs_plaintext.entry(0, 0);
         assert_eq!(matrix_output(&result, "vector"), &expected_vector);
-        assert_eq!(matrix_output(&result, "public"), &lhs_public.mul_decompose(&rhs_public));
+        assert_eq!(
+            matrix_output(&result, "public"),
+            &lhs_public
+                .multiply_small_rhs(rhs_public.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
         assert_eq!(matrix_output(&result, "plaintext"), &(lhs_plaintext * rhs_plaintext));
     }
     #[test]

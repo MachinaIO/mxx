@@ -12,9 +12,6 @@ pub mod public_key;
 pub mod slot_operation;
 pub mod tall_encoding;
 pub mod tall_rotation_encoding;
-pub mod wee25_commitment;
-pub mod wee25_opening;
-pub mod wee25_public_parameters;
 
 #[cfg(test)]
 mod test_utils;
@@ -79,16 +76,3 @@ pub use tall_rotation_encoding::{
     TallRotationEncodingPreprocessingWires, required_tall_anchor_reduce_encoding,
     required_tall_rotation_encodings,
 };
-pub use wee25_commitment::{
-    Wee25CommitmentCompiler, Wee25CommitmentError, Wee25CommitmentTreeWire,
-};
-pub use wee25_opening::{
-    WEE25_COMMITMENT, WEE25_COMMITMENT_NODES, WEE25_PUBLIC_B, WEE25_T_BOTTOM, WEE25_T_TOP,
-    Wee25CommitmentArtifacts, Wee25PublicParameterArtifacts, Wee25PublicParameterWires,
-    Wee25VerificationWire,
-};
-pub use wee25_public_parameters::{
-    WEE25_PUBLIC_B_TRAPDOOR, Wee25PublicParameterCompiler, Wee25PublicParameterPreprocessingWires,
-};
-
-// The WEE25 commitment-backed lookup evaluator remains intentionally absent.

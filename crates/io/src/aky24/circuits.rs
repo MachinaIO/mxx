@@ -1694,6 +1694,7 @@ mod tests {
             b_error_sigma: RealExpr::from_integer(1),
             fhe_error_sigma: RealExpr::from_integer(1),
             attribute_error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: 1u64 << 20,
             security_parameter_bits: 128,
             cascade_randomness_bits: 128,
             gaussian_sample_bits: 16,

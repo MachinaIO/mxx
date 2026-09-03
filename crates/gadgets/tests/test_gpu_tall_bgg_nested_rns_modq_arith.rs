@@ -672,6 +672,7 @@ fn prepare_candidate(
         lookup_trapdoor.clone(),
         gadget_base.clone().into(),
         parameters.modulus_digits().into(),
+        preimage_max_coefficient_bound.clone(),
         Vec::new(),
     );
     let rotation_keys =
@@ -2207,13 +2208,14 @@ fn lookup_planning_stats_match_preprocessing_for_repeated_subcircuit() {
     );
 
     let gadget_base = BigInt::from(1u64 << parameters.base_bits());
-    let trapdoor = ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000);
+    let trapdoor = ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1u64 << 20);
     let mut lookup = LweLookupPreprocessingLowering::new(
         parameters.clone(),
         ring.bytes_input("planning-parity-hash-key", 32),
         trapdoor,
         gadget_base.clone().into(),
         digit_count.into(),
+        (1u64 << 20).into(),
         Vec::new(),
     );
     let mut slots = NoSlotOperations::default();

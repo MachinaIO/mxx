@@ -297,6 +297,7 @@ impl PrivatePrfeLayerWires {
             config.trapdoor_sigma.clone(),
             config.gadget_base.clone(),
             config.digit_count,
+            config.preimage_max_coefficient_bound.clone(),
         );
         let b_public = b_trapdoor.public_matrix();
         Ok(Self {
@@ -693,7 +694,7 @@ impl PrivatePrfeLayerWires {
         let high = self.evaluate_ciphertext_matrix(veval_high, ciphertext, public_inputs)?;
         let low = self.evaluate_ciphertext_matrix(veval_low, ciphertext, public_inputs)?;
         let evaluated = self.combine_high_low(high.vector, low.vector, 1, output_count)?;
-        let z = ciphertext.c_b.clone().apply_preimage(key.preimage.clone()) - evaluated;
+        let z = ciphertext.c_b.clone().mul_small_rhs(key.preimage.clone()) - evaluated;
         Ok(z.threshold_decode_bools(2, output_count))
     }
 
@@ -1309,6 +1310,7 @@ mod tests {
         Backend, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
         transcript::SamplingMode,
     };
+    use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
     fn config(parameters: &DCRTPolyParams) -> Aky24IoConfig {
@@ -1324,6 +1326,7 @@ mod tests {
             b_error_sigma: RealExpr::from_integer(1),
             fhe_error_sigma: RealExpr::from_integer(1),
             attribute_error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             security_parameter_bits: 1,
             cascade_randomness_bits: 16,
             gaussian_sample_bits: 16,

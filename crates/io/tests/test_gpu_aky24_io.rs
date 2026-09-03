@@ -45,6 +45,7 @@ fn test_gpu_aky24_io_parameter_search_and_round_trip() {
         b_error_sigma: RealExpr::from_integer(1),
         fhe_error_sigma: RealExpr::from_integer(1),
         attribute_error_sigma: RealExpr::from_integer(1),
+        preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
         security_parameter_bits: 8,
         cascade_randomness_bits: 8,
         gaussian_sample_bits: 8,

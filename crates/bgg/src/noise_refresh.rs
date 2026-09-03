@@ -35,6 +35,7 @@ pub struct NaiveBggNoiseRefreshCompiler {
     /// with a scalar decoder trapdoor use zero.
     pub decoder_zero_rows: usize,
     pub decoder_trapdoor_sigma: RealExpr,
+    pub decoder_preimage_max_coefficient_bound: IntExpr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +170,7 @@ impl NaiveBggNoiseRefreshCompiler {
                 NOISE_REFRESH_DECODER_PREIMAGES,
                 vec![IntExpr::constant(self.flat_decoder_count())],
                 (self.decoder_public_columns, self.public_key_columns()),
+                self.decoder_preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
             ),
         })
@@ -189,7 +191,7 @@ impl NaiveBggNoiseRefreshCompiler {
         // D K_j: the state row is multiplied by the supplied K_j on the
         // right, so the preimage relation is consumed rather than inferred.
         Ok(Parallel::range(self.flat_decoder_count()).map_values(move |index| {
-            decoder_state.clone().apply_preimage(preimages.get(vec![index.as_int()]))
+            decoder_state.clone().mul_small_rhs(preimages.get(vec![index.as_int()]))
         })?)
     }
 
@@ -427,9 +429,9 @@ impl NaiveBggNoiseRefreshCompiler {
                             // The online level computes refreshed*K_g + R -
                             // one*K_a - decoder, with each decomposition
                             // consumed on the right in its existing carrier.
-                            refreshed.vectors.get_static(slot).mul_decomposed(gadget_decomposed) +
+                            refreshed.vectors.get_static(slot).mul_small_rhs(gadget_decomposed) +
                                 refresh_terms[crt].get_static(slot) -
-                                one.vectors.get_static(slot).mul_decomposed(a_decomposed) -
+                                one.vectors.get_static(slot).mul_small_rhs(a_decomposed) -
                                 decoders[crt].get_static(slot)
                         })
                         .collect(),
@@ -554,6 +556,8 @@ impl NaiveBggNoiseRefreshCompiler {
 
 #[cfg(test)]
 mod tests {
+    const TEST_PREIMAGE_BOUND: usize = 1 << 20;
+
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output};
 
@@ -603,6 +607,7 @@ mod tests {
             decoder_public_columns: digit_count + 2,
             decoder_zero_rows: 0,
             decoder_trapdoor_sigma: RealExpr::from_integer(5),
+            decoder_preimage_max_coefficient_bound: TEST_PREIMAGE_BOUND.into(),
         };
         assert_eq!(depth, compiler.crt_depth());
 
@@ -641,9 +646,7 @@ mod tests {
                     compiler.flat_decoder_count(),
                     (compiler.decoder_public_columns, compiler.public_key_columns()),
                 )
-                .parallel_map_values(move |_, preimage| {
-                    preimage.decompose(modulus.clone(), 1).into_preimage_relation()
-                })
+                .parallel_map_values(move |_, preimage| preimage.decompose(modulus.clone(), 1))
                 .unwrap(),
         };
         let projected = ring.input_family(

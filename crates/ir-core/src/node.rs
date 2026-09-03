@@ -41,6 +41,11 @@ pub enum NodeKind {
     RealBinary(RealBinaryOp),
     RealSqrt,
     MatrixBinary(MatrixBinaryOp),
+    /// Multiplies a full matrix by an explicitly bounded compact RHS.
+    ///
+    /// The RHS must be a `SmallMatrix` or relation-bearing `Preimage`; the
+    /// operation does not infer boundedness from an ordinary matrix wire.
+    MatrixMulSmallRhs,
     /// Computes `bias + sum(coefficients[t] * left[t] * right[t])`.
     /// This is an execution fusion; its semantics are ordinary multiply,
     /// integer scale, and add operations.
@@ -85,6 +90,7 @@ pub enum NodeKind {
     },
     HashSample {
         matrix_type: crate::types::MatrixType,
+        variant: HashVariant,
         tag_prefix: Vec<u8>,
         #[serde(default)]
         tag_expressions: Vec<IntExpr>,
@@ -92,6 +98,9 @@ pub enum NodeKind {
         tag_decimal_expressions: Vec<IntExpr>,
         #[serde(default)]
         tag_u64_le_expressions: Vec<IntExpr>,
+        base: Option<IntExpr>,
+        #[serde(default)]
+        digit_count: Option<IntExpr>,
     },
     TrapdoorSample {
         matrix_type: crate::types::MatrixType,
@@ -109,30 +118,6 @@ pub enum NodeKind {
         matrix_type: crate::types::MatrixType,
         max_coefficient_bound: IntExpr,
     },
-    /// Consumes a typed relation and computes its ordinary matrix product with the left input.
-    ///
-    /// Relation-aware analysis is authorized only when the left value carries the matching
-    /// source `B` and the right value carries `B * K = T`. Under that condition, the runtime
-    /// product is still the ordinary matrix multiplication `B * K`, while analysis may replace it
-    /// by `T` and transport the target's noise/carrier. `MatrixBinary::Multiply` has no such
-    /// matching-source authorization and therefore cannot consume or transport the relation.
-    ApplyPreimage,
-    /// Reinterprets a typed preimage as an ordinary matrix only for an exact relation target.
-    ///
-    /// The runtime value is unchanged (`K -> K`), while the semantic relation is intentionally
-    /// discarded.  A noisy target cannot use this escape: validation of the operational result
-    /// must reject it, so this node cannot erase the transport of target error.
-    MaterializePreimageExact,
-    /// Performs relation-preserving algebra on preimages sharing a common left source `B`.
-    ///
-    /// Each operation computes a new witness `K'` and target `T'` while preserving the equation
-    /// `B * K' = T'`; the operation-specific equations are documented by `PreimageBinaryOp`.
-    PreimageBinary(PreimageBinaryOp),
-    /// Concatenates witnesses with one common left source along matrix columns.
-    ///
-    /// For witnesses `K_j` satisfying `B * K_j = T_j`, the output is
-    /// `K = [K_1 | ... | K_n]` and its target is `T = [T_1 | ... | T_n]`, hence `B * K = T`.
-    PreimageConcatColumns,
     /// Samples branch-indexed witnesses for a shared source/trapdoor family.
     ///
     /// For each source branch `i` and final target branch `j`, the output witness `K_i,j` is typed
@@ -150,14 +135,6 @@ pub enum NodeKind {
         base: IntExpr,
         small: bool,
         digit_count: IntExpr,
-    },
-    /// Selects one scalar matrix entry from a gadget witness `K`.
-    ///
-    /// The selected value is `K[row, column]`; the surrounding decomposition still denotes
-    /// `G * K = T`, and the exact-target rule is enforced before this relation is forgotten.
-    DecompositionEntry {
-        row: IntExpr,
-        column: IntExpr,
     },
     ExtractCoefficient {
         position: IntExpr,
@@ -287,16 +264,6 @@ pub enum MatrixBinaryOp {
     Add,
     Subtract,
     Multiply,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum PreimageBinaryOp {
-    /// Adds witnesses and targets componentwise: `B*K' = (B*K_1) + (B*K_2) = T_1 + T_2`.
-    Add,
-    /// Right-multiplies by exact `A`: `B*(K*A) = (B*K)*A = T*A`.
-    RightMultiplyExact,
-    /// Composes with `G*L = U`: `B*(K*L) = (B*K)*L = T*L`.
-    ComposeExactDecomposition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

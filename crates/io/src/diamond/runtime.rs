@@ -610,6 +610,7 @@ mod tests {
             digit_count: parameters.modulus_digits(),
             trapdoor_sigma: RealExpr::from_f64_exact(4.578).unwrap(),
             error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-io-runtime-test".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,

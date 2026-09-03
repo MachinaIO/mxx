@@ -13,7 +13,7 @@ const TARGET_COLS: usize = 50;
 #[cfg(feature = "gpu")]
 fn bench_gpu_preimage() {
     use mxx_primitives::{
-        matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+        matrix::{PolyMatrix, ResidentPolyMatrixColumnSource, gpu_dcrt_poly::GpuDCRTPolyMatrix},
         poly::{
             PolyParams,
             dcrt::{
@@ -22,7 +22,7 @@ fn bench_gpu_preimage() {
             },
         },
         sampler::{
-            DistType, PolyTrapdoorSampler, PolyUniformSampler,
+            DistType, PolyTrapdoorSampler, PolyUniformSampler, bounds::default_preimage_cutoff,
             trapdoor::GpuDCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
         },
     };
@@ -50,7 +50,18 @@ fn bench_gpu_preimage() {
 
     gpu_device_sync();
     let start = Instant::now();
-    let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+    let bound = default_preimage_cutoff(
+        params.ring_dimension(),
+        public_matrix.row_size(),
+        params.modulus_digits(),
+        1u32 << params.base_bits(),
+        SIGMA,
+    )
+    .expect("preimage cutoff");
+    let target_source = ResidentPolyMatrixColumnSource::new(target);
+    let preimage = trapdoor_sampler
+        .preimage(&params, &trapdoor, &public_matrix, &target_source, bound, rand::random())
+        .expect("compact preimage sampling");
     gpu_device_sync();
     let elapsed = start.elapsed();
     black_box(preimage);

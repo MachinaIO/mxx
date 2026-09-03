@@ -627,9 +627,9 @@ impl ExponentLutEncodingCompiler {
             .gsw_ciphertext()
             .clone()
             .decompose(self.bgg.public_key.base.clone(), self.bgg.public_key.digit_count.clone());
-        let public = lhs.pubkey.matrix.clone().mul_decomposed(decomposed.clone());
+        let public = lhs.pubkey.matrix.clone().mul_small_rhs(decomposed.clone());
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone().mul_decomposed(decomposed),
+            vector: lhs.vector.clone().mul_small_rhs(decomposed),
             pubkey: BggPublicKeyWire { matrix: public, reveal_plaintext: false },
             plaintext: None,
         })
@@ -742,15 +742,15 @@ impl ExponentLutEncodingCompiler {
                     self.bgg.public_key.base.clone(),
                     self.bgg.public_key.digit_count.clone(),
                 );
-                let switched_vector = raw_vector.mul_decomposed(c_decomposition.clone());
-                let switched_public = raw_public.mul_decomposed(c_decomposition);
+                let switched_vector = raw_vector.mul_small_rhs(c_decomposition.clone());
+                let switched_public = raw_public.mul_small_rhs(c_decomposition);
                 let a_decomposition = switched_public.decompose(
                     self.bgg.public_key.base.clone(),
                     self.bgg.public_key.digit_count.clone(),
                 );
                 Ok((
-                    mask_vector.mul_decomposed(a_decomposition.clone()) + switched_vector,
-                    mask_public.mul_decomposed(a_decomposition),
+                    mask_vector.mul_small_rhs(a_decomposition.clone()) + switched_vector,
+                    mask_public.mul_small_rhs(a_decomposition),
                 ))
             },
         )
@@ -1450,19 +1450,19 @@ mod tests {
         let c_decomposition = rhs.gsw_ciphertext().clone().decompose(4, 2);
         assert_eq!(
             output.vector.matrix_type(),
-            ring.zero((1, 2)).mul_decomposed(c_decomposition.clone()).matrix_type()
+            ring.zero((1, 2)).mul_small_rhs(c_decomposition.clone()).matrix_type()
         );
         assert_eq!(
             output.pubkey.matrix.matrix_type(),
-            ring.zero((2, 2)).mul_decomposed(c_decomposition).matrix_type()
+            ring.zero((2, 2)).mul_small_rhs(c_decomposition).matrix_type()
         );
         assert!(matches!(
             output.vector.value_handle().node().kind(),
-            mxx_ir_core::node::NodeKind::ApplyPreimage
+            mxx_ir_core::node::NodeKind::MatrixMulSmallRhs
         ));
         assert!(matches!(
             output.pubkey.matrix.value_handle().node().kind(),
-            mxx_ir_core::node::NodeKind::ApplyPreimage
+            mxx_ir_core::node::NodeKind::MatrixMulSmallRhs
         ));
     }
 

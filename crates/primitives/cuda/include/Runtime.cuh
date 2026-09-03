@@ -80,6 +80,9 @@ struct GpuNttDeviceConstants
     uint64_t *twiddle_inverse; // limb-major layout: [limb][exponent]
     uint64_t *twiddle_shoup_forward;
     uint64_t *twiddle_shoup_inverse;
+    uint64_t *moduli;
+    uint64_t *n_inv;
+    uint64_t *n_inv_shoup;
 };
 
 struct PinnedHostReclaimer;

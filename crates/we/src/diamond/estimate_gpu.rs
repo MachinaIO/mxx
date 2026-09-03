@@ -13,7 +13,10 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType},
 };
 use mxx_primitives::{
-    matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+    matrix::{
+        PolyMatrix, PolyMatrixSmallRhs,
+        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
+    },
     poly::dcrt::gpu::GpuDCRTPolyParams,
     sampler::trapdoor::GpuDCRTTrapdoor,
 };
@@ -25,7 +28,7 @@ use mxx_runtime::{
     },
 };
 use num_bigint::BigInt;
-use num_traits::One;
+use num_traits::{One, ToPrimitive};
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use thiserror::Error;
 use tracing::{debug, info};
@@ -50,7 +53,8 @@ pub enum DiamondGpuMeasurementError {
 
 enum ReadyOutput {
     Matrix(GpuDCRTPolyMatrix),
-    Matrices(Vec<GpuDCRTPolyMatrix>),
+    SmallMatrix(GpuSmallMatrix),
+    SmallMatrices(Vec<GpuSmallMatrix>),
     Trapdoor { public: GpuDCRTPolyMatrix, secret: GpuDCRTTrapdoor },
     Host,
 }
@@ -59,7 +63,8 @@ impl ReadyOutput {
     fn wait_until_ready(self) {
         match self {
             Self::Matrix(matrix) => matrix.wait_until_ready(),
-            Self::Matrices(matrices) => {
+            Self::SmallMatrix(matrix) => matrix.wait_until_ready(),
+            Self::SmallMatrices(matrices) => {
                 for matrix in matrices {
                     matrix.wait_until_ready();
                 }
@@ -184,6 +189,129 @@ impl DiamondGpuMeasurementBackend {
             .ok_or(DiamondGpuMeasurementError::MatrixArgument)
     }
 
+    fn append_tag_integer(tag: &mut Vec<u8>, value: &BigInt) {
+        let (sign, bytes) = value.to_bytes_be();
+        tag.push(if matches!(sign, num_bigint::Sign::Minus) { 1 } else { 0 });
+        tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        tag.extend_from_slice(&bytes);
+    }
+
+    fn small_rhs(
+        &mut self,
+        node: &MeasurementNode<'_>,
+        bindings: &ParamEnv,
+    ) -> Result<GpuSmallMatrix, DiamondGpuMeasurementError> {
+        let rhs = node.argument_types.get(1).ok_or(DiamondGpuMeasurementError::MatrixArgument)?;
+        let (rhs, declared_bound) = match rhs {
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                (matrix, max_coefficient_bound)
+            }
+            _ => return Err(DiamondGpuMeasurementError::MatrixArgument),
+        };
+
+        // Hash-derived bounded wires are the production compact-RHS source. Keep the
+        // coefficient-domain source ephemeral and benchmark the direct compact-owner path.
+        if let Some(NodeKind::HashSample {
+            variant,
+            tag_prefix,
+            tag_expressions,
+            tag_decimal_expressions,
+            tag_u64_le_expressions,
+            base,
+            digit_count,
+            ..
+        }) = node.argument_kinds.get(1)
+        {
+            let mut tag = tag_prefix.clone();
+            for expression in tag_expressions {
+                let value = expression
+                    .evaluate(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+                Self::append_tag_integer(&mut tag, &value);
+            }
+            for expression in tag_decimal_expressions {
+                let value = expression
+                    .evaluate(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+                tag.extend_from_slice(value.to_string().as_bytes());
+            }
+            for expression in tag_u64_le_expressions {
+                let value = expression
+                    .evaluate(bindings)
+                    .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
+                    .to_u64()
+                    .ok_or_else(|| {
+                        DiamondGpuMeasurementError::Expression(
+                            "little-endian hash tag component must fit in u64".to_owned(),
+                        )
+                    })?;
+                tag.extend_from_slice(&value.to_le_bytes());
+            }
+            let base = base
+                .as_ref()
+                .ok_or_else(|| {
+                    DiamondGpuMeasurementError::Expression(
+                        "bounded hash RHS is missing its gadget base".to_owned(),
+                    )
+                })?
+                .evaluate(bindings)
+                .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?;
+            let digit_count = digit_count
+                .as_ref()
+                .ok_or_else(|| {
+                    DiamondGpuMeasurementError::Expression(
+                        "bounded hash RHS is missing its digit count".to_owned(),
+                    )
+                })?
+                .evaluate(bindings)
+                .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
+                .try_into()
+                .map_err(|_| {
+                    DiamondGpuMeasurementError::Expression(
+                        "hash decomposition digit count is not usize".to_owned(),
+                    )
+                })?;
+            let expected_bound = match variant {
+                HashVariant::Decomposed => (&base + BigInt::from(1u8)) / 2u8,
+                HashVariant::SmallDecomposed => &base - BigInt::from(1u8),
+                HashVariant::Plain => {
+                    return Err(DiamondGpuMeasurementError::Expression(
+                        "plain hash cannot be a bounded RHS".to_owned(),
+                    ));
+                }
+            };
+            if declared_bound != &expected_bound {
+                return Err(DiamondGpuMeasurementError::Expression(
+                    "bounded hash RHS bound does not match its gadget layout".to_owned(),
+                ));
+            }
+            return self
+                .backend
+                .sample_hash_small(rhs, [0x5a; 32], &tag, *variant, (&base, digit_count))
+                .map_err(Self::backend_error);
+        }
+
+        // Isolated preimage measurements still receive a compact representative with the exact
+        // declared bound. Build only a zero-valued pre-decomposition source, then compact it with
+        // that bound; the source is discarded before multiplication and is never an expanded RHS.
+        let source_type = rhs.clone();
+        let source = self
+            .backend
+            .sample_uniform(
+                &source_type,
+                &SampleRange { minimum: BigInt::from(0), maximum: BigInt::from(0) },
+            )
+            .map_err(Self::backend_error)?;
+        let bound = declared_bound.to_biguint().ok_or_else(|| {
+            DiamondGpuMeasurementError::Expression(
+                "bounded RHS coefficient bound must be nonnegative".to_owned(),
+            )
+        })?;
+        <GpuDCRTPolyMatrix as PolyMatrixSmallRhs>::compact_from_matrix(source, bound)
+            .map_err(Self::backend_error)
+    }
+
     fn evaluate_matrix_type(
         matrix_type: &MatrixType,
         bindings: &ParamEnv,
@@ -270,9 +398,10 @@ impl DiamondGpuMeasurementBackend {
     ) -> Result<(), DiamondGpuMeasurementError> {
         for ty in node.argument_types {
             match ty {
-                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                ConcreteWireType::Matrix(matrix) => {
                     self.matrix(matrix)?.wait_until_ready();
                 }
+                ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. } => {}
                 ConcreteWireType::Trapdoor { .. } => {
                     let (public, secret) = self.trapdoor(ty, bindings)?;
                     public.wait_until_ready();
@@ -302,7 +431,6 @@ impl DiamondGpuMeasurementBackend {
             NodeKind::BoolToInt |
             NodeKind::RealBinary(_) |
             NodeKind::RealSqrt |
-            NodeKind::MaterializePreimageExact |
             NodeKind::TrapdoorPublic |
             NodeKind::SubgraphCall(_) |
             NodeKind::SequentialLoop(_) |
@@ -351,14 +479,13 @@ impl DiamondGpuMeasurementBackend {
                     Ok(ReadyOutput::Matrix(value))
                 })
             }
-            NodeKind::ApplyPreimage => {
+            NodeKind::MatrixMulSmallRhs => {
                 let left = Self::matrix_argument(node, 0)?.clone();
-                let right = Self::matrix_argument(node, 1)?.clone();
                 self.measure_placements(node, bindings, |this| {
                     let left = this.matrix(&left)?;
-                    let right = this.matrix(&right)?;
+                    let right = this.small_rhs(node, bindings)?;
                     this.backend
-                        .multiply(&left, &right)
+                        .multiply_small_rhs(&left, &right)
                         .map(ReadyOutput::Matrix)
                         .map_err(Self::backend_error)
                 })
@@ -542,14 +669,81 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)
                 })
             }
-            NodeKind::HashSample { tag_prefix, .. } => {
+            NodeKind::HashSample {
+                variant,
+                tag_prefix,
+                tag_expressions,
+                tag_decimal_expressions,
+                tag_u64_le_expressions,
+                base,
+                digit_count,
+                ..
+            } => {
                 let output = Self::matrix_output(node)?.clone();
-                let tag = tag_prefix.clone();
-                self.measure_placements(node, bindings, |this| {
-                    this.backend
-                        .sample_hash(&output, [0x5a; 32], &tag, HashVariant::Plain, None)
+                let mut tag = tag_prefix.clone();
+                for expression in tag_expressions {
+                    let value = expression.evaluate(bindings).map_err(|error| {
+                        DiamondGpuMeasurementError::Expression(error.to_string())
+                    })?;
+                    Self::append_tag_integer(&mut tag, &value);
+                }
+                for expression in tag_decimal_expressions {
+                    let value = expression.evaluate(bindings).map_err(|error| {
+                        DiamondGpuMeasurementError::Expression(error.to_string())
+                    })?;
+                    tag.extend_from_slice(value.to_string().as_bytes());
+                }
+                for expression in tag_u64_le_expressions {
+                    let value = expression
+                        .evaluate(bindings)
+                        .map_err(|error| DiamondGpuMeasurementError::Expression(error.to_string()))?
+                        .to_u64()
+                        .ok_or_else(|| {
+                            DiamondGpuMeasurementError::Expression(
+                                "little-endian hash tag component must fit in u64".to_owned(),
+                            )
+                        })?;
+                    tag.extend_from_slice(&value.to_le_bytes());
+                }
+                let layout = base
+                    .as_ref()
+                    .zip(digit_count.as_ref())
+                    .map(|(base, digits)| {
+                        Ok((
+                            base.evaluate(bindings).map_err(|error| {
+                                DiamondGpuMeasurementError::Expression(error.to_string())
+                            })?,
+                            digits
+                                .evaluate(bindings)
+                                .map_err(|error| {
+                                    DiamondGpuMeasurementError::Expression(error.to_string())
+                                })?
+                                .try_into()
+                                .map_err(|_| {
+                                    DiamondGpuMeasurementError::Expression(
+                                        "hash decomposition digit count is not usize".to_owned(),
+                                    )
+                                })?,
+                        ))
+                    })
+                    .transpose()?;
+                self.measure_placements(node, bindings, |this| match variant {
+                    HashVariant::Plain => this
+                        .backend
+                        .sample_hash(&output, [0x5a; 32], &tag, *variant, None)
                         .map(ReadyOutput::Matrix)
-                        .map_err(Self::backend_error)
+                        .map_err(Self::backend_error),
+                    HashVariant::Decomposed | HashVariant::SmallDecomposed => {
+                        let (base, digits) = layout.as_ref().ok_or_else(|| {
+                            DiamondGpuMeasurementError::Expression(
+                                "decomposed hash is missing its gadget layout".to_owned(),
+                            )
+                        })?;
+                        this.backend
+                            .sample_hash_small(&output, [0x5a; 32], &tag, *variant, (base, *digits))
+                            .map(ReadyOutput::SmallMatrix)
+                            .map_err(Self::backend_error)
+                    }
                 })
             }
             NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } => {
@@ -604,7 +798,7 @@ impl DiamondGpuMeasurementBackend {
                         return this
                             .backend
                             .gadget_decompose(&target, false)
-                            .map(ReadyOutput::Matrix)
+                            .map(ReadyOutput::SmallMatrix)
                             .map_err(Self::backend_error);
                     }
                     let (public, secret) = this.trapdoor(&trapdoor_type, bindings)?;
@@ -615,6 +809,10 @@ impl DiamondGpuMeasurementBackend {
                         columns: output.columns,
                     };
                     let target = this.matrix(&target_ty)?;
+                    let (target_source, _) = this
+                        .backend
+                        .preimage_target(Arc::clone(&target))
+                        .map_err(Self::backend_error)?;
                     let ConcreteWireType::Trapdoor { sigma, gadget_base, digit_count, .. } =
                         &trapdoor_type
                     else {
@@ -632,9 +830,10 @@ impl DiamondGpuMeasurementBackend {
                             &bound,
                             &secret,
                             &public,
-                            &target,
+                            target_source.as_ref(),
+                            [0u8; 32],
                         )
-                        .map(ReadyOutput::Matrix)
+                        .map(ReadyOutput::SmallMatrix)
                         .map_err(Self::backend_error)
                 })
             }
@@ -685,6 +884,10 @@ impl DiamondGpuMeasurementBackend {
                 self.measure_placements(node, bindings, |this| {
                     let (public, secret) = this.trapdoor(&trapdoor_type, bindings)?;
                     let target = this.matrix(&target_type)?;
+                    let (target_source, _) = this
+                        .backend
+                        .preimage_target(Arc::clone(&target))
+                        .map_err(Self::backend_error)?;
                     let requests = (0..batch_size)
                         .map(|_| PreimageRequest {
                             matrix_type: output.clone(),
@@ -694,12 +897,13 @@ impl DiamondGpuMeasurementBackend {
                             max_coefficient_bound: bound.clone(),
                             trapdoor: Arc::clone(&secret),
                             public: Arc::clone(&public),
-                            target: Arc::clone(&target),
+                            target: Arc::clone(&target_source),
+                            randomness_seed: [0u8; 32],
                         })
                         .collect();
                     this.backend
                         .sample_preimage_batch(requests)
-                        .map(ReadyOutput::Matrices)
+                        .map(ReadyOutput::SmallMatrices)
                         .map_err(Self::backend_error)
                 })
             }
@@ -724,7 +928,7 @@ impl DiamondGpuMeasurementBackend {
                         .map_err(Self::backend_error)?;
                     this.backend
                         .gadget_decompose(&input, *small)
-                        .map(ReadyOutput::Matrix)
+                        .map(ReadyOutput::SmallMatrix)
                         .map_err(Self::backend_error)
                 })
             }
@@ -834,8 +1038,16 @@ impl MeasurementBackend for DiamondGpuMeasurementBackend {
                 .saturating_mul(8)
         };
         match wire_type {
-            ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
-                matrix_bytes(matrix)
+            ConcreteWireType::Matrix(matrix) => matrix_bytes(matrix),
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                (matrix.rows as u64)
+                    .saturating_mul(matrix.columns as u64)
+                    .saturating_mul(matrix.ring_dimension as u64)
+                    .saturating_mul((1usize.saturating_add(magnitude_bytes)) as u64)
             }
             ConcreteWireType::Trapdoor { matrix, .. } => matrix_bytes(matrix).saturating_mul(3),
             _ => 0,

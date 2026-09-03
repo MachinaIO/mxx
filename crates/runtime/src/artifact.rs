@@ -1,10 +1,11 @@
 use mxx_ir_core::{
     artifact::{
         ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-        validate_manifest,
+        SMALL_RHS_ROW_MAJOR_LAYOUT, validate_manifest,
     },
     encoding::IR_VERSION,
 };
+use num_bigint::Sign;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
@@ -33,6 +34,7 @@ pub struct ArtifactKey {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ArtifactPayload {
     Matrix(Vec<u8>),
+    SmallMatrix(Vec<u8>),
     Bytes(Vec<u8>),
     Trapdoor { public_bytes: Vec<u8>, secret_bytes: Vec<u8> },
     TypedBlob(Vec<u8>),
@@ -189,6 +191,11 @@ impl MemoryArtifactStore {
                 if artifact_type != &descriptor.artifact_type ||
                     confidentiality != &descriptor.confidentiality ||
                     layout != &descriptor.layout ||
+                    !canonical_bounded_descriptor(
+                        &descriptor.artifact_type,
+                        descriptor.layout.as_deref(),
+                        payload,
+                    ) ||
                     !payload_matches(artifact_type, payload)
                 {
                     return Err(MemoryArtifactError::DescriptorMismatch(key));
@@ -265,6 +272,13 @@ impl ArtifactStore for MemoryArtifactStore {
         {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
+        if !canonical_bounded_descriptor(
+            &descriptor.artifact_type,
+            descriptor.layout.as_deref(),
+            payload,
+        ) {
+            return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
+        }
         if !payload_matches(artifact_type, payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
         }
@@ -317,6 +331,9 @@ impl ArtifactStore for MemoryArtifactStore {
         if !payload_matches(artifact_type, &payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key));
         }
+        if !canonical_bounded_descriptor(artifact_type, layout, &payload) {
+            return Err(MemoryArtifactError::DescriptorMismatch(key));
+        }
         match self.entries.entry(key.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert((
@@ -353,6 +370,13 @@ impl ArtifactStore for MemoryArtifactStore {
             *stored_confidentiality != descriptor.confidentiality ||
             stored_layout != &descriptor.layout
         {
+            return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
+        }
+        if !canonical_bounded_descriptor(
+            &descriptor.artifact_type,
+            descriptor.layout.as_deref(),
+            payload,
+        ) {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
         if !payload_matches(&descriptor.artifact_type, payload) {
@@ -568,7 +592,11 @@ impl MemoryArtifactStore {
 
 fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> bool {
     match (artifact_type, payload) {
-        (ArtifactType::Matrix(_) | ArtifactType::Preimage(_), ArtifactPayload::Matrix(_)) |
+        (ArtifactType::Matrix(_), ArtifactPayload::Matrix(_)) |
+        (
+            ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. },
+            ArtifactPayload::SmallMatrix(_),
+        ) |
         (ArtifactType::Trapdoor { .. }, ArtifactPayload::Trapdoor { .. }) |
         (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(_)) => true,
         (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes)) => bytes.len() == *length,
@@ -576,9 +604,191 @@ fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> b
     }
 }
 
+fn canonical_bounded_descriptor(
+    artifact_type: &ArtifactType,
+    layout: Option<&str>,
+    payload: &ArtifactPayload,
+) -> bool {
+    let (matrix, bound, expected_kind) = match artifact_type {
+        ArtifactType::SmallMatrix { matrix, max_coefficient_bound } => {
+            (matrix, max_coefficient_bound, 0u8)
+        }
+        ArtifactType::Preimage { matrix, max_coefficient_bound } => {
+            (matrix, max_coefficient_bound, 1u8)
+        }
+        _ => return true,
+    };
+    if layout != Some(SMALL_RHS_ROW_MAJOR_LAYOUT) {
+        return false;
+    }
+    let ArtifactPayload::SmallMatrix(bytes) = payload else {
+        return false;
+    };
+    let Some((
+        kind,
+        rows,
+        columns,
+        ring_dimension,
+        encoded_bound,
+        magnitude_bytes,
+        count,
+        payload_start,
+    )) = parse_canonical_header(bytes)
+    else {
+        return false;
+    };
+    if kind != expected_kind ||
+        rows != matrix.rows ||
+        columns != matrix.columns ||
+        ring_dimension != matrix.ring_dimension ||
+        encoded_bound != canonical_bound_bytes(bound) ||
+        magnitude_bytes != coefficient_magnitude_bytes(bound) ||
+        Some(count) !=
+            matrix
+                .rows
+                .checked_mul(matrix.columns)
+                .and_then(|v| v.checked_mul(matrix.ring_dimension))
+    {
+        return false;
+    }
+    let Some(width) = 1usize.checked_add(magnitude_bytes) else {
+        return false;
+    };
+    let Some(payload_len) = count.checked_mul(width) else {
+        return false;
+    };
+    payload_start.checked_add(payload_len) == Some(bytes.len())
+}
+
+fn parse_canonical_header(
+    bytes: &[u8],
+) -> Option<(u8, usize, usize, usize, Vec<u8>, usize, usize, usize)> {
+    const FIXED: usize = 4 + 1 + 8 + 8 + 8 + 4;
+    if bytes.len() < FIXED || &bytes[..4] != b"SMR1" {
+        return None;
+    }
+    let read_u32 = |at: usize| -> Option<usize> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?).try_into().ok()?)
+    };
+    let read_u64 = |at: usize| -> Option<usize> {
+        Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?).try_into().ok()?)
+    };
+    let kind = *bytes.get(4)?;
+    let rows = read_u64(5)?;
+    let columns = read_u64(13)?;
+    let ring_dimension = read_u64(21)?;
+    let bound_length = read_u32(29)?;
+    let bound_start = FIXED;
+    let magnitude_start = bound_start.checked_add(bound_length)?;
+    let encoded_bound = bytes.get(bound_start..magnitude_start)?.to_vec();
+    let magnitude_bytes = read_u32(magnitude_start)?;
+    let count_start = magnitude_start.checked_add(4)?;
+    let coefficient_count = read_u64(count_start)?;
+    let payload_start = count_start.checked_add(8)?;
+    Some((
+        kind,
+        rows,
+        columns,
+        ring_dimension,
+        encoded_bound,
+        magnitude_bytes,
+        coefficient_count,
+        payload_start,
+    ))
+}
+
+fn canonical_bound_bytes(bound: &num_bigint::BigInt) -> Vec<u8> {
+    match bound.sign() {
+        Sign::Minus => Vec::new(),
+        _ => bound
+            .to_biguint()
+            .map(|value| {
+                let bytes = value.to_bytes_le();
+                if bytes.is_empty() { vec![0] } else { bytes }
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn coefficient_magnitude_bytes(bound: &num_bigint::BigInt) -> usize {
+    let bits = bound.to_biguint().map(|value| value.bits()).unwrap_or(0);
+    usize::try_from(bits.div_ceil(8)).unwrap_or(usize::MAX).max(1)
+}
+
+/// Wraps backend canonical coefficient bytes in the runtime-owned compact
+/// artifact framing.  Semantic kind is deliberately a wire concern; compact
+/// backend storage receives only the coefficient payload.
+pub(crate) fn encode_bounded_artifact(
+    schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+    semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    let ring_dimension = schema.matrix.ring_dimension;
+    let magnitude_bytes = coefficient_magnitude_bytes(&schema.max_coefficient_bound);
+    let coefficient_count = schema
+        .matrix
+        .rows
+        .checked_mul(schema.matrix.columns)
+        .and_then(|v| v.checked_mul(ring_dimension))
+        .ok_or_else(|| "bounded artifact coefficient count overflow".to_owned())?;
+    let expected_payload = coefficient_count
+        .checked_mul(
+            1usize
+                .checked_add(magnitude_bytes)
+                .ok_or_else(|| "bounded artifact width overflow".to_owned())?,
+        )
+        .ok_or_else(|| "bounded artifact payload length overflow".to_owned())?;
+    if payload.len() != expected_payload {
+        return Err("bounded artifact payload length mismatch".to_owned());
+    }
+    let bound = canonical_bound_bytes(&schema.max_coefficient_bound);
+    let mut bytes = Vec::with_capacity(4 + 1 + 8 + 8 + 8 + 4 + bound.len() + 4 + 8 + payload.len());
+    bytes.extend_from_slice(b"SMR1");
+    bytes.push(match semantic_kind {
+        mxx_ir_core::artifact::SmallMatrixSemanticKind::Generic => 0,
+        mxx_ir_core::artifact::SmallMatrixSemanticKind::Preimage => 1,
+    });
+    bytes.extend_from_slice(&(schema.matrix.rows as u64).to_le_bytes());
+    bytes.extend_from_slice(&(schema.matrix.columns as u64).to_le_bytes());
+    bytes.extend_from_slice(&(ring_dimension as u64).to_le_bytes());
+    bytes.extend_from_slice(&(bound.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&bound);
+    bytes.extend_from_slice(&(magnitude_bytes as u32).to_le_bytes());
+    bytes.extend_from_slice(&(coefficient_count as u64).to_le_bytes());
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+pub(crate) fn decode_bounded_artifact(
+    schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+    semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
+    bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if !canonical_bounded_descriptor(
+        &match semantic_kind {
+            mxx_ir_core::artifact::SmallMatrixSemanticKind::Generic => ArtifactType::SmallMatrix {
+                matrix: schema.matrix.clone(),
+                max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            },
+            mxx_ir_core::artifact::SmallMatrixSemanticKind::Preimage => ArtifactType::Preimage {
+                matrix: schema.matrix.clone(),
+                max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            },
+        },
+        Some(SMALL_RHS_ROW_MAJOR_LAYOUT),
+        &ArtifactPayload::SmallMatrix(bytes.to_vec()),
+    ) {
+        return Err("invalid compact artifact framing".to_owned());
+    }
+    let (_, _, _, _, _, _, _, start) = parse_canonical_header(bytes)
+        .ok_or_else(|| "invalid compact artifact header".to_owned())?;
+    Ok(bytes[start..].to_vec())
+}
+
 pub(crate) fn payload_bytes(payload: &ArtifactPayload) -> Vec<u8> {
     match payload {
         ArtifactPayload::Matrix(bytes) |
+        ArtifactPayload::SmallMatrix(bytes) |
         ArtifactPayload::Bytes(bytes) |
         ArtifactPayload::TypedBlob(bytes) => bytes.clone(),
         ArtifactPayload::Trapdoor { public_bytes, secret_bytes } => {
@@ -849,7 +1059,7 @@ mod tests {
             family_shape: Some(vec![2]),
             confidentiality: ArtifactConfidentiality::Public,
             content_hash: None,
-            layout: Some("lane".to_owned()),
+            layout: None,
         };
         let manifest = Manifest {
             ir_version: IR_VERSION,

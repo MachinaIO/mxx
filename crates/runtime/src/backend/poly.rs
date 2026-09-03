@@ -1,6 +1,6 @@
 use super::{
-    Backend, ChunkedPreimage, HashSampleRequest, IndexRange, MatrixMulAccumulateRequest,
-    PreimageRequest, SampleRange, UniformSampleRequest,
+    Backend, HashSampleRequest, IndexRange, MatrixMulAccumulateRequest, PreimageRequest,
+    PreimageTarget, SampleRange, UniformSampleRequest,
 };
 use mxx_ir_core::{
     ParamEnv,
@@ -8,11 +8,14 @@ use mxx_ir_core::{
     types::ConcreteMatrixType,
 };
 use mxx_primitives::{
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+    matrix::{
+        PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix,
+        dcrt_poly::DCRTPolyMatrix,
+    },
     poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        bounds::matrix_within_coefficient_bound, hash::DCRTPolyHashSampler,
+        bounds::default_preimage_cutoff, hash::DCRTPolyHashSampler,
         trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
 };
@@ -22,6 +25,9 @@ use num_traits::{One, ToPrimitive, Zero};
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 
+#[cfg(test)]
+use mxx_primitives::sampler::bounds::matrix_within_coefficient_bound;
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RingKey {
     pub modulus: BigInt,
@@ -30,6 +36,8 @@ pub struct RingKey {
 
 #[derive(Debug, Error)]
 pub enum PolyBackendError {
+    #[error(transparent)]
+    SmallMatrix(#[from] SmallMatrixError),
     #[error("no concrete polynomial parameters registered for {0:?}")]
     MissingParameters(RingKey),
     #[error("uniform range [{minimum}, {maximum}] is not supported by existing samplers")]
@@ -51,6 +59,10 @@ pub enum PolyBackendError {
         backend_base: BigInt,
         backend_digits: usize,
     },
+    #[error("requested preimage bound {requested} is below minimum {minimum}")]
+    PreimageBoundTooSmall { requested: BigInt, minimum: BigInt },
+    #[error("preimage sampling exhausted {attempts} attempts for bound {bound}")]
+    PreimageSamplingExhausted { attempts: usize, bound: BigInt },
     #[cfg(test)]
     #[error("injected release-fence failure")]
     InjectedReleaseFenceFailure,
@@ -61,48 +73,51 @@ where
     M: PolyMatrix,
 {
     pub(super) parameters: Vec<BTreeMap<RingKey, <M::P as Poly>::Params>>,
-    active_placement: usize,
-    preimage_batch_calls: usize,
+    pub(super) active_placement: usize,
+    pub(super) preimage_batch_calls: usize,
     #[cfg(test)]
-    matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize,
+    pub(super) matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize,
+    pub(super) uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    hash_sampling_batch_calls: std::sync::atomic::AtomicUsize,
-    uniform_batch_dispatch:
+    pub(super) hash_sampling_batch_calls: std::sync::atomic::AtomicUsize,
+    pub(super) uniform_batch_dispatch:
         Option<fn(&mut Self, Vec<UniformSampleRequest>) -> Result<Vec<M>, PolyBackendError>>,
-    hash_batch_dispatch:
+    pub(super) hash_batch_dispatch:
         Option<fn(&mut Self, Vec<HashSampleRequest>) -> Result<Vec<M>, PolyBackendError>>,
     #[cfg(test)]
-    preimage_batch_sizes: Vec<usize>,
+    pub(super) preimage_batch_sizes: Vec<usize>,
     #[cfg(test)]
-    multiply_calls: usize,
+    pub(super) multiply_calls: usize,
     #[cfg(test)]
-    multiply_batch_sizes: Vec<usize>,
+    pub(super) multiply_batch_sizes: Vec<usize>,
     #[cfg(test)]
-    fail_next_release_fence: bool,
-    _marker: PhantomData<(M, U, H, T)>,
+    pub(super) multiply_small_rhs_batch_sizes: Vec<usize>,
+    #[cfg(test)]
+    pub(super) fail_next_release_fence: bool,
+    pub(super) _marker: PhantomData<(M, U, H, T)>,
 }
 
-fn rejection_resample_candidate<T>(
-    mut sample: impl FnMut() -> T,
-    mut accepts: impl FnMut(&T) -> bool,
-) -> T {
-    loop {
-        let candidate = sample();
-        if accepts(&candidate) {
-            return candidate;
-        }
-    }
-}
-
+#[cfg(test)]
 fn sample_bounded_candidate<M: PolyMatrix>(
     max_coefficient_bound: &BigUint,
     sample: impl FnMut() -> M,
-) -> M {
-    rejection_resample_candidate(sample, |candidate| {
-        matrix_within_coefficient_bound(candidate, max_coefficient_bound)
-    })
+) -> Result<M, PolyBackendError> {
+    const MAX_ATTEMPTS: usize = 64;
+    let mut sample = sample;
+    for attempts in 1..=MAX_ATTEMPTS {
+        let candidate = sample();
+        if matrix_within_coefficient_bound(&candidate, max_coefficient_bound) {
+            return Ok(candidate);
+        }
+        if attempts == MAX_ATTEMPTS {
+            return Err(PolyBackendError::PreimageSamplingExhausted {
+                attempts,
+                bound: BigInt::from_biguint(Sign::Plus, max_coefficient_bound.clone()),
+            });
+        }
+    }
+    unreachable!("bounded sampling loop always returns")
 }
 
 pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
@@ -206,6 +221,8 @@ where
             #[cfg(test)]
             multiply_batch_sizes: Vec::new(),
             #[cfg(test)]
+            multiply_small_rhs_batch_sizes: Vec::new(),
+            #[cfg(test)]
             fail_next_release_fence: false,
             _marker: PhantomData,
         }
@@ -252,39 +269,6 @@ where
             let _ = requested_device_ids;
             Self::new(parameters)
         }
-    }
-
-    #[cfg(feature = "gpu")]
-    pub(crate) fn new_with_placements(placements: Vec<Vec<<M::P as Poly>::Params>>) -> Self {
-        assert!(!placements.is_empty(), "a backend needs at least one placement");
-        let mut backend = Self {
-            parameters: (0..placements.len()).map(|_| BTreeMap::new()).collect(),
-            active_placement: 0,
-            preimage_batch_calls: 0,
-            #[cfg(test)]
-            matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            hash_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
-            uniform_batch_dispatch: None,
-            hash_batch_dispatch: None,
-            #[cfg(test)]
-            preimage_batch_sizes: Vec::new(),
-            #[cfg(test)]
-            multiply_calls: 0,
-            #[cfg(test)]
-            multiply_batch_sizes: Vec::new(),
-            #[cfg(test)]
-            fail_next_release_fence: false,
-            _marker: PhantomData,
-        };
-        for (placement, parameters) in placements.into_iter().enumerate() {
-            for parameters in parameters {
-                backend.register_at(placement, parameters);
-            }
-        }
-        backend
     }
 
     fn register(&mut self, parameters: <M::P as Poly>::Params) {
@@ -345,8 +329,8 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn multiply_batch_sizes(&self) -> &[usize] {
-        &self.multiply_batch_sizes
+    pub(crate) fn multiply_small_rhs_batch_sizes(&self) -> &[usize] {
+        &self.multiply_small_rhs_batch_sizes
     }
 
     #[cfg(test)]
@@ -409,7 +393,13 @@ where
         &self,
         matrix: &M,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
-        let parameters = matrix.params();
+        self.parameters_for_params(matrix.params())
+    }
+
+    fn parameters_for_params(
+        &self,
+        parameters: &<M::P as Poly>::Params,
+    ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
         let modulus: Arc<BigUint> = parameters.modulus().into();
         let key = RingKey {
             modulus: BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone()),
@@ -434,13 +424,14 @@ where
 
 impl<M, U, H, T> Backend for PolyBackend<M, U, H, T>
 where
-    M: CrtRecomposeMatrix + 'static,
+    M: CrtRecomposeMatrix + PolyMatrixSmallRhs + 'static,
     U: PolyUniformSampler<M = M>,
     H: PolyHashSampler<[u8; 32], M = M>,
     T: PolyTrapdoorSampler<M = M>,
     T::Trapdoor: Clone + std::fmt::Debug,
 {
     type Matrix = M;
+    type SmallMatrix = M::SmallMatrix;
     type Trapdoor = T::Trapdoor;
     type Error = PolyBackendError;
 
@@ -474,6 +465,34 @@ where
 
     fn matrix_is_on_active_placement(&self, value: &M) -> bool {
         self.parameters_for_matrix(value).is_ok_and(|target| value.params() == target)
+    }
+
+    fn small_matrix_is_on_active_placement(&self, _value: &M::SmallMatrix) -> bool {
+        self.parameters_for_params(_value.params()).is_ok_and(|target| _value.params() == target)
+    }
+
+    fn small_matrix_to_active_placement(
+        &mut self,
+        value: &M::SmallMatrix,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        let target = self.parameters_for_params(value.params())?.clone();
+        if value.params() == &target {
+            return Ok(value.clone());
+        }
+
+        // Transfer only the canonical compact owner.  In particular, do not
+        // decode or materialize the O((log q)^2) RHS as a full DCRT matrix
+        // merely to move it between placements.  Reconstructing the same
+        // bounded owner under the target parameters preserves its complete
+        // rows, columns, inclusive bound, and canonical payload semantics.
+        let payload = value.to_canonical_coefficients()?;
+        Ok(M::SmallMatrix::from_canonical_coefficients(
+            &target,
+            value.rows(),
+            value.columns(),
+            value.max_coefficient_bound().clone(),
+            &payload,
+        )?)
     }
 
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
@@ -688,110 +707,74 @@ where
         Ok(M::multiply_batch_out_of_place(inputs))
     }
 
-    fn mul_decompose(&mut self, left: &M, right: &M, small: bool) -> Result<M, Self::Error> {
-        Ok(if small { left.mul_decompose_small(right) } else { left.mul_decompose(right) })
+    fn multiply_small_rhs(&mut self, left: &M, right: &M::SmallMatrix) -> Result<M, Self::Error> {
+        self.parameters_for_matrix(left)?;
+        Ok(left.multiply_small_rhs(right.clone())?)
     }
 
-    fn apply_chunked_preimage(
+    fn multiply_small_rhs_batch(
         &mut self,
-        left: &M,
-        preimage: &ChunkedPreimage,
-    ) -> Result<M, Self::Error> {
-        if preimage.chunks.is_empty() {
-            return Err(PolyBackendError::EmptyMatrix);
-        }
-        let mut output = M::zero(left.params(), left.row_size(), preimage.matrix_type.columns);
-        let mut expected_start = 0usize;
-        for chunk in &preimage.chunks {
-            if chunk.start != expected_start || chunk.columns == 0 {
-                return Err(PolyBackendError::InvalidInteger);
-            }
-            let right = M::from_compact_bytes(left.params(), &chunk.bytes);
-            if right.row_size() != left.col_size() || right.col_size() != chunk.columns {
-                return Err(PolyBackendError::InvalidInteger);
-            }
-            let product = left.multiply_out_of_place(&right);
-            output.copy_block_from(
-                &product,
-                0,
-                chunk.start,
-                0,
-                0,
-                output.row_size(),
-                chunk.columns,
-            );
-            expected_start = expected_start
-                .checked_add(chunk.columns)
-                .ok_or(PolyBackendError::InvalidInteger)?;
-        }
-        if expected_start != preimage.matrix_type.columns {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        Ok(output)
-    }
-
-    fn apply_chunked_preimage_batch(
-        &mut self,
-        inputs: Vec<(Arc<M>, Arc<ChunkedPreimage>)>,
+        inputs: Vec<(Arc<M>, Arc<M::SmallMatrix>)>,
     ) -> Result<Vec<M>, Self::Error> {
-        let Some((_first_left, first_preimage)) = inputs.first() else {
-            return Ok(Vec::new());
-        };
-        let chunk_count = first_preimage.chunks.len();
-        tracing::debug!(
-            batch_width = inputs.len(),
-            chunk_count,
-            total_columns = first_preimage.matrix_type.columns,
-            "apply chunked preimage batch"
-        );
-        let mut outputs = inputs
-            .iter()
-            .map(|(left, preimage)| {
-                if preimage.chunks.len() != chunk_count ||
-                    left.col_size() != preimage.matrix_type.rows
-                {
-                    return Err(PolyBackendError::InvalidInteger);
-                }
-                Ok(M::zero(left.params(), left.row_size(), preimage.matrix_type.columns))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for chunk_index in 0..chunk_count {
-            let first_chunk = &first_preimage.chunks[chunk_index];
-            tracing::debug!(
-                chunk_index,
-                start = first_chunk.start,
-                columns = first_chunk.columns,
-                batch_width = inputs.len(),
-                "apply chunked preimage column wave"
-            );
-            let mut multiply_inputs = Vec::with_capacity(inputs.len());
-            for (left, preimage) in &inputs {
-                let chunk = &preimage.chunks[chunk_index];
-                let right = M::from_compact_bytes(left.params(), &chunk.bytes);
-                if right.row_size() != left.col_size() || right.col_size() != chunk.columns {
-                    return Err(PolyBackendError::InvalidInteger);
-                }
-                multiply_inputs.push((left.clone(), Arc::new(right)));
-            }
-            #[cfg(test)]
-            self.multiply_batch_sizes.push(multiply_inputs.len());
-            let products = M::multiply_batch_out_of_place(multiply_inputs);
-            for (((_, preimage), output), product) in
-                inputs.iter().zip(outputs.iter_mut()).zip(products)
-            {
-                let chunk = &preimage.chunks[chunk_index];
-                output.copy_block_from(
-                    &product,
-                    0,
-                    chunk.start,
-                    0,
-                    0,
-                    output.row_size(),
-                    chunk.columns,
-                );
-            }
-        }
-        Ok(outputs)
+        #[cfg(test)]
+        self.multiply_small_rhs_batch_sizes.push(inputs.len());
+        inputs.into_iter().map(|(left, right)| self.multiply_small_rhs(&left, &right)).collect()
+    }
+
+    fn small_matrix_to_bytes(
+        &self,
+        value: &M::SmallMatrix,
+        expected_schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+        _semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
+    ) -> Result<Vec<u8>, Self::Error> {
+        let parameters = self.parameters(&expected_schema.matrix)?;
+        let bound = expected_schema
+            .max_coefficient_bound
+            .to_biguint()
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        value.validate_metadata(
+            parameters,
+            expected_schema.matrix.rows,
+            expected_schema.matrix.columns,
+            &bound,
+        )?;
+        Ok(value.to_canonical_coefficients()?)
+    }
+
+    fn small_matrix_matches_schema(
+        &self,
+        value: &M::SmallMatrix,
+        schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+    ) -> bool {
+        let Ok(parameters) = self.parameters(&schema.matrix) else { return false };
+        let Some(bound) = schema.max_coefficient_bound.to_biguint() else { return false };
+        value
+            .validate_metadata(parameters, schema.matrix.rows, schema.matrix.columns, &bound)
+            .is_ok()
+    }
+
+    fn small_matrix_to_untyped_bytes(&self, value: &M::SmallMatrix) -> Vec<u8> {
+        value.to_canonical_coefficients().unwrap_or_default()
+    }
+
+    fn small_matrix_from_bytes(
+        &self,
+        expected_schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+        bytes: &[u8],
+        _expected_semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        let params = self.parameters(&expected_schema.matrix)?;
+        let bound = expected_schema
+            .max_coefficient_bound
+            .to_biguint()
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        Ok(M::SmallMatrix::from_canonical_coefficients(
+            params,
+            expected_schema.matrix.rows,
+            expected_schema.matrix.columns,
+            bound,
+            bytes,
+        )?)
     }
 
     fn matrix_mul_accumulate_batch(
@@ -1027,6 +1010,57 @@ where
         })
     }
 
+    fn sample_hash_small(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        key: [u8; 32],
+        tag: &[u8],
+        variant: HashVariant,
+        gadget_layout: (&BigInt, usize),
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        let parameters = self.parameters(ty)?;
+        let (base, digits) = gadget_layout;
+        let small = matches!(variant, HashVariant::SmallDecomposed);
+        if !matches!(variant, HashVariant::Decomposed | HashVariant::SmallDecomposed) {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        self.validate_gadget_layout(ty, base, digits, small)?;
+        if ty.rows % digits != 0 {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        // Keep the hash source in coefficient form and decompose directly
+        // into the compact owner.  This avoids first materializing the full
+        // expanded gadget matrix (which is the dominant GPU peak).
+        let source = H::new().sample_hash_gadget_source(
+            parameters,
+            key,
+            tag,
+            ty.rows / digits,
+            ty.columns,
+            DistType::FinRingDist,
+        );
+        Ok(source.gadget_decompose(small)?)
+    }
+
+    fn sample_hash_small_batch(
+        &mut self,
+        requests: Vec<HashSampleRequest>,
+    ) -> Result<Vec<M::SmallMatrix>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| {
+                let layout = request.gadget_layout.ok_or(PolyBackendError::InvalidInteger)?;
+                self.sample_hash_small(
+                    &request.matrix_type,
+                    request.key,
+                    &request.tag,
+                    request.variant,
+                    (&layout.0, layout.1),
+                )
+            })
+            .collect()
+    }
+
     fn sample_hash_batch(
         &mut self,
         requests: Vec<HashSampleRequest>,
@@ -1095,22 +1129,106 @@ where
         max_coefficient_bound: &BigInt,
         trapdoor: &T::Trapdoor,
         public: &M,
-        target: &M,
-    ) -> Result<M, Self::Error> {
+        target: &dyn PolyMatrixColumnSource<M>,
+        randomness_seed: [u8; 32],
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        self.validate_preimage_bound(ty, sigma, gadget_base, digit_count, max_coefficient_bound)?;
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
         let max_coefficient_bound =
             max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         let sampler = T::new(parameters, sigma);
-        Ok(sample_bounded_candidate(&max_coefficient_bound, || {
-            sampler.preimage(parameters, trapdoor, public, target)
-        }))
+        Ok(sampler.preimage(
+            parameters,
+            trapdoor,
+            public,
+            target,
+            max_coefficient_bound,
+            randomness_seed,
+        )?)
+    }
+
+    fn preimage_target(
+        &mut self,
+        value: Arc<M>,
+    ) -> Result<(Arc<dyn PolyMatrixColumnSource<M>>, Arc<Vec<u8>>), Self::Error> {
+        let rows = value.row_size();
+        let columns = value.col_size();
+        let params = value.params().clone();
+        let bytes = Arc::new(
+            Arc::try_unwrap(value)
+                .map(|value| value.into_cpu_staging_bytes())
+                .unwrap_or_else(|value| value.as_ref().to_cpu_staging_bytes()),
+        );
+        Ok((Arc::new(PreimageTarget::staged(params, rows, columns, bytes.clone())), bytes))
+    }
+
+    fn matrix_from_cpu_staging_bytes(
+        &self,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<M, Self::Error> {
+        Ok(M::from_cpu_staging_bytes(self.parameters(ty)?, bytes))
+    }
+
+    fn preimage_target_from_staging(
+        &self,
+        ty: &ConcreteMatrixType,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<Arc<dyn PolyMatrixColumnSource<M>>, Self::Error> {
+        let params = self.parameters(ty)?.clone();
+        Ok(Arc::new(PreimageTarget::staged(params, rows, columns, bytes)))
+    }
+
+    fn validate_preimage_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        max_coefficient_bound: &BigInt,
+    ) -> Result<(), Self::Error> {
+        let parameters = self.parameters(ty)?;
+        let base = gadget_base.to_u32().ok_or(PolyBackendError::InvalidInteger)?;
+        let public_rows = ty
+            .rows
+            .checked_div(digit_count.checked_add(2).ok_or(PolyBackendError::InvalidInteger)?)
+            .filter(|rows| *rows > 0)
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        let minimum = default_preimage_cutoff(
+            parameters.ring_dimension(),
+            public_rows,
+            parameters.modulus_digits(),
+            base,
+            sigma,
+        )
+        .ok_or(PolyBackendError::InvalidInteger)?;
+        let requested =
+            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
+        if requested < minimum {
+            return Err(PolyBackendError::PreimageBoundTooSmall {
+                requested: max_coefficient_bound.clone(),
+                minimum: BigInt::from_biguint(Sign::Plus, minimum),
+            });
+        }
+        Ok(())
     }
 
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<PreimageRequest<M, T::Trapdoor>>,
-    ) -> Result<Vec<M>, Self::Error> {
+    ) -> Result<Vec<M::SmallMatrix>, Self::Error> {
+        for request in &requests {
+            self.validate_preimage_bound(
+                &request.matrix_type,
+                request.sigma,
+                &request.gadget_base,
+                request.digit_count,
+                &request.max_coefficient_bound,
+            )?;
+        }
         self.preimage_batch_calls += 1;
         #[cfg(test)]
         self.preimage_batch_sizes.push(requests.len());
@@ -1127,7 +1245,8 @@ where
                         &request.max_coefficient_bound,
                         &request.trapdoor,
                         &request.public,
-                        &request.target,
+                        request.target.as_ref(),
+                        request.randomness_seed,
                     )
                 })
                 .collect()
@@ -1141,7 +1260,18 @@ where
     fn sample_preimage_batches_by_placement(
         &mut self,
         batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
-    ) -> Result<Vec<(usize, Vec<M>)>, Self::Error> {
+    ) -> Result<Vec<(usize, Vec<M::SmallMatrix>)>, Self::Error> {
+        for (_, requests) in &batches {
+            for request in requests {
+                self.validate_preimage_bound(
+                    &request.matrix_type,
+                    request.sigma,
+                    &request.gadget_base,
+                    request.digit_count,
+                    &request.max_coefficient_bound,
+                )?;
+            }
+        }
         self.preimage_batch_calls += batches.len();
         #[cfg(test)]
         self.preimage_batch_sizes.extend(batches.iter().map(|(_, requests)| requests.len()));
@@ -1168,6 +1298,7 @@ where
                                 request.trapdoor.as_ref(),
                                 request.public.as_ref(),
                                 request.target.as_ref(),
+                                request.randomness_seed,
                             )
                         })
                         .collect::<Result<Vec<_>, _>>()
@@ -1179,8 +1310,8 @@ where
         }
     }
 
-    fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M, Self::Error> {
-        Ok(if small { value.small_decompose() } else { value.decompose() })
+    fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M::SmallMatrix, Self::Error> {
+        Ok(value.clone().gadget_decompose(small)?)
     }
 
     fn extract_coefficient(&mut self, value: &M, position: usize) -> Result<BigInt, Self::Error> {
@@ -1312,7 +1443,7 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
 mod tests {
     use super::*;
     use mxx_primitives::{
-        matrix::dcrt_poly::DCRTPolyMatrix,
+        matrix::{CpuSmallMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::poly::DCRTPoly},
     };
 
@@ -1348,73 +1479,145 @@ mod tests {
         let sampled = sample_bounded_candidate(&BigUint::from(2u8), || {
             draws += 1;
             if draws == 1 { rejected.clone() } else { accepted.clone() }
-        });
+        })
+        .expect("bounded candidate");
         assert_eq!(draws, 2);
         assert_eq!(sampled, accepted);
     }
 
     #[test]
-    fn chunked_preimage_apply_matches_full_product_for_nondivisible_width() {
-        let parameters = DCRTPolyParams::new(4, 1, 10, 5);
-        let polynomial =
-            |value: u8| DCRTPoly::from_biguint_to_constant(&parameters, BigUint::from(value));
-        let left =
-            DCRTPolyMatrix::from_poly_vec(&parameters, vec![vec![polynomial(2), polynomial(3)]]);
-        let right = DCRTPolyMatrix::from_poly_vec(
-            &parameters,
+    fn compact_small_matrix_moves_between_parameter_placements_without_shape_loss() {
+        let source_parameters = DCRTPolyParams::new(4, 1, 10, 2);
+        // The modulus and ring are identical, while the placement-specific
+        // gadget base differs. This forces the compact-owner transfer path
+        // without changing the logical matrix schema.
+        let target_parameters = DCRTPolyParams::new(4, 1, 10, 5);
+        let source_matrix = DCRTPolyMatrix::from_poly_vec(
+            &source_parameters,
             vec![
-                vec![polynomial(1), polynomial(2), polynomial(3)],
-                vec![polynomial(4), polynomial(5), polynomial(6)],
+                vec![
+                    DCRTPoly::from_biguints(
+                        &source_parameters,
+                        &[
+                            BigUint::from(1u8),
+                            BigUint::from(2u8),
+                            BigUint::from(3u8),
+                            BigUint::from(4u8),
+                        ],
+                    ),
+                    DCRTPoly::from_biguints(
+                        &source_parameters,
+                        &[
+                            BigUint::from(5u8),
+                            BigUint::from(6u8),
+                            BigUint::from(7u8),
+                            BigUint::from(8u8),
+                        ],
+                    ),
+                    DCRTPoly::from_biguints(
+                        &source_parameters,
+                        &[
+                            BigUint::from(9u8),
+                            BigUint::from(10u8),
+                            BigUint::from(11u8),
+                            BigUint::from(12u8),
+                        ],
+                    ),
+                ],
+                vec![
+                    DCRTPoly::from_biguints(
+                        &source_parameters,
+                        &[
+                            BigUint::from(13u8),
+                            BigUint::from(14u8),
+                            BigUint::from(15u8),
+                            BigUint::from(16u8),
+                        ],
+                    ),
+                    DCRTPoly::from_biguints(
+                        &source_parameters,
+                        &[
+                            BigUint::from(17u8),
+                            BigUint::from(18u8),
+                            BigUint::from(19u8),
+                            BigUint::from(20u8),
+                        ],
+                    ),
+                    DCRTPoly::from_biguints(
+                        &source_parameters,
+                        &[
+                            BigUint::from(21u8),
+                            BigUint::from(22u8),
+                            BigUint::from(23u8),
+                            BigUint::from(24u8),
+                        ],
+                    ),
+                ],
             ],
         );
-        let matrix_type = ConcreteMatrixType {
-            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()),
-            ring_dimension: 4,
-            rows: 2,
-            columns: 3,
-        };
-        let chunks = [(0, 2), (2, 3)]
-            .into_iter()
-            .map(|(start, end)| {
-                let chunk = right.slice(0, 2, start, end);
-                crate::backend::PreimageColumnChunk {
-                    start,
-                    columns: end - start,
-                    bytes: chunk.to_compact_bytes(),
-                }
-            })
-            .collect();
-        let preimage = ChunkedPreimage { matrix_type, chunks };
-        let mut backend = cpu_backend([parameters]);
+        let owner =
+            CpuSmallMatrix::new(source_matrix, BigUint::from(24u8)).expect("source compact owner");
+        let source_payload = owner.to_canonical_coefficients().expect("source payload");
+        let mut backend = CpuDcrtBackend::default();
+        backend.parameters.push(BTreeMap::new());
+        backend.register_at(0, source_parameters.clone());
+        backend.register_at(1, target_parameters.clone());
 
-        let actual =
-            backend.apply_chunked_preimage(&left, &preimage).expect("apply chunked preimage");
-        assert_eq!(actual, &left * &right);
+        assert!(backend.set_active_placement(0));
+        assert!(backend.small_matrix_is_on_active_placement(&owner));
+        assert!(backend.set_active_placement(1));
+        assert!(!backend.small_matrix_is_on_active_placement(&owner));
+        let moved =
+            backend.small_matrix_to_active_placement(&owner).expect("compact placement transfer");
+
+        assert_eq!(moved.params(), &target_parameters);
+        assert_eq!(moved.size(), owner.size());
+        assert_eq!(moved.max_coefficient_bound(), owner.max_coefficient_bound());
+        assert_eq!(moved.to_canonical_coefficients().expect("target payload"), source_payload);
     }
 
     #[test]
-    fn direct_mul_decompose_matches_explicit_materialization() {
-        let parameters = DCRTPolyParams::new(4, 1, 10, 5);
-        let polynomial =
-            |value: u8| DCRTPoly::from_biguint_to_constant(&parameters, BigUint::from(value));
-        let left = DCRTPolyMatrix::from_poly_vec(
-            &parameters,
-            vec![vec![polynomial(2), polynomial(3), polynomial(4), polynomial(5)]],
+    fn preimage_cutoff_accepts_authoritative_minimum() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let digit_count = parameters.modulus_digits();
+        let matrix_type = ConcreteMatrixType {
+            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()),
+            ring_dimension: parameters.ring_dimension() as usize,
+            rows: digit_count + 2,
+            columns: 1,
+        };
+        let backend = cpu_backend([parameters]);
+        let minimum = default_preimage_cutoff(
+            matrix_type.ring_dimension as u32,
+            1,
+            digit_count,
+            1u32 << 4,
+            5.0,
+        )
+        .expect("cutoff");
+        let minimum = BigInt::from_biguint(Sign::Plus, minimum);
+        assert!(
+            backend
+                .validate_preimage_bound(
+                    &matrix_type,
+                    5.0,
+                    &BigInt::from(1u32 << 4),
+                    digit_count,
+                    &minimum,
+                )
+                .is_ok()
         );
-        let right = DCRTPolyMatrix::from_poly_vec(
-            &parameters,
-            vec![vec![polynomial(1), polynomial(2)], vec![polynomial(4), polynomial(5)]],
-        );
-        let mut backend = cpu_backend([parameters]);
-
-        let direct = backend.mul_decompose(&left, &right, false).expect("direct decomposition");
-        let explicit = left.multiply_out_of_place(&right.decompose());
-        assert_eq!(direct, explicit);
-
-        let direct_small =
-            backend.mul_decompose(&left, &right, true).expect("direct small decomposition");
-        let explicit_small = left.multiply_out_of_place(&right.small_decompose());
-        assert_eq!(direct_small, explicit_small);
+        let below = &minimum - 1;
+        assert!(matches!(
+            backend.validate_preimage_bound(
+                &matrix_type,
+                5.0,
+                &BigInt::from(1u32 << 4),
+                digit_count,
+                &below,
+            ),
+            Err(PolyBackendError::PreimageBoundTooSmall { .. })
+        ));
     }
 
     #[test]
@@ -1449,6 +1652,40 @@ mod tests {
 
         assert_eq!(decomposed, plain.decompose());
         assert_eq!(small_decomposed, plain.small_decompose());
+
+        let expected_decomposed = backend
+            .sample_hash_small(&decomposed_type, key, tag, HashVariant::Decomposed, (&base, digits))
+            .expect("decomposed owner");
+        let expected_small = backend
+            .sample_hash_small(
+                &decomposed_type,
+                key,
+                tag,
+                HashVariant::SmallDecomposed,
+                (&base, digits),
+            )
+            .expect("small owner");
+        let batched = backend
+            .sample_hash_small_batch(vec![
+                HashSampleRequest {
+                    matrix_type: decomposed_type.clone(),
+                    key,
+                    tag: tag.to_vec(),
+                    variant: HashVariant::Decomposed,
+                    gadget_layout: Some((base.clone(), digits)),
+                },
+                HashSampleRequest {
+                    matrix_type: decomposed_type.clone(),
+                    key,
+                    tag: tag.to_vec(),
+                    variant: HashVariant::SmallDecomposed,
+                    gadget_layout: Some((base.clone(), digits)),
+                },
+            ])
+            .expect("batched compact hashes");
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[0], expected_decomposed);
+        assert_eq!(batched[1], expected_small);
     }
 
     #[test]

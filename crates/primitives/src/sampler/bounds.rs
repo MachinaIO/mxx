@@ -24,6 +24,31 @@ pub fn hard_cutoff_from_sigma_bound(sigma_bound: &BigDecimal) -> BigUint {
         .expect("nonnegative cutoff must convert to BigUint")
 }
 
+/// Returns the authoritative minimum inclusive bound accepted by preimage
+/// sampling for the supplied concrete sampler parameters.
+pub fn default_preimage_cutoff(
+    ring_dimension: u32,
+    public_rows: usize,
+    modulus_digits: usize,
+    base: u32,
+    sigma: f64,
+) -> Option<BigUint> {
+    if ring_dimension == 0 ||
+        public_rows == 0 ||
+        modulus_digits == 0 ||
+        base == 0 ||
+        !sigma.is_finite() ||
+        sigma <= 0.0
+    {
+        return None;
+    }
+    let m_g = public_rows.checked_mul(modulus_digits)?.try_into().ok()?;
+    let ring_dim_sqrt = BigDecimal::from_u32(ring_dimension)?.sqrt()?;
+    let base = BigDecimal::from_u32(base)?;
+    let preimage_sigma = compute_preimage_sigma(&ring_dim_sqrt, m_g, &base, None, Some(sigma));
+    Some(hard_cutoff_from_sigma_bound(&preimage_sigma))
+}
+
 pub fn centered_coefficient_abs(value: &BigUint, modulus: &BigUint) -> BigUint {
     debug_assert!(value < modulus, "ring residue must be reduced");
     let negative_magnitude = modulus - value;

@@ -31,6 +31,10 @@ pub struct Aky24IoConfig {
     pub fhe_error_sigma: RealExpr,
     /// Appendix B.1 error distribution for every `e_att` block.
     pub attribute_error_sigma: RealExpr,
+    /// Explicit coefficient cutoff carried by every AKY24 preimage artifact
+    /// and trapdoor sampler.  This is part of the protocol configuration;
+    /// graph construction must never substitute an unrelated default.
+    pub preimage_max_coefficient_bound: BigInt,
     pub security_parameter_bits: usize,
     pub cascade_randomness_bits: usize,
     /// Random bits used by each bounded inverse-CDF discrete-Gaussian sample
@@ -75,7 +79,8 @@ impl Aky24IoConfig {
             self.gaussian_sample_bits == 0 ||
             self.gaussian_sample_bits > 52 ||
             self.uniform_statistical_bits == 0 ||
-            self.function.output_bits == 0
+            self.function.output_bits == 0 ||
+            self.preimage_max_coefficient_bound <= BigInt::from(0)
         {
             return Err(Aky24ConfigError::NonPositiveParameter);
         }
@@ -144,6 +149,7 @@ mod tests {
             b_error_sigma: RealExpr::from_integer(1),
             fhe_error_sigma: RealExpr::from_integer(1),
             attribute_error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             security_parameter_bits: 128,
             cascade_randomness_bits: 128,
             gaussian_sample_bits: 16,
@@ -219,5 +225,14 @@ mod tests {
         unevaluable.trapdoor_sigma =
             RealExpr::Div(Box::new(RealExpr::from_integer(1)), Box::new(RealExpr::from_integer(0)));
         assert_eq!(unevaluable.validate(), Err(Aky24ConfigError::InvalidGaussianSigma));
+    }
+
+    #[test]
+    fn preimage_cutoff_must_be_strictly_positive() {
+        let mut invalid = config();
+        invalid.preimage_max_coefficient_bound = BigInt::from(0);
+        assert_eq!(invalid.validate(), Err(Aky24ConfigError::NonPositiveParameter));
+        invalid.preimage_max_coefficient_bound = BigInt::from(-1);
+        assert_eq!(invalid.validate(), Err(Aky24ConfigError::NonPositiveParameter));
     }
 }

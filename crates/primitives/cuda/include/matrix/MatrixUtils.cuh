@@ -25,6 +25,13 @@ int matrix_track_limb_consumer(
     const dim3 &limb_id,
     int consumer_device,
     cudaStream_t consumer_stream);
+// Adds only the producer-to-consumer wait edge. This read-only path must not
+// transfer ownership or defer the source allocation's release.
+int matrix_track_limb_consumer_readonly(
+    const GpuMatrix *src,
+    const dim3 &limb_id,
+    int consumer_device,
+    cudaStream_t consumer_stream);
 int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream);
 // Installs an already-recorded completion event as the limb's write event.
 // Ownership of `event` transfers to `dst` on success.

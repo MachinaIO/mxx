@@ -9,8 +9,8 @@
 //! A package stores the GSW matrix `C` satisfying `t C = y v G + e_C` for
 //! payload secret `t`, target secret `v`, and scalar/input value `y`. Fuse uses
 //! `c G^{-1}(C)` and therefore needs concrete C itself; import validates its
-//! production, public role, concrete matrix type, and sampler identities
-//! without loading private companion encodings.
+//! production, public role, and concrete matrix type against the caller's
+//! source/target sampler layouts, without loading private companion encodings.
 
 use crate::encoding::ExponentArtifactImportError;
 use mxx_dsl::Mat;
@@ -120,15 +120,17 @@ impl ExponentRhsPackage {
     }
 
     /// Imports the fixed ciphertext after checking its manifest identity and
-    /// concrete matrix type. No companion artifact is accepted or loaded.
+    /// concrete matrix type. The ciphertext `C` is an ordinary matrix: its
+    /// coefficients live in the full ciphertext modulus and therefore it is
+    /// not a bounded compact `SmallMatrix` artifact. The bounded object is
+    /// the gadget decomposition used by `mul_small_rhs`, which is derived
+    /// from this imported ciphertext at the operation boundary.
     pub fn artifact_input(
         production_id: ProductionId,
         manifest: &Manifest,
         names: ExponentRhsPackageArtifactNames,
         expected_source: &mxx_bgg::BggSamplerLayout,
-        expected_source_identity: [u8; 32],
         expected_target: &mxx_bgg::BggSamplerLayout,
-        expected_target_identity: [u8; 32],
     ) -> Result<Self, ExponentArtifactImportError> {
         if manifest.ir_version != mxx_ir_core::encoding::IR_VERSION {
             return Err(ExponentArtifactImportError::InvalidMetadata);
@@ -147,47 +149,34 @@ impl ExponentRhsPackage {
         }
         mxx_ir_core::artifact::validate_manifest(manifest)
             .map_err(|_| ExponentArtifactImportError::InvalidMetadata)?;
-        let metadata: ManifestRhsMetadata = serde_json::from_str(
-            artifact.layout.as_deref().ok_or(ExponentArtifactImportError::InvalidMetadata)?,
-        )
-        .map_err(|_| ExponentArtifactImportError::InvalidMetadata)?;
-        let source = metadata.source.sampler();
-        let target = metadata.target.sampler();
-        let modulus = source
+        let modulus = expected_source
             .modulus
             .evaluate(&ParamEnv::default())
             .map_err(|_| ExponentArtifactImportError::MatrixTypeMismatch)?;
-        let ring_dimension = source
+        let ring_dimension = expected_source
             .ring_dimension
             .evaluate(&ParamEnv::default())
             .ok()
             .and_then(|value| value.to_usize())
             .ok_or(ExponentArtifactImportError::MatrixTypeMismatch)?;
-        let target_columns = target
+        let target_columns = expected_target
             .secret_dimension
-            .checked_mul(target.digit_count)
+            .checked_mul(expected_target.digit_count)
             .filter(|columns| *columns > 0)
             .ok_or(ExponentArtifactImportError::MatrixTypeMismatch)?;
         let expected = ArtifactType::Matrix(ConcreteMatrixType {
             modulus,
             ring_dimension,
-            rows: source.secret_dimension,
+            rows: expected_source.secret_dimension,
             columns: target_columns,
         });
         if artifact.artifact_type != expected {
             return Err(ExponentArtifactImportError::MatrixTypeMismatch);
         }
-        if metadata.source.identity != expected_source_identity ||
-            metadata.target.identity != expected_target_identity ||
-            metadata.source.sampler() != *expected_source ||
-            metadata.target.sampler() != *expected_target
-        {
-            return Err(ExponentArtifactImportError::InvalidMetadata);
-        }
-        let ciphertext = source.ring().artifact_input(
+        let ciphertext = expected_source.ring().artifact_input(
             production_id,
             names.gsw_ciphertext,
-            (source.secret_dimension, target_columns),
+            (expected_source.secret_dimension, target_columns),
             ArtifactConfidentiality::Public,
         );
         Self::new(ciphertext).map_err(|_| ExponentArtifactImportError::MatrixTypeMismatch)
@@ -228,38 +217,12 @@ mod tests {
         }
     }
 
-    fn manifest_fixture() -> (
-        ProductionId,
-        Manifest,
-        ExponentRhsPackageArtifactNames,
-        BggSamplerLayout,
-        [u8; 32],
-        BggSamplerLayout,
-        [u8; 32],
-    ) {
+    fn manifest_fixture()
+    -> (ProductionId, Manifest, ExponentRhsPackageArtifactNames, BggSamplerLayout, BggSamplerLayout)
+    {
         let production_id = ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] };
         let source = sampler(4);
         let target = sampler(8);
-        let source_identity = [3; 32];
-        let target_identity = [4; 32];
-        let metadata = ManifestRhsMetadata {
-            source: ManifestSecretMetadata {
-                modulus: source.modulus.clone(),
-                ring_dimension: source.ring_dimension.clone(),
-                secret_dimension: source.secret_dimension,
-                digit_count: source.digit_count,
-                gadget_base: source.gadget_base.clone(),
-                identity: source_identity,
-            },
-            target: ManifestSecretMetadata {
-                modulus: target.modulus.clone(),
-                ring_dimension: target.ring_dimension.clone(),
-                secret_dimension: target.secret_dimension,
-                digit_count: target.digit_count,
-                gadget_base: target.gadget_base.clone(),
-                identity: target_identity,
-            },
-        };
         let artifact = ManifestArtifact {
             artifact_type: ArtifactType::Matrix(ConcreteMatrixType {
                 modulus: 97.into(),
@@ -270,7 +233,7 @@ mod tests {
             family_shape: None,
             confidentiality: ArtifactConfidentiality::Public,
             content_hash: Some([5; 32]),
-            layout: Some(serde_json::to_string(&metadata).unwrap()),
+            layout: None,
         };
         let names = ExponentRhsPackageArtifactNames { gsw_ciphertext: ARTIFACT_NAME.to_owned() };
         let manifest = Manifest {
@@ -278,20 +241,17 @@ mod tests {
             production_id: production_id.clone(),
             artifacts: BTreeMap::from([(ARTIFACT_NAME.to_owned(), artifact)]),
         };
-        (production_id, manifest, names, source, source_identity, target, target_identity)
+        (production_id, manifest, names, source, target)
     }
 
     fn import_fixture() -> (ExponentRhsPackage, ProductionId, Manifest) {
-        let (production_id, manifest, names, source, source_identity, target, target_identity) =
-            manifest_fixture();
+        let (production_id, manifest, names, source, target) = manifest_fixture();
         let package = ExponentRhsPackage::artifact_input(
             production_id.clone(),
             &manifest,
             names,
             &source,
-            source_identity,
             &target,
-            target_identity,
         )
         .unwrap();
         (package, production_id, manifest)
@@ -311,65 +271,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_source_identity_or_layout() {
-        let (production_id, manifest, names, source, source_identity, target, target_identity) =
-            manifest_fixture();
-        let wrong_identity = ExponentRhsPackage::artifact_input(
-            production_id.clone(),
-            &manifest,
-            names.clone(),
-            &source,
-            [9; 32],
-            &target,
-            target_identity,
-        );
-        assert!(matches!(wrong_identity, Err(ExponentArtifactImportError::InvalidMetadata)));
-
+    fn rejects_wrong_source_matrix_schema() {
+        let (production_id, manifest, names, _, target) = manifest_fixture();
         let wrong_layout = sampler(16);
+        let mut wrong_layout = wrong_layout;
+        wrong_layout.ring_dimension = 8.into();
         let wrong_layout = ExponentRhsPackage::artifact_input(
             production_id,
             &manifest,
             names,
             &wrong_layout,
-            source_identity,
             &target,
-            target_identity,
         );
-        assert!(matches!(wrong_layout, Err(ExponentArtifactImportError::InvalidMetadata)));
+        assert!(matches!(wrong_layout, Err(ExponentArtifactImportError::MatrixTypeMismatch)));
     }
 
     #[test]
-    fn rejects_wrong_target_identity_or_layout() {
-        let (production_id, manifest, names, source, source_identity, target, target_identity) =
-            manifest_fixture();
-        let wrong_identity = ExponentRhsPackage::artifact_input(
-            production_id.clone(),
-            &manifest,
-            names.clone(),
-            &source,
-            source_identity,
-            &target,
-            [9; 32],
-        );
-        assert!(matches!(wrong_identity, Err(ExponentArtifactImportError::InvalidMetadata)));
-
+    fn rejects_wrong_target_matrix_schema() {
+        let (production_id, manifest, names, source, _) = manifest_fixture();
         let wrong_layout = sampler(16);
+        let mut wrong_layout = wrong_layout;
+        wrong_layout.secret_dimension = 3;
         let wrong_layout = ExponentRhsPackage::artifact_input(
             production_id,
             &manifest,
             names,
             &source,
-            source_identity,
             &wrong_layout,
-            target_identity,
         );
-        assert!(matches!(wrong_layout, Err(ExponentArtifactImportError::InvalidMetadata)));
+        assert!(matches!(wrong_layout, Err(ExponentArtifactImportError::MatrixTypeMismatch)));
     }
 
     #[test]
     fn rejects_wrong_confidentiality_and_matrix_type() {
-        let (production_id, mut manifest, names, source, source_identity, target, target_identity) =
-            manifest_fixture();
+        let (production_id, mut manifest, names, source, target) = manifest_fixture();
         manifest.artifacts.get_mut(ARTIFACT_NAME).unwrap().confidentiality =
             ArtifactConfidentiality::Private;
         assert!(matches!(
@@ -378,9 +313,7 @@ mod tests {
                 &manifest,
                 names.clone(),
                 &source,
-                source_identity,
                 &target,
-                target_identity,
             ),
             Err(ExponentArtifactImportError::ConfidentialityMismatch)
         ));
@@ -394,15 +327,7 @@ mod tests {
             columns: 1,
         });
         assert!(matches!(
-            ExponentRhsPackage::artifact_input(
-                production_id,
-                &manifest,
-                names,
-                &source,
-                source_identity,
-                &target,
-                target_identity,
-            ),
+            ExponentRhsPackage::artifact_input(production_id, &manifest, names, &source, &target,),
             Err(ExponentArtifactImportError::MatrixTypeMismatch)
         ));
     }

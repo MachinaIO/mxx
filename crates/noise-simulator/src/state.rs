@@ -392,6 +392,9 @@ pub fn preimage_sample(
     cutoff: &BigInt,
 ) -> Result<MatrixState, StateError> {
     let cutoff = cutoff.to_biguint().ok_or(StateError::NegativeCutoff)?;
+    // The sampler cutoff bounds the integer candidate, while the simulator
+    // tracks the centered residue actually represented in the ring. Keep the
+    // cap here so every later right-action gain uses the representable bound.
     MatrixState::new(0u8.into(), modulus_cap(matrix, cutoff)?, false)
 }
 
@@ -488,6 +491,14 @@ mod tests {
         let small = gadget_decomposition(&ty(8), &4.into(), true, 3).unwrap();
         assert_eq!(regular.coefficient_magnitude_bound, 2u8.into());
         assert_eq!(small.coefficient_magnitude_bound, 3u8.into());
+    }
+
+    #[test]
+    fn preimage_sample_caps_represented_bound_at_centered_residue_limit() {
+        let sampled = preimage_sample(&ty(8), &BigInt::from(99)).unwrap();
+        assert_eq!(sampled.error_bound, BigUint::ZERO);
+        assert_eq!(sampled.coefficient_magnitude_bound, BigUint::from(8u8));
+        assert_eq!(preimage_sample(&ty(8), &BigInt::from(-1)), Err(StateError::NegativeCutoff));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use mxx_primitives::{
-    poly::dcrt::params::DCRTPolyParams,
+    matrix::{PolyMatrix, ResidentPolyMatrixColumnSource},
+    poly::{PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{
-        DistType, PolyTrapdoorSampler, PolyUniformSampler, trapdoor::DCRTPolyTrapdoorSampler,
-        uniform::DCRTPolyUniformSampler,
+        DistType, PolyTrapdoorSampler, PolyUniformSampler, bounds::default_preimage_cutoff,
+        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
 };
 use std::{hint::black_box, time::Instant};
@@ -25,7 +26,18 @@ fn bench_cpu_preimage() {
         uniform_sampler.sample_uniform(&params, TRAPDOOR_SIZE, TARGET_COLS, DistType::FinRingDist);
 
     let start = Instant::now();
-    let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+    let bound = default_preimage_cutoff(
+        params.ring_dimension(),
+        public_matrix.row_size(),
+        params.modulus_digits(),
+        1u32 << params.base_bits(),
+        SIGMA,
+    )
+    .expect("preimage cutoff");
+    let target_source = ResidentPolyMatrixColumnSource::new(target);
+    let preimage = trapdoor_sampler
+        .preimage(&params, &trapdoor, &public_matrix, &target_source, bound, rand::random())
+        .expect("compact preimage sampling");
     let elapsed = start.elapsed();
     black_box(preimage);
 

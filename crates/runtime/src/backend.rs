@@ -3,8 +3,12 @@ use mxx_ir_core::{
     node::{ConcatAxis, ConstantMatrix, HashVariant},
     types::ConcreteMatrixType,
 };
+use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnSource};
 use num_bigint::BigInt;
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 
 pub mod poly;
 #[cfg(feature = "gpu")]
@@ -19,25 +23,78 @@ pub struct PreimageRequest<M, T> {
     pub max_coefficient_bound: BigInt,
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,
-    pub target: Arc<M>,
+    pub target: Arc<dyn PolyMatrixColumnSource<M>>,
+    /// Stable cryptographic domain seed for this logical preimage request.
+    /// The sampler derives tile/attempt seeds from this value, so storage
+    /// tiling and placement do not change the sampled result.
+    pub randomness_seed: [u8; 32],
 }
 
-/// Host-backed consecutive columns of a typed preimage relation.
-///
-/// Each payload is an ordinary backend matrix serialization for the recorded
-/// column range. Keeping the chunks outside `Backend::Matrix` prevents a
-/// sampled `O((log q)^2)` witness from remaining resident on one GPU.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChunkedPreimage {
-    pub matrix_type: ConcreteMatrixType,
-    pub chunks: Vec<PreimageColumnChunk>,
+/// Full logical preimage target whose expanded columns are loaded on demand.
+/// The staged constructor owns host bytes, allowing a GPU owner to be dropped
+/// before sampling while preserving the original matrix dimensions.
+pub struct PreimageTarget<M> {
+    rows: usize,
+    columns: usize,
+    loader: Arc<dyn Fn(usize, usize) -> M + Send + Sync>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreimageColumnChunk {
-    pub start: usize,
-    pub columns: usize,
-    pub bytes: Vec<u8>,
+impl<M> Clone for PreimageTarget<M> {
+    fn clone(&self) -> Self {
+        Self { rows: self.rows, columns: self.columns, loader: self.loader.clone() }
+    }
+}
+
+impl<M> Debug for PreimageTarget<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreimageTarget")
+            .field("rows", &self.rows)
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> PreimageTarget<M>
+where
+    M: PolyMatrix + 'static,
+{
+    pub fn staged(
+        params: <M::P as mxx_primitives::poly::Poly>::Params,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Self {
+        let loader = Arc::new(move |start: usize, end: usize| {
+            M::from_cpu_staging_columns(&params, bytes.as_slice(), start, end)
+        });
+        Self { rows, columns, loader }
+    }
+
+    pub fn resident(value: Arc<M>) -> Self {
+        let rows = value.row_size();
+        let columns = value.col_size();
+        let loader = Arc::new(move |start: usize, end: usize| value.slice_columns(start, end));
+        Self { rows, columns, loader }
+    }
+}
+
+impl<M> PolyMatrixColumnSource<M> for PreimageTarget<M>
+where
+    M: PolyMatrix + 'static,
+{
+    fn row_size(&self) -> usize {
+        self.rows
+    }
+
+    fn col_size(&self) -> usize {
+        self.columns
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> M {
+        assert!(start <= end && end <= self.columns, "invalid preimage target column interval");
+        (self.loader)(start, end)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +140,10 @@ pub struct HashSampleRequest {
 }
 
 pub trait Backend {
-    type Matrix: Clone + Debug + PartialEq + Send + Sync;
+    type Matrix: Clone + Debug + PartialEq + Send + Sync + 'static;
+    /// Compact bounded-RHS storage.  Semantic kind is carried by validated
+    /// wire/artifact metadata, never by this backend storage type.
+    type SmallMatrix: Clone + Debug + PartialEq + Send + Sync;
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -105,6 +165,22 @@ pub trait Backend {
     fn matrix_is_on_active_placement(&self, _value: &Self::Matrix) -> bool {
         true
     }
+    fn small_matrix_to_active_placement(
+        &mut self,
+        value: &Self::SmallMatrix,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        Ok(value.clone())
+    }
+    fn small_matrix_is_on_active_placement(&self, _value: &Self::SmallMatrix) -> bool {
+        true
+    }
+    fn small_matrix_matches_schema(
+        &self,
+        _value: &Self::SmallMatrix,
+        _schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+    ) -> bool {
+        true
+    }
     /// Waits only for releases queued on backend-owned release streams.
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
         Ok(())
@@ -122,6 +198,26 @@ pub trait Backend {
                     None
                 } else {
                     Some(self.matrix_to_active_placement(value)?)
+                });
+            }
+            Ok(placed)
+        })();
+        assert!(self.set_active_placement(original), "backend rejected its active placement");
+        result
+    }
+    fn small_matrix_to_placements(
+        &mut self,
+        value: &Self::SmallMatrix,
+    ) -> Result<Vec<Option<Self::SmallMatrix>>, Self::Error> {
+        let original = self.active_placement();
+        let result = (|| {
+            let mut placed = Vec::with_capacity(self.placement_count());
+            for placement in 0..self.placement_count() {
+                assert!(self.set_active_placement(placement), "backend rejected its own placement");
+                placed.push(if self.small_matrix_is_on_active_placement(value) {
+                    None
+                } else {
+                    Some(self.small_matrix_to_active_placement(value)?)
                 });
             }
             Ok(placed)
@@ -198,62 +294,43 @@ pub trait Backend {
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
     }
-    /// Applies a gadget decomposition and multiplication without materializing
-    /// the decomposed right-hand matrix.  Backends must implement this using
-    /// their native column-chunked primitive.
-    fn mul_decompose(
+
+    /// Multiplies a full matrix by a complete bounded RHS owner.  Column
+    /// tiling, if needed, is entirely internal to the backend operation.
+    fn multiply_small_rhs(
         &mut self,
         left: &Self::Matrix,
-        right: &Self::Matrix,
-        small: bool,
+        right: &Self::SmallMatrix,
     ) -> Result<Self::Matrix, Self::Error>;
-    fn mul_decompose_batch(
+    fn multiply_small_rhs_batch(
         &mut self,
-        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>, bool)>,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::SmallMatrix>)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
-        inputs
-            .into_iter()
-            .map(|(left, right, small)| self.mul_decompose(&left, &right, small))
-            .collect()
+        inputs.into_iter().map(|(left, right)| self.multiply_small_rhs(&left, &right)).collect()
     }
-    /// Applies a host-backed typed preimage one consecutive column chunk at a time.
-    fn apply_chunked_preimage(
-        &mut self,
-        left: &Self::Matrix,
-        preimage: &ChunkedPreimage,
-    ) -> Result<Self::Matrix, Self::Error> {
-        let mut products = Vec::with_capacity(preimage.chunks.len());
-        for chunk in &preimage.chunks {
-            let mut chunk_type = preimage.matrix_type.clone();
-            chunk_type.columns = chunk.columns;
-            let right = self.matrix_from_bytes(&chunk_type, &chunk.bytes)?;
-            products.push(self.multiply(left, &right)?);
-        }
-        let references = products.iter().collect::<Vec<_>>();
-        self.concat(&references, ConcatAxis::Columns)
+
+    /// Decodes one complete canonical bounded artifact into its owner.
+    /// Backends with a compact codec should override this method.  The default
+    /// is useful for simple test backends whose matrix serialization already is
+    /// their canonical representation.
+    fn small_matrix_from_bytes(
+        &self,
+        expected_schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+        bytes: &[u8],
+        expected_semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
+
+    /// Encodes a bounded owner using the canonical artifact representation.
+    fn small_matrix_to_bytes(
+        &self,
+        value: &Self::SmallMatrix,
+        expected_schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
+        semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
+    ) -> Result<Vec<u8>, Self::Error>;
+    fn small_matrix_to_untyped_bytes(&self, value: &Self::SmallMatrix) -> Vec<u8> {
+        format!("{value:?}").into_bytes()
     }
-    fn apply_chunked_preimage_batch(
-        &mut self,
-        inputs: Vec<(Arc<Self::Matrix>, Arc<ChunkedPreimage>)>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
-        inputs
-            .into_iter()
-            .map(|(left, preimage)| self.apply_chunked_preimage(&left, &preimage))
-            .collect()
-    }
-    fn materialize_chunked_preimage(
-        &mut self,
-        preimage: &ChunkedPreimage,
-    ) -> Result<Self::Matrix, Self::Error> {
-        let mut matrices = Vec::with_capacity(preimage.chunks.len());
-        for chunk in &preimage.chunks {
-            let mut chunk_type = preimage.matrix_type.clone();
-            chunk_type.columns = chunk.columns;
-            matrices.push(self.matrix_from_bytes(&chunk_type, &chunk.bytes)?);
-        }
-        let references = matrices.iter().collect::<Vec<_>>();
-        self.concat(&references, ConcatAxis::Columns)
-    }
+
     fn matrix_mul_accumulate(
         &mut self,
         request: MatrixMulAccumulateRequest<Self::Matrix>,
@@ -366,6 +443,34 @@ pub trait Backend {
         variant: HashVariant,
         gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn sample_hash_small(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        key: [u8; 32],
+        tag: &[u8],
+        variant: HashVariant,
+        gadget_layout: (&BigInt, usize),
+    ) -> Result<Self::SmallMatrix, Self::Error>;
+    fn sample_hash_small_batch(
+        &mut self,
+        requests: Vec<HashSampleRequest>,
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| {
+                let layout = request
+                    .gadget_layout
+                    .expect("validated bounded hash request has gadget layout");
+                self.sample_hash_small(
+                    &request.matrix_type,
+                    request.key,
+                    &request.tag,
+                    request.variant,
+                    (&layout.0, layout.1),
+                )
+            })
+            .collect()
+    }
     /// Samples independent hash requests in input order.
     ///
     /// Backends may batch only requests with a compatible concrete layout;
@@ -396,6 +501,24 @@ pub trait Backend {
         gadget_base: &BigInt,
         digit_count: usize,
     ) -> Result<(Self::Matrix, Self::Trapdoor), Self::Error>;
+    /// Captures a full logical target at an explicit host-observation
+    /// boundary and exposes row-complete column tiles to preimage sampling.
+    fn preimage_target(
+        &mut self,
+        value: Arc<Self::Matrix>,
+    ) -> Result<(Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>), Self::Error>;
+    fn matrix_from_cpu_staging_bytes(
+        &self,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<Self::Matrix, Self::Error>;
+    fn preimage_target_from_staging(
+        &self,
+        ty: &ConcreteMatrixType,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Self::Error>;
     fn sample_preimage(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -405,46 +528,25 @@ pub trait Backend {
         max_coefficient_bound: &BigInt,
         trapdoor: &Self::Trapdoor,
         public: &Self::Matrix,
-        target: &Self::Matrix,
-    ) -> Result<Self::Matrix, Self::Error>;
-    /// Samples and immediately offloads consecutive preimage column chunks.
-    fn sample_chunked_preimage(
-        &mut self,
+        target: &dyn PolyMatrixColumnSource<Self::Matrix>,
+        randomness_seed: [u8; 32],
+    ) -> Result<Self::SmallMatrix, Self::Error>;
+    /// Validates a caller-selected inclusive cutoff before sampling starts.
+    /// Every backend must reject a bound below its authoritative supported
+    /// cutoff before entering a retry loop.
+    fn validate_preimage_bound(
+        &self,
         ty: &ConcreteMatrixType,
         sigma: f64,
         gadget_base: &BigInt,
         digit_count: usize,
         max_coefficient_bound: &BigInt,
-        trapdoor: &Self::Trapdoor,
-        public: &Self::Matrix,
-        target: &Self::Matrix,
-        column_chunk_width: usize,
-    ) -> Result<ChunkedPreimage, Self::Error> {
-        let request = PreimageRequest {
-            matrix_type: ty.clone(),
-            sigma,
-            gadget_base: gadget_base.clone(),
-            digit_count,
-            max_coefficient_bound: max_coefficient_bound.clone(),
-            trapdoor: Arc::new(trapdoor.clone()),
-            public: Arc::new(public.clone()),
-            target: Arc::new(target.clone()),
-        };
-        let mut batches = self.sample_chunked_preimage_batches_by_placement(
-            vec![(self.active_placement(), vec![request])],
-            column_chunk_width,
-        )?;
-        Ok(batches
-            .pop()
-            .expect("one chunked preimage placement")
-            .1
-            .pop()
-            .expect("one chunked preimage request"))
-    }
+    ) -> Result<(), Self::Error>;
+
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
         requests
             .into_iter()
             .map(|request| {
@@ -457,6 +559,7 @@ pub trait Backend {
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),
+                    request.randomness_seed,
                 )
             })
             .collect()
@@ -464,7 +567,7 @@ pub trait Backend {
     fn sample_preimage_batches_by_placement(
         &mut self,
         batches: Vec<(usize, Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>)>,
-    ) -> Result<Vec<(usize, Vec<Self::Matrix>)>, Self::Error> {
+    ) -> Result<Vec<(usize, Vec<Self::SmallMatrix>)>, Self::Error> {
         let original = self.active_placement();
         let result = batches
             .into_iter()
@@ -473,100 +576,6 @@ pub trait Backend {
                 self.sample_preimage_batch(requests).map(|outputs| (placement, outputs))
             })
             .collect();
-        assert!(self.set_active_placement(original), "backend rejected its active placement");
-        result
-    }
-    fn sample_chunked_preimage_batches_by_placement(
-        &mut self,
-        batches: Vec<(usize, Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>)>,
-        column_chunk_width: usize,
-    ) -> Result<Vec<(usize, Vec<ChunkedPreimage>)>, Self::Error> {
-        assert!(column_chunk_width > 0, "preimage column chunk width must be nonzero");
-        let original = self.active_placement();
-        let result = (|| {
-            let mut all_outputs = Vec::with_capacity(batches.len());
-            for (placement, requests) in batches {
-                assert!(self.set_active_placement(placement), "backend rejected its own placement");
-                let Some(first) = requests.first() else {
-                    all_outputs.push((placement, Vec::new()));
-                    continue;
-                };
-                let total_columns = first.matrix_type.columns;
-                let ranges = (0..total_columns)
-                    .step_by(column_chunk_width)
-                    .map(|start| {
-                        let end = (start + column_chunk_width).min(total_columns);
-                        (start, end)
-                    })
-                    .collect::<Vec<_>>();
-                // Offload target columns before sampling. Every sampling wave below restores
-                // only its selected range, so the sampler never receives the full target.
-                let mut staged_targets = Vec::with_capacity(requests.len());
-                for request in &requests {
-                    let mut chunks = Vec::with_capacity(ranges.len());
-                    for &(start, end) in &ranges {
-                        let target = self.slice(
-                            request.target.as_ref(),
-                            None,
-                            Some(&IndexRange { start, end }),
-                        )?;
-                        chunks.push(self.matrix_to_bytes(&target));
-                    }
-                    staged_targets.push(chunks);
-                }
-                let mut outputs = requests
-                    .iter()
-                    .map(|request| ChunkedPreimage {
-                        matrix_type: request.matrix_type.clone(),
-                        chunks: Vec::with_capacity(total_columns.div_ceil(column_chunk_width)),
-                    })
-                    .collect::<Vec<_>>();
-                for (chunk_index, &(start, end)) in ranges.iter().enumerate() {
-                    let columns = end - start;
-                    tracing::debug!(
-                        placement,
-                        chunk_index,
-                        start,
-                        end,
-                        columns,
-                        request_count = requests.len(),
-                        column_chunk_width,
-                        "preimage sampling column wave"
-                    );
-                    let mut chunk_requests = Vec::with_capacity(requests.len());
-                    for (request, target_chunks) in requests.iter().zip(&staged_targets) {
-                        assert_eq!(
-                            request.matrix_type.columns, total_columns,
-                            "chunked preimage batch requires one column count"
-                        );
-                        let mut matrix_type = request.matrix_type.clone();
-                        matrix_type.columns = columns;
-                        let target =
-                            self.matrix_from_bytes(&matrix_type, &target_chunks[chunk_index])?;
-                        chunk_requests.push(PreimageRequest {
-                            matrix_type,
-                            sigma: request.sigma,
-                            gadget_base: request.gadget_base.clone(),
-                            digit_count: request.digit_count,
-                            max_coefficient_bound: request.max_coefficient_bound.clone(),
-                            trapdoor: request.trapdoor.clone(),
-                            public: request.public.clone(),
-                            target: Arc::new(target),
-                        });
-                    }
-                    let sampled = self.sample_preimage_batch(chunk_requests)?;
-                    for (output, matrix) in outputs.iter_mut().zip(sampled) {
-                        output.chunks.push(PreimageColumnChunk {
-                            start,
-                            columns,
-                            bytes: self.matrix_to_bytes(&matrix),
-                        });
-                    }
-                }
-                all_outputs.push((placement, outputs));
-            }
-            Ok(all_outputs)
-        })();
         assert!(self.set_active_placement(original), "backend rejected its active placement");
         result
     }
@@ -583,7 +592,7 @@ pub trait Backend {
         &mut self,
         value: &Self::Matrix,
         small: bool,
-    ) -> Result<Self::Matrix, Self::Error>;
+    ) -> Result<Self::SmallMatrix, Self::Error>;
     fn extract_coefficient(
         &mut self,
         value: &Self::Matrix,
@@ -632,13 +641,16 @@ pub enum RuntimeValue<B: Backend> {
     Bytes(Vec<u8>),
     TypedBlob(Vec<u8>),
     Matrix(Arc<B::Matrix>),
-    /// A deferred GadgetDecompose result.  The original matrix remains live
-    /// so an adjacent ApplyPreimage can use the backend's fused operation.
-    DeferredGadgetDecomposition {
-        source: Arc<B::Matrix>,
-        small: bool,
+    /// Host-staged full matrix. Expanded owners are reconstructed only when a
+    /// later operation actually needs them; preimage sampling can use its
+    /// column source directly.
+    HostMatrix {
+        matrix_type: ConcreteMatrixType,
+        bytes: Arc<Vec<u8>>,
     },
-    ChunkedPreimage(Arc<ChunkedPreimage>),
+    /// A compact bounded RHS.  Shape, bound, and relation semantics live in
+    /// the validated wire/artifact metadata; the backend value is storage only.
+    SmallMatrix(Arc<B::SmallMatrix>),
     Trapdoor {
         secret: Option<Arc<B::Trapdoor>>,
         public: Arc<B::Matrix>,
@@ -682,10 +694,10 @@ impl<B: Backend> Clone for RuntimeValue<B> {
             Self::Bytes(value) => Self::Bytes(value.clone()),
             Self::TypedBlob(value) => Self::TypedBlob(value.clone()),
             Self::Matrix(value) => Self::Matrix(value.clone()),
-            Self::DeferredGadgetDecomposition { source, small } => {
-                Self::DeferredGadgetDecomposition { source: source.clone(), small: *small }
+            Self::HostMatrix { matrix_type, bytes } => {
+                Self::HostMatrix { matrix_type: matrix_type.clone(), bytes: bytes.clone() }
             }
-            Self::ChunkedPreimage(value) => Self::ChunkedPreimage(value.clone()),
+            Self::SmallMatrix(value) => Self::SmallMatrix(value.clone()),
             Self::Trapdoor {
                 secret,
                 public,
@@ -736,8 +748,7 @@ impl<B: Backend> RuntimeValue<B> {
     pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
         match self {
             Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
-            Self::DeferredGadgetDecomposition { source, .. } => Arc::strong_count(source) == 1,
-            Self::ChunkedPreimage(_) => false,
+            Self::SmallMatrix(owner) => Arc::strong_count(owner) == 1,
             Self::Trapdoor { secret, public, .. } => {
                 Arc::strong_count(public) == 1 ||
                     secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)
@@ -748,6 +759,7 @@ impl<B: Backend> RuntimeValue<B> {
             Self::Bool(_) |
             Self::Bytes(_) |
             Self::TypedBlob(_) |
+            Self::HostMatrix { .. } |
             Self::LazyArtifact { .. } |
             Self::LazyArtifactFamily { .. } |
             Self::StagedArtifact { .. } |
@@ -759,5 +771,9 @@ impl<B: Backend> RuntimeValue<B> {
 impl<B: Backend> RuntimeValue<B> {
     pub fn matrix(value: B::Matrix) -> Self {
         Self::Matrix(Arc::new(value))
+    }
+
+    pub fn small_matrix(value: B::SmallMatrix) -> Self {
+        Self::SmallMatrix(Arc::new(value))
     }
 }

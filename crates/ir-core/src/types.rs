@@ -80,7 +80,14 @@ pub enum WireType {
         digit_count: IntExpr,
         preimage_max_coefficient_bound: IntExpr,
     },
-    Preimage(MatrixType),
+    SmallMatrix {
+        matrix: MatrixType,
+        max_coefficient_bound: IntExpr,
+    },
+    Preimage {
+        matrix: MatrixType,
+        max_coefficient_bound: IntExpr,
+    },
     /// A flat row-major family with one logical rank-N shape.
     Family {
         element: Box<WireType>,
@@ -114,7 +121,16 @@ pub enum ConcreteWireType {
         #[serde(with = "serde_support::bigint")]
         preimage_max_coefficient_bound: BigInt,
     },
-    Preimage(ConcreteMatrixType),
+    SmallMatrix {
+        matrix: ConcreteMatrixType,
+        #[serde(with = "serde_support::bigint")]
+        max_coefficient_bound: BigInt,
+    },
+    Preimage {
+        matrix: ConcreteMatrixType,
+        #[serde(with = "serde_support::bigint")]
+        max_coefficient_bound: BigInt,
+    },
     Family {
         element: Box<ConcreteWireType>,
         shape: Vec<usize>,
@@ -124,7 +140,9 @@ pub enum ConcreteWireType {
 impl ConcreteWireType {
     pub fn matrix_type(&self) -> Option<&ConcreteMatrixType> {
         match self {
-            Self::Matrix(matrix) | Self::Preimage(matrix) => Some(matrix),
+            Self::Matrix(matrix) |
+            Self::SmallMatrix { matrix, .. } |
+            Self::Preimage { matrix, .. } => Some(matrix),
             Self::Trapdoor { matrix, .. } => Some(matrix),
             _ => None,
         }

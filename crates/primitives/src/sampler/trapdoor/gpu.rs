@@ -1,15 +1,20 @@
-#[cfg(test)]
-use crate::sampler::bounds::matrix_within_coefficient_bound;
 use crate::{
-    matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
-    poly::{Poly, PolyParams, dcrt::gpu::GpuDCRTPolyParams},
+    matrix::{
+        PolyMatrix, PolyMatrixColumnSource, SmallMatrixError,
+        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
+    },
+    poly::{
+        Poly, PolyParams,
+        dcrt::gpu::{GpuDCRTPolyParams, GpuRngSeed},
+    },
     sampler::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler,
+        bounds::default_preimage_cutoff,
         gpu::{GpuDCRTPolyUniformSampler, random_gpu_rng_seed},
     },
 };
+use digest::Digest;
 use num_bigint::BigUint;
-use rayon::prelude::*;
 use std::{
     sync::{Arc, Mutex},
     time::Instant,
@@ -188,18 +193,409 @@ pub struct GpuDCRTPolyTrapdoorSampler {
     c: f64,
 }
 
-#[derive(Debug)]
-pub struct GpuPreimageRequest<'a, M, T>
-where
-    M: PolyMatrix,
-    T: Send + Sync,
-{
-    pub entry_idx: usize,
-    pub params: &'a <<M as PolyMatrix>::P as Poly>::Params,
-    pub trapdoor: &'a T,
-    pub public_matrix: &'a M,
-    pub target: &'a M,
-    pub max_coefficient_bound: BigUint,
+fn preimage_seed(base: [u8; 32], stage: &[u8], column_start: usize, attempt: usize) -> GpuRngSeed {
+    let mut hasher = keccak_asm::Keccak256::new();
+    hasher.update(b"mxx-preimage-sampler/v1");
+    hasher.update(base);
+    hasher.update((stage.len() as u64).to_le_bytes());
+    hasher.update(stage);
+    hasher.update((column_start as u64).to_le_bytes());
+    hasher.update((attempt as u64).to_le_bytes());
+    GpuRngSeed::from_bytes(hasher.finalize().into())
+}
+
+/// Sample a bounded preimage directly into one resident all-column compact owner.
+/// Expanded candidates are limited to one target-column tile and are discarded
+/// immediately after the device-side bound decision.
+impl GpuDCRTPolyTrapdoorSampler {
+    pub fn preimage_small(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: BigUint,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let minimum = default_preimage_cutoff(
+            params.ring_dimension(),
+            public_matrix.row_size(),
+            params.modulus_digits(),
+            self.base,
+            self.sigma,
+        )
+        .ok_or(SmallMatrixError::InvalidConfig)?;
+        if max_coefficient_bound < minimum {
+            return Err(SmallMatrixError::PreimageBoundTooSmall {
+                requested: max_coefficient_bound,
+                minimum,
+            });
+        }
+        let d = public_matrix.row_size();
+        let rows = public_matrix.col_size();
+        let columns = target.col_size();
+        if rows == 0 || columns == 0 || target.row_size() != d {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if public_matrix.params != *params ||
+            trapdoor.r.params != *params ||
+            trapdoor.e.params != *params
+        {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if public_matrix.params.gpu_ids() != params.gpu_ids() ||
+            trapdoor.r.params.gpu_ids() != params.gpu_ids() ||
+            trapdoor.e.params.gpu_ids() != params.gpu_ids()
+        {
+            return Err(SmallMatrixError::DeviceMismatch);
+        }
+
+        let budget = crate::env::gpu_small_matrix_residency_bytes()
+            .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        let headroom = crate::env::gpu_small_matrix_allocator_headroom_bytes()
+            .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        let admission_budget =
+            budget.checked_sub(headroom).ok_or(SmallMatrixError::ResourceExhausted {
+                requested_bytes: headroom,
+                budget_bytes: budget,
+            })?;
+        let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
+            .map_err(|_| SmallMatrixError::WidthOverflow)?
+            .max(1);
+        let attempts = crate::env::gpu_preimage_max_tile_attempts()
+            .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        let mut tile_columns = crate::env::mul_small_rhs_tile_columns()
+            .map_err(|_| SmallMatrixError::InvalidConfig)?
+            .unwrap_or(1)
+            .min(columns);
+        let matrix_bytes = |matrix: &GpuDCRTPolyMatrix| {
+            params
+                .matrix_allocation_bytes(
+                    params.crt_depth().saturating_sub(1),
+                    matrix.row_size(),
+                    matrix.col_size(),
+                    true,
+                )
+                .map(|allocation| allocation.total_bytes)
+                .map_err(|_| SmallMatrixError::DimensionOverflow)
+        };
+        let persistent_bytes = [
+            public_matrix,
+            &trapdoor.r,
+            &trapdoor.e,
+            &trapdoor.a_mat_coeff,
+            &trapdoor.b_mat_coeff,
+            &trapdoor.d_mat_coeff,
+        ]
+        .into_iter()
+        .map(matrix_bytes)
+        .try_fold(0usize, |sum, bytes| {
+            sum.checked_add(bytes?).ok_or(SmallMatrixError::DimensionOverflow)
+        })?;
+        let cache_first_call = trapdoor
+            .p1_covariance_cache
+            .lock()
+            .map_err(|_| SmallMatrixError::InvalidConfig)?
+            .is_none();
+        let (cache_persistent_bytes, cache_workspace_bytes) =
+            GpuDCRTPolyMatrix::p1_covariance_cache_allocation_bytes(params, d)?;
+        let persistent_bytes = persistent_bytes
+            .checked_add(cache_persistent_bytes)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        while tile_columns > 0 {
+            let padded_columns = padded_tile_columns(tile_columns, d)?;
+            let candidate = matrix_bytes_for(params, rows, tile_columns)?;
+            let p1 = matrix_bytes_for(params, 2 * d, padded_columns)?;
+            let p2 = matrix_bytes_for(params, trapdoor.r.col_size(), padded_columns)?;
+            let tp2 = matrix_bytes_for(params, 2 * d, padded_columns)?;
+            let perturbation = p1
+                .checked_add(p2)
+                .and_then(|value| value.checked_add(tp2))
+                .ok_or(SmallMatrixError::DimensionOverflow)?;
+            let residual = matrix_bytes_for(params, d, tile_columns)?;
+            let z_hat = matrix_bytes_for(params, trapdoor.r.col_size(), tile_columns)?;
+            let target_tile = matrix_bytes_for(params, d, tile_columns)?;
+            let sampled_integer_bytes = (2usize)
+                .checked_mul(d)
+                .and_then(|value| value.checked_mul(padded_columns))
+                .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
+                .and_then(|value| value.checked_mul(std::mem::size_of::<i64>()))
+                .ok_or(SmallMatrixError::DimensionOverflow)?;
+            // MatrixTrapdoor.cu uses stack-local buffers through m <= 8 and
+            // allocates this workspace only for the large-kernel path.
+            let sampled_workspace_bytes = if 2 * d > 8 {
+                sampled_integer_bytes.checked_mul(2).ok_or(SmallMatrixError::DimensionOverflow)?
+            } else {
+                0
+            };
+            let candidate_workspace = candidate
+                .checked_add(residual)
+                .and_then(|value| value.checked_add(z_hat))
+                .and_then(|value| value.checked_add(target_tile))
+                .and_then(|value| value.checked_add(sampled_integer_bytes))
+                .and_then(|value| value.checked_add(sampled_workspace_bytes))
+                .ok_or(SmallMatrixError::DimensionOverflow)?;
+            // The report's candidate field is the aggregate of the mutually
+            // exclusive correction workspaces. The perturbation field above
+            // is the one phase where p1, p2, and tp2 are simultaneously live.
+            // Keeping these aggregates separate avoids counting any matrix in
+            // two report terms while still admitting the true peak.
+            let report = GpuSmallMatrix::sampler_allocation_report_for_shape(
+                params,
+                rows,
+                columns,
+                magnitude_bytes,
+                persistent_bytes,
+                candidate_workspace,
+                perturbation,
+                pack_check_scratch_bytes(params)?,
+                0,
+                (4usize
+                    .checked_add(
+                        4usize
+                            .checked_mul(params.crt_depth())
+                            .ok_or(SmallMatrixError::DimensionOverflow)?,
+                    )
+                    .ok_or(SmallMatrixError::DimensionOverflow)?)
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or(SmallMatrixError::DimensionOverflow)?,
+                std::mem::size_of::<i32>(),
+                std::mem::size_of::<i32>(),
+                headroom,
+            )?;
+            let first_call_peak = if cache_first_call { cache_workspace_bytes } else { 0 };
+            let sampler_peak = report
+                .sampler_peak_bytes
+                .checked_add(first_call_peak)
+                .ok_or(SmallMatrixError::DimensionOverflow)?;
+            if sampler_peak <= budget {
+                break;
+            }
+            tile_columns -= 1;
+        }
+        if tile_columns == 0 {
+            return Err(SmallMatrixError::ResourceExhausted {
+                requested_bytes: budget.saturating_add(1),
+                budget_bytes: budget,
+            });
+        }
+        let mut destination = GpuSmallMatrix::new_empty_checked(
+            params,
+            rows,
+            columns,
+            max_coefficient_bound,
+            magnitude_bytes,
+            admission_budget,
+        )?;
+        for column_start in (0..columns).step_by(tile_columns) {
+            let column_end = (column_start + tile_columns).min(columns);
+            let column_count = column_end - column_start;
+            let tile_target = target.load_columns(column_start, column_end);
+            if tile_target.params != *params ||
+                tile_target.params.gpu_ids() != params.gpu_ids() ||
+                tile_target.row_size() != d ||
+                tile_target.col_size() != column_count
+            {
+                return Err(SmallMatrixError::ParameterMismatch);
+            }
+            // Acceptance is independent for each logical global column. This
+            // is essential: a rejected column must not resample neighboring
+            // columns merely because they share a storage tile.
+            for local_column in 0..column_count {
+                let global_column = column_start + local_column;
+                let single_target = tile_target.slice_columns(local_column, local_column + 1);
+                let mut accepted = false;
+                for attempt in 0..attempts {
+                    let column_seed =
+                        preimage_seed(randomness_seed, b"candidate", global_column, attempt);
+                    let candidate = self.preimage_matrix_seeded(
+                        params,
+                        trapdoor,
+                        public_matrix,
+                        &single_target,
+                        column_seed.to_bytes(),
+                    );
+                    let candidate = candidate.into_coeff_domain();
+                    accepted =
+                        destination.try_pack_checked_tile(&candidate, 0, global_column, rows, 1)?;
+                    drop(candidate);
+                    if accepted {
+                        break;
+                    }
+                }
+                if !accepted {
+                    return Err(SmallMatrixError::AttemptExhausted {
+                        column_start: global_column,
+                        column_end: global_column + 1,
+                        attempts,
+                    });
+                }
+            }
+        }
+        Ok(destination)
+    }
+}
+
+fn pack_check_scratch_bytes(params: &GpuDCRTPolyParams) -> Result<usize, SmallMatrixError> {
+    let limbs = params.crt_depth();
+    let total_bits = params.moduli().iter().try_fold(0usize, |sum, modulus| {
+        sum.checked_add(64usize.saturating_sub(modulus.leading_zeros() as usize))
+            .ok_or(SmallMatrixError::DimensionOverflow)
+    })?;
+    let words = total_bits
+        .checked_add(63)
+        .ok_or(SmallMatrixError::DimensionOverflow)?
+        .checked_div(64)
+        .ok_or(SmallMatrixError::DimensionOverflow)?
+        .max(1);
+    let limb_metadata = limbs
+        .checked_mul(
+            std::mem::size_of::<*const u8>() +
+                std::mem::size_of::<usize>() +
+                std::mem::size_of::<u8>() +
+                std::mem::size_of::<u64>(),
+        )
+        .ok_or(SmallMatrixError::DimensionOverflow)?;
+    let garner = limbs
+        .checked_mul(limbs)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(SmallMatrixError::DimensionOverflow)?;
+    let word_tables = 3usize
+        .checked_mul(words)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(SmallMatrixError::DimensionOverflow)?;
+    limb_metadata
+        .checked_add(garner)
+        .and_then(|value| value.checked_add(word_tables))
+        .ok_or(SmallMatrixError::DimensionOverflow)
+}
+
+fn matrix_bytes_for(
+    params: &GpuDCRTPolyParams,
+    rows: usize,
+    columns: usize,
+) -> Result<usize, SmallMatrixError> {
+    params
+        .matrix_allocation_bytes(params.crt_depth().saturating_sub(1), rows, columns, true)
+        .map(|allocation| allocation.total_bytes)
+        .map_err(|_| SmallMatrixError::DimensionOverflow)
+}
+
+fn padded_tile_columns(columns: usize, d: usize) -> Result<usize, SmallMatrixError> {
+    if d == 0 {
+        return Err(SmallMatrixError::InvalidShape);
+    }
+    columns
+        .checked_add(d - 1)
+        .and_then(|value| value.checked_div(d))
+        .and_then(|value| value.checked_mul(d))
+        .ok_or(SmallMatrixError::DimensionOverflow)
+}
+
+impl GpuDCRTPolyTrapdoorSampler {
+    fn preimage_matrix(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &GpuDCRTPolyMatrix,
+    ) -> GpuDCRTPolyMatrix {
+        self.preimage_matrix_seeded(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            random_gpu_rng_seed().to_bytes(),
+        )
+    }
+
+    fn preimage_matrix_seeded(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &GpuDCRTPolyMatrix,
+        randomness_seed: [u8; 32],
+    ) -> GpuDCRTPolyMatrix {
+        let preimage_start = Instant::now();
+        let d = public_matrix.row_size();
+        let target_cols = target.col_size();
+        debug_assert_eq!(
+            target.row_size(),
+            d,
+            "Target matrix should have the same number of rows as the public matrix",
+        );
+        tracing::debug!(d = d, target_cols = target_cols, "gpu preimage: start");
+
+        let param_start = Instant::now();
+        let n = params.ring_dimension() as usize;
+        let k = params.modulus_digits();
+        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
+        let dgg_large_std = (s * s - self.c * self.c).sqrt();
+        tracing::debug!(
+            elapsed_ms = param_start.elapsed().as_secs_f64() * 1_000.0,
+            d = d,
+            n = n,
+            k = k,
+            s = s,
+            dgg_large_std = dgg_large_std,
+            "gpu preimage: parameters derived"
+        );
+
+        let p_hat_start = Instant::now();
+        let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts(
+            params,
+            trapdoor,
+            s,
+            self.c,
+            self.sigma,
+            dgg_large_std,
+            target_cols,
+            GpuRngSeed::from_bytes(randomness_seed),
+        );
+        tracing::debug!(
+            elapsed_ms = p_hat_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: sampled perturbation blocks"
+        );
+
+        let perturb_start = Instant::now();
+        let p1_rows = p1.row_size();
+        let p2_rows = p2.row_size();
+        debug_assert_eq!(
+            public_matrix.col_size(),
+            p1_rows + p2_rows,
+            "public matrix columns must match perturbation rows",
+        );
+        let perturbed_syndrome =
+            GpuDCRTPolyMatrix::preimage_residual(target, public_matrix, &p1, &p2);
+        tracing::debug!(
+            elapsed_ms = perturb_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: computed perturbed_syndrome"
+        );
+
+        let mut out = GpuDCRTPolyMatrix::preimage_output_from_perturbation(p1, p2, target_cols);
+        let assemble_start = Instant::now();
+        let gauss_start = Instant::now();
+        let z_hat_mat = perturbed_syndrome.gauss_samp_gq_arb_base(
+            self.c,
+            self.sigma,
+            preimage_seed(randomness_seed, b"z", 0, 0),
+        );
+        tracing::debug!(
+            elapsed_ms = gauss_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
+        );
+        out.preimage_add_correction(&trapdoor.r, &trapdoor.e, &z_hat_mat);
+        tracing::debug!(
+            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: assembled output matrix with fused correction"
+        );
+        tracing::debug!(
+            elapsed_ms = preimage_start.elapsed().as_secs_f64() * 1_000.0,
+            "gpu preimage: finished"
+        );
+        out
+    }
 }
 
 impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
@@ -243,163 +639,18 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         trapdoor: &Self::Trapdoor,
         public_matrix: &Self::M,
-        target: &Self::M,
-    ) -> Self::M {
-        let preimage_start = Instant::now();
-        let d = public_matrix.row_size();
-        let target_cols = target.col_size();
-        debug_assert_eq!(
-            target.row_size(),
-            d,
-            "Target matrix should have the same number of rows as the public matrix",
-        );
-        tracing::debug!(d = d, target_cols = target_cols, "gpu preimage: start");
-
-        let param_start = Instant::now();
-        let n = params.ring_dimension() as usize;
-        let k = params.modulus_digits();
-        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
-        let dgg_large_std = (s * s - self.c * self.c).sqrt();
-        tracing::debug!(
-            elapsed_ms = param_start.elapsed().as_secs_f64() * 1_000.0,
-            d = d,
-            n = n,
-            k = k,
-            s = s,
-            dgg_large_std = dgg_large_std,
-            "gpu preimage: parameters derived"
-        );
-
-        let p_hat_start = Instant::now();
-        let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts(
+        target: &dyn PolyMatrixColumnSource<Self::M>,
+        max_coefficient_bound: BigUint,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        self.preimage_small(
             params,
             trapdoor,
-            s,
-            self.c,
-            self.sigma,
-            dgg_large_std,
-            target_cols,
-        );
-        tracing::debug!(
-            elapsed_ms = p_hat_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: sampled perturbation blocks"
-        );
-
-        let perturb_start = Instant::now();
-        let p1_rows = p1.row_size();
-        let p2_rows = p2.row_size();
-        debug_assert_eq!(
-            public_matrix.col_size(),
-            p1_rows + p2_rows,
-            "public matrix columns must match perturbation rows",
-        );
-        let perturbed_syndrome =
-            GpuDCRTPolyMatrix::preimage_residual(target, public_matrix, &p1, &p2);
-        tracing::debug!(
-            elapsed_ms = perturb_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: computed perturbed_syndrome"
-        );
-
-        // Materialize the final layout before sampling z so p1/p2 can be released before the
-        // largest correction buffers are live. The correction itself remains one fused kernel.
-        let mut out = GpuDCRTPolyMatrix::preimage_output_from_perturbation(p1, p2, target_cols);
-        let assemble_start = Instant::now();
-        let gauss_start = Instant::now();
-        let z_hat_mat =
-            perturbed_syndrome.gauss_samp_gq_arb_base(self.c, self.sigma, random_gpu_rng_seed());
-        tracing::debug!(
-            elapsed_ms = gauss_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: sampled z_hat_mat with gauss_samp_gq_arb_base"
-        );
-
-        out.preimage_add_correction(&trapdoor.r, &trapdoor.e, &z_hat_mat);
-        tracing::debug!(
-            elapsed_ms = assemble_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: assembled output matrix with fused correction"
-        );
-        tracing::debug!(
-            elapsed_ms = preimage_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: finished"
-        );
-        out
-    }
-
-    fn preimage_batched_sharded<'a>(
-        &self,
-        requests: Vec<GpuPreimageRequest<'a, Self::M, Self::Trapdoor>>,
-    ) -> Vec<(usize, Self::M)>
-    where
-        Self::Trapdoor: Send + Sync + 'a,
-        Self::M: 'a,
-    {
-        tracing::debug!(
-            request_count = requests.len(),
-            "gpu preimage: start multi-target sharded dispatch"
-        );
-        let batch_start = Instant::now();
-        let common_bound = requests
-            .first()
-            .map(|request| request.max_coefficient_bound.clone())
-            .expect("preimage batch must not be empty");
-        assert!(
-            requests.iter().all(|request| request.max_coefficient_bound == common_bound),
-            "GPU preimage batch requires one common coefficient cutoff"
-        );
-        let mut pending = requests;
-        let mut results = Vec::with_capacity(pending.len());
-        let mut round = 0usize;
-        while !pending.is_empty() {
-            let round_start = Instant::now();
-            let pending_before = pending.len();
-            let sampled = pending
-                .into_par_iter()
-                .map(|request| {
-                    let candidate = self.preimage(
-                        request.params,
-                        request.trapdoor,
-                        request.public_matrix,
-                        request.target,
-                    );
-                    (request, candidate)
-                })
-                .collect::<Vec<_>>();
-            let (requests, mut candidates): (Vec<_>, Vec<_>) = sampled.into_iter().unzip();
-            let accepted =
-                GpuDCRTPolyMatrix::batch_within_coefficient_bound(&mut candidates, &common_bound);
-            pending = Vec::new();
-            let mut accepted_candidates = Vec::new();
-            for ((request, candidate), accepted) in
-                requests.into_iter().zip(candidates).zip(accepted)
-            {
-                if accepted {
-                    accepted_candidates.push((request.entry_idx, candidate));
-                } else {
-                    pending.push(request);
-                }
-            }
-            let (entry_indices, mut matrices): (Vec<_>, Vec<_>) =
-                accepted_candidates.into_iter().unzip();
-            let accepted_count = matrices.len();
-            let pending_after = pending.len();
-            GpuDCRTPolyMatrix::ntt_batch_in_place(&mut matrices);
-            results.extend(entry_indices.into_iter().zip(matrices));
-            tracing::debug!(
-                round,
-                pending_before,
-                accepted = accepted_count,
-                rejected = pending_after,
-                pending_after,
-                elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
-                "gpu preimage: rejection round"
-            );
-            round += 1;
-        }
-        tracing::debug!(
-            rounds = round,
-            elapsed_ms = batch_start.elapsed().as_secs_f64() * 1_000.0,
-            "gpu preimage: finished multi-target sharded dispatch"
-        );
-        results
+            public_matrix,
+            target,
+            max_coefficient_bound,
+            randomness_seed,
+        )
     }
 
     fn preimage_extend(
@@ -421,7 +672,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let preimage_right = uniform_sampler.sample_uniform(params, ext_ncol, target_ncol, dist);
         let t = target - &(ext_matrix * &preimage_right);
-        let preimage_left = self.preimage(params, trapdoor, public_matrix, &t);
+        let preimage_left = self.preimage_matrix(params, trapdoor, public_matrix, &t);
         preimage_left.concat_rows(&[&preimage_right])
     }
 }
@@ -434,6 +685,7 @@ fn sample_pert_square_mat_gpu_native_parts(
     dgg_stddev: f64,
     sigma_large: f64,
     total_ncol: usize,
+    randomness_seed: GpuRngSeed,
 ) -> GpuPerturbationSamples {
     let uniform_sampler = GpuDCRTPolyUniformSampler::new();
     let d = trapdoor.r.row_size();
@@ -451,11 +703,12 @@ fn sample_pert_square_mat_gpu_native_parts(
     );
 
     // p2 is sampled directly on GPU as in the Karney branch of OpenFHE.
-    let p2 = uniform_sampler.sample_uniform(
+    let p2 = uniform_sampler.sample_uniform_with_seed(
         params,
         dk,
         padded_ncol,
         DistType::GaussDist { sigma: sigma_large, max_coefficient_bound: None },
+        preimage_seed(randomness_seed.to_bytes(), b"p2", 0, 0),
     );
     tracing::debug!("gpu preimage sample_pert: sampled p2");
     let tp2 = GpuDCRTPolyMatrix::mul_vertical_pair(&trapdoor.r, &trapdoor.e, &p2);
@@ -472,7 +725,7 @@ fn sample_pert_square_mat_gpu_native_parts(
     let p1 = GpuDCRTPolyMatrix::sample_p1_full_cached(
         p1_covariance_cache.as_ref(),
         tp2,
-        random_gpu_rng_seed(),
+        preimage_seed(randomness_seed.to_bytes(), b"p1", 0, 0),
     );
     tracing::debug!("gpu preimage sample_pert: sampled p1");
 
@@ -500,6 +753,32 @@ mod tests {
 
     const SIGMA: f64 = 4.578;
 
+    #[test]
+    fn sampler_padding_rounds_partial_column_tiles_to_block_width() {
+        assert_eq!(padded_tile_columns(1, 8).unwrap(), 8);
+        assert_eq!(padded_tile_columns(7, 8).unwrap(), 8);
+        assert_eq!(padded_tile_columns(8, 8).unwrap(), 8);
+        assert_eq!(padded_tile_columns(9, 8).unwrap(), 16);
+        assert!(matches!(padded_tile_columns(1, 0), Err(SmallMatrixError::InvalidShape)));
+    }
+
+    #[test]
+    fn preimage_seed_is_partition_invariant_per_global_column_and_attempt() {
+        let request = [0x5au8; 32];
+        let from_unit_tiles = (0..4)
+            .map(|column| preimage_seed(request, b"candidate", column, 0))
+            .collect::<Vec<_>>();
+        let from_wide_tiles = (0..2)
+            .chain(2..4)
+            .map(|column| preimage_seed(request, b"candidate", column, 0))
+            .collect::<Vec<_>>();
+        assert_eq!(from_unit_tiles, from_wide_tiles);
+        assert_ne!(
+            preimage_seed(request, b"candidate", 2, 0),
+            preimage_seed(request, b"candidate", 2, 1)
+        );
+    }
+
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 16, 8)
     }
@@ -521,6 +800,7 @@ mod tests {
             dgg_stddev,
             sigma_large,
             total_ncol,
+            preimage_seed([0u8; 32], b"test", 0, 0),
         );
         let d = trapdoor.r.row_size();
         let num_blocks = total_ncol.div_ceil(d);
@@ -609,7 +889,8 @@ mod tests {
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
 
-        let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+        let preimage =
+            trapdoor_sampler.preimage_matrix(&params, &trapdoor, &public_matrix, &target);
         let product = &public_matrix * &preimage;
         assert_eq!(product, target);
     }
@@ -628,7 +909,8 @@ mod tests {
         for chunk_width in [1usize, 2, 3, 5, 8] {
             let target =
                 uniform_sampler.sample_uniform(&params, size, chunk_width, DistType::FinRingDist);
-            let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+            let preimage =
+                trapdoor_sampler.preimage_matrix(&params, &trapdoor, &public_matrix, &target);
             assert_eq!(preimage.col_size(), chunk_width);
             assert_eq!(
                 &public_matrix * &preimage,
@@ -656,9 +938,9 @@ mod tests {
         assert_ne!(first_target, second_target, "targets should differ");
 
         let first_preimage =
-            trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &first_target);
+            trapdoor_sampler.preimage_matrix(&params, &trapdoor, &public_matrix, &first_target);
         let second_preimage =
-            trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &second_target);
+            trapdoor_sampler.preimage_matrix(&params, &trapdoor, &public_matrix, &second_target);
 
         assert_eq!(&public_matrix * &first_preimage, first_target);
         assert_eq!(&public_matrix * &second_preimage, second_target);
@@ -683,7 +965,7 @@ mod tests {
         let z_plain_full = z_plain_former.concat_rows(&[&z_plain]);
         assert_eq!(&public_matrix * &z_plain_full, target);
 
-        let sampled = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+        let sampled = trapdoor_sampler.preimage_matrix(&params, &trapdoor, &public_matrix, &target);
         assert_eq!(&public_matrix * &sampled, target);
         assert_ne!(
             sampled, z_plain_full,
@@ -716,57 +998,6 @@ mod tests {
         assert!(larger_s > default_s);
     }
 
-    #[test]
-    #[sequential]
-    fn test_gpu_batched_preimages_respect_exact_request_cutoff() {
-        gpu_device_sync();
-        let size = 2usize;
-        let cpu_params = gpu_test_params();
-        let params = gpu_params_from_cpu(&cpu_params);
-        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (trapdoor, public_matrix) = sampler.trapdoor(&params, size);
-        let uniform_sampler = GpuDCRTPolyUniformSampler::new();
-        let targets = (0..2)
-            .map(|_| uniform_sampler.sample_uniform(&params, size, 1, DistType::FinRingDist))
-            .collect::<Vec<_>>();
-
-        let ring_dim_sqrt = BigDecimal::from_u32(params.ring_dimension())
-            .expect("ring dimension should convert to BigDecimal")
-            .sqrt()
-            .expect("ring dimension sqrt should exist");
-        let base = BigDecimal::from_biguint(BigUint::from(1u32) << params.base_bits(), 0);
-        let preimage_sigma = compute_preimage_sigma(
-            &ring_dim_sqrt,
-            (size * params.modulus_digits()) as u64,
-            &base,
-            None,
-            Some(SIGMA),
-        );
-        let cutoff = hard_cutoff_from_sigma_bound(&preimage_sigma);
-        let requests = targets
-            .iter()
-            .enumerate()
-            .map(|(entry_idx, target)| GpuPreimageRequest {
-                entry_idx,
-                params: &params,
-                trapdoor: &trapdoor,
-                public_matrix: &public_matrix,
-                target,
-                max_coefficient_bound: cutoff.clone(),
-            })
-            .collect();
-
-        let mut outputs = sampler.preimage_batched_sharded(requests);
-        outputs.sort_unstable_by_key(|(entry_idx, _)| *entry_idx);
-        for (expected_idx, ((entry_idx, preimage), target)) in
-            outputs.iter().zip(&targets).enumerate()
-        {
-            assert_eq!(*entry_idx, expected_idx);
-            assert_eq!(&public_matrix * preimage, *target);
-            assert!(matrix_within_coefficient_bound(&preimage.to_cpu_matrix(), &cutoff));
-        }
-    }
-
     fn assert_gpu_preimage_reconstructs_target_and_respects_norm_bound(
         sigma: f64,
         bound_sigma: Option<f64>,
@@ -791,7 +1022,8 @@ mod tests {
 
         for sample_idx in 0..4usize {
             let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
-            let preimage = trapdoor_sampler.preimage(&params, &trapdoor, &public_matrix, &target);
+            let preimage =
+                trapdoor_sampler.preimage_matrix(&params, &trapdoor, &public_matrix, &target);
             assert_eq!(&public_matrix * &preimage, target);
 
             for i in 0..preimage.row_size() {
@@ -932,7 +1164,7 @@ mod tests {
             let target =
                 uniform_sampler.sample_uniform(&src_params, size, size, DistType::FinRingDist);
             let preimage =
-                trapdoor_sampler.preimage(&src_params, &trapdoor, &public_matrix, &target);
+                trapdoor_sampler.preimage_matrix(&src_params, &trapdoor, &public_matrix, &target);
             assert_eq!(
                 &public_matrix * &preimage,
                 target,

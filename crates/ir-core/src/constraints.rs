@@ -165,17 +165,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RingAutomorphism { index } => {
                     positive(&mut constraints, index, format!("{prefix}: automorphism index"));
                 }
-                NodeKind::DecompositionEntry { row, column } => {
-                    nonnegative(&mut constraints, row, format!("{prefix}: decomposition row"));
-                    nonnegative(
-                        &mut constraints,
-                        column,
-                        format!("{prefix}: decomposition column"),
-                    );
-                }
-                NodeKind::MaterializePreimageExact |
-                NodeKind::PreimageBinary(_) |
-                NodeKind::PreimageConcatColumns => {}
+                NodeKind::MatrixMulSmallRhs => {}
                 NodeKind::FamilyGetStatic { indices } => {
                     let _ = indices;
                 }
@@ -222,8 +212,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::CrtRecompose { .. } |
                 NodeKind::PackPolynomialCoefficients { .. } |
                 NodeKind::SubgraphCall(_) |
-                NodeKind::FamilyGetDynamic { .. } |
-                NodeKind::ApplyPreimage => {}
+                NodeKind::FamilyGetDynamic { .. } => {}
             }
         }
     }
@@ -247,8 +236,17 @@ pub(crate) fn evaluate_param_constraints(
 
 fn derive_wire_constraints(wire_type: &WireType, output: &mut Vec<ParamConstraint>) {
     match wire_type {
-        WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
+        WireType::Matrix(matrix) => {
             constraints_for_matrix(matrix, output);
+        }
+        WireType::SmallMatrix { matrix, max_coefficient_bound } |
+        WireType::Preimage { matrix, max_coefficient_bound } => {
+            constraints_for_matrix(matrix, output);
+            nonnegative(
+                output,
+                max_coefficient_bound,
+                "bounded matrix coefficient bound".to_owned(),
+            );
         }
         WireType::Trapdoor {
             matrix,

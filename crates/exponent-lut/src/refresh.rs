@@ -1084,7 +1084,7 @@ impl RefreshAnchor {
     pub(crate) fn with_equation(b: Mat, k: Preimage) -> Self {
         // Construct the issuer target here so callers cannot attach an
         // unrelated matrix while claiming it is B*K.
-        let target = b.apply_preimage(k);
+        let target = b.mul_small_rhs(k);
         Self { equation: Some(RefreshAnchorEquation { target }) }
     }
 }
@@ -1277,13 +1277,6 @@ impl RefreshSetupManifest {
     pub fn refreshed_public_matrix(&self) -> &Mat {
         &self.a_prime
     }
-
-    /// Returns the shared decoder-base source handle for structural tests.
-    #[cfg(test)]
-    #[cfg(feature = "gpu")]
-    pub(crate) fn decoder_base_handle(&self) -> &mxx_ir_core::ValueHandle {
-        &self.packages[0].decoder_base_handle
-    }
 }
 
 /// Configuration for exact q/q_t gadget scaling and CRT recomposition.
@@ -1357,7 +1350,7 @@ impl RefreshCompiler {
             // `target = A_{sum,t} - mu_t A'`; the imported preimage K_t must
             // satisfy `B K_t = target` and is checked by RefreshDecoderPreimage.
             let decoder = BggEncodingWire {
-                vector: base.vector.apply_preimage(k.clone()),
+                vector: base.vector.mul_small_rhs(k.clone()),
                 pubkey: BggPublicKeyWire { matrix: target.clone(), reveal_plaintext: false },
                 plaintext: None,
             };
@@ -1650,7 +1643,7 @@ impl RefreshCompiler {
                 (format!("slot-{slot}-k"), package.k.value_handle().clone()),
                 (
                     format!("slot-{slot}-b-k-product"),
-                    package.b.clone().apply_preimage(package.k.clone()).value_handle().clone(),
+                    package.b.clone().mul_small_rhs(package.k.clone()).value_handle().clone(),
                 ),
             ]);
             levels.push(level);

@@ -271,7 +271,7 @@ impl ExponentLutPublicKeyCompiler {
         rhs: &ExponentRhsPackage,
     ) -> Result<Mat, ExponentLutError> {
         // Public projection of Fuse: multiply `A` by the digit matrix of C.
-        Ok(input.clone().mul_decomposed(
+        Ok(input.clone().mul_small_rhs(
             rhs.gsw_ciphertext()
                 .clone()
                 .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone()),
@@ -362,14 +362,14 @@ impl ExponentLutPublicKeyCompiler {
                     // payload or plaintext term is formed on this public path.
                     let rhs = ExponentRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
                     // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
-                    let fused = raw.mul_decomposed(rhs.gsw_ciphertext().clone().decompose(
+                    let fused = raw.mul_small_rhs(rhs.gsw_ciphertext().clone().decompose(
                         self.public_key.base.clone(),
                         self.public_key.digit_count.clone(),
                     ));
                     // `decomp = G^{-1}(fused)` has the gadget-digit shape needed
                     // by `mask`; `mask * decomp` is the helper's public projection
                     // that accompanies the private vector-side alignment.
-                    Ok(mask.mul_decomposed(fused.decompose(
+                    Ok(mask.mul_small_rhs(fused.decompose(
                         self.public_key.base.clone(),
                         self.public_key.digit_count.clone(),
                     )))
@@ -611,11 +611,11 @@ mod tests {
         let input = ring.zero((2, 2));
         let rhs = ExponentRhsPackage::new(ring.zero((2, 2))).unwrap();
         let output = compiler.fuse_public(&input, &rhs).unwrap();
-        let expected = input.mul_decomposed(rhs.gsw_ciphertext().clone().decompose(4, 2));
+        let expected = input.mul_small_rhs(rhs.gsw_ciphertext().clone().decompose(4, 2));
         assert_eq!(output.matrix_type(), expected.matrix_type());
         assert!(matches!(
             output.value_handle().node().kind(),
-            mxx_ir_core::node::NodeKind::ApplyPreimage
+            mxx_ir_core::node::NodeKind::MatrixMulSmallRhs
         ));
     }
 

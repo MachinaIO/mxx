@@ -1,12 +1,15 @@
 use crate::{
     artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId, validate_manifest},
     checks::{
-        CheckError, ElaborationWarning, WarningKind, check_add_shape, check_topological,
-        multiplication_type,
+        CheckError, ElaborationWarning, WarningKind, check_add_shape, check_same_ring,
+        check_topological, multiplication_type,
     },
-    expr::{ExprError, IndexExpr, IndexMap, IntExpr, ParamEnv},
+    expr::{ExprError, IndexExpr, IndexMap, IntExpr, ParamEnv, RealExpr},
     graph::{CompileParameterKind, FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
-    node::{ConcatAxis, ConstantMatrix, GridInputMode, IntBinaryOp, MatrixBinaryOp, NodeKind},
+    node::{
+        ConcatAxis, ConstantMatrix, GridInputMode, HashVariant, IntBinaryOp, MatrixBinaryOp,
+        NodeKind,
+    },
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireRef, WireType},
 };
 use num_bigint::BigInt;
@@ -25,7 +28,25 @@ pub struct ValidatedScope {
     pub execution_order: Vec<NodeHandle>,
     pub liveness: LivenessSchedule,
     pub wire_types: BTreeMap<WireRef, ConcreteWireType>,
+    /// Symbolic schemas are retained alongside the index-zero elaboration.
+    /// A loop body is validated structurally once, but its bounded RHS
+    /// expressions must be evaluated again for each concrete lane.
+    pub wire_schemas: BTreeMap<WireRef, WireType>,
     pub artifact_inputs: BTreeMap<WireRef, ManifestArtifact>,
+    /// Symbolic compact-RHS metadata keyed by multiplication node. The
+    /// per-instance bound is evaluated by downstream execution in its concrete
+    /// loop environment, rather than being frozen during index-zero scope
+    /// validation.
+    pub small_rhs_metadata: BTreeMap<NodeId, SmallRhsMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmallRhsMetadata {
+    /// This remains symbolic until the executor has the concrete loop
+    /// environment for the instance.  In particular, it must not be replaced
+    /// by the value obtained while elaborating loop index zero.
+    pub max_coefficient_bound: IntExpr,
+    pub relation_bearing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -246,11 +267,11 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                 }
             }
             for wire_type in node.output_types() {
-                let value = serde_json::to_value(wire_type).expect("WireType is serializable");
-                let mut ignored = BTreeSet::new();
-                let mut structural_slots = BTreeSet::new();
-                collect_expression_references(&value, &mut ignored, &mut structural_slots);
-                if let Some(slot) = structural_slots.into_iter().next() {
+                // Bounded RHS cutoffs are execution-instance metadata, not
+                // structural dimensions.  A loop body may therefore carry a
+                // bound such as `i + 1`; all matrix dimensions, family
+                // extents, and other structural expressions remain frozen.
+                if let Some(slot) = first_structural_loop_index(wire_type) {
                     return Err(ValidationError::StructuralLoopIndex {
                         scope: scope_id.clone(),
                         slot,
@@ -260,6 +281,76 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         }
     }
     Ok(())
+}
+
+fn first_structural_loop_index(wire_type: &WireType) -> Option<u32> {
+    match wire_type {
+        WireType::Bytes { length } => first_int_loop_index(length),
+        WireType::Matrix(matrix) => first_matrix_loop_index(matrix),
+        WireType::Trapdoor {
+            matrix,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+        } => first_matrix_loop_index(matrix)
+            .or_else(|| first_real_loop_index(sigma))
+            .or_else(|| first_int_loop_index(gadget_base))
+            .or_else(|| first_int_loop_index(digit_count))
+            .or_else(|| first_int_loop_index(preimage_max_coefficient_bound)),
+        // The bound is intentionally omitted: it is evaluated per concrete
+        // loop instance by the runtime.  Its matrix shape is still structural.
+        WireType::SmallMatrix { matrix, .. } | WireType::Preimage { matrix, .. } => {
+            first_matrix_loop_index(matrix)
+        }
+        WireType::Family { element, shape } => shape
+            .iter()
+            .find_map(first_int_loop_index)
+            .or_else(|| first_structural_loop_index(element)),
+        WireType::ConstantInt |
+        WireType::ConstantReal |
+        WireType::ConstantBool |
+        WireType::Int |
+        WireType::Real |
+        WireType::Bool |
+        WireType::TypedBlob { .. } => None,
+    }
+}
+
+fn first_matrix_loop_index(matrix: &MatrixType) -> Option<u32> {
+    first_int_loop_index(&matrix.modulus)
+        .or_else(|| first_int_loop_index(&matrix.ring_dimension))
+        .or_else(|| first_int_loop_index(&matrix.rows))
+        .or_else(|| first_int_loop_index(&matrix.columns))
+}
+
+fn first_int_loop_index(expression: &IntExpr) -> Option<u32> {
+    match expression {
+        IntExpr::LoopIndex(slot) => Some(*slot),
+        IntExpr::Add(left, right) |
+        IntExpr::Sub(left, right) |
+        IntExpr::Mul(left, right) |
+        IntExpr::Div(left, right) |
+        IntExpr::RoundDiv(left, right) => {
+            first_int_loop_index(left).or_else(|| first_int_loop_index(right))
+        }
+        IntExpr::Log2Ceil(value) => first_int_loop_index(value),
+        IntExpr::Const(_) | IntExpr::Var(_) => None,
+    }
+}
+
+fn first_real_loop_index(expression: &RealExpr) -> Option<u32> {
+    match expression {
+        RealExpr::FromInt(value) => first_int_loop_index(value),
+        RealExpr::Add(left, right) |
+        RealExpr::Sub(left, right) |
+        RealExpr::Mul(left, right) |
+        RealExpr::Div(left, right) => {
+            first_real_loop_index(left).or_else(|| first_real_loop_index(right))
+        }
+        RealExpr::Sqrt(value) => first_real_loop_index(value),
+        RealExpr::Rational(_) | RealExpr::Var(_) => None,
+    }
 }
 
 fn structural_loop_slots(graph: &Graph, scope: &FrozenGraphScopeId) -> BTreeSet<u32> {
@@ -461,7 +552,9 @@ fn validate_scope(
     warnings: &mut Vec<ElaborationWarning>,
 ) -> Result<ValidatedScope, ValidationError> {
     let mut wire_types = BTreeMap::new();
+    let mut wire_schemas = BTreeMap::new();
     let mut artifact_inputs = BTreeMap::new();
+    let mut small_rhs_metadata = BTreeMap::new();
     for (position, handle) in scope.nodes().iter().enumerate() {
         let node = NodeView {
             id: NodeId(position as u64),
@@ -476,7 +569,9 @@ fn validate_scope(
             bindings,
             manifests,
             &mut wire_types,
+            &mut wire_schemas,
             &mut artifact_inputs,
+            &mut small_rhs_metadata,
             warnings,
         )?;
     }
@@ -490,7 +585,9 @@ fn validate_scope(
         execution_order: scope.nodes().to_vec(),
         liveness,
         wire_types,
+        wire_schemas,
         artifact_inputs,
+        small_rhs_metadata,
     })
 }
 
@@ -508,7 +605,9 @@ fn validate_node(
     env: &ParamEnv,
     manifests: &BTreeMap<ProductionId, Manifest>,
     values: &mut BTreeMap<WireRef, ConcreteWireType>,
+    schemas: &mut BTreeMap<WireRef, WireType>,
     artifact_inputs: &mut BTreeMap<WireRef, ManifestArtifact>,
+    small_rhs_metadata: &mut BTreeMap<NodeId, SmallRhsMetadata>,
     warnings: &mut Vec<ElaborationWarning>,
 ) -> Result<(), ValidationError> {
     let sequential_slots = sequential_loop_slots(graph, scope);
@@ -656,6 +755,13 @@ fn validate_node(
             };
             vec![ConcreteWireType::Matrix(output)]
         }
+        NodeKind::MatrixMulSmallRhs => {
+            require_arity(scope, node, 2)?;
+            let left = matrix_argument(scope, values, node, 0)?;
+            let (right, metadata) = bounded_rhs_argument(scope, values, schemas, node, 1)?;
+            small_rhs_metadata.insert(node.id, metadata);
+            vec![ConcreteWireType::Matrix(small_rhs_multiplication_type(&left, &right)?)]
+        }
         NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
             if coefficients.is_empty() {
                 return Err(ValidationError::Node {
@@ -797,9 +903,12 @@ fn validate_node(
         }
         NodeKind::HashSample {
             matrix_type,
+            variant,
             tag_expressions,
             tag_decimal_expressions,
             tag_u64_le_expressions,
+            base,
+            digit_count,
             ..
         } => {
             if argument(scope, values, node, 0)? != &(ConcreteWireType::Bytes { length: 32 }) {
@@ -816,7 +925,53 @@ fn validate_node(
                     return node_error(scope, node.id, "little-endian hash tag must fit in u64");
                 }
             }
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let max_coefficient_bound = match variant {
+                HashVariant::Plain if base.is_none() && digit_count.is_none() => None,
+                HashVariant::Plain => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "plain hash cannot have decomposition metadata",
+                    )
+                }
+                HashVariant::Decomposed | HashVariant::SmallDecomposed => {
+                    let Some(base) = base else {
+                        return node_error(scope, node.id, "decomposed hash requires a gadget base")
+                    };
+                    let base = base.evaluate(env)?;
+                    if base <= BigInt::one() {
+                        return node_error(scope, node.id, "gadget base must be greater than one");
+                    }
+                    let Some(digit_count) = digit_count else {
+                        return node_error(scope, node.id, "decomposed hash requires a digit count")
+                    };
+                    let digit_count = positive_usize(
+                        digit_count.evaluate(env)?,
+                        "decomposition digit count",
+                        scope,
+                        node.id,
+                    )?;
+                    if matrix.rows % digit_count != 0 {
+                        return node_error(
+                            scope,
+                            node.id,
+                            "hash output rows must be divisible by decomposition digit count",
+                        );
+                    }
+                    Some(if matches!(variant, HashVariant::SmallDecomposed) {
+                        base - BigInt::one()
+                    } else {
+                        (base + BigInt::one()) / 2
+                    })
+                }
+            };
+            match max_coefficient_bound {
+                Some(max_coefficient_bound) => {
+                    vec![ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound }]
+                }
+                None => vec![ConcreteWireType::Matrix(matrix)],
+            }
         }
         NodeKind::TrapdoorSample {
             matrix_type,
@@ -884,17 +1039,10 @@ fn validate_node(
             // Matrix multiplication fixes the witness dimensions, and equality of the resulting
             // shape with T is the structural part of the relation B*K=T.
             check_preimage_equation(scope, node.id, &public, &trapdoor, &target, &output)?;
-            vec![ConcreteWireType::Preimage(output)]
-        }
-        NodeKind::ApplyPreimage => {
-            // ApplyPreimage is the relation-consuming edge: numerically it computes A*K, but its
-            // typed right input is what authorizes consuming the equation B*K=T. A plain
-            // MatrixBinary::Multiply follows the same arithmetic without this authorization.
-            require_arity(scope, node, 2)?;
-            let left = matrix_argument(scope, values, node, 0)?;
-            let right = preimage_argument(scope, values, node, 1)?;
-            // The output shape is the usual product shape for A*K; the relation marker is gone.
-            vec![ConcreteWireType::Matrix(multiplication_type(&left, &right)?)]
+            vec![ConcreteWireType::Preimage {
+                matrix: output,
+                max_coefficient_bound: max_coefficient_bound.evaluate(env)?,
+            }]
         }
         NodeKind::FamilyPreimageSample { matrix_type, max_coefficient_bound } => {
             // A source/trapdoor family indexed by i is paired with a target family indexed by
@@ -954,11 +1102,14 @@ fn validate_node(
             // The output keeps every source axis and the target's final branch axis, so relation
             // identity is preserved at each concrete family coordinate.
             vec![ConcreteWireType::Family {
-                element: Box::new(ConcreteWireType::Preimage(output)),
+                element: Box::new(ConcreteWireType::Preimage {
+                    matrix: output,
+                    max_coefficient_bound: max_coefficient_bound.evaluate(env)?,
+                }),
                 shape: target_shape,
             }]
         }
-        NodeKind::GadgetDecompose { base, digit_count, .. } => {
+        NodeKind::GadgetDecompose { base, small, digit_count } => {
             // GadgetDecompose creates a typed witness K whose row expansion is chosen so the
             // universal gadget equation G*K=T is dimensionally valid.
             require_arity(scope, node, 1)?;
@@ -980,66 +1131,15 @@ fn validate_node(
             })?;
             // Only the witness row count changes: multiplying G (with digit-expanded columns) by
             // K reconstructs the original target T without changing its column count.
-            vec![ConcreteWireType::Preimage(ConcreteMatrixType { rows, ..input })]
-        }
-        NodeKind::MaterializePreimageExact => {
-            // This conversion is an identity on the runtime matrix K, but drops B*K=T from the
-            // type. Exact-target validation outside this structural pass is what makes that drop
-            // safe; a noisy target cannot be hidden by this node.
-            require_arity(scope, node, 1)?;
-            let input = preimage_argument(scope, values, node, 0)?;
-            vec![ConcreteWireType::Matrix(input)]
-        }
-        NodeKind::PreimageBinary(operation) => {
-            // Each typed branch computes a new witness while retaining a common-source relation;
-            // the operation equations are B*(K')=T' and are encoded by PreimageBinaryOp.
-            require_arity(scope, node, 2)?;
-            let left = preimage_argument(scope, values, node, 0)?;
-            let output = match operation {
-                crate::node::PreimageBinaryOp::Add => {
-                    let right = preimage_argument(scope, values, node, 1)?;
-                    check_add_shape(&left, &right)?;
-                    left
-                }
-                crate::node::PreimageBinaryOp::RightMultiplyExact => {
-                    let right = matrix_argument(scope, values, node, 1)?;
-                    multiplication_type(&left, &right)?
-                }
-                crate::node::PreimageBinaryOp::ComposeExactDecomposition => {
-                    let right = preimage_argument(scope, values, node, 1)?;
-                    multiplication_type(&left, &right)?
-                }
+            let bound = if *small {
+                base.clone() - BigInt::from(1_u8)
+            } else {
+                base.clone() / BigInt::from(2_u8)
             };
-            vec![ConcreteWireType::Preimage(output)]
-        }
-        NodeKind::PreimageConcatColumns => {
-            // Column concatenation maps K_j with B*K_j=T_j to K=[K_1|...|K_n] and
-            // T=[T_1|...|T_n], preserving B*K=T componentwise.
-            if node.args.is_empty() {
-                return node_error(scope, node.id, "preimage concat requires at least one input");
-            }
-            let inputs = (0..node.args.len())
-                .map(|index| preimage_argument(scope, values, node, index))
-                .collect::<Result<Vec<_>, _>>()?;
-            vec![ConcreteWireType::Preimage(concat_type(
-                &inputs,
-                crate::node::ConcatAxis::Columns,
-                scope,
-                node.id,
-            )?)]
-        }
-        NodeKind::DecompositionEntry { row, column } => {
-            // The scalar output is the coordinate K[row,column] of a witness satisfying G*K=T;
-            // bounds are checked before the decomposition relation can be forgotten.
-            require_arity(scope, node, 1)?;
-            let input = preimage_argument(scope, values, node, 0)?;
-            let row = nonnegative_usize(row.evaluate(env)?, "decomposition row", scope, node.id)?;
-            let column =
-                nonnegative_usize(column.evaluate(env)?, "decomposition column", scope, node.id)?;
-            if row >= input.rows || column >= input.columns {
-                return node_error(scope, node.id, "decomposition entry is out of bounds");
-            }
-            vec![ConcreteWireType::Matrix(ConcreteMatrixType { rows: 1, columns: 1, ..input })]
+            vec![ConcreteWireType::Preimage {
+                matrix: ConcreteMatrixType { rows, ..input },
+                max_coefficient_bound: bound,
+            }]
         }
         NodeKind::ExtractCoefficient { position, .. } => {
             require_arity(scope, node, 1)?;
@@ -1355,7 +1455,9 @@ fn validate_node(
         );
     }
     for (port, ty) in inferred.into_iter().enumerate() {
-        values.insert(WireRef { node: node.id, port: Port(port as u32) }, ty);
+        let wire = WireRef { node: node.id, port: Port(port as u32) };
+        values.insert(wire, ty);
+        schemas.insert(wire, node.output_types[port].clone());
     }
     Ok(())
 }
@@ -1616,25 +1718,70 @@ fn matrix_argument(
     node: &NodeView<'_>,
     index: usize,
 ) -> Result<ConcreteMatrixType, ValidationError> {
-    argument(scope, values, node, index)?.matrix_type().cloned().ok_or_else(|| {
-        ValidationError::Node {
-            scope: scope.clone(),
-            node: node.id,
-            message: "expected matrix argument".to_owned(),
-        }
-    })
+    match argument(scope, values, node, index)? {
+        ConcreteWireType::Matrix(matrix) => Ok(matrix.clone()),
+        _ => node_error(scope, node.id, "expected ordinary matrix argument"),
+    }
 }
 
-fn preimage_argument(
+fn bounded_rhs_argument(
     scope: &FrozenGraphScopeId,
     values: &BTreeMap<WireRef, ConcreteWireType>,
+    schemas: &BTreeMap<WireRef, WireType>,
     node: &NodeView<'_>,
     index: usize,
-) -> Result<ConcreteMatrixType, ValidationError> {
+) -> Result<(ConcreteMatrixType, SmallRhsMetadata), ValidationError> {
+    let wire = *node.args.get(index).ok_or_else(|| ValidationError::Node {
+        scope: scope.clone(),
+        node: node.id,
+        message: format!("missing argument {index}"),
+    })?;
+    let metadata = match schemas.get(&wire) {
+        Some(WireType::SmallMatrix { max_coefficient_bound, .. }) => SmallRhsMetadata {
+            max_coefficient_bound: max_coefficient_bound.clone(),
+            relation_bearing: false,
+        },
+        Some(WireType::Preimage { max_coefficient_bound, .. }) => SmallRhsMetadata {
+            max_coefficient_bound: max_coefficient_bound.clone(),
+            relation_bearing: true,
+        },
+        _ => return node_error(scope, node.id, "small RHS requires a bounded matrix or preimage"),
+    };
     match argument(scope, values, node, index)? {
-        ConcreteWireType::Preimage(matrix) => Ok(matrix.clone()),
-        _ => node_error(scope, node.id, "expected preimage argument"),
+        ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+        ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+            if max_coefficient_bound.is_negative() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "small RHS coefficient bound must be nonnegative",
+                );
+            }
+            // The concrete value is checked at this scope's representative
+            // environment.  The returned metadata deliberately comes from
+            // the symbolic schema above so loop-dependent bounds are not
+            // frozen at index zero.
+            let _ = max_coefficient_bound;
+            Ok((matrix.clone(), metadata))
+        }
+        _ => node_error(scope, node.id, "small RHS requires a bounded matrix or preimage"),
     }
+}
+
+fn small_rhs_multiplication_type(
+    left: &ConcreteMatrixType,
+    right: &ConcreteMatrixType,
+) -> Result<ConcreteMatrixType, CheckError> {
+    check_same_ring(left, right)?;
+    if left.columns != right.rows {
+        return Err(CheckError::ShapeMismatch { left: left.clone(), right: right.clone() });
+    }
+    Ok(ConcreteMatrixType {
+        modulus: left.modulus.clone(),
+        ring_dimension: left.ring_dimension,
+        rows: left.rows,
+        columns: right.columns,
+    })
 }
 
 fn trapdoor_argument(
@@ -1721,8 +1868,29 @@ fn concrete_wire(
         }
         // A Preimage wire is deliberately distinct from Matrix: the former carries a witness K
         // for some registered B*K=T, whereas the latter carries only the runtime matrix value.
-        WireType::Preimage(matrix) => {
-            ConcreteWireType::Preimage(concrete_matrix(matrix, env, scope, node)?)
+        WireType::SmallMatrix { matrix, max_coefficient_bound } => {
+            let bound = max_coefficient_bound.evaluate(env)?;
+            if bound.is_negative() {
+                return node_error(
+                    scope,
+                    node,
+                    "small matrix coefficient bound must be nonnegative",
+                );
+            }
+            ConcreteWireType::SmallMatrix {
+                matrix: concrete_matrix(matrix, env, scope, node)?,
+                max_coefficient_bound: bound,
+            }
+        }
+        WireType::Preimage { matrix, max_coefficient_bound } => {
+            let bound = max_coefficient_bound.evaluate(env)?;
+            if bound.is_negative() {
+                return node_error(scope, node, "preimage coefficient bound must be nonnegative");
+            }
+            ConcreteWireType::Preimage {
+                matrix: concrete_matrix(matrix, env, scope, node)?,
+                max_coefficient_bound: bound,
+            }
         }
         WireType::Trapdoor {
             matrix,
@@ -2363,31 +2531,89 @@ mod tests {
     }
 
     #[test]
-    fn apply_preimage_requires_a_typed_preimage_right_operand() {
-        let left_type = matrix_type(17, 1, 2);
-        let preimage_type = matrix_type(17, 2, 1);
-        let output_type = matrix_type(17, 1, 1);
-        let applied = |name: &str, right_type: WireType| {
-            let left = input("left", left_type.clone());
-            let right = typed_input("right", right_type);
-            graph(
-                name,
-                value(
-                    NodeKind::ApplyPreimage,
-                    vec![left, right],
-                    vec![WireType::Matrix(output_type.clone())],
-                ),
-            )
-        };
-
-        let typed = applied("typed-apply-preimage", WireType::Preimage(preimage_type.clone()));
-        assert!(validate(&typed, &ParamEnv::default()).is_ok());
-
-        let ordinary = applied("matrix-apply-preimage", WireType::Matrix(preimage_type));
-        assert_eq!(
-            node_message(validate(&ordinary, &ParamEnv::default()).unwrap_err()),
-            "expected preimage argument"
+    fn small_rhs_multiplication_requires_bounded_rhs_and_exact_shared_dimension() {
+        let left = input("left", matrix_type(17, 3, 2));
+        let rhs_type = matrix_type(17, 2, 4);
+        let rhs = typed_input(
+            "rhs",
+            WireType::SmallMatrix {
+                matrix: rhs_type.clone(),
+                max_coefficient_bound: IntExpr::constant(2),
+            },
         );
+        let product = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![left, rhs],
+            vec![WireType::Matrix(matrix_type(17, 3, 4))],
+        );
+        let validated = validate(&graph("small-rhs-valid", product), &ParamEnv::default())
+            .expect("bounded product validates");
+        assert_eq!(validated.root_scope().small_rhs_metadata.len(), 1);
+        assert_eq!(
+            validated.root_scope().small_rhs_metadata.values().next().unwrap(),
+            &SmallRhsMetadata {
+                max_coefficient_bound: IntExpr::constant(2),
+                relation_bearing: false,
+            }
+        );
+
+        let ordinary_rhs = input("ordinary-rhs", rhs_type.clone());
+        let invalid = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![input("left", matrix_type(17, 3, 2)), ordinary_rhs],
+            vec![WireType::Matrix(matrix_type(17, 3, 4))],
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("small-rhs-ordinary", invalid), &ParamEnv::default()).unwrap_err()
+            ),
+            "small RHS requires a bounded matrix or preimage"
+        );
+
+        let negative = typed_input(
+            "negative-rhs",
+            WireType::Preimage { matrix: rhs_type, max_coefficient_bound: IntExpr::constant(-1) },
+        );
+        let invalid_bound = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![input("left", matrix_type(17, 3, 2)), negative],
+            vec![WireType::Matrix(matrix_type(17, 3, 4))],
+        );
+        assert_eq!(
+            node_message(
+                validate(&graph("small-rhs-negative", invalid_bound), &ParamEnv::default())
+                    .unwrap_err()
+            ),
+            "bounded matrix coefficient bound"
+        );
+    }
+
+    #[test]
+    fn loop_dependent_bounded_rhs_preserves_symbolic_bound_per_instance() {
+        let bound = IntExpr::Add(Box::new(IntExpr::LoopIndex(7)), Box::new(IntExpr::constant(1)));
+        let ty = WireType::SmallMatrix {
+            matrix: matrix_type(17, 2, 2),
+            max_coefficient_bound: bound.clone(),
+        };
+        // The cutoff is instance metadata and is therefore allowed to depend
+        // on the enclosing loop.  Matrix dimensions remain structural.
+        assert_eq!(first_structural_loop_index(&ty), None);
+        let mut first = ParamEnv::default();
+        first.loop_indices.insert(7, BigInt::zero());
+        let mut later = first.clone();
+        later.loop_indices.insert(7, BigInt::from(5));
+        assert_eq!(bound.evaluate(&first).unwrap(), BigInt::from(1));
+        assert_eq!(bound.evaluate(&later).unwrap(), BigInt::from(6));
+
+        let metadata = SmallRhsMetadata { max_coefficient_bound: bound, relation_bearing: false };
+        assert_eq!(metadata.max_coefficient_bound.evaluate(&first).unwrap(), BigInt::from(1));
+        assert_eq!(metadata.max_coefficient_bound.evaluate(&later).unwrap(), BigInt::from(6));
+
+        let invalid_dimensions = WireType::SmallMatrix {
+            matrix: MatrixType { rows: IntExpr::LoopIndex(7), ..matrix_type(17, 2, 2) },
+            max_coefficient_bound: IntExpr::constant(1),
+        };
+        assert_eq!(first_structural_loop_index(&invalid_dimensions), Some(7));
     }
 
     #[test]
@@ -2466,7 +2692,10 @@ mod tests {
                 small: false,
             },
             vec![target],
-            vec![WireType::Preimage(decomposition_type.clone())],
+            vec![WireType::Preimage {
+                matrix: decomposition_type.clone(),
+                max_coefficient_bound: IntExpr::constant(2),
+            }],
         );
         let automorphism = value(
             NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
@@ -2582,7 +2811,13 @@ mod tests {
                     max_coefficient_bound: IntExpr::constant(8),
                 },
                 vec![public, trapdoor, target],
-                vec![family(WireType::Preimage(preimage_type), &[2, 4])],
+                vec![family(
+                    WireType::Preimage {
+                        matrix: preimage_type,
+                        max_coefficient_bound: IntExpr::constant(8),
+                    },
+                    &[2, 4],
+                )],
             )
         }
 

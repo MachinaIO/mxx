@@ -1040,6 +1040,7 @@ mod artifact {
                         name.clone(),
                         vec![IntExpr::constant(count)],
                         (self.b0_public_columns(), range_len(&columns)),
+                        self.preimage_max_coefficient_bound.clone(),
                         ArtifactConfidentiality::Public,
                     );
                     preimage_chunks.insert(name, family);
@@ -1077,7 +1078,7 @@ mod artifact {
                     let destination_public = slots.public_keys.get_static(destination);
                     let destination_chunk = destination_public.slice(None, Some(columns.clone()));
                     let rhs = source_secret *
-                        input.clone().mul_decomposed(
+                        input.clone().mul_small_rhs(
                             destination_chunk.decompose(self.gadget_base.clone(), self.digit_count),
                         ) *
                         ring.polynomial([IntExpr::constant(scalar.unwrap_or(1))]);
@@ -1117,7 +1118,7 @@ mod artifact {
                     let rhs = (0..source_slot_count)
                         .map(|source| {
                             slots.secrets.get_static(source) *
-                                input.clone().mul_decomposed(
+                                input.clone().mul_small_rhs(
                                     destination_chunk
                                         .clone()
                                         .decompose(self.gadget_base.clone(), self.digit_count),
@@ -1200,6 +1201,7 @@ mod artifact {
                         if b0 { b0_preimage_name(chunk) } else { b1_preimage_name(chunk) },
                         vec![IntExpr::constant(self.slot_count)],
                         (rows, range_len(&range)),
+                        self.preimage_max_coefficient_bound.clone(),
                         ArtifactConfidentiality::Public,
                     )
                 })
@@ -1255,7 +1257,7 @@ mod artifact {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::test_utils::{execute_graph, matrix_output, row};
+        use crate::test_utils::{execute_graph, matrix_output, row, small_matrix_output};
         use mxx_ir_core::ParamEnv;
         use mxx_primitives::{
             matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -1311,7 +1313,7 @@ mod artifact {
                 gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
                 trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
                 error_sigma: RealExpr::from_integer(0),
-                preimage_max_coefficient_bound: 29.into(),
+                preimage_max_coefficient_bound: 1_000_000.into(),
                 error_max_coefficient_bound: 0.into(),
             };
             let ring = compiler.ring();
@@ -1408,7 +1410,8 @@ mod artifact {
                 {
                     let (start, end) = static_range(&range);
                     assert_eq!(
-                        b0.clone() * matrix_output(&result, &format!("slot_b0_{chunk}_{slot}")),
+                        b0.clone() *
+                            small_matrix_output(&result, &format!("slot_b0_{chunk}_{slot}")),
                         secret_identity.clone() * &b1.slice_columns(start, end)
                     );
                 }
@@ -1420,7 +1423,8 @@ mod artifact {
                         .slice_columns(start, end)
                         .concat_rows(&[&-(secret.clone() * &gadget.slice_columns(start, end))]);
                     assert_eq!(
-                        b1.clone() * matrix_output(&result, &format!("slot_b1_{chunk}_{slot}")),
+                        b1.clone() *
+                            small_matrix_output(&result, &format!("slot_b1_{chunk}_{slot}")),
                         expected
                     );
                 }
@@ -1446,7 +1450,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone() *
-                            matrix_output(
+                            small_matrix_output(
                                 &result,
                                 &format!("gate_transfer_{chunk}_{destination}"),
                             ),
@@ -1468,7 +1472,10 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone() *
-                            matrix_output(&result, &format!("gate_reduce_{chunk}_{destination}"),),
+                            small_matrix_output(
+                                &result,
+                                &format!("gate_reduce_{chunk}_{destination}"),
+                            ),
                         expected
                     );
                 }
@@ -1489,7 +1496,7 @@ mod artifact {
                 gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
                 trapdoor_sigma: RealExpr::from_f64_exact(4.578).expect("finite sigma"),
                 error_sigma: RealExpr::from_integer(0),
-                preimage_max_coefficient_bound: 29.into(),
+                preimage_max_coefficient_bound: 1_000_000.into(),
                 error_max_coefficient_bound: 0.into(),
             };
             let mut backend = cpu_backend([parameters.clone()]);
@@ -1617,7 +1624,7 @@ mod artifact {
             for (chunk, range) in b0_ranges.iter().enumerate() {
                 let (start, end) = static_range(range);
                 assert_eq!(
-                    b0.clone() * matrix_output(&inspected, &format!("b0-preimage-{chunk}")),
+                    b0.clone() * small_matrix_output(&inspected, &format!("b0-preimage-{chunk}")),
                     secret_identity.clone() * &b1.slice_columns(start, end)
                 );
             }
@@ -1628,7 +1635,7 @@ mod artifact {
                     .slice_columns(start, end)
                     .concat_rows(&[&-(secret.clone() * &gadget.slice_columns(start, end))]);
                 assert_eq!(
-                    b1.clone() * matrix_output(&inspected, &format!("b1-preimage-{chunk}")),
+                    b1.clone() * small_matrix_output(&inspected, &format!("b1-preimage-{chunk}")),
                     expected
                 );
             }
@@ -1801,7 +1808,7 @@ mod artifact {
                 &matrix_output(&consumed, "transfer-output").slice_columns(start, end) -
                 &transfer_rhs;
             assert_eq!(
-                b0.clone() * matrix_output(&consumed, "transfer-preimage"),
+                b0.clone() * small_matrix_output(&consumed, "transfer-preimage"),
                 transfer_expected
             );
             let mut reduce_rhs =
@@ -1814,7 +1821,10 @@ mod artifact {
             let reduce_expected = matrix_output(&consumed, "secret-0").clone() *
                 &matrix_output(&consumed, "reduce-output").slice_columns(start, end) -
                 &reduce_rhs;
-            assert_eq!(b0.clone() * matrix_output(&consumed, "reduce-preimage"), reduce_expected);
+            assert_eq!(
+                b0.clone() * small_matrix_output(&consumed, "reduce-preimage"),
+                reduce_expected
+            );
         }
 
         #[test]

@@ -9,7 +9,7 @@ use mxx_ir_core::{
     artifact::{ArtifactConfidentiality, ProductionId},
     graph::with_new_construction_scope,
     node::{
-        ArtifactInput, ConstantMatrix, IndexRange, MatrixBinaryOp, NodeKind,
+        ArtifactInput, ConstantMatrix, HashVariant, IndexRange, MatrixBinaryOp, NodeKind,
         ParallelGrid as IrParallelGrid, SampleRange, SequentialLoop,
     },
     types::{MatrixType, WireType},
@@ -121,11 +121,20 @@ pub struct IntType;
 pub struct BoolType;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SmallMatrixType {
+    pub matrix: MatrixType,
+    pub max_coefficient_bound: IntExpr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 /// Type of a witness matrix `K` whose public relation is `B*K=T`.
 ///
 /// This wrapper is intentionally distinct from `Mat`: a matrix value alone does not authorize
 /// relation consumption, while a `Preimage` value does.
-pub struct PreimageType(pub MatrixType);
+pub struct PreimageType {
+    pub matrix: MatrixType,
+    pub max_coefficient_bound: IntExpr,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TrapdoorType {
@@ -154,6 +163,13 @@ pub struct MatFamilyType {
 /// Shape and typed witness element of a rank-N preimage family `K[u]`.
 pub struct PreimageFamilyType {
     pub element: MatrixType,
+    pub max_coefficient_bound: IntExpr,
+    pub shape: Vec<IntExpr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SmallMatrixFamilyType {
+    pub element: SmallMatrixType,
     pub shape: Vec<IntExpr>,
 }
 
@@ -212,9 +228,29 @@ impl Ring {
     /// Noise simulation remains fail-closed unless a relation for this value is supplied by the
     /// surrounding stage or artifact flow.
     #[track_caller]
-    pub fn preimage_input(&self, name: impl Into<String>, shape: impl IntoShape) -> Preimage {
+    pub fn small_matrix_input(
+        &self,
+        name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> SmallMatrix {
         let matrix_type = self.matrix_type(shape);
-        let wire_type = WireType::Preimage(matrix_type.clone());
+        SmallMatrix::source_input(name.into(), matrix_type, max_coefficient_bound.into(), None)
+    }
+
+    #[track_caller]
+    pub fn preimage_input(
+        &self,
+        name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Preimage {
+        let matrix_type = self.matrix_type(shape);
+        let max_coefficient_bound = max_coefficient_bound.into();
+        let wire_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
         let node = NodeHandle::new(
             NodeKind::Input { name: name.into(), wire_type: wire_type.clone(), artifact: None },
             Vec::new(),
@@ -223,6 +259,7 @@ impl Ring {
         Preimage {
             value: node.output(0).expect("preimage input"),
             matrix_type,
+            max_coefficient_bound,
             pending: Pending::default(),
         }
     }
@@ -249,11 +286,16 @@ impl Ring {
         production_id: ProductionId,
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
         confidentiality: ArtifactConfidentiality,
     ) -> Preimage {
         let artifact_name = artifact_name.into();
         let matrix_type = self.matrix_type(shape);
-        let wire_type = WireType::Preimage(matrix_type.clone());
+        let max_coefficient_bound = max_coefficient_bound.into();
+        let wire_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
         let node = NodeHandle::new(
             NodeKind::Input {
                 name: artifact_name.clone(),
@@ -266,8 +308,29 @@ impl Ring {
         Preimage {
             value: node.output(0).expect("preimage artifact input"),
             matrix_type,
+            max_coefficient_bound,
             pending: Pending::default(),
         }
+    }
+
+    #[track_caller]
+    pub fn small_matrix_artifact_input(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> SmallMatrix {
+        let artifact_name = artifact_name.into();
+        let matrix_type = self.matrix_type(shape);
+        let max_coefficient_bound = max_coefficient_bound.into();
+        SmallMatrix::source_input(
+            format!("artifact:{artifact_name}"),
+            matrix_type,
+            max_coefficient_bound,
+            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+        )
     }
 
     #[track_caller]
@@ -414,6 +477,44 @@ impl Ring {
     }
 
     #[track_caller]
+    pub fn small_matrix_family_input(
+        &self,
+        name: impl Into<String>,
+        count: impl Into<IntExpr>,
+        shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+    ) -> Family<SmallMatrix> {
+        let element = self.matrix_type(shape);
+        Family::<SmallMatrix>::source_input(
+            name.into(),
+            element,
+            vec![count.into()],
+            max_coefficient_bound.into(),
+            None,
+        )
+    }
+
+    #[track_caller]
+    pub fn small_matrix_family_artifact_input(
+        &self,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        family_shape: Vec<IntExpr>,
+        matrix_shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> Family<SmallMatrix> {
+        let artifact_name = artifact_name.into();
+        Family::<SmallMatrix>::source_input(
+            format!("artifact:{artifact_name}"),
+            self.matrix_type(matrix_shape),
+            family_shape,
+            max_coefficient_bound.into(),
+            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+        )
+    }
+
+    #[track_caller]
     pub fn family_artifact_input(
         &self,
         production_id: ProductionId,
@@ -433,9 +534,8 @@ impl Ring {
 
     /// Loads a public or private artifact family whose elements are preimages.
     ///
-    /// Preimages retain their relation marker after crossing a stage boundary;
-    /// this is what lets a later `mul_decomposed`/`apply_preimage` operation
-    /// consume the artifact without re-discovering the relation.
+    /// Preimages retain their relation marker after crossing a stage boundary so that the bounded
+    /// RHS operation can consume the artifact without re-discovering the relation.
     #[track_caller]
     pub fn preimage_family_artifact_input(
         &self,
@@ -443,14 +543,17 @@ impl Ring {
         artifact_name: impl Into<String>,
         family_shape: Vec<IntExpr>,
         matrix_shape: impl IntoShape,
+        max_coefficient_bound: impl Into<IntExpr>,
         confidentiality: ArtifactConfidentiality,
     ) -> Family<Preimage> {
         let artifact_name = artifact_name.into();
         let matrix_type = self.matrix_type(matrix_shape);
+        let max_coefficient_bound = max_coefficient_bound.into();
         Family::<Preimage>::source_input(
             format!("artifact:{artifact_name}"),
             matrix_type,
             family_shape,
+            max_coefficient_bound,
             Some(ArtifactInput { production_id, artifact_name, confidentiality }),
         )
     }
@@ -564,7 +667,7 @@ impl Ring {
 
     #[track_caller]
     pub fn hash_matrix(&self, key: Bytes, tag: impl Into<HashTag>, shape: impl IntoShape) -> Mat {
-        self.hash(key, tag, shape)
+        self.hash(key, tag, shape, HashVariant::Plain, None, None)
     }
 
     #[track_caller]
@@ -575,19 +678,85 @@ impl Ring {
         shape: impl IntoShape,
         base: impl Into<IntExpr>,
         digit_count: impl Into<IntExpr>,
-    ) -> Decomposition {
-        let shape = shape.into_shape();
-        let base = base.into();
-        let digit_count = digit_count.into();
-        let plain_shape = Shape {
-            rows: IntExpr::Div(Box::new(shape.rows.clone()), Box::new(digit_count.clone())),
-            columns: shape.columns.clone(),
-        };
-        self.hash(key, tag, plain_shape).decompose(base, digit_count)
+    ) -> SmallMatrix {
+        self.hash_bounded(key, tag, shape, HashVariant::Decomposed, base.into(), digit_count.into())
     }
 
     #[track_caller]
-    fn hash(&self, key: Bytes, tag: impl Into<HashTag>, shape: impl IntoShape) -> Mat {
+    pub fn hash_small_decomposed(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        shape: impl IntoShape,
+        base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+    ) -> SmallMatrix {
+        self.hash_bounded(
+            key,
+            tag,
+            shape,
+            HashVariant::SmallDecomposed,
+            base.into(),
+            digit_count.into(),
+        )
+    }
+
+    #[track_caller]
+    fn hash_bounded(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        shape: impl IntoShape,
+        variant: HashVariant,
+        base: IntExpr,
+        digit_count: IntExpr,
+    ) -> SmallMatrix {
+        let matrix_type = self.matrix_type(shape);
+        let tag = tag.into();
+        let max_coefficient_bound = if matches!(variant, HashVariant::SmallDecomposed) {
+            IntExpr::Sub(Box::new(base.clone()), Box::new(IntExpr::constant(1))).canonicalize()
+        } else {
+            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2))).canonicalize()
+        };
+        let pending = Pending::merge([key.pending.clone(), tag.pending]);
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
+        let wire_type = WireType::SmallMatrix {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::HashSample {
+                matrix_type: matrix_type.clone(),
+                variant,
+                tag_prefix: tag.prefix,
+                tag_expressions: tag.binary,
+                tag_decimal_expressions: tag.decimal,
+                tag_u64_le_expressions: tag.u64_le,
+                base: Some(base),
+                digit_count: Some(digit_count),
+            },
+            arguments,
+            vec![wire_type],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("bounded hash output"),
+            matrix_type,
+            max_coefficient_bound,
+            pending,
+        }
+    }
+
+    #[track_caller]
+    fn hash(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        shape: impl IntoShape,
+        variant: HashVariant,
+        base: Option<IntExpr>,
+        digit_count: Option<IntExpr>,
+    ) -> Mat {
         let ty = self.matrix_type(shape);
         let tag = tag.into();
         let pending = Pending::merge([key.pending.clone(), tag.pending]);
@@ -596,10 +765,13 @@ impl Ring {
         let node = NodeHandle::new(
             NodeKind::HashSample {
                 matrix_type: ty.clone(),
+                variant,
                 tag_prefix: tag.prefix,
                 tag_expressions: tag.binary,
                 tag_decimal_expressions: tag.decimal,
                 tag_u64_le_expressions: tag.u64_le,
+                base,
+                digit_count,
             },
             arguments,
             vec![WireType::Matrix(ty.clone())],
@@ -758,6 +930,18 @@ impl HashTagPart for LoopIndex {
     }
 }
 
+fn decomposition_bound(base: &IntExpr, small: bool) -> IntExpr {
+    if small {
+        IntExpr::Sub(Box::new(base.clone()), Box::new(IntExpr::constant(1))).canonicalize()
+    } else {
+        IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2))).canonicalize()
+    }
+}
+
+fn preimage_wire(matrix: MatrixType, max_coefficient_bound: IntExpr) -> WireType {
+    WireType::Preimage { matrix, max_coefficient_bound }
+}
+
 impl HashTagPart for IntExpr {
     fn append_to(self, tag: &mut HashTag) {
         tag.u64_le.push(self);
@@ -776,6 +960,52 @@ pub struct Mat {
     value: ValueHandle,
     matrix_type: MatrixType,
     pending: Pending,
+}
+
+#[derive(Clone)]
+pub struct SmallMatrix {
+    value: ValueHandle,
+    matrix_type: MatrixType,
+    max_coefficient_bound: IntExpr,
+    pending: Pending,
+}
+
+impl SmallMatrix {
+    fn source_input(
+        name: String,
+        matrix_type: MatrixType,
+        max_coefficient_bound: IntExpr,
+        artifact: Option<ArtifactInput>,
+    ) -> Self {
+        let wire_type = WireType::SmallMatrix {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::Input { name, wire_type: wire_type.clone(), artifact },
+            Vec::new(),
+            vec![wire_type],
+        );
+        Self {
+            value: node.output(0).expect("small matrix input"),
+            matrix_type,
+            max_coefficient_bound,
+            pending: Pending::default(),
+        }
+    }
+
+    pub fn matrix_type(&self) -> &MatrixType {
+        &self.matrix_type
+    }
+
+    pub fn max_coefficient_bound(&self) -> &IntExpr {
+        &self.max_coefficient_bound
+    }
+
+    #[doc(hidden)]
+    pub fn value_handle(&self) -> &ValueHandle {
+        &self.value
+    }
 }
 
 impl Mat {
@@ -902,35 +1132,25 @@ impl Mat {
     }
 
     #[track_caller]
-    pub fn decompose(
-        self,
-        base: impl Into<IntExpr>,
-        digit_count: impl Into<IntExpr>,
-    ) -> Decomposition {
+    pub fn decompose(self, base: impl Into<IntExpr>, digit_count: impl Into<IntExpr>) -> Preimage {
         self.decompose_with_mode(base.into(), digit_count.into(), false)
     }
 
-    /// Applies a typed preimage relation explicitly; this is the only operation that transports
-    /// relation semantics across a matrix product.
+    /// Multiplies this full matrix by a validated bounded RHS.
     ///
-    /// Given ordinary `A` and witness `K` with `B*K=T`, this emits `A*K`. The arithmetic matches
-    /// `Mat * Mat`, but only this method is allowed to consume the `Preimage` marker; ordinary
-    /// multiplication remains relation-unaware.
+    /// The sealed `BoundedRhs` interface prevents ordinary `Mat` values or raw handles from
+    /// entering the compact operation without an explicit bound and semantic kind.
     #[track_caller]
-    pub fn apply_preimage(self, preimage: Preimage) -> Self {
-        let matrix_type = product_type(&self.matrix_type, &preimage.matrix_type);
-        let pending = Pending::merge([self.pending, preimage.pending]);
+    pub fn mul_small_rhs<R: BoundedRhs>(self, rhs: R) -> Self {
+        let matrix_type = exact_product_type(&self.matrix_type, rhs.matrix_type());
+        debug_assert_eq!(rhs.value_handle().wire_type(), &rhs.wire_type());
+        let pending = Pending::merge([self.pending, rhs.pending()]);
         let node = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![self.value, preimage.value],
+            NodeKind::MatrixMulSmallRhs,
+            vec![self.value, rhs.value_handle().clone()],
             vec![WireType::Matrix(matrix_type.clone())],
         );
-        Self { value: node.output(0).expect("preimage application"), matrix_type, pending }
-    }
-
-    #[track_caller]
-    pub fn mul_decomposed(self, decomposition: Decomposition) -> Self {
-        self.apply_preimage(decomposition.into_preimage_relation())
+        Self { value: node.output(0).expect("small RHS multiplication"), matrix_type, pending }
     }
 
     #[track_caller]
@@ -938,16 +1158,11 @@ impl Mat {
         self,
         base: impl Into<IntExpr>,
         digit_count: impl Into<IntExpr>,
-    ) -> Decomposition {
+    ) -> Preimage {
         self.decompose_with_mode(base.into(), digit_count.into(), true)
     }
 
-    fn decompose_with_mode(
-        self,
-        base: IntExpr,
-        digit_count: IntExpr,
-        small: bool,
-    ) -> Decomposition {
+    fn decompose_with_mode(self, base: IntExpr, digit_count: IntExpr, small: bool) -> Preimage {
         // The witness has `digit_count` times the target row count, making `G*K=T` well typed for
         // the gadget matrix G selected by `base` and `small`.
         let ty = MatrixType {
@@ -958,18 +1173,21 @@ impl Mat {
             .canonicalize(),
             ..self.matrix_type.clone()
         };
+        let max_coefficient_bound = decomposition_bound(&base, small);
         let pending = self.pending;
         let node = NodeHandle::new(
             NodeKind::GadgetDecompose { base, small, digit_count },
             vec![self.value],
-            vec![WireType::Preimage(ty.clone())],
+            vec![WireType::Preimage {
+                matrix: ty.clone(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+            }],
         );
-        Decomposition {
-            preimage: Preimage {
-                value: node.output(0).expect("decomposition"),
-                matrix_type: ty,
-                pending,
-            },
+        Preimage {
+            value: node.output(0).expect("decomposition"),
+            matrix_type: ty,
+            max_coefficient_bound,
+            pending,
         }
     }
 
@@ -1145,10 +1363,90 @@ impl Neg for Mat {
 pub struct Preimage {
     value: ValueHandle,
     matrix_type: MatrixType,
+    max_coefficient_bound: IntExpr,
     pending: Pending,
 }
 
+mod bounded_rhs_sealed {
+    pub trait Sealed {}
+}
+
+pub trait BoundedRhs: bounded_rhs_sealed::Sealed {
+    fn value_handle(&self) -> &ValueHandle;
+    fn matrix_type(&self) -> &MatrixType;
+    fn max_coefficient_bound(&self) -> &IntExpr;
+    fn wire_type(&self) -> WireType;
+    fn pending(&self) -> Pending;
+}
+
+impl bounded_rhs_sealed::Sealed for SmallMatrix {}
+impl BoundedRhs for SmallMatrix {
+    fn value_handle(&self) -> &ValueHandle {
+        &self.value
+    }
+    fn matrix_type(&self) -> &MatrixType {
+        &self.matrix_type
+    }
+    fn max_coefficient_bound(&self) -> &IntExpr {
+        &self.max_coefficient_bound
+    }
+    fn wire_type(&self) -> WireType {
+        WireType::SmallMatrix {
+            matrix: self.matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }
+    }
+    fn pending(&self) -> Pending {
+        self.pending.clone()
+    }
+}
+
+impl bounded_rhs_sealed::Sealed for Preimage {}
+impl BoundedRhs for Preimage {
+    fn value_handle(&self) -> &ValueHandle {
+        &self.value
+    }
+    fn matrix_type(&self) -> &MatrixType {
+        &self.matrix_type
+    }
+    fn max_coefficient_bound(&self) -> &IntExpr {
+        &self.max_coefficient_bound
+    }
+    fn wire_type(&self) -> WireType {
+        WireType::Preimage {
+            matrix: self.matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }
+    }
+    fn pending(&self) -> Pending {
+        self.pending.clone()
+    }
+}
+
 impl Preimage {
+    fn source_input(
+        name: String,
+        matrix_type: MatrixType,
+        max_coefficient_bound: IntExpr,
+        artifact: Option<ArtifactInput>,
+    ) -> Self {
+        let wire_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::Input { name, wire_type: wire_type.clone(), artifact },
+            Vec::new(),
+            vec![wire_type],
+        );
+        Self {
+            value: node.output(0).expect("preimage input"),
+            matrix_type,
+            max_coefficient_bound,
+            pending: Pending::default(),
+        }
+    }
+
     #[doc(hidden)]
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
@@ -1159,125 +1457,8 @@ impl Preimage {
         &self.matrix_type
     }
 
-    /// Projects a witness `K` to an ordinary matrix only when its registered target is exact.
-    ///
-    /// The runtime representation is unchanged (`K -> K`), but the `B*K=T` marker is dropped.
-    /// The noise simulator rejects this operation when `T` has nonzero error, so it cannot erase
-    /// noise transport.
-    pub fn materialize_exact(self) -> Mat {
-        let matrix_type = self.matrix_type.clone();
-        let pending = self.pending;
-        let node = NodeHandle::new(
-            NodeKind::MaterializePreimageExact,
-            vec![self.value],
-            vec![WireType::Matrix(matrix_type.clone())],
-        );
-        Mat { value: node.output(0).expect("exact preimage materialization"), matrix_type, pending }
-    }
-
-    /// Adds two witnesses for the same public source and adds their relation targets.
-    ///
-    /// If `B*K_1=T_1` and `B*K_2=T_2`, the result is `K'=K_1+K_2` with
-    /// `B*K'=T_1+T_2` by distributivity.
-    pub fn add_same_source(self, rhs: Self) -> Self {
-        let matrix_type = self.matrix_type.clone();
-        let pending = Pending::merge([self.pending, rhs.pending]);
-        let node = NodeHandle::new(
-            NodeKind::PreimageBinary(mxx_ir_core::node::PreimageBinaryOp::Add),
-            vec![self.value, rhs.value],
-            vec![WireType::Preimage(matrix_type.clone())],
-        );
-        Self { value: node.output(0).expect("preimage sum"), matrix_type, pending }
-    }
-
-    /// Right-multiplies a witness by an exact ordinary scalar matrix `A`.
-    ///
-    /// The resulting relation follows from `B*(K*A)=(B*K)*A=T*A`.
-    pub fn right_multiply_exact(self, rhs: Mat) -> Self {
-        let matrix_type = product_type(&self.matrix_type, &rhs.matrix_type);
-        let pending = Pending::merge([self.pending, rhs.pending]);
-        let node = NodeHandle::new(
-            NodeKind::PreimageBinary(mxx_ir_core::node::PreimageBinaryOp::RightMultiplyExact),
-            vec![self.value, rhs.value],
-            vec![WireType::Preimage(matrix_type.clone())],
-        );
-        Self { value: node.output(0).expect("preimage right product"), matrix_type, pending }
-    }
-
-    /// Right-composes a witness with an exact gadget witness `L`.
-    ///
-    /// With `B*K=T` and `G*L=U`, this emits `K*L`; the common-source relation is preserved as
-    /// `B*(K*L)=T*L`.
-    pub fn compose_exact_decomposition(self, rhs: Decomposition) -> Self {
-        let rhs = rhs.preimage;
-        let matrix_type = product_type(&self.matrix_type, &rhs.matrix_type);
-        let pending = Pending::merge([self.pending, rhs.pending]);
-        let node = NodeHandle::new(
-            NodeKind::PreimageBinary(
-                mxx_ir_core::node::PreimageBinaryOp::ComposeExactDecomposition,
-            ),
-            vec![self.value, rhs.value],
-            vec![WireType::Preimage(matrix_type.clone())],
-        );
-        Self { value: node.output(0).expect("composed preimage"), matrix_type, pending }
-    }
-
-    /// Concatenates columns of witnesses sharing one public source.
-    ///
-    /// For each input `B*K_j=T_j`, the output `K=[K_1|...|K_n]` has target
-    /// `T=[T_1|...|T_n]`, so `B*K=T` columnwise.
-    pub fn concat_columns(values: Vec<Self>) -> Self {
-        assert!(!values.is_empty(), "preimage concat requires at least one value");
-        let first = &values[0];
-        let matrix_type = MatrixType {
-            columns: values
-                .iter()
-                .map(|value| value.matrix_type.columns.clone())
-                .reduce(|left, right| IntExpr::Add(Box::new(left), Box::new(right)).canonicalize())
-                .expect("nonempty preimage concat"),
-            ..first.matrix_type.clone()
-        };
-        let pending = Pending::merge(values.iter().map(|value| value.pending.clone()));
-        let node = NodeHandle::new(
-            NodeKind::PreimageConcatColumns,
-            values.into_iter().map(|value| value.value).collect(),
-            vec![WireType::Preimage(matrix_type.clone())],
-        );
-        Self { value: node.output(0).expect("preimage column concat"), matrix_type, pending }
-    }
-}
-
-/// A gadget decomposition that can either be consumed as its typed preimage relation or queried
-/// entry-by-entry when its relation target is exact.
-#[derive(Clone)]
-pub struct Decomposition {
-    preimage: Preimage,
-}
-
-impl Decomposition {
-    /// Retains the universal gadget relation `G*K=T` while exposing the common witness interface.
-    pub fn into_preimage_relation(self) -> Preimage {
-        self.preimage
-    }
-
-    /// Selects one scalar digit `K[row,column]` without exposing the whole decomposition as a
-    /// relation-free matrix; the underlying witness still denotes `G*K=T`.
-    pub fn entry(&self, row: impl Into<IntExpr>, column: impl Into<IntExpr>) -> Mat {
-        let matrix_type = MatrixType {
-            rows: IntExpr::constant(1),
-            columns: IntExpr::constant(1),
-            ..self.preimage.matrix_type.clone()
-        };
-        let node = NodeHandle::new(
-            NodeKind::DecompositionEntry { row: row.into(), column: column.into() },
-            vec![self.preimage.value.clone()],
-            vec![WireType::Matrix(matrix_type.clone())],
-        );
-        Mat {
-            value: node.output(0).expect("decomposition entry"),
-            matrix_type,
-            pending: self.preimage.pending.clone(),
-        }
+    pub fn max_coefficient_bound(&self) -> &IntExpr {
+        &self.max_coefficient_bound
     }
 }
 
@@ -1315,9 +1496,17 @@ impl Trapdoor {
                 max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
             },
             vec![self.public.value.clone(), self.value.clone(), target.value],
-            vec![WireType::Preimage(ty.clone())],
+            vec![WireType::Preimage {
+                matrix: ty.clone(),
+                max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            }],
         );
-        Preimage { value: node.output(0).expect("preimage"), matrix_type: ty, pending }
+        Preimage {
+            value: node.output(0).expect("preimage"),
+            matrix_type: ty,
+            max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
+            pending,
+        }
     }
 }
 
@@ -1437,7 +1626,10 @@ impl TrapdoorFamily {
         // The node represents Y[u]=X[f(u)]; only coordinate interpretation changes, not the
         // matrix element schema.
         let family_type = WireType::Family {
-            element: Box::new(WireType::Preimage(matrix_type.clone())),
+            element: Box::new(WireType::Preimage {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: self.element_schema.preimage_max_coefficient_bound.clone(),
+            }),
             shape: targets.shape.clone(),
         };
         let node = NodeHandle::new(
@@ -1454,15 +1646,28 @@ impl TrapdoorFamily {
                 value: NodeHandle::new(
                     NodeKind::Input {
                         name: "family-preimage-element".to_owned(),
-                        wire_type: WireType::Preimage(matrix_type.clone()),
+                        wire_type: WireType::Preimage {
+                            matrix: matrix_type.clone(),
+                            max_coefficient_bound: self
+                                .element_schema
+                                .preimage_max_coefficient_bound
+                                .clone(),
+                        },
                         artifact: None,
                     },
                     Vec::new(),
-                    vec![WireType::Preimage(matrix_type.clone())],
+                    vec![WireType::Preimage {
+                        matrix: matrix_type.clone(),
+                        max_coefficient_bound: self
+                            .element_schema
+                            .preimage_max_coefficient_bound
+                            .clone(),
+                    }],
                 )
                 .output(0)
                 .expect("family preimage schema"),
                 matrix_type: matrix_type.clone(),
+                max_coefficient_bound: self.element_schema.preimage_max_coefficient_bound.clone(),
                 pending: Pending::default(),
             },
             count: targets.count.clone(),
@@ -2233,6 +2438,12 @@ pub trait FamilyElement: GraphValue {
 }
 
 impl FamilyElement for Mat {
+    fn normalize_for_family(self) -> Self {
+        self
+    }
+}
+
+impl FamilyElement for SmallMatrix {
     fn normalize_for_family(self) -> Self {
         self
     }
@@ -4104,6 +4315,34 @@ impl DslContext {
         Ok(self)
     }
 
+    pub fn public_small_matrix_output(
+        mut self,
+        name: impl Into<String>,
+        matrix: SmallMatrix,
+    ) -> Result<Self, DslError> {
+        self.insert_pending_output(
+            name.into(),
+            matrix.value,
+            matrix.pending,
+            Some(ArtifactConfidentiality::Public),
+        )?;
+        Ok(self)
+    }
+
+    pub fn private_small_matrix_output(
+        mut self,
+        name: impl Into<String>,
+        matrix: SmallMatrix,
+    ) -> Result<Self, DslError> {
+        self.insert_pending_output(
+            name.into(),
+            matrix.value,
+            matrix.pending,
+            Some(ArtifactConfidentiality::Private),
+        )?;
+        Ok(self)
+    }
+
     pub fn private_preimage_output(
         mut self,
         name: impl Into<String>,
@@ -4171,6 +4410,15 @@ impl DslContext {
         Ok(self)
     }
 
+    pub fn small_matrix_output(
+        mut self,
+        name: impl Into<String>,
+        matrix: SmallMatrix,
+    ) -> Result<Self, DslError> {
+        self.insert_pending_output(name.into(), matrix.value, matrix.pending, None)?;
+        Ok(self)
+    }
+
     pub fn preimage_family_output(
         mut self,
         name: impl Into<String>,
@@ -4193,6 +4441,15 @@ impl DslContext {
         mut self,
         name: impl Into<String>,
         family: Family<Bool>,
+    ) -> Result<Self, DslError> {
+        self.insert_pending_output(name.into(), family.value, family.pending, None)?;
+        Ok(self)
+    }
+
+    pub fn small_matrix_family_output(
+        mut self,
+        name: impl Into<String>,
+        family: Family<SmallMatrix>,
     ) -> Result<Self, DslError> {
         self.insert_pending_output(name.into(), family.value, family.pending, None)?;
         Ok(self)
@@ -4234,6 +4491,34 @@ impl DslContext {
         mut self,
         name: impl Into<String>,
         family: Family<Preimage>,
+    ) -> Result<Self, DslError> {
+        self.insert_pending_output(
+            name.into(),
+            family.value,
+            family.pending,
+            Some(ArtifactConfidentiality::Private),
+        )?;
+        Ok(self)
+    }
+
+    pub fn public_small_matrix_family_output(
+        mut self,
+        name: impl Into<String>,
+        family: Family<SmallMatrix>,
+    ) -> Result<Self, DslError> {
+        self.insert_pending_output(
+            name.into(),
+            family.value,
+            family.pending,
+            Some(ArtifactConfidentiality::Public),
+        )?;
+        Ok(self)
+    }
+
+    pub fn private_small_matrix_family_output(
+        mut self,
+        name: impl Into<String>,
+        family: Family<SmallMatrix>,
     ) -> Result<Self, DslError> {
         self.insert_pending_output(
             name.into(),
@@ -4385,7 +4670,10 @@ impl ParallelOutput for Preimage {
         // Mapping a witness over i produces a family K[i] with the same witness matrix schema;
         // the relation marker remains part of each family element type.
         Ok(vec![WireType::Family {
-            element: Box::new(WireType::Preimage(self.matrix_type.clone())),
+            element: Box::new(WireType::Preimage {
+                matrix: self.matrix_type.clone(),
+                max_coefficient_bound: self.max_coefficient_bound.clone(),
+            }),
             shape: vec![count.clone()],
         }])
     }
@@ -4405,6 +4693,44 @@ impl ParallelOutput for Preimage {
             element_schema: Preimage {
                 value: self.value,
                 matrix_type: self.matrix_type,
+                max_coefficient_bound: self.max_coefficient_bound,
+                pending: Pending::default(),
+            },
+            count: count.clone(),
+            shape: vec![count.clone()],
+            pending,
+        })
+    }
+}
+
+impl ParallelOutput for SmallMatrix {
+    type Families = Family<SmallMatrix>;
+
+    fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
+        Ok(vec![WireType::Family {
+            element: Box::new(WireType::SmallMatrix {
+                matrix: self.matrix_type.clone(),
+                max_coefficient_bound: self.max_coefficient_bound.clone(),
+            }),
+            shape: vec![count.clone()],
+        }])
+    }
+
+    fn parallel_families(
+        self,
+        node: &NodeHandle,
+        next_port: &mut u32,
+        count: &IntExpr,
+        pending: Pending,
+    ) -> Result<Self::Families, DslError> {
+        let value = node.output(*next_port).ok_or(DslError::Schema)?;
+        *next_port += 1;
+        Ok(Family {
+            value,
+            element_schema: SmallMatrix {
+                value: self.value,
+                matrix_type: self.matrix_type,
+                max_coefficient_bound: self.max_coefficient_bound,
                 pending: Pending::default(),
             },
             count: count.clone(),
@@ -4764,9 +5090,12 @@ impl GraphValue for Preimage {
     }
 
     fn schema(&self) -> Self::Schema {
-        // A schema round-trip must retain `Preimage(MatrixType)`, not weaken it to `MatrixType`;
+        // A schema round-trip must retain the bounded `Preimage` wire, not weaken it to `Matrix`;
         // otherwise a subgraph boundary could silently authorize arbitrary multiplication.
-        PreimageType(self.matrix_type.clone())
+        PreimageType {
+            matrix: self.matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }
     }
 
     fn from_values(
@@ -4775,7 +5104,78 @@ impl GraphValue for Preimage {
         pending: Pending,
     ) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
-        Ok(Self { value: value.clone(), matrix_type: schema.0.clone(), pending })
+        Ok(Self {
+            value: value.clone(),
+            matrix_type: schema.matrix.clone(),
+            max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            pending,
+        })
+    }
+}
+
+impl GraphValue for SmallMatrix {
+    type Schema = SmallMatrixType;
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        vec![self.value.clone()]
+    }
+
+    fn pending(&self) -> Pending {
+        self.pending.clone()
+    }
+
+    fn schema(&self) -> Self::Schema {
+        SmallMatrixType {
+            matrix: self.matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }
+    }
+
+    fn from_values(
+        schema: &Self::Schema,
+        values: &[ValueHandle],
+        pending: Pending,
+    ) -> Result<Self, DslError> {
+        let [value] = values else { return Err(DslError::Schema) };
+        Ok(Self {
+            value: value.clone(),
+            matrix_type: schema.matrix.clone(),
+            max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            pending,
+        })
+    }
+}
+
+impl GraphValueSchema for SmallMatrixType {
+    type Value = SmallMatrix;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        let wire_type = WireType::SmallMatrix {
+            matrix: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::Input {
+                name: argument_name(next, "small-matrix"),
+                wire_type: wire_type.clone(),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![wire_type],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("small matrix argument"),
+            matrix_type: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+            pending: Pending::default(),
+        }
+    }
+
+    fn wire_types(&self) -> Vec<WireType> {
+        vec![WireType::SmallMatrix {
+            matrix: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }]
     }
 }
 
@@ -4785,7 +5185,10 @@ impl GraphValueSchema for PreimageType {
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
         // Placeholder construction carries the typed witness wire so a subgraph can consume
         // `B*K=T` only through an explicit relation-aware operation.
-        let wire_type = WireType::Preimage(self.0.clone());
+        let wire_type = WireType::Preimage {
+            matrix: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        };
         let node = NodeHandle::new(
             NodeKind::Input {
                 name: argument_name(next, "preimage"),
@@ -4797,13 +5200,17 @@ impl GraphValueSchema for PreimageType {
         );
         Preimage {
             value: node.output(0).expect("preimage argument"),
-            matrix_type: self.0.clone(),
+            matrix_type: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
             pending: Pending::default(),
         }
     }
 
     fn wire_types(&self) -> Vec<WireType> {
-        vec![WireType::Preimage(self.0.clone())]
+        vec![WireType::Preimage {
+            matrix: self.matrix.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        }]
     }
 }
 
@@ -5014,6 +5421,395 @@ impl GraphValue for Family<Mat> {
     }
 }
 
+impl GraphValue for Family<SmallMatrix> {
+    type Schema = SmallMatrixFamilyType;
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        vec![self.value.clone()]
+    }
+
+    fn pending(&self) -> Pending {
+        self.pending.clone()
+    }
+
+    fn schema(&self) -> Self::Schema {
+        SmallMatrixFamilyType {
+            element: SmallMatrixType {
+                matrix: self.element_schema.matrix_type.clone(),
+                max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+            },
+            shape: self.shape.clone(),
+        }
+    }
+
+    fn from_values(
+        schema: &Self::Schema,
+        values: &[ValueHandle],
+        pending: Pending,
+    ) -> Result<Self, DslError> {
+        let [value] = values else { return Err(DslError::Schema) };
+        Ok(Self {
+            value: value.clone(),
+            element_schema: SmallMatrix::source_input(
+                "__family-element-schema".to_owned(),
+                schema.element.matrix.clone(),
+                schema.element.max_coefficient_bound.clone(),
+                None,
+            ),
+            count: shape_count(&schema.shape),
+            shape: schema.shape.clone(),
+            pending,
+        })
+    }
+}
+
+impl GraphValueSchema for SmallMatrixFamilyType {
+    type Value = Family<SmallMatrix>;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        Family::<SmallMatrix>::source_input(
+            argument_name(next, "small-matrix-family"),
+            self.element.matrix.clone(),
+            self.shape.clone(),
+            self.element.max_coefficient_bound.clone(),
+            None,
+        )
+    }
+
+    fn wire_types(&self) -> Vec<WireType> {
+        vec![WireType::Family {
+            element: Box::new(WireType::SmallMatrix {
+                matrix: self.element.matrix.clone(),
+                max_coefficient_bound: self.element.max_coefficient_bound.clone(),
+            }),
+            shape: self.shape.clone(),
+        }]
+    }
+}
+
+impl Family<SmallMatrix> {
+    fn source_input(
+        name: String,
+        matrix_type: MatrixType,
+        shape: Vec<IntExpr>,
+        max_coefficient_bound: IntExpr,
+        artifact: Option<ArtifactInput>,
+    ) -> Self {
+        let element_type = WireType::SmallMatrix {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
+        let family_type =
+            WireType::Family { element: Box::new(element_type), shape: shape.clone() };
+        let node = NodeHandle::new(
+            NodeKind::Input { name, wire_type: family_type.clone(), artifact },
+            Vec::new(),
+            vec![family_type],
+        );
+        let element_schema = SmallMatrix::source_input(
+            "__family-element-schema".to_owned(),
+            matrix_type.clone(),
+            max_coefficient_bound.clone(),
+            None,
+        );
+        Self {
+            value: node.output(0).expect("small matrix family"),
+            element_schema,
+            count: shape_count(&shape),
+            shape,
+            pending: Pending::default(),
+        }
+    }
+
+    pub fn shape(&self) -> &[IntExpr] {
+        &self.shape
+    }
+
+    pub fn count(&self) -> &IntExpr {
+        &self.count
+    }
+
+    pub fn element(&self) -> &SmallMatrix {
+        &self.element_schema
+    }
+
+    pub fn element_type(&self) -> &MatrixType {
+        &self.element_schema.matrix_type
+    }
+
+    pub fn max_coefficient_bound(&self) -> &IntExpr {
+        &self.element_schema.max_coefficient_bound
+    }
+
+    /// Selects one same-schema bounded-matrix family without changing its element bound.
+    pub fn select(selector: Int, branches: Vec<Self>) -> Result<Self, DslError> {
+        let Some(first) = branches.first() else {
+            return Err(DslError::Schema);
+        };
+        if branches.iter().any(|branch| {
+            branch.shape != first.shape ||
+                branch.element_schema.matrix_type != first.element_schema.matrix_type ||
+                branch.element_schema.max_coefficient_bound !=
+                    first.element_schema.max_coefficient_bound
+        }) {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let pending = Pending::merge(
+            std::iter::once(selector.pending.clone())
+                .chain(branches.iter().map(|branch| branch.pending.clone())),
+        );
+        let mut arguments = vec![selector.value];
+        arguments.extend(branches.iter().map(|branch| branch.value.clone()));
+        let family_type = WireType::Family {
+            element: Box::new(WireType::SmallMatrix {
+                matrix: first.element_schema.matrix_type.clone(),
+                max_coefficient_bound: first.element_schema.max_coefficient_bound.clone(),
+            }),
+            shape: first.shape.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::Select { count: IntExpr::constant(branches.len()) },
+            arguments,
+            vec![family_type],
+        );
+        Ok(Self {
+            value: node.output(0).expect("selected small matrix family"),
+            element_schema: first.element_schema.clone(),
+            count: first.count.clone(),
+            shape: first.shape.clone(),
+            pending,
+        })
+    }
+
+    pub fn get_static(&self, indices: impl IntoFamilyStaticIndices) -> SmallMatrix {
+        let node = NodeHandle::new(
+            NodeKind::FamilyGetStatic { indices: indices.into_family_indices() },
+            vec![self.value.clone()],
+            vec![WireType::SmallMatrix {
+                matrix: self.element_schema.matrix_type.clone(),
+                max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+            }],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("small matrix family element"),
+            matrix_type: self.element_schema.matrix_type.clone(),
+            max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+            pending: self.pending.clone(),
+        }
+    }
+
+    pub fn get(&self, indices: impl IntoFamilyDynamicIndices) -> SmallMatrix {
+        let indices = indices.into_family_indices();
+        let pending = Pending::merge(
+            std::iter::once(self.pending.clone())
+                .chain(indices.iter().map(|index| index.pending.clone())),
+        );
+        let mut arguments = vec![self.value.clone()];
+        arguments.extend(indices.iter().map(|index| index.value.clone()));
+        let node = NodeHandle::new(
+            NodeKind::FamilyGetDynamic { rank: indices.len() },
+            arguments,
+            vec![WireType::SmallMatrix {
+                matrix: self.element_schema.matrix_type.clone(),
+                max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+            }],
+        );
+        SmallMatrix {
+            value: node.output(0).expect("dynamic small matrix family element"),
+            matrix_type: self.element_schema.matrix_type.clone(),
+            max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+            pending,
+        }
+    }
+
+    pub fn parallel_map_values<R: ParallelOutput>(
+        self,
+        body: impl FnOnce(LoopIndex, SmallMatrix) -> R,
+    ) -> Result<R::Families, DslError> {
+        if self.shape.len() != 1 {
+            return Err(DslError::ParallelMapRank);
+        }
+        let outer_family = self.value.clone();
+        let count = self.count.clone();
+        let schema = self.element_schema.schema();
+        let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| {
+                let input = schema.placeholders();
+                let output = body(index, input.clone());
+                (output, input.flatten(), scope)
+            })
+        });
+        let body_outputs = body_value.flatten();
+        let sealed = SubgraphHandle::seal(
+            "parallel-map-small-matrix-body",
+            scope,
+            explicit_input,
+            body_outputs,
+            CapturePolicy::BroadcastScalarsAndArtifactFamilies,
+        )?;
+        let mut arguments = vec![outer_family];
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        let node = NodeHandle::parallel_grid(
+            sealed.handle.clone(),
+            arguments,
+            body_value.parallel_family_types(&count)?,
+            IrParallelGrid {
+                shape: vec![count.clone()],
+                index_slots: vec![index_slot],
+                bindings: Vec::new(),
+                input_modes: std::iter::once(mxx_ir_core::node::GridInputMode::Reindex {
+                    map: IndexMap::new([IndexExpr::Axis(0)]),
+                })
+                .chain(
+                    (0..sealed.captures.len()).map(|_| mxx_ir_core::node::GridInputMode::Broadcast),
+                )
+                .collect(),
+            },
+        );
+        let pending = Pending::merge([self.pending, body_value.pending().remap(&sealed.remap)]);
+        let mut next_port = 0;
+        body_value.parallel_families(&node, &mut next_port, &count, pending)
+    }
+
+    pub fn parallel_map(
+        self,
+        body: impl FnOnce(LoopIndex, SmallMatrix) -> SmallMatrix,
+    ) -> Result<Self, DslError> {
+        self.parallel_map_values(|index, value| body(index, value).normalize_for_family())
+    }
+
+    pub fn parallel_gather(self, indices: Family<Int>) -> Result<Self, DslError> {
+        let matrix_type = self.element_schema.matrix_type.clone();
+        let max_coefficient_bound = self.element_schema.max_coefficient_bound.clone();
+        scalar_parallel_gather(
+            self,
+            indices,
+            "parallel-gather-small-matrix-body",
+            WireType::SmallMatrix {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+            },
+            |value, pending| SmallMatrix {
+                value,
+                matrix_type: matrix_type.clone(),
+                max_coefficient_bound: max_coefficient_bound.clone(),
+                pending,
+            },
+        )
+    }
+
+    pub fn reindex(self, output_shape: Vec<IntExpr>, map: IndexMap) -> Result<Self, DslError> {
+        if output_shape.is_empty() {
+            return Err(DslError::Schema);
+        }
+        let family_type = WireType::Family {
+            element: Box::new(WireType::SmallMatrix {
+                matrix: self.element_schema.matrix_type.clone(),
+                max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+            }),
+            shape: output_shape.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::FamilyReindex { output_shape: output_shape.clone(), map },
+            vec![self.value],
+            vec![family_type],
+        );
+        let count = shape_count(&output_shape);
+        Ok(Self {
+            value: node.output(0).expect("reindexed small matrix family"),
+            element_schema: self.element_schema,
+            count,
+            shape: output_shape,
+            pending: self.pending,
+        })
+    }
+
+    pub fn select_axis(
+        self,
+        axis: usize,
+        selector: impl IntoFamilyAxisSelector,
+    ) -> Result<FamilyAxisSelection<SmallMatrix>, DslError> {
+        if axis >= self.shape.len() {
+            return Err(DslError::Schema);
+        }
+        let (selector_value, selector_pending, selector_shape) = selector.selector_parts();
+        let mut output_shape = self.shape.clone();
+        output_shape.remove(axis);
+        if selector_shape.as_ref().is_some_and(|shape| *shape != output_shape) {
+            return Err(DslError::Schema);
+        }
+        let element_type = WireType::SmallMatrix {
+            matrix: self.element_schema.matrix_type.clone(),
+            max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+        };
+        let output_type = if output_shape.is_empty() {
+            element_type.clone()
+        } else {
+            WireType::Family { element: Box::new(element_type), shape: output_shape.clone() }
+        };
+        let node = NodeHandle::new(
+            NodeKind::FamilySelectAxis { axis },
+            vec![self.value, selector_value],
+            vec![output_type],
+        );
+        let pending = Pending::merge([self.pending, selector_pending]);
+        let value = node.output(0).expect("selected small matrix family");
+        if output_shape.is_empty() {
+            Ok(FamilyAxisSelection::Scalar(SmallMatrix {
+                value,
+                matrix_type: self.element_schema.matrix_type,
+                max_coefficient_bound: self.element_schema.max_coefficient_bound,
+                pending,
+            }))
+        } else {
+            Ok(FamilyAxisSelection::Family(Self {
+                value,
+                element_schema: self.element_schema,
+                count: shape_count(&output_shape),
+                shape: output_shape,
+                pending,
+            }))
+        }
+    }
+
+    pub fn gather(
+        self,
+        output_shape: Vec<IntExpr>,
+        selectors: Vec<Family<Int>>,
+    ) -> Result<Self, DslError> {
+        if output_shape.is_empty() || selectors.len() != self.shape.len() {
+            return Err(DslError::Schema);
+        }
+        let mut arguments = vec![self.value];
+        arguments.extend(selectors.iter().map(|selector| selector.value.clone()));
+        let node = NodeHandle::new(
+            NodeKind::FamilyGather {
+                output_shape: output_shape.clone(),
+                input_rank: selectors.len(),
+            },
+            arguments,
+            vec![WireType::Family {
+                element: Box::new(WireType::SmallMatrix {
+                    matrix: self.element_schema.matrix_type.clone(),
+                    max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+                }),
+                shape: output_shape.clone(),
+            }],
+        );
+        let pending = Pending::merge(
+            std::iter::once(self.pending)
+                .chain(selectors.into_iter().map(|selector| selector.pending)),
+        );
+        Ok(Self {
+            value: node.output(0).expect("gathered small matrix family"),
+            element_schema: self.element_schema,
+            count: shape_count(&output_shape),
+            shape: output_shape,
+            pending,
+        })
+    }
+}
+
 impl GraphValue for Family<Preimage> {
     type Schema = PreimageFamilyType;
 
@@ -5029,6 +5825,7 @@ impl GraphValue for Family<Preimage> {
         // Family schema preserves both the witness element type and every coordinate extent.
         PreimageFamilyType {
             element: self.element_schema.matrix_type.clone(),
+            max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
             shape: self.shape.clone(),
         }
     }
@@ -5041,11 +5838,16 @@ impl GraphValue for Family<Preimage> {
         let [value] = values else { return Err(DslError::Schema) };
         Ok(Self {
             value: value.clone(),
-            element_schema: Preimage {
-                value: value.clone(),
-                matrix_type: schema.element.clone(),
-                pending: Pending::default(),
-            },
+            // `value` is the family handle and cannot stand in for one of its
+            // relation-bearing elements.  Keep a genuine leaf placeholder so
+            // family operations can lower a selected element with the same
+            // typed Preimage contract as an independently constructed value.
+            element_schema: Preimage::source_input(
+                "__family-element-schema".to_owned(),
+                schema.element.clone(),
+                schema.max_coefficient_bound.clone(),
+                None,
+            ),
             count: schema
                 .shape
                 .iter()
@@ -5065,7 +5867,10 @@ impl GraphValueSchema for PreimageFamilyType {
         // A family placeholder denotes K[u] for every u in the declared Cartesian shape, with
         // each element retaining the `B*K[u]=T[u]` witness marker.
         let wire_type = WireType::Family {
-            element: Box::new(WireType::Preimage(self.element.clone())),
+            element: Box::new(WireType::Preimage {
+                matrix: self.element.clone(),
+                max_coefficient_bound: self.max_coefficient_bound.clone(),
+            }),
             shape: self.shape.clone(),
         };
         let node = NodeHandle::new(
@@ -5079,11 +5884,15 @@ impl GraphValueSchema for PreimageFamilyType {
         );
         Family {
             value: node.output(0).expect("preimage family argument"),
-            element_schema: Preimage {
-                value: node.output(0).expect("preimage element schema"),
-                matrix_type: self.element.clone(),
-                pending: Pending::default(),
-            },
+            // As in `Family<SmallMatrix>`, the family input is only the
+            // container wire.  The element schema must be backed by a leaf
+            // Preimage handle, never by that container handle.
+            element_schema: Preimage::source_input(
+                argument_name(next, "preimage-element"),
+                self.element.clone(),
+                self.max_coefficient_bound.clone(),
+                None,
+            ),
             count: self
                 .shape
                 .iter()
@@ -5097,7 +5906,10 @@ impl GraphValueSchema for PreimageFamilyType {
 
     fn wire_types(&self) -> Vec<WireType> {
         vec![WireType::Family {
-            element: Box::new(WireType::Preimage(self.element.clone())),
+            element: Box::new(WireType::Preimage {
+                matrix: self.element.clone(),
+                max_coefficient_bound: self.max_coefficient_bound.clone(),
+            }),
             shape: self.shape.clone(),
         }]
     }
@@ -5110,9 +5922,13 @@ impl Family<Preimage> {
         name: String,
         matrix_type: MatrixType,
         shape: Vec<IntExpr>,
+        max_coefficient_bound: IntExpr,
         artifact: Option<ArtifactInput>,
     ) -> Self {
-        let element_type = WireType::Preimage(matrix_type.clone());
+        let element_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        };
         let family_type =
             WireType::Family { element: Box::new(element_type), shape: shape.clone() };
         let node = NodeHandle::new(
@@ -5123,6 +5939,7 @@ impl Family<Preimage> {
         let placeholder = Preimage {
             value: node.output(0).expect("preimage family"),
             matrix_type: matrix_type.clone(),
+            max_coefficient_bound,
             pending: Pending::default(),
         };
         Self {
@@ -5155,7 +5972,9 @@ impl Family<Preimage> {
         };
         if branches.iter().any(|branch| {
             branch.shape != first.shape ||
-                branch.element_schema.matrix_type != first.element_schema.matrix_type
+                branch.element_schema.matrix_type != first.element_schema.matrix_type ||
+                branch.element_schema.max_coefficient_bound !=
+                    first.element_schema.max_coefficient_bound
         }) {
             return Err(DslError::FamilyCountMismatch);
         }
@@ -5166,7 +5985,10 @@ impl Family<Preimage> {
         let mut arguments = vec![selector.value];
         arguments.extend(branches.iter().map(|branch| branch.value.clone()));
         let family_type = WireType::Family {
-            element: Box::new(WireType::Preimage(first.element_schema.matrix_type.clone())),
+            element: Box::new(WireType::Preimage {
+                matrix: first.element_schema.matrix_type.clone(),
+                max_coefficient_bound: first.element_schema.max_coefficient_bound.clone(),
+            }),
             shape: first.shape.clone(),
         };
         let node = NodeHandle::new(
@@ -5200,7 +6022,11 @@ impl Family<Preimage> {
         let matrix_type = self.element_schema.matrix_type.clone();
         let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
             with_new_construction_scope(|scope| {
-                let wire_type = WireType::Preimage(matrix_type.clone());
+                let max_coefficient_bound = self.element_schema.max_coefficient_bound.clone();
+                let wire_type = WireType::Preimage {
+                    matrix: matrix_type.clone(),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                };
                 let node = NodeHandle::new(
                     NodeKind::Input {
                         name: "preimage-item".to_owned(),
@@ -5213,6 +6039,7 @@ impl Family<Preimage> {
                 let input = Preimage {
                     value: node.output(0).expect("preimage family item"),
                     matrix_type,
+                    max_coefficient_bound,
                     pending: Pending::default(),
                 };
                 let output = body(index, input.clone());
@@ -5255,11 +6082,15 @@ impl Family<Preimage> {
         let node = NodeHandle::new(
             NodeKind::FamilyGetStatic { indices },
             vec![self.value.clone()],
-            vec![WireType::Preimage(self.element_schema.matrix_type.clone())],
+            vec![preimage_wire(
+                self.element_schema.matrix_type.clone(),
+                self.element_schema.max_coefficient_bound.clone(),
+            )],
         );
         Preimage {
             value: node.output(0).expect("preimage family element"),
             matrix_type: self.element_schema.matrix_type.clone(),
+            max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
             pending: self.pending.clone(),
         }
     }
@@ -5277,11 +6108,15 @@ impl Family<Preimage> {
         let node = NodeHandle::new(
             NodeKind::FamilyGetDynamic { rank: indices.len() },
             arguments,
-            vec![WireType::Preimage(self.element_schema.matrix_type.clone())],
+            vec![preimage_wire(
+                self.element_schema.matrix_type.clone(),
+                self.element_schema.max_coefficient_bound.clone(),
+            )],
         );
         Preimage {
             value: node.output(0).expect("dynamic preimage family element"),
             matrix_type: self.element_schema.matrix_type.clone(),
+            max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
             pending,
         }
     }
@@ -5293,7 +6128,10 @@ impl Family<Preimage> {
             return Err(DslError::Schema);
         }
         let family_type = WireType::Family {
-            element: Box::new(WireType::Preimage(self.element_schema.matrix_type.clone())),
+            element: Box::new(WireType::Preimage {
+                matrix: self.element_schema.matrix_type.clone(),
+                max_coefficient_bound: self.element_schema.max_coefficient_bound.clone(),
+            }),
             shape: output_shape.clone(),
         };
         let node = NodeHandle::new(
@@ -5331,7 +6169,10 @@ impl Family<Preimage> {
         if selector_shape.as_ref().is_some_and(|shape| *shape != output_shape) {
             return Err(DslError::Schema);
         }
-        let element_type = WireType::Preimage(self.element_schema.matrix_type.clone());
+        let element_type = preimage_wire(
+            self.element_schema.matrix_type.clone(),
+            self.element_schema.max_coefficient_bound.clone(),
+        );
         let output_type = if output_shape.is_empty() {
             element_type.clone()
         } else {
@@ -5348,6 +6189,7 @@ impl Family<Preimage> {
             Ok(FamilyAxisSelection::Scalar(Preimage {
                 value,
                 matrix_type: self.element_schema.matrix_type,
+                max_coefficient_bound: self.element_schema.max_coefficient_bound,
                 pending,
             }))
         } else {
@@ -5380,7 +6222,10 @@ impl Family<Preimage> {
             },
             arguments,
             vec![WireType::Family {
-                element: Box::new(WireType::Preimage(self.element_schema.matrix_type.clone())),
+                element: Box::new(preimage_wire(
+                    self.element_schema.matrix_type.clone(),
+                    self.element_schema.max_coefficient_bound.clone(),
+                )),
                 shape: output_shape.clone(),
             }],
         );
@@ -5770,6 +6615,12 @@ fn product_type(left: &MatrixType, right: &MatrixType) -> MatrixType {
     MatrixType { rows, columns, ..left.clone() }
 }
 
+/// Computes the literal matrix product shape. Compact-RHS multiplication must not reinterpret a
+/// 1x1 input as a scalar: its output schema is always `(left.rows, right.columns)`.
+fn exact_product_type(left: &MatrixType, right: &MatrixType) -> MatrixType {
+    MatrixType { rows: left.rows.clone(), columns: right.columns.clone(), ..left.clone() }
+}
+
 fn is_scalar_type(matrix: &MatrixType) -> bool {
     matrix.rows == IntExpr::constant(1) && matrix.columns == IntExpr::constant(1)
 }
@@ -5820,73 +6671,115 @@ mod tests {
     }
 
     #[test]
-    fn preimage_parallel_outputs_and_artifacts_preserve_their_wire_type() {
-        let ring = Ring::new(257, 8);
-        let trapdoor = ring.sample_trapdoor(1, 5, 4, 4, 1_000_000);
-        let scalar = trapdoor.sample_preimage(ring.zero((1, 1)), (6, 1));
-        let family = Parallel::range(2)
-            .map_values({
-                let trapdoor = trapdoor.clone();
-                let ring = ring.clone();
-                move |_| trapdoor.sample_preimage(ring.zero((1, 1)), (6, 1))
-            })
-            .unwrap();
-        let built = DslContext::new("typed-preimage-outputs")
-            .public_preimage_output("scalar", scalar)
+    fn small_rhs_api_preserves_bound_and_rejects_ordinary_rhs_at_the_type_boundary() {
+        let ring = Ring::new(17, 8);
+        let rhs = ring.small_matrix_input("rhs", (2, 3), 2);
+        assert_eq!(rhs.max_coefficient_bound(), &IntExpr::constant(2));
+        let output = ring.input("lhs", (4, 2)).mul_small_rhs(rhs.clone());
+        let built = DslContext::new("small-rhs").output("output", output).unwrap().build().unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+
+        let schema = rhs.schema();
+        assert_eq!(schema.max_coefficient_bound, IntExpr::constant(2));
+        let preimage = ring.preimage_input("preimage", (2, 3), 7);
+        let output = ring.input("lhs-preimage", (4, 2)).mul_small_rhs(preimage);
+        DslContext::new("preimage-small-rhs")
+            .output("output", output)
             .unwrap()
-            .private_preimage_family_output("family", family)
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn small_matrix_families_preserve_bound_through_family_operations() {
+        let ring = Ring::new(17, 8);
+        let context = DslContext::new("small-matrix-family-operations");
+        let family = ring.small_matrix_family_input("rhs-family", 2, (2, 3), 4);
+        let element_product =
+            ring.input("element-lhs", (5, 2)).mul_small_rhs(family.element().clone());
+        let preimage_family = Family::<Preimage>::source_input(
+            "preimage-family".to_owned(),
+            ring.matrix_type((2, 3)),
+            vec![IntExpr::constant(2)],
+            IntExpr::constant(4),
+            None,
+        );
+        // A selected family element is a genuine leaf Preimage handle, not
+        // the container family wire, and is accepted by mul_small_rhs.
+        let preimage_element_product =
+            ring.input("preimage-element-lhs", (5, 2)).mul_small_rhs(preimage_family.get_static(0));
+        let placeholder_family = PreimageFamilyType {
+            element: ring.matrix_type((2, 3)),
+            max_coefficient_bound: IntExpr::constant(4),
+            shape: vec![IntExpr::constant(2)],
+        }
+        .placeholders();
+        let placeholder_element = placeholder_family.get_static(0);
+        assert_ne!(placeholder_element.value_handle().node(), placeholder_family.value.node());
+        let selected =
+            Family::<SmallMatrix>::select(Int::constant(0), vec![family.clone(), family.clone()])
+                .unwrap();
+        assert_eq!(selected.max_coefficient_bound(), &IntExpr::constant(4));
+
+        let static_item = selected.get_static(0);
+        let dynamic_item = selected.get(Int::constant(1));
+        assert_eq!(static_item.max_coefficient_bound(), &IntExpr::constant(4));
+        assert_eq!(dynamic_item.max_coefficient_bound(), &IntExpr::constant(4));
+
+        let reindexed = family
+            .clone()
+            .reindex(vec![IntExpr::constant(2)], IndexMap::new([IndexExpr::Axis(0)]))
+            .unwrap();
+        assert_eq!(reindexed.max_coefficient_bound(), &IntExpr::constant(4));
+
+        let selected_axis = family.clone().select_axis(0, Int::constant(1)).unwrap();
+        let FamilyAxisSelection::Scalar(selected_axis) = selected_axis else {
+            panic!("rank-one axis selection must return a scalar")
+        };
+        assert_eq!(selected_axis.max_coefficient_bound(), &IntExpr::constant(4));
+
+        let selectors = Family::<Int>::pack(vec![Int::constant(0), Int::constant(1)]).unwrap();
+        let gathered = family.clone().gather(vec![IntExpr::constant(2)], vec![selectors]).unwrap();
+        assert_eq!(gathered.max_coefficient_bound(), &IntExpr::constant(4));
+
+        let mapped = family.parallel_map(|_, value| value).unwrap();
+        assert_eq!(mapped.max_coefficient_bound(), &IntExpr::constant(4));
+
+        let built = context
+            .output("element-product", element_product)
+            .unwrap()
+            .output("preimage-element-product", preimage_element_product)
+            .unwrap()
+            .preimage_output("placeholder-element", placeholder_element)
+            .unwrap()
+            .small_matrix_output("static", static_item)
+            .unwrap()
+            .small_matrix_output("dynamic", dynamic_item)
+            .unwrap()
+            .small_matrix_family_output("reindexed", reindexed)
+            .unwrap()
+            .small_matrix_family_output("selected-axis-family", gathered)
+            .unwrap()
+            .small_matrix_family_output("mapped", mapped)
+            .unwrap()
+            .small_matrix_output("axis", selected_axis)
             .unwrap()
             .build()
             .unwrap();
         built.validate(&ParamEnv::default()).unwrap();
+    }
 
-        let scalar = built.graph.outputs()["scalar"].value;
-        let scalar_type = &built.graph.root_scope().node(scalar.node).unwrap().output_types()
-            [scalar.port.0 as usize];
-        assert!(matches!(scalar_type, WireType::Preimage(_)));
-        let family = built.graph.outputs()["family"].value;
-        let family_type = &built.graph.root_scope().node(family.node).unwrap().output_types()
-            [family.port.0 as usize];
+    #[test]
+    fn small_matrix_family_select_rejects_different_bounds() {
+        let ring = Ring::new(17, 8);
+        let left = ring.small_matrix_family_input("left", 2, (2, 3), 4);
+        let right = ring.small_matrix_family_input("right", 2, (2, 3), 5);
         assert!(matches!(
-            family_type,
-            WireType::Family { element, shape }
-                if matches!(element.as_ref(), WireType::Preimage(_)) &&
-                    shape == &vec![IntExpr::constant(2)]
+            Family::<SmallMatrix>::select(Int::constant(0), vec![left, right]),
+            Err(DslError::FamilyCountMismatch)
         ));
-
-        let production_id = ProductionId {
-            spec_hash: mxx_ir_core::artifact::SpecHash([1; 32]),
-            execution_nonce: [2; 32],
-        };
-        let scalar = ring.preimage_artifact_input(
-            production_id.clone(),
-            "scalar",
-            (6, 1),
-            ArtifactConfidentiality::Public,
-        );
-        let family = ring.preimage_family_artifact_input(
-            production_id,
-            "family",
-            vec![IntExpr::constant(2)],
-            (6, 1),
-            ArtifactConfidentiality::Private,
-        );
-        let family_left = ring.input("family-left", (1, 6));
-        let family = Family::<Preimage>::select(
-            Int::constant(0).add(Int::constant(0)),
-            vec![family.clone(), family],
-        )
-        .unwrap();
-        let applied_family = family
-            .parallel_map_values(move |_, preimage| family_left.clone().apply_preimage(preimage))
-            .unwrap();
-        DslContext::new("typed-preimage-inputs")
-            .output("scalar", ring.input("left", (1, 6)).apply_preimage(scalar))
-            .unwrap()
-            .public_family_output("family", applied_family)
-            .unwrap()
-            .build()
-            .unwrap();
     }
 
     #[test]
@@ -5909,6 +6802,39 @@ mod tests {
         assert_eq!(hash.arguments().len(), 2);
         assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
         built.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn bounded_hash_is_a_direct_small_matrix_producer() {
+        let ring = Ring::new(17, 8);
+        let bounded =
+            ring.hash_decomposed(ring.bytes_input("key", 32), tag!("bounded-hash"), (4, 2), 4, 2);
+        assert_eq!(
+            bounded.max_coefficient_bound().evaluate(&ParamEnv::default()).unwrap(),
+            2.into()
+        );
+        let built = DslContext::new("bounded-hash-direct")
+            .small_matrix_output("rhs", bounded)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
+        let hash_nodes = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            .count();
+        assert_eq!(hash_nodes, 1);
+        assert!(
+            !built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .any(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
+        );
     }
 
     #[test]
@@ -5941,25 +6867,43 @@ mod tests {
         let ring = Ring::new(257, 8);
         let input = ring.input("input", (1, 1));
         let regular = DslContext::new("regular-decomposition")
-            .preimage_output("value", input.clone().decompose(4, 4).into_preimage_relation())
+            .preimage_output("value", input.clone().decompose(4, 4))
             .unwrap()
             .build()
             .unwrap();
         regular.validate(&ParamEnv::default()).unwrap();
+        assert_eq!(
+            input
+                .clone()
+                .decompose(4, 4)
+                .max_coefficient_bound()
+                .evaluate(&ParamEnv::default())
+                .unwrap(),
+            2.into()
+        );
         let serialized = serde_json::to_string(&regular.graph).unwrap();
         assert!(serialized.contains("digit_count"));
         assert!(serialized.contains("\"small\":false"));
 
         let small = DslContext::new("small-decomposition")
-            .preimage_output("value", input.clone().small_decompose(4, 4).into_preimage_relation())
+            .preimage_output("value", input.clone().small_decompose(4, 4))
             .unwrap()
             .build()
             .unwrap();
         small.validate(&ParamEnv::default()).unwrap();
+        assert_eq!(
+            input
+                .clone()
+                .small_decompose(4, 4)
+                .max_coefficient_bound()
+                .evaluate(&ParamEnv::default())
+                .unwrap(),
+            3.into()
+        );
         assert!(serde_json::to_string(&small.graph).unwrap().contains("\"small\":true"));
 
         let invalid = DslContext::new("negative-decomposition-base")
-            .preimage_output("value", input.decompose(-4, 4).into_preimage_relation())
+            .preimage_output("value", input.decompose(-4, 4))
             .unwrap()
             .build()
             .unwrap();
@@ -6148,11 +7092,11 @@ mod tests {
         let applied = trapdoors
             .public_matrices()
             .get_static(vec![IndexExpr::constant(0)])
-            .apply_preimage(selected.clone());
+            .mul_small_rhs(selected.clone());
         let applied_other = trapdoors
             .public_matrices()
             .get_static(vec![IndexExpr::constant(1)])
-            .apply_preimage(selected_other);
+            .mul_small_rhs(selected_other);
         let built = DslContext::new("trapdoor-family-branch-preimages")
             .private_preimage_output("preimage", selected)
             .unwrap()
@@ -6761,6 +7705,7 @@ mod tests {
             "rank-two-preimages".into(),
             matrix_type,
             shape.clone(),
+            IntExpr::constant(0),
             None,
         );
         assert!(matches!(

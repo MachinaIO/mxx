@@ -221,6 +221,11 @@ uint8_t *matrix_limb_ptr_by_id(GpuMatrix *mat, size_t poly_idx, const dim3 &limb
     {
         return nullptr;
     }
+    // `device_descriptors` resides in CUDA device memory and is consumed only
+    // by kernels.  Host-side serde and matrix helpers must derive addresses
+    // from the mirrored host metadata instead of dereferencing that device
+    // pointer.  For packed views `buffer.ptr` already includes the view
+    // offset, while `base_offset` selects the requested local limb.
     return buffer.ptr + offset_bytes;
 }
 
@@ -366,6 +371,51 @@ int matrix_track_limb_consumer(
             return set_error(err);
         }
         state->write_done_valid = true;
+    }
+    return 0;
+}
+
+int matrix_track_limb_consumer_readonly(
+    const GpuMatrix *src,
+    const dim3 &limb_id,
+    int consumer_device,
+    cudaStream_t consumer_stream)
+{
+    if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
+    {
+        return set_error("invalid matrix_track_limb_consumer_readonly arguments");
+    }
+    const auto *state = matrix_limb_state_const(
+        src,
+        limb_id,
+        "invalid limb index in matrix_track_limb_consumer_readonly");
+    if (!state)
+    {
+        return 1;
+    }
+    if (state->device != consumer_device || !state->stream)
+    {
+        return set_error("invalid source placement in matrix_track_limb_consumer_readonly");
+    }
+    if (limb_id.x >= src->ctx->release_streams_by_partition.size() ||
+        !src->ctx->release_streams_by_partition[limb_id.x])
+    {
+        return set_error("missing source release stream in matrix_track_limb_consumer_readonly");
+    }
+
+    cudaError_t err = cudaSetDevice(consumer_device);
+    if (err != cudaSuccess) return set_error(err);
+    cudaEvent_t consumer_done = nullptr;
+    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
+    if (err == cudaSuccess) err = cudaEventRecord(consumer_done, consumer_stream);
+    if (err == cudaSuccess)
+        err = cudaStreamWaitEvent(src->ctx->release_streams_by_partition[limb_id.x], consumer_done, 0);
+    const cudaError_t destroy_err = consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
+    if (err == cudaSuccess) err = destroy_err;
+    if (err != cudaSuccess)
+    {
+        cudaStreamSynchronize(consumer_stream);
+        return set_error(err);
     }
     return 0;
 }

@@ -31,14 +31,6 @@ use mxx_ir_core::{
     node::{ConcatAxis, NodeKind},
 };
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-#[cfg(feature = "gpu")]
-use mxx_primitives::{
-    matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
-    poly::{
-        Poly,
-        dcrt::{gpu::GpuDCRTPolyParams, poly::DCRTPoly},
-    },
-};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
 
@@ -61,30 +53,8 @@ fn positive_u32(name: &str, default: u32) -> u32 {
 }
 
 struct Fixture {
-    #[cfg(feature = "gpu")]
-    dcrt: DCRTPolyParams,
-    #[cfg(feature = "gpu")]
-    gpu: GpuDCRTPolyParams,
     parameters: RefreshSetupParameters,
-    #[cfg(feature = "gpu")]
-    compiler: ExponentLutEncodingCompiler,
     request: RefreshPreprocessingRequest,
-    #[cfg(feature = "gpu")]
-    selector_graph: mxx_dsl::BuiltGraph,
-    #[cfg(feature = "gpu")]
-    selector_production: mxx_ir_core::artifact::ProductionId,
-    #[cfg(feature = "gpu")]
-    selector_artifacts: PbcSelectorArtifacts,
-    #[cfg(feature = "gpu")]
-    selector_bits: PbcTrustedSelectorBits,
-    #[cfg(feature = "gpu")]
-    mask_secret_reference: DCRTPolyMatrix,
-    #[cfg(feature = "gpu")]
-    payload_secret_reference: DCRTPolyMatrix,
-    #[cfg(feature = "gpu")]
-    payload_secret: Mat,
-    #[cfg(feature = "gpu")]
-    expected_plaintext: Mat,
 }
 
 impl Fixture {
@@ -119,22 +89,6 @@ impl Fixture {
         let payload_secret = Mat::concat(
             ConcatAxis::Columns,
             vec![ring.polynomial([BigInt::from(-1).into()]), ring.identity(1)],
-        );
-        #[cfg(feature = "gpu")]
-        let mask_secret_reference = DCRTPolyMatrix::from_poly_vec(
-            &dcrt,
-            vec![vec![
-                DCRTPoly::from_usize_to_constant(&dcrt, 1),
-                DCRTPoly::from_usize_to_constant(&dcrt, 1),
-            ]],
-        );
-        #[cfg(feature = "gpu")]
-        let payload_secret_reference = DCRTPolyMatrix::from_poly_vec(
-            &dcrt,
-            vec![vec![
-                DCRTPoly::from_biguint_to_constant(&dcrt, dcrt.modulus().as_ref().clone() - 1u8),
-                DCRTPoly::from_usize_to_constant(&dcrt, 1),
-            ]],
         );
         let hash_key = ring.bytes_input("refresh-setup-gpu-hash-key", 32);
 
@@ -404,36 +358,7 @@ impl Fixture {
             secret: mask_secret_input,
             hash_key,
         };
-        #[cfg(feature = "gpu")]
-        let expected_plaintext = unit_attribute;
-        #[cfg(feature = "gpu")]
-        let gpu = GpuDCRTPolyParams::new(ring_dimension, dcrt.to_crt().0, dcrt.base_bits());
-        Fixture {
-            #[cfg(feature = "gpu")]
-            dcrt,
-            #[cfg(feature = "gpu")]
-            gpu,
-            parameters,
-            #[cfg(feature = "gpu")]
-            compiler,
-            request,
-            #[cfg(feature = "gpu")]
-            selector_graph,
-            #[cfg(feature = "gpu")]
-            selector_production,
-            #[cfg(feature = "gpu")]
-            selector_artifacts,
-            #[cfg(feature = "gpu")]
-            selector_bits,
-            #[cfg(feature = "gpu")]
-            mask_secret_reference,
-            #[cfg(feature = "gpu")]
-            payload_secret_reference,
-            #[cfg(feature = "gpu")]
-            payload_secret,
-            #[cfg(feature = "gpu")]
-            expected_plaintext,
-        }
+        Fixture { parameters, request }
     }
 }
 

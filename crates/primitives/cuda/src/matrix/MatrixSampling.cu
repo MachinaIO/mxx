@@ -581,10 +581,15 @@ static int gpu_matrix_sample_distribution_impl(
         return set_error("column range out of bounds in gpu_matrix_sample_distribution");
     }
 
+    const GpuPolyFormat requested_format = out->format;
+    if (requested_format != GPU_POLY_FORMAT_COEFF && requested_format != GPU_POLY_FORMAT_EVAL)
+    {
+        return set_error("invalid output format in gpu_matrix_sample_distribution");
+    }
+
     const size_t count = out->rows * out->cols;
     if (count == 0)
     {
-        out->format = GPU_POLY_FORMAT_EVAL;
         return 0;
     }
 
@@ -670,12 +675,15 @@ static int gpu_matrix_sample_distribution_impl(
     }
 
     out->format = GPU_POLY_FORMAT_COEFF;
-    status = gpu_matrix_ntt_all(out);
-    if (status != 0)
+    if (requested_format == GPU_POLY_FORMAT_EVAL)
     {
-        return status;
+        status = gpu_matrix_ntt_all(out);
+        if (status != 0)
+        {
+            return status;
+        }
     }
-    out->format = GPU_POLY_FORMAT_EVAL;
+    out->format = requested_format;
     return 0;
 }
 

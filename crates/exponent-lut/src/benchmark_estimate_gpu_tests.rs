@@ -14,7 +14,7 @@ use mxx_bench_estimator::{
 };
 use mxx_ir_core::ParamEnv;
 use mxx_primitives::{
-    env::mul_decompose_column_chunk_width,
+    env::mul_small_rhs_tile_columns,
     poly::{
         PolyParams,
         dcrt::{
@@ -93,9 +93,17 @@ fn log_report(stage: &'static str, report: &CostReport) {
     info!(
         stage,
         total_work_seconds = report.total_work_seconds,
+        total_time_seconds = report.total_time_seconds,
         preimage_sampling_work_seconds = report.preimage_sampling_work_seconds,
         critical_path_seconds = report.critical_path_seconds,
         maximum_parallelism = report.maximum_parallelism,
+        chunk_count = report.chunk_count,
+        transmitted_bytes = report.transmitted_bytes,
+        cache_bytes = report.cache_bytes,
+        persistent_storage_bytes = report.persistent_storage_bytes,
+        resident_vram_bytes = report.resident_vram_bytes,
+        expanded_workspace_bytes = report.expanded_workspace_bytes,
+        output_bytes = report.output_bytes,
         workspace_high_water_bytes = report.workspace_high_water_bytes,
         peak_memory_bytes = report.peak_memory_bytes,
         "Exponent-LUT GPU benchmark estimate"
@@ -118,10 +126,18 @@ fn log_subgraph_breakdown(stage: &'static str, report: &CostReport) {
             invocations = cost.invocations,
             work_seconds_per_invocation = cost.work_seconds_per_invocation,
             total_work_seconds = cost.work_seconds_per_invocation * cost.invocations as f64,
+            total_time_seconds = cost.total_time_seconds_per_invocation * cost.invocations as f64,
             latency_seconds_per_invocation = cost.latency_seconds_per_invocation,
             peak_memory_bytes = cost.peak_memory_bytes,
             workspace_high_water_bytes = cost.workspace_high_water_bytes,
             maximum_parallelism = cost.maximum_parallelism,
+            chunk_count = cost.chunk_count_per_invocation,
+            transmitted_bytes = cost.transmitted_bytes_per_invocation,
+            cache_bytes = cost.cache_bytes_per_invocation,
+            persistent_storage_bytes = cost.persistent_storage_bytes_per_invocation,
+            resident_vram_bytes = cost.resident_vram_bytes,
+            expanded_workspace_bytes = cost.expanded_workspace_bytes,
+            output_bytes = cost.output_bytes_per_invocation,
             "Exponent-LUT GPU benchmark subgraph work breakdown"
         );
     }
@@ -145,12 +161,23 @@ fn log_preprocess_report(select_setup: &CostReport, preprocessing: &CostReport) 
     info!(
         stage = "preprocess",
         total_work_seconds = select_setup.total_work_seconds + preprocessing.total_work_seconds,
+        total_time_seconds = select_setup.total_time_seconds + preprocessing.total_time_seconds,
         preimage_sampling_work_seconds = select_setup.preimage_sampling_work_seconds +
             preprocessing.preimage_sampling_work_seconds,
         critical_path_seconds =
             select_setup.critical_path_seconds + preprocessing.critical_path_seconds,
         maximum_parallelism =
             select_setup.maximum_parallelism.max(preprocessing.maximum_parallelism),
+        chunk_count = select_setup.chunk_count + preprocessing.chunk_count,
+        transmitted_bytes = select_setup.transmitted_bytes + preprocessing.transmitted_bytes,
+        cache_bytes = select_setup.cache_bytes + preprocessing.cache_bytes,
+        persistent_storage_bytes =
+            select_setup.persistent_storage_bytes + preprocessing.persistent_storage_bytes,
+        resident_vram_bytes =
+            select_setup.resident_vram_bytes.max(preprocessing.resident_vram_bytes),
+        expanded_workspace_bytes =
+            select_setup.expanded_workspace_bytes.max(preprocessing.expanded_workspace_bytes,),
+        output_bytes = select_setup.output_bytes + preprocessing.output_bytes,
         workspace_high_water_bytes =
             select_setup.workspace_high_water_bytes.max(preprocessing.workspace_high_water_bytes),
         peak_memory_bytes = select_setup.peak_memory_bytes.max(preprocessing.peak_memory_bytes),
@@ -347,7 +374,9 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         device_ids.len(),
     ))
     .expect("parallel instance count must be positive");
-    let column_chunk_width = mul_decompose_column_chunk_width();
+    let column_tile_width = mul_small_rhs_tile_columns()
+        .expect("MXX_MUL_SMALL_RHS_TILE_COLUMNS must be a positive integer")
+        .unwrap_or(1);
     let estimate_config =
         EstimateConfig { device_pool_size: parallel_instances.get(), per_instance_occupancy: 1 };
     let mut backend = GpuNodeMeasurementBackend::new(
@@ -359,14 +388,13 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
             ..MeasurementHarnessConfig::default()
         },
         crt_depth,
-        column_chunk_width,
-        2,
+        column_tile_width,
     );
     info!(
         gpu_count = device_ids.len(),
         ?device_ids,
         parallel_instances = parallel_instances.get(),
-        column_chunk_width,
+        column_tile_width,
         warm_up_iterations,
         measured_iterations,
         "Exponent-LUT benchmark estimator configuration"

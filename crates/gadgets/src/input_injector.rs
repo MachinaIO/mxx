@@ -509,7 +509,7 @@ impl DiamondInputInjector {
                 // transition relation rather than treating K as metadata.
                 parallel_zip_bundle(
                     (source_states, selected_transitions),
-                    |_, (source, transition)| source.apply_preimage(transition),
+                    |_, (source, transition)| source.mul_small_rhs(transition),
                 )
             },
         )?;

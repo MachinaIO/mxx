@@ -132,6 +132,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             lookup.trapdoors.clone(),
             self.config.gadget_base.clone().into(),
             self.config.digit_count.into(),
+            self.config.preimage_max_coefficient_bound.clone().into(),
             prefix,
         )?;
         let mut slots = NaivePublicKeySlotOperations;
@@ -166,6 +167,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             self.config.digit_count.into(),
             self.config.ring_dimension,
             &prefix,
+            self.config.preimage_max_coefficient_bound.clone().into(),
         )?;
         let mut lowering =
             NaiveLweLookupEncodingLowering::new(invocations, lookup.c_b_by_slot.clone())?;
@@ -204,6 +206,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             self.config.trapdoor_sigma.clone(),
             self.config.gadget_base.clone(),
             self.config.digit_count,
+            self.config.preimage_max_coefficient_bound.clone(),
         );
         let lookup_base = lookup_trapdoor.public_matrix();
         let lookup_base_keys = NaiveBggPublicKeyVecWire {
@@ -448,11 +451,12 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             DiamondIoArtifactNames::LOOKUP_BASE_PROJECTION,
             vec![IntExpr::constant(self.config.ring_dimension)],
             (self.config.input_config().state_columns()?, self.config.digit_count + 2),
+            self.config.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let root_state = states.get_static(0);
         let c_b_by_slot = lookup_base_preimages
-            .parallel_map_values(move |_, preimage| root_state.clone().apply_preimage(preimage))?;
+            .parallel_map_values(move |_, preimage| root_state.clone().mul_small_rhs(preimage))?;
         let mut lookups =
             LookupEvaluation { production: production.clone(), c_b_by_slot, next_circuit: 0 };
         let one_public = self.import_public_key(
@@ -577,6 +581,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 DiamondIoArtifactNames::final_decoder_preimages(output),
                 vec![IntExpr::constant(self.config.ring_dimension)],
                 (self.config.input_config().state_columns()?, 1),
+                self.config.preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
             );
             let MaskedHighBitDecoderOutputs::Booleans(decoded) = decoder.build_online(
@@ -656,6 +661,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             digit_count: self.config.digit_count,
             gadget_base: self.config.gadget_base.clone().into(),
             trapdoor_sigma: self.config.trapdoor_sigma.clone(),
+            preimage_max_coefficient_bound: self.config.preimage_max_coefficient_bound.clone().into(),
             coefficient_count: self.config.ring_dimension,
         }
     }
@@ -1163,11 +1169,12 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 self.config.input_config().state_columns().expect("validated layout"),
                 self.config.public_key_columns(),
             ),
+            self.config.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let state = state.clone();
         let vectors = preimages
-            .parallel_map_values(move |_, preimage| state.clone().apply_preimage(preimage))?;
+            .parallel_map_values(move |_, preimage| state.clone().mul_small_rhs(preimage))?;
         let plaintexts = plaintext
             .map(|value| Parallel::range(self.config.ring_dimension).map(move |_| value.clone()))
             .transpose()?;
@@ -1195,6 +1202,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                 IntExpr::constant(self.config.digit_base),
             ],
             (state_columns, state_columns),
+            self.config.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         )
     }
@@ -1230,6 +1238,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                                 self.config.input_config().state_columns().expect("layout"),
                                 self.config.public_key_columns(),
                             ),
+                            self.config.preimage_max_coefficient_bound.clone(),
                             ArtifactConfidentiality::Public,
                         )
                     })
@@ -1263,6 +1272,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                                 self.config.input_config().state_columns().expect("layout"),
                                 self.config.refresh_decoder_public_columns,
                             ),
+                            self.config.preimage_max_coefficient_bound.clone(),
                             ArtifactConfidentiality::Public,
                         ),
                     })
@@ -1441,7 +1451,7 @@ impl DiamondIoRoundCompiler {
                 let preimages = preprocessing.branch_rebase_preimages[branch][wire].clone();
                 let projected = preimages.parallel_map_values({
                     let final_state = final_state.clone();
-                    move |_, preimage| final_state.clone().apply_preimage(preimage)
+                    move |_, preimage| final_state.clone().mul_small_rhs(preimage)
                 })?;
                 let vectors =
                     projected.parallel_zip(masked.vectors, |_, left, right| left + right)?;
@@ -1635,6 +1645,8 @@ impl DiamondIoRoundCompiler {
             decoder_public_columns: self.config.refresh_decoder_public_columns,
             decoder_zero_rows: 1,
             decoder_trapdoor_sigma: self.config.trapdoor_sigma.clone(),
+            decoder_preimage_max_coefficient_bound:
+                self.config.preimage_max_coefficient_bound.clone().into(),
         }
     }
 
@@ -1732,6 +1744,7 @@ mod tests {
             digit_count: parameters.modulus_digits(),
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             bgg_tag: b"diamond-top-level".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -1873,6 +1886,7 @@ mod tests {
             digit_count: 2,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             bgg_tag: b"diamond-round-test".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -1915,7 +1929,7 @@ mod tests {
             })
             .collect::<Vec<Vec<Vec<_>>>>();
         let hash_key = ring.bytes_input("hash-key", 32);
-        let final_trapdoor = ring.sample_trapdoor(2, 4, 4, 2);
+        let final_trapdoor = ring.sample_trapdoor(2, 4, 4, 2, 1u64 << 20);
         let preprocessing = compiler
             .preprocess_round(
                 0,
@@ -2000,6 +2014,7 @@ mod tests {
             digit_count,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             bgg_tag: b"diamond-round-runtime".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -2047,7 +2062,13 @@ mod tests {
                     &selector_public,
                     &branch_public,
                     &decoded_public,
-                    ring.sample_trapdoor(2, 4, config.gadget_base_expr(), digit_count),
+                    ring.sample_trapdoor(
+                        2,
+                        4,
+                        config.gadget_base_expr(),
+                        digit_count,
+                        config.preimage_max_coefficient_bound.clone(),
+                    ),
                 )
                 .unwrap();
             let encoding = |name: &str, keys: Family<Mat>| NaiveBggEncodingVecWire {
@@ -2209,6 +2230,7 @@ mod tests {
             digit_count,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             bgg_tag: b"diamond-rebase-sign".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -2242,7 +2264,13 @@ mod tests {
             })
             .collect::<Vec<Vec<Vec<_>>>>();
         let hash_key = ring.bytes_input("hash-key", 32);
-        let trapdoor = ring.sample_trapdoor(2, 4, config.gadget_base_expr(), digit_count);
+        let trapdoor = ring.sample_trapdoor(
+            2,
+            4,
+            config.gadget_base_expr(),
+            digit_count,
+            config.preimage_max_coefficient_bound.clone(),
+        );
         let final_state = ring.input("state-secret", (1, 2)) * trapdoor.public_matrix();
         let preprocessing = compiler
             .preprocess_round(

@@ -1,5 +1,27 @@
 namespace
 {
+    struct DeviceDescriptorInit
+    {
+        uint8_t *base;
+        size_t stride;
+        size_t count;
+        uint8_t widths[GPU_RUNTIME_MAX_LIMBS];
+        size_t offsets[GPU_RUNTIME_MAX_LIMBS];
+    };
+
+    __global__ void initialize_device_descriptors(
+        GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors,
+        DeviceDescriptorInit init)
+    {
+        const size_t limb = blockIdx.x * blockDim.x + threadIdx.x;
+        if (limb >= init.count)
+        {
+            return;
+        }
+        descriptors[limb] = GpuMatrix::SharedLimbBuffer::DeviceDescriptor{
+            init.base + init.offsets[limb], init.stride, init.widths[limb], 0};
+    }
+
     bool checked_mul_size(size_t a, size_t b, size_t *out)
     {
         if (!out)
@@ -12,6 +34,149 @@ namespace
         }
         *out = a * b;
         return true;
+    }
+
+    bool checked_add_size(size_t a, size_t b, size_t *out)
+    {
+        if (!out || a > static_cast<size_t>(-1) - b)
+        {
+            return false;
+        }
+        *out = a + b;
+        return true;
+    }
+
+    int calculate_matrix_allocation_bytes(
+        const GpuContext *ctx,
+        int level,
+        size_t rows,
+        size_t cols,
+        int format,
+        GpuMatrixAllocationBytes *out)
+    {
+        if (!ctx || !out)
+        {
+            return set_error("invalid matrix allocation accounting arguments");
+        }
+        GpuPolyFormat parsed_format;
+        if (!parse_format(format, parsed_format) || level < -1 || level > ctx->level ||
+            ctx->N < 0 || ctx->gpu_ids.empty())
+        {
+            return set_error("invalid matrix allocation accounting parameters");
+        }
+        (void)parsed_format;
+        size_t count = 0;
+        if (!checked_mul_size(rows, cols, &count))
+        {
+            return set_error("matrix size overflow in allocation accounting");
+        }
+        const size_t active_limbs = level < 0 ? 0 : static_cast<size_t>(level + 1);
+        if (active_limbs > GPU_RUNTIME_MAX_LIMBS)
+        {
+            return set_error("matrix limb count exceeds CUDA runtime limit");
+        }
+        if (ctx->limb_gpu_ids.size() < active_limbs ||
+            ctx->limb_coeff_bytes.size() < active_limbs ||
+            ctx->decomp_counts_by_partition.size() < ctx->gpu_ids.size())
+        {
+            return set_error("missing matrix allocation metadata");
+        }
+        *out = GpuMatrixAllocationBytes{};
+        const size_t n = static_cast<size_t>(ctx->N);
+        for (size_t partition = 0; partition < ctx->gpu_ids.size(); ++partition)
+        {
+            size_t local_limbs = 0;
+            for (size_t limb = 0; limb < active_limbs; ++limb)
+            {
+                const dim3 id = ctx->limb_gpu_ids[limb];
+                if (id.x >= ctx->gpu_ids.size())
+                {
+                    return set_error("invalid limb partition in allocation accounting");
+                }
+                if (id.x == partition)
+                {
+                    local_limbs = std::max(local_limbs, static_cast<size_t>(id.y) + 1);
+                }
+            }
+            if (local_limbs == 0 || count == 0)
+            {
+                continue;
+            }
+            size_t coeff_bytes_per_poly = 0;
+            for (size_t local = 0; local < local_limbs; ++local)
+            {
+                size_t global_limb = active_limbs;
+                for (size_t limb = 0; limb < active_limbs; ++limb)
+                {
+                    const dim3 id = ctx->limb_gpu_ids[limb];
+                    if (id.x == partition && id.y == local)
+                    {
+                        global_limb = limb;
+                        break;
+                    }
+                }
+                if (global_limb == active_limbs || ctx->limb_coeff_bytes[global_limb] == 0)
+                {
+                    return set_error("missing limb width in allocation accounting");
+                }
+                size_t limb_bytes = 0;
+                if (!checked_mul_size(
+                        n,
+                        static_cast<size_t>(ctx->limb_coeff_bytes[global_limb]),
+                        &limb_bytes) ||
+                    !checked_add_size(coeff_bytes_per_poly, limb_bytes, &coeff_bytes_per_poly))
+                {
+                    return set_error("limb size overflow in allocation accounting");
+                }
+            }
+            size_t bytes_per_poly = 0;
+            size_t data_bytes = 0;
+            if (!checked_mul_size(coeff_bytes_per_poly, 2, &bytes_per_poly) ||
+                !checked_mul_size(bytes_per_poly, count, &data_bytes))
+            {
+                return set_error("data size overflow in allocation accounting");
+            }
+            size_t decomp_slots = 0;
+            size_t aux_slots = 0;
+            size_t aux_total_slots = 0;
+            size_t aux_bytes = 0;
+            if (!checked_mul_size(
+                    static_cast<size_t>(4),
+                    ctx->decomp_counts_by_partition[partition],
+                    &decomp_slots) ||
+                !checked_add_size(static_cast<size_t>(4), decomp_slots, &decomp_slots) ||
+                !checked_mul_size(ctx->max_aux_limbs, decomp_slots, &aux_slots) ||
+                !checked_mul_size(aux_slots, count, &aux_total_slots) ||
+                !checked_mul_size(aux_total_slots, sizeof(void *), &aux_bytes))
+            {
+                return set_error("auxiliary size overflow in allocation accounting");
+            }
+            size_t descriptor_bytes = 0;
+            if (!checked_mul_size(
+                    local_limbs,
+                    sizeof(GpuMatrix::SharedLimbBuffer::DeviceDescriptor),
+                    &descriptor_bytes) ||
+                !checked_add_size(aux_bytes, descriptor_bytes, &aux_bytes))
+            {
+                return set_error("descriptor size overflow in allocation accounting");
+            }
+            size_t event_count = 0;
+            size_t event_bytes = 0;
+            if (!checked_add_size(local_limbs, 1, &event_count) ||
+                !checked_mul_size(event_count, sizeof(cudaEvent_t), &event_bytes) ||
+                !checked_add_size(out->data_bytes, data_bytes, &out->data_bytes) ||
+                !checked_add_size(out->aux_bytes, aux_bytes, &out->aux_bytes) ||
+                !checked_add_size(out->event_bytes, event_bytes, &out->event_bytes))
+            {
+                return set_error("total size overflow in allocation accounting");
+            }
+        }
+        if (!checked_add_size(out->data_bytes, out->aux_bytes, &out->total_bytes) ||
+            !checked_add_size(out->total_bytes, out->event_bytes, &out->total_bytes))
+        {
+            return set_error("total size overflow in allocation accounting");
+        }
+        return 0;
     }
 
     bool queue_shared_allocation_free_locked(
@@ -159,6 +324,7 @@ namespace
         if (partition_idx < mat->shared_limb_buffers.size())
         {
             mat->shared_limb_buffers[partition_idx].ptr = nullptr;
+            mat->shared_limb_buffers[partition_idx].device_descriptors = nullptr;
             mat->shared_limb_buffers[partition_idx].allocation.reset();
         }
         if (partition_idx < mat->shared_aux_buffers.size())
@@ -251,6 +417,21 @@ GpuMatrix::SharedAllocation::~SharedAllocation()
     }
 }
 
+extern "C" int gpu_matrix_query_allocation_bytes(
+    const GpuContext *ctx,
+    int level,
+    size_t rows,
+    size_t cols,
+    int format,
+    GpuMatrixAllocationBytes *out)
+{
+    if (!out)
+    {
+        return set_error("invalid gpu_matrix_query_allocation_bytes output");
+    }
+    return calculate_matrix_allocation_bytes(ctx, level, rows, cols, format, out);
+}
+
 extern "C" int gpu_matrix_create(
     GpuContext *ctx,
     int level,
@@ -278,6 +459,13 @@ extern "C" int gpu_matrix_create(
     if (!checked_mul_size(rows, cols, &count))
     {
         return set_error("matrix size overflow in gpu_matrix_create");
+    }
+    GpuMatrixAllocationBytes checked_allocation{};
+    const int allocation_status =
+        calculate_matrix_allocation_bytes(ctx, level, rows, cols, format, &checked_allocation);
+    if (allocation_status != 0)
+    {
+        return allocation_status;
     }
 
     auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}, {}, {}};
@@ -369,6 +557,12 @@ extern "C" int gpu_matrix_create(
         if (limbs == 0 || count == 0)
         {
             continue;
+        }
+        if (limbs > GPU_RUNTIME_MAX_LIMBS)
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error("matrix descriptor count exceeds CUDA runtime limit");
         }
 
         mat->exec_limb_states[partition_idx].resize(limbs);
@@ -489,7 +683,10 @@ extern "C" int gpu_matrix_create(
             return set_error("unexpected decomp metadata size in gpu_matrix_create");
         }
         const size_t decomp_count = ctx->decomp_counts_by_partition[partition_idx];
-        if (!checked_mul_size(ctx->max_aux_limbs, static_cast<size_t>(4 + 4 * decomp_count), &aux_slots) ||
+        size_t decomp_slots = 0;
+        if (!checked_mul_size(static_cast<size_t>(4), decomp_count, &decomp_slots) ||
+            !checked_add_size(static_cast<size_t>(4), decomp_slots, &decomp_slots) ||
+            !checked_mul_size(ctx->max_aux_limbs, decomp_slots, &aux_slots) ||
             !checked_mul_size(aux_slots, count, &aux_total_slots) ||
             !checked_mul_size(aux_total_slots, sizeof(void *), &aux_total_bytes))
         {
@@ -497,6 +694,18 @@ extern "C" int gpu_matrix_create(
             delete mat;
             return set_error("matrix aux allocation overflow in gpu_matrix_create");
         }
+        size_t descriptor_bytes = 0;
+        if (!checked_mul_size(
+                limbs,
+                sizeof(GpuMatrix::SharedLimbBuffer::DeviceDescriptor),
+                &descriptor_bytes) ||
+            aux_total_bytes > static_cast<size_t>(-1) - descriptor_bytes)
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error("matrix device descriptor allocation overflow in gpu_matrix_create");
+        }
+        aux_total_bytes += descriptor_bytes;
 
         void **aux_base = nullptr;
         err = cudaMallocAsync(&aux_base, aux_total_bytes, alloc_stream);
@@ -510,6 +719,31 @@ extern "C" int gpu_matrix_create(
         allocation->aux_bytes = aux_total_bytes;
         mat->shared_aux_buffers[partition_idx].allocation = allocation;
         mat->shared_aux_buffers[partition_idx].ptr = aux_base;
+
+        auto *device_descriptors = reinterpret_cast<GpuMatrix::SharedLimbBuffer::DeviceDescriptor *>(
+            reinterpret_cast<uint8_t *>(aux_base) + aux_total_slots * sizeof(void *));
+        DeviceDescriptorInit descriptor_init{};
+        descriptor_init.base = base;
+        descriptor_init.stride = bytes_per_poly;
+        descriptor_init.count = limbs;
+        for (size_t limb_idx = 0; limb_idx < limbs; ++limb_idx)
+        {
+            descriptor_init.offsets[limb_idx] = local_limb_offsets[limb_idx];
+            descriptor_init.widths[limb_idx] = local_limb_bytes[limb_idx];
+        }
+        initialize_device_descriptors<<<1, static_cast<unsigned int>(limbs), 0, alloc_stream>>>(
+            device_descriptors, descriptor_init);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            {
+                std::lock_guard<std::mutex> lock(allocation->mutex);
+                allocation->release_blocked = true;
+            }
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error(err);
+        }
 
         err = cudaEventRecord(allocation->allocation_ready, alloc_stream);
         if (err != cudaSuccess)
@@ -583,6 +817,8 @@ extern "C" int gpu_matrix_create(
         mat->shared_limb_buffers[partition_idx] = GpuMatrix::SharedLimbBuffer{
             ctx->gpu_ids[partition_idx],
             base,
+            device_descriptors,
+            0,
             limbs,
             bytes_per_poly,
             total_bytes,
@@ -708,6 +944,8 @@ extern "C" int gpu_matrix_create_batch(
             view->shared_limb_buffers[partition_idx] = GpuMatrix::SharedLimbBuffer{
                 owner_limb.device,
                 owner_limb.ptr ? owner_limb.ptr + limb_offset : nullptr,
+                owner_limb.device_descriptors,
+                limb_offset,
                 owner_limb.limb_count,
                 owner_limb.bytes_per_poly,
                 view_bytes,

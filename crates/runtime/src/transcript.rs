@@ -1,4 +1,7 @@
-use mxx_ir_core::types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port};
+use mxx_ir_core::{
+    artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
+    types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -12,8 +15,20 @@ pub struct DrawSite {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RecordedValue {
-    Matrix { matrix_type: ConcreteMatrixType, bytes: Vec<u8> },
-    Trapdoor { matrix_type: ConcreteMatrixType, public_bytes: Vec<u8>, trapdoor_bytes: Vec<u8> },
+    Matrix {
+        matrix_type: ConcreteMatrixType,
+        bytes: Vec<u8>,
+    },
+    SmallMatrix {
+        schema: ConcreteBoundedMatrixSchema,
+        semantic_kind: SmallMatrixSemanticKind,
+        bytes: Vec<u8>,
+    },
+    Trapdoor {
+        matrix_type: ConcreteMatrixType,
+        public_bytes: Vec<u8>,
+        trapdoor_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

@@ -2,8 +2,8 @@
 
 use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
 use mxx_dsl::{
-    Bytes, Decomposition, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel,
-    Pending, Ring,
+    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending,
+    Preimage, Ring,
 };
 use mxx_ir_core::{IntExpr, ValueHandle};
 
@@ -98,11 +98,11 @@ impl BggPublicKeyCompiler {
         &self,
         lhs: &BggPublicKeyWire,
         rhs: &BggPublicKeyWire,
-        decomposed_rhs: Decomposition,
+        decomposed_rhs: Preimage,
     ) -> BggPublicKeyWire {
         // If G K_R = A_R, then A_L K_R is the public-key product A_L G^-1(A_R).
         BggPublicKeyWire {
-            matrix: lhs.matrix.clone().mul_decomposed(decomposed_rhs),
+            matrix: lhs.matrix.clone().mul_small_rhs(decomposed_rhs),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
@@ -127,7 +127,7 @@ impl BggPublicKeyCompiler {
         // G K_T = T.  T is only a consumed matrix target, not a claim that it
         // is itself a canonical gadget encoding.
         BggPublicKeyWire {
-            matrix: input.matrix.clone().mul_decomposed(decomposed),
+            matrix: input.matrix.clone().mul_small_rhs(decomposed),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -135,10 +135,10 @@ impl BggPublicKeyCompiler {
     pub(crate) fn large_scalar_mul_with_decomposition(
         &self,
         input: &BggPublicKeyWire,
-        decomposed: Decomposition,
+        decomposed: Preimage,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: input.matrix.clone().mul_decomposed(decomposed),
+            matrix: input.matrix.clone().mul_small_rhs(decomposed),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -147,7 +147,7 @@ impl BggPublicKeyCompiler {
         &self,
         input: &BggPublicKeyWire,
         scalar: &Mat,
-    ) -> Decomposition {
+    ) -> Preimage {
         let rows = input.matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
         // A large scalar t must be converted into a gadget-carried target tG.
@@ -222,7 +222,7 @@ mod tests {
     use mxx_dsl::DslContext;
     use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
     };
     use mxx_runtime::RuntimeValue;
@@ -250,14 +250,9 @@ mod tests {
             .map(|node| node.kind())
             .collect::<Vec<_>>();
         assert_eq!(
-            kinds.iter().filter(|kind| matches!(kind, NodeKind::MaterializePreimageExact)).count(),
-            0,
-            "public-key multiplication must keep gadget decomposition lazy",
-        );
-        assert_eq!(
-            kinds.iter().filter(|kind| matches!(kind, NodeKind::ApplyPreimage)).count(),
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::MatrixMulSmallRhs)).count(),
             1,
-            "public-key multiplication must use the fused mul_decomposed path",
+            "public-key multiplication must consume the bounded decomposition directly",
         );
     }
 
@@ -349,7 +344,17 @@ mod tests {
 
         assert_eq!(matrix_output(&result, "add"), &(lhs_value.clone() + rhs_value.clone()));
         assert_eq!(matrix_output(&result, "sub"), &(lhs_value.clone() - rhs_value.clone()));
-        assert_eq!(matrix_output(&result, "mul"), &lhs_value.mul_decompose(&rhs_value));
-        assert_eq!(matrix_output(&result, "matrix-mul"), &lhs_value.mul_decompose(&target_value));
+        assert_eq!(
+            matrix_output(&result, "mul"),
+            &lhs_value
+                .multiply_small_rhs(rhs_value.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            matrix_output(&result, "matrix-mul"),
+            &lhs_value
+                .multiply_small_rhs(target_value.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+        );
     }
 }

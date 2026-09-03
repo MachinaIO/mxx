@@ -670,6 +670,27 @@ impl<'a> Evaluator<'a> {
         Ok(BigInt::from(crate::bound::max_abs_interval(&range.minimum, &range.maximum_inclusive)))
     }
 
+    /// Resolve a serialized coefficient cutoff without turning a negative
+    /// declaration into a positive one.  Bounds are protocol inputs, not
+    /// signed scalar coefficients; accepting `-B` as `B` would silently
+    /// change the sampler contract and could make a later transfer
+    /// inconsistent with the declared wire type.
+    fn nonnegative_integer_expression(
+        &self,
+        expression: &mxx_ir_core::IntExpr,
+        env: &ParamEnv,
+        purpose: &str,
+    ) -> Result<BigInt, SimulationError> {
+        let range = self.integer_expression(expression, env)?;
+        if range.minimum.is_negative() {
+            return Err(SimulationError::InvalidGraph {
+                message: format!("{purpose} must be nonnegative"),
+                site: None,
+            });
+        }
+        Ok(range.maximum_inclusive)
+    }
+
     fn require_uniform_wire_type(
         &self,
         ty: &WireType,
@@ -679,7 +700,9 @@ impl<'a> Evaluator<'a> {
             self.singleton_integer_expression(expression, env, purpose).map(|_| ())
         };
         match ty {
-            WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
+            WireType::Matrix(matrix) |
+            WireType::SmallMatrix { matrix, .. } |
+            WireType::Preimage { matrix, .. } => {
                 require(&matrix.modulus, "matrix modulus")?;
                 require(&matrix.ring_dimension, "matrix ring dimension")?;
                 require(&matrix.rows, "matrix row count")?;
@@ -885,65 +908,6 @@ impl<'a> Evaluator<'a> {
             self.source_lineages.get(&source).is_some_and(|lineage| {
                 !lineage.leaves.is_empty() && lineage.leaves.iter().all(is_gadget)
             })
-    }
-
-    fn source_origin(&self, source: crate::SourceId) -> String {
-        self.source_origin_with_depth(source, 0)
-    }
-
-    fn source_origin_with_depth(&self, source: crate::SourceId, depth: usize) -> String {
-        if let Some(key) =
-            self.sources.iter().find_map(|(key, value)| (*value == source).then_some(key))
-        {
-            return format!("primitive {key:?}");
-        }
-        if let Some((key, _)) = self.mapped_sources.iter().find(|(_, value)| **value == source) {
-            return if depth >= 8 {
-                format!("mapped {key:?}")
-            } else {
-                format!("mapped {key:?} <- {}", self.source_origin_with_depth(key.0, depth + 1))
-            };
-        }
-        if let Some((key, _)) = self.gathered_sources.iter().find(|(_, value)| **value == source) {
-            let parent = self.source_lineages.get(&key.0);
-            return if depth >= 8 {
-                format!(
-                    "gathered {key:?}, parent_shape={:?}, parent_leaves={:?}",
-                    parent.map(|lineage| &lineage.shape),
-                    parent.map(|lineage| lineage.leaves.iter().take(8).collect::<Vec<_>>())
-                )
-            } else {
-                format!(
-                    "gathered {key:?}, parent_shape={:?}, parent_leaves={:?} <- {}",
-                    parent.map(|lineage| &lineage.shape),
-                    parent.map(|lineage| lineage.leaves.iter().take(8).collect::<Vec<_>>()),
-                    self.source_origin_with_depth(key.0, depth + 1)
-                )
-            };
-        }
-        if let Some((key, _)) = self.binder_sources.iter().find(|(_, value)| **value == source) {
-            return format!(
-                "binder {:?} <- {}",
-                key,
-                self.source_origin_with_depth(key.0, depth + 1)
-            );
-        }
-        match self.source_lineages.get(&source) {
-            Some(lineage) if depth < 8 => format!(
-                "canonical-lineage shape={:?} leaves={:?} <- [{}]",
-                lineage.shape,
-                lineage.leaves.iter().take(8).collect::<Vec<_>>(),
-                lineage
-                    .leaves
-                    .iter()
-                    .take(8)
-                    .map(|leaf| self.source_origin_with_depth(*leaf, depth + 1))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Some(lineage) => format!("canonical-lineage {lineage:?}"),
-            None => "unknown-source".into(),
-        }
     }
 
     fn view_shape(&self, view: crate::FamilyViewId) -> Option<Vec<usize>> {
@@ -2150,73 +2114,82 @@ impl<'a> Evaluator<'a> {
                     paired_public: None,
                 }])
             }
-            NodeKind::ApplyPreimage => {
+            NodeKind::MatrixMulSmallRhs => {
                 let a = matrix(&xs[0])?;
                 let b = matrix(&xs[1])?;
                 let left_type = mt(&xs[0])?;
                 let result_type = output_type(scope, n, env)?;
-                let view = xs[1].relation.as_ref().and_then(|r| r.view).ok_or_else(|| {
-                    SimulationError::Relation {
-                        message: format!(
-                            "explicit preimage use has no relation (value={:?}, relation={:?}, view={:?})",
-                            xs[1].value, xs[1].relation, xs[1].view
-                        ),
-                        site: site(),
-                    }
-                })?;
-                let r = self.preimages.get(&view).ok_or_else(|| SimulationError::Relation {
-                    message: "explicit preimage relation is not registered".into(),
-                    site: site(),
-                })?;
-                if a.right_carrier.as_ref().is_some_and(|carrier| carrier.source != r.source) {
-                    return Err(SimulationError::Relation {
-                        message: format!(
-                            "preimage relation source mismatch: expected {:?} for relation view {:?} with lineage {:?} (origin {:?}), actual {:?} for left view {:?} with lineage {:?} (origin {:?})",
-                            r.source,
-                            r.view,
-                            self.source_lineages.get(&r.source),
-                            self.source_origin(r.source),
-                            a.right_carrier.as_ref().map(|carrier| carrier.source),
-                            xs[0].view,
-                            a.right_carrier
-                                .as_ref()
-                                .and_then(|carrier| self.source_lineages.get(&carrier.source)),
-                            a.right_carrier
-                                .as_ref()
-                                .map(|carrier| self.source_origin(carrier.source)),
-                        ),
-                        site: site(),
-                    });
+                let rhs_wire = scope
+                    .node(mxx_ir_core::NodeId(n as u64))
+                    .and_then(|node| node.arguments().get(1))
+                    .map(|value| value.wire_type())
+                    .ok_or_else(|| bad("bounded RHS wire type is unavailable"))?;
+                let bound = match rhs_wire {
+                    WireType::SmallMatrix { max_coefficient_bound, .. } |
+                    WireType::Preimage { max_coefficient_bound, .. } => self
+                        .nonnegative_integer_expression(
+                            max_coefficient_bound,
+                            env,
+                            "bounded RHS coefficient bound",
+                        )?,
+                    _ => return Err(bad("small-RHS multiplication requires a bounded RHS")),
+                };
+                let bound = bound
+                    .to_biguint()
+                    .ok_or_else(|| bad("bounded RHS coefficient bound is negative"))?;
+                let bound = bound.min(crate::centered_residue_bound(&result_type.modulus)?);
+                if b.coefficient_magnitude_bound > bound {
+                    return Err(bad(
+                        "bounded RHS coefficient magnitude exceeds declared wire bound",
+                    ));
                 }
-                let z = relation::consume(
-                    &a,
-                    &b,
-                    self.states.get(&r.target).ok_or_else(|| SimulationError::Relation {
-                        message: format!("preimage target state is unavailable target={:?} relation={:?} view={:?} occurrence={:?}", r.target, r, xs[1].view, occurrence),
-                        site: site(),
-                    })?,
-                    r,
-                    xs[1].view,
-                    r.target,
-                    ProductGeometry {
-                        inner_dimension: left_type.columns,
-                        ring_dimension: left_type.ring_dimension,
-                    },
-                    &result_type.modulus,
-                )
-                .map_err(|e| SimulationError::Relation {
-                    message: format!(
-                        "preimage relation error: {e}; relation={r:?}, preimage_view={:?}, left_view={:?}, target_state_view={:?}, target_state_available={}, left_carrier={:?}, left_state={a:?}, preimage_state={b:?}",
-                        xs[1].view,
-                        xs[0].view,
-                        r.target,
-                        self.states.contains_key(&r.target),
-                        a.right_carrier,
-                    ),
-                    site: site(),
-                })?;
+                let geometry = ProductGeometry {
+                    inner_dimension: left_type.columns,
+                    ring_dimension: left_type.ring_dimension,
+                };
+                let value = if matches!(rhs_wire, WireType::Preimage { .. }) {
+                    let view =
+                        xs[1].relation.as_ref().and_then(|relation| relation.view).ok_or_else(
+                            || SimulationError::Relation {
+                                message: "bounded preimage RHS has no relation".into(),
+                                site: site(),
+                            },
+                        )?;
+                    let relation =
+                        self.preimages.get(&view).ok_or_else(|| SimulationError::Relation {
+                            message: "bounded preimage RHS relation is not registered".into(),
+                            site: site(),
+                        })?;
+                    if a.right_carrier
+                        .as_ref()
+                        .is_some_and(|carrier| carrier.source != relation.source)
+                    {
+                        return Err(SimulationError::Relation {
+                            message: "bounded preimage RHS source does not match left carrier"
+                                .into(),
+                            site: site(),
+                        });
+                    }
+                    relation::consume(
+                        &a,
+                        &b,
+                        self.states.get(&relation.target).ok_or_else(|| {
+                            SimulationError::Relation {
+                                message: "bounded preimage RHS target state is unavailable".into(),
+                                site: site(),
+                            }
+                        })?,
+                        relation,
+                        view,
+                        relation.target,
+                        geometry,
+                        &result_type.modulus,
+                    )?
+                } else {
+                    a.ordinary_product(&b, geometry, &result_type.modulus)?
+                };
                 Ok(vec![Info {
-                    value: AbstractValue::Matrix(z),
+                    value: AbstractValue::Matrix(value),
                     ty: Some(result_type),
                     relation: None,
                     view: crate::FamilyViewId(u32::MAX),
@@ -2414,9 +2387,47 @@ impl<'a> Evaluator<'a> {
                     paired_public: None,
                 }])
             }
-            NodeKind::UniformResidueSample { .. } | NodeKind::HashSample { .. } => {
+            NodeKind::UniformResidueSample { .. } => {
                 let t = output_type(scope, n, env)?;
-                let mut z = state::plain_hash_sample(&t)?;
+                let mut z = state::uniform_residue_sample(&t)?;
+                z.right_carrier = Some(crate::RightCarrier {
+                    source: self.source_for(stage, sid, occurrence, n, "uniform-residue"),
+                    left_gain: 1u8.into(),
+                });
+                Ok(vec![Info {
+                    value: AbstractValue::Matrix(z),
+                    ty: Some(t),
+                    relation: None,
+                    view: crate::FamilyViewId(u32::MAX),
+                    paired_public: None,
+                }])
+            }
+            NodeKind::HashSample { variant, base, .. } => {
+                let t = output_type(scope, n, env)?;
+                let mut z = match variant {
+                    mxx_ir_core::node::HashVariant::Plain => state::plain_hash_sample(&t)?,
+                    mxx_ir_core::node::HashVariant::Decomposed |
+                    mxx_ir_core::node::HashVariant::SmallDecomposed => {
+                        let base = base
+                            .as_ref()
+                            .ok_or_else(|| bad("decomposed hash is missing its gadget base"))?;
+                        let base =
+                            self.singleton_integer_expression(base, env, "hash gadget base")?;
+                        let magnitude =
+                            if matches!(variant, mxx_ir_core::node::HashVariant::SmallDecomposed) {
+                                &base - BigInt::one()
+                            } else {
+                                (&base + BigInt::one()) / 2
+                            };
+                        state::exact_matrix(
+                            &t,
+                            magnitude
+                                .to_biguint()
+                                .ok_or_else(|| bad("hash coefficient bound is negative"))?,
+                            false,
+                        )?
+                    }
+                };
                 z.right_carrier = Some(crate::RightCarrier {
                     source: self.source_for(stage, sid, occurrence, n, "uniform-residue"),
                     left_gain: 1u8.into(),
@@ -2452,7 +2463,11 @@ impl<'a> Evaluator<'a> {
             }
             NodeKind::GaussianSample { max_coefficient_bound, .. } => {
                 let t = output_type(scope, n, env)?;
-                let bound = self.integer_expression_magnitude(max_coefficient_bound, env)?;
+                let bound = self.nonnegative_integer_expression(
+                    max_coefficient_bound,
+                    env,
+                    "Gaussian coefficient cutoff",
+                )?;
                 Ok(vec![Info {
                     value: AbstractValue::Matrix(state::gaussian_sample(&t, &bound)?),
                     ty: Some(t),
@@ -2499,9 +2514,10 @@ impl<'a> Evaluator<'a> {
                                 )?
                                 .to_usize()
                                 .ok_or_else(|| bad("invalid digit count"))?,
-                            preimage_max_coefficient_bound: self.integer_expression_magnitude(
+                            preimage_max_coefficient_bound: self.nonnegative_integer_expression(
                                 preimage_max_coefficient_bound,
                                 env,
+                                "trapdoor preimage bound",
                             )?,
                         }),
                         ty: None,
@@ -2553,7 +2569,11 @@ impl<'a> Evaluator<'a> {
                 Ok(vec![Info {
                     value: AbstractValue::Matrix(state::preimage_sample(
                         &t,
-                        &self.integer_expression_magnitude(max_coefficient_bound, env)?,
+                        &self.nonnegative_integer_expression(
+                            max_coefficient_bound,
+                            env,
+                            "preimage coefficient cutoff",
+                        )?,
                     )?),
                     ty: Some(t),
                     relation: Some(RightPreimage {
@@ -2650,7 +2670,11 @@ impl<'a> Evaluator<'a> {
                         shape,
                         AbstractValue::Matrix(state::preimage_sample(
                             &t,
-                            &self.integer_expression_magnitude(max_coefficient_bound, env)?,
+                            &self.nonnegative_integer_expression(
+                                max_coefficient_bound,
+                                env,
+                                "family preimage coefficient cutoff",
+                            )?,
                         )?),
                     )?),
                     ty: Some(t),
@@ -2701,216 +2725,6 @@ impl<'a> Evaluator<'a> {
                         view: None,
                         selector: None,
                     }),
-                    view: crate::FamilyViewId(u32::MAX),
-                    paired_public: None,
-                }])
-            }
-            NodeKind::PreimageBinary(operation) => {
-                let left_relation_view = xs[0]
-                    .relation
-                    .as_ref()
-                    .and_then(|relation| relation.view)
-                    .ok_or_else(|| bad("preimage algebra left relation is unavailable"))?;
-                let left_relation = self
-                    .preimages
-                    .get(&left_relation_view)
-                    .cloned()
-                    .ok_or_else(|| bad("preimage algebra left relation is not registered"))?;
-                let left = matrix(&xs[0])?;
-                let right = matrix(&xs[1])?;
-                let output_type = output_type(scope, n, env)?;
-                let (value, target, target_parents) = match operation {
-                    mxx_ir_core::node::PreimageBinaryOp::Add => {
-                        let right_relation_view = xs[1]
-                            .relation
-                            .as_ref()
-                            .and_then(|relation| relation.view)
-                            .ok_or_else(|| bad("preimage sum right relation is unavailable"))?;
-                        let right_relation =
-                            self.preimages.get(&right_relation_view).cloned().ok_or_else(|| {
-                                bad("preimage sum right relation is not registered")
-                            })?;
-                        if left_relation.source != right_relation.source {
-                            return Err(bad("preimage sum requires a common source"));
-                        }
-                        let left_target = self
-                            .states
-                            .get(&left_relation.target)
-                            .cloned()
-                            .ok_or_else(|| bad("preimage sum left target is unavailable"))?;
-                        let right_target = self
-                            .states
-                            .get(&right_relation.target)
-                            .cloned()
-                            .ok_or_else(|| bad("preimage sum right target is unavailable"))?;
-                        (
-                            left.add(&right, &output_type.modulus)?,
-                            left_target.add(&right_target, &output_type.modulus)?,
-                            vec![left_relation.target, right_relation.target],
-                        )
-                    }
-                    mxx_ir_core::node::PreimageBinaryOp::RightMultiplyExact => {
-                        if !right.error_bound.is_zero() {
-                            return Err(bad("preimage right multiplier must be exact"));
-                        }
-                        let left_type = mt(&xs[0])?;
-                        let geometry = ProductGeometry {
-                            inner_dimension: left_type.columns,
-                            ring_dimension: output_type.ring_dimension,
-                        };
-                        let left_target = self
-                            .states
-                            .get(&left_relation.target)
-                            .cloned()
-                            .ok_or_else(|| bad("preimage product target is unavailable"))?;
-                        (
-                            left.ordinary_product(&right, geometry, &output_type.modulus)?,
-                            left_target.ordinary_product(&right, geometry, &output_type.modulus)?,
-                            vec![left_relation.target, xs[1].view],
-                        )
-                    }
-                    mxx_ir_core::node::PreimageBinaryOp::ComposeExactDecomposition => {
-                        let right_relation_view =
-                            xs[1].relation.as_ref().and_then(|relation| relation.view).ok_or_else(
-                                || bad("composed decomposition relation is unavailable"),
-                            )?;
-                        let right_relation = self
-                            .preimages
-                            .get(&right_relation_view)
-                            .cloned()
-                            .ok_or_else(|| bad("composed decomposition is not registered"))?;
-                        let right_target = self
-                            .states
-                            .get(&right_relation.target)
-                            .ok_or_else(|| bad("composed decomposition target is unavailable"))?;
-                        if !right_target.error_bound.is_zero() {
-                            return Err(bad("composed decomposition target must be exact"));
-                        }
-                        let left_type = mt(&xs[0])?;
-                        let geometry = ProductGeometry {
-                            inner_dimension: left_type.columns,
-                            ring_dimension: output_type.ring_dimension,
-                        };
-                        let left_target = self
-                            .states
-                            .get(&left_relation.target)
-                            .cloned()
-                            .ok_or_else(|| bad("preimage composition target is unavailable"))?;
-                        (
-                            left.ordinary_product(&right, geometry, &output_type.modulus)?,
-                            left_target.ordinary_product(&right, geometry, &output_type.modulus)?,
-                            vec![left_relation.target, xs[1].view],
-                        )
-                    }
-                };
-                let target_view =
-                    self.interners.intern_composed_view(target_parents, Vec::new(), &[]);
-                self.states.insert(target_view, target);
-                Ok(vec![Info {
-                    value: AbstractValue::Matrix(value),
-                    ty: Some(output_type),
-                    relation: Some(RightPreimage {
-                        source: left_relation.source,
-                        target: target_view,
-                        view: None,
-                        selector: None,
-                    }),
-                    view: crate::FamilyViewId(u32::MAX),
-                    paired_public: None,
-                }])
-            }
-            NodeKind::PreimageConcatColumns => {
-                if xs.is_empty() {
-                    return Err(bad("preimage concat requires at least one input"));
-                }
-                let output_type = output_type(scope, n, env)?;
-                let mut value = state::zero_matrix(&output_type)?;
-                let mut target = state::zero_matrix(&output_type)?;
-                let mut source = None;
-                let mut target_views = Vec::with_capacity(xs.len());
-                for input in xs {
-                    let relation_view = input
-                        .relation
-                        .as_ref()
-                        .and_then(|relation| relation.view)
-                        .ok_or_else(|| bad("preimage concat relation is unavailable"))?;
-                    let relation = self
-                        .preimages
-                        .get(&relation_view)
-                        .ok_or_else(|| bad("preimage concat relation is not registered"))?;
-                    if source.is_some_and(|current| current != relation.source) {
-                        return Err(bad("preimage concat requires a common source"));
-                    }
-                    source = Some(relation.source);
-                    let part = matrix(input)?;
-                    value.error_bound = value.error_bound.max(part.error_bound);
-                    value.coefficient_magnitude_bound =
-                        value.coefficient_magnitude_bound.max(part.coefficient_magnitude_bound);
-                    value.is_constant_polynomial &= part.is_constant_polynomial;
-                    let target_part = self
-                        .states
-                        .get(&relation.target)
-                        .ok_or_else(|| bad("preimage concat target is unavailable"))?;
-                    target.error_bound = target.error_bound.max(target_part.error_bound.clone());
-                    target.coefficient_magnitude_bound = target
-                        .coefficient_magnitude_bound
-                        .max(target_part.coefficient_magnitude_bound.clone());
-                    target.is_constant_polynomial &= target_part.is_constant_polynomial;
-                    target_views.push(relation.target);
-                }
-                let target_view =
-                    self.interners.intern_composed_view(target_views, Vec::new(), &[]);
-                self.states.insert(target_view, target);
-                Ok(vec![Info {
-                    value: AbstractValue::Matrix(value),
-                    ty: Some(output_type),
-                    relation: Some(RightPreimage {
-                        source: source.expect("nonempty preimage concat"),
-                        target: target_view,
-                        view: None,
-                        selector: None,
-                    }),
-                    view: crate::FamilyViewId(u32::MAX),
-                    paired_public: None,
-                }])
-            }
-            NodeKind::MaterializePreimageExact | NodeKind::DecompositionEntry { .. } => {
-                let relation_view =
-                    xs[0].relation.as_ref().and_then(|relation| relation.view).ok_or_else(
-                        || SimulationError::Relation {
-                            message: "exact preimage projection has no registered relation".into(),
-                            site: site(),
-                        },
-                    )?;
-                let relation = self.preimages.get(&relation_view).ok_or_else(|| {
-                    SimulationError::Relation {
-                        message: "exact preimage projection relation is unavailable".into(),
-                        site: site(),
-                    }
-                })?;
-                let target =
-                    self.states.get(&relation.target).ok_or_else(|| SimulationError::Relation {
-                        message: "exact preimage projection target state is unavailable".into(),
-                        site: site(),
-                    })?;
-                if !target.error_bound.is_zero() {
-                    return Err(SimulationError::Relation {
-                        message: "preimage can be projected only when its relation target is exact"
-                            .into(),
-                        site: site(),
-                    });
-                }
-                let mut value = matrix(&xs[0])?;
-                value.right_carrier = None;
-                let ty = match kind {
-                    NodeKind::MaterializePreimageExact => mt(&xs[0])?,
-                    NodeKind::DecompositionEntry { .. } => output_type(scope, n, env)?,
-                    _ => unreachable!(),
-                };
-                Ok(vec![Info {
-                    value: AbstractValue::Matrix(value),
-                    ty: Some(ty),
-                    relation: None,
                     view: crate::FamilyViewId(u32::MAX),
                     paired_public: None,
                 }])
@@ -3144,7 +2958,7 @@ impl<'a> Evaluator<'a> {
                         matches!(
                             ty,
                             WireType::Family { element, .. }
-                                if matches!(element.as_ref(), WireType::Preimage(_))
+                                if matches!(element.as_ref(), WireType::Preimage { .. })
                         )
                     });
                 let relation = packs_preimages
@@ -4264,7 +4078,7 @@ fn empty_info_for_type(ty: &WireType, env: &ParamEnv) -> Result<Info, Simulation
     let invalid =
         |message: &str| SimulationError::InvalidGraph { message: message.into(), site: None };
     let (value, matrix_type) = match ty {
-        WireType::Matrix(_) | WireType::Preimage(_) => {
+        WireType::Matrix(_) | WireType::SmallMatrix { .. } | WireType::Preimage { .. } => {
             let matrix = concrete_matrix(ty, env).ok_or_else(|| invalid("invalid matrix type"))?;
             (AbstractValue::Matrix(state::zero_matrix(&matrix)?), Some(matrix))
         }
@@ -4301,9 +4115,15 @@ fn empty_info_for_type(ty: &WireType, env: &ParamEnv) -> Result<Info, Simulation
                         .evaluate(env)
                         .map_err(|error| invalid(&error.to_string()))?,
                     digit_count,
-                    preimage_max_coefficient_bound: preimage_max_coefficient_bound
-                        .evaluate(env)
-                        .map_err(|error| invalid(&error.to_string()))?,
+                    preimage_max_coefficient_bound: {
+                        let value = preimage_max_coefficient_bound
+                            .evaluate(env)
+                            .map_err(|error| invalid(&error.to_string()))?;
+                        if value.is_negative() {
+                            return Err(invalid("trapdoor preimage bound must be nonnegative"));
+                        }
+                        value
+                    },
                 }),
                 None,
             )
@@ -4838,8 +4658,12 @@ fn eval_index_interval(
 fn wire_types_compatible(expected: &WireType, actual: &WireType, env: &ParamEnv) -> bool {
     match (expected, actual) {
         (
-            WireType::Matrix(a) | WireType::Preimage(a),
-            WireType::Matrix(b) | WireType::Preimage(b),
+            WireType::Matrix(a) |
+            WireType::SmallMatrix { matrix: a, .. } |
+            WireType::Preimage { matrix: a, .. },
+            WireType::Matrix(b) |
+            WireType::SmallMatrix { matrix: b, .. } |
+            WireType::Preimage { matrix: b, .. },
         ) => {
             concrete_matrix(&WireType::Matrix(a.clone()), env) ==
                 concrete_matrix(&WireType::Matrix(b.clone()), env)
@@ -5415,7 +5239,9 @@ fn family_shape(ty: &WireType, env: &ParamEnv) -> Option<Vec<usize>> {
 
 fn concrete_matrix(ty: &WireType, env: &ParamEnv) -> Option<ConcreteMatrixType> {
     let m = match ty {
-        WireType::Matrix(m) | WireType::Preimage(m) => m,
+        WireType::Matrix(m) |
+        WireType::SmallMatrix { matrix: m, .. } |
+        WireType::Preimage { matrix: m, .. } => m,
         WireType::Family { element, .. } => return concrete_matrix(element, env),
         _ => return None,
     };
@@ -5450,9 +5276,15 @@ fn value_fact(ty: &WireType, f: &ExternalInputValue, env: &ParamEnv) -> Result<I
                         .map_err(|e| e.to_string())?
                         .to_usize()
                         .ok_or("invalid trapdoor digit count")?,
-                    preimage_max_coefficient_bound: preimage_max_coefficient_bound
-                        .evaluate(env)
-                        .map_err(|e| e.to_string())?,
+                    preimage_max_coefficient_bound: {
+                        let value = preimage_max_coefficient_bound
+                            .evaluate(env)
+                            .map_err(|e| e.to_string())?;
+                        if value.is_negative() {
+                            return Err("trapdoor preimage bound must be nonnegative".into());
+                        }
+                        value
+                    },
                 }),
                 ty: None,
                 relation: None,
@@ -5461,7 +5293,7 @@ fn value_fact(ty: &WireType, f: &ExternalInputValue, env: &ParamEnv) -> Result<I
             })
         }
         (
-            WireType::Matrix(_) | WireType::Preimage(_),
+            WireType::Matrix(_) | WireType::SmallMatrix { .. } | WireType::Preimage { .. },
             ExternalInputValue::Matrix {
                 maximum_absolute_coefficient_error,
                 maximum_absolute_coefficient_value,
@@ -5974,10 +5806,13 @@ mod tests {
         let hash = NodeHandle::new(
             NodeKind::HashSample {
                 matrix_type: matrix.clone(),
+                variant: mxx_ir_core::node::HashVariant::Plain,
                 tag_prefix: vec![1],
                 tag_expressions: vec![],
                 tag_decimal_expressions: vec![],
                 tag_u64_le_expressions: vec![],
+                base: None,
+                digit_count: None,
             },
             vec![key],
             vec![WireType::Matrix(matrix.clone())],
@@ -6460,7 +6295,7 @@ mod tests {
     }
 
     #[test]
-    fn rectangular_apply_preimage_chain_uses_actual_intermediate_columns() {
+    fn rectangular_preimage_chain_uses_actual_intermediate_columns() {
         let matrix_type = |rows, columns| MatrixType {
             modulus: mxx_ir_core::IntExpr::constant(1009),
             ring_dimension: mxx_ir_core::IntExpr::constant(1),
@@ -6518,12 +6353,12 @@ mod tests {
                 max_coefficient_bound: mxx_ir_core::IntExpr::constant(5),
             },
             vec![public.clone(), trapdoor, target],
-            vec![WireType::Preimage(preimage_type)],
+            vec![WireType::Preimage { matrix: preimage_type, max_coefficient_bound: 5.into() }],
         )
         .output(0)
         .unwrap();
         let applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
+            NodeKind::MatrixMulSmallRhs,
             vec![public, preimage],
             vec![WireType::Matrix(target_type)],
         )
@@ -7912,958 +7747,6 @@ mod tests {
     }
 
     #[test]
-    fn scalar_preimage_graph_uses_paired_public_and_strict_consumer() {
-        let public_type = mxx_ir_core::types::MatrixType {
-            modulus: mxx_ir_core::IntExpr::constant(17),
-            ring_dimension: mxx_ir_core::IntExpr::constant(8),
-            rows: mxx_ir_core::IntExpr::constant(1),
-            columns: mxx_ir_core::IntExpr::constant(2),
-        };
-        let output_type = mxx_ir_core::types::MatrixType {
-            rows: mxx_ir_core::IntExpr::constant(2),
-            columns: mxx_ir_core::IntExpr::constant(1),
-            ..public_type.clone()
-        };
-        let target_type = mxx_ir_core::types::MatrixType {
-            rows: mxx_ir_core::IntExpr::constant(1),
-            columns: mxx_ir_core::IntExpr::constant(1),
-            ..public_type.clone()
-        };
-        let public = NodeHandle::new(
-            NodeKind::Input {
-                name: "public".into(),
-                wire_type: WireType::Matrix(public_type.clone()),
-                artifact: None,
-            },
-            vec![],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let trapdoor_wire = WireType::Trapdoor {
-            matrix: public_type.clone(),
-            sigma: mxx_ir_core::RealExpr::from_integer(1),
-            gadget_base: mxx_ir_core::IntExpr::constant(2),
-            digit_count: mxx_ir_core::IntExpr::constant(1),
-            preimage_max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-        };
-        let trapdoor = NodeHandle::new(
-            NodeKind::Input {
-                name: "trapdoor".into(),
-                wire_type: trapdoor_wire.clone(),
-                artifact: None,
-            },
-            vec![],
-            vec![trapdoor_wire.clone()],
-        )
-        .output(0)
-        .unwrap();
-        let target = NodeHandle::new(
-            NodeKind::ConstantMatrix {
-                matrix_type: target_type.clone(),
-                value: ConstantMatrix::Zero,
-            },
-            vec![],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let carrier_target = NodeHandle::new(
-            NodeKind::Input {
-                name: "carrier-target".into(),
-                wire_type: WireType::Matrix(target_type.clone()),
-                artifact: None,
-            },
-            vec![],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let family_target = NodeHandle::new(
-            NodeKind::FamilyPack { shape: vec![mxx_ir_core::IntExpr::constant(2)] },
-            vec![target.clone(), target.clone()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(target_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let family_preimage = NodeHandle::new(
-            NodeKind::FamilyPreimageSample {
-                matrix_type: output_type.clone(),
-                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-            },
-            vec![public.clone(), trapdoor.clone(), family_target],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let family_selected = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 0 },
-            vec![
-                family_preimage.clone(),
-                NodeHandle::new(
-                    NodeKind::ConstantInt(0.into()),
-                    vec![],
-                    vec![WireType::ConstantInt],
-                )
-                .output(0)
-                .unwrap(),
-            ],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let family_static_selected = NodeHandle::new(
-            NodeKind::FamilyGetStatic { indices: vec![mxx_ir_core::IndexExpr::constant(1)] },
-            vec![family_preimage.clone()],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let family_static_applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![public.clone(), family_static_selected],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let scalar_selector = || {
-            NodeHandle::new(NodeKind::ConstantInt(0.into()), vec![], vec![WireType::ConstantInt])
-                .output(0)
-                .unwrap()
-        };
-        let branch_selector_family = NodeHandle::new(
-            NodeKind::FamilyPack { shape: vec![mxx_ir_core::IntExpr::constant(2)] },
-            vec![scalar_selector(), scalar_selector()],
-            vec![WireType::Family {
-                element: Box::new(WireType::ConstantInt),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let gathered_preimages = NodeHandle::new(
-            NodeKind::FamilyGather {
-                output_shape: vec![mxx_ir_core::IntExpr::constant(2)],
-                input_rank: 1,
-            },
-            vec![family_preimage.clone(), branch_selector_family],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let gathered_preimage = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 0 },
-            vec![gathered_preimages, scalar_selector()],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let gathered_applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![public.clone(), gathered_preimage],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let group_shape = vec![mxx_ir_core::IntExpr::constant(2)];
-        let grouped_public = NodeHandle::new(
-            NodeKind::FamilyPack { shape: group_shape.clone() },
-            vec![public.clone(), public.clone()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(public_type.clone())),
-                shape: group_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let grouped_trapdoor = NodeHandle::new(
-            NodeKind::FamilyPack { shape: group_shape.clone() },
-            vec![trapdoor.clone(), trapdoor.clone()],
-            vec![WireType::Family {
-                element: Box::new(trapdoor_wire.clone()),
-                shape: group_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let relation_shape =
-            vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)];
-        let grouped_target = NodeHandle::new(
-            NodeKind::FamilyPack { shape: relation_shape.clone() },
-            vec![target.clone(), target.clone(), target.clone(), target.clone()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(target_type.clone())),
-                shape: relation_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let grouped_preimage = NodeHandle::new(
-            NodeKind::FamilyPreimageSample {
-                matrix_type: output_type.clone(),
-                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-            },
-            vec![grouped_public.clone(), grouped_trapdoor, grouped_target],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: relation_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let selector_body = with_new_construction_scope(|scope| {
-            let group = NodeHandle::new(
-                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(0)),
-                vec![],
-                vec![WireType::ConstantInt],
-            )
-            .output(0)
-            .unwrap();
-            let branch = NodeHandle::new(
-                NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(1)),
-                vec![],
-                vec![WireType::ConstantInt],
-            )
-            .output(0)
-            .unwrap();
-            SubgraphHandle::new("gather-selector-body", scope, vec![], vec![group, branch]).unwrap()
-        });
-        let selector_families = NodeHandle::parallel_grid(
-            selector_body,
-            vec![],
-            vec![
-                WireType::Family {
-                    element: Box::new(WireType::ConstantInt),
-                    shape: relation_shape.clone(),
-                },
-                WireType::Family {
-                    element: Box::new(WireType::ConstantInt),
-                    shape: relation_shape.clone(),
-                },
-            ],
-            mxx_ir_core::node::ParallelGrid {
-                shape: relation_shape.clone(),
-                index_slots: vec![0, 1],
-                bindings: vec![],
-                input_modes: vec![],
-            },
-        );
-        let varying_gather = NodeHandle::new(
-            NodeKind::FamilyGather { output_shape: relation_shape.clone(), input_rank: 2 },
-            vec![
-                grouped_preimage,
-                selector_families.output(0).unwrap(),
-                selector_families.output(1).unwrap(),
-            ],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: relation_shape,
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let varying_gather_group = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 1 },
-            vec![varying_gather, scalar_selector()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: group_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let grouped_public_element = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 0 },
-            vec![grouped_public, scalar_selector()],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let varying_gather_element = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 0 },
-            vec![varying_gather_group, scalar_selector()],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let varying_gather_applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![grouped_public_element, varying_gather_element],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let preimage = NodeHandle::new(
-            NodeKind::PreimageSample {
-                matrix_type: output_type.clone(),
-                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-            },
-            vec![public.clone(), trapdoor.clone(), target.clone()],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_second_target = NodeHandle::new(
-            NodeKind::ConstantMatrix {
-                matrix_type: target_type.clone(),
-                value: ConstantMatrix::Zero,
-            },
-            vec![],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_second_preimage = NodeHandle::new(
-            NodeKind::PreimageSample {
-                matrix_type: output_type.clone(),
-                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-            },
-            vec![public.clone(), trapdoor.clone(), packed_second_target],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_shape = vec![mxx_ir_core::IntExpr::constant(2)];
-        let packed_public = NodeHandle::new(
-            NodeKind::FamilyPack { shape: packed_shape.clone() },
-            vec![public.clone(), public.clone()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(public_type.clone())),
-                shape: packed_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let packed_preimages = NodeHandle::new(
-            NodeKind::FamilyPack { shape: packed_shape.clone() },
-            vec![preimage.clone(), packed_second_preimage.clone()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: packed_shape,
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let rank_two_packed_preimages = NodeHandle::new(
-            NodeKind::FamilyPack {
-                shape: vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)],
-            },
-            vec![
-                preimage.clone(),
-                packed_second_preimage.clone(),
-                preimage.clone(),
-                packed_second_preimage,
-            ],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let branch_dependent_reindex = NodeHandle::new(
-            NodeKind::FamilyReindex {
-                output_shape: vec![
-                    mxx_ir_core::IntExpr::constant(2),
-                    mxx_ir_core::IntExpr::constant(2),
-                ],
-                map: mxx_ir_core::IndexMap::new([
-                    mxx_ir_core::IndexExpr::Axis(1),
-                    mxx_ir_core::IndexExpr::Axis(1),
-                ]),
-            },
-            vec![rank_two_packed_preimages],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let packed_static_public = NodeHandle::new(
-            NodeKind::FamilyGetStatic { indices: vec![mxx_ir_core::IndexExpr::constant(1)] },
-            vec![packed_public.clone()],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_static_preimage = NodeHandle::new(
-            NodeKind::FamilyGetStatic { indices: vec![mxx_ir_core::IndexExpr::constant(1)] },
-            vec![packed_preimages.clone()],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_static_applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![packed_static_public, packed_static_preimage],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_selector =
-            NodeHandle::new(NodeKind::ConstantInt(0.into()), vec![], vec![WireType::ConstantInt])
-                .output(0)
-                .unwrap();
-        let packed_dynamic_public = NodeHandle::new(
-            NodeKind::FamilyGetDynamic { rank: 1 },
-            vec![packed_public, packed_selector.clone()],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_dynamic_preimage = NodeHandle::new(
-            NodeKind::FamilyGetDynamic { rank: 1 },
-            vec![packed_preimages, packed_selector],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let packed_dynamic_applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![packed_dynamic_public, packed_dynamic_preimage],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let unrelated_preimage = NodeHandle::new(
-            NodeKind::Input {
-                name: "unrelated-preimage".into(),
-                wire_type: WireType::Preimage(output_type.clone()),
-                artifact: None,
-            },
-            vec![],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let incompatible_packed_preimages = NodeHandle::new(
-            NodeKind::FamilyPack { shape: vec![mxx_ir_core::IntExpr::constant(2)] },
-            vec![preimage.clone(), unrelated_preimage],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let second_public = NodeHandle::new(
-            NodeKind::Input {
-                name: "second-public".into(),
-                wire_type: WireType::Matrix(public_type.clone()),
-                artifact: None,
-            },
-            vec![],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let second_trapdoor = NodeHandle::new(
-            NodeKind::Input {
-                name: "second-trapdoor".into(),
-                wire_type: trapdoor_wire.clone(),
-                artifact: None,
-            },
-            vec![],
-            vec![trapdoor_wire.clone()],
-        )
-        .output(0)
-        .unwrap();
-        let second_source_preimage = NodeHandle::new(
-            NodeKind::PreimageSample {
-                matrix_type: output_type.clone(),
-                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-            },
-            vec![second_public, second_trapdoor, target.clone()],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let distinct_group_packed_preimages = NodeHandle::new(
-            NodeKind::FamilyPack {
-                shape: vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)],
-            },
-            vec![
-                preimage.clone(),
-                preimage.clone(),
-                second_source_preimage.clone(),
-                second_source_preimage.clone(),
-            ],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let mixed_source_packed_preimages = NodeHandle::new(
-            NodeKind::FamilyPack { shape: vec![mxx_ir_core::IntExpr::constant(2)] },
-            vec![preimage.clone(), second_source_preimage],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let carrier_target_preimage = NodeHandle::new(
-            NodeKind::PreimageSample {
-                matrix_type: output_type.clone(),
-                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-            },
-            vec![public.clone(), trapdoor, carrier_target],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let pointwise_body = with_new_construction_scope(|scope| {
-            let body_public = NodeHandle::new(
-                NodeKind::Input {
-                    name: "body-public".into(),
-                    wire_type: WireType::Matrix(public_type.clone()),
-                    artifact: None,
-                },
-                vec![],
-                vec![WireType::Matrix(public_type.clone())],
-            )
-            .output(0)
-            .unwrap();
-            let body_preimage = NodeHandle::new(
-                NodeKind::Input {
-                    name: "body-preimage".into(),
-                    wire_type: WireType::Preimage(output_type.clone()),
-                    artifact: None,
-                },
-                vec![],
-                vec![WireType::Preimage(output_type.clone())],
-            )
-            .output(0)
-            .unwrap();
-            SubgraphHandle::new(
-                "pointwise-preimage-body",
-                scope,
-                vec![body_public.clone(), body_preimage.clone()],
-                vec![body_public, body_preimage],
-            )
-            .unwrap()
-        });
-        let pointwise_shape =
-            vec![mxx_ir_core::IntExpr::constant(2), mxx_ir_core::IntExpr::constant(2)];
-        let pointwise = NodeHandle::parallel_grid(
-            pointwise_body,
-            vec![public.clone(), carrier_target_preimage],
-            vec![
-                WireType::Family {
-                    element: Box::new(WireType::Matrix(public_type.clone())),
-                    shape: pointwise_shape.clone(),
-                },
-                WireType::Family {
-                    element: Box::new(WireType::Preimage(output_type.clone())),
-                    shape: pointwise_shape.clone(),
-                },
-            ],
-            mxx_ir_core::node::ParallelGrid {
-                shape: pointwise_shape.clone(),
-                index_slots: vec![0, 1],
-                bindings: vec![],
-                input_modes: vec![
-                    mxx_ir_core::node::GridInputMode::Broadcast,
-                    mxx_ir_core::node::GridInputMode::Broadcast,
-                ],
-            },
-        );
-        let identity_map = mxx_ir_core::IndexMap::new([
-            mxx_ir_core::IndexExpr::Axis(0),
-            mxx_ir_core::IndexExpr::Axis(1),
-        ]);
-        let pointwise_public = NodeHandle::new(
-            NodeKind::FamilyReindex {
-                output_shape: pointwise_shape.clone(),
-                map: identity_map.clone(),
-            },
-            vec![pointwise.output(0).unwrap()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(public_type.clone())),
-                shape: pointwise_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let pointwise_preimage = NodeHandle::new(
-            NodeKind::FamilyReindex { output_shape: pointwise_shape.clone(), map: identity_map },
-            vec![pointwise.output(1).unwrap()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: pointwise_shape,
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let pointwise_selector = scalar_selector();
-        let selected_pointwise_public = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 1 },
-            vec![pointwise_public.clone(), pointwise_selector.clone()],
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(public_type.clone())),
-                shape: group_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let selected_pointwise_preimage = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 1 },
-            vec![pointwise_preimage.clone(), pointwise_selector],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(output_type.clone())),
-                shape: group_shape.clone(),
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let pointwise_group_selector = scalar_selector();
-        let selected_pointwise_public = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 0 },
-            vec![selected_pointwise_public, pointwise_group_selector.clone()],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let selected_pointwise_preimage = NodeHandle::new(
-            NodeKind::FamilySelectAxis { axis: 0 },
-            vec![selected_pointwise_preimage, pointwise_group_selector],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let pointwise_selected_applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![selected_pointwise_public, selected_pointwise_preimage],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let static_index =
-            vec![mxx_ir_core::IndexExpr::constant(0), mxx_ir_core::IndexExpr::constant(0)];
-        let pointwise_public = NodeHandle::new(
-            NodeKind::FamilyGetStatic { indices: static_index.clone() },
-            vec![pointwise_public],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let pointwise_preimage = NodeHandle::new(
-            NodeKind::FamilyGetStatic { indices: static_index },
-            vec![pointwise_preimage],
-            vec![WireType::Preimage(output_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let pointwise_applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![pointwise_public, pointwise_preimage],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let unrelated = NodeHandle::new(
-            NodeKind::ConstantMatrix {
-                matrix_type: public_type.clone(),
-                value: ConstantMatrix::Zero,
-            },
-            vec![],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let fallback = NodeHandle::new(
-            NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-            vec![unrelated, preimage.clone()],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
-            vec![public, preimage],
-            vec![WireType::Matrix(target_type)],
-        )
-        .output(0)
-        .unwrap();
-        let graph = Graph::freeze(
-            "scalar-preimage",
-            vec![],
-            BTreeMap::from([
-                ("out".into(), GraphOutput { value: applied, confidentiality: None }),
-                ("fallback".into(), GraphOutput { value: fallback, confidentiality: None }),
-                ("family".into(), GraphOutput { value: family_selected, confidentiality: None }),
-                (
-                    "family-static".into(),
-                    GraphOutput { value: family_static_applied, confidentiality: None },
-                ),
-                (
-                    "pointwise-reindex".into(),
-                    GraphOutput { value: pointwise_applied, confidentiality: None },
-                ),
-                (
-                    "pointwise-select".into(),
-                    GraphOutput { value: pointwise_selected_applied, confidentiality: None },
-                ),
-                (
-                    "shared-gather".into(),
-                    GraphOutput { value: gathered_applied, confidentiality: None },
-                ),
-                (
-                    "varying-shared-gather".into(),
-                    GraphOutput { value: varying_gather_applied, confidentiality: None },
-                ),
-                (
-                    "packed-static".into(),
-                    GraphOutput { value: packed_static_applied, confidentiality: None },
-                ),
-                (
-                    "packed-dynamic".into(),
-                    GraphOutput { value: packed_dynamic_applied, confidentiality: None },
-                ),
-                (
-                    "packed-incompatible".into(),
-                    GraphOutput { value: incompatible_packed_preimages, confidentiality: None },
-                ),
-                (
-                    "packed-shared-classification".into(),
-                    GraphOutput { value: branch_dependent_reindex, confidentiality: None },
-                ),
-                (
-                    "packed-mixed-source".into(),
-                    GraphOutput { value: mixed_source_packed_preimages, confidentiality: None },
-                ),
-                (
-                    "packed-distinct-groups".into(),
-                    GraphOutput { value: distinct_group_packed_preimages, confidentiality: None },
-                ),
-            ]),
-            vec![],
-            vec![],
-            BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
-        let environment = ParamEnv::default();
-        let stage_id = crate::StageId("preimage".into());
-        let request = SimulationRequest {
-            program: crate::SimulationProgram {
-                stages: vec![crate::SimulationStage {
-                    id: stage_id.clone(),
-                    production_id: ProductionId {
-                        spec_hash: spec_hash(&graph, &environment).unwrap(),
-                        execution_nonce: [0; 32],
-                    },
-                    graph,
-                }],
-            },
-            environment,
-            roots: vec![
-                crate::SimulationRoot { stage: stage_id.clone(), output: "out".into() },
-                crate::SimulationRoot { stage: stage_id.clone(), output: "fallback".into() },
-                crate::SimulationRoot { stage: stage_id.clone(), output: "family".into() },
-                crate::SimulationRoot { stage: stage_id.clone(), output: "family-static".into() },
-                crate::SimulationRoot {
-                    stage: stage_id.clone(),
-                    output: "pointwise-reindex".into(),
-                },
-                crate::SimulationRoot { stage: stage_id.clone(), output: "shared-gather".into() },
-            ],
-            external_inputs: vec![
-                crate::ExternalInputFact {
-                    stage: stage_id.clone(),
-                    input: "public".into(),
-                    value: crate::ExternalInputValue::Matrix {
-                        maximum_absolute_coefficient_error: BigUint::ZERO,
-                        maximum_absolute_coefficient_value: None,
-                        is_constant_polynomial: false,
-                    },
-                },
-                crate::ExternalInputFact {
-                    stage: stage_id.clone(),
-                    input: "trapdoor".into(),
-                    value: crate::ExternalInputValue::Trapdoor {
-                        public_matrix_input: "public".into(),
-                    },
-                },
-                crate::ExternalInputFact {
-                    stage: stage_id.clone(),
-                    input: "second-public".into(),
-                    value: crate::ExternalInputValue::Matrix {
-                        maximum_absolute_coefficient_error: BigUint::ZERO,
-                        maximum_absolute_coefficient_value: None,
-                        is_constant_polynomial: false,
-                    },
-                },
-                crate::ExternalInputFact {
-                    stage: stage_id.clone(),
-                    input: "second-trapdoor".into(),
-                    value: crate::ExternalInputValue::Trapdoor {
-                        public_matrix_input: "second-public".into(),
-                    },
-                },
-                crate::ExternalInputFact {
-                    stage: stage_id.clone(),
-                    input: "carrier-target".into(),
-                    value: crate::ExternalInputValue::Matrix {
-                        maximum_absolute_coefficient_error: BigUint::ZERO,
-                        maximum_absolute_coefficient_value: None,
-                        is_constant_polynomial: false,
-                    },
-                },
-                crate::ExternalInputFact {
-                    stage: stage_id.clone(),
-                    input: "unrelated-preimage".into(),
-                    value: crate::ExternalInputValue::Matrix {
-                        maximum_absolute_coefficient_error: BigUint::ZERO,
-                        maximum_absolute_coefficient_value: None,
-                        is_constant_polynomial: false,
-                    },
-                },
-            ],
-            limits: crate::SimulationLimits::default(),
-        };
-        for output in [
-            "family",
-            "family-static",
-            "pointwise-reindex",
-            "pointwise-select",
-            "shared-gather",
-            "varying-shared-gather",
-            "packed-static",
-            "packed-dynamic",
-            "packed-distinct-groups",
-        ] {
-            let mut focused = request.clone();
-            focused.roots =
-                vec![crate::SimulationRoot { stage: stage_id.clone(), output: output.into() }];
-            let result = run(&focused);
-            assert!(result.is_ok(), "{output} failed relation projection: {result:?}");
-        }
-        let mut incompatible = request.clone();
-        incompatible.roots = vec![crate::SimulationRoot {
-            stage: stage_id.clone(),
-            output: "packed-incompatible".into(),
-        }];
-        let error =
-            run(&incompatible).expect_err("a relationless packed preimage must fail closed");
-        assert!(error.to_string().contains("every packed preimage must carry a relation"));
-        let mut shared = request.clone();
-        shared.roots = vec![crate::SimulationRoot {
-            stage: stage_id.clone(),
-            output: "packed-shared-classification".into(),
-        }];
-        let error = run(&shared).expect_err("packed relation must remain shared-source");
-        assert!(error.to_string().contains("shared-source relation depends on its branch axis"));
-        let mut mixed = request.clone();
-        mixed.roots = vec![crate::SimulationRoot {
-            stage: stage_id.clone(),
-            output: "packed-mixed-source".into(),
-        }];
-        let error = run(&mixed).expect_err("mixed sources inside one branch family must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("packed preimage branches within one group must share one source")
-        );
-        assert!(run(&request).is_ok());
-    }
-
-    #[test]
-    fn exact_decomposition_target_can_be_materialized() {
-        let target_type = MatrixType {
-            modulus: mxx_ir_core::IntExpr::constant(17),
-            ring_dimension: mxx_ir_core::IntExpr::constant(1),
-            rows: mxx_ir_core::IntExpr::constant(1),
-            columns: mxx_ir_core::IntExpr::constant(1),
-        };
-        let decomposition_type =
-            MatrixType { rows: mxx_ir_core::IntExpr::constant(2), ..target_type.clone() };
-        let target = NodeHandle::new(
-            NodeKind::Input {
-                name: "target".into(),
-                wire_type: WireType::Matrix(target_type.clone()),
-                artifact: None,
-            },
-            vec![],
-            vec![WireType::Matrix(target_type)],
-        )
-        .output(0)
-        .unwrap();
-        let decomposition = NodeHandle::new(
-            NodeKind::GadgetDecompose {
-                base: mxx_ir_core::IntExpr::constant(4),
-                small: false,
-                digit_count: mxx_ir_core::IntExpr::constant(2),
-            },
-            vec![target],
-            vec![WireType::Preimage(decomposition_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let materialized = NodeHandle::new(
-            NodeKind::MaterializePreimageExact,
-            vec![decomposition],
-            vec![WireType::Matrix(decomposition_type)],
-        )
-        .output(0)
-        .unwrap();
-        let graph = Graph::freeze(
-            "exact-decomposition-materialization",
-            vec![],
-            BTreeMap::from([(
-                "out".into(),
-                GraphOutput { value: materialized, confidentiality: None },
-            )]),
-            vec![],
-            vec![],
-            BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
-        let environment = ParamEnv::default();
-        let stage = crate::StageId("exact-decomposition-materialization".into());
-        let request = SimulationRequest {
-            program: crate::SimulationProgram {
-                stages: vec![crate::SimulationStage {
-                    id: stage.clone(),
-                    production_id: ProductionId {
-                        spec_hash: spec_hash(&graph, &environment).unwrap(),
-                        execution_nonce: [0; 32],
-                    },
-                    graph,
-                }],
-            },
-            environment,
-            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
-            external_inputs: vec![crate::ExternalInputFact {
-                stage,
-                input: "target".into(),
-                value: crate::ExternalInputValue::Matrix {
-                    maximum_absolute_coefficient_error: BigUint::ZERO,
-                    maximum_absolute_coefficient_value: Some(7u8.into()),
-                    is_constant_polynomial: false,
-                },
-            }],
-            limits: crate::SimulationLimits::default(),
-        };
-        let result = run(&request).unwrap();
-        assert_eq!(result.roots[0].maximum_absolute_coefficient_error, BigUint::ZERO);
-    }
-
-    #[test]
     fn explicit_gadget_and_decomposition_share_one_canonical_source() {
         let target_type = MatrixType {
             modulus: mxx_ir_core::IntExpr::constant(17),
@@ -8892,7 +7775,10 @@ mod tests {
                 digit_count: mxx_ir_core::IntExpr::constant(2),
             },
             vec![target],
-            vec![WireType::Preimage(decomposition_type)],
+            vec![WireType::Preimage {
+                matrix: decomposition_type,
+                max_coefficient_bound: 2.into(),
+            }],
         )
         .output(0)
         .unwrap();
@@ -8917,7 +7803,7 @@ mod tests {
         .output(0)
         .unwrap();
         let product = NodeHandle::new(
-            NodeKind::ApplyPreimage,
+            NodeKind::MatrixMulSmallRhs,
             vec![automorphed_gadget, decomposition],
             vec![WireType::Matrix(target_type)],
         )
@@ -8954,147 +7840,6 @@ mod tests {
         assert_eq!(
             run(&request).unwrap().roots[0].maximum_absolute_coefficient_error,
             BigUint::ZERO
-        );
-    }
-
-    #[test]
-    fn noisy_sampled_preimage_target_cannot_be_materialized() {
-        let public_type = MatrixType {
-            modulus: mxx_ir_core::IntExpr::constant(17),
-            ring_dimension: mxx_ir_core::IntExpr::constant(1),
-            rows: mxx_ir_core::IntExpr::constant(1),
-            columns: mxx_ir_core::IntExpr::constant(2),
-        };
-        let preimage_type = MatrixType {
-            rows: mxx_ir_core::IntExpr::constant(2),
-            columns: mxx_ir_core::IntExpr::constant(1),
-            ..public_type.clone()
-        };
-        let target_type = MatrixType {
-            rows: mxx_ir_core::IntExpr::constant(1),
-            columns: mxx_ir_core::IntExpr::constant(1),
-            ..public_type.clone()
-        };
-        let public = NodeHandle::new(
-            NodeKind::Input {
-                name: "public".into(),
-                wire_type: WireType::Matrix(public_type.clone()),
-                artifact: None,
-            },
-            vec![],
-            vec![WireType::Matrix(public_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let trapdoor_type = WireType::Trapdoor {
-            matrix: public_type.clone(),
-            sigma: mxx_ir_core::RealExpr::from_integer(1),
-            gadget_base: mxx_ir_core::IntExpr::constant(2),
-            digit_count: mxx_ir_core::IntExpr::constant(1),
-            preimage_max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-        };
-        let trapdoor = NodeHandle::new(
-            NodeKind::Input {
-                name: "trapdoor".into(),
-                wire_type: trapdoor_type.clone(),
-                artifact: None,
-            },
-            vec![],
-            vec![trapdoor_type],
-        )
-        .output(0)
-        .unwrap();
-        let target = NodeHandle::new(
-            NodeKind::Input {
-                name: "target".into(),
-                wire_type: WireType::Matrix(target_type.clone()),
-                artifact: None,
-            },
-            vec![],
-            vec![WireType::Matrix(target_type)],
-        )
-        .output(0)
-        .unwrap();
-        let preimage = NodeHandle::new(
-            NodeKind::PreimageSample {
-                matrix_type: preimage_type.clone(),
-                max_coefficient_bound: mxx_ir_core::IntExpr::constant(4),
-            },
-            vec![public, trapdoor, target],
-            vec![WireType::Preimage(preimage_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let materialized = NodeHandle::new(
-            NodeKind::MaterializePreimageExact,
-            vec![preimage],
-            vec![WireType::Matrix(preimage_type)],
-        )
-        .output(0)
-        .unwrap();
-        let graph = Graph::freeze(
-            "noisy-preimage-materialization",
-            vec![],
-            BTreeMap::from([(
-                "out".into(),
-                GraphOutput { value: materialized, confidentiality: None },
-            )]),
-            vec![],
-            vec![],
-            BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
-        let environment = ParamEnv::default();
-        let stage = crate::StageId("noisy-preimage-materialization".into());
-        let request = SimulationRequest {
-            program: crate::SimulationProgram {
-                stages: vec![crate::SimulationStage {
-                    id: stage.clone(),
-                    production_id: ProductionId {
-                        spec_hash: spec_hash(&graph, &environment).unwrap(),
-                        execution_nonce: [0; 32],
-                    },
-                    graph,
-                }],
-            },
-            environment,
-            roots: vec![crate::SimulationRoot { stage: stage.clone(), output: "out".into() }],
-            external_inputs: vec![
-                crate::ExternalInputFact {
-                    stage: stage.clone(),
-                    input: "public".into(),
-                    value: crate::ExternalInputValue::Matrix {
-                        maximum_absolute_coefficient_error: BigUint::ZERO,
-                        maximum_absolute_coefficient_value: None,
-                        is_constant_polynomial: false,
-                    },
-                },
-                crate::ExternalInputFact {
-                    stage: stage.clone(),
-                    input: "trapdoor".into(),
-                    value: crate::ExternalInputValue::Trapdoor {
-                        public_matrix_input: "public".into(),
-                    },
-                },
-                crate::ExternalInputFact {
-                    stage,
-                    input: "target".into(),
-                    value: crate::ExternalInputValue::Matrix {
-                        maximum_absolute_coefficient_error: 3u8.into(),
-                        maximum_absolute_coefficient_value: Some(7u8.into()),
-                        is_constant_polynomial: false,
-                    },
-                },
-            ],
-            limits: crate::SimulationLimits::default(),
-        };
-        let error = run(&request).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("preimage can be projected only when its relation target is exact"),
-            "unexpected error: {error}"
         );
     }
 
@@ -9304,16 +8049,19 @@ mod tests {
                 max_coefficient_bound: mxx_ir_core::IntExpr::constant(8),
             },
             vec![pointwise_public_element, pointwise_trapdoor_element, target],
-            vec![WireType::Preimage(MatrixType {
-                rows: mxx_ir_core::IntExpr::constant(3),
-                columns: mxx_ir_core::IntExpr::constant(1),
-                ..public_type.clone()
-            })],
+            vec![WireType::Preimage {
+                matrix: MatrixType {
+                    rows: mxx_ir_core::IntExpr::constant(3),
+                    columns: mxx_ir_core::IntExpr::constant(1),
+                    ..public_type.clone()
+                },
+                max_coefficient_bound: 8.into(),
+            }],
         )
         .output(0)
         .unwrap();
         let applied = NodeHandle::new(
-            NodeKind::ApplyPreimage,
+            NodeKind::MatrixMulSmallRhs,
             vec![public_element, preimage],
             vec![WireType::Matrix(target_type)],
         )
@@ -9330,180 +8078,6 @@ mod tests {
         .unwrap();
         let environment = ParamEnv::default();
         let stage = crate::StageId("trapdoor-family-pair".into());
-        let request = SimulationRequest {
-            program: crate::SimulationProgram {
-                stages: vec![crate::SimulationStage {
-                    id: stage.clone(),
-                    production_id: ProductionId {
-                        spec_hash: spec_hash(&graph, &environment).unwrap(),
-                        execution_nonce: [0; 32],
-                    },
-                    graph,
-                }],
-            },
-            environment,
-            roots: vec![crate::SimulationRoot { stage, output: "out".into() }],
-            external_inputs: vec![],
-            limits: crate::SimulationLimits::default(),
-        };
-        assert!(run(&request).is_ok());
-    }
-
-    #[test]
-    fn parallel_grid_zip_public_and_trapdoor_families_preserve_pairing() {
-        let public_type = MatrixType {
-            modulus: mxx_ir_core::IntExpr::constant(97),
-            ring_dimension: mxx_ir_core::IntExpr::constant(1),
-            rows: mxx_ir_core::IntExpr::constant(1),
-            columns: mxx_ir_core::IntExpr::constant(3),
-        };
-        let target_type = MatrixType {
-            rows: mxx_ir_core::IntExpr::constant(1),
-            columns: mxx_ir_core::IntExpr::constant(1),
-            ..public_type.clone()
-        };
-        let preimage_type = MatrixType {
-            rows: mxx_ir_core::IntExpr::constant(3),
-            columns: mxx_ir_core::IntExpr::constant(1),
-            ..public_type.clone()
-        };
-        let trapdoor_type = WireType::Trapdoor {
-            matrix: public_type.clone(),
-            sigma: mxx_ir_core::RealExpr::from_integer(1),
-            gadget_base: mxx_ir_core::IntExpr::constant(2),
-            digit_count: mxx_ir_core::IntExpr::constant(1),
-            preimage_max_coefficient_bound: mxx_ir_core::IntExpr::constant(8),
-        };
-        let sampled = NodeHandle::new(
-            NodeKind::TrapdoorSample {
-                matrix_type: public_type.clone(),
-                sigma: mxx_ir_core::RealExpr::from_integer(1),
-                gadget_base: mxx_ir_core::IntExpr::constant(2),
-                digit_count: mxx_ir_core::IntExpr::constant(1),
-                preimage_max_coefficient_bound: mxx_ir_core::IntExpr::constant(8),
-            },
-            vec![],
-            vec![WireType::Matrix(public_type.clone()), trapdoor_type.clone()],
-        );
-        let public = sampled.output(0).unwrap();
-        let trapdoor = sampled.output(1).unwrap();
-        let public_family = NodeHandle::new(
-            NodeKind::FamilyPack { shape: vec![mxx_ir_core::IntExpr::constant(2)] },
-            vec![public.clone(), public],
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(public_type.clone())),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let trapdoor_family = NodeHandle::new(
-            NodeKind::FamilyPack { shape: vec![mxx_ir_core::IntExpr::constant(2)] },
-            vec![trapdoor.clone(), trapdoor],
-            vec![WireType::Family {
-                element: Box::new(trapdoor_type.clone()),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-        )
-        .output(0)
-        .unwrap();
-        let target = NodeHandle::new(
-            NodeKind::ConstantMatrix {
-                matrix_type: target_type.clone(),
-                value: ConstantMatrix::Zero,
-            },
-            vec![],
-            vec![WireType::Matrix(target_type.clone())],
-        )
-        .output(0)
-        .unwrap();
-        let body = with_new_construction_scope(|scope| {
-            let body_public = NodeHandle::new(
-                NodeKind::Input {
-                    name: "body-public".into(),
-                    wire_type: WireType::Matrix(public_type.clone()),
-                    artifact: None,
-                },
-                vec![],
-                vec![WireType::Matrix(public_type.clone())],
-            )
-            .output(0)
-            .unwrap();
-            let body_trapdoor = NodeHandle::new(
-                NodeKind::Input {
-                    name: "body-trapdoor".into(),
-                    wire_type: trapdoor_type.clone(),
-                    artifact: None,
-                },
-                vec![],
-                vec![trapdoor_type.clone()],
-            )
-            .output(0)
-            .unwrap();
-            let body_target = NodeHandle::new(
-                NodeKind::Input {
-                    name: "body-target".into(),
-                    wire_type: WireType::Matrix(target_type.clone()),
-                    artifact: None,
-                },
-                vec![],
-                vec![WireType::Matrix(target_type.clone())],
-            )
-            .output(0)
-            .unwrap();
-            let preimage = NodeHandle::new(
-                NodeKind::PreimageSample {
-                    matrix_type: preimage_type.clone(),
-                    max_coefficient_bound: mxx_ir_core::IntExpr::constant(8),
-                },
-                vec![body_public.clone(), body_trapdoor.clone(), body_target.clone()],
-                vec![WireType::Preimage(preimage_type.clone())],
-            )
-            .output(0)
-            .unwrap();
-            SubgraphHandle::new(
-                "parallel-zip-preimage-body",
-                scope,
-                vec![body_public, body_trapdoor, body_target],
-                vec![preimage],
-            )
-            .unwrap()
-        });
-        let output = NodeHandle::parallel_grid(
-            body,
-            vec![public_family, trapdoor_family, target],
-            vec![WireType::Family {
-                element: Box::new(WireType::Preimage(preimage_type)),
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-            }],
-            mxx_ir_core::node::ParallelGrid {
-                shape: vec![mxx_ir_core::IntExpr::constant(2)],
-                index_slots: vec![0],
-                bindings: vec![],
-                input_modes: vec![
-                    mxx_ir_core::node::GridInputMode::Reindex {
-                        map: mxx_ir_core::IndexMap::new(vec![mxx_ir_core::IndexExpr::Axis(0)]),
-                    },
-                    mxx_ir_core::node::GridInputMode::Reindex {
-                        map: mxx_ir_core::IndexMap::new(vec![mxx_ir_core::IndexExpr::Axis(0)]),
-                    },
-                    mxx_ir_core::node::GridInputMode::Broadcast,
-                ],
-            },
-        )
-        .output(0)
-        .unwrap();
-        let (graph, _) = Graph::freeze(
-            "parallel-zip-preimage",
-            vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: output, confidentiality: None })]),
-            vec![],
-            vec![],
-            BTreeMap::new(),
-        )
-        .unwrap();
-        let environment = ParamEnv::default();
-        let stage = crate::StageId("parallel-zip-preimage".into());
         let request = SimulationRequest {
             program: crate::SimulationProgram {
                 stages: vec![crate::SimulationStage {
@@ -9941,7 +8515,10 @@ mod tests {
             },
             vec![public_a, trapdoor_b, target_family],
             vec![WireType::Family {
-                element: Box::new(WireType::Preimage(matrix.clone())),
+                element: Box::new(WireType::Preimage {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: 4.into(),
+                }),
                 shape: vec![mxx_ir_core::IntExpr::constant(2)],
             }],
         )

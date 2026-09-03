@@ -1,7 +1,8 @@
-use crate::{matrix::PolyMatrix, poly::Poly};
+use crate::{
+    matrix::{PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError},
+    poly::Poly,
+};
 use num_bigint::BigUint;
-#[cfg(feature = "gpu")]
-use std::time::Instant;
 
 pub mod bounds;
 #[cfg(feature = "gpu")]
@@ -52,6 +53,21 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
         ncol: usize,
         dist: DistType,
     ) -> Self::M;
+
+    /// Samples the matrix that will immediately be gadget-decomposed.
+    /// Backends may keep the result in coefficient form to avoid a redundant
+    /// transform; the default preserves ordinary hash-sampling semantics.
+    fn sample_hash_gadget_source<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+    ) -> Self::M {
+        self.sample_hash(params, key, tag, nrow, ncol, dist)
+    }
 
     /// Samples the conceptual matrix returned by `sample_hash(..., total_ncol, ...)`, then returns
     /// only the requested column window `[col_start, col_start + col_len)`.
@@ -154,7 +170,7 @@ pub trait PolyUniformSampler {
 }
 
 pub trait PolyTrapdoorSampler {
-    type M: PolyMatrix;
+    type M: PolyMatrix + PolyMatrixSmallRhs;
     type Trapdoor: Send + Sync;
 
     fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self;
@@ -177,74 +193,10 @@ pub trait PolyTrapdoorSampler {
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         trapdoor: &Self::Trapdoor,
         public_matrix: &Self::M,
-        target: &Self::M,
-    ) -> Self::M;
-
-    #[cfg(feature = "gpu")]
-    fn preimage_batched_sharded<'a>(
-        &self,
-        requests: Vec<crate::sampler::trapdoor::GpuPreimageRequest<'a, Self::M, Self::Trapdoor>>,
-    ) -> Vec<(usize, Self::M)>
-    where
-        Self::Trapdoor: Send + Sync + 'a,
-        Self::M: 'a,
-    {
-        let batch_start = Instant::now();
-        let request_count = requests.len();
-        tracing::debug!(request_count, "preimage: start bounded batch dispatch");
-        let mut total_rounds = 0usize;
-        let outputs = requests
-            .into_iter()
-            .map(|request| {
-                let mut round = 0usize;
-                let out = loop {
-                    let round_start = Instant::now();
-                    let pending_before = 1usize;
-                    let candidate = self.preimage(
-                        request.params,
-                        request.trapdoor,
-                        request.public_matrix,
-                        &request.target,
-                    );
-                    if bounds::matrix_within_coefficient_bound(
-                        &candidate,
-                        &request.max_coefficient_bound,
-                    ) {
-                        tracing::debug!(
-                            round,
-                            pending_before,
-                            accepted = 1usize,
-                            rejected = 0usize,
-                            pending_after = 0usize,
-                            elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
-                            "preimage: rejection round"
-                        );
-                        break candidate;
-                    } else {
-                        tracing::debug!(
-                            round,
-                            pending_before,
-                            accepted = 0usize,
-                            rejected = 1usize,
-                            pending_after = 1usize,
-                            elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
-                            "preimage: rejection round"
-                        );
-                    }
-                    round += 1;
-                };
-                total_rounds += round + 1;
-                (request.entry_idx, out)
-            })
-            .collect();
-        tracing::debug!(
-            request_count,
-            rounds = total_rounds,
-            elapsed_ms = batch_start.elapsed().as_secs_f64() * 1_000.0,
-            "preimage: finished bounded batch dispatch"
-        );
-        outputs
-    }
+        target: &dyn PolyMatrixColumnSource<Self::M>,
+        max_coefficient_bound: BigUint,
+        randomness_seed: [u8; 32],
+    ) -> Result<<Self::M as PolyMatrixSmallRhs>::SmallMatrix, SmallMatrixError>;
 
     // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.
     // [B,C]D = U.

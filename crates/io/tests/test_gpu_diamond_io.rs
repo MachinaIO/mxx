@@ -58,6 +58,7 @@ fn test_gpu_diamond_io_parameter_search_and_round_trip() {
         digit_count: 9,
         trapdoor_sigma: RealExpr::from_f64_exact(4.578).unwrap(),
         error_sigma: RealExpr::from_integer(1),
+        preimage_max_coefficient_bound: 1_000_000.into(),
         bgg_tag: b"diamond-io-gpu-integration".to_vec(),
         seed_bits: 5,
         prf_mask_output_coeff_bits: 1,

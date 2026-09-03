@@ -46,6 +46,20 @@ impl PolyUniformSampler for GpuDCRTPolyUniformSampler {
 }
 
 impl GpuDCRTPolyUniformSampler {
+    /// Samples one matrix using an explicit stable seed.  The caller owns
+    /// domain separation; this method does not incorporate tile or batch
+    /// ordinals.
+    pub fn sample_uniform_with_seed(
+        &self,
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+        seed: GpuRngSeed,
+    ) -> GpuDCRTPolyMatrix {
+        sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed)
+    }
+
     /// Samples a homogeneous batch using one explicit RNG seed per output.
     /// Seeds are not mixed with the batch ordinal.
     pub fn sample_uniform_batch(
@@ -88,6 +102,19 @@ where
         sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed)
     }
 
+    fn sample_hash_gadget_source<B: AsRef<[u8]>>(
+        &self,
+        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
+        key: [u8; 32],
+        tag: B,
+        nrow: usize,
+        ncol: usize,
+        dist: DistType,
+    ) -> Self::M {
+        let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
+        sample_gpu_matrix_with_seed_coeff(params, nrow, ncol, dist, seed)
+    }
+
     fn sample_hash_columns<B: AsRef<[u8]>>(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
@@ -115,7 +142,7 @@ where
         dist: DistType,
     ) -> Self::M {
         let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
-        sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed).decompose()
+        sample_gpu_matrix_with_seed_coeff(params, nrow, ncol, dist, seed).decompose()
     }
 
     fn sample_hash_small_decomposed<B: AsRef<[u8]>>(
@@ -128,7 +155,7 @@ where
         dist: DistType,
     ) -> Self::M {
         let seed = hash_seed_for_matrix::<H>(key, tag.as_ref());
-        sample_gpu_matrix_with_seed(params, nrow, ncol, dist, seed).small_decompose()
+        sample_gpu_matrix_with_seed_coeff(params, nrow, ncol, dist, seed).small_decompose()
     }
 }
 
@@ -213,48 +240,68 @@ fn sample_gpu_matrix_with_seed(
     dist: DistType,
     seed: GpuRngSeed,
 ) -> GpuDCRTPolyMatrix {
+    sample_gpu_matrix_with_seed_format(params, nrow, ncol, dist, seed, true)
+}
+
+fn sample_gpu_matrix_with_seed_coeff(
+    params: &GpuDCRTPolyParams,
+    nrow: usize,
+    ncol: usize,
+    dist: DistType,
+    seed: GpuRngSeed,
+) -> GpuDCRTPolyMatrix {
+    sample_gpu_matrix_with_seed_format(params, nrow, ncol, dist, seed, false)
+}
+
+fn sample_gpu_matrix_with_seed_format(
+    params: &GpuDCRTPolyParams,
+    nrow: usize,
+    ncol: usize,
+    dist: DistType,
+    seed: GpuRngSeed,
+    is_ntt: bool,
+) -> GpuDCRTPolyMatrix {
     if nrow == 0 || ncol == 0 {
-        return GpuDCRTPolyMatrix::zero(params, nrow, ncol);
-    }
-    match dist {
-        DistType::FinRingDist => GpuDCRTPolyMatrix::sample_distribution(
+        return GpuDCRTPolyMatrix::new_empty_with_state(
             params,
             nrow,
             ncol,
-            GpuMatrixSampleDist::Uniform,
-            0.0,
-            u64::MAX,
-            seed,
-        ),
-        DistType::GaussDist { sigma, max_coefficient_bound } => {
+            params.crt_depth().saturating_sub(1),
+            is_ntt,
+        );
+    }
+    let sample = |dist, sigma, max_coefficient_bound| {
+        if is_ntt {
             GpuDCRTPolyMatrix::sample_distribution(
                 params,
                 nrow,
                 ncol,
-                GpuMatrixSampleDist::Gauss,
+                dist,
                 sigma,
-                gpu_coefficient_cutoff(max_coefficient_bound.as_ref()),
+                max_coefficient_bound,
+                seed,
+            )
+        } else {
+            GpuDCRTPolyMatrix::sample_distribution_coeff(
+                params,
+                nrow,
+                ncol,
+                dist,
+                sigma,
+                max_coefficient_bound,
                 seed,
             )
         }
-        DistType::BitDist => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Bit,
-            0.0,
-            u64::MAX,
-            seed,
+    };
+    match dist {
+        DistType::FinRingDist => sample(GpuMatrixSampleDist::Uniform, 0.0, u64::MAX),
+        DistType::GaussDist { sigma, max_coefficient_bound } => sample(
+            GpuMatrixSampleDist::Gauss,
+            sigma,
+            gpu_coefficient_cutoff(max_coefficient_bound.as_ref()),
         ),
-        DistType::TernaryDist => GpuDCRTPolyMatrix::sample_distribution(
-            params,
-            nrow,
-            ncol,
-            GpuMatrixSampleDist::Ternary,
-            0.0,
-            u64::MAX,
-            seed,
-        ),
+        DistType::BitDist => sample(GpuMatrixSampleDist::Bit, 0.0, u64::MAX),
+        DistType::TernaryDist => sample(GpuMatrixSampleDist::Ternary, 0.0, u64::MAX),
     }
 }
 
@@ -551,6 +598,10 @@ mod tests {
         let sampled_decomposed =
             sampler.sample_hash_decomposed(&params, key, tag, 3, 4, DistType::FinRingDist);
         let sampled_legacy = sampler.sample_hash(&params, key, tag, 3, 4, DistType::FinRingDist);
+        let sampled_gadget_source =
+            sampler.sample_hash_gadget_source(&params, key, tag, 3, 4, DistType::FinRingDist);
+        assert!(!sampled_gadget_source.is_ntt());
+        assert_eq!(sampled_gadget_source.ensure_eval_domain(), sampled_legacy);
         let sampled_legacy_decomposed = sampled_legacy.decompose();
         assert_eq!(sampled_decomposed, sampled_legacy_decomposed);
     }

@@ -388,6 +388,7 @@ impl Aky24CascadeCompiler {
                         2 * (self.config.digit_count + 2),
                         self.layout.dimensions[input_index].ciphertext_bits,
                     ),
+                    self.config.preimage_max_coefficient_bound.clone(),
                     ArtifactConfidentiality::Public,
                 ),
                 output_count: self.layout.dimensions[input_index].ciphertext_bits,
@@ -409,6 +410,7 @@ impl Aky24CascadeCompiler {
                 production,
                 Aky24ArtifactNames::FINAL_KEY_PREIMAGE,
                 (2 * (self.config.digit_count + 2), self.config.function.output_bits),
+                self.config.preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
             ),
             output_count: self.config.function.output_bits,
@@ -614,6 +616,7 @@ mod tests {
         artifact::{SpecHash, export_validated_manifest},
         node::NodeKind,
     };
+    use num_bigint::BigInt;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn config() -> Aky24IoConfig {
@@ -629,6 +632,7 @@ mod tests {
             b_error_sigma: RealExpr::from_integer(1),
             fhe_error_sigma: RealExpr::from_integer(1),
             attribute_error_sigma: RealExpr::from_integer(1),
+            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             security_parameter_bits: 8,
             cascade_randomness_bits: 8,
             gaussian_sample_bits: 8,

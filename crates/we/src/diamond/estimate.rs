@@ -101,7 +101,7 @@ mod tests {
 
         fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
             match wire_type {
-                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage { matrix, .. } => {
                     (matrix.rows * matrix.columns * matrix.ring_dimension * 8) as u64
                 }
                 _ => 8,

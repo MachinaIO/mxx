@@ -21,9 +21,53 @@ pub mod dcrt_poly;
 #[cfg(feature = "gpu")]
 pub mod gpu_dcrt_poly;
 pub mod i64;
+pub mod small;
+
+pub use small::{CpuSmallMatrix, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix};
 
 pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {
     fn entry_size(&self) -> usize;
+}
+
+/// A logical full matrix whose columns are materialized on demand.
+///
+/// Implementations may be backed by host staging bytes or persistent storage;
+/// callers must not assume that the complete expanded matrix is resident.
+pub trait PolyMatrixColumnSource<M>: Debug + Send + Sync
+where
+    M: PolyMatrix,
+{
+    fn row_size(&self) -> usize;
+    fn col_size(&self) -> usize;
+    fn load_columns(&self, start: usize, end: usize) -> M;
+}
+
+/// Owns a resident matrix while presenting it as a logical column source.
+/// Sampling can therefore retain the full logical shape and load only the
+/// requested columns, without exposing an expanded preimage-returning API.
+#[derive(Clone, Debug)]
+pub struct ResidentPolyMatrixColumnSource<M: PolyMatrix> {
+    value: M,
+}
+
+impl<M: PolyMatrix> ResidentPolyMatrixColumnSource<M> {
+    pub fn new(value: M) -> Self {
+        Self { value }
+    }
+}
+
+impl<M: PolyMatrix> PolyMatrixColumnSource<M> for ResidentPolyMatrixColumnSource<M> {
+    fn row_size(&self) -> usize {
+        self.value.row_size()
+    }
+
+    fn col_size(&self) -> usize {
+        self.value.col_size()
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> M {
+        self.value.slice_columns(start, end)
+    }
 }
 
 pub trait MatrixElem:
@@ -255,6 +299,19 @@ pub trait PolyMatrix:
     }
     fn to_cpu_staging_bytes(&self) -> Vec<u8> {
         self.clone().into_cpu_staging_bytes()
+    }
+    /// Reconstructs only a row-complete column interval from CPU staging
+    /// bytes. The default is correct for all matrix formats; GPU matrices
+    /// override it to avoid decoding an expanded full target per tile.
+    fn from_cpu_staging_columns(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Self {
+        let full = Self::from_cpu_staging_bytes(params, bytes);
+        assert!(start <= end && end <= full.col_size(), "invalid staging column interval");
+        full.slice_columns(start, end)
     }
     fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
         Self::from_compact_bytes(params, bytes)
@@ -523,12 +580,6 @@ pub trait PolyMatrix:
     /// Performs the operation S * (identity ⊗ G^-1(other)),
     /// where G^-1(other) is bit decomposition of other matrix
     fn mul_tensor_identity_decompose(&self, other: &Self, identity_size: usize) -> Self;
-    /// Performs the operation S * G^-1(other),
-    /// where G^-1(other) is digit decomposition of other matrix
-    fn mul_decompose(&self, other: &Self) -> Self;
-    /// Performs the operation S * G_small^-1(other),
-    /// where G_small^-1(other) is compact digit decomposition of other matrix
-    fn mul_decompose_small(&self, other: &Self) -> Self;
     /// j is column and return decomposed matrix of target column
     fn get_column_matrix_decompose(&self, j: usize) -> Self;
     /// Stack columns into a single column vector (column-wise vectorization).

@@ -55,3 +55,10 @@ pub fn matrix_output<'a>(
     };
     value.as_ref()
 }
+
+pub fn small_matrix_output(result: &ExecutionResult<CpuDcrtBackend>, name: &str) -> DCRTPolyMatrix {
+    let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
+        panic!("{name} must be a compact small-matrix output")
+    };
+    value.decode_full().expect("valid compact small-matrix output")
+}

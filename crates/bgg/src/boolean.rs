@@ -400,7 +400,7 @@ fn encoding_multiply(
         {
             let base = compiler.public_key.base.clone();
             let digits = compiler.public_key.digit_count.clone();
-            move |_, (key, rhs)| Ok(key.mul_decomposed(rhs.decompose(base.clone(), digits.clone())))
+            move |_, (key, rhs)| Ok(key.mul_small_rhs(rhs.decompose(base.clone(), digits.clone())))
         },
     )?;
     let first = mxx_dsl::parallel_zip_bundle_result(
@@ -409,7 +409,7 @@ fn encoding_multiply(
             let base = compiler.public_key.base.clone();
             let digits = compiler.public_key.digit_count.clone();
             move |_, (vector, rhs)| {
-                Ok(vector.mul_decomposed(rhs.decompose(base.clone(), digits.clone())))
+                Ok(vector.mul_small_rhs(rhs.decompose(base.clone(), digits.clone())))
             }
         },
     )?;
@@ -555,7 +555,7 @@ mod tests {
                 .scopes()
                 .values()
                 .flat_map(|scope| scope.nodes())
-                .any(|node| matches!(node.kind(), NodeKind::ApplyPreimage)),
+                .any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)),
             "dynamic BGG multiplication must consume the decomposition relation"
         );
     }

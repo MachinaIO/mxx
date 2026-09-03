@@ -1146,6 +1146,7 @@ mod tests {
             high_matrix_type: matrix_type(&parameters, digit_count + 2, digit_count),
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
             digit_count: IntExpr::constant(digit_count),
+            preimage_max_coefficient_bound: 1_000_000.into(),
         };
         let invocation = LweLookupInvocation::bind(
             lookup.clone(),

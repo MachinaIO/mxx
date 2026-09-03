@@ -1023,7 +1023,7 @@ impl RefreshPreprocessingProducer {
             )?;
             let target = combined.pubkey.matrix - scale * w.a_prime.clone();
             if !same_matrix_type(
-                w.public_b.clone().apply_preimage(k.clone()).matrix_type(),
+                w.public_b.clone().mul_small_rhs(k.clone()).matrix_type(),
                 target.matrix_type(),
             ) {
                 return Err(RefreshSetupError::InvalidManifest);
@@ -1562,7 +1562,7 @@ impl ImportedRefreshSetup {
         };
         for x in &n.preimages {
             // Keep K typed as a preimage across the artifact boundary. The
-            // consumer therefore applies the witness through `apply_preimage`
+            // consumer therefore applies the bounded witness through `mul_small_rhs`
             // instead of materializing it as an untyped matrix.
             let matrix = resolve_graph_output_preimage(
                 &attestation.graph,
@@ -1575,6 +1575,7 @@ impl ImportedRefreshSetup {
                 production_id.clone(),
                 x.to_owned(),
                 (matrix.rows.clone(), matrix.columns.clone()),
+                decoder_preimage_bound.clone(),
                 ArtifactConfidentiality::Private,
             ));
         }
@@ -1875,6 +1876,10 @@ fn validate_manifest(
     n: &RefreshPreprocessingArtifactNames,
     p: &RefreshSetupParameters,
 ) -> Result<(), RefreshSetupError> {
+    let decoder_preimage_bound = p
+        .resolve_decoder_preimage_bound()?
+        .evaluate(&ParamEnv::default())
+        .map_err(|_| RefreshSetupError::InvalidManifest)?;
     let ring_dimension = p
         .layout
         .ring_dimension
@@ -1921,12 +1926,15 @@ fn validate_manifest(
         check_type(
             name,
             ArtifactConfidentiality::Private,
-            ArtifactType::Preimage(ConcreteMatrixType {
-                modulus: modulus.clone(),
-                ring_dimension,
-                rows,
-                columns,
-            }),
+            ArtifactType::Preimage {
+                matrix: ConcreteMatrixType {
+                    modulus: modulus.clone(),
+                    ring_dimension,
+                    rows,
+                    columns,
+                },
+                max_coefficient_bound: decoder_preimage_bound.clone(),
+            },
         )
     };
     let slots = p.refresh.crt_plaintext_moduli.len();
@@ -2619,7 +2627,7 @@ impl RefreshParameterSimulationRequest {
             setup.decoder_sigma.clone(),
             setup.layout.gadget_base.clone(),
             setup.layout.digit_count,
-            decoder_preimage_bound,
+            decoder_preimage_bound.clone(),
         );
         let benchmark_public_b = benchmark_trapdoor.public_matrix();
         let benchmark_decoder_base = shared_decoder_base(
@@ -2691,6 +2699,7 @@ impl RefreshParameterSimulationRequest {
                 ring.preimage_input(
                     format!("benchmark-decoder-preimage-{slot}"),
                     (b_columns, setup.layout.public_key_columns()),
+                    decoder_preimage_bound.clone(),
                 )
             })
             .collect();
@@ -2937,7 +2946,7 @@ fn resolve_graph_output_preimage(
         .node(output.value.node)
         .and_then(|node| node.output_types().get(output.value.port.0 as usize))
         .ok_or(RefreshSetupError::InvalidManifest)?;
-    let WireType::Preimage(matrix) = output_type else {
+    let WireType::Preimage { matrix, .. } = output_type else {
         return Err(RefreshSetupError::InvalidManifest);
     };
     if !same_matrix_type(matrix, expected_matrix) {

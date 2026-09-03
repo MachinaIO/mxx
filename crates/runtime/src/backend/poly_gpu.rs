@@ -3,11 +3,53 @@ use super::{
     poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError},
 };
 use mxx_ir_core::node::HashVariant;
-use mxx_primitives::sampler::DistType;
+use mxx_primitives::{matrix::PolyMatrixSmallRhs, sampler::DistType};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use rand::Rng;
 use rayon::prelude::*;
+use std::{collections::BTreeMap, marker::PhantomData};
+
+impl<M, U, H, T> PolyBackend<M, U, H, T>
+where
+    M: mxx_primitives::matrix::PolyMatrix,
+{
+    pub(crate) fn new_with_placements(
+        placements: Vec<Vec<<M::P as mxx_primitives::poly::Poly>::Params>>,
+    ) -> Self {
+        assert!(!placements.is_empty(), "a backend needs at least one placement");
+        let mut backend = Self {
+            parameters: (0..placements.len()).map(|_| BTreeMap::new()).collect(),
+            active_placement: 0,
+            preimage_batch_calls: 0,
+            #[cfg(test)]
+            matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            hash_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
+            uniform_batch_dispatch: None,
+            hash_batch_dispatch: None,
+            #[cfg(test)]
+            preimage_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            multiply_calls: 0,
+            #[cfg(test)]
+            multiply_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            multiply_small_rhs_batch_sizes: Vec::new(),
+            #[cfg(test)]
+            fail_next_release_fence: false,
+            _marker: PhantomData,
+        };
+        for (placement, parameters) in placements.into_iter().enumerate() {
+            for parameters in parameters {
+                backend.register_at(placement, parameters);
+            }
+        }
+        backend
+    }
+}
 
 impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
     fn crt_recompose_levels(
@@ -204,19 +246,15 @@ where
 pub(super) fn sample_preimage_batch<M, U, H, T>(
     backend: &mut PolyBackend<M, U, H, T>,
     requests: Vec<PreimageRequest<M, T::Trapdoor>>,
-) -> Result<Vec<M>, PolyBackendError>
+) -> Result<Vec<M::SmallMatrix>, PolyBackendError>
 where
-    M: PolyMatrix + CrtRecomposeMatrix + 'static,
+    M: PolyMatrix + CrtRecomposeMatrix + PolyMatrixSmallRhs + 'static,
     U: PolyUniformSampler<M = M>,
     H: PolyHashSampler<[u8; 32], M = M>,
     T: PolyTrapdoorSampler<M = M>,
     T::Trapdoor: Clone + std::fmt::Debug,
 {
-    use mxx_primitives::sampler::trapdoor::GpuPreimageRequest;
-
-    let Some(first) = requests.first() else {
-        return Ok(Vec::new());
-    };
+    let Some(first) = requests.first() else { return Ok(Vec::new()) };
     if requests.iter().any(|request| {
         request.matrix_type != first.matrix_type ||
             request.sigma != first.sigma ||
@@ -236,59 +274,40 @@ where
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),
+                    request.randomness_seed,
                 )
             })
             .collect();
     }
-    let parameters = backend.parameters(&first.matrix_type)?;
-    if parameters.device_ids().is_empty() {
-        return requests
-            .into_iter()
-            .map(|request| {
-                backend.sample_preimage(
-                    &request.matrix_type,
-                    request.sigma,
-                    &request.gadget_base,
-                    request.digit_count,
-                    &request.max_coefficient_bound,
+    let parameters = backend.parameters(&first.matrix_type)?.clone();
+    let sampler = T::new(&parameters, first.sigma);
+    requests
+        .into_iter()
+        .map(|request| {
+            let bound = request
+                .max_coefficient_bound
+                .to_biguint()
+                .ok_or(PolyBackendError::InvalidInteger)?;
+            sampler
+                .preimage(
+                    &parameters,
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),
+                    bound,
+                    request.randomness_seed,
                 )
-            })
-            .collect();
-    }
-    PolyBackend::<M, U, H, T>::validate_regular_gadget_layout(
-        parameters,
-        &first.gadget_base,
-        first.digit_count,
-    )?;
-    let sampler = T::new(parameters, first.sigma);
-    let max_coefficient_bound =
-        first.max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
-    let batched = requests
-        .iter()
-        .enumerate()
-        .map(|(entry_idx, request)| GpuPreimageRequest {
-            entry_idx,
-            params: parameters,
-            trapdoor: request.trapdoor.as_ref(),
-            public_matrix: request.public.as_ref(),
-            target: request.target.as_ref(),
-            max_coefficient_bound: max_coefficient_bound.clone(),
+                .map_err(Into::into)
         })
-        .collect();
-    let mut results = sampler.preimage_batched_sharded(batched);
-    results.sort_unstable_by_key(|(entry_idx, _)| *entry_idx);
-    Ok(results.into_iter().map(|(_, matrix)| matrix).collect())
+        .collect()
 }
 
 pub(super) fn sample_preimage_batches_by_placement<M, U, H, T>(
-    backend: &PolyBackend<M, U, H, T>,
+    backend: &mut PolyBackend<M, U, H, T>,
     batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
-) -> Result<Vec<(usize, Vec<M>)>, PolyBackendError>
+) -> Result<Vec<(usize, Vec<M::SmallMatrix>)>, PolyBackendError>
 where
-    M: PolyMatrix + CrtRecomposeMatrix + 'static,
+    M: PolyMatrix + CrtRecomposeMatrix + PolyMatrixSmallRhs + 'static,
     U: PolyUniformSampler<M = M>,
     H: PolyHashSampler<[u8; 32], M = M>,
     T: PolyTrapdoorSampler<M = M>,
@@ -298,75 +317,58 @@ where
         .into_iter()
         .map(|(placement, requests)| {
             let first = requests.first().ok_or(PolyBackendError::EmptyMatrix)?;
-            Ok((placement, backend.parameters_at(placement, &first.matrix_type)?, requests))
+            Ok((placement, backend.parameters_at(placement, &first.matrix_type)?.clone(), requests))
         })
         .collect::<Result<Vec<_>, PolyBackendError>>()?;
     prepared
         .into_par_iter()
         .map(|(placement, parameters, requests)| {
-            sample_preimage_batch_with_parameters::<M, U, H, T>(parameters, requests)
+            let first = requests.first().ok_or(PolyBackendError::EmptyMatrix)?;
+            if requests.iter().any(|request| {
+                request.matrix_type != first.matrix_type ||
+                    request.sigma != first.sigma ||
+                    request.gadget_base != first.gadget_base ||
+                    request.digit_count != first.digit_count ||
+                    request.max_coefficient_bound != first.max_coefficient_bound
+            }) {
+                return Err(PolyBackendError::InvalidInteger);
+            }
+            let sampler = T::new(&parameters, first.sigma);
+            requests
+                .into_iter()
+                .map(|request| {
+                    let bound = request
+                        .max_coefficient_bound
+                        .to_biguint()
+                        .ok_or(PolyBackendError::InvalidInteger)?;
+                    sampler
+                        .preimage(
+                            &parameters,
+                            request.trapdoor.as_ref(),
+                            request.public.as_ref(),
+                            request.target.as_ref(),
+                            bound,
+                            request.randomness_seed,
+                        )
+                        .map_err(Into::into)
+                })
+                .collect::<Result<Vec<_>, PolyBackendError>>()
                 .map(|outputs| (placement, outputs))
         })
         .collect()
 }
 
-fn sample_preimage_batch_with_parameters<M, U, H, T>(
-    parameters: &<M::P as Poly>::Params,
-    requests: Vec<PreimageRequest<M, T::Trapdoor>>,
-) -> Result<Vec<M>, PolyBackendError>
-where
-    M: PolyMatrix + CrtRecomposeMatrix + 'static,
-    U: PolyUniformSampler<M = M>,
-    H: PolyHashSampler<[u8; 32], M = M>,
-    T: PolyTrapdoorSampler<M = M>,
-    T::Trapdoor: Clone + std::fmt::Debug,
-{
-    use mxx_primitives::sampler::trapdoor::GpuPreimageRequest;
-
-    let first = requests.first().ok_or(PolyBackendError::EmptyMatrix)?;
-    if requests.iter().any(|request| {
-        request.matrix_type != first.matrix_type ||
-            request.sigma != first.sigma ||
-            request.gadget_base != first.gadget_base ||
-            request.digit_count != first.digit_count ||
-            request.max_coefficient_bound != first.max_coefficient_bound
-    }) {
-        return Err(PolyBackendError::InvalidInteger);
-    }
-    PolyBackend::<M, U, H, T>::validate_regular_gadget_layout(
-        parameters,
-        &first.gadget_base,
-        first.digit_count,
-    )?;
-    let sampler = T::new(parameters, first.sigma);
-    let max_coefficient_bound =
-        first.max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
-    let batched = requests
-        .iter()
-        .enumerate()
-        .map(|(entry_idx, request)| GpuPreimageRequest {
-            entry_idx,
-            params: parameters,
-            trapdoor: request.trapdoor.as_ref(),
-            public_matrix: request.public.as_ref(),
-            target: request.target.as_ref(),
-            max_coefficient_bound: max_coefficient_bound.clone(),
-        })
-        .collect();
-    let mut results = sampler.preimage_batched_sharded(batched);
-    results.sort_unstable_by_key(|(entry_idx, _)| *entry_idx);
-    Ok(results.into_iter().map(|(_, matrix)| matrix).collect())
-}
-
 #[cfg(test)]
 mod crt_tests {
     use super::*;
-    use crate::backend::poly::crt_recompose_cpu;
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::PolyMatrix,
         poly::{
             Poly, PolyParams,
-            dcrt::{gpu::gpu_device_sync, params::DCRTPolyParams, poly::DCRTPoly},
+            dcrt::{
+                gpu::{GpuDCRTPoly, gpu_device_sync},
+                params::DCRTPolyParams,
+            },
         },
     };
     use num_bigint::{BigInt, BigUint, Sign};
@@ -393,87 +395,91 @@ mod crt_tests {
             .expect("test parameters must produce a low-word carry while adding Q/2");
         let plaintext_moduli = vec![BigInt::from(overflowing_plaintext_modulus), BigInt::from(19)];
         let reconstruction_coefficients = vec![BigInt::from(-23), BigInt::from(29)];
-        let cpu_levels = plaintext_moduli
+        let level_coefficients = plaintext_moduli
             .iter()
             .enumerate()
             .map(|(level, plaintext_modulus)| {
                 let plaintext_modulus = plaintext_modulus.to_biguint().unwrap();
-                DCRTPolyMatrix::from_poly_vec_row(
-                    &cpu_parameters,
-                    (0..5)
-                        .map(|column| {
-                            let coefficients = (0..cpu_parameters.ring_dimension() as usize)
-                                .map(|index| {
-                                    let ordinal = level + column + index;
-                                    match ordinal % 5 {
-                                        0 => BigUint::from(0u8),
-                                        1 => &q - BigUint::from(1u8),
-                                        2 => &q / BigUint::from(2u8),
-                                        3 => {
-                                            let bucket = BigUint::from((ordinal % 7) + 1);
-                                            (&q * (BigUint::from(2u8) * bucket + 1u8)) /
-                                                (BigUint::from(2u8) * &plaintext_modulus)
-                                        }
-                                        _ => {
-                                            (BigUint::from(7919usize * (ordinal + 1)) +
-                                                BigUint::from(104729usize * (column + 1))) %
-                                                &q
-                                        }
+                (0..5)
+                    .map(|column| {
+                        (0..cpu_parameters.ring_dimension() as usize)
+                            .map(|index| {
+                                let ordinal = level + column + index;
+                                match ordinal % 5 {
+                                    0 => BigUint::from(0u8),
+                                    1 => &q - BigUint::from(1u8),
+                                    2 => &q / BigUint::from(2u8),
+                                    3 => {
+                                        let bucket = BigUint::from((ordinal % 7) + 1);
+                                        (&q * (BigUint::from(2u8) * bucket + 1u8)) /
+                                            (BigUint::from(2u8) * &plaintext_modulus)
                                     }
-                                })
-                                .collect::<Vec<_>>();
-                            DCRTPoly::from_biguints(&cpu_parameters, &coefficients)
-                        })
-                        .collect(),
-                )
+                                    _ => {
+                                        (BigUint::from(7919usize * (ordinal + 1)) +
+                                            BigUint::from(104729usize * (column + 1))) %
+                                            &q
+                                    }
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let expected =
-            crt_recompose_cpu(&cpu_levels, &plaintext_moduli, &reconstruction_coefficients)
-                .unwrap();
-
         // Derive the expected value independently from the operation's
         // coefficient-wise nearest-scale rule.  In particular, this covers
         // canonical residues for negative centered errors and values close to
-        // the half-interval, rather than merely checking GPU against another
-        // implementation of the same backend dispatch.
+        // the half-interval without relying on a concurrently initialized CPU
+        // transform cache as the GPU test's reference value.
         let q_int = BigInt::from_biguint(Sign::Plus, q.clone());
-        let mut direct_expected = DCRTPolyMatrix::zero(&cpu_parameters, 1, 5);
-        for ((level, plaintext_modulus), reconstruction_coefficient) in
-            cpu_levels.iter().zip(&plaintext_moduli).zip(&reconstruction_coefficients)
-        {
-            let rounded = (0..level.col_size())
-                .map(|column| {
-                    let coefficients = level
-                        .entry(0, column)
-                        .coeffs_biguints()
-                        .into_iter()
-                        .map(|value| {
-                            let value = BigInt::from_biguint(Sign::Plus, value);
-                            (((plaintext_modulus * value + &q_int / 2u8) / &q_int) %
-                                plaintext_modulus)
-                                .to_biguint()
-                                .expect("rounded coefficient is nonnegative")
-                        })
-                        .collect::<Vec<_>>();
-                    DCRTPoly::from_biguints(&cpu_parameters, &coefficients)
+        let expected_coefficients = (0..5)
+            .map(|column| {
+                (0..cpu_parameters.ring_dimension() as usize)
+                    .map(|index| {
+                        let accumulated = level_coefficients
+                            .iter()
+                            .zip(&plaintext_moduli)
+                            .zip(&reconstruction_coefficients)
+                            .fold(BigInt::from(0), |acc, ((level, modulus), coefficient)| {
+                                let value =
+                                    BigInt::from_biguint(Sign::Plus, level[column][index].clone());
+                                let rounded = ((modulus * value + &q_int / 2u8) / &q_int) % modulus;
+                                acc + rounded * coefficient
+                            });
+                        (((accumulated % &q_int) + &q_int) % &q_int)
+                            .to_biguint()
+                            .expect("expected CRT coefficient is nonnegative")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected_rns = expected_coefficients
+            .iter()
+            .flat_map(|coefficients| {
+                gpu_parameters.moduli().iter().flat_map(|modulus| {
+                    let modulus = BigUint::from(*modulus);
+                    coefficients.iter().flat_map(move |coefficient| {
+                        let digits = (coefficient % &modulus).to_u64_digits();
+                        digits.first().copied().unwrap_or(0).to_le_bytes()
+                    })
                 })
-                .collect::<Vec<_>>();
-            let residue = ((reconstruction_coefficient % &q_int) + &q_int) % &q_int;
-            let scalar = DCRTPoly::from_biguint_to_constant(
-                &cpu_parameters,
-                residue.to_biguint().expect("reconstruction residue is nonnegative"),
-            );
-            direct_expected.add_in_place(
-                &(DCRTPolyMatrix::from_poly_vec_row(&cpu_parameters, rounded) * scalar),
-            );
-        }
-        assert_eq!(expected, direct_expected);
+            })
+            .collect::<Vec<_>>();
 
         for _ in 0..5 {
-            let gpu_levels = cpu_levels
+            let gpu_levels = level_coefficients
                 .iter()
-                .map(|level| GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, level))
+                .map(|columns| {
+                    GpuDCRTPolyMatrix::from_poly_vec_row(
+                        &gpu_parameters,
+                        columns
+                            .iter()
+                            .map(|coefficients| {
+                                GpuDCRTPoly::from_biguints(&gpu_parameters, coefficients)
+                            })
+                            .collect(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let actual = <GpuDCRTPolyMatrix as CrtRecomposeMatrix>::crt_recompose_levels(
                 &gpu_levels,
@@ -481,7 +487,21 @@ mod crt_tests {
                 &reconstruction_coefficients,
             )
             .unwrap();
-            assert_eq!(actual.to_cpu_matrix(), expected);
+            let actual_snapshot = actual.to_coefficient_rns_snapshot();
+            assert!(!actual_snapshot.is_ntt());
+            if actual_snapshot.bytes() != expected_rns {
+                let mismatch = actual_snapshot
+                    .bytes()
+                    .iter()
+                    .zip(&expected_rns)
+                    .position(|(actual, expected)| actual != expected)
+                    .expect("mismatched snapshots must have a differing byte");
+                panic!(
+                    "raw GPU CRT mismatch at byte {mismatch}: actual={}, expected={}",
+                    actual_snapshot.bytes()[mismatch],
+                    expected_rns[mismatch]
+                );
+            }
         }
         gpu_device_sync();
     }

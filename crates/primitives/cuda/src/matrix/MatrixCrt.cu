@@ -190,12 +190,13 @@ namespace
     int crt_alloc_and_copy_async(
         T **device,
         const std::vector<T> &host,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        std::vector<void *> *pinned_metadata)
     {
         *device = nullptr;
-        if (host.empty())
+        if (host.empty() || !pinned_metadata)
         {
-            return 0;
+            return host.empty() ? 0 : set_error("missing CRT pinned-metadata owner");
         }
         const size_t bytes = host.size() * sizeof(T);
         void *allocation = nullptr;
@@ -205,7 +206,17 @@ namespace
             return set_error(error);
         }
         *device = static_cast<T *>(allocation);
-        error = cudaMemcpyAsync(*device, host.data(), bytes, cudaMemcpyHostToDevice, stream);
+        void *pinned = nullptr;
+        error = cudaHostAlloc(&pinned, bytes, cudaHostAllocPortable);
+        if (error != cudaSuccess)
+        {
+            cudaFreeAsync(*device, stream);
+            *device = nullptr;
+            return set_error(error);
+        }
+        std::memcpy(pinned, host.data(), bytes);
+        pinned_metadata->push_back(pinned);
+        error = cudaMemcpyAsync(*device, pinned, bytes, cudaMemcpyHostToDevice, stream);
         if (error != cudaSuccess)
         {
             cudaFreeAsync(*device, stream);
@@ -360,6 +371,8 @@ extern "C" int gpu_matrix_crt_recompose(
     uint64_t *d_modulus_words = nullptr;
     uint64_t *d_plaintext = nullptr;
     uint64_t *d_reconstruction = nullptr;
+    std::vector<void *> pinned_metadata;
+    pinned_metadata.reserve(10);
     auto cleanup = [&]()
     {
         cudaSetDevice(dispatch_device);
@@ -374,9 +387,25 @@ extern "C" int gpu_matrix_crt_recompose(
         if (d_source_coeff_bytes) cudaFreeAsync(d_source_coeff_bytes, dispatch_stream);
         if (d_source_strides) cudaFreeAsync(d_source_strides, dispatch_stream);
         if (d_source_bases) cudaFreeAsync(const_cast<uint8_t **>(d_source_bases), dispatch_stream);
+        if (!pinned_metadata.empty())
+        {
+            // Every asynchronous H2D copy above reads from these buffers.
+            // Keep them alive until all copies, the CRT kernel, and the
+            // stream-ordered device frees have completed.
+            (void)gpu_defer_pinned_frees(
+                out->ctx,
+                dispatch_device,
+                dispatch_stream,
+                pinned_metadata.data(),
+                pinned_metadata.size());
+            // The reclaimer retains ownership even on its fail-closed error
+            // path, where uncertain pointers are intentionally leaked.
+            pinned_metadata.clear();
+        }
     };
 #define CRT_COPY(device, host) \
-    do { status = crt_alloc_and_copy_async(&(device), (host), dispatch_stream); \
+    do { status = crt_alloc_and_copy_async( \
+             &(device), (host), dispatch_stream, &pinned_metadata); \
          if (status != 0) { cleanup(); return status; } } while (false)
     CRT_COPY(d_source_bases, source_bases);
     CRT_COPY(d_source_strides, source_strides);

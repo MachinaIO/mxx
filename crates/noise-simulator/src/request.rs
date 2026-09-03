@@ -310,8 +310,14 @@ fn validate_external_fact_shape(
             maximum_absolute_coefficient_value,
             ..
         } => {
-            let Some(WireType::Matrix(matrix_type) | WireType::Preimage(matrix_type)) = wire_type
-            else {
+            let Some((matrix_type, declared_bound)) = (match wire_type {
+                Some(WireType::Matrix(matrix_type)) => Some((matrix_type, None)),
+                Some(WireType::SmallMatrix { matrix: matrix_type, max_coefficient_bound }) |
+                Some(WireType::Preimage { matrix: matrix_type, max_coefficient_bound }) => {
+                    Some((matrix_type, Some(max_coefficient_bound)))
+                }
+                _ => None,
+            }) else {
                 return Err("external matrix fact does not match input wire".to_owned());
             };
             let matrix = concrete_matrix(matrix_type, environment)?;
@@ -320,6 +326,23 @@ fn validate_external_fact_shape(
             if maximum_absolute_coefficient_value.as_ref().is_some_and(|value| value > &cap) {
                 return Err("external matrix coefficient magnitude exceeds centered residue bound"
                     .to_owned());
+            }
+            if let (Some(value), Some(bound)) =
+                (maximum_absolute_coefficient_value.as_ref(), declared_bound)
+            {
+                let bound = bound
+                    .evaluate(environment)
+                    .map_err(|error| {
+                        format!("bounded RHS coefficient bound is unresolved: {error}")
+                    })?
+                    .to_biguint()
+                    .ok_or_else(|| "bounded RHS coefficient bound is negative".to_owned())?;
+                if value > &bound {
+                    return Err(
+                        "external matrix coefficient magnitude exceeds declared bounded RHS bound"
+                            .to_owned(),
+                    );
+                }
             }
             let _ = maximum_absolute_coefficient_error;
             Ok(())
@@ -360,9 +383,12 @@ fn validate_external_fact_shape(
 
 fn is_matrix_or_matrix_family(wire_type: &WireType) -> bool {
     match wire_type {
-        WireType::Matrix(_) | WireType::Preimage(_) => true,
+        WireType::Matrix(_) | WireType::SmallMatrix { .. } | WireType::Preimage { .. } => true,
         WireType::Family { element, .. } => {
-            matches!(element.as_ref(), WireType::Matrix(_) | WireType::Preimage(_))
+            matches!(
+                element.as_ref(),
+                WireType::Matrix(_) | WireType::SmallMatrix { .. } | WireType::Preimage { .. }
+            )
         }
         _ => false,
     }
@@ -386,7 +412,9 @@ fn trapdoor_public_types_match(
     match (trapdoor, public) {
         (
             WireType::Trapdoor { matrix: trapdoor_matrix, .. },
-            WireType::Matrix(public_matrix) | WireType::Preimage(public_matrix),
+            WireType::Matrix(public_matrix) |
+            WireType::SmallMatrix { matrix: public_matrix, .. } |
+            WireType::Preimage { matrix: public_matrix, .. },
         ) => Ok(concrete_matrix(trapdoor_matrix, environment)
             .map_err(|message| SimulationError::InvalidGraph { message, site: None })? ==
             concrete_matrix(public_matrix, environment)
@@ -582,6 +610,20 @@ mod tests {
     fn trapdoor_pairing_rejects_incompatible_public_matrix() {
         let request = request(matrix_type(1, 2), matrix_type(2, 2), zero_matrix_fact());
         assert!(matches!(request.validate(), Err(SimulationError::Relation { .. })));
+    }
+
+    #[test]
+    fn bounded_external_matrix_fact_cannot_exceed_declared_rhs_bound() {
+        let ty = matrix_type(1, 1);
+        let wire = WireType::SmallMatrix { matrix: ty, max_coefficient_bound: 3.into() };
+        let fact = ExternalInputValue::Matrix {
+            maximum_absolute_coefficient_error: BigUint::ZERO,
+            maximum_absolute_coefficient_value: Some(BigUint::from(4u8)),
+            is_constant_polynomial: false,
+        };
+        let error = validate_external_fact_shape(&fact, Some(&wire), &ParamEnv::default())
+            .expect_err("bounded RHS facts above the wire bound must be rejected");
+        assert!(error.contains("declared bounded RHS bound"));
     }
 
     #[test]

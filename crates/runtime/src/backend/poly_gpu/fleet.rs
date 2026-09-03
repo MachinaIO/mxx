@@ -1192,6 +1192,27 @@ mod tests {
         assert!(backend.column_widths(operation).is_some());
     }
 
+    fn first_bidirectional_peer_pair(
+        detected: &[i32],
+        parameters: &GpuDCRTPolyParams,
+    ) -> Option<[i32; 2]> {
+        for (index, &left_device) in detected.iter().enumerate() {
+            for &right_device in &detected[index + 1..] {
+                let left_params = parameters.params_for_device(left_device);
+                let right_params = parameters.params_for_device(right_device);
+                let left = GpuDCRTPolyMatrix::zero(&left_params, 1, 1);
+                if left.copy_to_params_direct(&right_params).is_none() {
+                    continue;
+                }
+                let right = GpuDCRTPolyMatrix::zero(&right_params, 1, 1);
+                if right.copy_to_params_direct(&left_params).is_some() {
+                    return Some([left_device, right_device]);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     #[serial_test::serial(gpu_context)]
     fn gpu_fleet_uses_context_vram_percent_after_environment_changes() {
@@ -1370,25 +1391,30 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires at least two GPUs"]
+    #[ignore = "requires at least two GPUs with bidirectional peer access"]
     #[serial_test::serial(gpu_context)]
-    fn test_gpu_two_device_small_rhs_waves_match_single_device_canonical_output() {
+    fn test_gpu_bidirectional_peer_fleet_small_rhs_waves_match_single_device_canonical_output() {
         let detected = detected_gpu_device_ids();
         assert!(detected.len() >= 2, "this ignored test requires at least two detected GPUs");
-        let devices = &detected[..2];
-        for &device in devices {
+        for &device in &detected {
             super::super::wait_for_gpu_test_context_quiescence(device);
         }
 
         let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let devices = first_bidirectional_peer_pair(&detected, &parameters).unwrap_or_else(|| {
+            panic!(
+                "this ignored test requires a GPU pair with bidirectional CUDA peer access; \
+                 detected devices {detected:?} have no compatible pair"
+            )
+        });
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let gadget_base = BigInt::from(1u8) << parameters.base_bits();
         let operation = [117u8; 32];
         let hash_key: [u8; 32] = rand::random();
         let mut fleet = super::super::gpu_backend_on([parameters.clone()], devices.iter().copied());
         assert!(
-            fleet.devices.iter().map(|(device, _)| *device).eq(devices.iter().copied()),
-            "test backend must use exactly the first two detected GPUs"
+            fleet.devices.iter().map(|(device, _)| *device).eq(devices),
+            "test backend must use exactly the selected bidirectional peer pair"
         );
         fleet.set_column_widths_for_operation(
             operation,

@@ -7,6 +7,22 @@ extern "C"
 {
 #endif
 
+    typedef struct GpuMatrixAllocationBytes
+    {
+        size_t data_bytes;
+        size_t aux_bytes;
+        size_t event_bytes;
+        size_t total_bytes;
+    } GpuMatrixAllocationBytes;
+
+    int gpu_matrix_query_allocation_bytes(
+        const GpuContext *ctx,
+        int level,
+        size_t rows,
+        size_t cols,
+        int format,
+        GpuMatrixAllocationBytes *out);
+
     int gpu_matrix_create(
         GpuContext *ctx,
         int level,

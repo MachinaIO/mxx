@@ -352,7 +352,13 @@ namespace
         const uint64_t *modulus_words,
         const uint64_t *half_modulus_words,
         const uint64_t *bound_words,
-        int *accepted)
+        int *accepted,
+        uint8_t *canonical_payload,
+        size_t canonical_dst_cols,
+        size_t canonical_magnitude_bytes,
+        size_t canonical_dst_row,
+        size_t canonical_dst_col,
+        size_t canonical_tile_cols)
     {
         const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (idx >= total_coefficients)
@@ -417,10 +423,11 @@ namespace
                 carry = static_cast<uint64_t>(term >> 64);
             }
         }
-        if (serde_compare_words_desc_device(
+        const bool is_negative = serde_compare_words_desc_device(
                 coeff_words,
                 half_modulus_words,
-                words_per_coeff) > 0)
+                words_per_coeff) > 0;
+        if (is_negative)
         {
             uint64_t borrow = 0;
             for (int w = 0; w < words_per_coeff; ++w)
@@ -444,6 +451,30 @@ namespace
         if (serde_compare_words_desc_device(coeff_words, bound_words, words_per_coeff) > 0)
         {
             atomicExch(&accepted[matrix_idx], 0);
+        }
+        if (canonical_payload)
+        {
+            bool is_zero = true;
+            for (int w = 0; w < words_per_coeff; ++w)
+            {
+                is_zero = is_zero && coeff_words[w] == 0;
+            }
+            const size_t tile_row = poly_idx / canonical_tile_cols;
+            const size_t tile_col = poly_idx % canonical_tile_cols;
+            const size_t dst_poly =
+                (canonical_dst_row + tile_row) * canonical_dst_cols +
+                canonical_dst_col + tile_col;
+            uint8_t *dst = canonical_payload +
+                (dst_poly * n + coeff_idx) * (canonical_magnitude_bytes + 1);
+            dst[0] = is_zero ? 0 : (is_negative ? 2 : 1);
+            for (size_t byte = 0; byte < canonical_magnitude_bytes; ++byte)
+            {
+                const size_t word = byte / sizeof(uint64_t);
+                const size_t shift = (byte % sizeof(uint64_t)) * 8;
+                dst[1 + byte] = word < static_cast<size_t>(words_per_coeff)
+                    ? static_cast<uint8_t>(coeff_words[word] >> shift)
+                    : 0;
+            }
         }
     }
 
@@ -1171,272 +1202,6 @@ extern "C" int gpu_matrix_store_const_coeff_batch(
     }
 
     return serde_build_event_set_from_streams(streams, out_events);
-}
-
-extern "C" int gpu_matrix_batch_within_coefficient_bound(
-    const GpuMatrix *const *matrices,
-    size_t matrix_count,
-    const uint64_t *bound_words,
-    size_t bound_word_count,
-    uint8_t *accepted_out)
-{
-    if (!matrices || matrix_count == 0 || !bound_words || bound_word_count == 0 || !accepted_out)
-    {
-        return set_error("invalid gpu_matrix_batch_within_coefficient_bound arguments");
-    }
-    const GpuMatrix *first = matrices[0];
-    if (!first || !first->ctx || first->format != GPU_POLY_FORMAT_COEFF || first->level < 0)
-    {
-        return set_error("coefficient-format matrices are required for batch bound checking");
-    }
-    const size_t limb_count = static_cast<size_t>(first->level + 1);
-    const size_t poly_count = first->rows * first->cols;
-    const size_t n = static_cast<size_t>(first->ctx->N);
-    if (limb_count == 0 || limb_count > static_cast<size_t>(kMaxRnsLimbs) ||
-        poly_count == 0 || n == 0)
-    {
-        return set_error("invalid matrix shape for batch bound checking");
-    }
-    size_t coefficients_per_matrix = 0;
-    size_t total_coefficients = 0;
-    if (!serde_checked_mul_size(poly_count, n, &coefficients_per_matrix) ||
-        !serde_checked_mul_size(coefficients_per_matrix, matrix_count, &total_coefficients))
-    {
-        return set_error("batch bound coefficient count overflow");
-    }
-    size_t total_bits = 0;
-    for (size_t limb = 0; limb < limb_count; ++limb)
-    {
-        total_bits += static_cast<size_t>(bit_width_u64(first->ctx->moduli[limb]));
-    }
-    const size_t words_per_coeff = std::max<size_t>(1, (total_bits + 63) / 64);
-    if (words_per_coeff > static_cast<size_t>(kMaxCoeffWords) ||
-        bound_word_count > words_per_coeff)
-    {
-        return set_error("bound width exceeds supported coefficient width");
-    }
-
-    const auto &limb_map = first->ctx->limb_gpu_ids;
-    if (limb_map.size() < limb_count)
-    {
-        return set_error("unexpected limb mapping size in batch bound checking");
-    }
-    std::vector<const uint8_t *> matrix_limb_ptrs(matrix_count * limb_count);
-    std::vector<size_t> limb_strides(limb_count);
-    std::vector<uint8_t> limb_coeff_bytes(limb_count);
-    int common_device = -1;
-    cudaStream_t work_stream = nullptr;
-    for (size_t matrix_idx = 0; matrix_idx < matrix_count; ++matrix_idx)
-    {
-        const GpuMatrix *matrix = matrices[matrix_idx];
-        if (!matrix || matrix->ctx != first->ctx || matrix->rows != first->rows ||
-            matrix->cols != first->cols || matrix->level != first->level ||
-            matrix->format != GPU_POLY_FORMAT_COEFF)
-        {
-            return set_error("inconsistent matrix batch for coefficient bound checking");
-        }
-        for (size_t limb = 0; limb < limb_count; ++limb)
-        {
-            const dim3 limb_id = limb_map[limb];
-            const uint8_t *ptr = matrix_limb_ptr_by_id(matrix, 0, limb_id);
-            int device = -1;
-            cudaStream_t stream = nullptr;
-            if (!ptr || matrix_limb_device(matrix, limb_id, &device) != 0 ||
-                matrix_limb_stream(matrix, limb_id, &stream) != 0)
-            {
-                return set_error("invalid matrix limb in batch bound checking");
-            }
-            if (common_device < 0)
-            {
-                common_device = device;
-                work_stream = stream;
-            }
-            else if (device != common_device)
-            {
-                return set_error("batch bound checking requires one GPU placement");
-            }
-            size_t stride = 0;
-            uint8_t coeff_bytes = 0;
-            if (!matrix_limb_metadata_by_id(matrix, limb_id, &stride, &coeff_bytes))
-            {
-                return set_error("invalid limb metadata in batch bound checking");
-            }
-            if (matrix_idx == 0)
-            {
-                limb_strides[limb] = stride;
-                limb_coeff_bytes[limb] = coeff_bytes;
-            }
-            else if (limb_strides[limb] != stride || limb_coeff_bytes[limb] != coeff_bytes)
-            {
-                return set_error("inconsistent limb layout in batch bound checking");
-            }
-            matrix_limb_ptrs[matrix_idx * limb_count + limb] = ptr;
-        }
-    }
-    if (common_device < 0 || !work_stream)
-    {
-        return set_error("missing batch bound checking stream");
-    }
-    cudaError_t err = cudaSetDevice(common_device);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    for (size_t matrix_idx = 0; matrix_idx < matrix_count; ++matrix_idx)
-    {
-        for (size_t limb = 0; limb < limb_count; ++limb)
-        {
-            const int status = matrix_wait_limb_stream(
-                matrices[matrix_idx],
-                limb_map[limb],
-                common_device,
-                work_stream);
-            if (status != 0)
-            {
-                return status;
-            }
-        }
-    }
-
-    std::vector<uint64_t> modulus_words;
-    const std::vector<uint64_t> moduli(
-        first->ctx->moduli.begin(),
-        first->ctx->moduli.begin() + limb_count);
-    if (!serde_compute_modulus_words_le(moduli, &modulus_words))
-    {
-        return set_error("failed to compute modulus words for batch bound checking");
-    }
-    std::vector<uint64_t> half_modulus_words = modulus_words;
-    serde_shift_words_right_one_le(&half_modulus_words);
-    modulus_words.resize(words_per_coeff, 0);
-    half_modulus_words.resize(words_per_coeff, 0);
-    std::vector<uint64_t> padded_bound(words_per_coeff, 0);
-    std::copy(bound_words, bound_words + bound_word_count, padded_bound.begin());
-    std::vector<int> accepted(matrix_count, 1);
-
-    const uint8_t **d_matrix_limb_ptrs = nullptr;
-    size_t *d_limb_strides = nullptr;
-    uint8_t *d_limb_coeff_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
-    uint64_t *d_garner_inverses = nullptr;
-    uint64_t *d_modulus_words = nullptr;
-    uint64_t *d_half_modulus_words = nullptr;
-    uint64_t *d_bound_words = nullptr;
-    int *d_accepted = nullptr;
-    auto release = [&]() {
-        if (d_accepted) cudaFreeAsync(d_accepted, work_stream);
-        if (d_bound_words) cudaFreeAsync(d_bound_words, work_stream);
-        if (d_half_modulus_words) cudaFreeAsync(d_half_modulus_words, work_stream);
-        if (d_modulus_words) cudaFreeAsync(d_modulus_words, work_stream);
-        if (d_garner_inverses) cudaFreeAsync(d_garner_inverses, work_stream);
-        if (d_moduli) cudaFreeAsync(d_moduli, work_stream);
-        if (d_limb_coeff_bytes) cudaFreeAsync(d_limb_coeff_bytes, work_stream);
-        if (d_limb_strides) cudaFreeAsync(d_limb_strides, work_stream);
-        if (d_matrix_limb_ptrs) cudaFreeAsync(d_matrix_limb_ptrs, work_stream);
-    };
-#define MXX_BOUND_ALLOC(dst, bytes)                                                        \
-    do                                                                                    \
-    {                                                                                     \
-        err = cudaMallocAsync(reinterpret_cast<void **>(&(dst)), (bytes), work_stream);   \
-        if (err != cudaSuccess)                                                            \
-        {                                                                                 \
-            release();                                                                    \
-            return set_error(err);                                                        \
-        }                                                                                 \
-    } while (false)
-    MXX_BOUND_ALLOC(d_matrix_limb_ptrs, matrix_limb_ptrs.size() * sizeof(uint8_t *));
-    MXX_BOUND_ALLOC(d_limb_strides, limb_strides.size() * sizeof(size_t));
-    MXX_BOUND_ALLOC(d_limb_coeff_bytes, limb_coeff_bytes.size() * sizeof(uint8_t));
-    MXX_BOUND_ALLOC(d_moduli, moduli.size() * sizeof(uint64_t));
-    MXX_BOUND_ALLOC(
-        d_garner_inverses,
-        first->ctx->garner_inverse_table.size() * sizeof(uint64_t));
-    MXX_BOUND_ALLOC(d_modulus_words, words_per_coeff * sizeof(uint64_t));
-    MXX_BOUND_ALLOC(d_half_modulus_words, words_per_coeff * sizeof(uint64_t));
-    MXX_BOUND_ALLOC(d_bound_words, words_per_coeff * sizeof(uint64_t));
-    MXX_BOUND_ALLOC(d_accepted, matrix_count * sizeof(int));
-#undef MXX_BOUND_ALLOC
-
-    auto copy_to_device = [&](void *dst, const void *src, size_t bytes) {
-        return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, work_stream);
-    };
-    err = copy_to_device(
-        d_matrix_limb_ptrs,
-        matrix_limb_ptrs.data(),
-        matrix_limb_ptrs.size() * sizeof(uint8_t *));
-    if (err == cudaSuccess) err = copy_to_device(d_limb_strides, limb_strides.data(), limb_strides.size() * sizeof(size_t));
-    if (err == cudaSuccess) err = copy_to_device(d_limb_coeff_bytes, limb_coeff_bytes.data(), limb_coeff_bytes.size() * sizeof(uint8_t));
-    if (err == cudaSuccess) err = copy_to_device(d_moduli, moduli.data(), moduli.size() * sizeof(uint64_t));
-    if (err == cudaSuccess) err = copy_to_device(d_garner_inverses, first->ctx->garner_inverse_table.data(), first->ctx->garner_inverse_table.size() * sizeof(uint64_t));
-    if (err == cudaSuccess) err = copy_to_device(d_modulus_words, modulus_words.data(), words_per_coeff * sizeof(uint64_t));
-    if (err == cudaSuccess) err = copy_to_device(d_half_modulus_words, half_modulus_words.data(), words_per_coeff * sizeof(uint64_t));
-    if (err == cudaSuccess) err = copy_to_device(d_bound_words, padded_bound.data(), words_per_coeff * sizeof(uint64_t));
-    if (err == cudaSuccess) err = copy_to_device(d_accepted, accepted.data(), matrix_count * sizeof(int));
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
-    }
-
-    const int threads = 256;
-    const int blocks = static_cast<int>((total_coefficients + threads - 1) / threads);
-    serde_check_centered_bound_batch_kernel<<<blocks, threads, 0, work_stream>>>(
-        d_matrix_limb_ptrs,
-        d_limb_strides,
-        d_limb_coeff_bytes,
-        d_moduli,
-        d_garner_inverses,
-        static_cast<int>(first->ctx->moduli.size()),
-        static_cast<int>(limb_count),
-        total_coefficients,
-        coefficients_per_matrix,
-        n,
-        static_cast<int>(words_per_coeff),
-        d_modulus_words,
-        d_half_modulus_words,
-        d_bound_words,
-        d_accepted);
-    err = cudaGetLastError();
-    if (err == cudaSuccess)
-    {
-        err = cudaMemcpyAsync(
-            accepted.data(),
-            d_accepted,
-            matrix_count * sizeof(int),
-            cudaMemcpyDeviceToHost,
-            work_stream);
-    }
-    for (size_t matrix_idx = 0; matrix_idx < matrix_count && err == cudaSuccess; ++matrix_idx)
-    {
-        for (size_t limb = 0; limb < limb_count; ++limb)
-        {
-            const int status = matrix_track_limb_consumer(
-                matrices[matrix_idx],
-                limb_map[limb],
-                common_device,
-                work_stream);
-            if (status != 0)
-            {
-                release();
-                return status;
-            }
-        }
-    }
-    if (err == cudaSuccess)
-    {
-        err = cudaStreamSynchronize(work_stream);
-    }
-    if (err != cudaSuccess)
-    {
-        release();
-        return set_error(err);
-    }
-    for (size_t i = 0; i < matrix_count; ++i)
-    {
-        accepted_out[i] = static_cast<uint8_t>(accepted[i] != 0);
-    }
-    release();
-    return 0;
 }
 
 extern "C" int gpu_poly_store_compact_bytes(

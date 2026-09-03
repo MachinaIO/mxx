@@ -404,9 +404,8 @@ impl DiamondWeProtocolFamily {
         let one_target = Mat::concat(ConcatAxis::Rows, vec![one_difference, zero_row]);
         let projection_trapdoor = input_preprocessing.final_trapdoors.get_static(0);
         let one_trapdoor = projection_trapdoor.clone();
-        let one_sample = one_trapdoor
+        let one_preimage = one_trapdoor
             .sample_preimage(one_target, (state_columns.clone(), public_columns.clone()));
-        let one_preimage = one_sample.as_mat();
         let witness_indices =
             Parallel::range(witness_size).map_values(|bit| bit.as_int().add(Int::constant(1)))?;
         let witness_trapdoors =
@@ -421,9 +420,7 @@ impl DiamondWeProtocolFamily {
         })?;
         let witness_preimages =
             witness_trapdoors.parallel_zip_mat_values(witness_targets, |_, trapdoor, target| {
-                let sample = trapdoor
-                    .sample_preimage(target, (state_columns.clone(), public_columns.clone()));
-                sample.as_mat()
+                trapdoor.sample_preimage(target, (state_columns.clone(), public_columns.clone()))
             })?;
 
         let k_public_key_matrix = ring.hash_matrix(
@@ -449,24 +446,20 @@ impl DiamondWeProtocolFamily {
             vec![k_public_key_first.clone(), half_modulus_polynomial],
         );
         let k_trapdoor = projection_trapdoor.clone();
-        let k_sample = k_trapdoor.sample_preimage(k_target, (state_columns.clone(), 1));
-        let k_preimage = k_sample.as_mat();
+        let k_preimage = k_trapdoor.sample_preimage(k_target, (state_columns.clone(), 1));
         let r = ring.hash_matrix(hash_key, self.tag(b":r"), (1, public_columns.clone()));
         let r_column = r.slice(None, first_column);
-        let r_decomposition = r_column.decompose(
+        let r_decomposed = r_column.decompose(
             graph_params.input.gadget_base.clone(),
             graph_params.input.digit_count.clone(),
         );
-        let r_materialized = r_decomposition.as_mat();
-        let r_decomposed = r_materialized;
         let difference = public_key_compiler.sub(&one_public_key, &circuit_output);
-        let projected_difference = difference.matrix * r_decomposed.clone();
+        let projected_difference = r_decomposed.clone().mul_small_rhs(difference.matrix);
         let decoder_public_key = k_public_key_first + projected_difference;
         let decoder_zero = ring.zero((1, 1));
         let decoder_target = Mat::concat(ConcatAxis::Rows, vec![decoder_public_key, decoder_zero]);
         let decoder_trapdoor = projection_trapdoor;
-        let decoder_sample = decoder_trapdoor.sample_preimage(decoder_target, (state_columns, 1));
-        let decoder_preimage = decoder_sample.as_mat();
+        let decoder_preimage = decoder_trapdoor.sample_preimage(decoder_target, (state_columns, 1));
 
         let graph = context
             .public_output(DiamondArtifactNames::INITIAL_STATE, input_preprocessing.p)?
@@ -474,12 +467,9 @@ impl DiamondWeProtocolFamily {
             .public_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
             .public_output(DiamondArtifactNames::DECODER_PREIMAGE, decoder_preimage)?
             .public_output(DiamondArtifactNames::R_DECOMPOSED, r_decomposed)?
-            .public_family_output(DiamondArtifactNames::PUBLIC_KEYS, public_keys.matrices)?
-            .public_family_output(
-                DiamondArtifactNames::TRANSITIONS,
-                input_preprocessing.transitions,
-            )?
-            .public_family_output(DiamondArtifactNames::WITNESS_PREIMAGES, witness_preimages)?
+            .public_output(DiamondArtifactNames::PUBLIC_KEYS, public_keys.matrices)?
+            .public_output(DiamondArtifactNames::TRANSITIONS, input_preprocessing.transitions)?
+            .public_output(DiamondArtifactNames::WITNESS_PREIMAGES, witness_preimages)?
             .build()?;
         Ok(DiamondEncryptionBuild { graph: DiamondEncryptionGraph { graph } })
     }
@@ -497,6 +487,7 @@ impl DiamondWeProtocolFamily {
             .int_family_input(BOOLEAN_INSTANCE_INPUT, circuit_params.max_layer_width.clone());
         let state_columns = graph_params.input.state_columns();
         let public_columns = graph_params.input.digit_count.clone();
+        let preimage_bound = graph_params.input.preimage_max_coefficient_bound.clone();
         let initial_state = ring.artifact_input(
             encryption.clone(),
             DiamondArtifactNames::INITIAL_STATE,
@@ -522,11 +513,12 @@ impl DiamondWeProtocolFamily {
             )),
         )
         .canonicalize();
-        let transitions = ring.family_artifact_input(
+        let transitions = ring.preimage_family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::TRANSITIONS,
             transition_count,
             (state_columns.clone(), state_columns.clone()),
+            preimage_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let input_evaluation = DiamondInputInjector::parameterized(graph_params.input.clone())
@@ -544,28 +536,31 @@ impl DiamondWeProtocolFamily {
         );
         let public_keys =
             BggPublicKeyFamily { matrices: public_key_matrices, reveal_plaintext: true };
-        let one_preimage = ring.artifact_input(
+        let one_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::ONE_PREIMAGE,
             (state_columns.clone(), public_columns.clone()),
+            preimage_bound.clone(),
             ArtifactConfidentiality::Public,
         );
-        let k_preimage = ring.artifact_input(
+        let k_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::K_PREIMAGE,
             (state_columns.clone(), 1),
+            preimage_bound.clone(),
             ArtifactConfidentiality::Public,
         );
-        let decoder_preimage = ring.artifact_input(
+        let decoder_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::DECODER_PREIMAGE,
             (state_columns.clone(), 1),
+            preimage_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let initial_projection_state = states.get_static(0);
-        let one_vector = initial_projection_state.clone() * one_preimage;
-        let k_vector = initial_projection_state.clone() * k_preimage;
-        let decoder = initial_projection_state * decoder_preimage;
+        let one_vector = one_preimage.mul_small_rhs(initial_projection_state.clone());
+        let k_vector = k_preimage.mul_small_rhs(initial_projection_state.clone());
+        let decoder = decoder_preimage.mul_small_rhs(initial_projection_state);
         let one_public_key_matrix = public_keys.matrices.get_static(0);
         let one_plaintext_matrix = ring.identity(1);
         let one_encoding = BggEncodingWire {
@@ -574,11 +569,12 @@ impl DiamondWeProtocolFamily {
             plaintext: Some(one_plaintext_matrix),
         };
         let zero_encoding = encoding_compiler.sub(&one_encoding, &one_encoding).expect("revealed");
-        let witness_preimages = ring.family_artifact_input(
+        let witness_preimages = ring.preimage_family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::WITNESS_PREIMAGES,
             witness_size.clone(),
             (state_columns.clone(), public_columns.clone()),
+            preimage_bound,
             ArtifactConfidentiality::Public,
         );
         let witness_state_indices = Parallel::range(witness_size.clone())
@@ -586,7 +582,7 @@ impl DiamondWeProtocolFamily {
         let witness_states = states.parallel_gather(witness_state_indices)?;
         let witness_vectors = parallel_zip_bundle_result(
             (witness_states, witness_preimages),
-            |_, (state, preimage)| Ok::<_, DslError>(state * preimage),
+            |_, (state, preimage)| Ok::<_, DslError>(preimage.mul_small_rhs(state)),
         )?;
         let witness_public_indices = Parallel::range(witness_size.clone())
             .map_values(|bit| bit.as_int().add(Int::constant(1)))?;
@@ -702,14 +698,19 @@ impl DiamondWeProtocolFamily {
             .vectors
             .get(circuit_output_index.clone())
             .semantic_anchor("diamond.decrypt.selected-circuit-vector")?;
-        let r_decomposed = ring.artifact_input(
+        let r_decomposed = ring.preimage_artifact_input(
             encryption,
             DiamondArtifactNames::R_DECOMPOSED,
             (public_columns, 1),
+            IntExpr::RoundDiv(
+                Box::new(graph_params.input.gadget_base.clone()),
+                Box::new(IntExpr::constant(2)),
+            )
+            .canonicalize(),
             ArtifactConfidentiality::Public,
         );
         let one_minus_circuit = one_encoding.vector - circuit_vector;
-        let projected_difference = one_minus_circuit * r_decomposed;
+        let projected_difference = r_decomposed.mul_small_rhs(one_minus_circuit);
         let k_plus_projection = k_vector + projected_difference;
         let noisy_plaintext =
             (decoder - k_plus_projection).semantic_anchor("diamond.decoder.residual")?;
@@ -1093,6 +1094,7 @@ mod tests {
         RealExpr,
         artifact::{ProductionId, SpecHash, export_validated_manifest},
         node::NodeKind,
+        types::ConcreteWireType,
     };
     use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
     use mxx_runtime::{
@@ -1133,6 +1135,66 @@ mod tests {
         let encryption = compiler.build_encryption().unwrap().graph;
         let bindings = compiler.circuit_bindings().unwrap();
         let validated = encryption.validate(&bindings).unwrap();
+        let output_type = |name: &str| {
+            let wire = encryption.graph.outputs()[name].value;
+            validated.root_scope().wire_types.get(&wire).expect("validated encryption output")
+        };
+        for artifact in [
+            DiamondArtifactNames::ONE_PREIMAGE,
+            DiamondArtifactNames::K_PREIMAGE,
+            DiamondArtifactNames::DECODER_PREIMAGE,
+        ] {
+            assert!(matches!(
+                output_type(artifact),
+                ConcreteWireType::Preimage { max_coefficient_bound, .. }
+                    if *max_coefficient_bound == 26.into()
+            ));
+        }
+        assert!(matches!(
+            output_type(DiamondArtifactNames::R_DECOMPOSED),
+            ConcreteWireType::Preimage { max_coefficient_bound, .. }
+                if *max_coefficient_bound == 2.into()
+        ));
+        for artifact in [DiamondArtifactNames::TRANSITIONS, DiamondArtifactNames::WITNESS_PREIMAGES]
+        {
+            assert!(matches!(
+                output_type(artifact),
+                ConcreteWireType::IndexedFamily { element, .. }
+                    if matches!(element.as_ref(), ConcreteWireType::Preimage {
+                        max_coefficient_bound, ..
+                    } if *max_coefficient_bound == 26.into())
+            ));
+        }
+        let r_output = encryption.graph.outputs()[DiamondArtifactNames::R_DECOMPOSED].value;
+        assert!(matches!(
+            encryption
+                .graph
+                .root_scope()
+                .node(r_output.node)
+                .expect("R decomposition producer")
+                .kind(),
+            NodeKind::GadgetDecompose { small: false, .. }
+        ));
+        for artifact in [
+            DiamondArtifactNames::ONE_PREIMAGE,
+            DiamondArtifactNames::K_PREIMAGE,
+            DiamondArtifactNames::DECODER_PREIMAGE,
+        ] {
+            let wire = encryption.graph.outputs()[artifact].value;
+            assert!(matches!(
+                encryption.graph.root_scope().node(wire.node).expect("preimage producer").kind(),
+                NodeKind::PreimageSample { .. }
+            ));
+        }
+        let encryption_nodes =
+            validated.source.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert!(
+            encryption_nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs))
+        );
+        assert!(!encryption_nodes.iter().any(|node| matches!(
+            node.kind(),
+            NodeKind::MatrixScale { scalar } if *scalar == IntExpr::constant(1)
+        )));
         for family in [
             DiamondArtifactNames::PUBLIC_KEYS,
             DiamondArtifactNames::TRANSITIONS,
@@ -1153,9 +1215,22 @@ mod tests {
             decryption.anchors.get("diamond.decoder.result").expect("decoded endpoint anchor");
         assert_eq!(decoded_anchor.len(), 1);
         assert_eq!(decoded_anchor[0].wire, decoded_output);
-        decryption
+        let validated_decryption = decryption
             .validate_with_manifests(&bindings, &BTreeMap::from([(production, manifest)]))
             .unwrap();
+        let decryption_nodes = validated_decryption
+            .source
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .collect::<Vec<_>>();
+        assert!(
+            decryption_nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs))
+        );
+        assert!(!decryption_nodes.iter().any(|node| matches!(
+            node.kind(),
+            NodeKind::MatrixScale { scalar } if *scalar == IntExpr::constant(1)
+        )));
 
         for graph in [&encryption.graph, &decryption.graph] {
             assert_eq!(

@@ -1045,9 +1045,7 @@ mod tests {
             .enumerate()
             .try_fold(
                 DslContext::new("ring-gsw-native-scalar-adapter"),
-                |context, (wire, family)| {
-                    context.public_family_output(format!("wire-{wire}"), family)
-                },
+                |context, (wire, family)| context.public_output(format!("wire-{wire}"), family),
             )
             .unwrap()
             .build()

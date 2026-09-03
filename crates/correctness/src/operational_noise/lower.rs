@@ -817,6 +817,7 @@ fn classify_node_kind(kind: &NodeKind) -> NodeKindClass {
         NodeKind::RealSqrt |
         NodeKind::MatrixBinary(_) |
         NodeKind::MatrixMulAccumulate { .. } |
+        NodeKind::MatrixMulSmallRhs |
         NodeKind::MatrixNegate |
         NodeKind::MatrixScale { .. } |
         NodeKind::Transpose |
@@ -6140,6 +6141,12 @@ impl<'a> ProductionAdapter<'a> {
                 }
                 Value::Expr(accumulated)
             }
+            NodeKind::MatrixMulSmallRhs => {
+                // The bounded RHS is already a typed value in Graph IR.  Preserve the
+                // exact operand edge and use the ordinary matrix product semantics here;
+                // boundedness and relation identity stay in the wire/producer contract.
+                expr(self, ValueOperator::Matrix(MatrixOperation::Multiply), inputs)?
+            }
             NodeKind::MatrixNegate => {
                 expr(self, ValueOperator::Matrix(MatrixOperation::Negate), inputs)?
             }
@@ -7074,7 +7081,9 @@ impl<'a> ProductionAdapter<'a> {
             WireType::Bool | WireType::ConstantBool => Ok(ResolvedValueType::Bool),
             WireType::Real | WireType::ConstantReal => Ok(ResolvedValueType::Real),
             WireType::Bytes { .. } => Ok(ResolvedValueType::Bytes),
-            WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
+            WireType::Matrix(matrix) |
+            WireType::SmallMatrix { matrix, .. } |
+            WireType::Preimage { matrix, .. } => {
                 Ok(ResolvedValueType::Matrix(self.matrix_type_from_ir(matrix)?))
             }
             WireType::Trapdoor { .. } => Ok(ResolvedValueType::Trapdoor),
@@ -7091,9 +7100,9 @@ impl<'a> ProductionAdapter<'a> {
     }
     fn matrix_type(&self, output: &WireType) -> Result<ResolvedMatrixType, ProductionAdapterError> {
         match output {
-            WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
-                self.matrix_type_from_ir(matrix)
-            }
+            WireType::Matrix(matrix) |
+            WireType::SmallMatrix { matrix, .. } |
+            WireType::Preimage { matrix, .. } => self.matrix_type_from_ir(matrix),
             _ => Err(ProductionAdapterError::UnsupportedWireType {
                 wire_type: output.clone(),
                 wire: self.plan.target().residual.clone(),
@@ -8237,7 +8246,8 @@ mod tests {
             OperationalDecoderTarget, OutputRef, StageId, operational_protocol_from_graphs,
         };
         use mxx_dsl::{
-            Bool, DslContext, Family, IdealSpec, Mat, MatFamilyType, Ring, SemanticAnchor, Subgraph,
+            Bool, DslContext, Family, FamilyType, IdealSpec, Mat, MatType, Ring, SemanticAnchor,
+            Subgraph,
         };
         use mxx_ir_core::{
             IntExpr,
@@ -8249,14 +8259,15 @@ mod tests {
         let artifact_a_source = ring.input_family("artifact-a-source", count.clone(), (1, 1));
         let artifact_b_source = ring.input_family("artifact-b-source", count.clone(), (1, 1));
         let producer = DslContext::new("named-parallel-artifact-producer")
-            .public_family_output("artifact-a", artifact_a_source)
+            .public_output("artifact-a", artifact_a_source)
             .expect("artifact A output")
-            .public_family_output("artifact-b", artifact_b_source)
+            .public_output("artifact-b", artifact_b_source)
             .expect("artifact B output")
             .build()
             .expect("producer graph");
 
-        let schema = MatFamilyType { element: ring.matrix_type((1, 1)), count: count.clone() };
+        let schema =
+            FamilyType { element: MatType::new(ring.matrix_type((1, 1))), count: count.clone() };
         let kernel = Subgraph::<Vec<Family<Mat>>, Family<Mat>>::try_define(
             "named-parallel-artifact-kernel",
             vec![schema.clone(), schema.clone(), schema],
@@ -8718,7 +8729,7 @@ mod tests {
             NoPublicLookup, PolyCircuitCompiler,
         };
         use mxx_dsl::{
-            Bool, DslContext, Family, IdealSpec, Mat, MatFamilyType, MatType, Ring, SemanticAnchor,
+            Bool, DslContext, Family, FamilyType, IdealSpec, Mat, MatType, Ring, SemanticAnchor,
             Subgraph,
         };
         use mxx_gadgets::circuit::PolyCircuit;
@@ -8740,16 +8751,18 @@ mod tests {
             .build()
             .expect("producer graph");
 
-        let family_schema =
-            MatFamilyType { element: ring.matrix_type((1, columns)), count: count.clone() };
+        let family_schema = FamilyType {
+            element: MatType::new(ring.matrix_type((1, columns))),
+            count: count.clone(),
+        };
         let kernel = Subgraph::<(Vec<Family<Mat>>, Vec<Mat>), Family<Mat>>::try_define(
             "compact-tall-gaussian-kernel",
             (
                 vec![
                     family_schema.clone(),
                     family_schema,
-                    MatFamilyType {
-                        element: ring.matrix_type((1, secret_size)),
+                    FamilyType {
+                        element: MatType::new(ring.matrix_type((1, secret_size))),
                         count: count.clone(),
                     },
                 ],
@@ -8931,8 +8944,8 @@ mod tests {
         let trapdoor = ring.sample_trapdoor(1, 3, 4, 2, 8);
         let public = trapdoor.public_matrix();
         let target = ring.uniform_residue((1, 1));
-        let preimage = trapdoor.sample_preimage(target.clone(), (4, 1)).as_mat();
-        let residual = public * preimage - target;
+        let preimage = trapdoor.sample_preimage(target.clone(), (4, 1));
+        let residual = preimage.mul_small_rhs(public) - target;
         let decoded = residual
             .clone()
             .threshold_decode_bools(2, 1)
@@ -9130,16 +9143,13 @@ mod tests {
             .expect("trapdoor family");
         let targets =
             Parallel::range(2).map(|_| ring.uniform_residue((1, 1))).expect("target family");
-        let preimages = trapdoors
+        let products = trapdoors
             .clone()
             .parallel_zip_mat_values(targets.clone(), |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (4, 1)).as_mat()
+                let preimage = trapdoor.sample_preimage(target, (4, 1));
+                preimage.mul_small_rhs(trapdoor.public_matrix())
             })
             .expect("preimage family");
-        let products = trapdoors
-            .public_matrices()
-            .parallel_zip(preimages, |_, public, preimage| public * preimage)
-            .expect("product family");
         let residual = products.get_static(0) - targets.get_static(0);
         let decoded = residual
             .clone()
@@ -10113,7 +10123,7 @@ mod tests {
             .semantic_anchor("fixed-slice.decoder")
             .expect("fixed slice decoder anchor");
         let graph = DslContext::new("production-fixed-slice-hash")
-            .private_family_output("operational-residual", family)
+            .private_output("operational-residual", family)
             .expect("fixed slice residual")
             .bool_output("decoded", decoded)
             .expect("fixed slice decoded output")
@@ -10198,12 +10208,12 @@ mod tests {
                         .select(vec![value.clone(), value])
                         .expect("binder-dependent explicit family body")
                         .decompose(4, 2)
-                        .as_mat()
+                        .mul_small_rhs(ring.gadget(1, 4, 2))
                 })
                 .expect("binder-dependent explicit family body")
         } else if binder_dependent_gadget {
             source
-                .parallel_map(|_, value| value.decompose(4, 2).as_mat())
+                .parallel_map(|_, value| value.decompose(4, 2).mul_small_rhs(ring.gadget(1, 4, 2)))
                 .expect("binder-dependent family body")
         } else {
             source.parallel_map(|_, value| value + ring.zero((1, 1))).expect("indexed family body")
@@ -10228,7 +10238,7 @@ mod tests {
             .semantic_anchor("indexed-family.decoder")
             .expect("indexed family decoder anchor");
         let graph = DslContext::new("production-indexed-family")
-            .private_family_output("operational-residual", family)
+            .private_output("operational-residual", family)
             .expect("indexed family residual")
             .bool_output("decoded", decoded)
             .expect("indexed family decoder")
@@ -10321,7 +10331,7 @@ mod tests {
             None,
         );
         let graph = DslContext::new("production-extract-binding-family")
-            .private_family_output("operational-residual", family)
+            .private_output("operational-residual", family)
             .expect("extract-binding residual")
             .bool_output(
                 "decoded",
@@ -10498,7 +10508,10 @@ mod tests {
                     digit_count: IntExpr::constant(if ordinary { 4 } else { 2 }),
                 },
                 vec![input],
-                vec![WireType::Preimage(decomposition_matrix.clone())],
+                vec![WireType::Preimage {
+                    matrix: decomposition_matrix.clone(),
+                    max_coefficient_bound: IntExpr::constant(2),
+                }],
             )
             .output(0)
             .expect("gadget decomposition");
@@ -10632,7 +10645,10 @@ mod tests {
             Vec::new(),
             vec![WireType::IndexedFamily {
                 element: Box::new(if matches!(case, GeneratedGadgetProductCase::Standalone) {
-                    WireType::Preimage(decomposition_matrix.clone())
+                    WireType::Preimage {
+                        matrix: decomposition_matrix.clone(),
+                        max_coefficient_bound: IntExpr::constant(2),
+                    }
                 } else {
                     WireType::Matrix(output_matrix.clone())
                 }),
@@ -12288,6 +12304,97 @@ mod tests {
     }
 
     #[test]
+    fn matrix_mul_small_rhs_preserves_exact_operands_without_new_producers() {
+        let protocol = crate::toy_example::protocol();
+        let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
+        let mut adapter = ProductionAdapter::new(
+            &protocol,
+            &plan,
+            BTreeMap::from([("cutoff".to_owned(), BigInt::from(8))]),
+        )
+        .expect("production adapter");
+        let ring = BigUint::from(17_u8);
+        let lhs_type = ResolvedMatrixType::new(ring.clone(), 4, 1, 2).unwrap();
+        let rhs_type = ResolvedMatrixType::new(ring.clone(), 4, 2, 3).unwrap();
+        let output_type = ResolvedMatrixType::new(ring, 4, 1, 3).unwrap();
+        let lhs = adapter
+            .job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Sampler {
+                    event: SampleEventId(991),
+                    operation: SamplerOperation::UniformResidue { output: lhs_type },
+                },
+                Box::new([]),
+            )
+            .unwrap();
+        let rhs_first = adapter
+            .job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Sampler {
+                    event: SampleEventId(992),
+                    operation: SamplerOperation::Preimage {
+                        output: rhs_type.clone(),
+                        max_coefficient_bound: BigInt::from(3),
+                    },
+                },
+                Box::new([]),
+            )
+            .unwrap();
+        let rhs_second = adapter
+            .job
+            .expressions_mut()
+            .intern(
+                ValueOperator::Sampler {
+                    event: SampleEventId(993),
+                    operation: SamplerOperation::Preimage {
+                        output: rhs_type,
+                        max_coefficient_bound: BigInt::from(3),
+                    },
+                },
+                Box::new([]),
+            )
+            .unwrap();
+        assert_ne!(rhs_first, rhs_second, "same-schema producers retain sampler identity");
+        let domain = FamilyDomain::new(0, 1).unwrap();
+        let rhs_family = adapter.generated_family(domain, rhs_second).unwrap();
+        let index = adapter.intern_index_constant(BigInt::ZERO).unwrap();
+        let selected_rhs = adapter
+            .call_family_in_program_scope_deferred_generated(
+                rhs_family,
+                index,
+                TrustedIndexRange::new(0, 1).unwrap(),
+            )
+            .unwrap();
+        let wire = plan.target().residual.clone();
+        let output = WireType::Matrix(mxx_ir_core::types::MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(4),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(3),
+        });
+        let Value::Expr(product) = adapter
+            .lower_node(
+                &wire,
+                &NodeKind::MatrixMulSmallRhs,
+                &output,
+                &[Value::Expr(lhs), Value::Expr(selected_rhs)],
+            )
+            .unwrap()
+        else {
+            panic!("small-RHS multiplication must produce an expression")
+        };
+        let node = adapter.job.expressions().node(product).unwrap();
+        assert!(matches!(node.operator, ValueOperator::Matrix(MatrixOperation::Multiply)));
+        assert_eq!(node.inputs.as_ref(), &[lhs, selected_rhs]);
+        assert_eq!(
+            adapter.job.expressions().value_type(product).unwrap(),
+            &ResolvedValueType::Matrix(output_type)
+        );
+    }
+
+    #[test]
     fn matrix_observation_materializes_wrapped_calls_but_preserves_fact_authority() {
         let protocol = crate::toy_example::protocol();
         let plan = ProtocolPlan::build(&protocol, "toy-threshold").expect("toy plan");
@@ -13785,14 +13892,14 @@ mod tests {
         let residual = preflight
             .resolve(plan.target().residual.clone(), Rc::new(BTreeMap::new()))
             .expect("binder-dependent family residual");
-        assert!(preflight.compact_residual_preflight(&residual).is_none());
+        assert!(preflight.compact_residual_preflight(&residual).is_some());
         assert!(!preflight.job.relations().is_frozen());
 
         let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
             .expect("binder-dependent eager adapter");
         let (mut job, roots) = adapter.lower().expect("binder-dependent eager fallback lowering");
-        let ProductionRoot::CompactFamily(_) = roots.residual else {
-            panic!("binder-dependent family must retain compact family marker")
+        let ProductionRoot::Family(_) = roots.residual else {
+            panic!("binder-dependent family must retain typed family marker")
         };
         let target = super::super::report::ReportTarget {
             target_id: "indexed-family-production".to_owned(),
@@ -13816,13 +13923,13 @@ mod tests {
         let residual = preflight
             .resolve(plan.target().residual.clone(), Rc::new(BTreeMap::new()))
             .expect("binder-dependent explicit family residual");
-        assert!(preflight.compact_residual_preflight(&residual).is_none());
+        assert!(preflight.compact_residual_preflight(&residual).is_some());
         assert!(!preflight.job.relations().is_frozen());
 
         let adapter = ProductionAdapter::new(&protocol, &plan, BTreeMap::new())
             .expect("binder-dependent explicit eager adapter");
         let (mut job, roots) = adapter.lower().expect("binder-dependent explicit eager fallback");
-        assert!(matches!(roots.residual, ProductionRoot::CompactFamily(_)));
+        assert!(matches!(roots.residual, ProductionRoot::Family(_)));
         let target = super::super::report::ReportTarget {
             target_id: "indexed-family-production".to_owned(),
             plaintext_modulus: 2_u8.into(),

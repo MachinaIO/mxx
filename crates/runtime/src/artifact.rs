@@ -27,6 +27,7 @@ pub struct ArtifactKey {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ArtifactPayload {
     Matrix(Vec<u8>),
+    SmallMatrix(Vec<u8>),
     Bytes(Vec<u8>),
     Trapdoor { public_bytes: Vec<u8>, secret_bytes: Vec<u8> },
     TypedBlob(Vec<u8>),
@@ -561,6 +562,8 @@ impl MemoryArtifactStore {
 fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> bool {
     match (artifact_type, payload) {
         (ArtifactType::Matrix(_), ArtifactPayload::Matrix(_)) |
+        (ArtifactType::SmallMatrix { .. }, ArtifactPayload::SmallMatrix(_)) |
+        (ArtifactType::Preimage { .. }, ArtifactPayload::SmallMatrix(_)) |
         (ArtifactType::Trapdoor { .. }, ArtifactPayload::Trapdoor { .. }) |
         (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(_)) => true,
         (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes)) => bytes.len() == *length,
@@ -571,6 +574,7 @@ fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> b
 pub(crate) fn payload_bytes(payload: &ArtifactPayload) -> Vec<u8> {
     match payload {
         ArtifactPayload::Matrix(bytes) |
+        ArtifactPayload::SmallMatrix(bytes) |
         ArtifactPayload::Bytes(bytes) |
         ArtifactPayload::TypedBlob(bytes) => bytes.clone(),
         ArtifactPayload::Trapdoor { public_bytes, secret_bytes } => {
@@ -630,6 +634,35 @@ mod tests {
             )
             .expect_err("wrong payload variant must be rejected");
         assert!(matches!(error, MemoryArtifactError::PayloadTypeMismatch(_)));
+
+        let bounded_matrix = ConcreteMatrixType {
+            modulus: BigInt::from(17),
+            ring_dimension: 8,
+            rows: 1,
+            columns: 1,
+        };
+        let compact_payload = ArtifactPayload::SmallMatrix(vec![0]);
+        assert!(payload_matches(
+            &ArtifactType::SmallMatrix {
+                matrix: bounded_matrix.clone(),
+                max_coefficient_bound: BigInt::from(3),
+            },
+            &compact_payload,
+        ));
+        assert!(payload_matches(
+            &ArtifactType::Preimage {
+                matrix: bounded_matrix.clone(),
+                max_coefficient_bound: BigInt::from(3),
+            },
+            &compact_payload,
+        ));
+        assert!(!payload_matches(
+            &ArtifactType::Preimage {
+                matrix: bounded_matrix,
+                max_coefficient_bound: BigInt::from(3),
+            },
+            &ArtifactPayload::Matrix(vec![0]),
+        ));
     }
 
     #[test]

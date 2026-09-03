@@ -79,7 +79,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diamond::{DiamondWeCompiler, DiamondWeConfig};
+    use crate::diamond::{
+        DiamondWeCompiler, DiamondWeConfig, default_preimage_max_coefficient_bound,
+    };
     use mxx_bench_estimator::{MeasurementNode, NodeMeasurement};
     use mxx_gadgets::circuit::BooleanCircuitShape;
     use mxx_ir_core::{ParamEnv, RealExpr, types::ConcreteWireType};
@@ -101,7 +103,7 @@ mod tests {
 
         fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
             match wire_type {
-                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage(matrix) => {
+                ConcreteWireType::Matrix(matrix) | ConcreteWireType::Preimage { matrix, .. } => {
                     (matrix.rows * matrix.columns * matrix.ring_dimension * 8) as u64
                 }
                 _ => 8,
@@ -111,6 +113,9 @@ mod tests {
 
     #[test]
     fn estimator_consumes_the_actual_encryption_and_decryption_graphs() {
+        let preimage_max_coefficient_bound =
+            default_preimage_max_coefficient_bound(&RealExpr::from_integer(4), 8, 2, &4.into())
+                .unwrap();
         let compiler = DiamondWeCompiler::new(
             DiamondWeConfig {
                 modulus: 257.into(),
@@ -123,7 +128,7 @@ mod tests {
                 trapdoor_sigma: RealExpr::from_integer(4),
                 error_sigma: RealExpr::from_integer(1),
                 error_max_coefficient_bound: 6.into(),
-                preimage_max_coefficient_bound: 26.into(),
+                preimage_max_coefficient_bound,
                 bgg_tag: b"diamond-estimate-test".to_vec(),
             },
             BooleanCircuitShape {

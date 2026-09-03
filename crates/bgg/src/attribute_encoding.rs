@@ -146,7 +146,8 @@ impl AttributeEncodingCompiler {
             let terms = (0..output_rows)
                 .map(|row| {
                     let target = self.unit_column(output_rows, row);
-                    outputs[row * output_columns + column].clone() * self.decompose(target)
+                    self.decompose(target)
+                        .mul_small_rhs(outputs[row * output_columns + column].clone())
                 })
                 .collect::<Vec<_>>();
             columns.push(sum_matrices(terms));
@@ -169,7 +170,8 @@ impl AttributeEncodingCompiler {
             let terms = (0..output_rows)
                 .map(|row| {
                     let target = self.unit_column(output_rows, row);
-                    outputs[row * output_columns + column].clone() * self.decompose(target)
+                    self.decompose(target)
+                        .mul_small_rhs(outputs[row * output_columns + column].clone())
                 })
                 .collect::<Vec<_>>();
             columns.push(sum_matrices(terms));
@@ -197,8 +199,8 @@ impl AttributeEncodingCompiler {
                 let output = &outputs[row * output_columns + column];
                 let target = self.unit_column(output_rows, row);
                 let decomposed = self.decompose(target.clone());
-                vector_terms.push(output.vector.clone() * decomposed.clone());
-                public_terms.push(output.public_matrix.clone() * decomposed);
+                vector_terms.push(decomposed.clone().mul_small_rhs(output.vector.clone()));
+                public_terms.push(decomposed.mul_small_rhs(output.public_matrix.clone()));
                 value_terms.push(target * output.attribute.clone());
             }
             vectors.push(sum_matrices(vector_terms));
@@ -233,8 +235,8 @@ impl AttributeEncodingCompiler {
                 let output = &outputs[row * output_columns + column];
                 let target = self.unit_column(output_rows, row);
                 let decomposed = self.decompose(target.clone());
-                vector_terms.push(output.vector.clone() * decomposed.clone());
-                public_terms.push(output.public_matrix.clone() * decomposed);
+                vector_terms.push(decomposed.clone().mul_small_rhs(output.vector.clone()));
+                public_terms.push(decomposed.mul_small_rhs(output.public_matrix.clone()));
                 value_terms.push(target * output.attribute.clone());
             }
             vectors.push(sum_matrices(vector_terms));
@@ -248,15 +250,15 @@ impl AttributeEncodingCompiler {
         })
     }
 
-    fn decompose(&self, matrix: Mat) -> Mat {
-        matrix.decompose(self.gadget_base.clone(), self.digit_count.clone()).as_mat()
+    fn decompose(&self, matrix: Mat) -> mxx_dsl::Preimage {
+        matrix.decompose(self.gadget_base.clone(), self.digit_count.clone())
     }
 
     fn scalar(&self, coefficients: impl IntoIterator<Item = mxx_ir_core::IntExpr>) -> Mat {
         self.ring.polynomial(coefficients)
     }
 
-    fn large_scalar_decomposition(&self, public_matrix: &Mat, scalar: Mat) -> Mat {
+    fn large_scalar_decomposition(&self, public_matrix: &Mat, scalar: Mat) -> mxx_dsl::Preimage {
         let rows = public_matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.gadget_base.clone(), self.digit_count.clone());
         self.decompose(gadget * scalar)
@@ -307,7 +309,9 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicAttributeLowering<'_> {
         match operation {
             PolyGateKind::Add => Ok(lhs.clone() + rhs.clone()),
             PolyGateKind::Sub => Ok(lhs.clone() - rhs.clone()),
-            PolyGateKind::Mul => Ok(lhs.clone() * self.compiler.decompose(rhs.clone())),
+            PolyGateKind::Mul => {
+                Ok(self.compiler.decompose(rhs.clone()).mul_small_rhs(lhs.clone()))
+            }
             _ => unsupported(gate, "non-arithmetic gate"),
         }
     }
@@ -335,7 +339,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicAttributeLowering<'_> {
                 .map(num_bigint::BigInt::from)
                 .map(mxx_ir_core::IntExpr::constant),
         );
-        Ok(input.clone() * self.compiler.large_scalar_decomposition(input, scalar))
+        Ok(self.compiler.large_scalar_decomposition(input, scalar).mul_small_rhs(input.clone()))
     }
 }
 
@@ -415,9 +419,9 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
                 // encoding of the product under the public product matrix.
                 let decomposed_rhs = self.compiler.decompose(rhs.public_matrix.clone());
                 Ok(AttributeEncodingWire {
-                    vector: lhs.vector.clone() * decomposed_rhs.clone() +
+                    vector: decomposed_rhs.clone().mul_small_rhs(lhs.vector.clone()) +
                         rhs.vector.clone() * lhs.attribute.clone(),
-                    public_matrix: lhs.public_matrix.clone() * decomposed_rhs,
+                    public_matrix: decomposed_rhs.mul_small_rhs(lhs.public_matrix.clone()),
                     attribute: lhs.attribute.clone() * rhs.attribute.clone(),
                 })
             }
@@ -456,8 +460,8 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
         let decomposed =
             self.compiler.large_scalar_decomposition(&input.public_matrix, scalar.clone());
         Ok(AttributeEncodingWire {
-            vector: input.vector.clone() * decomposed.clone(),
-            public_matrix: input.public_matrix.clone() * decomposed,
+            vector: decomposed.clone().mul_small_rhs(input.vector.clone()),
+            public_matrix: decomposed.mul_small_rhs(input.public_matrix.clone()),
             attribute: input.attribute.clone() * scalar,
         })
     }

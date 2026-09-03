@@ -569,8 +569,8 @@ mod tests {
         };
         let key = ring.bytes_input("key", 32);
         let h = hash(key.clone());
-        let decomposition = (gadget() * coefficient()).decompose(4, 2).as_mat();
-        let p = h.clone() * decomposition;
+        let decomposition = (gadget() * coefficient()).decompose(4, 2);
+        let p = decomposition.mul_small_rhs(h.clone());
         let preprocess = DslContext::new("lineage-preprocess")
             .int_parameter("cutoff")
             .public_output("H", h)
@@ -591,8 +591,8 @@ mod tests {
             ring.artifact_input(production_id, "P", (1, 1), ArtifactConfidentiality::Public);
         let recomputed_h = hash(online_key);
         let online_h = if recompute_h { recomputed_h } else { imported_h };
-        let online_decomposition = (gadget() * coefficient()).decompose(4, 2).as_mat();
-        let residual = imported_p - online_h * online_decomposition;
+        let online_decomposition = (gadget() * coefficient()).decompose(4, 2);
+        let residual = imported_p - online_decomposition.mul_small_rhs(online_h);
         let decoded = residual
             .clone()
             .threshold_decode_bools(IntExpr::constant(2), 1)

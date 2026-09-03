@@ -158,12 +158,13 @@ impl BggTallEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let rows = lhs.rows.clone().parallel_zip3(
             rhs.rows.clone(),
             lhs_plaintexts.clone(),
-            move |_, left, right, plaintext| left * decomposed_rhs.clone() + right * plaintext,
+            move |_, left, right, plaintext| {
+                decomposed_rhs.clone().mul_small_rhs(left) + right * plaintext
+            },
         )?;
         let plaintext = match &rhs.plaintext {
             BggTallPlaintext::Diagonal(rhs_plaintexts) => BggTallPlaintext::Diagonal(
@@ -187,7 +188,7 @@ impl BggTallEncodingCompiler {
         input: &BggTallEncodingWire,
         scalar: &Mat,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
-        self.scalar_mul(input, scalar, scalar.clone(), false)
+        self.scalar_mul(input, scalar, scalar.clone(), None, false)
     }
 
     /// Multiplies every row by the gadget decomposition of a large scalar.
@@ -197,7 +198,7 @@ impl BggTallEncodingCompiler {
         scalar: &Mat,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
         let decomposed = self.public_key.large_scalar_decomposition(&input.pubkey, scalar);
-        self.scalar_mul(input, scalar, decomposed, true)
+        self.scalar_mul(input, scalar, scalar.clone(), Some(decomposed), true)
     }
 
     /// Applies one provisioned cyclic rotation pair.
@@ -228,22 +229,20 @@ impl BggTallEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let step1 =
             transform.left_rows.clone().parallel_zip(rotated_rows, move |_, left, input| {
-                left * decomposed_input.clone() + input
+                decomposed_input.clone().mul_small_rhs(left) + input
             })?;
         let decomposed_right = transform
             .right_matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let rows = step1.parallel_zip3(
             rotated_plaintexts.clone(),
             rotated_right_rows,
             move |_, intermediate, plaintext, right| {
-                intermediate * decomposed_right.clone() + right * plaintext
+                decomposed_right.clone().mul_small_rhs(intermediate) + right * plaintext
             },
         )?;
         Ok(BggTallEncodingWire {
@@ -372,27 +371,19 @@ impl BggTallEncodingCompiler {
             .pubkey
             .matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
-        let intermediate =
-            left_rows.parallel_zip(left_times_input_rows, move |_, left, input| {
-                Mat::multi_row_gemm_accumulate(
-                    vec![(1, left, decomposed_input.clone())],
-                    Some(input),
-                )
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+        let intermediate = left_rows
+            .parallel_zip(left_times_input_rows, move |_, left, input| {
+                decomposed_input.clone().mul_small_rhs(left) + input
             })?;
         let decomposed_right = transform
             .right_matrix
             .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-            .as_mat();
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
         let rows = intermediate.parallel_zip(
             left_message_times_right_rows,
             move |_, intermediate, right| {
-                Mat::multi_row_gemm_accumulate(
-                    vec![(1, intermediate, decomposed_right.clone())],
-                    Some(right),
-                )
+                decomposed_right.clone().mul_small_rhs(intermediate) + right
             },
         )?;
         Ok(BggTallEncodingWire {
@@ -414,18 +405,16 @@ impl BggTallEncodingCompiler {
         left_matrix: &Mat,
         right_matrix: &Mat,
     ) -> BggPublicKeyWire {
-        let first = left_matrix.clone() *
-            input
-                .matrix
+        let first = input
+            .matrix
+            .clone()
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+            .mul_small_rhs(left_matrix.clone());
+        BggPublicKeyWire {
+            matrix: right_matrix
                 .clone()
                 .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                .as_mat();
-        BggPublicKeyWire {
-            matrix: first *
-                right_matrix
-                    .clone()
-                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                    .as_mat(),
+                .mul_small_rhs(first),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -469,9 +458,16 @@ impl BggTallEncodingCompiler {
         input: &BggTallEncodingWire,
         scalar: &Mat,
         row_factor: Mat,
+        decomposed_row_factor: Option<mxx_dsl::Preimage>,
         large: bool,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
-        let rows = input.rows.clone().parallel_map(move |_, row| row * row_factor.clone())?;
+        let rows = match decomposed_row_factor {
+            Some(decomposed) => input
+                .rows
+                .clone()
+                .parallel_map(move |_, row| decomposed.clone().mul_small_rhs(row))?,
+            None => input.rows.clone().parallel_map(move |_, row| row * row_factor.clone())?,
+        };
         let plaintext = match &input.plaintext {
             BggTallPlaintext::Hidden => BggTallPlaintext::Hidden,
             BggTallPlaintext::Diagonal(values) => {
@@ -808,7 +804,7 @@ mod tests {
     };
     use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{
             PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -1022,7 +1018,10 @@ mod tests {
         );
         assert_eq!(
             matrix_output(&result, "product-public"),
-            &left_public.mul_decompose(&right_public)
+            &left_public
+                .clone()
+                .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
+                .unwrap()
         );
         for slot in 0..slots {
             assert_eq!(
@@ -1031,7 +1030,10 @@ mod tests {
             );
             assert_eq!(
                 matrix_output(&result, &format!("product-row-{slot}")),
-                &(left_rows[slot].mul_decompose(&right_public) +
+                &(left_rows[slot]
+                    .clone()
+                    .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
+                    .unwrap() +
                     right_rows[slot].clone() * left_plaintexts[slot].entry(0, 0))
             );
             assert_eq!(
@@ -1153,13 +1155,24 @@ mod tests {
         let result = execute_graph(built, parameters, inputs);
         assert_eq!(
             matrix_output(&result, "public"),
-            &a_forward.mul_decompose(&input_public).mul_decompose(&a_backward)
+            &a_forward
+                .clone()
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
+                .unwrap()
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
+                .unwrap()
         );
         for destination in 0..slots {
             let source = (destination + slots - 1) % slots;
-            let step1 =
-                c_forward[destination].mul_decompose(&input_public) + input_rows[source].clone();
-            let expected = step1.mul_decompose(&a_backward) +
+            let step1 = c_forward[destination]
+                .clone()
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
+                .unwrap() +
+                input_rows[source].clone();
+            let expected = step1
+                .clone()
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
+                .unwrap() +
                 c_backward[source].clone() * plaintexts[source].entry(0, 0);
             assert_eq!(matrix_output(&result, &format!("row-{destination}")), &expected);
             assert_eq!(

@@ -47,8 +47,15 @@ struct GpuMatrix
     };
     struct SharedLimbBuffer
     {
+        struct DeviceDescriptor
+        {
+            uint8_t *base;
+            size_t stride;
+            uint8_t width;
+        };
         int device;
         uint8_t *ptr;
+        DeviceDescriptor *device_descriptors;
         size_t limb_count;
         size_t bytes_per_poly;
         size_t bytes_total;
@@ -78,3 +85,4 @@ struct GpuMatrix
 #include "matrix/MatrixSerde.cuh"
 #include "matrix/MatrixTrapdoor.cuh"
 #include "matrix/MatrixUtils.cuh"
+#include "matrix/MatrixSmallRhs.cuh"

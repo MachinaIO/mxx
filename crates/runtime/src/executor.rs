@@ -9,7 +9,10 @@ use crate::{
 };
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
-    artifact::{ArtifactConfidentiality, ArtifactType, ManifestArtifact, ProductionId},
+    artifact::{
+        ArtifactConfidentiality, ArtifactType, ConcreteBoundedMatrixSchema, ManifestArtifact,
+        ProductionId, SmallMatrixSemanticKind,
+    },
     expr::euclidean_div_rem,
     graph::{FrozenGraphScopeId, GraphScope},
     node::{
@@ -297,7 +300,7 @@ where
     let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
         .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
     let production = mxx_ir_core::artifact::production_id(spec_hash, execution_nonce);
-    let input_digest = runtime_inputs_digest(backend, &inputs)?;
+    let input_digest = runtime_inputs_digest(validated, backend, &inputs)?;
     let descriptor = SessionDescriptor::new(
         production.clone(),
         validated.source.name().to_owned(),
@@ -1133,6 +1136,17 @@ where
                 let bytes = self.backend.matrix_to_bytes(matrix);
                 Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
             }
+            (RuntimeValue::SmallMatrix(matrix), artifact_type)
+                if artifact_type.bounded_matrix_schema().is_some() =>
+            {
+                let (schema, semantic_kind) =
+                    artifact_type.bounded_matrix_schema().expect("bounded artifact checked above");
+                let bytes = self
+                    .backend
+                    .small_matrix_to_bytes(matrix, &schema, semantic_kind)
+                    .map_err(Self::backend_error)?;
+                Ok((ArtifactPayload::SmallMatrix(bytes.clone()), bytes))
+            }
             (RuntimeValue::Bytes(bytes), ArtifactType::Bytes { length })
                 if bytes.len() == *length =>
             {
@@ -1171,6 +1185,41 @@ where
         inputs: &BTreeMap<String, RuntimeValue<B>>,
         values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
     ) -> Result<(), ExecutionError> {
+        #[cfg(feature = "gpu")]
+        {
+            if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
+                let argument_types = node
+                    .args
+                    .iter()
+                    .map(|wire| {
+                        self.validated_wire_type(scope_id, *wire).cloned().ok_or_else(|| {
+                            ExecutionError::MissingMetadata(WireId {
+                                instantiation_path: path.to_vec(),
+                                wire: *wire,
+                            })
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut output_types = self
+                    .validated
+                    .scope(scope_id)
+                    .into_iter()
+                    .flat_map(|scope| scope.wire_types.iter())
+                    .filter(|(wire, _)| wire.node == node.id)
+                    .map(|(wire, ty)| (wire.port, ty.clone()))
+                    .collect::<Vec<_>>();
+                output_types.sort_by_key(|(port, _)| *port);
+                let output_types = output_types.into_iter().map(|(_, ty)| ty).collect::<Vec<_>>();
+                let operation = crate::gpu_calibration::gpu_calibration_operation_identity(
+                    node.kind,
+                    &argument_types,
+                    &output_types,
+                    env,
+                )
+                .map_err(ExecutionError::Backend)?;
+                self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
+            }
+        }
         match &node.kind {
             NodeKind::Input { name, wire_type: _, artifact } => {
                 if let Some(artifact) = artifact {
@@ -1242,7 +1291,17 @@ where
                         .get(name)
                         .cloned()
                         .ok_or_else(|| ExecutionError::MissingInput(name.clone()))?;
-                    values.insert(WireRef { node: node.id, port: Port(0) }, value);
+                    let wire = WireRef { node: node.id, port: Port(0) };
+                    let concrete = self.validated_wire_type(scope_id, wire).ok_or_else(|| {
+                        ExecutionError::MissingMetadata(WireId {
+                            instantiation_path: path.to_vec(),
+                            wire,
+                        })
+                    })?;
+                    if !runtime_value_matches_wire_type(&value, concrete) {
+                        return Err(ExecutionError::ValueKind(wire));
+                    }
+                    values.insert(wire, value);
                 }
             }
             NodeKind::ConstantInt(value) => {
@@ -1391,6 +1450,15 @@ where
                     MatrixBinaryOp::Multiply => self.backend.multiply(&left, &right),
                 }
                 .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::MatrixMulSmallRhs => {
+                let lhs = self.matrix(values, node.args[0])?;
+                let rhs = self.small_matrix(values, node.args[1])?;
+                let output = self
+                    .backend
+                    .multiply_small_rhs(lhs.as_ref(), rhs.as_ref())
+                    .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
@@ -1571,8 +1639,13 @@ where
                     .as_ref()
                     .map(|count| self.eval_usize(node.id, count, env))
                     .transpose()?;
-                let gadget_layout = match (variant, gadget_base.as_ref(), digit_count) {
-                    (HashVariant::Plain, None, None) => None,
+                match (variant, gadget_base.as_ref(), digit_count) {
+                    (HashVariant::Plain, None, None) => {
+                        let value = self.sample_matrix(path, wire, &ty, |backend| {
+                            backend.sample_hash(&ty, key, &tag)
+                        })?;
+                        self.put(values, node.id, 0, RuntimeValue::matrix(value));
+                    }
                     (
                         HashVariant::Decomposed | HashVariant::SmallDecomposed,
                         Some(base),
@@ -1585,7 +1658,28 @@ where
                                     .to_owned(),
                             });
                         }
-                        Some((base, count))
+                        let (schema, semantic_kind) =
+                            self.bounded_matrix_schema(scope_id, path, wire)?;
+                        if semantic_kind != SmallMatrixSemanticKind::Generic {
+                            return Err(ExecutionError::Manifest(
+                                "decomposed hash output is not a generic small matrix".to_owned(),
+                            ));
+                        }
+                        let value = self.sample_small_matrix(
+                            path,
+                            wire,
+                            &schema,
+                            semantic_kind,
+                            |backend| match variant {
+                                HashVariant::Decomposed => {
+                                    backend.sample_hash_decomposed(&ty, key, &tag, base, count)
+                                }
+                                HashVariant::SmallDecomposed => backend
+                                    .sample_hash_small_decomposed(&ty, key, &tag, base, count),
+                                HashVariant::Plain => unreachable!("plain hash handled above"),
+                            },
+                        )?;
+                        self.put(values, node.id, 0, RuntimeValue::small_matrix(value));
                     }
                     _ => {
                         return Err(ExecutionError::Expression {
@@ -1593,11 +1687,7 @@ where
                             message: "hash variant and gadget layout do not match".to_owned(),
                         });
                     }
-                };
-                let value = self.sample_matrix(path, wire, &ty, |backend| {
-                    backend.sample_hash(&ty, key, &tag, *variant, gadget_layout)
-                })?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(value));
+                }
             }
             NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } => {
                 let matrix_wire = WireRef { node: node.id, port: Port(0) };
@@ -1649,10 +1739,16 @@ where
                 let target = self.matrix(values, node.args[2])?;
                 let target_type = self.matrix_type(scope_id, path, node.args[2])?;
                 let wire = WireRef { node: node.id, port: Port(0) };
-                let ty = self.matrix_type(scope_id, path, wire)?;
-                let max_coefficient_bound = max_coefficient_bound
+                let (mut schema, semantic_kind) =
+                    self.bounded_matrix_schema(scope_id, path, wire)?;
+                schema.max_coefficient_bound = max_coefficient_bound
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
+                if semantic_kind != SmallMatrixSemanticKind::Preimage {
+                    return Err(ExecutionError::Manifest(
+                        "preimage sampler output is not relation typed".to_owned(),
+                    ));
+                }
                 let (value, sampled) = if let Some(small) = gadget_small {
                     self.backend
                         .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
@@ -1666,23 +1762,29 @@ where
                 } else {
                     let secret =
                         secret.as_ref().expect("sampled trapdoor must carry secret material");
-                    self.sample_matrix_with_status(path, wire, &ty, |backend| {
-                        backend.sample_preimage(
-                            &ty,
-                            sigma,
-                            &gadget_base,
-                            digit_count,
-                            &max_coefficient_bound,
-                            secret,
-                            &public,
-                            &target,
-                        )
-                    })?
+                    self.sample_small_matrix_with_status(
+                        path,
+                        wire,
+                        &schema,
+                        semantic_kind,
+                        |backend| {
+                            backend.sample_preimage(
+                                &schema.matrix,
+                                sigma,
+                                &gadget_base,
+                                digit_count,
+                                &schema.max_coefficient_bound,
+                                secret,
+                                &public,
+                                &target,
+                            )
+                        },
+                    )?
                 };
                 if sampled {
                     self.record_preimages(1);
                 }
-                self.put(values, node.id, 0, RuntimeValue::matrix(value));
+                self.put(values, node.id, 0, RuntimeValue::small_matrix(value));
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
                 let input = self.matrix(values, node.args[0])?;
@@ -1710,7 +1812,7 @@ where
                 }
                 let output =
                     self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
-                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+                self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
             }
             NodeKind::ExtractCoefficient { position, .. } => {
                 let input = self.matrix(values, node.args[0])?;
@@ -1864,96 +1966,102 @@ where
                     return Err(ExecutionError::BackendPlacement { placement: 0, count: 0 });
                 }
                 let parent_placement = self.backend.active_placement();
-                let mut broadcast_inputs = (0..placement_count)
-                    .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
-                    .collect::<Vec<_>>();
-                for (argument, (wire, mode)) in
-                    node.args.iter().zip(&loop_node.input_modes).enumerate()
-                {
-                    if matches!(mode, LoopInputMode::Broadcast) {
-                        let placed = self.values_for_placements(self.value(values, *wire)?)?;
-                        for (placement, value) in placed.into_iter().enumerate() {
-                            broadcast_inputs[placement][argument] = Some(value);
-                        }
-                    }
-                }
-                self.set_placement(parent_placement)?;
-                let wave_size = self.config.max_parallel_instances.get();
-                for wave_start in (0..count).step_by(wave_size) {
-                    let wave_end = count.min(wave_start.saturating_add(wave_size));
-                    let wave_len = wave_end - wave_start;
-                    let mut child_envs = Vec::with_capacity(wave_len);
-                    let mut child_paths = Vec::with_capacity(wave_len);
-                    let mut child_inputs = Vec::with_capacity(wave_len);
-                    let mut child_placements = Vec::with_capacity(wave_len);
-                    for index in wave_start..wave_end {
-                        let placement = index % placement_count;
-                        child_envs.push(self.child_env(
-                            env,
-                            &loop_node.bindings,
-                            Some((loop_node.index_slot, index)),
-                            node.id,
-                        )?);
-                        let mut child_path = path.to_vec();
-                        child_path.push(InstantiationFrame {
-                            call: node.id,
-                            loop_index: Some(index as u64),
-                        });
-                        child_paths.push(child_path);
-                        child_placements.push(placement);
-                        child_inputs.push(self.loop_child_inputs(
-                            child,
-                            node,
-                            &loop_node.input_modes,
-                            index,
-                            placement,
-                            &broadcast_inputs[placement],
-                            values,
-                        )?);
-                    }
-                    let instances = self.execute_instances_batch(
-                        &child_id,
-                        child_envs,
-                        child_paths,
-                        child_inputs,
-                        child_placements,
-                    )?;
-                    for (offset, instance) in instances.into_iter().enumerate() {
-                        for (port, value) in instance.outputs.into_iter().enumerate() {
-                            if let Some((name, descriptor)) = &staged[port] {
-                                let (payload, _) =
-                                    self.encode_artifact(&value, &descriptor.artifact_type)?;
-                                self.artifact_store
-                                    .store(
-                                        ArtifactKey {
-                                            production: self.scratch_production.clone(),
-                                            name: name.clone(),
-                                            index: Some(wave_start + offset),
-                                        },
-                                        &descriptor.artifact_type,
-                                        descriptor.confidentiality,
-                                        descriptor.layout.as_deref(),
-                                        payload,
-                                    )
-                                    .map_err(Self::artifact_error)?;
-                            } else {
-                                families[port].push(value);
+                let loop_result = (|| {
+                    let mut broadcast_inputs = (0..placement_count)
+                        .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
+                        .collect::<Vec<_>>();
+                    for (argument, (wire, mode)) in
+                        node.args.iter().zip(&loop_node.input_modes).enumerate()
+                    {
+                        if matches!(mode, LoopInputMode::Broadcast) {
+                            let placed = self.values_for_placements(self.value(values, *wire)?)?;
+                            for (placement, value) in placed.into_iter().enumerate() {
+                                broadcast_inputs[placement][argument] = Some(value);
                             }
                         }
                     }
-                }
-                self.set_placement(parent_placement)?;
-                for (port, family) in families.into_iter().enumerate() {
-                    let value = match &staged[port] {
-                        Some((name, descriptor)) => RuntimeValue::StagedArtifactFamily {
-                            production: self.scratch_production.clone(),
-                            name: name.clone(),
-                            descriptor: descriptor.clone(),
-                        },
-                        None => RuntimeValue::IndexedFamily(family),
-                    };
-                    self.put(values, node.id, port as u32, value);
-                }
+                    self.set_placement(parent_placement)?;
+                    let wave_size = self.config.max_parallel_instances.get();
+                    for wave_start in (0..count).step_by(wave_size) {
+                        let wave_end = count.min(wave_start.saturating_add(wave_size));
+                        let wave_len = wave_end - wave_start;
+                        let mut child_envs = Vec::with_capacity(wave_len);
+                        let mut child_paths = Vec::with_capacity(wave_len);
+                        let mut child_inputs = Vec::with_capacity(wave_len);
+                        let mut child_placements = Vec::with_capacity(wave_len);
+                        for index in wave_start..wave_end {
+                            let placement = index % placement_count;
+                            child_envs.push(self.child_env(
+                                env,
+                                &loop_node.bindings,
+                                Some((loop_node.index_slot, index)),
+                                node.id,
+                            )?);
+                            let mut child_path = path.to_vec();
+                            child_path.push(InstantiationFrame {
+                                call: node.id,
+                                loop_index: Some(index as u64),
+                            });
+                            child_paths.push(child_path);
+                            child_placements.push(placement);
+                            child_inputs.push(self.loop_child_inputs(
+                                child,
+                                node,
+                                &loop_node.input_modes,
+                                index,
+                                placement,
+                                &broadcast_inputs[placement],
+                                values,
+                            )?);
+                        }
+                        let instances = self.execute_instances_batch(
+                            &child_id,
+                            child_envs,
+                            child_paths,
+                            child_inputs,
+                            child_placements.clone(),
+                        )?;
+                        for (offset, instance) in instances.into_iter().enumerate() {
+                            self.set_placement(child_placements[offset])?;
+                            for (port, value) in instance.outputs.into_iter().enumerate() {
+                                if let Some((name, descriptor)) = &staged[port] {
+                                    let (payload, _) =
+                                        self.encode_artifact(&value, &descriptor.artifact_type)?;
+                                    self.artifact_store
+                                        .store(
+                                            ArtifactKey {
+                                                production: self.scratch_production.clone(),
+                                                name: name.clone(),
+                                                index: Some(wave_start + offset),
+                                            },
+                                            &descriptor.artifact_type,
+                                            descriptor.confidentiality,
+                                            descriptor.layout.as_deref(),
+                                            payload,
+                                        )
+                                        .map_err(Self::artifact_error)?;
+                                } else {
+                                    families[port].push(value);
+                                }
+                            }
+                        }
+                    }
+                    for (port, family) in families.into_iter().enumerate() {
+                        let value = match &staged[port] {
+                            Some((name, descriptor)) => RuntimeValue::StagedArtifactFamily {
+                                production: self.scratch_production.clone(),
+                                name: name.clone(),
+                                descriptor: descriptor.clone(),
+                            },
+                            None => RuntimeValue::IndexedFamily(family),
+                        };
+                        self.put(values, node.id, port as u32, value);
+                    }
+                    Ok::<(), ExecutionError>(())
+                })();
+                let restore_result = self.set_placement(parent_placement);
+                loop_result?;
+                restore_result?;
             }
             NodeKind::SequentialLoop(loop_node) => {
                 let child_id =
@@ -2149,11 +2257,13 @@ where
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
     ) -> Result<(), ExecutionError> {
+        debug_assert_eq!(envs.len(), values.len());
         struct Pending<M, T> {
             instance: usize,
             placement: usize,
             wire: WireRef,
             path: Vec<InstantiationFrame>,
+            schema: ConcreteBoundedMatrixSchema,
             request: PreimageRequest<M, T>,
         }
 
@@ -2170,17 +2280,27 @@ where
             }
             let target = self.matrix(&mut values[instance], node.args[2])?;
             let wire = WireRef { node: node.id, port: Port(0) };
+            let (mut schema, semantic_kind) =
+                self.bounded_matrix_schema(scope_id, &paths[instance], wire)?;
+            if semantic_kind != SmallMatrixSemanticKind::Preimage {
+                return Err(ExecutionError::Manifest(
+                    "batched preimage sampler output is not relation typed".to_owned(),
+                ));
+            }
             if let Some(small) = gadget_small {
+                let target_type = self.matrix_type(scope_id, &paths[instance], node.args[2])?;
+                self.backend
+                    .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
+                    .map_err(Self::backend_error)?;
                 let value =
                     self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?;
-                self.put(&mut values[instance], node.id, 0, RuntimeValue::matrix(value));
+                self.put(&mut values[instance], node.id, 0, RuntimeValue::small_matrix(value));
                 continue;
             }
-            let matrix_type = self.matrix_type(scope_id, &paths[instance], wire)?;
             let NodeKind::PreimageSample { max_coefficient_bound, .. } = node.kind else {
                 unreachable!("preimage batch only handles preimage nodes")
             };
-            let max_coefficient_bound = max_coefficient_bound
+            schema.max_coefficient_bound = max_coefficient_bound
                 .evaluate(&envs[instance])
                 .map_err(|error| self.expression_error(node.id, error))?;
             pending.push(Pending {
@@ -2189,15 +2309,16 @@ where
                 wire,
                 path: paths[instance].clone(),
                 request: PreimageRequest {
-                    matrix_type,
+                    matrix_type: schema.matrix.clone(),
                     sigma,
                     gadget_base,
                     digit_count,
-                    max_coefficient_bound,
+                    max_coefficient_bound: schema.max_coefficient_bound.clone(),
                     trapdoor: secret.expect("sampled trapdoor must carry secret material"),
                     public,
                     target,
                 },
+                schema,
             });
         }
         if pending.is_empty() {
@@ -2205,7 +2326,8 @@ where
         }
 
         if let Some(production) = self.session.clone() {
-            let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
+            let mut outputs =
+                (0..pending.len()).map(|_| None).collect::<Vec<Option<B::SmallMatrix>>>();
             let mut missing = Vec::new();
             for (index, request) in pending.iter().enumerate() {
                 let site = DrawSite {
@@ -2218,17 +2340,26 @@ where
                     .transcript_entry(&production, &site)
                     .map_err(Self::artifact_error)?
                 {
-                    Some(RecordedValue::Matrix { matrix_type, bytes })
-                        if matrix_type == request.request.matrix_type =>
+                    Some(RecordedValue::SmallMatrix { schema, semantic_kind, bytes })
+                        if schema == request.schema &&
+                            semantic_kind == SmallMatrixSemanticKind::Preimage =>
                     {
                         self.set_placement(request.placement)?;
                         outputs[index] = Some(
                             self.backend
-                                .matrix_from_bytes(&request.request.matrix_type, &bytes)
+                                .small_matrix_from_bytes(
+                                    &request.schema,
+                                    &bytes,
+                                    SmallMatrixSemanticKind::Preimage,
+                                )
                                 .map_err(Self::backend_error)?,
                         );
                     }
-                    Some(RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. }) => {
+                    Some(
+                        RecordedValue::Matrix { .. } |
+                        RecordedValue::SmallMatrix { .. } |
+                        RecordedValue::Trapdoor { .. },
+                    ) => {
                         return Err(TranscriptError::KindMismatch(site).into());
                     }
                     None => missing.push(index),
@@ -2236,7 +2367,7 @@ where
             }
             if !missing.is_empty() {
                 let mut sampled_by_index =
-                    (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
+                    (0..pending.len()).map(|_| None).collect::<Vec<Option<B::SmallMatrix>>>();
                 let groups = (0..self.backend.placement_count())
                     .filter_map(|placement| {
                         let indices = missing
@@ -2270,34 +2401,35 @@ where
                         sampled_by_index[index] = Some(output);
                     }
                 }
-                let serialized = self.backend.matrices_to_bytes(
-                    &missing
-                        .iter()
-                        .map(|index| {
-                            sampled_by_index[*index]
-                                .as_ref()
-                                .expect("every missing preimage was sampled")
-                        })
-                        .collect::<Vec<_>>(),
-                );
                 let entries = missing
                     .iter()
-                    .zip(serialized)
-                    .map(|(index, bytes)| {
+                    .map(|index| {
                         let request = &pending[*index];
-                        (
+                        let value = sampled_by_index[*index]
+                            .as_ref()
+                            .expect("every missing preimage was sampled");
+                        let bytes = self
+                            .backend
+                            .small_matrix_to_bytes(
+                                value,
+                                &request.schema,
+                                SmallMatrixSemanticKind::Preimage,
+                            )
+                            .map_err(Self::backend_error)?;
+                        Ok((
                             DrawSite {
                                 instantiation_path: request.path.clone(),
                                 node: request.wire.node,
                                 port: request.wire.port,
                             },
-                            RecordedValue::Matrix {
-                                matrix_type: request.request.matrix_type.clone(),
+                            RecordedValue::SmallMatrix {
+                                schema: request.schema.clone(),
+                                semantic_kind: SmallMatrixSemanticKind::Preimage,
                                 bytes,
                             },
-                        )
+                        ))
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, ExecutionError>>()?;
                 self.artifact_store
                     .record_transcript_batch(&production, &entries)
                     .map_err(Self::artifact_error)?;
@@ -2310,7 +2442,9 @@ where
                     &mut values[request.instance],
                     node.id,
                     0,
-                    RuntimeValue::matrix(output.expect("every session preimage draw is resolved")),
+                    RuntimeValue::small_matrix(
+                        output.expect("every session preimage draw is resolved"),
+                    ),
                 );
             }
             return Ok(());
@@ -2332,14 +2466,23 @@ where
                 let mut outputs = Vec::with_capacity(pending.len());
                 for (request, recorded) in pending.iter().zip(recorded) {
                     match recorded {
-                        RecordedValue::Matrix { bytes, .. } => {
+                        RecordedValue::SmallMatrix { schema, semantic_kind, bytes }
+                            if schema == request.schema &&
+                                semantic_kind == SmallMatrixSemanticKind::Preimage =>
+                        {
                             self.set_placement(request.placement)?;
                             outputs.push(
                                 self.backend
-                                    .matrix_from_bytes(&request.request.matrix_type, &bytes)
+                                    .small_matrix_from_bytes(
+                                        &request.schema,
+                                        &bytes,
+                                        SmallMatrixSemanticKind::Preimage,
+                                    )
                                     .map_err(Self::backend_error)?,
                             );
                         }
+                        RecordedValue::Matrix { .. } |
+                        RecordedValue::SmallMatrix { .. } |
                         RecordedValue::Trapdoor { .. } => {
                             return Err(TranscriptError::KindMismatch(DrawSite {
                                 instantiation_path: request.path.clone(),
@@ -2357,7 +2500,8 @@ where
         let outputs = if let Some(outputs) = replayed {
             outputs
         } else {
-            let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<Option<B::Matrix>>>();
+            let mut outputs =
+                (0..pending.len()).map(|_| None).collect::<Vec<Option<B::SmallMatrix>>>();
             let groups = (0..self.backend.placement_count())
                 .filter_map(|placement| {
                     let indices = pending
@@ -2399,23 +2543,31 @@ where
         debug_assert_eq!(outputs.len(), pending.len());
 
         if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
-            let serialized = self.backend.matrices_to_bytes(&outputs.iter().collect::<Vec<_>>());
-            for ((request, _), bytes) in pending.iter().zip(&outputs).zip(serialized) {
+            for (request, value) in pending.iter().zip(&outputs) {
+                let bytes = self
+                    .backend
+                    .small_matrix_to_bytes(
+                        value,
+                        &request.schema,
+                        SmallMatrixSemanticKind::Preimage,
+                    )
+                    .map_err(Self::backend_error)?;
                 recorder.record(
                     DrawSite {
                         instantiation_path: request.path.clone(),
                         node: request.wire.node,
                         port: request.wire.port,
                     },
-                    RecordedValue::Matrix {
-                        matrix_type: request.request.matrix_type.clone(),
+                    RecordedValue::SmallMatrix {
+                        schema: request.schema.clone(),
+                        semantic_kind: SmallMatrixSemanticKind::Preimage,
                         bytes,
                     },
                 )?;
             }
         }
         for (request, output) in pending.into_iter().zip(outputs) {
-            self.put(&mut values[request.instance], node.id, 0, RuntimeValue::matrix(output));
+            self.put(&mut values[request.instance], node.id, 0, RuntimeValue::small_matrix(output));
         }
         Ok(())
     }
@@ -2486,7 +2638,9 @@ where
                         .matrix_from_bytes(ty, &bytes)
                         .map(|value| (value, false))
                         .map_err(Self::backend_error),
-                    RecordedValue::Matrix { .. } | RecordedValue::Trapdoor { .. } => {
+                    RecordedValue::Matrix { .. } |
+                    RecordedValue::SmallMatrix { .. } |
+                    RecordedValue::Trapdoor { .. } => {
                         Err(TranscriptError::KindMismatch(site).into())
                     }
                 };
@@ -2527,6 +2681,107 @@ where
                     .matrix_from_bytes(ty, bytes)
                     .map(|value| (value, false))
                     .map_err(Self::backend_error),
+                RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
+                    Err(TranscriptError::KindMismatch(site).into())
+                }
+            },
+        }
+    }
+
+    fn sample_small_matrix<F>(
+        &mut self,
+        path: &[InstantiationFrame],
+        wire: WireRef,
+        schema: &ConcreteBoundedMatrixSchema,
+        semantic_kind: SmallMatrixSemanticKind,
+        fresh: F,
+    ) -> Result<B::SmallMatrix, ExecutionError>
+    where
+        F: FnOnce(&mut B) -> Result<B::SmallMatrix, B::Error>,
+    {
+        self.sample_small_matrix_with_status(path, wire, schema, semantic_kind, fresh)
+            .map(|(value, _)| value)
+    }
+
+    fn sample_small_matrix_with_status<F>(
+        &mut self,
+        path: &[InstantiationFrame],
+        wire: WireRef,
+        schema: &ConcreteBoundedMatrixSchema,
+        semantic_kind: SmallMatrixSemanticKind,
+        fresh: F,
+    ) -> Result<(B::SmallMatrix, bool), ExecutionError>
+    where
+        F: FnOnce(&mut B) -> Result<B::SmallMatrix, B::Error>,
+    {
+        let site = DrawSite { instantiation_path: path.to_vec(), node: wire.node, port: wire.port };
+        if let Some(production) = self.session.clone() {
+            if let Some(recorded) = self
+                .artifact_store
+                .transcript_entry(&production, &site)
+                .map_err(Self::artifact_error)?
+            {
+                return match recorded {
+                    RecordedValue::SmallMatrix {
+                        schema: recorded_schema,
+                        semantic_kind: recorded_kind,
+                        bytes,
+                    } if recorded_schema == *schema && recorded_kind == semantic_kind => self
+                        .backend
+                        .small_matrix_from_bytes(schema, &bytes, semantic_kind)
+                        .map(|value| (value, false))
+                        .map_err(Self::backend_error),
+                    RecordedValue::Matrix { .. } |
+                    RecordedValue::SmallMatrix { .. } |
+                    RecordedValue::Trapdoor { .. } => {
+                        Err(TranscriptError::KindMismatch(site).into())
+                    }
+                };
+            }
+            let value = fresh(self.backend).map_err(Self::backend_error)?;
+            let bytes = self
+                .backend
+                .small_matrix_to_bytes(&value, schema, semantic_kind)
+                .map_err(Self::backend_error)?;
+            self.artifact_store
+                .record_transcript_batch(
+                    &production,
+                    &[(
+                        (site),
+                        RecordedValue::SmallMatrix { schema: schema.clone(), semantic_kind, bytes },
+                    )],
+                )
+                .map_err(Self::artifact_error)?;
+            return Ok((value, true));
+        }
+        match &mut self.sampling_mode {
+            SamplingMode::Fresh => {
+                fresh(self.backend).map(|value| (value, true)).map_err(Self::backend_error)
+            }
+            SamplingMode::Record(recorder) => {
+                let value = fresh(self.backend).map_err(Self::backend_error)?;
+                let bytes = self
+                    .backend
+                    .small_matrix_to_bytes(&value, schema, semantic_kind)
+                    .map_err(Self::backend_error)?;
+                recorder.record(
+                    site,
+                    RecordedValue::SmallMatrix { schema: schema.clone(), semantic_kind, bytes },
+                )?;
+                Ok((value, true))
+            }
+            SamplingMode::Replay(replayer) => match replayer.get(&site)? {
+                RecordedValue::SmallMatrix {
+                    schema: recorded_schema,
+                    semantic_kind: recorded_kind,
+                    bytes,
+                } if recorded_schema == schema && *recorded_kind == semantic_kind => self
+                    .backend
+                    .small_matrix_from_bytes(schema, bytes, semantic_kind)
+                    .map(|value| (value, false))
+                    .map_err(Self::backend_error),
+                RecordedValue::Matrix { .. } |
+                RecordedValue::SmallMatrix { .. } |
                 RecordedValue::Trapdoor { .. } => Err(TranscriptError::KindMismatch(site).into()),
             },
         }
@@ -2653,7 +2908,7 @@ where
                     RecordedValue::Matrix { bytes, .. } => {
                         self.backend.matrix_from_bytes(ty, bytes).map_err(Self::backend_error)?
                     }
-                    RecordedValue::Trapdoor { .. } => {
+                    RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
                         return Err(TranscriptError::KindMismatch(matrix_site).into());
                     }
                 };
@@ -2662,7 +2917,7 @@ where
                         .backend
                         .trapdoor_from_bytes(ty, trapdoor_bytes)
                         .map_err(Self::backend_error)?,
-                    RecordedValue::Matrix { .. } => {
+                    RecordedValue::Matrix { .. } | RecordedValue::SmallMatrix { .. } => {
                         return Err(TranscriptError::KindMismatch(trapdoor_site).into());
                     }
                 };
@@ -2724,6 +2979,17 @@ where
     ) -> Result<Arc<B::Matrix>, ExecutionError> {
         match self.materialize(values, wire)? {
             RuntimeValue::Matrix(value) => Ok(value),
+            _ => Err(ExecutionError::ValueKind(wire)),
+        }
+    }
+
+    fn small_matrix(
+        &mut self,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
+        wire: WireRef,
+    ) -> Result<Arc<B::SmallMatrix>, ExecutionError> {
+        match self.materialize(values, wire)? {
+            RuntimeValue::SmallMatrix(value) => Ok(value),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -2847,6 +3113,17 @@ where
                     )
                 }
             }
+            RuntimeValue::SmallMatrix(matrix) => {
+                if self.backend.small_matrix_is_on_active_placement(matrix.as_ref()) {
+                    RuntimeValue::SmallMatrix(matrix)
+                } else {
+                    RuntimeValue::small_matrix(
+                        self.backend
+                            .small_matrix_to_active_placement(matrix.as_ref())
+                            .map_err(Self::backend_error)?,
+                    )
+                }
+            }
             RuntimeValue::Trapdoor {
                 secret,
                 public,
@@ -2897,6 +3174,10 @@ where
                     .map(|value| self.value_for_placement(value, placement))
                     .collect::<Result<_, _>>()?,
             ),
+            value @ (RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. }) => {
+                let materialized = self.materialize_value(value)?;
+                self.value_for_placement(materialized, placement)?
+            }
             value => value,
         })
     }
@@ -2916,6 +3197,17 @@ where
                     placed
                         .map(RuntimeValue::matrix)
                         .unwrap_or_else(|| RuntimeValue::Matrix(matrix.clone()))
+                })
+                .collect(),
+            RuntimeValue::SmallMatrix(matrix) => self
+                .backend
+                .small_matrix_to_placements(matrix.as_ref())
+                .map_err(Self::backend_error)?
+                .into_iter()
+                .map(|placed| {
+                    placed
+                        .map(RuntimeValue::small_matrix)
+                        .unwrap_or_else(|| RuntimeValue::SmallMatrix(matrix.clone()))
                 })
                 .collect(),
             RuntimeValue::Trapdoor {
@@ -3006,6 +3298,20 @@ where
         self.validated_wire_type(scope_id, wire)
             .and_then(|wire| wire.matrix_type().cloned())
             .ok_or(ExecutionError::MissingMetadata(id))
+    }
+
+    fn bounded_matrix_schema(
+        &self,
+        scope_id: &FrozenGraphScopeId,
+        path: &[InstantiationFrame],
+        wire: WireRef,
+    ) -> Result<(ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind), ExecutionError> {
+        let id = WireId { instantiation_path: path.to_vec(), wire };
+        let artifact_type = self
+            .validated_wire_type(scope_id, wire)
+            .and_then(ArtifactType::from_wire_type)
+            .ok_or_else(|| ExecutionError::MissingMetadata(id.clone()))?;
+        artifact_type.bounded_matrix_schema().ok_or(ExecutionError::MissingMetadata(id))
     }
 
     fn validated_wire_type(
@@ -3191,14 +3497,41 @@ fn append_tag_integer(tag: &mut Vec<u8>, value: &BigInt) {
 }
 
 fn runtime_inputs_digest<B: Backend>(
+    validated: &ValidatedGraph,
     backend: &B,
     inputs: &BTreeMap<String, RuntimeValue<B>>,
 ) -> Result<[u8; 32], ExecutionError> {
+    let root = validated.source.root_scope();
+    let input_types = root
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let NodeKind::Input { name, artifact: None, .. } = node.kind() else {
+                return None;
+            };
+            let wire = WireRef { node: NodeId(index as u64), port: Port(0) };
+            let concrete = validated
+                .root_scope()
+                .wire_types
+                .get(&wire)
+                .expect("validated root input has concrete metadata");
+            Some((name.as_str(), concrete))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut hasher = Sha256::new();
     hasher.update(b"mxx-runtime-session-inputs-v1");
     for (name, value) in inputs {
+        let concrete = input_types.get(name.as_str()).ok_or_else(|| {
+            ExecutionError::Manifest(format!("runtime input {name} is not declared by the graph"))
+        })?;
+        if !runtime_value_matches_wire_type(value, concrete) {
+            return Err(ExecutionError::Manifest(format!(
+                "runtime input {name} does not match its validated wire type"
+            )));
+        }
         hash_sized(&mut hasher, name.as_bytes());
-        hash_runtime_value(backend, value, &mut hasher)?;
+        hash_runtime_value(backend, value, concrete, &mut hasher)?;
     }
     Ok(hasher.finalize().into())
 }
@@ -3206,6 +3539,7 @@ fn runtime_inputs_digest<B: Backend>(
 fn hash_runtime_value<B: Backend>(
     backend: &B,
     value: &RuntimeValue<B>,
+    concrete: &ConcreteWireType,
     hasher: &mut Sha256,
 ) -> Result<(), ExecutionError> {
     match value {
@@ -3231,6 +3565,24 @@ fn hash_runtime_value<B: Backend>(
         RuntimeValue::Matrix(value) => {
             hasher.update([5]);
             hash_sized(hasher, &backend.matrix_to_bytes(value));
+        }
+        RuntimeValue::SmallMatrix(value) => {
+            let artifact_type = ArtifactType::from_wire_type(concrete).ok_or_else(|| {
+                ExecutionError::Manifest(
+                    "small-matrix runtime input has no bounded schema".to_owned(),
+                )
+            })?;
+            let (schema, semantic_kind) =
+                artifact_type.bounded_matrix_schema().ok_or_else(|| {
+                    ExecutionError::Manifest(
+                        "small-matrix runtime input has no bounded schema".to_owned(),
+                    )
+                })?;
+            let bytes = backend
+                .small_matrix_to_bytes(value, &schema, semantic_kind)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            hasher.update([12]);
+            hash_sized(hasher, &bytes);
         }
         RuntimeValue::Trapdoor {
             secret,
@@ -3309,12 +3661,57 @@ fn hash_runtime_value<B: Backend>(
         RuntimeValue::IndexedFamily(values) => {
             hasher.update([11]);
             hasher.update(values.len().to_le_bytes());
+            let ConcreteWireType::IndexedFamily { element, count } = concrete else {
+                return Err(ExecutionError::Manifest(
+                    "indexed runtime input has non-family wire metadata".to_owned(),
+                ));
+            };
+            if values.len() != *count {
+                return Err(ExecutionError::Manifest(
+                    "indexed runtime input count does not match wire metadata".to_owned(),
+                ));
+            }
             for value in values {
-                hash_runtime_value(backend, value, hasher)?;
+                hash_runtime_value(backend, value, element, hasher)?;
             }
         }
     }
     Ok(())
+}
+
+fn runtime_value_matches_wire_type<B: Backend>(
+    value: &RuntimeValue<B>,
+    concrete: &ConcreteWireType,
+) -> bool {
+    match (value, concrete) {
+        (RuntimeValue::Int(_), ConcreteWireType::ConstantInt | ConcreteWireType::Int) |
+        (RuntimeValue::Real(_), ConcreteWireType::ConstantReal | ConcreteWireType::Real) |
+        (RuntimeValue::Bool(_), ConcreteWireType::ConstantBool | ConcreteWireType::Bool) |
+        (RuntimeValue::Bytes(_), ConcreteWireType::Bytes { .. }) |
+        (RuntimeValue::TypedBlob(_), ConcreteWireType::TypedBlob { .. }) |
+        (RuntimeValue::Matrix(_), ConcreteWireType::Matrix(_)) |
+        (
+            RuntimeValue::SmallMatrix(_),
+            ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. },
+        ) |
+        (RuntimeValue::Trapdoor { .. }, ConcreteWireType::Trapdoor { .. }) => true,
+        (
+            RuntimeValue::IndexedFamily(values),
+            ConcreteWireType::IndexedFamily { element, count },
+        ) => {
+            values.len() == *count &&
+                values.iter().all(|value| runtime_value_matches_wire_type(value, element))
+        }
+        (
+            RuntimeValue::LazyArtifactFamily { descriptor, .. } |
+            RuntimeValue::StagedArtifactFamily { descriptor, .. },
+            ConcreteWireType::IndexedFamily { element, count },
+        ) => {
+            descriptor.family_count == Some(*count) &&
+                ArtifactType::from_wire_type(element).as_ref() == Some(&descriptor.artifact_type)
+        }
+        _ => false,
+    }
 }
 
 fn hash_sized(hasher: &mut Sha256, bytes: &[u8]) {
@@ -3429,6 +3826,16 @@ fn decode_artifact<B: Backend>(
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             Ok(RuntimeValue::matrix(matrix))
         }
+        (artifact_type, ArtifactPayload::SmallMatrix(bytes))
+            if artifact_type.bounded_matrix_schema().is_some() =>
+        {
+            let (schema, semantic_kind) =
+                artifact_type.bounded_matrix_schema().expect("bounded artifact checked above");
+            let matrix = backend
+                .small_matrix_from_bytes(&schema, &bytes, semantic_kind)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            Ok(RuntimeValue::small_matrix(matrix))
+        }
         (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes))
             if bytes.len() == length =>
         {
@@ -3493,7 +3900,7 @@ mod tests {
         node::{IntBinaryOp, IntCompareOp, NodeKind, RealBinaryOp},
     };
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{CpuSmallMatrix, PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             Poly, PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -3502,6 +3909,357 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct PlacementProbeSmallMatrix {
+        placement: usize,
+    }
+
+    #[derive(Debug, Error)]
+    enum PlacementProbeError {
+        #[error("small matrix belongs to placement {owner}, but codec is on placement {active}")]
+        ParameterMismatch { owner: usize, active: usize },
+        #[error("forced broadcast preparation failure at placement {placement}")]
+        ForcedBroadcastPreparationFailure { placement: usize },
+        #[error("forced child-input preparation failure at placement {placement}")]
+        ForcedPreparationFailure { placement: usize },
+        #[error("forced staged codec failure at placement {placement}")]
+        ForcedFailure { placement: usize },
+    }
+
+    #[derive(Default)]
+    struct PlacementProbeBackend {
+        active: usize,
+        encoded: std::cell::RefCell<Vec<(SmallMatrixSemanticKind, usize, usize)>>,
+        fail_broadcast_preparation: bool,
+        fail_move_at: Option<usize>,
+        fail_at: Option<(SmallMatrixSemanticKind, usize)>,
+    }
+
+    macro_rules! unused_probe_operation {
+        ($($argument:expr),* $(,)?) => {{
+            std::hint::black_box(($($argument,)*));
+            panic!("unused placement-probe backend operation")
+        }};
+    }
+
+    impl Backend for PlacementProbeBackend {
+        type Matrix = ();
+        type SmallMatrix = PlacementProbeSmallMatrix;
+        type Trapdoor = ();
+        type Error = PlacementProbeError;
+
+        fn placement_count(&self) -> usize {
+            2
+        }
+
+        fn active_placement(&self) -> usize {
+            self.active
+        }
+
+        fn set_active_placement(&mut self, placement: usize) -> bool {
+            if placement >= self.placement_count() {
+                return false;
+            }
+            self.active = placement;
+            true
+        }
+
+        fn small_matrix_to_active_placement(
+            &mut self,
+            value: &Self::SmallMatrix,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            if self.fail_move_at == Some(self.active) {
+                return Err(PlacementProbeError::ForcedPreparationFailure {
+                    placement: self.active,
+                });
+            }
+            Ok(if value.placement == self.active {
+                value.clone()
+            } else {
+                PlacementProbeSmallMatrix { placement: self.active }
+            })
+        }
+
+        fn small_matrix_is_on_active_placement(&self, value: &Self::SmallMatrix) -> bool {
+            value.placement == self.active
+        }
+
+        fn small_matrix_to_placements(
+            &mut self,
+            value: &Self::SmallMatrix,
+        ) -> Result<Vec<Option<Self::SmallMatrix>>, Self::Error> {
+            if self.fail_broadcast_preparation {
+                self.active = 1;
+                return Err(PlacementProbeError::ForcedBroadcastPreparationFailure {
+                    placement: self.active,
+                });
+            }
+            Ok(vec![
+                (value.placement != 0).then(|| PlacementProbeSmallMatrix { placement: 0 }),
+                (value.placement != 1).then(|| PlacementProbeSmallMatrix { placement: 1 }),
+            ])
+        }
+
+        fn constant_matrix(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            value: &mxx_ir_core::node::ConstantMatrix,
+            env: &ParamEnv,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, value, env)
+        }
+
+        fn add(
+            &mut self,
+            left: &Self::Matrix,
+            right: &Self::Matrix,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(left, right)
+        }
+
+        fn sub(
+            &mut self,
+            left: &Self::Matrix,
+            right: &Self::Matrix,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(left, right)
+        }
+
+        fn multiply(
+            &mut self,
+            left: &Self::Matrix,
+            right: &Self::Matrix,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(left, right)
+        }
+
+        fn negate(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value)
+        }
+
+        fn scale_integer(
+            &mut self,
+            value: &Self::Matrix,
+            scalar: &BigInt,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, scalar)
+        }
+
+        fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value)
+        }
+
+        fn slice(
+            &mut self,
+            value: &Self::Matrix,
+            rows: Option<&RuntimeIndexRange>,
+            columns: Option<&RuntimeIndexRange>,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, rows, columns)
+        }
+
+        fn tensor(
+            &mut self,
+            left: &Self::Matrix,
+            right: &Self::Matrix,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(left, right)
+        }
+
+        fn concat(
+            &mut self,
+            inputs: &[&Self::Matrix],
+            axis: mxx_ir_core::node::ConcatAxis,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(inputs, axis)
+        }
+
+        fn sample_uniform(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            range: &RuntimeSampleRange,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, range)
+        }
+
+        fn sample_gaussian(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            sigma: f64,
+            max_coefficient_bound: &BigInt,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, sigma, max_coefficient_bound)
+        }
+
+        fn sample_hash(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            key: [u8; 32],
+            tag: &[u8],
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, key, tag)
+        }
+
+        fn sample_hash_decomposed(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            key: [u8; 32],
+            tag: &[u8],
+            gadget_base: &BigInt,
+            digit_count: usize,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            unused_probe_operation!(ty, key, tag, gadget_base, digit_count)
+        }
+
+        fn sample_hash_small_decomposed(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            key: [u8; 32],
+            tag: &[u8],
+            gadget_base: &BigInt,
+            digit_count: usize,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            unused_probe_operation!(ty, key, tag, gadget_base, digit_count)
+        }
+
+        fn sample_trapdoor(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            sigma: f64,
+            gadget_base: &BigInt,
+            digit_count: usize,
+        ) -> Result<(Self::Matrix, Self::Trapdoor), Self::Error> {
+            unused_probe_operation!(ty, sigma, gadget_base, digit_count)
+        }
+
+        fn sample_preimage(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            sigma: f64,
+            gadget_base: &BigInt,
+            digit_count: usize,
+            max_coefficient_bound: &BigInt,
+            trapdoor: &Self::Trapdoor,
+            public: &Self::Matrix,
+            target: &Self::Matrix,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            unused_probe_operation!(
+                ty,
+                sigma,
+                gadget_base,
+                digit_count,
+                max_coefficient_bound,
+                trapdoor,
+                public,
+                target,
+            )
+        }
+
+        fn gadget_decompose(
+            &mut self,
+            value: &Self::Matrix,
+            small: bool,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            unused_probe_operation!(value, small)
+        }
+
+        fn multiply_small_rhs(
+            &mut self,
+            lhs: &Self::Matrix,
+            rhs: &Self::SmallMatrix,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(lhs, rhs)
+        }
+
+        fn extract_coefficient(
+            &mut self,
+            value: &Self::Matrix,
+            position: usize,
+        ) -> Result<BigInt, Self::Error> {
+            unused_probe_operation!(value, position)
+        }
+
+        fn threshold_decode(
+            &mut self,
+            value: &Self::Matrix,
+            plaintext_modulus: &BigInt,
+            length: usize,
+        ) -> Result<Vec<BigInt>, Self::Error> {
+            unused_probe_operation!(value, plaintext_modulus, length)
+        }
+
+        fn pack_polynomial_coefficients(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            bits: &[bool],
+            coefficient_bits: usize,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, bits, coefficient_bits)
+        }
+
+        fn crt_recompose(
+            &mut self,
+            levels: &[Self::Matrix],
+            plaintext_moduli: &[BigInt],
+            reconstruction_coefficients: &[BigInt],
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(levels, plaintext_moduli, reconstruction_coefficients)
+        }
+
+        fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
+            unused_probe_operation!(value)
+        }
+
+        fn matrix_from_bytes(
+            &self,
+            ty: &ConcreteMatrixType,
+            bytes: &[u8],
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, bytes)
+        }
+
+        fn small_matrix_to_bytes(
+            &self,
+            value: &Self::SmallMatrix,
+            expected_schema: &ConcreteBoundedMatrixSchema,
+            semantic_kind: SmallMatrixSemanticKind,
+        ) -> Result<Vec<u8>, Self::Error> {
+            std::hint::black_box(expected_schema);
+            if value.placement != self.active {
+                return Err(PlacementProbeError::ParameterMismatch {
+                    owner: value.placement,
+                    active: self.active,
+                });
+            }
+            if self.fail_at == Some((semantic_kind, self.active)) {
+                return Err(PlacementProbeError::ForcedFailure { placement: self.active });
+            }
+            self.encoded.borrow_mut().push((semantic_kind, value.placement, self.active));
+            Ok(vec![value.placement as u8])
+        }
+
+        fn small_matrix_from_bytes(
+            &self,
+            expected_schema: &ConcreteBoundedMatrixSchema,
+            bytes: &[u8],
+            expected_semantic_kind: SmallMatrixSemanticKind,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            unused_probe_operation!(expected_schema, bytes, expected_semantic_kind)
+        }
+
+        fn trapdoor_to_bytes(&self, value: &Self::Trapdoor) -> Vec<u8> {
+            unused_probe_operation!(value)
+        }
+
+        fn trapdoor_from_bytes(
+            &self,
+            ty: &ConcreteMatrixType,
+            bytes: &[u8],
+        ) -> Result<Self::Trapdoor, Self::Error> {
+            unused_probe_operation!(ty, bytes)
+        }
+    }
 
     #[test]
     fn preimage_progress_requires_the_configured_exact_total() {
@@ -3521,6 +4279,151 @@ mod tests {
         ));
         progress.record(1);
         assert!(progress.finish().is_ok());
+    }
+
+    #[test]
+    fn staged_small_families_encode_on_each_child_placement_and_restore_parent() {
+        let ring = Ring::new(17, 8);
+        let small = ring.small_matrix_input_family("small", 2, (1, 1), 1);
+        let preimage = ring.preimage_input_family("preimage", 2, (1, 1), 1);
+        let broadcast = ring.small_matrix_input("broadcast", (1, 1), 1);
+        let (small, preimage, broadcast) = parallel_zip((small, preimage), move |_, values| {
+            (values.0, values.1, broadcast.clone())
+        })
+        .expect("parallel small families");
+        let validated = DslContext::new("runtime-staged-small-placement")
+            .output("small", small)
+            .expect("small output")
+            .output("preimage", preimage)
+            .expect("preimage output")
+            .output("broadcast", broadcast)
+            .expect("broadcast output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let members = || {
+            RuntimeValue::IndexedFamily(vec![
+                RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
+                RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
+            ])
+        };
+        let mut backend = PlacementProbeBackend::default();
+        let mut store = MemoryArtifactStore::default();
+        let result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::from([
+                ("small".to_owned(), members()),
+                ("preimage".to_owned(), members()),
+                (
+                    "broadcast".to_owned(),
+                    RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
+                ),
+            ]),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(2).expect("two is nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("multi-placement staged encoding");
+
+        assert_eq!(
+            *backend.encoded.borrow(),
+            vec![
+                (SmallMatrixSemanticKind::Generic, 0, 0),
+                (SmallMatrixSemanticKind::Preimage, 0, 0),
+                (SmallMatrixSemanticKind::Generic, 0, 0),
+                (SmallMatrixSemanticKind::Generic, 1, 1),
+                (SmallMatrixSemanticKind::Preimage, 1, 1),
+                (SmallMatrixSemanticKind::Generic, 1, 1),
+            ]
+        );
+        assert_eq!(backend.active_placement(), 0);
+        assert!(matches!(result.outputs["small"], RuntimeValue::StagedArtifactFamily { .. }));
+        assert!(matches!(result.outputs["preimage"], RuntimeValue::StagedArtifactFamily { .. }));
+        assert!(matches!(result.outputs["broadcast"], RuntimeValue::StagedArtifactFamily { .. }));
+
+        let mut failing_backend = PlacementProbeBackend {
+            fail_at: Some((SmallMatrixSemanticKind::Preimage, 1)),
+            ..PlacementProbeBackend::default()
+        };
+        assert!(matches!(
+            execute_with_config(
+                &validated,
+                &mut failing_backend,
+                BTreeMap::from([
+                    ("small".to_owned(), members()),
+                    ("preimage".to_owned(), members()),
+                    (
+                        "broadcast".to_owned(),
+                        RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
+                    ),
+                ]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    max_parallel_instances: NonZeroUsize::new(2).expect("two is nonzero"),
+                    ..ExecutionConfig::default()
+                },
+            ),
+            Err(ExecutionError::Backend(_))
+        ));
+        assert_eq!(failing_backend.active_placement(), 0);
+
+        let mut preparation_failing_backend =
+            PlacementProbeBackend { fail_move_at: Some(1), ..PlacementProbeBackend::default() };
+        assert!(matches!(
+            execute_with_config(
+                &validated,
+                &mut preparation_failing_backend,
+                BTreeMap::from([
+                    ("small".to_owned(), members()),
+                    ("preimage".to_owned(), members()),
+                    (
+                        "broadcast".to_owned(),
+                        RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
+                    ),
+                ]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    max_parallel_instances: NonZeroUsize::new(2).expect("two is nonzero"),
+                    ..ExecutionConfig::default()
+                },
+            ),
+            Err(ExecutionError::Backend(_))
+        ));
+        assert_eq!(preparation_failing_backend.active_placement(), 0);
+
+        let mut broadcast_failing_backend = PlacementProbeBackend {
+            fail_broadcast_preparation: true,
+            ..PlacementProbeBackend::default()
+        };
+        assert!(matches!(
+            execute_with_config(
+                &validated,
+                &mut broadcast_failing_backend,
+                BTreeMap::from([
+                    ("small".to_owned(), members()),
+                    ("preimage".to_owned(), members()),
+                    (
+                        "broadcast".to_owned(),
+                        RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
+                    ),
+                ]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    max_parallel_instances: NonZeroUsize::new(2).expect("two is nonzero"),
+                    ..ExecutionConfig::default()
+                },
+            ),
+            Err(ExecutionError::Backend(_))
+        ));
+        assert_eq!(broadcast_failing_backend.active_placement(), 0);
     }
 
     #[test]
@@ -3641,6 +4544,61 @@ mod tests {
     }
 
     #[test]
+    fn staged_family_can_be_broadcast_into_a_later_gather_loop() {
+        let parameters = DCRTPolyParams::default();
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let source = Parallel::range(3)
+            .map(|index| ring.polynomial([index.expression()]))
+            .expect("source range");
+        let indices = Family::pack(vec![Int::constant(2), Int::constant(0)]).expect("indices");
+        let gathered = source.parallel_gather(indices).expect("gather");
+        let expected = Family::pack(vec![
+            ring.polynomial([mxx_ir_core::IntExpr::constant(2)]),
+            ring.polynomial([mxx_ir_core::IntExpr::constant(0)]),
+        ])
+        .expect("expected family");
+        let validated = DslContext::new("runtime-staged-family-gather")
+            .family_output("gathered", gathered)
+            .expect("gathered output")
+            .family_output("expected", expected)
+            .expect("expected output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("execution");
+        let gathered = result
+            .materialize_output("gathered", &backend, &mut store)
+            .expect("materialized gathered family")
+            .clone();
+        let expected = result
+            .materialize_output("expected", &backend, &mut store)
+            .expect("materialized expected family")
+            .clone();
+        let matrices = |value: RuntimeValue<CpuDcrtBackend>| {
+            let RuntimeValue::IndexedFamily(values) = value else {
+                panic!("expected indexed family")
+            };
+            values
+                .into_iter()
+                .map(|value| {
+                    let RuntimeValue::Matrix(matrix) = value else {
+                        panic!("expected matrix family member")
+                    };
+                    matrix.as_ref().clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matrices(gathered), matrices(expected));
+        result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
     fn dynamic_integer_hash_tags_are_deterministic_and_row_distinct() {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -3706,6 +4664,149 @@ mod tests {
     }
 
     #[test]
+    fn decomposed_hash_executes_as_a_generic_small_rhs() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u8) << parameters.base_bits();
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let key = ring.bytes_input("key", 32);
+        let tag = HashTag::from(b"runtime-small-hash".as_slice());
+        let plain = ring.hash_matrix(key.clone(), tag.clone(), (1, 1));
+        let small =
+            ring.hash_decomposed(key, tag, (digit_count, 1), gadget_base.clone(), digit_count);
+        let product = ring.gadget(1, gadget_base, digit_count).mul_small_rhs(small);
+        let validated = DslContext::new("runtime-decomposed-hash-small-rhs")
+            .output("plain", plain)
+            .expect("plain output")
+            .output("product", product)
+            .expect("product output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(vec![0x39; 32]))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert_eq!(matrix_output(&result, "product"), matrix_output(&result, "plain"));
+    }
+
+    #[test]
+    fn generic_small_rhs_input_and_artifact_keep_the_compact_runtime_kind() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let lhs = ring.input("lhs", (1, 1));
+        let rhs = ring.small_matrix_input("rhs", (1, 1), 1);
+        let validated = DslContext::new("runtime-generic-small-rhs-input")
+            .private_output("rhs", rhs.clone())
+            .expect("small RHS output")
+            .output("product", lhs.mul_small_rhs(rhs))
+            .expect("product output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let identity = DCRTPolyMatrix::identity(&parameters, 1, None);
+        let compact = CpuSmallMatrix::new(identity.clone(), 1u8.into()).expect("bounded owner");
+        let mut backend = cpu_backend([parameters.clone()]);
+        let mut store = MemoryArtifactStore::default();
+        let result = execute(
+            &validated,
+            &mut backend,
+            BTreeMap::from([
+                ("lhs".to_owned(), RuntimeValue::matrix(identity.clone())),
+                ("rhs".to_owned(), RuntimeValue::small_matrix(compact)),
+            ]),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .expect("execution");
+        assert_eq!(matrix_output(&result, "product"), &identity);
+        assert!(matches!(result.outputs["rhs"], RuntimeValue::SmallMatrix(_)));
+
+        let production = result.production_id.expect("artifact production");
+        let manifest = store.manifest(&production).expect("manifest").clone();
+        let imported = ring.small_matrix_artifact_input(
+            production.clone(),
+            "rhs",
+            (1, 1),
+            1,
+            ArtifactConfidentiality::Private,
+        );
+        let imported_graph = DslContext::new("runtime-imported-generic-small-rhs")
+            .output("product", ring.identity(1).mul_small_rhs(imported))
+            .expect("imported product")
+            .build()
+            .expect("import build")
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .expect("import validation");
+        let imported_result = execute(
+            &imported_graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .expect("import execution");
+        assert_eq!(matrix_output(&imported_result, "product"), &identity);
+
+        assert!(matches!(
+            execute(
+                &validated,
+                &mut backend,
+                BTreeMap::from([
+                    ("lhs".to_owned(), RuntimeValue::matrix(identity.clone())),
+                    ("rhs".to_owned(), RuntimeValue::matrix(identity.clone())),
+                ]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+            ),
+            Err(ExecutionError::ValueKind(_))
+        ));
+
+        let mut session_store = MemoryArtifactStore::default();
+        let session_nonce = [0x91; 32];
+        let session_inputs = |rhs| {
+            BTreeMap::from([
+                ("lhs".to_owned(), RuntimeValue::matrix(identity.clone())),
+                ("rhs".to_owned(), RuntimeValue::small_matrix(rhs)),
+            ])
+        };
+        execute_in_session(
+            &validated,
+            &mut backend,
+            session_inputs(
+                CpuSmallMatrix::new(identity.clone(), 1u8.into()).expect("identity compact owner"),
+            ),
+            &mut session_store,
+            session_nonce,
+        )
+        .expect("initial compact-input session");
+        let zero = CpuSmallMatrix::new(DCRTPolyMatrix::zero(&parameters, 1, 1), 1u8.into())
+            .expect("zero compact owner with the declared inclusive bound");
+        assert!(matches!(
+            execute_in_session(
+                &validated,
+                &mut backend,
+                session_inputs(zero),
+                &mut session_store,
+                session_nonce,
+            ),
+            Err(ExecutionError::Artifact(_))
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn trapdoor_families_sample_preimages_and_persist_each_member() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -3731,30 +4832,31 @@ mod tests {
         let preimages = trapdoors
             .clone()
             .parallel_zip_mat_values(targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (digit_count + 2, 1)).as_mat()
+                trapdoor.sample_preimage(target, (digit_count + 2, 1))
             })
             .expect("preimages");
-        let products = trapdoors
-            .public_matrices()
-            .parallel_zip(preimages, |_, public, preimage| public * preimage)
+        let products =
+            parallel_zip((trapdoors.public_matrices(), preimages), |_, (public, preimage)| {
+                preimage.mul_small_rhs(public)
+            })
             .expect("products");
         let static_target = ring.polynomial([3.into()]);
         let static_trapdoor = trapdoors.get_static(0);
         let static_public = static_trapdoor.public_matrix();
-        let static_product = static_public.clone() *
-            static_trapdoor.sample_preimage(static_target.clone(), (digit_count + 2, 1)).as_mat();
+        let static_product = static_trapdoor
+            .sample_preimage(static_target.clone(), (digit_count + 2, 1))
+            .mul_small_rhs(static_public.clone());
         let indices = DslContext::new("trapdoor-family-indices").int_family_input("indices", 1);
         let dynamic_target = ring.polynomial([4.into()]);
         let dynamic_trapdoor = trapdoors.get(indices.get_static(0));
         let dynamic_public = dynamic_trapdoor.public_matrix();
-        let dynamic_product = dynamic_public.clone() *
-            dynamic_trapdoor
-                .sample_preimage(dynamic_target.clone(), (digit_count + 2, 1))
-                .as_mat();
+        let dynamic_product = dynamic_trapdoor
+            .sample_preimage(dynamic_target.clone(), (digit_count + 2, 1))
+            .mul_small_rhs(dynamic_public.clone());
         let validated = DslContext::new("runtime-trapdoor-family")
-            .public_family_output("public", trapdoors.public_matrices())
+            .public_output("public", trapdoors.public_matrices())
             .expect("public family output")
-            .public_family_output("public-swapped", swapped_public)
+            .public_output("public-swapped", swapped_public)
             .expect("swapped public family output")
             .private_trapdoor_family_output("trapdoors", trapdoors)
             .expect("private trapdoor family output")
@@ -3864,13 +4966,14 @@ mod tests {
         let imported_preimages = imported
             .clone()
             .parallel_zip_mat_values(imported_targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (digit_count + 2, 1)).as_mat()
+                trapdoor.sample_preimage(target, (digit_count + 2, 1))
             })
             .expect("imported preimages");
-        let imported_products = imported
-            .public_matrices()
-            .parallel_zip(imported_preimages, |_, public, preimage| public * preimage)
-            .expect("imported products");
+        let imported_products = parallel_zip(
+            (imported.public_matrices(), imported_preimages),
+            |_, (public, preimage)| preimage.mul_small_rhs(public),
+        )
+        .expect("imported products");
         let imported_graph = DslContext::new("runtime-imported-trapdoor-family")
             .output("product-0", imported_products.get_static(0))
             .expect("first imported product")
@@ -3919,9 +5022,7 @@ mod tests {
         let scalar_mismatch_graph = DslContext::new("runtime-mismatched-scalar-trapdoor")
             .output(
                 "preimage",
-                scalar_trapdoor
-                    .sample_preimage(ring.polynomial([1.into()]), (digit_count + 2, 1))
-                    .as_mat(),
+                scalar_trapdoor.sample_preimage(ring.polynomial([1.into()]), (digit_count + 2, 1)),
             )
             .expect("mismatched scalar output")
             .build()
@@ -3947,7 +5048,7 @@ mod tests {
             .expect("mismatched batch targets");
         let batch_preimages = mismatched
             .parallel_zip_mat_values(batch_targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (digit_count + 2, 1)).as_mat()
+                trapdoor.sample_preimage(target, (digit_count + 2, 1))
             })
             .expect("mismatched batch preimages");
         let batch_mismatch_graph = DslContext::new("runtime-mismatched-batch-trapdoor")
@@ -3970,6 +5071,56 @@ mod tests {
             ),
             Err(ExecutionError::PreimagePublicMismatch(_))
         ));
+    }
+
+    #[test]
+    fn transcript_replay_preserves_preimage_small_owner_and_relation() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let digit_count = parameters.modulus_digits();
+        let gadget_base = BigInt::from(1u8) << parameters.base_bits();
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let trapdoor = ring.sample_trapdoor(1, 5, gadget_base, digit_count, 1_000_000);
+        let public = trapdoor.public_matrix();
+        let target = ring.polynomial([7.into()]);
+        let product =
+            trapdoor.sample_preimage(target.clone(), (digit_count + 2, 1)).mul_small_rhs(public);
+        let validated = DslContext::new("runtime-preimage-small-transcript")
+            .output("product", product)
+            .expect("product output")
+            .output("target", target)
+            .expect("target output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let mut recorder = crate::transcript::TranscriptRecorder::default();
+        let recorded = execute(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Record(&mut recorder),
+        )
+        .expect("recorded preimage execution");
+        let replayer = recorder.into_replayer();
+        assert!(replayer.iter().any(|(_, value)| {
+            matches!(
+                value,
+                RecordedValue::SmallMatrix { semantic_kind: SmallMatrixSemanticKind::Preimage, .. }
+            )
+        }));
+        let replayed = execute(
+            &validated,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Replay(&replayer),
+        )
+        .expect("replayed preimage execution");
+        assert_eq!(matrix_output(&recorded, "product"), matrix_output(&recorded, "target"));
+        assert_eq!(matrix_output(&replayed, "product"), matrix_output(&recorded, "product"));
     }
 
     #[test]
@@ -4180,6 +5331,7 @@ mod tests {
             RuntimeValue::Bytes(_) => panic!("empty range output became bytes"),
             RuntimeValue::TypedBlob(_) => panic!("empty range output became a blob"),
             RuntimeValue::Matrix(_) => panic!("empty range output became a matrix"),
+            RuntimeValue::SmallMatrix(_) => panic!("empty range output became a small matrix"),
             RuntimeValue::Trapdoor { .. } => panic!("empty range output became a trapdoor"),
             RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. } => {
                 panic!("empty range output became a scalar artifact")

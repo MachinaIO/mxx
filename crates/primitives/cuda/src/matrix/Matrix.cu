@@ -22,3 +22,4 @@
 #include "MatrixSerde.cu"
 #include "MatrixSerdeBatch.cu"
 #include "MatrixCrt.cu"
+#include "MatrixSmallRhs.cu" // compact bounded RHS implementation and staged kernels

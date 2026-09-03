@@ -190,6 +190,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RealSqrt |
                 NodeKind::MatrixBinary(_) |
                 NodeKind::MatrixMulAccumulate { .. } |
+                NodeKind::MatrixMulSmallRhs |
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
                 NodeKind::Transpose |
@@ -223,8 +224,13 @@ pub(crate) fn evaluate_param_constraints(
 
 fn derive_wire_constraints(wire_type: &WireType, output: &mut Vec<ParamConstraint>) {
     match wire_type {
-        WireType::Matrix(matrix) | WireType::Preimage(matrix) => {
+        WireType::Matrix(matrix) => {
             constraints_for_matrix(matrix, output);
+        }
+        WireType::SmallMatrix { matrix, max_coefficient_bound } |
+        WireType::Preimage { matrix, max_coefficient_bound } => {
+            constraints_for_matrix(matrix, output);
+            nonnegative(output, max_coefficient_bound, "small RHS coefficient bound".to_owned());
         }
         WireType::Trapdoor {
             matrix,

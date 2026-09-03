@@ -1,6 +1,7 @@
 use mxx_ir_core::{
     ParamEnv,
-    node::{ConcatAxis, ConstantMatrix, HashVariant},
+    artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
+    node::{ConcatAxis, ConstantMatrix},
     types::ConcreteMatrixType,
 };
 use num_bigint::BigInt;
@@ -42,8 +43,15 @@ pub struct SampleRange {
 
 pub trait Backend {
     type Matrix: Clone + Debug + PartialEq + Send + Sync;
+    type SmallMatrix: Clone + Debug + PartialEq + Send + Sync;
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Selects the setup-time GPU calibration for the next primitive. CPU and
+    /// non-fleet backends ignore this hook.
+    fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn placement_count(&self) -> usize {
         1
@@ -63,6 +71,15 @@ pub trait Backend {
     fn matrix_is_on_active_placement(&self, _value: &Self::Matrix) -> bool {
         true
     }
+    fn small_matrix_to_active_placement(
+        &mut self,
+        value: &Self::SmallMatrix,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        Ok(value.clone())
+    }
+    fn small_matrix_is_on_active_placement(&self, _value: &Self::SmallMatrix) -> bool {
+        true
+    }
     /// Waits only for releases queued on backend-owned release streams.
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
         Ok(())
@@ -80,6 +97,26 @@ pub trait Backend {
                     None
                 } else {
                     Some(self.matrix_to_active_placement(value)?)
+                });
+            }
+            Ok(placed)
+        })();
+        assert!(self.set_active_placement(original), "backend rejected its active placement");
+        result
+    }
+    fn small_matrix_to_placements(
+        &mut self,
+        value: &Self::SmallMatrix,
+    ) -> Result<Vec<Option<Self::SmallMatrix>>, Self::Error> {
+        let original = self.active_placement();
+        let result = (|| {
+            let mut placed = Vec::with_capacity(self.placement_count());
+            for placement in 0..self.placement_count() {
+                assert!(self.set_active_placement(placement), "backend rejected its own placement");
+                placed.push(if self.small_matrix_is_on_active_placement(value) {
+                    None
+                } else {
+                    Some(self.small_matrix_to_active_placement(value)?)
                 });
             }
             Ok(placed)
@@ -232,9 +269,23 @@ pub trait Backend {
         ty: &ConcreteMatrixType,
         key: [u8; 32],
         tag: &[u8],
-        variant: HashVariant,
-        gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn sample_hash_decomposed(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        key: [u8; 32],
+        tag: &[u8],
+        gadget_base: &BigInt,
+        digit_count: usize,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
+    fn sample_hash_small_decomposed(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        key: [u8; 32],
+        tag: &[u8],
+        gadget_base: &BigInt,
+        digit_count: usize,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
     fn sample_trapdoor(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -252,11 +303,11 @@ pub trait Backend {
         trapdoor: &Self::Trapdoor,
         public: &Self::Matrix,
         target: &Self::Matrix,
-    ) -> Result<Self::Matrix, Self::Error>;
+    ) -> Result<Self::SmallMatrix, Self::Error>;
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
         requests
             .into_iter()
             .map(|request| {
@@ -276,7 +327,7 @@ pub trait Backend {
     fn sample_preimage_batches_by_placement(
         &mut self,
         batches: Vec<(usize, Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>)>,
-    ) -> Result<Vec<(usize, Vec<Self::Matrix>)>, Self::Error> {
+    ) -> Result<Vec<(usize, Vec<Self::SmallMatrix>)>, Self::Error> {
         let original = self.active_placement();
         let result = batches
             .into_iter()
@@ -301,6 +352,11 @@ pub trait Backend {
         &mut self,
         value: &Self::Matrix,
         small: bool,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
+    fn multiply_small_rhs(
+        &mut self,
+        lhs: &Self::Matrix,
+        rhs: &Self::SmallMatrix,
     ) -> Result<Self::Matrix, Self::Error>;
     fn extract_coefficient(
         &mut self,
@@ -335,6 +391,18 @@ pub trait Backend {
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error>;
+    fn small_matrix_to_bytes(
+        &self,
+        value: &Self::SmallMatrix,
+        expected_schema: &ConcreteBoundedMatrixSchema,
+        semantic_kind: SmallMatrixSemanticKind,
+    ) -> Result<Vec<u8>, Self::Error>;
+    fn small_matrix_from_bytes(
+        &self,
+        expected_schema: &ConcreteBoundedMatrixSchema,
+        bytes: &[u8],
+        expected_semantic_kind: SmallMatrixSemanticKind,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
     fn trapdoor_to_bytes(&self, value: &Self::Trapdoor) -> Vec<u8>;
     fn trapdoor_from_bytes(
         &self,
@@ -350,6 +418,7 @@ pub enum RuntimeValue<B: Backend> {
     Bytes(Vec<u8>),
     TypedBlob(Vec<u8>),
     Matrix(Arc<B::Matrix>),
+    SmallMatrix(Arc<B::SmallMatrix>),
     Trapdoor {
         secret: Option<Arc<B::Trapdoor>>,
         public: Arc<B::Matrix>,
@@ -393,6 +462,7 @@ impl<B: Backend> Clone for RuntimeValue<B> {
             Self::Bytes(value) => Self::Bytes(value.clone()),
             Self::TypedBlob(value) => Self::TypedBlob(value.clone()),
             Self::Matrix(value) => Self::Matrix(value.clone()),
+            Self::SmallMatrix(value) => Self::SmallMatrix(value.clone()),
             Self::Trapdoor {
                 secret,
                 public,
@@ -443,6 +513,7 @@ impl<B: Backend> RuntimeValue<B> {
     pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
         match self {
             Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
+            Self::SmallMatrix(matrix) => Arc::strong_count(matrix) == 1,
             Self::Trapdoor { secret, public, .. } => {
                 Arc::strong_count(public) == 1 ||
                     secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)
@@ -466,5 +537,9 @@ impl<B: Backend> RuntimeValue<B> {
 impl<B: Backend> RuntimeValue<B> {
     pub fn matrix(value: B::Matrix) -> Self {
         Self::Matrix(Arc::new(value))
+    }
+
+    pub fn small_matrix(value: B::SmallMatrix) -> Self {
+        Self::SmallMatrix(Arc::new(value))
     }
 }

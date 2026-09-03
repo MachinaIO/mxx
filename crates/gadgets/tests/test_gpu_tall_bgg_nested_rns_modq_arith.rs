@@ -62,7 +62,9 @@ use mxx_primitives::{
             poly::DCRTPoly,
         },
     },
-    sampler::bounds::{compute_preimage_sigma, hard_cutoff_from_sigma_bound},
+    sampler::bounds::{
+        compute_preimage_sigma, default_preimage_cutoff, hard_cutoff_from_sigma_bound,
+    },
     utils::{gen_biguint_for_modulus, mod_inverse},
 };
 use mxx_runtime::{
@@ -70,6 +72,7 @@ use mxx_runtime::{
     artifact::{ArtifactKey, ArtifactPayload, ArtifactStore, MemoryArtifactStore},
     backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
     execute_in_session_with_config, execute_with_config,
+    gpu_calibration::FrozenGpuCalibrationRegistry,
     transcript::SamplingMode,
 };
 use num_bigint::{BigInt, BigUint};
@@ -1655,7 +1658,7 @@ fn benchmark_estimation(
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
     device_ids: &[i32],
-) -> Result<(CostReport, CostReport), String> {
+) -> Result<(CostReport, CostReport, FrozenGpuCalibrationRegistry), String> {
     info!("stage 2/4: benchmark estimation");
     let bindings = ParamEnv::default();
     let manifests =
@@ -1671,41 +1674,25 @@ fn benchmark_estimation(
         measured_iterations: config.benchmark_iterations,
         memory_poll_interval: Duration::from_millis(1),
     };
-    let encoding_parallel_instances = config.max_parallel_instances;
-    let preprocessing_parallel_instances = config.preprocessing_parallel_instances;
-    let encoding_column_wave_size = encoding_parallel_instances.div_ceil(device_ids.len());
-    let preprocessing_column_wave_size =
-        preprocessing_parallel_instances.div_ceil(device_ids.len());
-    let estimator_config =
-        EstimateConfig { device_pool_size: encoding_parallel_instances, per_instance_occupancy: 1 };
-    let preprocessing_estimator_config = EstimateConfig {
-        device_pool_size: preprocessing_parallel_instances,
-        per_instance_occupancy: 1,
-    };
+    // A measured GPU primitive consumes the complete fleet. Do not count the device count again
+    // as independent estimator capacity; column concurrency is calibrated inside the backend.
+    let estimator_config = EstimateConfig { device_pool_size: 1, per_instance_occupancy: 1 };
+    let preprocessing_estimator_config = estimator_config.clone();
     info!(
         gpu_count = device_ids.len(),
         measurement_workers = device_ids.len(),
-        encoding_column_wave_size,
-        preprocessing_column_wave_size,
-        encoding_parallel_instances,
-        preprocessing_parallel_instances,
-        "effective benchmark estimator parallelism"
+        "fleet-wide benchmark estimator parallelism"
     );
     let backends = device_ids
         .iter()
         .copied()
         .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
         .collect();
-    let mut backend = GpuNodeMeasurementBackend::new(
-        backends,
-        harness,
-        selected.parameters.to_crt().2,
-        preprocessing_column_wave_size,
-    );
+    let mut backend =
+        GpuNodeMeasurementBackend::new(backends, harness, selected.parameters.to_crt().2);
     info!("collecting unique GPU measurement shapes");
     estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
         .map_err(|error| error.to_string())?;
-    backend.set_column_wave_size(encoding_column_wave_size);
     estimate(&encoding_graph, &mut backend, &estimator_config)
         .map_err(|error| error.to_string())?;
     let measurement_started = Instant::now();
@@ -1717,7 +1704,6 @@ fn benchmark_estimation(
     );
     let preprocessing_started = Instant::now();
     info!(subgraph = "preprocessing", "benchmark subgraph estimation begin");
-    backend.set_column_wave_size(preprocessing_column_wave_size);
     let preprocessing_report =
         estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
             .map_err(|error| error.to_string())?;
@@ -1730,12 +1716,12 @@ fn benchmark_estimation(
     log_cost_report("TallBggPreprocessing", &preprocessing_report);
     let encoding_started = Instant::now();
     info!(subgraph = "encoding", "benchmark subgraph estimation begin");
-    backend.set_column_wave_size(encoding_column_wave_size);
     let encoding_report = estimate(&encoding_graph, &mut backend, &estimator_config)
         .map_err(|error| error.to_string())?;
     info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggEncoding", &encoding_report);
-    Ok((preprocessing_report, encoding_report))
+    let calibration_registry = backend.calibration_registry().freeze();
+    Ok((preprocessing_report, encoding_report, calibration_registry))
 }
 
 fn execution_config(
@@ -1762,7 +1748,7 @@ fn execution_config(
 fn matrix_family_output(
     result: &mut ExecutionResult<GpuDcrtBackend>,
     name: &str,
-    backend: &GpuDcrtBackend,
+    backend: &mut GpuDcrtBackend,
     store: &mut MemoryArtifactStore,
 ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
     let RuntimeValue::IndexedFamily(values) =
@@ -1773,7 +1759,9 @@ fn matrix_family_output(
     values
         .iter()
         .map(|value| match value {
-            RuntimeValue::Matrix(matrix) => Ok(matrix.as_ref().clone()),
+            RuntimeValue::Matrix(matrix) => {
+                backend.gather_matrix_for_host(matrix.as_ref()).map_err(|error| error.to_string())
+            }
             _ => Err(format!("output family {name} contains a non-matrix member")),
         })
         .collect()
@@ -1788,6 +1776,7 @@ fn save_preprocessing(
     let payloads = store.snapshot_manifest_payloads(manifest).map_err(|error| error.to_string())?;
     let payload_size = |payload: &ArtifactPayload| match payload {
         ArtifactPayload::Matrix(bytes) |
+        ArtifactPayload::SmallMatrix(bytes) |
         ArtifactPayload::Bytes(bytes) |
         ArtifactPayload::TypedBlob(bytes) => bytes.len(),
         ArtifactPayload::Trapdoor { public_bytes, secret_bytes } => {
@@ -2117,10 +2106,13 @@ fn encoding_inputs(
                 RuntimeValue::IndexedFamily(
                     (0..cpu.row_size())
                         .map(|slot| {
-                            RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(
-                                gpu_parameters,
-                                &cpu.slice(slot, slot + 1, 0, 1),
-                            ))
+                            RuntimeValue::matrix(
+                                GpuDCRTPolyMatrix::from_cpu_matrix(
+                                    gpu_parameters,
+                                    &cpu.slice(slot, slot + 1, 0, 1),
+                                )
+                                .into(),
+                            )
                         })
                         .collect(),
                 ),
@@ -2138,6 +2130,7 @@ fn end_to_end_processing(
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
     device_ids: &[i32],
+    calibration_registry: Option<&FrozenGpuCalibrationRegistry>,
 ) -> Result<EndToEndOutputs, String> {
     info!("stage 3/4: end-to-end processing");
     info!(
@@ -2185,6 +2178,9 @@ fn end_to_end_processing(
         let production = {
             let mut preprocessing_backend =
                 gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+            if let Some(registry) = calibration_registry {
+                preprocessing_backend.set_calibration_registry(registry.clone());
+            }
             let started = Instant::now();
             let preprocessing_result = execute_in_session_with_config(
                 &preprocessing,
@@ -2222,6 +2218,9 @@ fn end_to_end_processing(
     };
     let manifests = BTreeMap::from([(selected.production.clone(), manifest)]);
     let mut backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+    if let Some(registry) = calibration_registry {
+        backend.set_calibration_registry(registry.clone());
+    }
 
     let started = Instant::now();
     let operands = random_operands(selected, config);
@@ -2269,13 +2268,13 @@ fn end_to_end_processing(
     )
     .map_err(|error| error.to_string())?;
     let encoding_rows =
-        matrix_family_output(&mut encoding_result, "encoding_rows", &backend, &mut store)?;
+        matrix_family_output(&mut encoding_result, "encoding_rows", &mut backend, &mut store)?;
     let output_plaintexts =
-        matrix_family_output(&mut encoding_result, "output_plaintexts", &backend, &mut store)?;
+        matrix_family_output(&mut encoding_result, "output_plaintexts", &mut backend, &mut store)?;
     let residuals = matrix_family_output(
         &mut encoding_result,
         TALL_OPERATIONAL_RESIDUAL,
-        &backend,
+        &mut backend,
         &mut store,
     )?;
     encoding_result.cleanup_staged(&mut store).map_err(|error| error.to_string())?;
@@ -2726,6 +2725,16 @@ fn single_lwe_public_lut_signal_check(
         high_matrix_type: matrix_type(digit_count + 2, digit_count),
         gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
         digit_count: IntExpr::constant(digit_count),
+        preimage_max_coefficient_bound: IntExpr::constant(BigInt::from(
+            default_preimage_cutoff(
+                parameters.ring_dimension(),
+                digit_count + 2,
+                digit_count,
+                1u32 << parameters.base_bits(),
+                5.0,
+            )
+            .expect("default preimage cutoff"),
+        )),
     };
     let production = ProductionId {
         spec_hash: mxx_ir_core::artifact::SpecHash([6; 32]),
@@ -2737,7 +2746,7 @@ fn single_lwe_public_lut_signal_check(
         5,
         lookup.gadget_base.clone(),
         lookup.digit_count.clone(),
-        1_000_000,
+        lookup.preimage_max_coefficient_bound.clone(),
     );
     let preprocessing = lookup
         .preprocess(
@@ -2957,7 +2966,7 @@ fn test_gpu_tall_bgg_nested_rns_noiseless_encoding_matches_ideal_product() {
         moduli,
         selected.parameters.base_bits(),
     );
-    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
+    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids, None)
         .expect("small noiseless Tall execution");
     let (maximum_residual, location) =
         measure_runtime_residual(&selected, &gpu_parameters, outputs)
@@ -3077,8 +3086,9 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         moduli,
         selected.parameters.base_bits(),
     );
-    let _reports = benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
-        .expect("benchmark estimation");
+    let (_preprocessing_report, _encoding_report, calibration_registry) =
+        benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
+            .expect("benchmark estimation");
     if matches!(requested_mode, TallRunMode::Benchmark | TallRunMode::BenchmarkSelected) {
         info!(
             skipped_operational_simulation = requested_mode == TallRunMode::BenchmarkSelected,
@@ -3086,7 +3096,13 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         );
         return;
     }
-    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
-        .expect("end-to-end processing");
+    let outputs = end_to_end_processing(
+        &selected,
+        &config,
+        &gpu_parameters,
+        &device_ids,
+        Some(&calibration_registry),
+    )
+    .expect("end-to-end processing");
     runtime_verification(&selected, &gpu_parameters, outputs).expect("runtime verification");
 }

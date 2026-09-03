@@ -259,7 +259,6 @@ impl BooleanLayerGate<Mat> for PublicKeyBooleanGate {
             .matrix
             .clone()
             .decompose(self.compiler.base.clone(), self.compiler.digit_count.clone());
-        let right_decomposition = right_decomposition.as_mat();
         let product = self.compiler.mul_with_decomposition(&left, &right, right_decomposition);
         let sum = self.compiler.add(&left, &right);
         let two_scalar = self.compiler.ring.polynomial([2.into()]);
@@ -448,14 +447,14 @@ fn encoding_multiply(
         .public_keys
         .matrices
         .clone()
-        .parallel_map_values(move |_, key| key.decompose(base, digits).as_mat())?;
+        .parallel_map_values(move |_, key| key.decompose(base, digits))?;
     let public_keys = mxx_dsl::parallel_zip_bundle_result(
         (left.public_keys.matrices.clone(), decomposed_right.clone()),
-        |_, (key, decomposition)| Ok(key * decomposition),
+        |_, (key, decomposition)| Ok(decomposition.mul_small_rhs(key)),
     )?;
     let first = mxx_dsl::parallel_zip_bundle_result(
         (left.vectors.clone(), decomposed_right.clone()),
-        |_, (vector, key)| Ok(vector * key),
+        |_, (vector, decomposition)| Ok(decomposition.mul_small_rhs(vector)),
     )?;
     let second = mxx_dsl::parallel_zip_bundle_result(
         (right.vectors.clone(), left.plaintexts.clone()),
@@ -593,6 +592,14 @@ mod tests {
             decomposition_count, 1,
             "the encoding family reuses one deterministic right-key decomposition"
         );
+        let small_rhs_count = encoding_graph
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs))
+            .count();
+        assert_eq!(small_rhs_count, 2);
     }
 
     fn bindings() -> ParamEnv {

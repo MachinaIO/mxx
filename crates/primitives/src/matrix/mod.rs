@@ -1,4 +1,9 @@
-use crate::poly::{Poly, PolyParams};
+use crate::{
+    element::PolyElem,
+    poly::{Poly, PolyParams},
+};
+use num_bigint::BigUint;
+use num_traits::Zero;
 use rayon::prelude::*;
 use std::{
     fmt::Debug,
@@ -6,6 +11,7 @@ use std::{
     path::Path,
     sync::Arc,
 };
+use thiserror::Error;
 
 pub mod base;
 pub(crate) mod cpp_matrix;
@@ -459,12 +465,6 @@ pub trait PolyMatrix:
     /// Performs the operation S * (identity ⊗ G^-1(other)),
     /// where G^-1(other) is bit decomposition of other matrix
     fn mul_tensor_identity_decompose(&self, other: &Self, identity_size: usize) -> Self;
-    /// Performs the operation S * G^-1(other),
-    /// where G^-1(other) is digit decomposition of other matrix
-    fn mul_decompose(&self, other: &Self) -> Self;
-    /// Performs the operation S * G_small^-1(other),
-    /// where G_small^-1(other) is compact digit decomposition of other matrix
-    fn mul_decompose_small(&self, other: &Self) -> Self;
     /// j is column and return decomposed matrix of target column
     fn get_column_matrix_decompose(&self, j: usize) -> Self;
     /// Stack columns into a single column vector (column-wise vectorization).
@@ -483,4 +483,330 @@ pub trait PolyMatrix:
         rows: std::ops::Range<usize>,
         cols: std::ops::Range<usize>,
     ) -> Vec<Vec<Self::P>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum SmallMatrixError {
+    #[error("small matrix shape is empty or overflows")]
+    InvalidShape,
+    #[error("small matrix shape does not match the expected schema")]
+    ShapeMismatch,
+    #[error("small matrix parameters do not match the expected context")]
+    ParameterMismatch,
+    #[error("small matrix bound does not match the expected schema")]
+    BoundMismatch,
+    #[error("requested preimage bound {requested} is below the minimum {minimum}")]
+    PreimageBoundTooSmall { requested: BigUint, minimum: BigUint },
+    #[error("small matrix coefficient exceeds its inclusive bound")]
+    BoundExceeded,
+    #[error("small matrix coefficient is outside the ring")]
+    CoefficientOutOfRange,
+    #[error("small matrix coefficient modulus does not match the matrix parameters")]
+    CoefficientModulusMismatch,
+    #[error("small matrix payload has invalid length")]
+    PayloadLength,
+    #[error("small matrix payload has an invalid sign byte")]
+    InvalidSign,
+    #[error("small matrix payload contains a non-canonical coefficient")]
+    NonCanonicalCoefficient,
+    #[error("small matrix dimension arithmetic overflows")]
+    DimensionOverflow,
+    #[error("small matrix coefficient width overflows")]
+    WidthOverflow,
+    #[error("small matrix configuration is invalid")]
+    InvalidConfig,
+    #[error(
+        "small matrix resource request ({requested_bytes} bytes) exceeds budget ({budget_bytes} bytes)"
+    )]
+    ResourceExhausted { requested_bytes: usize, budget_bytes: usize },
+    #[error("small matrix owner is on the wrong device")]
+    DeviceMismatch,
+    #[error("small matrix owner belongs to the wrong context")]
+    ContextMismatch,
+    #[error(
+        "small matrix retry budget exhausted at column {column_start} for {column_count} columns after {attempts} attempts"
+    )]
+    AttemptExhausted { column_start: usize, column_count: usize, attempts: usize },
+}
+
+/// A bounded matrix owner that carries no semantic relation kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuSmallMatrix<M: PolyMatrix> {
+    value: M,
+    max_coefficient_bound: BigUint,
+}
+
+fn validate_canonical_coefficient_sign(
+    sign: u8,
+    magnitude: &BigUint,
+    modulus: &BigUint,
+) -> Result<(), SmallMatrixError> {
+    if sign == 0 {
+        return if magnitude.is_zero() {
+            Ok(())
+        } else {
+            Err(SmallMatrixError::NonCanonicalCoefficient)
+        };
+    }
+    if sign != 1 && sign != 2 {
+        return Err(SmallMatrixError::InvalidSign);
+    }
+    if magnitude.is_zero() {
+        return Err(SmallMatrixError::NonCanonicalCoefficient);
+    }
+    if magnitude >= modulus {
+        return Err(SmallMatrixError::CoefficientOutOfRange);
+    }
+    let doubled = magnitude * 2u8;
+    let non_canonical = match sign {
+        1 => doubled > *modulus,
+        2 => doubled >= *modulus,
+        _ => unreachable!("sign was checked above"),
+    };
+    if non_canonical { Err(SmallMatrixError::NonCanonicalCoefficient) } else { Ok(()) }
+}
+
+impl<M: PolyMatrix> CpuSmallMatrix<M> {
+    pub fn new(value: M, max_coefficient_bound: BigUint) -> Result<Self, SmallMatrixError> {
+        let (rows, columns) = value.size();
+        if rows == 0 || columns == 0 || value.params().ring_dimension() == 0 {
+            return Err(SmallMatrixError::InvalidShape);
+        }
+        let expected_modulus: Arc<BigUint> = PolyParams::modulus(value.params()).into();
+        let modulus = expected_modulus.as_ref().clone();
+        for row in 0..rows {
+            for column in 0..columns {
+                for coefficient in value.entry(row, column).coeffs() {
+                    let coefficient_modulus: Arc<BigUint> = coefficient.modulus().clone().into();
+                    if coefficient_modulus != expected_modulus {
+                        return Err(SmallMatrixError::CoefficientModulusMismatch);
+                    }
+                    let residue = coefficient.value();
+                    if residue >= &modulus {
+                        return Err(SmallMatrixError::CoefficientOutOfRange);
+                    }
+                    let magnitude =
+                        if residue * 2u8 > modulus { &modulus - residue } else { residue.clone() };
+                    if magnitude > max_coefficient_bound {
+                        return Err(SmallMatrixError::BoundExceeded);
+                    }
+                }
+            }
+        }
+        Ok(Self::from_validated(value, max_coefficient_bound))
+    }
+
+    /// Constructs an owner after the caller has checked its complete value and metadata.
+    fn from_validated(value: M, max_coefficient_bound: BigUint) -> Self {
+        Self { value, max_coefficient_bound }
+    }
+
+    pub fn value(&self) -> &M {
+        &self.value
+    }
+
+    pub fn into_value(self) -> M {
+        self.value
+    }
+
+    pub fn max_coefficient_bound(&self) -> &BigUint {
+        &self.max_coefficient_bound
+    }
+
+    pub fn size(&self) -> (usize, usize) {
+        self.value.size()
+    }
+}
+
+/// Common metadata and canonical coefficient transport for bounded owners.
+pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
+    type Params: PolyParams;
+
+    fn params(&self) -> &Self::Params;
+    fn max_coefficient_bound(&self) -> &BigUint;
+    fn rows(&self) -> usize;
+    fn columns(&self) -> usize;
+    fn size(&self) -> (usize, usize) {
+        (self.rows(), self.columns())
+    }
+    fn is_on_params(&self, params: &Self::Params) -> bool {
+        self.params() == params
+    }
+    fn validate_metadata(
+        &self,
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: &BigUint,
+    ) -> Result<(), SmallMatrixError> {
+        if self.size() != (rows, columns) {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if self.params() != params {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if self.max_coefficient_bound() != max_coefficient_bound {
+            return Err(SmallMatrixError::BoundMismatch);
+        }
+        Ok(())
+    }
+    fn to_canonical_coefficients(&self) -> Result<Vec<u8>, SmallMatrixError>;
+    fn from_canonical_coefficients(
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+        payload: &[u8],
+    ) -> Result<Self, SmallMatrixError>;
+}
+
+/// Operations whose RHS is a bounded compact matrix, kept off `PolyMatrix`.
+pub trait PolyMatrixSmallRhs: PolyMatrix {
+    type SmallMatrix: SmallPolyMatrix<Params = <Self::P as Poly>::Params>;
+
+    fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError>;
+    fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
+}
+
+impl<M> SmallPolyMatrix for CpuSmallMatrix<M>
+where
+    M: PolyMatrix,
+    M::P: Poly,
+    <M::P as Poly>::Elem: PolyElem,
+{
+    type Params = <M::P as Poly>::Params;
+
+    fn params(&self) -> &Self::Params {
+        self.value.params()
+    }
+
+    fn max_coefficient_bound(&self) -> &BigUint {
+        &self.max_coefficient_bound
+    }
+
+    fn rows(&self) -> usize {
+        self.value.size().0
+    }
+
+    fn columns(&self) -> usize {
+        self.value.size().1
+    }
+
+    fn to_canonical_coefficients(&self) -> Result<Vec<u8>, SmallMatrixError> {
+        let (rows, columns) = self.value.size();
+        let ring_dimension = usize::try_from(self.value.params().ring_dimension())
+            .map_err(|_| SmallMatrixError::DimensionOverflow)?;
+        let coefficient_count = rows
+            .checked_mul(columns)
+            .and_then(|count| count.checked_mul(ring_dimension))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let bound_bits = self.max_coefficient_bound.bits();
+        let magnitude_bytes = usize::try_from(bound_bits.div_ceil(8))
+            .map_err(|_| SmallMatrixError::WidthOverflow)?
+            .max(1);
+        let encoded_width =
+            1usize.checked_add(magnitude_bytes).ok_or(SmallMatrixError::WidthOverflow)?;
+        let payload_length = coefficient_count
+            .checked_mul(encoded_width)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let modulus: BigUint = PolyParams::modulus(self.value.params()).into().as_ref().clone();
+        let mut payload = Vec::with_capacity(payload_length);
+        for row in 0..rows {
+            for column in 0..columns {
+                for coefficient in self.value.entry(row, column).coeffs() {
+                    let residue = coefficient.value();
+                    let negative = residue * 2u8 > modulus;
+                    let magnitude = if negative { &modulus - residue } else { residue.clone() };
+                    if magnitude > self.max_coefficient_bound {
+                        return Err(SmallMatrixError::BoundExceeded);
+                    }
+                    let sign = if magnitude.is_zero() {
+                        0
+                    } else if negative {
+                        2
+                    } else {
+                        1
+                    };
+                    payload.push(sign);
+                    let bytes = magnitude.to_bytes_le();
+                    if bytes.len() > magnitude_bytes {
+                        return Err(SmallMatrixError::WidthOverflow);
+                    }
+                    payload.extend_from_slice(&bytes);
+                    payload.resize(payload.len() + magnitude_bytes - bytes.len(), 0);
+                }
+            }
+        }
+        debug_assert_eq!(payload.len(), payload_length);
+        Ok(payload)
+    }
+
+    fn from_canonical_coefficients(
+        params: &Self::Params,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+        payload: &[u8],
+    ) -> Result<Self, SmallMatrixError> {
+        if rows == 0 || columns == 0 || params.ring_dimension() == 0 {
+            return Err(SmallMatrixError::InvalidShape);
+        }
+        let ring_dimension = usize::try_from(params.ring_dimension())
+            .map_err(|_| SmallMatrixError::DimensionOverflow)?;
+        let coefficient_count = rows
+            .checked_mul(columns)
+            .and_then(|count| count.checked_mul(ring_dimension))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
+            .map_err(|_| SmallMatrixError::WidthOverflow)?
+            .max(1);
+        let encoded_width =
+            1usize.checked_add(magnitude_bytes).ok_or(SmallMatrixError::WidthOverflow)?;
+        let expected_length = coefficient_count
+            .checked_mul(encoded_width)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        if payload.len() != expected_length {
+            return Err(SmallMatrixError::PayloadLength);
+        }
+        let modulus: BigUint = PolyParams::modulus(params).into().as_ref().clone();
+        let mut offset = 0usize;
+        let mut entries = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let mut row_entries = Vec::with_capacity(columns);
+            for _ in 0..columns {
+                let mut coefficients = Vec::with_capacity(ring_dimension);
+                for _ in 0..ring_dimension {
+                    let sign = payload[offset];
+                    let magnitude =
+                        BigUint::from_bytes_le(&payload[offset + 1..offset + encoded_width]);
+                    offset += encoded_width;
+                    if magnitude > max_coefficient_bound {
+                        return Err(SmallMatrixError::BoundExceeded);
+                    }
+                    validate_canonical_coefficient_sign(sign, &magnitude, &modulus)?;
+                    let residue = if sign == 2 { &modulus - magnitude } else { magnitude };
+                    coefficients.push(residue);
+                }
+                row_entries.push(<M::P as Poly>::from_biguints(params, &coefficients));
+            }
+            entries.push(row_entries);
+        }
+        Ok(CpuSmallMatrix::from_validated(M::from_poly_vec(params, entries), max_coefficient_bound))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_coefficient_sign_handles_even_modulus_tie() {
+        let modulus = BigUint::from(16u8);
+        let half = BigUint::from(8u8);
+        assert!(validate_canonical_coefficient_sign(1, &half, &modulus).is_ok());
+        assert_eq!(
+            validate_canonical_coefficient_sign(2, &half, &modulus),
+            Err(SmallMatrixError::NonCanonicalCoefficient)
+        );
+    }
 }

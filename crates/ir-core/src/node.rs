@@ -48,6 +48,8 @@ pub enum NodeKind {
         coefficients: Vec<IntExpr>,
         has_bias: bool,
     },
+    /// Ordinary matrix multiplication with a bounded compact right-hand side.
+    MatrixMulSmallRhs,
     MatrixNegate,
     MatrixScale {
         scalar: IntExpr,

@@ -1,5 +1,27 @@
 namespace
 {
+    struct DeviceDescriptorInit
+    {
+        uint8_t *base;
+        size_t stride;
+        size_t count;
+        uint8_t widths[GPU_RUNTIME_MAX_LIMBS];
+        size_t offsets[GPU_RUNTIME_MAX_LIMBS];
+    };
+
+    __global__ void initialize_device_descriptors(
+        GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors,
+        DeviceDescriptorInit init)
+    {
+        const size_t limb = blockIdx.x * blockDim.x + threadIdx.x;
+        if (limb >= init.count)
+        {
+            return;
+        }
+        descriptors[limb] = GpuMatrix::SharedLimbBuffer::DeviceDescriptor{
+            init.base + init.offsets[limb], init.stride, init.widths[limb]};
+    }
+
     bool checked_mul_size(size_t a, size_t b, size_t *out)
     {
         if (!out)
@@ -12,6 +34,232 @@ namespace
         }
         *out = a * b;
         return true;
+    }
+
+    bool checked_add_size(size_t a, size_t b, size_t *out)
+    {
+        if (!out || a > static_cast<size_t>(-1) - b)
+        {
+            return false;
+        }
+        *out = a + b;
+        return true;
+    }
+
+    struct MatrixPartitionAllocationPlan
+    {
+        size_t partition;
+        size_t local_limb_count;
+        size_t bytes_per_poly;
+        size_t data_bytes;
+        size_t aux_slots_per_poly;
+        size_t aux_slots_total;
+        size_t aux_bytes;
+        std::vector<uint8_t> limb_coeff_bytes;
+        std::vector<size_t> limb_offsets_bytes;
+    };
+
+    struct MatrixAllocationPlan
+    {
+        size_t count;
+        GpuPolyFormat format;
+        std::vector<MatrixPartitionAllocationPlan> partitions;
+        GpuMatrixAllocationBytes totals;
+    };
+
+    int build_matrix_allocation_plan(
+        const GpuContext *ctx,
+        int level,
+        size_t rows,
+        size_t cols,
+        int format,
+        MatrixAllocationPlan *out)
+    {
+        if (!ctx || !out)
+        {
+            return set_error("invalid matrix allocation plan arguments");
+        }
+        GpuPolyFormat parsed_format;
+        if (!parse_format(format, parsed_format))
+        {
+            return set_error("invalid format in matrix allocation plan");
+        }
+        if (level < -1 || level > ctx->level)
+        {
+            return set_error("invalid level in matrix allocation plan");
+        }
+        if (ctx->N < 0 || ctx->gpu_ids.empty())
+        {
+            return set_error("invalid context in matrix allocation plan");
+        }
+
+        MatrixAllocationPlan plan{};
+        plan.format = parsed_format;
+        if (!checked_mul_size(rows, cols, &plan.count))
+        {
+            return set_error("matrix size overflow in matrix allocation plan");
+        }
+        plan.partitions.reserve(ctx->gpu_ids.size());
+
+        const size_t n = static_cast<size_t>(ctx->N);
+        const size_t active_limbs = level < 0 ? 0 : static_cast<size_t>(level + 1);
+        if (ctx->limb_gpu_ids.size() < active_limbs ||
+            ctx->limb_coeff_bytes.size() < active_limbs)
+        {
+            return set_error("unexpected limb metadata in matrix allocation plan");
+        }
+        if (ctx->decomp_counts_by_partition.size() < ctx->gpu_ids.size())
+        {
+            return set_error("unexpected decomposition metadata in matrix allocation plan");
+        }
+
+        for (size_t partition_idx = 0; partition_idx < ctx->gpu_ids.size(); ++partition_idx)
+        {
+            MatrixPartitionAllocationPlan partition{};
+            partition.partition = partition_idx;
+            for (size_t limb = 0; limb < active_limbs; ++limb)
+            {
+                const dim3 limb_id = ctx->limb_gpu_ids[limb];
+                if (limb_id.x == partition_idx)
+                {
+                    partition.local_limb_count = std::max(
+                        partition.local_limb_count,
+                        static_cast<size_t>(limb_id.y) + 1);
+                }
+                else if (limb_id.x >= ctx->gpu_ids.size())
+                {
+                    return set_error("invalid limb partition in matrix allocation plan");
+                }
+            }
+
+            partition.limb_coeff_bytes.assign(partition.local_limb_count, 0);
+            partition.limb_offsets_bytes.assign(partition.local_limb_count, 0);
+            for (size_t limb = 0; limb < active_limbs; ++limb)
+            {
+                const dim3 limb_id = ctx->limb_gpu_ids[limb];
+                if (limb_id.x != partition_idx)
+                {
+                    continue;
+                }
+                if (limb_id.y >= partition.local_limb_count)
+                {
+                    return set_error("invalid local limb index in matrix allocation plan");
+                }
+                partition.limb_coeff_bytes[limb_id.y] = ctx->limb_coeff_bytes[limb];
+            }
+
+            size_t coefficient_bytes_per_poly = 0;
+            for (size_t local_limb = 0; local_limb < partition.local_limb_count; ++local_limb)
+            {
+                const uint8_t coefficient_bytes = partition.limb_coeff_bytes[local_limb];
+                if (coefficient_bytes == 0)
+                {
+                    return set_error("missing local limb width in matrix allocation plan");
+                }
+                size_t limb_region_bytes = 0;
+                if (!checked_mul_size(n, static_cast<size_t>(coefficient_bytes), &limb_region_bytes))
+                {
+                    return set_error("matrix limb region overflow in matrix allocation plan");
+                }
+                partition.limb_offsets_bytes[local_limb] = coefficient_bytes_per_poly;
+                if (!checked_add_size(
+                        coefficient_bytes_per_poly,
+                        limb_region_bytes,
+                        &coefficient_bytes_per_poly))
+                {
+                    return set_error("matrix limb offset overflow in matrix allocation plan");
+                }
+            }
+
+            if (partition.local_limb_count != 0 && plan.count != 0)
+            {
+                if (!checked_mul_size(
+                        coefficient_bytes_per_poly,
+                        static_cast<size_t>(2),
+                        &partition.bytes_per_poly) ||
+                    !checked_mul_size(
+                        partition.bytes_per_poly,
+                        plan.count,
+                        &partition.data_bytes))
+                {
+                    return set_error("matrix data allocation overflow in matrix allocation plan");
+                }
+                const size_t decomp_count =
+                    ctx->decomp_counts_by_partition[partition_idx];
+                size_t decomp_slots = 0;
+                if (!checked_mul_size(static_cast<size_t>(4), decomp_count, &decomp_slots) ||
+                    !checked_add_size(static_cast<size_t>(4), decomp_slots, &decomp_slots) ||
+                    !checked_mul_size(
+                        ctx->max_aux_limbs,
+                        decomp_slots,
+                        &partition.aux_slots_per_poly) ||
+                    !checked_mul_size(
+                        partition.aux_slots_per_poly,
+                        plan.count,
+                        &partition.aux_slots_total) ||
+                    !checked_mul_size(
+                        partition.aux_slots_total,
+                        sizeof(void *),
+                        &partition.aux_bytes))
+                {
+                    return set_error("matrix aux allocation overflow in matrix allocation plan");
+                }
+                size_t descriptor_bytes = 0;
+                if (!checked_mul_size(
+                        partition.local_limb_count,
+                        sizeof(GpuMatrix::SharedLimbBuffer::DeviceDescriptor),
+                        &descriptor_bytes) ||
+                    !checked_add_size(partition.aux_bytes, descriptor_bytes, &partition.aux_bytes))
+                {
+                    return set_error("matrix device descriptor allocation overflow");
+                }
+
+                size_t partition_event_count = 0;
+                size_t partition_event_bytes = 0;
+                if (!checked_add_size(
+                        partition.local_limb_count,
+                        static_cast<size_t>(1),
+                        &partition_event_count) ||
+                    !checked_mul_size(
+                        partition_event_count,
+                        sizeof(cudaEvent_t),
+                        &partition_event_bytes) ||
+                    !checked_add_size(
+                        plan.totals.event_bytes,
+                        partition_event_bytes,
+                        &plan.totals.event_bytes))
+                {
+                    return set_error("matrix event accounting overflow in matrix allocation plan");
+                }
+            }
+
+            if (!checked_add_size(
+                    plan.totals.data_bytes,
+                    partition.data_bytes,
+                    &plan.totals.data_bytes) ||
+                !checked_add_size(
+                    plan.totals.aux_bytes,
+                    partition.aux_bytes,
+                    &plan.totals.aux_bytes))
+            {
+                return set_error("matrix allocation total overflow");
+            }
+            plan.partitions.push_back(std::move(partition));
+        }
+
+        if (!checked_add_size(
+                plan.totals.data_bytes,
+                plan.totals.aux_bytes,
+                &plan.totals.total_bytes) ||
+            !checked_add_size(
+                plan.totals.total_bytes,
+                plan.totals.event_bytes,
+                &plan.totals.total_bytes))
+        {
+            return set_error("matrix allocation total overflow");
+        }
+        *out = std::move(plan);
+        return 0;
     }
 
     void free_matrix_shared_buffers(GpuMatrix *mat)
@@ -117,6 +365,7 @@ namespace
             if (partition_idx < mat->shared_limb_buffers.size())
             {
                 mat->shared_limb_buffers[partition_idx].ptr = nullptr;
+                mat->shared_limb_buffers[partition_idx].device_descriptors = nullptr;
             }
             if (partition_idx < mat->shared_aux_buffers.size())
             {
@@ -175,6 +424,29 @@ namespace
 
 }
 
+extern "C" int gpu_matrix_query_allocation_bytes(
+    const GpuContext *ctx,
+    int level,
+    size_t rows,
+    size_t cols,
+    int format,
+    GpuMatrixAllocationBytes *out)
+{
+    if (!out)
+    {
+        return set_error("invalid gpu_matrix_query_allocation_bytes output");
+    }
+    *out = GpuMatrixAllocationBytes{};
+    MatrixAllocationPlan plan{};
+    const int status = build_matrix_allocation_plan(ctx, level, rows, cols, format, &plan);
+    if (status != 0)
+    {
+        return status;
+    }
+    *out = plan.totals;
+    return 0;
+}
+
 extern "C" int gpu_matrix_create(
     GpuContext *ctx,
     int level,
@@ -188,124 +460,30 @@ extern "C" int gpu_matrix_create(
         return set_error("invalid gpu_matrix_create arguments");
     }
     *out = nullptr;
-    GpuPolyFormat fmt;
-    if (!parse_format(format, fmt))
+    MatrixAllocationPlan plan{};
+    const int plan_status =
+        build_matrix_allocation_plan(ctx, level, rows, cols, format, &plan);
+    if (plan_status != 0)
     {
-        return set_error("invalid format in gpu_matrix_create");
-    }
-    if (level < -1 || level > ctx->level)
-    {
-        return set_error("invalid level in gpu_matrix_create");
+        return plan_status;
     }
 
-    size_t count = 0;
-    if (!checked_mul_size(rows, cols, &count))
-    {
-        return set_error("matrix size overflow in gpu_matrix_create");
-    }
-
-    auto *mat = new GpuMatrix{ctx, rows, cols, level, fmt, {}, {}, {}};
-    const size_t partition_count = ctx->gpu_ids.size();
-    if (partition_count == 0)
-    {
-        destroy_matrix_contents(mat);
-        delete mat;
-        return set_error("unexpected empty gpu_ids in gpu_matrix_create");
-    }
+    auto *mat = new GpuMatrix{ctx, rows, cols, level, plan.format, {}, {}, {}};
+    const size_t partition_count = plan.partitions.size();
     mat->shared_limb_buffers.resize(partition_count);
     mat->shared_aux_buffers.resize(partition_count);
     mat->exec_limb_states.resize(partition_count);
 
     const size_t n = static_cast<size_t>(ctx->N);
-
-    for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
+    for (auto &partition : plan.partitions)
     {
-        size_t limbs = 0;
-        std::vector<uint8_t> local_limb_bytes;
-        std::vector<size_t> local_limb_offsets;
-        size_t coeff_bytes_per_poly = 0;
-        if (level >= 0)
-        {
-            const size_t active_limbs = static_cast<size_t>(level + 1);
-            if (ctx->limb_gpu_ids.size() < active_limbs)
-            {
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("unexpected limb mapping size in gpu_matrix_create");
-            }
-            if (ctx->limb_coeff_bytes.size() < active_limbs)
-            {
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("unexpected limb byte-width metadata in gpu_matrix_create");
-            }
-            for (size_t limb = 0; limb < active_limbs; ++limb)
-            {
-                const dim3 limb_id = ctx->limb_gpu_ids[limb];
-                if (limb_id.x == partition_idx)
-                {
-                    limbs = std::max(limbs, static_cast<size_t>(limb_id.y) + 1);
-                }
-            }
-            local_limb_bytes.assign(limbs, 0);
-            local_limb_offsets.assign(limbs, 0);
-            for (size_t limb = 0; limb < active_limbs; ++limb)
-            {
-                const dim3 limb_id = ctx->limb_gpu_ids[limb];
-                if (limb_id.x != partition_idx)
-                {
-                    continue;
-                }
-                if (limb_id.y >= local_limb_bytes.size())
-                {
-                    destroy_matrix_contents(mat);
-                    delete mat;
-                    return set_error("invalid local limb index in gpu_matrix_create");
-                }
-                local_limb_bytes[limb_id.y] = ctx->limb_coeff_bytes[limb];
-            }
-            for (size_t limb_idx = 0; limb_idx < limbs; ++limb_idx)
-            {
-                const uint8_t coeff_bytes = local_limb_bytes[limb_idx];
-                if (coeff_bytes == 0)
-                {
-                    destroy_matrix_contents(mat);
-                    delete mat;
-                    return set_error("missing local limb byte-width in gpu_matrix_create");
-                }
-                size_t limb_region_bytes = 0;
-                if (!checked_mul_size(n, static_cast<size_t>(coeff_bytes), &limb_region_bytes))
-                {
-                    destroy_matrix_contents(mat);
-                    delete mat;
-                    return set_error("matrix limb region overflow in gpu_matrix_create");
-                }
-                local_limb_offsets[limb_idx] = coeff_bytes_per_poly;
-                if (coeff_bytes_per_poly > static_cast<size_t>(-1) - limb_region_bytes)
-                {
-                    destroy_matrix_contents(mat);
-                    delete mat;
-                    return set_error("matrix limb offset overflow in gpu_matrix_create");
-                }
-                coeff_bytes_per_poly += limb_region_bytes;
-            }
-        }
-        if (limbs == 0 || count == 0)
+        const size_t partition_idx = partition.partition;
+        if (partition.local_limb_count == 0 || plan.count == 0)
         {
             continue;
         }
 
-        mat->exec_limb_states[partition_idx].resize(limbs);
-
-        size_t bytes_per_poly = 0;
-        size_t total_bytes = 0;
-        if (!checked_mul_size(coeff_bytes_per_poly, static_cast<size_t>(2), &bytes_per_poly) ||
-            !checked_mul_size(bytes_per_poly, count, &total_bytes))
-        {
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error("matrix limb allocation overflow in gpu_matrix_create");
-        }
+        mat->exec_limb_states[partition_idx].resize(partition.local_limb_count);
 
         cudaError_t err = cudaSetDevice(ctx->gpu_ids[partition_idx]);
         if (err != cudaSuccess)
@@ -316,7 +494,7 @@ extern "C" int gpu_matrix_create(
         }
 
         auto &exec_states = mat->exec_limb_states[partition_idx];
-        for (size_t limb_idx = 0; limb_idx < limbs; ++limb_idx)
+        for (size_t limb_idx = 0; limb_idx < partition.local_limb_count; ++limb_idx)
         {
             auto &state = exec_states[limb_idx];
             state.device = ctx->gpu_ids[partition_idx];
@@ -360,91 +538,109 @@ extern "C" int gpu_matrix_create(
         }
 
         uint8_t *base = nullptr;
-        err = cudaMallocAsync(reinterpret_cast<void **>(&base), total_bytes, alloc_stream);
+        err = cudaMallocAsync(
+            reinterpret_cast<void **>(&base),
+            partition.data_bytes,
+            alloc_stream);
         if (err != cudaSuccess)
         {
             destroy_matrix_contents(mat);
             delete mat;
             return set_error(err);
-        }
-
-        size_t aux_slots = 0;
-        size_t aux_total_slots = 0;
-        size_t aux_total_bytes = 0;
-        if (partition_idx >= ctx->decomp_counts_by_partition.size())
-        {
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error("unexpected decomp metadata size in gpu_matrix_create");
-        }
-        const size_t decomp_count = ctx->decomp_counts_by_partition[partition_idx];
-        if (!checked_mul_size(ctx->max_aux_limbs, static_cast<size_t>(4 + 4 * decomp_count), &aux_slots) ||
-            !checked_mul_size(aux_slots, count, &aux_total_slots) ||
-            !checked_mul_size(aux_total_slots, sizeof(void *), &aux_total_bytes))
-        {
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error("matrix aux allocation overflow in gpu_matrix_create");
         }
 
         void **aux_base = nullptr;
-        err = cudaMallocAsync(&aux_base, aux_total_bytes, alloc_stream);
+        err = cudaMallocAsync(&aux_base, partition.aux_bytes, alloc_stream);
         if (err != cudaSuccess)
         {
+            const cudaError_t allocation_error = err;
+            cudaFreeAsync(base, alloc_stream);
             destroy_matrix_contents(mat);
             delete mat;
-            return set_error(err);
+            return set_error(allocation_error);
+        }
+
+        auto *device_descriptors = reinterpret_cast<GpuMatrix::SharedLimbBuffer::DeviceDescriptor *>(
+            reinterpret_cast<uint8_t *>(aux_base) +
+            partition.aux_slots_total * sizeof(void *));
+        DeviceDescriptorInit descriptor_init{};
+        descriptor_init.base = base;
+        descriptor_init.stride = partition.bytes_per_poly;
+        descriptor_init.count = partition.local_limb_count;
+        for (size_t limb_idx = 0; limb_idx < partition.local_limb_count; ++limb_idx)
+        {
+            descriptor_init.offsets[limb_idx] = partition.limb_offsets_bytes[limb_idx];
+            descriptor_init.widths[limb_idx] = partition.limb_coeff_bytes[limb_idx];
+        }
+        mat->shared_limb_buffers[partition_idx] = GpuMatrix::SharedLimbBuffer{
+            ctx->gpu_ids[partition_idx],
+            base,
+            device_descriptors,
+            partition.local_limb_count,
+            partition.bytes_per_poly,
+            partition.data_bytes,
+            n,
+            std::move(partition.limb_coeff_bytes),
+            std::move(partition.limb_offsets_bytes)};
+        mat->shared_aux_buffers[partition_idx] = GpuMatrix::SharedAuxBuffer{
+            ctx->gpu_ids[partition_idx],
+            aux_base,
+            partition.aux_slots_per_poly,
+            partition.aux_slots_total};
+        auto fail_after_descriptor_enqueue = [&](cudaError_t failure) -> int {
+            // Only an error path may block here. Until the post-allocation
+            // events are installed, the older limb events do not protect the
+            // descriptor initialization from asynchronous owner cleanup.
+            cudaStreamSynchronize(alloc_stream);
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error(failure);
+        };
+        initialize_device_descriptors<<<1, static_cast<unsigned int>(partition.local_limb_count), 0, alloc_stream>>>(
+            device_descriptors, descriptor_init);
+        err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            return fail_after_descriptor_enqueue(err);
         }
 
         cudaEvent_t alloc_ready = nullptr;
         err = cudaEventCreateWithFlags(&alloc_ready, cudaEventDisableTiming);
         if (err != cudaSuccess)
         {
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error(err);
+            return fail_after_descriptor_enqueue(err);
         }
         err = cudaEventRecord(alloc_ready, alloc_stream);
         if (err != cudaSuccess)
         {
             cudaEventDestroy(alloc_ready);
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error(err);
+            return fail_after_descriptor_enqueue(err);
         }
 
-        for (size_t limb_idx = 0; limb_idx < limbs; ++limb_idx)
+        for (size_t limb_idx = 0; limb_idx < partition.local_limb_count; ++limb_idx)
         {
             auto &state = exec_states[limb_idx];
-            if (!state.stream || state.stream == alloc_stream)
+            if (!state.stream)
             {
                 continue;
             }
-            err = cudaStreamWaitEvent(state.stream, alloc_ready, 0);
+            if (state.stream != alloc_stream)
+            {
+                err = cudaStreamWaitEvent(state.stream, alloc_ready, 0);
+                if (err != cudaSuccess)
+                {
+                    cudaEventDestroy(alloc_ready);
+                    return fail_after_descriptor_enqueue(err);
+                }
+            }
+            err = cudaEventRecord(state.write_done, state.stream);
             if (err != cudaSuccess)
             {
                 cudaEventDestroy(alloc_ready);
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error(err);
+                return fail_after_descriptor_enqueue(err);
             }
         }
         cudaEventDestroy(alloc_ready);
-
-        mat->shared_limb_buffers[partition_idx] = GpuMatrix::SharedLimbBuffer{
-            ctx->gpu_ids[partition_idx],
-            base,
-            limbs,
-            bytes_per_poly,
-            total_bytes,
-            n,
-            std::move(local_limb_bytes),
-            std::move(local_limb_offsets)};
-        mat->shared_aux_buffers[partition_idx] = GpuMatrix::SharedAuxBuffer{
-            ctx->gpu_ids[partition_idx],
-            aux_base,
-            aux_slots,
-            aux_total_slots};
     }
 
     *out = mat;

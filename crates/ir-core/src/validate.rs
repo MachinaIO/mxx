@@ -6,7 +6,10 @@ use crate::{
     },
     expr::{ExprError, IntExpr, ParamEnv},
     graph::{CompileParameterKind, FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
-    node::{ConcatAxis, ConstantMatrix, IntBinaryOp, LoopInputMode, MatrixBinaryOp, NodeKind},
+    node::{
+        ConcatAxis, ConstantMatrix, HashVariant, IntBinaryOp, LoopInputMode, MatrixBinaryOp,
+        NodeKind,
+    },
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireRef, WireType},
 };
 use num_bigint::BigInt;
@@ -654,6 +657,32 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(output)]
         }
+        NodeKind::MatrixMulSmallRhs => {
+            require_arity(scope, node, 2)?;
+            let lhs = matrix_argument(scope, values, node, 0)?;
+            let (rhs, bound) = bounded_matrix_argument(scope, values, node, 1)?;
+            if lhs.modulus != rhs.modulus || lhs.ring_dimension != rhs.ring_dimension {
+                return Err(ValidationError::Check(crate::checks::CheckError::RingMismatch));
+            }
+            if lhs.columns != rhs.rows {
+                return Err(ValidationError::Check(crate::checks::CheckError::ShapeMismatch {
+                    left: lhs,
+                    right: rhs,
+                }));
+            }
+            if bound.is_negative() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "small RHS coefficient bound must be nonnegative",
+                );
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType {
+                rows: lhs.rows,
+                columns: rhs.columns,
+                ..lhs
+            })]
+        }
         NodeKind::MatrixNegate | NodeKind::MatrixScale { .. } => {
             require_arity(scope, node, 1)?;
             if let NodeKind::MatrixScale { scalar } = node.kind {
@@ -734,6 +763,7 @@ fn validate_node(
         }
         NodeKind::HashSample {
             matrix_type,
+            variant,
             tag_expressions,
             tag_decimal_expressions,
             tag_u64_le_expressions,
@@ -755,16 +785,53 @@ fn validate_node(
                     return node_error(scope, node.id, "little-endian hash tag must fit in u64");
                 }
             }
-            if base
-                .as_ref()
-                .is_some_and(|base| base.evaluate(env).is_ok_and(|v| v.abs() <= BigInt::one()))
-            {
-                return node_error(scope, node.id, "gadget base must be greater than one");
+            let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
+            let bound = match variant {
+                HashVariant::Plain if base.is_none() && digit_count.is_none() => None,
+                HashVariant::Plain => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "plain hash cannot have decomposition metadata",
+                    )
+                }
+                HashVariant::Decomposed | HashVariant::SmallDecomposed => {
+                    let Some(base) = base else {
+                        return node_error(scope, node.id, "decomposed hash requires a gadget base")
+                    };
+                    let base = base.evaluate(env)?;
+                    if base <= BigInt::one() {
+                        return node_error(scope, node.id, "gadget base must be greater than one");
+                    }
+                    let Some(count) = digit_count else {
+                        return node_error(scope, node.id, "decomposed hash requires a digit count")
+                    };
+                    let count = positive_usize(
+                        count.evaluate(env)?,
+                        "decomposition digit count",
+                        scope,
+                        node.id,
+                    )?;
+                    if matrix.rows % count != 0 {
+                        return node_error(
+                            scope,
+                            node.id,
+                            "hash output rows must be divisible by decomposition digit count",
+                        );
+                    }
+                    Some(if matches!(variant, HashVariant::SmallDecomposed) {
+                        base - BigInt::one()
+                    } else {
+                        (base + BigInt::one()) / 2
+                    })
+                }
+            };
+            match bound {
+                Some(max_coefficient_bound) => {
+                    vec![ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound }]
+                }
+                None => vec![ConcreteWireType::Matrix(matrix)],
             }
-            if let Some(count) = digit_count {
-                positive_usize(count.evaluate(env)?, "decomposition digit count", scope, node.id)?;
-            }
-            vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
         }
         NodeKind::TrapdoorSample {
             matrix_type,
@@ -835,9 +902,10 @@ fn validate_node(
             let target = matrix_argument(scope, values, node, 2)?;
             let output = concrete_matrix(matrix_type, env, scope, node.id)?;
             check_add_shape(&multiplication_type(&trapdoor, &output)?, &target)?;
-            vec![ConcreteWireType::Preimage(output)]
+            let bound = max_coefficient_bound.evaluate(env)?;
+            vec![ConcreteWireType::Preimage { matrix: output, max_coefficient_bound: bound }]
         }
-        NodeKind::GadgetDecompose { base, digit_count, .. } => {
+        NodeKind::GadgetDecompose { base, digit_count, small } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
             let base = base.evaluate(env)?;
@@ -855,7 +923,12 @@ fn validate_node(
                 node: node.id,
                 message: "gadget decomposition row count overflow".to_owned(),
             })?;
-            vec![ConcreteWireType::Preimage(ConcreteMatrixType { rows, ..input })]
+            let max_coefficient_bound =
+                if *small { base - BigInt::one() } else { (base + BigInt::one()) / 2 };
+            vec![ConcreteWireType::Preimage {
+                matrix: ConcreteMatrixType { rows, ..input },
+                max_coefficient_bound,
+            }]
         }
         NodeKind::ExtractCoefficient { position, .. } => {
             require_arity(scope, node, 1)?;
@@ -1274,13 +1347,25 @@ fn matrix_argument(
     node: &NodeView<'_>,
     index: usize,
 ) -> Result<ConcreteMatrixType, ValidationError> {
-    argument(scope, values, node, index)?.matrix_type().cloned().ok_or_else(|| {
-        ValidationError::Node {
-            scope: scope.clone(),
-            node: node.id,
-            message: "expected matrix argument".to_owned(),
+    match argument(scope, values, node, index)? {
+        ConcreteWireType::Matrix(matrix) => Ok(matrix.clone()),
+        _ => node_error(scope, node.id, "expected ordinary matrix argument"),
+    }
+}
+
+fn bounded_matrix_argument(
+    scope: &FrozenGraphScopeId,
+    values: &BTreeMap<WireRef, ConcreteWireType>,
+    node: &NodeView<'_>,
+    index: usize,
+) -> Result<(ConcreteMatrixType, BigInt), ValidationError> {
+    match argument(scope, values, node, index)? {
+        ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+        ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+            Ok((matrix.clone(), max_coefficient_bound.clone()))
         }
-    })
+        _ => node_error(scope, node.id, "expected SmallMatrix or Preimage right-hand side"),
+    }
 }
 
 fn trapdoor_argument(
@@ -1348,8 +1433,25 @@ fn concrete_wire(
         WireType::Matrix(matrix) => {
             ConcreteWireType::Matrix(concrete_matrix(matrix, env, scope, node)?)
         }
-        WireType::Preimage(matrix) => {
-            ConcreteWireType::Preimage(concrete_matrix(matrix, env, scope, node)?)
+        WireType::SmallMatrix { matrix, max_coefficient_bound } => {
+            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+            if max_coefficient_bound.is_negative() {
+                return node_error(scope, node, "small RHS coefficient bound must be nonnegative");
+            }
+            ConcreteWireType::SmallMatrix {
+                matrix: concrete_matrix(matrix, env, scope, node)?,
+                max_coefficient_bound,
+            }
+        }
+        WireType::Preimage { matrix, max_coefficient_bound } => {
+            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+            if max_coefficient_bound.is_negative() {
+                return node_error(scope, node, "preimage coefficient bound must be nonnegative");
+            }
+            ConcreteWireType::Preimage {
+                matrix: concrete_matrix(matrix, env, scope, node)?,
+                max_coefficient_bound,
+            }
         }
         WireType::Trapdoor {
             matrix,
@@ -1599,8 +1701,9 @@ fn node_error<T>(
 mod tests {
     use super::*;
     use crate::{
+        artifact::SpecHash,
         graph::{GraphOutput, ValueHandle},
-        node::{LoopInputMode, ParallelLoop, SampleRange, SequentialLoop},
+        node::{ArtifactInput, LoopInputMode, ParallelLoop, SampleRange, SequentialLoop},
     };
 
     fn matrix_type(modulus: i64, rows: i64, columns: i64) -> MatrixType {
@@ -1623,12 +1726,139 @@ mod tests {
         .expect("matrix input")
     }
 
+    fn bounded_input(
+        name: &str,
+        matrix_type: MatrixType,
+        max_coefficient_bound: i64,
+        preimage: bool,
+    ) -> ValueHandle {
+        let wire_type = if preimage {
+            WireType::Preimage {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        } else {
+            WireType::SmallMatrix {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        };
+        NodeHandle::new(
+            NodeKind::Input { name: name.to_owned(), wire_type: wire_type.clone(), artifact: None },
+            Vec::new(),
+            vec![wire_type],
+        )
+        .output(0)
+        .expect("bounded matrix input")
+    }
+
+    fn bounded_artifact_input(
+        matrix_type: MatrixType,
+        max_coefficient_bound: i64,
+        preimage: bool,
+        artifact_type: ArtifactType,
+    ) -> (ValueHandle, BTreeMap<ProductionId, Manifest>) {
+        let production_id = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] };
+        let artifact_name = "bounded".to_owned();
+        let wire_type = if preimage {
+            WireType::Preimage {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        } else {
+            WireType::SmallMatrix {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        };
+        let value = NodeHandle::new(
+            NodeKind::Input {
+                name: artifact_name.clone(),
+                wire_type: wire_type.clone(),
+                artifact: Some(ArtifactInput {
+                    production_id: production_id.clone(),
+                    artifact_name: artifact_name.clone(),
+                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
+                }),
+            },
+            Vec::new(),
+            vec![wire_type],
+        )
+        .output(0)
+        .expect("bounded artifact input");
+        let manifest = Manifest {
+            ir_version: crate::encoding::IR_VERSION,
+            production_id: production_id.clone(),
+            artifacts: BTreeMap::from([(
+                artifact_name,
+                ManifestArtifact {
+                    artifact_type,
+                    family_count: None,
+                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+        };
+        (value, BTreeMap::from([(production_id, manifest)]))
+    }
+
     fn value(
         kind: NodeKind,
         arguments: Vec<ValueHandle>,
         output_types: Vec<WireType>,
     ) -> ValueHandle {
         NodeHandle::new(kind, arguments, output_types).output(0).expect("node has an output")
+    }
+
+    fn hash_sample(
+        matrix_type: MatrixType,
+        variant: HashVariant,
+        base: Option<IntExpr>,
+        digit_count: Option<IntExpr>,
+    ) -> ValueHandle {
+        let output_type = match (&variant, &base) {
+            (HashVariant::Plain, _) => WireType::Matrix(matrix_type.clone()),
+            (HashVariant::Decomposed, Some(base)) => WireType::SmallMatrix {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: IntExpr::RoundDiv(
+                    Box::new(base.clone()),
+                    Box::new(IntExpr::constant(2)),
+                )
+                .canonicalize(),
+            },
+            (HashVariant::SmallDecomposed, Some(base)) => WireType::SmallMatrix {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: IntExpr::Sub(
+                    Box::new(base.clone()),
+                    Box::new(IntExpr::constant(1)),
+                )
+                .canonicalize(),
+            },
+            _ => WireType::Matrix(matrix_type.clone()),
+        };
+        let key_type = WireType::Bytes { length: IntExpr::constant(32) };
+        let key = NodeHandle::new(
+            NodeKind::Input { name: "key".to_owned(), wire_type: key_type.clone(), artifact: None },
+            Vec::new(),
+            vec![key_type],
+        )
+        .output(0)
+        .expect("hash key");
+        value(
+            NodeKind::HashSample {
+                matrix_type: matrix_type.clone(),
+                variant,
+                tag_prefix: Vec::new(),
+                tag_expressions: Vec::new(),
+                tag_decimal_expressions: Vec::new(),
+                tag_u64_le_expressions: Vec::new(),
+                base,
+                digit_count,
+            },
+            vec![key],
+            vec![output_type],
+        )
     }
 
     fn graph(name: &str, output: ValueHandle) -> Graph {
@@ -1680,6 +1910,290 @@ mod tests {
             validate(&graph("ring-mismatch", product), &ParamEnv::default()),
             Err(ValidationError::Check(CheckError::RingMismatch))
         ));
+    }
+
+    #[test]
+    fn small_rhs_multiplication_accepts_only_bounded_typed_rhs() {
+        let lhs = input("lhs", matrix_type(17, 2, 3));
+        let rhs = bounded_input("rhs", matrix_type(17, 3, 4), 7, false);
+        let product = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![lhs, rhs],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+        );
+        let validated = validate(&graph("small-rhs", product), &ParamEnv::default()).unwrap();
+        assert!(validated.root_scope().wire_types.values().any(|ty| {
+            matches!(
+                ty,
+                ConcreteWireType::SmallMatrix { max_coefficient_bound, .. }
+                    if max_coefficient_bound == &BigInt::from(7)
+            )
+        }));
+
+        let preimage = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input("preimage-rhs", matrix_type(17, 3, 4), 7, true),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+        );
+        validate(&graph("preimage-rhs", preimage), &ParamEnv::default()).unwrap();
+
+        let ordinary_rhs = input("ordinary-rhs", matrix_type(17, 3, 4));
+        let product = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![input("lhs", matrix_type(17, 2, 3)), ordinary_rhs],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+        );
+        assert!(
+            node_message(
+                validate(&graph("ordinary-rhs", product), &ParamEnv::default()).unwrap_err()
+            )
+            .contains("SmallMatrix or Preimage")
+        );
+    }
+
+    #[test]
+    fn hash_sample_metadata_matches_variant_and_output_schema() {
+        let plain_with_base = hash_sample(
+            matrix_type(17, 1, 1),
+            HashVariant::Plain,
+            Some(IntExpr::constant(4)),
+            None,
+        );
+        assert!(
+            node_message(
+                validate(&graph("plain-with-base", plain_with_base), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("plain hash cannot have decomposition metadata")
+        );
+
+        let plain_with_digits = hash_sample(
+            matrix_type(17, 1, 1),
+            HashVariant::Plain,
+            None,
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(&graph("plain-with-digits", plain_with_digits), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("plain hash cannot have decomposition metadata")
+        );
+
+        let decomposed_without_base = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            None,
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("decomposed-without-base", decomposed_without_base),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("decomposed hash requires a gadget base")
+        );
+
+        let decomposed_without_digits = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            None,
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("decomposed-without-digits", decomposed_without_digits),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("decomposed hash requires a digit count")
+        );
+
+        let nonpositive_digits = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(0)),
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("nonpositive-hash-digits", nonpositive_digits),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("decomposition digit count")
+        );
+
+        let invalid_base = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::SmallDecomposed,
+            Some(IntExpr::constant(1)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(&graph("invalid-hash-base", invalid_base), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("gadget base must be greater than one")
+        );
+
+        let nondivisible_rows = hash_sample(
+            matrix_type(17, 3, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(&graph("nondivisible-hash-rows", nondivisible_rows), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("hash output rows must be divisible")
+        );
+
+        let valid_balanced = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            validate(&graph("valid-balanced-hash", valid_balanced), &ParamEnv::default()).is_ok()
+        );
+
+        let valid_unsigned = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::SmallDecomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            validate(&graph("valid-unsigned-hash", valid_unsigned), &ParamEnv::default()).is_ok()
+        );
+    }
+
+    #[test]
+    fn small_rhs_multiplication_rejects_shape_and_negative_bound() {
+        let product = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input("rhs", matrix_type(17, 4, 1), 1, false),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 1))],
+        );
+        assert!(matches!(
+            validate(&graph("small-rhs-shape", product), &ParamEnv::default()),
+            Err(ValidationError::Check(CheckError::ShapeMismatch { .. }))
+        ));
+
+        let negative = bounded_input("negative", matrix_type(17, 1, 1), -1, false);
+        assert!(
+            node_message(
+                validate(&graph("negative-bound", negative), &ParamEnv::default()).unwrap_err()
+            )
+            .contains("small RHS coefficient bound")
+        );
+    }
+
+    #[test]
+    fn small_rhs_multiplication_rejects_modulus_and_ring_dimension_mismatches() {
+        let modulus_mismatch = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input("rhs", matrix_type(19, 3, 4), 1, false),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+        );
+        assert!(matches!(
+            validate(&graph("small-rhs-modulus-mismatch", modulus_mismatch), &ParamEnv::default()),
+            Err(ValidationError::Check(CheckError::RingMismatch))
+        ));
+
+        let ring_dimension_mismatch = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input(
+                    "rhs",
+                    MatrixType { ring_dimension: IntExpr::constant(16), ..matrix_type(17, 3, 4) },
+                    1,
+                    false,
+                ),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+        );
+        assert!(matches!(
+            validate(
+                &graph("small-rhs-ring-dimension-mismatch", ring_dimension_mismatch),
+                &ParamEnv::default()
+            ),
+            Err(ValidationError::Check(CheckError::RingMismatch))
+        ));
+    }
+
+    #[test]
+    fn artifact_manifest_rejects_bounded_kind_bound_and_shape_mismatches() {
+        let matrix = matrix_type(17, 1, 1);
+        let cases = [
+            (
+                "kind",
+                ArtifactType::Preimage {
+                    matrix: crate::types::ConcreteMatrixType {
+                        modulus: BigInt::from(17),
+                        ring_dimension: 8,
+                        rows: 1,
+                        columns: 1,
+                    },
+                    max_coefficient_bound: BigInt::from(3),
+                },
+            ),
+            (
+                "bound",
+                ArtifactType::SmallMatrix {
+                    matrix: crate::types::ConcreteMatrixType {
+                        modulus: BigInt::from(17),
+                        ring_dimension: 8,
+                        rows: 1,
+                        columns: 1,
+                    },
+                    max_coefficient_bound: BigInt::from(4),
+                },
+            ),
+            (
+                "shape",
+                ArtifactType::SmallMatrix {
+                    matrix: crate::types::ConcreteMatrixType {
+                        modulus: BigInt::from(17),
+                        ring_dimension: 8,
+                        rows: 2,
+                        columns: 1,
+                    },
+                    max_coefficient_bound: BigInt::from(3),
+                },
+            ),
+        ];
+        for (label, artifact_type) in cases {
+            let (input, manifests) =
+                bounded_artifact_input(matrix.clone(), 3, false, artifact_type);
+            let error =
+                validate_with_manifests(&graph(label, input), &ParamEnv::default(), &manifests)
+                    .expect_err("manifest mismatch must be rejected");
+            assert!(node_message(error).contains("artifact type does not match manifest"));
+        }
     }
 
     #[test]

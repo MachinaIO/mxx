@@ -53,11 +53,12 @@ extern "C"
         const GpuMatrix *const *matrices,
         const GpuMatrix *const *scalars,
         size_t matrix_count);
-    int gpu_matrix_intt_batch(GpuMatrix *const *matrices, size_t matrix_count);
-    int gpu_matrix_ntt_batch(GpuMatrix *const *matrices, size_t matrix_count);
     int gpu_matrix_intt_out_of_place_batch(
         GpuMatrix *const *outputs,
         const GpuMatrix *const *inputs,
+        size_t matrix_count);
+    int gpu_matrix_ntt_in_place_batch(
+        GpuMatrix *const *matrices,
         size_t matrix_count);
 
 #ifdef __cplusplus

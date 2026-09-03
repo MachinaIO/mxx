@@ -603,6 +603,7 @@ dependencies = [
 name = "mxx-runtime"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "keccak-asm",
  "libc",
  "mxx-dsl",

@@ -4,7 +4,10 @@ use crate::{
     BggPublicKeyCompiler, BggPublicKeyWire, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecWire,
     NaiveBggVecCompiler, NaiveVecCompileError,
 };
-use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Parallel, Ring, Trapdoor};
+use mxx_dsl::{
+    Bytes, DslContext, DslError, Family, GraphValue, HashTag, Mat, Parallel, Preimage, Ring,
+    Trapdoor,
+};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactConfidentiality, ProductionId},
@@ -33,6 +36,7 @@ pub struct NaiveBggNoiseRefreshCompiler {
     /// with a scalar decoder trapdoor use zero.
     pub decoder_zero_rows: usize,
     pub decoder_trapdoor_sigma: RealExpr,
+    pub decoder_preimage_max_coefficient_bound: IntExpr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,13 +48,13 @@ pub struct NaiveBggNoiseRefreshArtifacts {
 pub struct NaiveBggNoiseRefreshPreprocessingWires {
     pub a_prime: NaiveBggPublicKeyVecWire,
     pub decoder_public_keys: Family<Mat>,
-    pub decoder_preimages: Family<Mat>,
+    pub decoder_preimages: Family<Preimage>,
 }
 
 #[derive(Clone)]
 pub struct NaiveBggNoiseRefreshArtifactWires {
     pub a_prime: NaiveBggPublicKeyVecWire,
-    pub decoder_preimages: Family<Mat>,
+    pub decoder_preimages: Family<Preimage>,
 }
 
 #[derive(Debug, Error)]
@@ -104,6 +108,11 @@ impl NaiveBggNoiseRefreshCompiler {
     ) -> Result<NaiveBggNoiseRefreshPreprocessingWires, NaiveBggNoiseRefreshError> {
         self.validate_public_bundle(one)?;
         self.validate_public_bundle(refreshed_input)?;
+        if decoder_trapdoor.preimage_max_coefficient_bound() !=
+            &self.decoder_preimage_max_coefficient_bound
+        {
+            return Err(NaiveBggNoiseRefreshError::FamilyLayoutMismatch);
+        }
         let refresh_terms = self.public_refresh_terms(decoded_material)?;
         let a_prime = self.sample_a_prime(hash_key, refresh_id)?;
         let decoder_by_crt =
@@ -113,14 +122,18 @@ impl NaiveBggNoiseRefreshCompiler {
         let public_columns = self.public_key_columns();
         let zero_rows = self.decoder_zero_rows;
         let ring = self.ring();
-        let decoder_preimages = decoder_public_keys.clone().parallel_map(move |_, target| {
-            let target = if zero_rows == 0 {
-                target
-            } else {
-                Mat::concat(ConcatAxis::Rows, vec![target, ring.zero((zero_rows, public_columns))])
-            };
-            decoder_trapdoor.sample_preimage(target, (decoder_columns, public_columns)).as_mat()
-        })?;
+        let decoder_preimages =
+            decoder_public_keys.clone().parallel_map_values(move |_, target| {
+                let target = if zero_rows == 0 {
+                    target
+                } else {
+                    Mat::concat(
+                        ConcatAxis::Rows,
+                        vec![target, ring.zero((zero_rows, public_columns))],
+                    )
+                };
+                decoder_trapdoor.sample_preimage(target, (decoder_columns, public_columns))
+            })?;
         Ok(NaiveBggNoiseRefreshPreprocessingWires {
             a_prime,
             decoder_public_keys,
@@ -134,8 +147,8 @@ impl NaiveBggNoiseRefreshCompiler {
         wires: NaiveBggNoiseRefreshPreprocessingWires,
     ) -> Result<DslContext, NaiveBggNoiseRefreshError> {
         Ok(context
-            .public_family_output(NOISE_REFRESH_A_PRIME, wires.a_prime.matrices)?
-            .public_family_output(NOISE_REFRESH_DECODER_PREIMAGES, wires.decoder_preimages)?)
+            .public_output(NOISE_REFRESH_A_PRIME, wires.a_prime.matrices)?
+            .public_output(NOISE_REFRESH_DECODER_PREIMAGES, wires.decoder_preimages)?)
     }
 
     pub fn import_artifacts(
@@ -155,11 +168,12 @@ impl NaiveBggNoiseRefreshCompiler {
                 ),
                 reveal_plaintext: true,
             },
-            decoder_preimages: ring.family_artifact_input(
+            decoder_preimages: ring.preimage_family_artifact_input(
                 artifacts.production_id.clone(),
                 NOISE_REFRESH_DECODER_PREIMAGES,
                 self.flat_decoder_count(),
                 (self.decoder_public_columns, self.public_key_columns()),
+                self.decoder_preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
             ),
         })
@@ -168,15 +182,20 @@ impl NaiveBggNoiseRefreshCompiler {
     pub fn project_decoder_preimages(
         &self,
         decoder_state: Mat,
-        preimages: Family<Mat>,
+        preimages: Family<Preimage>,
     ) -> Result<Family<Mat>, NaiveBggNoiseRefreshError> {
+        let preimage_schema = preimages.schema();
         if decoder_state.matrix_type() != &self.decoder_state_type() ||
-            preimages.element_type() != &self.decoder_preimage_type() ||
+            preimage_schema.element.matrix != self.decoder_preimage_type() ||
+            preimage_schema.element.max_coefficient_bound !=
+                self.decoder_preimage_max_coefficient_bound ||
             preimages.count() != &IntExpr::constant(self.flat_decoder_count())
         {
             return Err(NaiveBggNoiseRefreshError::FamilyLayoutMismatch);
         }
-        Ok(preimages.parallel_map(move |_, preimage| decoder_state.clone() * preimage)?)
+        Ok(preimages.parallel_map_values(move |_, preimage| {
+            preimage.mul_small_rhs(decoder_state.clone())
+        })?)
     }
 
     pub fn build_online(
@@ -395,15 +414,13 @@ impl NaiveBggNoiseRefreshCompiler {
                         .map(|slot| {
                             let a_decomposed = (a_prime.matrices.get_static(slot) *
                                 self.ring().polynomial([scale.clone()]))
-                            .decompose(self.public_key.base.clone(), self.digit_count)
-                            .as_mat();
+                            .decompose(self.public_key.base.clone(), self.digit_count);
                             let gadget_decomposed = (gadget.clone() *
                                 self.ring().polynomial([scale.clone()]))
-                            .decompose(self.public_key.base.clone(), self.digit_count)
-                            .as_mat();
-                            refreshed.vectors.get_static(slot) * gadget_decomposed +
+                            .decompose(self.public_key.base.clone(), self.digit_count);
+                            gadget_decomposed.mul_small_rhs(refreshed.vectors.get_static(slot)) +
                                 refresh_terms[crt].get_static(slot) -
-                                one.vectors.get_static(slot) * a_decomposed -
+                                a_decomposed.mul_small_rhs(one.vectors.get_static(slot)) -
                                 decoders[crt].get_static(slot)
                         })
                         .collect(),
@@ -591,6 +608,7 @@ mod tests {
             decoder_public_columns: digit_count + 2,
             decoder_zero_rows: 0,
             decoder_trapdoor_sigma: RealExpr::from_integer(5),
+            decoder_preimage_max_coefficient_bound: IntExpr::constant(1_000_000),
         };
         assert_eq!(depth, compiler.crt_depth());
 
@@ -622,10 +640,11 @@ mod tests {
                 ),
                 reveal_plaintext: true,
             },
-            decoder_preimages: ring.input_family(
+            decoder_preimages: ring.preimage_input_family(
                 "unused-preimages",
                 compiler.flat_decoder_count(),
                 (compiler.decoder_public_columns, compiler.public_key_columns()),
+                compiler.decoder_preimage_max_coefficient_bound.clone(),
             ),
         };
         let projected = ring.input_family(

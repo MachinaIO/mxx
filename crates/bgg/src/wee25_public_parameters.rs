@@ -4,10 +4,10 @@ use crate::{
     WEE25_PUBLIC_B, WEE25_T_BOTTOM, Wee25CommitmentCompiler, Wee25CommitmentError,
     Wee25PublicParameterWires,
 };
-use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Trapdoor};
+use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Trapdoor};
 use mxx_ir_core::{
     IntExpr, RealExpr,
-    node::{ConcatAxis, ConstantMatrix, IndexRange},
+    node::{ConstantMatrix, IndexRange},
 };
 
 pub const WEE25_PUBLIC_B_TRAPDOOR: &str = "wee25_public_b_trapdoor";
@@ -91,10 +91,10 @@ impl Wee25PublicParameterCompiler {
     ) -> Result<DslContext, DslError> {
         context = context.public_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
         context = context.private_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
-        context = context.public_family_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
+        context = context.public_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
         for (index, family) in wires.public_parameters.t_top.into_iter().enumerate() {
             let part_count = self.layout.public_parameter_part_count();
-            context = context.public_family_output(
+            context = context.public_output(
                 self.layout.public_parameter_top_name(index / part_count, index % part_count),
                 family,
             )?;
@@ -109,7 +109,7 @@ impl Wee25PublicParameterCompiler {
         t_bottom: &Mat,
         digit_row: usize,
         part: usize,
-    ) -> Result<Family<Mat>, Wee25CommitmentError> {
+    ) -> Result<Family<Preimage>, Wee25CommitmentError> {
         let matrices = (0..self.layout.public_parameter_block_count())
             .map(|block| {
                 let block_index = block * self.layout.gadget_rows() + digit_row;
@@ -120,24 +120,42 @@ impl Wee25PublicParameterCompiler {
                     tag,
                     (self.layout.secret_size, self.layout.public_columns()),
                 );
-                let j = self.build_j_block(block, digit_row, part);
                 let gadget = self.layout.ring().gadget(
                     self.layout.secret_size,
                     self.layout.gadget_base.clone(),
                     self.layout.digit_count,
                 );
-                let target = gadget * j - w * t_bottom.clone();
+                let j_rows = self.build_j_block(block, digit_row, part);
+                let gadget_j = j_rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(secret_row, row)| {
+                        let gadget_block = gadget.clone().slice(
+                            None,
+                            Some(IndexRange {
+                                start: (secret_row * self.layout.digit_count).into(),
+                                end: ((secret_row + 1) * self.layout.digit_count).into(),
+                            }),
+                        );
+                        row.mul_small_rhs(gadget_block)
+                    })
+                    .reduce(|sum, term| sum + term)
+                    .unwrap_or_else(|| {
+                        self.layout
+                            .ring()
+                            .zero((self.layout.secret_size, self.layout.public_columns()))
+                    });
+                let target = gadget_j - w * t_bottom.clone();
                 b.sample_preimage(
                     target,
                     (self.layout.public_columns(), self.layout.public_columns()),
                 )
-                .as_mat()
             })
             .collect::<Vec<_>>();
         Ok(Family::pack(matrices)?)
     }
 
-    fn build_j_block(&self, block: usize, digit_row: usize, part: usize) -> Mat {
+    fn build_j_block(&self, block: usize, digit_row: usize, part: usize) -> Vec<Preimage> {
         let ring = self.layout.ring();
         let d = self.layout.secret_size;
         let k = self.layout.digit_count;
@@ -177,10 +195,10 @@ impl Wee25PublicParameterCompiler {
                     .into_iter()
                     .reduce(|sum, term| sum + term)
                     .unwrap_or_else(|| ring.zero((1, m_b)));
-                row.decompose(self.layout.gadget_base.clone(), k).as_mat()
+                row.decompose(self.layout.gadget_base.clone(), k)
             })
             .collect::<Vec<_>>();
-        if rows.len() == 1 { rows[0].clone() } else { Mat::concat(ConcatAxis::Rows, rows) }
+        rows
     }
 }
 
@@ -191,15 +209,25 @@ mod tests {
     use mxx_dsl::DslContext;
 
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{CpuSmallMatrix, PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
         poly::{PolyParams, dcrt::params::DCRTPolyParams},
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
-    use mxx_runtime::RuntimeValue;
+    use mxx_runtime::{ExecutionResult, RuntimeValue, backend::poly::CpuDcrtBackend};
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
 
     type HashSampler = DCRTPolyHashSampler<keccak_asm::Keccak256>;
+
+    fn small_matrix_output(
+        result: &ExecutionResult<CpuDcrtBackend>,
+        name: &str,
+    ) -> CpuSmallMatrix<DCRTPolyMatrix> {
+        let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
+            panic!("{name} must be a compact matrix output")
+        };
+        value.as_ref().clone()
+    }
 
     fn direct_j_block(
         layout: &Wee25CommitmentCompiler,
@@ -313,8 +341,12 @@ mod tests {
                     let j = direct_j_block(&layout, &parameters, block_index, part);
                     let expected = gadget.clone() * &j - &(w * bottom);
                     assert_eq!(
-                        b.clone() *
-                            matrix_output(&result, &format!("top-{digit_row}-{part}-{block}"),),
+                        b.clone()
+                            .multiply_small_rhs(&small_matrix_output(
+                                &result,
+                                &format!("top-{digit_row}-{part}-{block}"),
+                            ))
+                            .unwrap(),
                         expected,
                         "digit row {digit_row}, part {part}, block {block}"
                     );

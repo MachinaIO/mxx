@@ -370,6 +370,68 @@ int matrix_track_limb_consumer(
     return 0;
 }
 
+int matrix_track_limb_consumer_readonly(
+    const GpuMatrix *src,
+    const dim3 &limb_id,
+    int consumer_device,
+    cudaStream_t consumer_stream)
+{
+    if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
+    {
+        return set_error("invalid matrix_track_limb_consumer_readonly arguments");
+    }
+    const auto *state = matrix_limb_state_const(
+        src,
+        limb_id,
+        "invalid limb index in matrix_track_limb_consumer_readonly");
+    if (!state)
+    {
+        return 1;
+    }
+    if (state->device != consumer_device || !state->stream)
+    {
+        return set_error("invalid source placement in matrix_track_limb_consumer_readonly");
+    }
+    if (limb_id.x >= src->ctx->release_streams_by_partition.size() ||
+        !src->ctx->release_streams_by_partition[limb_id.x])
+    {
+        return set_error("missing source release stream in matrix_track_limb_consumer_readonly");
+    }
+
+    cudaError_t err = cudaSetDevice(consumer_device);
+    if (err != cudaSuccess)
+    {
+        return set_error(err);
+    }
+    cudaEvent_t consumer_done = nullptr;
+    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
+    if (err == cudaSuccess)
+    {
+        err = cudaEventRecord(consumer_done, consumer_stream);
+    }
+    if (err == cudaSuccess)
+    {
+        err = cudaStreamWaitEvent(
+            src->ctx->release_streams_by_partition[limb_id.x],
+            consumer_done,
+            0);
+    }
+    const cudaError_t destroy_err = consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
+    if (err == cudaSuccess)
+    {
+        err = destroy_err;
+    }
+    if (err != cudaSuccess)
+    {
+        // The caller may release the source immediately after an error.  A
+        // synchronous error-path fence keeps that release safe without
+        // changing the producer's write_done event.
+        cudaStreamSynchronize(consumer_stream);
+        return set_error(err);
+    }
+    return 0;
+}
+
 int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream)
 {
     if (!dst || !dst->ctx)
@@ -482,10 +544,14 @@ int matrix_acquire_aux_workspace(
     {
         return 0;
     }
-    if (aux_owner && aux_limb_id && matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
+    if (aux_owner && aux_limb_id)
     {
-        *out_shared = true;
-        return 0;
+        if (matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
+        {
+            *out_shared = true;
+            return 0;
+        }
+        return set_error("preallocated matrix auxiliary workspace is insufficient");
     }
     if (!stream)
     {

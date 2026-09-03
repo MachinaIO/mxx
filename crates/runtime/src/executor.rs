@@ -813,14 +813,21 @@ where
                     output_types.sort_by_key(|(port, _)| *port);
                     let output_types =
                         output_types.into_iter().map(|(_, ty)| ty).collect::<Vec<_>>();
-                    let operation = crate::gpu_calibration::gpu_calibration_operation_identity(
+                    if crate::gpu_calibration::gpu_operation_is_column_separable_for_types(
                         node.kind,
                         &argument_types,
-                        &output_types,
-                        &envs[0],
-                    )
-                    .map_err(ExecutionError::Backend)?;
-                    self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
+                    ) {
+                        let operation = crate::gpu_calibration::gpu_calibration_operation_identity(
+                            node.kind,
+                            &argument_types,
+                            &output_types,
+                            &envs[0],
+                        )
+                        .map_err(ExecutionError::Backend)?;
+                        self.backend
+                            .select_gpu_operation(operation)
+                            .map_err(Self::backend_error)?;
+                    }
                 }
             }
             if matches!(node.kind, NodeKind::PreimageSample { .. }) && envs.len() > 1 {

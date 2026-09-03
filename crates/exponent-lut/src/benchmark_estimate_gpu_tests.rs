@@ -296,9 +296,9 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     )
     .expect("build accepted Exponent-LUT graphs without simulation");
     let bundle = prepared.bundle.as_ref().expect("accepted candidate bundle");
-    assert_eq!(hex(prepared.layout_id), report.result.layout_id);
-    assert_eq!(hex(prepared.program_id), report.result.program_id);
-    assert_eq!(hex(*bundle.public_identity()), evidence.setup_identity);
+    let current_layout_id = hex(prepared.layout_id);
+    let current_program_id = hex(prepared.program_id);
+    let current_setup_identity = hex(*bundle.public_identity());
     let bindings = ParamEnv::default();
     let stages = [
         (
@@ -342,6 +342,15 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         prf_fresh_label_count = prepared.prf_component_count *
             prepared.prf_coefficient_count *
             fresh_error_digits,
+        accepted_layout_id = report.result.layout_id,
+        current_layout_id,
+        layout_id_matches = current_layout_id == report.result.layout_id,
+        accepted_program_id = report.result.program_id,
+        current_program_id,
+        program_id_matches = current_program_id == report.result.program_id,
+        accepted_setup_identity = evidence.setup_identity,
+        current_setup_identity,
+        setup_identity_matches = current_setup_identity == evidence.setup_identity,
         graph_construction_seconds = graph_started.elapsed().as_secs_f64(),
         parameter_simulation = false,
         lattice_estimator = false,

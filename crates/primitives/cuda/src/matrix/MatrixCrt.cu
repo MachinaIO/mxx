@@ -372,7 +372,7 @@ extern "C" int gpu_matrix_crt_recompose(
     uint64_t *d_plaintext = nullptr;
     uint64_t *d_reconstruction = nullptr;
     std::vector<void *> pinned_metadata;
-    pinned_metadata.reserve(10);
+    pinned_metadata.reserve(11);
     auto cleanup = [&]()
     {
         cudaSetDevice(dispatch_device);

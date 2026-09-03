@@ -375,15 +375,13 @@ mod crt_tests {
 
     #[test]
     #[serial_test::serial]
-    fn gpu_crt_recompose_matches_cpu_five_times() {
-        let cpu_parameters = DCRTPolyParams::new(32, 5, 17, 8);
-        let (moduli, _, _) = cpu_parameters.to_crt();
-        let gpu_parameters = GpuDCRTPolyParams::new(
-            cpu_parameters.ring_dimension(),
-            moduli,
-            cpu_parameters.base_bits(),
-        );
-        let q = cpu_parameters.modulus().as_ref().clone();
+    fn gpu_crt_recompose_matches_direct_residues_five_times() {
+        // Fixed primes avoid constructing an OpenFHE parameter object (and its
+        // process-global transform/cache state) in this GPU correctness oracle.
+        // Each prime is 1 mod 2N for N = 32.
+        let moduli = vec![131_009, 130_817, 129_793, 129_281, 128_833];
+        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8);
+        let q = moduli.iter().map(|modulus| BigUint::from(*modulus)).product::<BigUint>();
         assert!(q.bits() > 64, "test must exercise a multi-word ring modulus");
         let q_minus_one = &q - BigUint::from(1u8);
         let half_q_low = (&q / BigUint::from(2u8)).to_u64_digits()[0];
@@ -503,7 +501,6 @@ mod crt_tests {
                 );
             }
         }
-        gpu_device_sync();
     }
 }
 

@@ -456,6 +456,7 @@ dependencies = [
  "num-traits",
  "rayon",
  "serde",
+ "serial_test",
  "thiserror",
  "tracing",
 ]

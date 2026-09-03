@@ -30,3 +30,4 @@ tracing = { workspace = true, optional = true }
 [dev-dependencies]
 mxx-dsl.workspace = true
 num-bigint.workspace = true
+serial_test.workspace = true

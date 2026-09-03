@@ -15,7 +15,6 @@ use mxx_ir_core::{
     types::ConcreteMatrixType,
 };
 use mxx_primitives::{
-    env::gpu_vram_percent,
     matrix::{
         PolyMatrix, PolyMatrixSmallRhs, SmallPolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
@@ -135,6 +134,39 @@ fn pilot_interval_was_contaminated(baseline: &[u64], used_current: &[u64]) -> bo
 
 fn contaminated_pilot_can_retry(attempts: usize) -> bool {
     attempts < MAX_RUNTIME_PILOT_ATTEMPTS
+}
+
+fn fleet_context_vram_percent<T>(
+    placements: &[Vec<T>],
+    fixed_percent: impl Fn(&T) -> u32,
+    fixed_budget: impl Fn(&T) -> usize,
+) -> Result<u32, String> {
+    let first = placements
+        .first()
+        .and_then(|placement| placement.first())
+        .ok_or_else(|| "a GPU fleet needs nonempty device parameters".to_owned())?;
+    let fleet_percent = fixed_percent(first);
+    for (placement, parameters) in placements.iter().enumerate() {
+        let first = parameters
+            .first()
+            .ok_or_else(|| format!("GPU placement {placement} has no parameters"))?;
+        let placement_budget = fixed_budget(first);
+        for parameters in parameters {
+            let percent = fixed_percent(parameters);
+            if percent != fleet_percent {
+                return Err(format!(
+                    "GPU fleet contexts disagree on fixed VRAM percentage: expected {fleet_percent}, got {percent} at placement {placement}"
+                ));
+            }
+            let budget = fixed_budget(parameters);
+            if budget != placement_budget {
+                return Err(format!(
+                    "GPU placement {placement} contexts disagree on fixed VRAM budget: expected {placement_budget}, got {budget}"
+                ));
+            }
+        }
+    }
+    Ok(fleet_percent)
 }
 
 fn derive_runtime_widths(
@@ -363,6 +395,12 @@ struct RuntimePilot {
 impl GpuDcrtBackend {
     pub(super) fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
         assert!(!placements.is_empty(), "a GPU fleet needs at least one device");
+        let vram_percent = fleet_context_vram_percent(
+            &placements,
+            GpuDCRTPolyParams::vram_percent,
+            GpuDCRTPolyParams::vram_budget_bytes,
+        )
+        .unwrap_or_else(|error| panic!("invalid GPU fleet context configuration: {error}"));
         let devices = placements
             .into_iter()
             .map(|parameters| {
@@ -383,7 +421,7 @@ impl GpuDcrtBackend {
             pending_pilot: None,
             active_operation: None,
             calibration_registry: FrozenGpuCalibrationRegistry::default(),
-            vram_percent: gpu_vram_percent().expect("invalid MXX_GPU_VRAM_PERCENT"),
+            vram_percent,
             matrix_replicas: HashMap::new(),
         }
     }
@@ -397,6 +435,11 @@ impl GpuDcrtBackend {
 
     pub fn calibration_registry(&self) -> &FrozenGpuCalibrationRegistry {
         &self.calibration_registry
+    }
+
+    /// Percentage of physical VRAM fixed when this fleet context was created.
+    pub fn vram_percent(&self) -> u32 {
+        self.vram_percent
     }
 
     pub fn set_column_widths_for_operation(
@@ -1145,6 +1188,44 @@ mod tests {
     fn assert_profile_created(backend: &GpuDcrtBackend, operation: &[u8; 32]) {
         assert!(backend.operation_profiles.contains_key(operation));
         assert!(backend.column_widths(operation).is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn gpu_fleet_uses_context_vram_percent_after_environment_changes() {
+        let device = detected_gpu_device_ids()[0];
+        super::super::wait_for_gpu_test_context_quiescence(device);
+        let name = "MXX_GPU_VRAM_PERCENT";
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, "37") };
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        unsafe { std::env::set_var(name, "91") };
+        let backend = super::super::gpu_backend_on([parameters], [device]);
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        assert_eq!(backend.vram_percent(), 37);
+    }
+
+    #[test]
+    fn fleet_vram_configuration_rejects_inconsistent_contexts() {
+        assert!(
+            fleet_context_vram_percent(
+                &[vec![(37, 3_700)], vec![(80, 8_000)]],
+                |value| value.0,
+                |value| value.1
+            )
+            .is_err()
+        );
+        assert!(
+            fleet_context_vram_percent(
+                &[vec![(37, 3_700), (37, 3_701)]],
+                |value| value.0,
+                |value| value.1
+            )
+            .is_err()
+        );
     }
 
     #[test]

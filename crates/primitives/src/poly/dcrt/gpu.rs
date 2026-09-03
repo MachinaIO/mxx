@@ -967,6 +967,11 @@ impl GpuDCRTPolyParams {
         self.ctx.vram_budget_bytes
     }
 
+    /// Percentage fixed when this parameter set's GPU context was created.
+    pub fn vram_percent(&self) -> u32 {
+        self.vram_percent
+    }
+
     pub(crate) fn matrix_allocation_bytes(
         &self,
         level: usize,

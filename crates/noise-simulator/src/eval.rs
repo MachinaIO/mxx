@@ -4361,6 +4361,14 @@ fn eval_int_facts(
                 }
             }
             IntExpr::RoundDiv(_, _) | IntExpr::Log2Ceil(_) => None,
+            IntExpr::Select { selector, branches } => {
+                let selector = evaluate(selector, integers, loop_atoms)?;
+                if selector.binder.is_some() {
+                    return None;
+                }
+                let index = selector.offset.to_usize()?;
+                evaluate(branches.get(index)?, integers, loop_atoms)
+            }
         }
     }
     evaluate(&expression.canonicalize(), integers, loop_atoms).map(ScalarFacts::Affine)
@@ -4388,6 +4396,16 @@ fn int_expr_dependencies(
             &int_expr_dependencies(right, variables, loop_atoms),
         ]),
         IntExpr::Log2Ceil(value) => int_expr_dependencies(value, variables, loop_atoms),
+        IntExpr::Select { selector, branches } => BinderDependencies::union(
+            std::iter::once(int_expr_dependencies(selector, variables, loop_atoms))
+                .chain(
+                    branches
+                        .iter()
+                        .map(|branch| int_expr_dependencies(branch, variables, loop_atoms)),
+                )
+                .collect::<Vec<_>>()
+                .iter(),
+        ),
     }
 }
 
@@ -4493,6 +4511,34 @@ fn eval_int_interval(
                     log2_ceil(&range.minimum)?,
                     log2_ceil(&range.maximum_inclusive)?,
                 )?
+            }
+            IntExpr::Select { selector, branches } => {
+                let selector = evaluate(selector, concrete, integers, loop_indices)?;
+                let minimum = selector.minimum.to_usize().ok_or_else(|| {
+                    invalid("integer selector range is negative or does not fit usize".into())
+                })?;
+                let maximum = selector
+                    .maximum_inclusive
+                    .to_usize()
+                    .ok_or_else(|| invalid("integer selector range does not fit usize".into()))?;
+                if minimum > maximum || maximum >= branches.len() {
+                    return Err(invalid("integer selector range is out of bounds".into()));
+                }
+                let mut selected = branches[minimum..=maximum].iter();
+                let first = evaluate(
+                    selected.next().expect("validated nonempty selector interval"),
+                    concrete,
+                    integers,
+                    loop_indices,
+                )?;
+                selected.try_fold(first, |joined, branch| {
+                    Ok::<_, SimulationError>(joined.join(&evaluate(
+                        branch,
+                        concrete,
+                        integers,
+                        loop_indices,
+                    )?))
+                })?
             }
         })
     }

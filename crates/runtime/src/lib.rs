@@ -8,6 +8,10 @@ pub mod gpu_calibration;
 pub mod session;
 pub mod transcript;
 
+pub use artifact::{
+    ArtifactKey, ArtifactPayload, ArtifactStore, FileArtifactError, FileArtifactStore,
+    FilesystemArtifactStore, MemoryArtifactStore,
+};
 pub use backend::{Backend, RuntimeValue};
 pub use executor::{
     ExecutionConfig, ExecutionError, ExecutionResult, ExecutionTrace, PreimageProgressConfig,

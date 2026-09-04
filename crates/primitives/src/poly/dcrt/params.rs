@@ -3,6 +3,7 @@ use num_traits::Num;
 use openfhe::ffi;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::Arc};
+use thiserror::Error;
 
 use crate::poly::PolyParams;
 
@@ -21,6 +22,33 @@ pub struct DCRTPolyParams {
     base_bits: u32,
     decompose_last_mask: Option<u64>,
 }
+
+/// Backend capability errors for a concrete DCRT parameter request.
+///
+/// The limits are imposed by the OpenFHE native-int64 build and by the
+/// primitive decomposition paths, rather than by an application search
+/// harness.  Callers that need a panic-free parameter boundary should use
+/// [`DCRTPolyParams::validate_capability`] or [`DCRTPolyParams::try_new`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum DCRTPolyParamsError {
+    #[error("ring_dimension must be a power of 2")]
+    InvalidRingDimension,
+    #[error("CRT depth must be positive")]
+    InvalidCrtDepth,
+    #[error("CRT modulus width must be in 1..=60 for the OpenFHE native-int64 backend")]
+    UnsupportedCrtBits,
+    #[error("gadget base width must be in 1..=31 for primitive u32 decomposition")]
+    UnsupportedBaseBits,
+    #[error("gadget base width must not exceed CRT modulus width")]
+    BaseBitsExceedCrtBits,
+    #[error("DCRT digit count overflows usize")]
+    DigitCountOverflow,
+}
+
+/// OpenFHE's `MAX_MODULUS_SIZE` for the native-int64/HAVE_INT128 backend.
+pub const OPENFHE_MAX_CRT_BITS: usize = 60;
+/// Primitive decomposition uses `1u32 << base_bits` in its public paths.
+pub const MAX_PRIMITIVE_BASE_BITS: u32 = u32::BITS - 1;
 
 impl Debug for DCRTPolyParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,9 +103,43 @@ impl Default for DCRTPolyParams {
 }
 
 impl DCRTPolyParams {
-    pub fn new(ring_dimension: u32, crt_depth: usize, crt_bits: usize, base_bits: u32) -> Self {
-        // assert that ring_dimension is a power of 2
-        assert!(ring_dimension.is_power_of_two(), "ring_dimension must be a power of 2");
+    /// Checks the backend and primitive capability boundary without entering
+    /// OpenFHE or touching global native state.
+    pub fn validate_capability(
+        ring_dimension: u32,
+        crt_depth: usize,
+        crt_bits: usize,
+        base_bits: u32,
+    ) -> Result<(), DCRTPolyParamsError> {
+        if ring_dimension == 0 || !ring_dimension.is_power_of_two() {
+            return Err(DCRTPolyParamsError::InvalidRingDimension);
+        }
+        if crt_depth == 0 {
+            return Err(DCRTPolyParamsError::InvalidCrtDepth);
+        }
+        if crt_bits == 0 || crt_bits > OPENFHE_MAX_CRT_BITS {
+            return Err(DCRTPolyParamsError::UnsupportedCrtBits);
+        }
+        if base_bits == 0 || base_bits > MAX_PRIMITIVE_BASE_BITS {
+            return Err(DCRTPolyParamsError::UnsupportedBaseBits);
+        }
+        if base_bits as usize > crt_bits {
+            return Err(DCRTPolyParamsError::BaseBitsExceedCrtBits);
+        }
+        if crt_bits.div_ceil(base_bits as usize).checked_mul(crt_depth).is_none() {
+            return Err(DCRTPolyParamsError::DigitCountOverflow);
+        }
+        Ok(())
+    }
+
+    /// Panic-free constructor after capability validation.
+    pub fn try_new(
+        ring_dimension: u32,
+        crt_depth: usize,
+        crt_bits: usize,
+        base_bits: u32,
+    ) -> Result<Self, DCRTPolyParamsError> {
+        Self::validate_capability(ring_dimension, crt_depth, crt_bits, base_bits)?;
         let modulus = {
             let _native = crate::openfhe_guard::native_guard();
             ffi::GenModulus(ring_dimension, crt_depth, crt_bits)
@@ -90,19 +152,23 @@ impl DCRTPolyParams {
             None
         } else {
             let digits_per_tower = crt_bits.div_ceil(base_bits as usize);
-            // Determine effective bit-width for this digit within its CRT tower
             let last_bits = crt_bits - base_bits as usize * (digits_per_tower - 1);
             let mask = (1u64 << last_bits) - 1u64;
             Some(mask)
         };
-        Self {
+        Ok(Self {
             ring_dimension,
             crt_depth,
             crt_bits,
             modulus: Arc::new(BigUint::from_str_radix(&modulus, 10).expect("invalid string")),
             base_bits,
             decompose_last_mask,
-        }
+        })
+    }
+
+    pub fn new(ring_dimension: u32, crt_depth: usize, crt_bits: usize, base_bits: u32) -> Self {
+        Self::try_new(ring_dimension, crt_depth, crt_bits, base_bits)
+            .unwrap_or_else(|error| panic!("invalid DCRT parameters: {error}"))
     }
 
     pub fn crt_depth(&self) -> usize {
@@ -207,6 +273,27 @@ mod tests {
         let base_bits = 20;
         let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
         assert_eq!(p.base_bits(), base_bits);
+    }
+
+    #[test]
+    fn backend_capability_accepts_the_reviewed_50_25_pair() {
+        assert!(DCRTPolyParams::validate_capability(16, 1, 50, 25).is_ok());
+        let params = DCRTPolyParams::try_new(16, 1, 50, 25).expect("50/25 backend pair");
+        assert_eq!(params.crt_bits(), 50);
+        assert_eq!(params.base_bits(), 25);
+    }
+
+    #[test]
+    fn backend_capability_rejects_values_before_openfhe() {
+        assert_eq!(
+            DCRTPolyParams::validate_capability(16, 1, 61, 25),
+            Err(DCRTPolyParamsError::UnsupportedCrtBits)
+        );
+        assert_eq!(
+            DCRTPolyParams::validate_capability(16, 1, 50, 32),
+            Err(DCRTPolyParamsError::UnsupportedBaseBits)
+        );
+        assert!(DCRTPolyParams::try_new(16, 1, 50, 32).is_err());
     }
 
     #[test]

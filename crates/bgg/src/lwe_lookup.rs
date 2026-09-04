@@ -769,7 +769,6 @@ impl LweLookupCompiler {
         let output_plaintext = artifacts.output_plaintexts.get(input_index.clone());
         Ok(BggEncodingWire {
             vector: c_b.clone().mul_small_rhs(high) + input.vector.clone().mul_small_rhs(low),
-            pubkey: self.public_key(artifacts),
             plaintext: Some(output_plaintext),
         })
     }
@@ -1602,10 +1601,6 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupEncodingLowering {
                     .encoding(
                         &BggEncodingWire {
                             vector: input.vectors.get_static(slot_index),
-                            pubkey: BggPublicKeyWire {
-                                matrix: input.pubkeys.get_static(slot_index),
-                                reveal_plaintext: input.pubkey_reveal_plaintext,
-                            },
                             plaintext: Some(plaintexts.get_static(slot_index)),
                         },
                         &self.c_b_by_slot.get_static(slot_index),
@@ -1619,8 +1614,18 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupEncodingLowering {
         let mut output_plaintexts = Vec::with_capacity(outputs.len());
         for output in outputs {
             vectors.push(output.vector);
-            public_keys.push(output.pubkey.matrix);
             output_plaintexts.push(output.plaintext.expect("lookup reveals its output"));
+        }
+        // The Naive vector wire still carries the separately materialized
+        // public projection for its decoder-facing API.  It is imported from
+        // the preprocessing artifact; `BggEncodingWire` itself never carries
+        // this projection.
+        for slot in 0..invocation.slots.len() {
+            let artifacts = invocation.slots[slot]
+                .compiler
+                .import_artifacts(&invocation.slots[slot].artifacts)
+                .map_err(|source| lookup_error(gate, source))?;
+            public_keys.push(invocation.slots[slot].compiler.public_key(&artifacts).matrix);
         }
         Ok(NaiveBggEncodingVecWire {
             vectors: Family::pack(vectors)?,
@@ -1696,15 +1701,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        BggEncodingCompiler, BggPublicKeyCompiler, BggTallEncodingCompiler,
+        BggPublicKeyCompiler, BggTallEncodingCompiler,
         test_utils::{matrix_output, row},
     };
     use mxx_dsl::DslContext;
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{
         FrozenGraphScopeId, ParamEnv,
-        artifact::{ArtifactConfidentiality, SpecHash},
-        node::{GridInputMode, IntBinaryOp, MatrixBinaryOp, NodeKind},
+        artifact::SpecHash,
+        node::{GridInputMode, IntBinaryOp, NodeKind},
         types::WireType,
     };
     use mxx_primitives::{
@@ -2787,15 +2792,13 @@ mod tests {
         )
         .expect("invocation");
         let ring = lookup.ring();
-        let standard = BggEncodingCompiler {
+        let circuit_compiler = crate::PolyCircuitCompiler {
             public_key: BggPublicKeyCompiler {
                 ring: ring.clone(),
                 base: lookup.gadget_base.clone(),
                 digit_count: lookup.digit_count.clone(),
             },
         };
-        let circuit_compiler =
-            crate::PolyCircuitCompiler { public_key: standard.public_key.clone() };
         let public_key = |prefix: &str| BggPublicKeyWire {
             matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
             reveal_plaintext: true,
@@ -2829,10 +2832,6 @@ mod tests {
         );
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, digit_count)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
-                reveal_plaintext: true,
-            },
             plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
         };
         let mut lowering =
@@ -2851,8 +2850,6 @@ mod tests {
         let built = DslContext::new("lwe-lookup-lowering")
             .output("vector", outputs[0].vector.clone())
             .expect("output")
-            .output("public-key", outputs[0].pubkey.matrix.clone())
-            .expect("public key")
             .output("plaintext", outputs[0].plaintext.clone().expect("lookup output plaintext"))
             .expect("plaintext")
             .build()
@@ -2863,7 +2860,7 @@ mod tests {
                 .iter()
                 .filter(|node| matches!(node.kind(), NodeKind::Input { artifact: Some(_), .. }))
                 .count(),
-            4
+            3
         );
         for suffix in ["_low_matrices", "_high_matrices", "_output_plaintexts"] {
             assert!(
@@ -2948,8 +2945,6 @@ mod tests {
                 .expect("table"),
         );
         let production_id = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] };
-        let output_public_key_artifact =
-            LweLookupArtifactNames::for_compiler(&lookup).output_public_key;
         let invocation = LweLookupInvocation::bind(
             lookup.clone(),
             LweLookupArtifacts::for_compiler(production_id.clone(), &lookup),
@@ -2967,10 +2962,6 @@ mod tests {
         };
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, digit_count)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
-                reveal_plaintext: true,
-            },
             plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
         };
         let input_encoding = encoding("input");
@@ -2991,76 +2982,21 @@ mod tests {
             .next()
             .expect("one LUT output");
         let output_plaintext = output.plaintext.clone().expect("lookup output plaintext");
-        let secret = ring.input("lookup-secret", (1, 1));
-        let gadget = ring.gadget(1, lookup.gadget_base.clone(), lookup.digit_count.clone());
-        let signal = secret.clone() * output.pubkey.matrix.clone() -
-            output_plaintext.clone() * secret.clone() * gadget.clone();
-
-        let NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) = signal.value_handle().node().kind()
-        else {
-            panic!("lookup signal must be a subtraction")
-        };
-        let [left, right] = signal.value_handle().node().arguments() else {
-            panic!("lookup signal subtraction must have two operands")
-        };
-        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = left.node().kind() else {
-            panic!("lookup signal left side must be secret times output public key")
-        };
-        assert_eq!(
-            left.node().arguments(),
-            [secret.value_handle().clone(), output.pubkey.matrix.value_handle().clone()]
-        );
-        let NodeKind::Input { artifact: Some(artifact), .. } =
-            output.pubkey.matrix.value_handle().node().kind()
-        else {
-            panic!("lookup output public key must be imported from its exact artifact")
-        };
-        assert_eq!(artifact.production_id, production_id);
-        assert_eq!(artifact.artifact_name, output_public_key_artifact);
-        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
-
-        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = right.node().kind() else {
-            panic!("lookup signal right side must end with a gadget multiplication")
-        };
-        let [plaintext_times_secret, right_gadget] = right.node().arguments() else {
-            panic!("lookup signal gadget product must have two operands")
-        };
-        assert_eq!(right_gadget, gadget.value_handle());
-        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = plaintext_times_secret.node().kind()
-        else {
-            panic!("lookup signal must multiply its plaintext by the secret before the gadget")
-        };
-        assert_eq!(
-            plaintext_times_secret.node().arguments(),
-            [output_plaintext.value_handle().clone(), secret.value_handle().clone()]
-        );
-        let NodeKind::FamilyGetDynamic { .. } = output_plaintext.value_handle().node().kind()
-        else {
-            panic!("lookup output plaintext must use dynamic access to the artifact family")
-        };
-        let [output_family, output_selector] = output_plaintext.value_handle().node().arguments()
-        else {
-            panic!("lookup output plaintext family access has the wrong arity")
-        };
-        let NodeKind::Input { artifact: Some(artifact), .. } = output_family.node().kind() else {
-            panic!("lookup output plaintext must come from the authoritative artifact family")
-        };
-        assert_eq!(artifact.production_id, production_id);
-        assert_eq!(
-            artifact.artifact_name,
-            LweLookupArtifactNames::for_compiler(&lookup).output_plaintexts
-        );
-        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
-        let NodeKind::ExtractCoefficient { position, .. } = output_selector.node().kind() else {
-            panic!("lookup output plaintext selector must be the input coefficient")
-        };
-        assert_eq!(position, &IntExpr::constant(0));
-
-        DslContext::new("single-lwe-public-lookup-signal")
-            .output("signal", signal)
-            .expect("signal output")
+        let built = DslContext::new("single-lwe-public-lookup-encoding")
+            .output("vector", output.vector)
+            .expect("vector output")
+            .output("plaintext", output_plaintext)
+            .expect("plaintext output")
             .build()
-            .expect("signal graph");
+            .expect("encoding graph");
+        assert!(
+            built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .all(|node| { !matches!(node.kind(), NodeKind::GadgetDecompose { .. }) })
+        );
     }
 
     #[test]

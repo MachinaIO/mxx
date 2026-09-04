@@ -334,10 +334,15 @@ fn int_contains_loop_index(value: &IntExpr) -> bool {
         IntExpr::Sub(left, right) |
         IntExpr::Mul(left, right) |
         IntExpr::Div(left, right) |
+        IntExpr::FloorDiv(left, right) |
+        IntExpr::Rem(left, right) |
         IntExpr::RoundDiv(left, right) => {
             int_contains_loop_index(left) || int_contains_loop_index(right)
         }
         IntExpr::Log2Ceil(value) => int_contains_loop_index(value),
+        IntExpr::Select { selector, branches } => {
+            int_contains_loop_index(selector) || branches.iter().any(int_contains_loop_index)
+        }
         IntExpr::Const(_) | IntExpr::Var(_) => false,
     }
 }

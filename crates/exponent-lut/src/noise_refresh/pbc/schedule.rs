@@ -99,6 +99,7 @@ impl ValidatedSupport {
 }
 
 /// Private bucket selections for one validated public layout.
+#[derive(Clone)]
 pub struct PbcPrivateSchedule {
     pub(crate) layout_id: PbcLayoutId,
     pub(crate) selected_slots: Vec<usize>,
@@ -256,6 +257,7 @@ pub(crate) fn schedule_from_owners(
 }
 
 /// Public layout paired with its private schedule during key generation.
+#[derive(Clone)]
 pub struct PbcGeneratedKeyLayout {
     /// Public metadata safe to serialize and share.
     pub public_layout: PbcPublicLayout,

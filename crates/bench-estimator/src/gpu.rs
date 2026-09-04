@@ -10,7 +10,7 @@ use crate::{
 };
 use mxx_ir_core::{
     ParamEnv,
-    artifact::ArtifactType,
+    artifact::{ArtifactConfidentiality, ArtifactType},
     encoding,
     node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp, NodeKind},
     types::{ConcreteMatrixType, ConcreteWireType},
@@ -34,8 +34,7 @@ use mxx_runtime::{
         GpuCalibrationKey, GpuCalibrationProfile, GpuCalibrationRegistry, GpuColumnWidths,
         GpuDeviceCalibration, GpuDeviceMemory, gpu_calibration_environment,
         gpu_calibration_operation_identity, gpu_capped_waterfill_columns,
-        gpu_matrix_multiply_scales_left, gpu_operation_is_column_separable,
-        gpu_operation_is_column_separable_for_types,
+        gpu_matrix_multiply_scales_left, gpu_operation_is_column_separable_for_types,
     },
 };
 use num_bigint::BigInt;
@@ -465,10 +464,6 @@ impl GpuNodeMeasurementBackend {
         Ok(())
     }
 
-    fn column_separable(kind: &NodeKind) -> bool {
-        gpu_operation_is_column_separable(kind)
-    }
-
     fn matrix_columns(wire_type: &ConcreteWireType) -> Option<usize> {
         match wire_type {
             ConcreteWireType::Matrix(matrix) |
@@ -529,10 +524,6 @@ impl GpuNodeMeasurementBackend {
             NodeKind::Concat { axis: ConcatAxis::Diagonal } => true,
             _ => false,
         }
-    }
-
-    fn argument_is_fixed(node: &MeasurementNode<'_>, index: usize) -> bool {
-        Self::argument_is_fixed_for(node.kind, &node.concrete_argument_types, index)
     }
 
     fn fixed_arguments(kind: &NodeKind, concrete_argument_types: &[ConcreteWireType]) -> Vec<bool> {
@@ -2910,9 +2901,15 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
     }
 
     fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
-        matches!(kind, NodeKind::Input { .. })
-            .then(|| self.persistent_storage_bytes_for_node(kind, wire_type))
-            .unwrap_or(0)
+        match kind {
+            NodeKind::Input { artifact: Some(artifact), .. }
+                if artifact.confidentiality == ArtifactConfidentiality::Private =>
+            {
+                0
+            }
+            NodeKind::Input { .. } => self.persistent_storage_bytes_for_node(kind, wire_type),
+            _ => 0,
+        }
     }
 
     fn persistent_alias_argument(&self, kind: &NodeKind, output_port: usize) -> Option<usize> {
@@ -2975,7 +2972,9 @@ mod tests {
         node::{ConstantMatrix, HashVariant, IndexRange, MatrixBinaryOp, NodeKind},
         types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId},
     };
-    use mxx_runtime::gpu_calibration::{GpuColumnWidths, gpu_capped_waterfill_columns};
+    use mxx_runtime::gpu_calibration::{
+        GpuColumnWidths, gpu_capped_waterfill_columns, gpu_operation_is_column_separable,
+    };
     use num_bigint::BigInt;
 
     #[test]
@@ -3046,22 +3045,22 @@ mod tests {
             modulus: IntExpr::constant(257),
         };
 
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::ConstantMatrix {
+        assert!(gpu_operation_is_column_separable(&NodeKind::ConstantMatrix {
             matrix_type: matrix_type.clone(),
             value: ConstantMatrix::Identity
         }));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Transpose));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Concat {
+        assert!(gpu_operation_is_column_separable(&NodeKind::Transpose));
+        assert!(gpu_operation_is_column_separable(&NodeKind::Concat {
             axis: mxx_ir_core::node::ConcatAxis::Columns,
         }));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Tensor));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::RingAutomorphism {
+        assert!(gpu_operation_is_column_separable(&NodeKind::Tensor));
+        assert!(gpu_operation_is_column_separable(&NodeKind::RingAutomorphism {
             index: IntExpr::constant(3),
         }));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Concat {
+        assert!(gpu_operation_is_column_separable(&NodeKind::Concat {
             axis: mxx_ir_core::node::ConcatAxis::Diagonal,
         }));
-        assert!(!GpuNodeMeasurementBackend::column_separable(&NodeKind::ConstantMatrix {
+        assert!(!gpu_operation_is_column_separable(&NodeKind::ConstantMatrix {
             matrix_type,
             value: ConstantMatrix::Rotation { exponent: IntExpr::constant(1) },
         }));
@@ -3459,8 +3458,16 @@ mod tests {
             assert_eq!(outputs[0].matrix_type().unwrap().columns, 4);
             assert_eq!(scale, 2.0);
             assert_eq!(remainder_columns, Some(2));
-            assert!(GpuNodeMeasurementBackend::argument_is_fixed(&node, fixed_argument));
-            assert!(!GpuNodeMeasurementBackend::argument_is_fixed(&node, 1 - fixed_argument));
+            assert!(GpuNodeMeasurementBackend::argument_is_fixed_for(
+                node.kind,
+                &node.concrete_argument_types,
+                fixed_argument,
+            ));
+            assert!(!GpuNodeMeasurementBackend::argument_is_fixed_for(
+                node.kind,
+                &node.concrete_argument_types,
+                1 - fixed_argument,
+            ));
         }
     }
 
@@ -3507,7 +3514,13 @@ mod tests {
         };
         assert_eq!(
             (0..2)
-                .map(|index| GpuNodeMeasurementBackend::argument_is_fixed(&pilot_node, index))
+                .map(|index| {
+                    GpuNodeMeasurementBackend::argument_is_fixed_for(
+                        pilot_node.kind,
+                        &pilot_node.concrete_argument_types,
+                        index,
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![false, true]
         );
@@ -3566,8 +3579,16 @@ mod tests {
         assert_eq!(outputs[0].matrix_type().unwrap().columns, 4);
         assert_eq!(scale, 2.0);
         assert_eq!(remainder, Some(2));
-        assert!(!GpuNodeMeasurementBackend::argument_is_fixed(&node, 0));
-        assert!(GpuNodeMeasurementBackend::argument_is_fixed(&node, 1));
+        assert!(!GpuNodeMeasurementBackend::argument_is_fixed_for(
+            node.kind,
+            &node.concrete_argument_types,
+            0,
+        ));
+        assert!(GpuNodeMeasurementBackend::argument_is_fixed_for(
+            node.kind,
+            &node.concrete_argument_types,
+            1,
+        ));
     }
 
     #[test]
@@ -3606,7 +3627,7 @@ mod tests {
             }],
         };
 
-        assert!(GpuNodeMeasurementBackend::column_separable(&kind));
+        assert!(gpu_operation_is_column_separable(&kind));
         let (representative, _, outputs, scale, remainder_columns) =
             GpuNodeMeasurementBackend::representative_node(&node, 4);
         let NodeKind::GadgetTrapdoor { matrix_type, .. } = representative else {

@@ -13,8 +13,8 @@ gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
 mxx-bgg.workspace = true
 mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
-mxx-noise-simulator.workspace = true
 mxx-primitives.workspace = true
+mxx-runtime.workspace = true
 bigdecimal.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
@@ -27,7 +27,6 @@ rand.workspace = true
 [dev-dependencies]
 mxx-bench-estimator = { workspace = true, features = ["gpu"] }
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
-mxx-runtime.workspace = true
 serial_test.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

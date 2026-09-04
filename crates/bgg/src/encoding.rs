@@ -1,25 +1,28 @@
 //! Declarative BGG+ encoding graph values.
 
-use crate::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
-use bigdecimal::BigDecimal;
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
+use crate::BggPublicKeyWire;
+use mxx_dsl::{
+    DslError, FamilyElement, GraphValue, GraphValueSchema, Mat, MatType, Pending, Preimage, Ring,
+};
 use mxx_ir_core::{IntExpr, RealExpr, ValueHandle, WireType, node::IndexRange};
-use num_bigint::ToBigInt;
-use num_traits::{ToPrimitive, Zero};
 use rayon::prelude::*;
 use thiserror::Error;
 
 #[derive(Clone)]
 pub struct BggEncodingWire {
     pub vector: Mat,
-    pub pubkey: BggPublicKeyWire,
     pub plaintext: Option<Mat>,
+}
+
+impl FamilyElement for BggEncodingWire {
+    fn normalize_for_family(self) -> Self {
+        self
+    }
 }
 
 #[derive(Clone)]
 pub struct BggEncodingType {
     pub vector: MatType,
-    pub pubkey: BggPublicKeyType,
     pub plaintext: Option<MatType>,
 }
 
@@ -28,7 +31,6 @@ impl GraphValue for BggEncodingWire {
 
     fn flatten(&self) -> Vec<ValueHandle> {
         let mut values = self.vector.flatten();
-        values.extend(self.pubkey.flatten());
         if let Some(plaintext) = &self.plaintext {
             values.extend(plaintext.flatten());
         }
@@ -38,7 +40,6 @@ impl GraphValue for BggEncodingWire {
     fn pending(&self) -> Pending {
         Pending::merge(
             std::iter::once(self.vector.pending())
-                .chain(std::iter::once(self.pubkey.pending()))
                 .chain(self.plaintext.as_ref().map(GraphValue::pending)),
         )
     }
@@ -46,7 +47,6 @@ impl GraphValue for BggEncodingWire {
     fn schema(&self) -> Self::Schema {
         BggEncodingType {
             vector: self.vector.schema(),
-            pubkey: self.pubkey.schema(),
             plaintext: self.plaintext.as_ref().map(GraphValue::schema),
         }
     }
@@ -57,22 +57,16 @@ impl GraphValue for BggEncodingWire {
         pending: Pending,
     ) -> Result<Self, DslError> {
         let vector_count = schema.vector.wire_types().len();
-        let pubkey_count = schema.pubkey.wire_types().len();
-        let expected = vector_count + pubkey_count + usize::from(schema.plaintext.is_some());
+        let expected = vector_count + usize::from(schema.plaintext.is_some());
         if values.len() != expected {
             return Err(DslError::Schema);
         }
         Ok(Self {
             vector: Mat::from_values(&schema.vector, &values[..vector_count], pending.clone())?,
-            pubkey: BggPublicKeyWire::from_values(
-                &schema.pubkey,
-                &values[vector_count..vector_count + pubkey_count],
-                pending.clone(),
-            )?,
             plaintext: schema
                 .plaintext
                 .as_ref()
-                .map(|ty| Mat::from_values(ty, &values[vector_count + pubkey_count..], pending))
+                .map(|ty| Mat::from_values(ty, &values[vector_count..], pending))
                 .transpose()?,
         })
     }
@@ -84,14 +78,12 @@ impl GraphValueSchema for BggEncodingType {
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
         BggEncodingWire {
             vector: self.vector.placeholders_from(next),
-            pubkey: self.pubkey.placeholders_from(next),
             plaintext: self.plaintext.as_ref().map(|plaintext| plaintext.placeholders_from(next)),
         }
     }
 
     fn wire_types(&self) -> Vec<WireType> {
         let mut types = self.vector.wire_types();
-        types.extend(self.pubkey.wire_types());
         if let Some(plaintext) = &self.plaintext {
             types.extend(plaintext.wire_types());
         }
@@ -99,10 +91,13 @@ impl GraphValueSchema for BggEncodingType {
     }
 }
 
-#[derive(Clone)]
-pub struct BggEncodingCompiler {
-    pub public_key: BggPublicKeyCompiler,
-}
+/// Compiler for online encoding carriers.
+///
+/// This is intentionally state-free: public-key compilation and gadget
+/// decomposition belong to preprocessing.  Online multiplication methods
+/// receive the already cached typed `Preimage` explicitly.
+#[derive(Clone, Copy, Default)]
+pub struct BggEncodingCompiler;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum EncodingCompileError {
@@ -111,17 +106,16 @@ pub enum EncodingCompileError {
 }
 
 impl BggEncodingCompiler {
+    /// Adds encoding carriers.  Public-key arithmetic is deliberately absent:
+    /// it belongs to the preprocessing public-key program, not this online
+    /// encoding value.
     pub fn add(
         &self,
         lhs: &BggEncodingWire,
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
-        // If C_L and C_R are encodings, their additive carrier is C_L + C_R and
-        // their known message is x_L + x_R; the public-key relation is added in
-        // the same coordinate system, so no carrier or column is discarded.
         Ok(BggEncodingWire {
             vector: lhs.vector.clone() + rhs.vector.clone(),
-            pubkey: self.public_key.add(&lhs.pubkey, &rhs.pubkey),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left + right),
         })
     }
@@ -131,35 +125,25 @@ impl BggEncodingCompiler {
         lhs: &BggEncodingWire,
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
-        // Subtraction is the same component-wise relation with signs reversed:
-        // C_L - C_R carries x_L - x_R and A_L - A_R, respectively.
         Ok(BggEncodingWire {
             vector: lhs.vector.clone() - rhs.vector.clone(),
-            pubkey: self.public_key.sub(&lhs.pubkey, &rhs.pubkey),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left - right),
         })
     }
 
-    /// Builds `c_L G^-1(A_R) + c_R x_L`, matching the concrete BGG+ formula.
+    /// Builds `c_L K_R + c_R x_L`, where `K_R` is the preprocessing-supplied
+    /// typed decomposition of the public RHS.  This is the sole multiplication
+    /// input needed by online encoding.
     pub fn mul(
         &self,
         lhs: &BggEncodingWire,
         rhs: &BggEncodingWire,
+        decomposed_rhs: Preimage,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
         let plaintext = lhs.plaintext.clone().ok_or(EncodingCompileError::MissingLeftPlaintext)?;
-        let decomposed_rhs = rhs
-            .pubkey
-            .matrix
-            .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        // For C_L = s_L A_L - x_L s_L G + e_L and the decomposition
-        // G K_R = A_R, the two terms C_L K_R + x_L C_R cancel the
-        // cross term and leave an encoding of x_L x_R.  `mul_small_rhs`
-        // keeps K_R as the rightmost carrier consumed by C_L.
         Ok(BggEncodingWire {
             vector: lhs.vector.clone().mul_small_rhs(decomposed_rhs) +
                 plaintext * rhs.vector.clone(),
-            pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
     }
@@ -170,35 +154,29 @@ impl BggEncodingCompiler {
         // without changing the gadget-column layout.
         BggEncodingWire {
             vector: scalar.clone() * input.vector.clone(),
-            pubkey: self.public_key.small_scalar_mul(&input.pubkey, scalar),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
     }
 
-    pub fn large_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
-        let decomposed = self.public_key.large_scalar_decomposition(&input.pubkey, scalar);
-        // A large scalar t is represented by the decomposition of tG.  Thus
-        // C_x G^-1(tG) is the carrier-preserving form of t C_x, while the
-        // metadata records the ordinary plaintext product t x.
+    /// Applies a preprocessing-supplied scalar decomposition to an encoding.
+    pub fn large_scalar_mul(
+        &self,
+        input: &BggEncodingWire,
+        scalar: &Mat,
+        decomposed: Preimage,
+    ) -> BggEncodingWire {
         BggEncodingWire {
-            vector: input.vector.clone().mul_small_rhs(decomposed.clone()),
-            pubkey: self.public_key.large_scalar_mul_with_decomposition(&input.pubkey, decomposed),
+            vector: input.vector.clone().mul_small_rhs(decomposed),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
     }
 
-    pub fn matrix_mul(&self, input: &BggEncodingWire, target: &Mat) -> BggEncodingWire {
-        let decomposed = target
-            .clone()
-            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
+    /// Applies a preprocessing-supplied decomposition for an arbitrary target.
+    pub fn matrix_mul(&self, input: &BggEncodingWire, decomposed: Preimage) -> BggEncodingWire {
         // This is an explicit right action by an arbitrary target matrix.  Its
         // decomposition is used only to consume the input carrier; it does not
         // assert that the projected target itself is a canonical G encoding.
-        BggEncodingWire {
-            vector: input.vector.clone().mul_small_rhs(decomposed),
-            pubkey: self.public_key.matrix_mul(&input.pubkey, target),
-            plaintext: None,
-        }
+        BggEncodingWire { vector: input.vector.clone().mul_small_rhs(decomposed), plaintext: None }
     }
 }
 
@@ -217,121 +195,6 @@ pub struct BggSamplerLayout {
     pub secret_dimension: usize,
     pub digit_count: usize,
     pub gadget_base: IntExpr,
-}
-
-/// Policy for the coefficient cutoff used when sampling a BGG-related
-/// preimage.
-///
-/// `Official` delegates to the authoritative bound calculation in
-/// `mxx-primitives`.  `Explicit` is available for reviewed parameter studies
-/// and test fixtures that intentionally select a different cutoff.  The
-/// policy is resolved by the owning application once all concrete dimensions
-/// are known; it is not an IR node or a runtime sampling mode.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PreimageCoefficientBound {
-    /// Compute the cutoff from the official preimage sigma formula.
-    Official,
-    /// Use this exact coefficient cutoff instead of the official formula.
-    Explicit(IntExpr),
-}
-
-impl Default for PreimageCoefficientBound {
-    fn default() -> Self {
-        Self::Official
-    }
-}
-
-impl PreimageCoefficientBound {
-    /// Resolves this policy to the concrete integer cutoff used by trapdoor
-    /// preimage rejection.  The official policy is shared by all BGG-based
-    /// applications and delegates its numerical constants to the primitive
-    /// sampler bounds module.  Symbolic or invalid inputs are rejected before
-    /// any graph node is constructed.
-    pub fn resolve(
-        &self,
-        layout: &BggSamplerLayout,
-        trapdoor_rows: usize,
-        sigma: &mxx_ir_core::RealExpr,
-    ) -> Result<IntExpr, BggSampleError> {
-        match self {
-            Self::Explicit(bound) => {
-                let value = bound.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(|_| {
-                    BggSampleError::InvalidPreimageBound("explicit preimage bound must be concrete")
-                })?;
-                if value <= num_bigint::BigInt::zero() {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "explicit preimage bound must be positive",
-                    ));
-                }
-                Ok(IntExpr::constant(value))
-            }
-            Self::Official => {
-                let n = layout
-                    .ring_dimension
-                    .evaluate(&mxx_ir_core::ParamEnv::default())
-                    .ok()
-                    .and_then(|value| value.to_u64())
-                    .filter(|value| *value > 0)
-                    .ok_or(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound requires a positive concrete ring dimension",
-                    ))?;
-                let base = layout.gadget_base.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(
-                    |_| {
-                        BggSampleError::InvalidPreimageBound(
-                            "official preimage bound requires a concrete gadget base",
-                        )
-                    },
-                )?;
-                if base < num_bigint::BigInt::from(2) {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound requires gadget base >= 2",
-                    ));
-                }
-                let m_g = trapdoor_rows
-                    .checked_mul(layout.digit_count)
-                    .and_then(|value| u64::try_from(value).ok())
-                    .filter(|value| *value > 0)
-                    .ok_or(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound dimensions overflow",
-                    ))?;
-                let sigma =
-                    sigma.evaluate_f64(&mxx_ir_core::ParamEnv::default()).map_err(|_| {
-                        BggSampleError::InvalidPreimageBound(
-                            "official preimage bound requires concrete finite sigma",
-                        )
-                    })?;
-                if !sigma.is_finite() || sigma <= 0.0 {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound requires positive finite sigma",
-                    ));
-                }
-                let ring_dim_sqrt =
-                    BigDecimal::from(n).sqrt().ok_or(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound ring dimension sqrt failed",
-                    ))?;
-                let base = BigDecimal::from_bigint(base, 0);
-                let sigma_bound = mxx_primitives::sampler::bounds::compute_preimage_sigma(
-                    &ring_dim_sqrt,
-                    m_g,
-                    &base,
-                    None,
-                    Some(sigma),
-                );
-                let cutoff =
-                    mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound)
-                        .to_bigint()
-                        .ok_or(BggSampleError::InvalidPreimageBound(
-                            "official preimage bound conversion failed",
-                        ))?;
-                if cutoff <= num_bigint::BigInt::zero() {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound resolved to zero",
-                    ));
-                }
-                Ok(IntExpr::constant(cutoff))
-            }
-        }
-    }
 }
 
 impl BggSamplerLayout {
@@ -356,8 +219,6 @@ pub enum BggSampleError {
     SlotCountMismatch,
     #[error("BGG+ Gaussian sampling requires both a sigma and an explicit coefficient cutoff")]
     MissingGaussianBound,
-    #[error("invalid BGG+ preimage coefficient bound: {0}")]
-    InvalidPreimageBound(&'static str),
     #[error(transparent)]
     Dsl(#[from] mxx_dsl::DslError),
 }
@@ -436,7 +297,6 @@ impl BggEncodingSampler {
                             end: (columns * (index + 1)).into(),
                         }),
                     ),
-                pubkey: public_keys[index].clone(),
                 plaintext: public_keys[index]
                     .reveal_plaintext
                     .then(|| extended_plaintexts[index].clone()),
@@ -512,11 +372,7 @@ mod tests {
     fn repeated_bgg_encoding_schema_defines_a_subgraph() {
         let ring = Ring::new(257, 8);
         let matrix = MatType(ring.matrix_type((1, 1)));
-        let encoding = BggEncodingType {
-            vector: matrix.clone(),
-            pubkey: BggPublicKeyType { matrix: matrix.clone(), reveal_plaintext: true },
-            plaintext: Some(matrix),
-        };
+        let encoding = BggEncodingType { vector: matrix.clone(), plaintext: Some(matrix) };
         Subgraph::<(BggEncodingWire, BggEncodingWire), _>::define(
             "bgg-pair-reverse",
             (encoding.clone(), encoding),
@@ -528,21 +384,11 @@ mod tests {
     #[test]
     fn reveal_combinations_match_the_encoding_contract() {
         let ring = Ring::new(17, 8);
-        let compiler = BggEncodingCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 2.into(),
-                digit_count: 2.into(),
-            },
-        };
+        let compiler = BggEncodingCompiler;
         for left_revealed in [false, true] {
             for right_revealed in [false, true] {
                 let encoding = |prefix: &str, revealed: bool| BggEncodingWire {
                     vector: ring.input(format!("{prefix}-vector"), (1, 4)),
-                    pubkey: BggPublicKeyWire {
-                        matrix: ring.input(format!("{prefix}-public"), (2, 4)),
-                        reveal_plaintext: revealed,
-                    },
                     plaintext: revealed.then(|| ring.input(format!("{prefix}-plain"), (1, 1))),
                 };
                 let left = encoding("left", left_revealed);
@@ -551,13 +397,12 @@ mod tests {
                 for output in
                     [compiler.add(&left, &right).unwrap(), compiler.sub(&left, &right).unwrap()]
                 {
-                    assert_eq!(output.pubkey.reveal_plaintext, expected);
                     assert_eq!(output.plaintext.is_some(), expected);
                 }
-                match compiler.mul(&left, &right) {
+                let decomposition = ring.preimage_input("rhs-decomposition", (4, 4), 2);
+                match compiler.mul(&left, &right, decomposition) {
                     Ok(output) => {
                         assert!(left_revealed);
-                        assert_eq!(output.pubkey.reveal_plaintext, expected);
                         assert_eq!(output.plaintext.is_some(), expected);
                     }
                     Err(error) => {
@@ -572,27 +417,17 @@ mod tests {
     #[test]
     fn encoding_multiplication_keeps_executable_decompose_multiply_add_and_elaborates() {
         let ring = Ring::new(257, 8);
-        let compiler = BggEncodingCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 4.into(),
-                digit_count: 4.into(),
-            },
-        };
+        let compiler = BggEncodingCompiler;
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, 8)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (2, 8)),
-                reveal_plaintext: true,
-            },
             plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
         };
-        let product = compiler.mul(&encoding("left"), &encoding("right")).expect("product");
+        let decomposition = ring.preimage_input("rhs-decomposition", (8, 8), 2);
+        let product =
+            compiler.mul(&encoding("left"), &encoding("right"), decomposition).expect("product");
         let built = DslContext::new("bgg-encoding-mul")
             .output("vector", product.vector)
             .expect("vector output")
-            .output("public", product.pubkey.matrix)
-            .expect("public output")
             .build()
             .expect("build");
         let kinds = built
@@ -604,12 +439,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             kinds.iter().filter(|kind| matches!(kind, NodeKind::GadgetDecompose { .. })).count(),
-            2
+            0
         );
         assert_eq!(
             kinds.iter().filter(|kind| matches!(kind, NodeKind::MatrixMulSmallRhs)).count(),
-            2,
-            "the encoding vector and public key must consume their bounded decomposition relations"
+            1,
+            "only the encoding vector consumes the typed decomposition"
         );
         assert!(kinds.iter().any(|kind| {
             matches!(kind, NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply))
@@ -628,26 +463,15 @@ mod tests {
             BigInt::from(parameters.modulus().as_ref().clone()),
             parameters.ring_dimension() as usize,
         );
-        let compiler = BggEncodingCompiler {
-            public_key: BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: BigInt::from(1u64 << parameters.base_bits()).into(),
-                digit_count: digit_count.into(),
-            },
-        };
+        let compiler = BggEncodingCompiler;
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, columns)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (2, columns)),
-                reveal_plaintext: true,
-            },
             plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
         };
-        let output = compiler.mul(&encoding("lhs"), &encoding("rhs")).unwrap();
+        let decomposition = ring.preimage_input("rhs-decomposition", (2 * digit_count, columns), 8);
+        let output = compiler.mul(&encoding("lhs"), &encoding("rhs"), decomposition).unwrap();
         let graph = DslContext::new("bgg-encoding-runtime")
             .output("vector", output.vector)
-            .unwrap()
-            .output("public", output.pubkey.matrix)
             .unwrap()
             .output("plaintext", output.plaintext.unwrap())
             .unwrap()
@@ -656,10 +480,6 @@ mod tests {
 
         let lhs_vector = row(&parameters, columns, 0);
         let rhs_vector = row(&parameters, columns, 1);
-        let lhs_public = DCRTPolyMatrix::from_poly_vec(
-            &parameters,
-            vec![row(&parameters, columns, 2).get_row(0), row(&parameters, columns, 3).get_row(0)],
-        );
         let rhs_public = DCRTPolyMatrix::from_poly_vec(
             &parameters,
             vec![row(&parameters, columns, 4).get_row(0), row(&parameters, columns, 5).get_row(0)],
@@ -672,8 +492,10 @@ mod tests {
             BTreeMap::from([
                 ("lhs-vector".to_owned(), RuntimeValue::matrix(lhs_vector.clone())),
                 ("rhs-vector".to_owned(), RuntimeValue::matrix(rhs_vector.clone())),
-                ("lhs-public".to_owned(), RuntimeValue::matrix(lhs_public.clone())),
-                ("rhs-public".to_owned(), RuntimeValue::matrix(rhs_public.clone())),
+                (
+                    "rhs-decomposition".to_owned(),
+                    RuntimeValue::small_matrix(rhs_public.clone().gadget_decompose(false).unwrap()),
+                ),
                 ("lhs-plaintext".to_owned(), RuntimeValue::matrix(lhs_plaintext.clone())),
                 ("rhs-plaintext".to_owned(), RuntimeValue::matrix(rhs_plaintext.clone())),
             ]),
@@ -685,14 +507,45 @@ mod tests {
             .unwrap() +
             rhs_vector * lhs_plaintext.entry(0, 0);
         assert_eq!(matrix_output(&result, "vector"), &expected_vector);
-        assert_eq!(
-            matrix_output(&result, "public"),
-            &lhs_public
-                .clone()
-                .multiply_small_rhs(&rhs_public.clone().gadget_decompose(false).unwrap())
-                .unwrap()
-        );
         assert_eq!(matrix_output(&result, "plaintext"), &(lhs_plaintext * rhs_plaintext));
+    }
+
+    #[test]
+    fn cached_multiplication_keeps_public_projection_lazy() {
+        let ring = Ring::new(257, 8);
+        let compiler = BggEncodingCompiler;
+        let lhs = BggEncodingWire {
+            vector: ring.input("cached-lhs-vector", (1, 4)),
+            plaintext: Some(ring.input("cached-lhs-plaintext", (1, 1))),
+        };
+        let rhs = BggEncodingWire {
+            vector: ring.input("cached-rhs-vector", (1, 4)),
+            plaintext: Some(ring.input("cached-rhs-plaintext", (1, 1))),
+        };
+        let decomposition = ring.preimage_input("cached-rhs-decomposition", (4, 4), 2);
+        let output = compiler.mul(&lhs, &rhs, decomposition).expect("cached artifact");
+        let built = DslContext::new("bgg-encoding-cached-mul")
+            .output("vector", output.vector)
+            .expect("vector output")
+            .build()
+            .expect("build");
+        let kinds = built
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::GadgetDecompose { .. })).count(),
+            0
+        );
+        assert_eq!(
+            kinds.iter().filter(|kind| matches!(kind, NodeKind::MatrixMulSmallRhs)).count(),
+            1,
+            "only the vector-side cached action is emitted; G*K_out stays lazy"
+        );
+        built.validate(&ParamEnv::default()).expect("valid cached graph");
     }
     #[test]
     fn bgg_sampling_builds_a_packed_executable_graph() {

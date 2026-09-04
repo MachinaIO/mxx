@@ -1,5 +1,5 @@
 #!/usr/bin/env sage -python
-"""Full pinned-commit LWE-surrogate estimate for one sparse-binary LWR candidate.
+"""Full pinned-commit LWE-surrogate estimate for one native mod-Q candidate.
 
 The caller supplies the official lattice-estimator checkout through
 MXX_LATTICE_ESTIMATOR_ROOT.  The script emits JSON only on stdout; diagnostics
@@ -49,7 +49,7 @@ def estimator_root():
         return Path(configured).resolve()
     here = Path(__file__).resolve()
     for candidate in (here, *here.parents, Path.cwd()):
-        if (candidate / "estimator" / "estimator" / "lwe.py").is_file():
+        if (candidate / "estimator" / "lwe.py").is_file():
             return candidate
     raise RuntimeError("set MXX_LATTICE_ESTIMATOR_ROOT to the official estimator checkout")
 
@@ -81,13 +81,21 @@ def main():
     args = parse_args()
     root = estimator_root()
     sys.path.insert(0, str(root))
-    from estimator.estimator import LWE, ND, RC
+    # The pinned estimator commit exposes these symbols from its package root.
+    from estimator import LWE, ND, RC
     from sage.version import version as sage_version
 
     if args.nu <= 0 or args.h <= 0 or args.h > args.nu:
         raise ValueError("require 0 < h <= nu")
-    if args.q <= 0 or args.p <= 0 or args.p > args.q or args.q % args.p:
-        raise ValueError("require 0 < p <= q and p | q")
+    if args.q <= 0 or args.q & (args.q - 1):
+        raise ValueError("require native Q to be a positive power of two")
+    if (
+        args.p < 2
+        or args.p & (args.p - 1)
+        or args.p > args.q
+        or args.q % args.p
+    ):
+        raise ValueError("require native P to be a power of two with 2 <= P <= Q and P | Q")
     delta = args.q // args.p
     low = -(delta // 2)
     high = (delta - 1) // 2
@@ -130,7 +138,7 @@ def main():
     minimum = min(finite_bits)
     # Bind provenance to the imported estimator source checkout, not the
     # wrapper repository that happens to contain this submodule.
-    source_root = root / "estimator"
+    source_root = root
     commit = subprocess.check_output(
         ["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True
     ).strip()

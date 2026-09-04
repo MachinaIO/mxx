@@ -2,8 +2,8 @@
 
 use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
 use mxx_dsl::{
-    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending,
-    Preimage, Ring,
+    Bytes, DslError, FamilyElement, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel,
+    Pending, Preimage, Ring,
 };
 use mxx_ir_core::{IntExpr, ValueHandle};
 
@@ -11,6 +11,12 @@ use mxx_ir_core::{IntExpr, ValueHandle};
 pub struct BggPublicKeyWire {
     pub matrix: Mat,
     pub reveal_plaintext: bool,
+}
+
+impl FamilyElement for BggPublicKeyWire {
+    fn normalize_for_family(self) -> Self {
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -94,7 +100,12 @@ impl BggPublicKeyCompiler {
         self.mul_with_decomposition(lhs, rhs, decomposed)
     }
 
-    pub(crate) fn mul_with_decomposition(
+    /// Builds `lhs * G^-1(rhs)` from a precomputed typed decomposition.
+    ///
+    /// The preimage is consumed directly by the executable graph. Callers
+    /// crossing a preprocessing/online boundary can therefore import the
+    /// existing [`Preimage`] artifact instead of decomposing `rhs` again.
+    pub fn mul_with_decomposition(
         &self,
         lhs: &BggPublicKeyWire,
         rhs: &BggPublicKeyWire,
@@ -132,7 +143,8 @@ impl BggPublicKeyCompiler {
         }
     }
 
-    pub(crate) fn large_scalar_mul_with_decomposition(
+    /// Applies a precomputed decomposition of a large scalar target.
+    pub fn large_scalar_mul_with_decomposition(
         &self,
         input: &BggPublicKeyWire,
         decomposed: Preimage,
@@ -143,11 +155,24 @@ impl BggPublicKeyCompiler {
         }
     }
 
-    pub(crate) fn large_scalar_decomposition(
+    /// Materializes a public matrix from a typed output decomposition.
+    ///
+    /// This is an explicit final-boundary operation.  Cache-required online
+    /// operations must not call it: their public projection is represented by
+    /// the imported `Preimage` at the application wire boundary and is not
+    /// expanded to `G*K` between gates.
+    pub fn materialize_decomposition(
         &self,
-        input: &BggPublicKeyWire,
-        scalar: &Mat,
-    ) -> Preimage {
+        matrix_rows: IntExpr,
+        reveal_plaintext: bool,
+        decomposed: Preimage,
+    ) -> BggPublicKeyWire {
+        let gadget = self.ring.gadget(matrix_rows, self.base.clone(), self.digit_count.clone());
+        BggPublicKeyWire { matrix: gadget.mul_small_rhs(decomposed), reveal_plaintext }
+    }
+
+    /// Computes the typed decomposition of `scalar * G` for later reuse.
+    pub fn large_scalar_decomposition(&self, input: &BggPublicKeyWire, scalar: &Mat) -> Preimage {
         let rows = input.matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
         // A large scalar t must be converted into a gadget-carried target tG.
@@ -286,6 +311,22 @@ mod tests {
             assert_eq!(compiler.small_scalar_mul(&input, &scalar).reveal_plaintext, revealed);
             assert_eq!(compiler.large_scalar_mul(&input, &scalar).reveal_plaintext, revealed);
         }
+    }
+
+    #[test]
+    fn explicit_materialization_reconstructs_output_from_typed_preimage() {
+        let ring = Ring::new(17, 8);
+        let input =
+            BggPublicKeyWire { matrix: ring.input("input-cached", (2, 4)), reveal_plaintext: true };
+        let decomposition = ring.preimage_input("cached-decomposition", (4, 4), 7);
+        let compiler = BggPublicKeyCompiler { ring, base: 2.into(), digit_count: 2.into() };
+        let result = compiler.materialize_decomposition(
+            input.matrix.matrix_type().rows.clone(),
+            false,
+            decomposition,
+        );
+        assert_eq!(result.matrix.matrix_type(), &compiler.ring.matrix_type((2, 4)));
+        assert!(!result.reveal_plaintext);
     }
 
     #[test]

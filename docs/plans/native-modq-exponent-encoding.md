@@ -24,16 +24,19 @@ The principal decisions are:
    those four gates;
 6. the encodings of the PRF coordinates are supplied as online BGG+ encoding
    inputs;
-7. a public attribute is represented only by the existing
-   `BggEncodingWire::plaintext: Option<Mat>` field;
-8. preprocessing evaluates the public-key projection of the program and builds
-   decoder preimages, while online evaluation computes the encoding-vector
-   projection and consumes those preprocessing artifacts;
-9. only gadget decompositions are caches; public-key matrices remain ordinary
-   protocol artifacts;
-10. decomposition caches use the existing typed `Preimage` artifact path and
+7. `BggPublicKeyWire` remains a materialized public-key matrix, while
+   `BggEncodingWire` contains only its encoding vector and the optional
+   plaintext relation;
+8. preprocessing evaluates the public-key program, keeps its materialized
+   `BggPublicKeyWire` values while planning gates, and exports only the
+   operand decompositions consumed by encoding multiplications;
+9. online evaluation computes only encoding vectors and consumes those
+   preprocessing decompositions; it never reconstructs a public-key wire;
+10. only gadget decompositions are caches; public-key matrices remain ordinary
+   preprocessing values and are not cache payloads;
+11. decomposition caches use the existing typed `Preimage` artifact path and
     are loaded in bounded waves instead of remaining resident in RAM or VRAM;
-11. Exponent-LUT acceptance uses only the application-specific simulator in
+12. Exponent-LUT acceptance uses only the application-specific simulator in
     `mxx-exponent-lut`; the generic noise simulator is not an authority or a
     fallback for this application.
 
@@ -161,10 +164,25 @@ The existing plaintext metadata is the sole source of public attribute values:
 ```rust
 pub struct BggEncodingWire {
     pub vector: Mat,
-    pub pubkey: BggPublicKeyWire,
     pub plaintext: Option<Mat>,
 }
 ```
+
+`BggPublicKeyWire` is a separate value used by the preprocessing public-key
+program.  It retains the materialized matrix:
+
+```rust
+pub struct BggPublicKeyWire {
+    pub matrix: Mat,
+    pub reveal_plaintext: bool,
+}
+```
+
+An encoding wire does not carry a public-key matrix, a decomposition, a cache
+handle, or a projected-public-key enum.  The correspondence between an
+encoding wire and its public-key wire is established by the program's typed
+gate/artifact bindings, not by storing the public projection inside the
+encoding value.
 
 No parallel `known_values`, `public_exponent`, or provenance-value field is
 introduced. Program input declarations state whether public plaintext is
@@ -184,43 +202,47 @@ pub struct ProgramWireType {
 
 `Public` requires `plaintext.is_some()` at binding time. `Private` permits
 `None`. The current blanket rejection of all plaintext metadata at the
-Exponent-LUT boundary is removed.
+Exponent-LUT boundary is removed. This metadata is an optional plaintext
+relation only; it is not a public-key carrier.
 
 Knowledge propagation is:
 
 - `MulPrivate`: private unless both operand relations explicitly expose their
   plaintexts;
-- `MulPublic`: the public operand must be `Some`; the output is public only if
-  the other operand is also public;
+- `MulPublic`: the preprocessing decomposition of the `private` operand's
+  public-key matrix must be present, and the `public` encoding must carry the
+  `x_{public}` plaintext needed by
+  `c_{public}K_{private}+x_{public}c_{private}`; the output plaintext is known
+  only when both input relations are known;
 - `Add`: public only if both operands are public; and
 - `Lut`: preserves whether its input is public and computes the known output
   through the table when it is public.
 
 ## Frozen gate set
 
-Replace the current unary, binary, and one-hot gate variants with:
+The frozen cryptographic gate set is:
 
 ```rust
-pub enum ProgramGate {
+pub enum Gate {
     MulPrivate {
-        lhs: ProgramWireId,
-        rhs: RhsInputId,
-        output: ProgramWireId,
+        lhs: WireId,
+        rhs: RhsId,
+        output: WireId,
     },
     MulPublic {
-        private: ProgramWireId,
-        public: ProgramWireId,
-        output: ProgramWireId,
+        private: WireId,
+        public: WireId,
+        output: WireId,
     },
     Add {
-        lhs: ProgramWireId,
-        rhs: ProgramWireId,
-        output: ProgramWireId,
+        lhs: WireId,
+        rhs: WireId,
+        output: WireId,
     },
     Lut {
-        input: ProgramWireId,
+        input: WireId,
         lut: LutId,
-        output: ProgramWireId,
+        output: WireId,
     },
 }
 ```
@@ -243,41 +265,63 @@ selector bit `b`, this is the gate
 \]
 
 The name describes visibility rather than an Exponent-LUT-specific selector
-role. The RHS remains a typed `RhsInputId` because private multiplication
+role. The RHS remains a typed `RhsId` because private multiplication
 requires the special RHS representation.
 
 ### MulPublic
 
-`MulPublic` multiplies by a BGG+ encoding whose attribute is public. For a
-public encoding `(c_x, A_x, Some(x))` and a private encoding `(c, A, _)`, it
-computes
+`MulPublic` combines its named `private` and `public` encoding operands. The
+public-key relation of the `private` operand was evaluated and decomposed
+during preprocessing. Let the online encoding wires carry vectors
+`c_{private}` and `c_{public}`, let `x_{public}` be the plaintext relation
+carried by the `public` wire, and let
 
 \[
-  c_{out} = c_x G^{-1}(A) + x c,
-  \qquad
-  A_{out} = A_x G^{-1}(A).
+  K_{private}=G^{-1}(A_{private})
 \]
 
-The operation rejects a public operand with `plaintext == None`. `Public`
-refers to the attribute value, not to an unencrypted carrier or to a public
-key alone.
+be the typed `Preimage` artifact selected for this gate. The online operation
+computes only the vector
+
+\[
+  c_{out}=c_{public}K_{private}+x_{public}c_{private}.
+\]
+
+The corresponding preprocessing public-key operation retains the materialized
+`BggPublicKeyWire` matrices and computes its public projection using the same
+private-operand relation. It is not repeated by the encoding operation. The
+operation rejects a missing `x_{public}` plaintext relation. `Public` refers
+to the typed public-key relation and its known attribute, not to a public-key
+matrix embedded in `BggEncodingWire`.
+
+For the matching public-key wires, preprocessing computes
+
+\[
+  A_{out}=A_{public}K_{private},
+\]
+
+and retains this as the materialized matrix of the next `BggPublicKeyWire`.
+The decomposition is named and stored by the multiplication consumer that
+uses `A_{private}`; it is not attached to either wire.
 
 ### Add
 
-`Add` is ordinary addition of encoding relations:
+`Add` on encoding wires is ordinary vector addition:
 
 \[
-  c_{out}=c_1+c_2,
-  \qquad
-  A_{out}=A_1+A_2,
+  c_{out}=c_1+c_2.
 \]
 
-and therefore adds the represented ring attributes. It is not exponent
-addition. Family sums are structured reductions of this primitive.
+The optional plaintext fields are combined when both relations are known.
+There is no public-key matrix in this operation and no cache is produced by
+it. The separate preprocessing public-key program adds its materialized
+`BggPublicKeyWire` matrices only when it needs to establish a later public-key
+operand. `Add` is not exponent addition. Family sums are structured
+reductions of this primitive.
 
 ### Lut
 
-`Lut` maps
+`Lut` maps the encoding vector
 
 \[
   \operatorname{mono}_m(u)
@@ -285,7 +329,8 @@ addition. Family sums are structured reductions of this primitive.
   \operatorname{mono}_m(L(u))
 \]
 
-by one single-layer automorphism sum. There is no evaluation mode. Types,
+by one single-layer automorphism sum using helper decompositions planned in
+preprocessing. There is no evaluation mode. Types,
 functions, artifacts, report fields, and logs use `Lut`, `LutHelper`,
 `LutMaskBank`, and corresponding public variants; they do not include `Flat`.
 
@@ -301,21 +346,42 @@ The coefficient for an automorphism `sigma` is
 
 ## Structured program control
 
-Cryptographic semantics remain in `ProgramGate`. Generic structural nodes
+Cryptographic semantics remain in `Gate`. Generic structural nodes
 describe repetition and reduction without introducing a one-hot cryptographic
 gate:
 
 ```rust
 pub enum ProgramStep {
-    Gate(ProgramGate),
-    FamilyMap { /* typed bindings and body */ },
-    FamilyReduceAdd { /* input family and output wire */ },
+    Gate(Gate),
+    Family {
+        id: ProgramFamilyId,
+        capacity: usize,
+        body: FamilyProgram, // local SSA over the scoped WireId/RhsId names
+        aggregation: FamilyAggregation::Add,
+        output: WireId,
+    },
 }
 ```
 
+`Gate`, `WireId`, and `RhsId` are the only primitive operation and identifier
+names. A `FamilyProgram` is a local SSA scope that uses those same types; its
+identifiers are not global and there are no separate body-gate or body-wire
+identifier types. One shared `lower_program` traversal is parameterized by the
+single `ProgramLoweringTypes` and `ExponentProgramLowering` traits. The public
+matrix, encoding, and noise interpreters implement those traits respectively:
+`PublicProgramLowering` in `public_key.rs`, `EncodingProgramLowering` in
+`encoding.rs`, and `ProgramNoiseInterpreter` in `noise.rs`. The
+`noise_refresh/simulation.rs` module is a thin application-specific wrapper
+around the root noise interpreter for readout, routing, and refresh; it does
+not define a second gate lowering or noise semantics.
+
+Each invocation has one runtime `FamilyRange` binding. Its logical count may
+vary, but its capacity is frozen in the program and determines graph shape.
+Indexed ordinary-wire families and RHS families have distinct identifiers.
 The implementation reuses the existing DSL `Family` map, zip, gather, and
-balanced-sum support. It must not emit one host-built graph body per slot or
-label.
+balanced Add reduction. It must not emit one host-built graph body per slot or
+label. Selector is only a builder-level composition whose body is
+`MulPrivate` followed by `MulPublic`; it is not a `ProgramStep` concept.
 
 Program identity is computed from the canonical expanded gate/structural IR,
 layout, tables, shapes, and knowledge requirements. It does not include actual
@@ -327,26 +393,26 @@ The public builder exposes convenient compound operations while the frozen
 gate set remains minimal:
 
 ```rust
-impl ExponentProgramBuilder {
+impl ExponentLutProgramBuilder {
     pub fn lut(
         &mut self,
-        input: Wire,
-        table: UnaryLutTable,
-    ) -> Result<Wire, ProgramError>;
+        input: WireId,
+        table: LutTable,
+    ) -> Result<WireId, ProgramValidationError>;
 
     pub fn lut2(
         &mut self,
-        lhs: Wire,
-        rhs: PrivateRhsInput,
-        table: BinaryLutTable,
-    ) -> Result<Wire, ProgramError>;
+        lhs: WireId,
+        rhs: RhsId,
+        table: LutTable,
+    ) -> Result<WireId, ProgramValidationError>;
 
     pub fn select(
         &mut self,
-        input: Wire,
-        selectors: PrivateRhsFamily,
-        public_values: PublicWireFamily,
-    ) -> Result<Wire, ProgramError>;
+        input: WireId,
+        selectors: RhsFamilyId,
+        wire_values: WireFamilyId,
+    ) -> Result<WireId, ProgramValidationError>;
 }
 ```
 
@@ -393,7 +459,7 @@ The public selection API represents
 It expands in this mandatory order:
 
 ```rust
-let branches = zip(selectors, public_values).map(|selector, value| {
+let branches = zip(selectors, wire_values).map(|selector, value| {
     let selected = builder.mul_private(input, selector)?;
     builder.mul_public(selected, value)
 });
@@ -424,101 +490,159 @@ For the PRF, `layout.width_log2 = log2(n) - m`, so
   \qquad P=2p'.
 \]
 
+The sparse-LWR value table is canonical and is not supplied by a caller.  For
+the complete native domain `0 <= k < n'`, define
+
+\[
+  f(k)=\left\lfloor\frac{p'k}{n'}\right\rfloor+1.
+\]
+
+Its `Q`-periodic complement is fixed by
+
+\[
+  f(z+n')=1-f(z),
+\]
+
+so every pair of points separated by `n'` sums to one.  The canonical table
+therefore contains each value in `{1, ..., p'}` uniformly (with the exact
+count determined by `n'/p'`), and the readout target uses
+`(2f(k)-1) mono_m(-k)` for these coefficients.  No alternative table or
+caller-provided readout is accepted by the native PRF constructor.
+
 `q_l`, `lut_width`, reduction intervals, and terminal LUT width are not
 independent parameters and are deleted.
 
 ## PRF online inputs
 
-For every PBC block `j` and slot `i`, online evaluation receives a BGG+
-encoding of
-
-\[
-  \operatorname{mono}_m(a'_j[i])=X^{2^m a'_j[i]}.
-\]
-
-The relation is
-
-\[
-  c_{j,i}
-  = s A_{j,i}
-    - \operatorname{mono}_m(a'_j[i])sG
-    + e_{j,i},
-\]
-
-where `A_{j,i}` is setup-fixed and independent of the value and label. Dummy
-slots use `a'_j[i]=0` and may share a setup-time encoding of one.
-
-The logical input is:
+For every logical output `r`, PBC block `j`, and slot `i`, `online_eval`
+samples the public coefficient `a_{r,j}[i]` and supplies its BGG+ input
+encoding to the program:
 
 ```rust
-pub struct NativePrfLabelInputs {
-    pub exponent_encodings: Family<BggEncodingWire>,
+pub struct BggEncodingWire {
+    pub vector: Mat,
+    pub plaintext: Option<Mat>,   // Some(X^{a_{r,j}[i]}) for public attributes
 }
 ```
 
-For this PRF, `a'_j[i]` is public to the evaluator, so each imported wire has
+For each logical PRF output `r`, the setup-fixed public matrix `A_{r,j,i}` is
+held by the separate
+`BggPublicKeyWire` produced by preprocessing and is not embedded in this
+encoding. The encoding vector depends on the sampled public `a_{r,j}[i]`; it is an
+online input and is not expanded on the host into an `L * A` collection. The
+BGG plaintext `Option` is the sole clear attribute/transport projection:
+there is no parallel exponent field and no separate label or hash-specific
+plaintext artifact.
 
-```rust
-plaintext: Some(layout.mono(ring, a_prime_j_i)?),
-```
+The online evaluator samples one fresh secret `s`. The private accumulator is
+an encoding with `(mask secret, payload secret) = (s,t)`, where `t` is fixed by
+preprocessing. In contrast, every public label encoding of `X^{a_{r,j}[i]}` uses
+`(s,s)`. Thus every `a_{r,j}[i]` is decided and sampled inside each `online_eval`;
+it is never preprocessing-fixed and never a cache-artifact input. Neither
+preprocessing nor any cache path generates, fixes, stores, or derives `a_{r,j}[i]`
+or `X^{a_{r,j}[i]}`; preprocessing does not learn it or store a label encoding.
 
-with no duplicate clear-value field. If another application supplies a hidden
-attribute, it leaves `plaintext` as `None` and cannot use that wire as the
-public operand of `MulPublic`.
+At the program boundary, the sampled public attribute is consumed as a
+`MulPublic` operand. In particular, for the private accumulator and the
+separately supplied public-attribute encoding,
 
-At the transport boundary, setup-fixed public matrices are not duplicated for
-every label. A label payload contains the private vector and a setup public-key
-slot reference; import reconstructs the full `BggEncodingWire`. The public
-plaintext is derived from the label/hash computation rather than transmitted
-as a matrix artifact.
+\[
+  \operatorname{Enc}(X^{acc_r}) * \operatorname{Enc}(X^{a_{r,j}[i]})
+  = \operatorname{Enc}(X^{acc_r+a_{r,j}[i]}).
+\]
+
+The online evaluator is responsible for sampling `a_{r,j}[i]`, deriving
+`X^{a_{r,j}[i]}`, and constructing/supplying this input encoding. The PRF graph
+does not know the secret `s`, derive the exponent again, or resample the
+encoding error. Preprocessing keeps the corresponding public-key matrices in
+the public-key program and exports only the typed decompositions required by
+later multiplication consumers; it does not place those matrices in the
+encoding wire.
 
 ## PRF accumulation
 
 Initialize the state with attribute `mono_m(0)=1`. For each block, invoke the
-public `select` API. Its slot-level expansion is
+public `select` API. The public-key program evaluates the public projection
+using materialized `BggPublicKeyWire` matrices. Its slot-level public
+projection is planned in preprocessing as
 
 \[
-  f_i = c\,G^{-1}(C_{j,i}),
-  \qquad
-  A_{f_i}=A\,G^{-1}(C_{j,i}),
+  A_{f,r,i}=A_{acc,r}\,D_{C,j,i},
 \]
 
 followed by
 
 \[
-  g_i
-  = c_{j,i}G^{-1}(A_{f_i})
-    + \operatorname{mono}_m(a'_j[i])f_i,
+  A_{g,r,i}=A_{r,j,i}D_{f,r,j,i},
 \]
 
 \[
-  A_{g_i}=A_{j,i}G^{-1}(A_{f_i}),
+  A_{next,r}=\sum_i A_{g,r,i},
+\]
+
+where `D_{C,j,i}` is the setup-fixed selector decomposition shared across
+outputs, while `D_{f,r,j,i}` is the output-indexed decomposition associated
+with the corresponding `MulPublic` consumer. The public-key matrices and these
+decompositions are handled during preprocessing only.
+
+The online encoding-vector projection uses the corresponding imported
+decompositions directly:
+
+\[
+  f_{r,i}=c_r\,D_{C,j,i},
+  \qquad
+  g_{r,i}=c_{r,j,i}D_{f,r,j,i}
+      +\operatorname{mono}_m(a_{r,j}[i])f_{r,i},
 \]
 
 and
 
 \[
-  c_{next}=\sum_i g_i,
-  \qquad
-  A_{next}=\sum_i A_{g_i}.
+  c_{next,r}=\sum_i g_{r,i},
 \]
+
+For the selected branch, write
+
+\[
+ c_{r,j,i}=sA_{r,j,i}-X^{a_{r,j}[i]}sG+e_{r,j,i},\qquad
+ f_{r,i}=sA_{f,r,i}-X^{acc_r}tG+e_{f,r,i},\qquad
+ GD_{f,r,j,i}=A_{f,r,i}.
+\]
+
+Then the two middle `sA_{f,r,i}` terms cancel in `MulPublic`:
+
+\[
+ c_{r,j,i}D_{f,r,j,i}+X^{a_{r,j}[i]}f_{r,i}
+ =sA_{r,j,i}D_{f,r,j,i}-X^{a_{r,j}[i]+acc_r}tG
+  +e_{r,j,i}D_{f,r,j,i}+X^{a_{r,j}[i]}e_{f,r,i}.
+\]
+
+This cancellation is why label encodings must use payload secret `s`, not
+setup secret `t`, while the accumulator continues to use payload secret `t`.
 
 Exactly one selector is one. Therefore the next attribute is
 
 \[
-  \operatorname{mono}_m(acc+a'_j[i^*] \bmod Q).
+  \operatorname{mono}_m(acc_r+a_{r,j}[i^*] \bmod Q).
 \]
 
-No LUT is called inside the block sequence.
+No LUT is called inside the block sequence. Encoding `Add` and the family
+reduction are vector-only; they do not materialize a public matrix or create
+a cache entry. If a later multiplication consumes the public projection of
+such an output, preprocessing computes the decomposition selected by that
+consumer from the materialized public-key program and exports it under that
+consumer's typed artifact binding.
 
-The public recurrence contains only setup-fixed `A`, `A_{j,i}`, and
-`C_{j,i}`. It is independent of `a'_j[i]` and therefore independent of the
-label. Preprocessing evaluates this public recurrence once.
+The setup-side public-key recurrence contains only setup-fixed `A_r`,
+`A_{r,j,i}`, and `C_{j,i}`. The sampled public `a_{r,j}[i]` is supplied only to
+the online encoding path. Preprocessing evaluates one public-key projection
+for every logical output `r` through a structural output family; it does not
+host-unroll outputs and does not compute online encoding vectors.
 
 ## Value-form readout
 
 The accumulator program is followed by a separate `ValueReadout`; it is not a
-fifth `ProgramGate` because it exits the exponent-encoded domain and returns a
+fifth `Gate` because it exits the exponent-encoded domain and returns a
 constant ring attribute.
 
 ```rust
@@ -543,10 +667,13 @@ Define
 
 Readout performs:
 
-1. public multiplication `c <- T'c`, `A <- T'A`;
-2. one single-layer trace over all indices `J_{m,log2(n')}`, including the
+1. in preprocessing, evaluate the readout public-key projection as
+   materialized `BggPublicKeyWire` values and export the required typed helper
+   decompositions;
+2. online, apply the imported decompositions to the encoding vector `c`;
+3. one single-layer trace over all indices `J_{m,log2(n')}`, including the
    identity term;
-3. normalization by the decomposition of `(2n')^{-1}G`.
+4. normalization by the imported decomposition of `(2n')^{-1}G`.
 
 The trace has `n'` terms and requires `n'-1` plain automorphism helpers. There
 is no sequential part or split parameter. For `n=2^16` and `m=5`, this means
@@ -563,37 +690,59 @@ The output attribute is
 Preprocessing performs:
 
 1. setup of selector RHS/GSW material;
-2. setup of the value-encoding public matrices `A_{j,i}`;
-3. evaluation of the complete public-key projection of the PRF accumulation;
-4. evaluation of the public-key projection of value readout;
-5. generation of decoder preimages;
-6. generation and export of only the gadget decompositions required by online
-   right-hand-side multiplications.
+2. setup of the output-indexed value-encoding public matrices `A_{r,j,i}`;
+3. evaluation of the complete public-key program for every `r`, retaining its materialized
+   `BggPublicKeyWire` matrices while planning the gates;
+4. for every multiplication consumer that needs a public-key matrix
+   decomposition, decomposition of the matrix operand selected by that
+   consumer and export of only the resulting typed `Preimage` (called `K_rhs`
+   by the existing generic cache API and `K_private` for `MulPublic`);
+5. evaluation of the public-key projection needed by value readout;
+6. generation of independent readout helper preimages;
+7. sampling the trapdoor public matrix `B` and the per-slot typed preimages
+   `K_t` for the public targets `T_t`, with `B K_t = T_t`.
 
 Online evaluation performs:
 
-1. label/hash evaluation producing the public `a'_j[i]` values;
-2. import of the separately supplied encoding vectors;
-3. reconstruction of BGG+ input wires using setup-fixed public keys and public
-   plaintext metadata;
-4. vector-side execution of the PRF accumulation;
-5. vector-side value readout;
-6. digit routing and public half-offset addition; and
-7. application of preprocessing decoder preimages to obtain refreshed
-   encodings.
+1. public sampling of each `a_{r,j}[i]` and derivation of `X^{a_{r,j}[i]}`;
+2. supply/import of the corresponding `BggEncodingWire`, carrying its vector
+   and `Some(X^{a_{r,j}[i]})` only in the BGG plaintext option;
+3. loading the decomposition artifact selected by each multiplication
+   consumer (`K_rhs` in the generic cache API) and executing the
+   encoding-vector formula (including `MulPublic` with the sampled-`a`
+   encoding);
+4. vector-side value readout using its independent imported helper
+   decompositions;
+5. digit routing and public half-offset addition;
+6. sampling one fresh anchor error `e_b`, forming `b = sB + e_b` exactly once
+   from the same online secret `s`, and sharing that `b` across all CRT slots;
+   and
+7. application of the preprocessing-fixed `K_t` values as `b K_t` to obtain
+   refreshed encodings.
 
-In cache-required online mode, public-key arithmetic and gadget decomposition
-are not recomputed. Missing required artifacts are errors; there is no silent
-fallback.
+The decoder boundary is strict: `t`, selector GSW material, `B`, `A'`, the
+public targets `T_t`, and `K_t` are preprocessing-fixed. The online secret
+`s`, the shared decoder anchor `b`, and every `s`-dependent encoding output are
+online-only values and are never exported, imported, or stored as artifacts.
+The decoder anchor inputs `s` and `b` never cross this boundary. `K_t`
+continues to cross it using the generic typed `Preimage` artifact
+representation. The simulator equations are unchanged: their decoder term
+already includes the fresh anchor contribution `e_b K_t`.
+
+In cache-required online mode, the public-key program and gadget decomposition
+are not run at all. Missing required decomposition artifacts (`K_rhs` in the
+generic cache API) are errors; there is no silent fallback.
 
 ## Public keys versus decomposition caches
 
 The distinction is normative:
 
 - a public-key matrix `A` is protocol state and is not a cache;
-- `G^{-1}(A)` is deterministic acceleration data and is a cache.
+- `G^{-1}(A_{decomp})` is deterministic acceleration data for a particular
+  multiplication consumer and is its cache. For `MulPublic`,
+  `A_{decomp}=A_{private}`.
 
-`BggPublicKeyWire` remains unchanged and does not contain an inline
+`BggPublicKeyWire` remains a materialized matrix and does not contain an inline
 `Option<Preimage>`:
 
 ```rust
@@ -603,15 +752,14 @@ pub struct BggPublicKeyWire {
 }
 ```
 
-Public matrices that must cross the preprocessing/online boundary are exported
-once as ordinary public matrix artifacts. They are never duplicated inside a
-cache artifact and are not counted as cache bytes.
-
-Only decompositions needed by later operations are exported as cache
-artifacts. Public matrices and decomposition caches are associated by setup
-identity, program gate, family coordinate, and operand role. This association
-is ordinary artifact wiring, not an adversarial proof or a new cryptographic
-commitment.
+No public-key matrix crosses the preprocessing/online encoding boundary. The
+cache artifact for a multiplication consumer is only the generic typed
+`Preimage` for its selected decomposition operand (`A_{private}` for
+`MulPublic`). Encoding vectors and online `c_out` values are never stored or
+counted as cache artifacts. The artifact store remains generic and carries no
+BGG-specific pair semantics. Setup identity, program gate, family coordinate,
+and operand role are ordinary wiring metadata used by the caller to select the
+required `Preimage`.
 
 ## Reusing the typed Preimage artifact path
 
@@ -619,9 +767,14 @@ No new cache payload or decomposition wire type is introduced. `Mat::decompose`
 already returns the typed `Preimage` used by `mul_small_rhs`:
 
 ```rust
-let decomposition: Preimage =
-    public_key.matrix.clone().decompose(base, digit_count);
+let k_rhs: Preimage =
+    decomposition_operand.matrix.clone().decompose(base, digit_count);
 ```
+
+This call is made by preprocessing for the named multiplication consumer. The
+result is called the consumer's `K_rhs` by the generic cache API; for
+`MulPublic` it is the mathematical `K_private`. It is not stored in either
+wire and is not recomputed while evaluating an encoding.
 
 Preprocessing exports scalar or family decompositions with the existing APIs:
 
@@ -655,22 +808,49 @@ The coefficient bound remains part of the `Preimage` artifact type and is
 validated before compact multiplication. A generic matrix artifact may not be
 relabeled as a preimage.
 
+The artifact type does not imply a single cutoff formula. The resolved bound
+depends on how the preimage was produced:
+
+- a trapdoor-sampled preimage uses the sampler cutoff computed from the ring
+  dimension, public-row count, gadget digit count, gadget base, and sampling
+  sigma. `mxx-primitives::sampler::bounds` owns
+  `TrapdoorPreimageCoefficientCutoff::{Official, Explicit}` and resolves it to
+  a concrete nonnegative integer. An explicit cutoff strictly below the
+  official cutoff for the same concrete sampler parameters is rejected;
+- a deterministic balanced gadget decomposition uses its exact digit bound.
+  For the required power-of-two base `B`, this is `B / 2`; and
+- a deterministic nonnegative small decomposition uses the exact digit bound
+  `B - 1`.
+
+The trapdoor policy is never reused for gadget decomposition. Conversely,
+generic DSL and IR `Preimage` values store only the already resolved numeric
+coefficient bound; they do not carry BGG-specific policy, provenance, or a
+decomposition witness.
+
 ## Decomposition cache planning
 
-The public program is analyzed before preprocessing. A public matrix is
-decomposed only if it is consumed as a bounded right operand during online
-evaluation. Unused public outputs and unused decompositions are not exported.
+The public-key program is analyzed before preprocessing. During its one
+preprocessing execution, every public-key wire remains a materialized
+`BggPublicKeyWire` matrix. A matrix is decomposed and exported only when a
+specific multiplication consumer will use that wire as its decomposition
+operand during encoding evaluation. Unused public outputs and unused
+decompositions are not exported.
 
 For each gate:
 
-- `MulPrivate` caches the RHS/GSW decomposition and exports the ordinary output
-  public key only when it is needed across the stage boundary;
-- `MulPublic` caches the private operand's public-key decomposition and exports
-  its ordinary output public key when needed;
-- `Add` needs no cache by itself; its output is decomposed only if a later gate
-  consumes it as a right operand;
-- `Lut` caches the helper RHS decompositions and the relation-bearing
-  intermediate decompositions required by its branches; and
+- `MulPrivate` uses its typed RHS/GSW material and records no encoding-wire
+  public-key state;
+- `MulPublic` consumes the `K_private` decomposition selected for its
+  `private` operand's public-key wire;
+- a public-key multiplication computes its materialized matrix result during
+  preprocessing and exports the selected operand decomposition only for each
+  later encoding consumer;
+- family reduction and encoding `Add` are vector-only and cache nothing;
+  if a later multiplication consumes their result as a decomposition operand,
+  the public-key program materializes that result and preprocessing exports
+  the decomposition for that later consumer;
+- `Lut` caches only the helper RHS decompositions and the relation-bearing
+  public-key RHS decompositions required by its branches; and
 - value readout caches its automorphism helper decompositions and normalization
   decomposition.
 
@@ -679,21 +859,27 @@ For a PRF block and slot, the principal cached values are
 \[
   D_{C,j,i}=G^{-1}(C_{j,i}),
   \qquad
-  D_{f,j,i}=G^{-1}(A_{f,j,i}).
+  D_{f,r,j,i}=G^{-1}(A_{f,r,j,i}),
 \]
 
-They are exported as rectangular `Family<Preimage>` artifacts with structural
-shape such as `[block_count, slot_capacity]`, not as thousands of separately
-named scalar artifacts.
+They are exported as consumer-specific flattened one-dimensional
+`Family<Preimage>` artifacts. A shared consumer uses shape `[count]`; an
+output-indexed consumer uses shape `[R * count]` in output-major order. The
+runtime preserves these structural ranges instead of exporting thousands of
+separately named scalar artifacts.
 
 ## Artifact ownership and storage
 
 The existing workspace layers retain their responsibilities:
 
 - `mxx-bgg` exposes cache-aware operations that accept explicit typed
-  `Preimage` operands and never owns an application program ID;
+  `Preimage` decomposition operands. `BggPublicKeyWire` owns only its materialized
+  matrix; `BggEncodingWire` owns only its vector and optional plaintext, and
+  neither wire owns an application program ID;
 - `mxx-exponent-lut` decides which public program values require decomposition,
-  declares artifact names and family coordinates, and binds them to gates;
+  declares artifact names and family coordinates for each multiplication
+  consumer, and binds the generic cache API's `K_rhs` to the encoding gate
+  (`K_private` for `MulPublic`);
 - `mxx-dsl` retains the existing preimage output/input constructors;
 - `mxx-runtime` stores, loads, stages, and releases artifact payloads; and
 - `mxx-primitives` owns compact bounded representations, GPU owners, and
@@ -722,7 +908,7 @@ load the required preimage artifact columns
 transfer them to the assigned GPU
 reuse them for the current label/output wave
 run mul_small_rhs or mul_decomposed
-store any required output artifact
+store any operand decomposition required by a later multiplication consumer
 release the loaded columns and temporary owners
 advance to the next wave
 ```
@@ -802,12 +988,13 @@ while the desired digit is
   d=g+\frac12=f(z)\in\{-p'+1,\ldots,p'\}.
 \]
 
-Use digit base `B=P`. The digit counts are
+Use digit base `B=P`. Choose separate positive digit counts `d_m` and `d_e`,
+and define their represented ranges directly:
 
 \[
-  C_m=\left\lceil\frac{\omega_m}{\log_2P}\right\rceil,
+  M_m=P^{d_m},\quad B_m=M_m-1,
   \qquad
-  C_e=\left\lceil\frac{\log_2B_e}{\log_2P}\right\rceil.
+  M_e=P^{d_e},\quad B_e=M_e-1.
 \]
 
 Mask and fresh-error outputs each have `2*ell_beta` columns. The routed targets
@@ -830,7 +1017,7 @@ Add the public mask offset
 \[
   o_m(1+X+\cdots+X^{n-1}),
   \qquad
-  o_m=\frac12\sum_{c<C_m}B^c,
+  o_m=\frac12\sum_{c<d_m}B^c,
 \]
 
 and the public fresh-error offset
@@ -838,7 +1025,7 @@ and the public fresh-error offset
 \[
   \frac{q}{q_t}o_e(1+X+\cdots+X^{n-1}),
   \qquad
-  o_e=\frac12\sum_{c<C_e}B^c.
+  o_e=\frac12\sum_{c<d_e}B^c.
 \]
 
 These are public vector additions. They change neither the public matrix nor
@@ -846,11 +1033,14 @@ the noise.
 
 ## Exponent-LUT-specific noise authority
 
-`crates/exponent-lut/src/noise.rs` is the only correctness noise authority for
-this application. Parameter search and integration tests must not translate
-the program to the generic noise simulator, compare against it, or fall back
-to it. Remove the dependency on `mxx-noise-simulator` if no unrelated use
-remains.
+`crates/exponent-lut/src/noise.rs` owns the shared gate-level noise interpreter
+(`ProgramNoiseInterpreter`) and is the source of truth for primitive program
+transfers. `crates/exponent-lut/src/noise_refresh/simulation.rs` is a thin
+application-specific wrapper that invokes that interpreter and adds the
+readout, routing, and refresh equations. It is not a second gate interpreter.
+Parameter search and integration tests must not translate the program to the
+generic `mxx-noise-simulator`, compare against it, or fall back to it. Remove
+that dependency if no unrelated use remains.
 
 ### Coordinate conventions and structural input
 
@@ -860,6 +1050,15 @@ explicit channels:
 - `WorstCase`, whose state `E` is an absolute coefficient bound; and
 - `AverageCase`, whose state `V2` is the per-coefficient variance of the
   doubled error `2e`.
+
+For a complete centered base-`P` digit, this convention gives the exact
+variance
+
+\[
+  \operatorname{Var}(2e)=\frac{P^2-1}{3}.
+\]
+
+This includes the binary case `P=2`, where the variance is exactly one.
 
 The average helper variance `V_chi,2 = Var(2e_chi)` comes from the configured
 sampler distribution. It is not reconstructed from the worst-case cutoff
@@ -922,10 +1121,15 @@ The snapshot is ordinary trusted simulator input. No commitment, digest
 recalculation, or adversarial attestation is required. Given the same snapshot,
 the simulator must deterministically produce the same report.
 
+AverageCase candidates bind every declared public-value family from the setup
+path, including its concrete member count, error cutoff, and doubled variance.
+An empty public-family map is not a candidate input and must fail closed when a
+family is declared.
+
 ### Gate transfers
 
 The simulator evaluates the frozen program in topological order and records a
-state for every `ProgramWireId`.
+state for every `WireId`.
 
 For `MulPrivate`, let `D_rhs` be the typed RHS decomposition, let `E_rhs` be its
 helper error bound, and let `V_{rhs,2}` be its doubled variance. Exponent-LUT
@@ -942,30 +1146,41 @@ so its action norm is at most one. Therefore
   = \gamma_2^2(D_{rhs})V_{lhs,2}+V_{rhs,2}.
 \]
 
-For `MulPublic`, let `D_A=G^{-1}(A_private)` be the cached decomposition of the
-private operand's public matrix and let `E_public` and `V_{public,2}` describe
-the public-value encoding. Because the public plaintext is a signed monomial,
+For `MulPublic`, let
+`D_{private}=K_{private}=G^{-1}(A_{private})` be the cached decomposition
+consumed by this gate. Let `E_{private},V_{private,2}` describe the private
+encoding vector and `E_{public},V_{public,2}` the public encoding vector. The
+public plaintext `x_{public}` acts as a signed monomial, so its action norm is
+exactly one:
 
 \[
   E_{out}
-  \le E_{private}+\gamma_1(D_A)E_{public},
+  \le \gamma_1(D_{private})E_{public}+E_{private},
 \]
 
 \[
   V_{out,2}
-  =V_{private,2}+\gamma_2^2(D_A)V_{public,2}.
+  =\gamma_2^2(D_{private})V_{public,2}+V_{private,2}.
 \]
 
-`V_{private,2}` is the doubled-error variance already attached to the private
-operand's `ProgramWireId` immediately before this gate. It is produced by the
-preceding gate transfers and includes every inherited and fresh contribution
-accumulated on that wire. It is not the variance of the private key and it is
-not a new sampler parameter.
+The consumed `D_{private}` is the exact same typed decomposition loaded by the
+encoding evaluator.  It is not recomputed from an encoding wire.  The state
+variances `V_{private,2}` and `V_{public,2}` are the doubled-error variances
+already attached to the respective `WireId`s immediately before this gate.
+They include every inherited and fresh contribution
+accumulated on those wires; neither is a secret-key variance or a new sampler
+parameter.
+
+Normal inherited right actions use their `gamma_2^2(D)` variance transfer;
+fresh iid helper contributions use the same `gamma_2^2(D)` rule. BGG+ `Add`
+remains conservative even in AverageCase: binary Add uses
+`2*(V_lhs,2 + V_rhs,2)`, and an `r`-term reduction uses
+`r*sum_i V_i,2`.
 
 These equations correspond exactly to
 
 \[
-  c_{out}=c_{public}D_A+x c_{private}.
+  c_{out}=c_{public}K_{private}+x_{public}c_{private}.
 \]
 
 For `Add`, worst-case bounds add:
@@ -1031,10 +1246,10 @@ Under independent automorphism-helper sampling, the average transfer is
   V_{Lut,2}
   =
   \sum_{\sigma\in\Sigma_L}
-  \left(
-    \gamma_2^2(D_{C,\sigma,L})V_{in,2}
-    +\left(1+\gamma_2^2(D_{A,\sigma,L})\right)V_{\chi,2}
-  \right).
+    \left(
+      \gamma_2^2(D_{C,\sigma,L})V_{in,2}
+      +\left(1+\gamma_2^2(D_{A,\sigma,L})\right)V_{\chi,2}
+    \right).
 \]
 
 The two-input LUT API needs no separate simulator formula: the simulator sees
@@ -1048,12 +1263,12 @@ branch's `MulPrivate` followed by `MulPublic`, followed by `Add`. Compound
 operation names may group already-derived gate rows in the report, but they
 must not change the arithmetic or supply an alternative bound.
 
-### One-hot PRF block
+### Native PRF selection block
 
 The equations in this subsection are the algebraic expansion of the basic
 gate transfers for logging and review. They are not implemented as a separate
-one-hot transfer. The final reduction uses the same coherent average `Add`
-rule as every other family reduction Add.
+selector transfer. The final reduction uses the same conservative average
+`Add` rule as every other family reduction.
 
 For PRF block `j`, only the actual non-padding slots are included. For active
 slot `i`, define
@@ -1074,9 +1289,9 @@ The `MulPrivate` stage gives
 and the following `MulPublic` gives
 
 \[
-  E_{g,j,i}
-  \le E_{f,j,i}
-     +\gamma_1(D_{f,j,i})E_{V,j,i}.
+    E_{g,j,i}
+    \le \gamma_1(D_{f,j,i})E_{V,j,i}
+       +E_{f,j,i}.
 \]
 
 The block output is the `Add` reduction
@@ -1094,8 +1309,8 @@ In the average channel,
 
 \[
   V_{g,j,i,2}
-  =V_{f,j,i,2}
-   +\gamma_2^2(D_{f,j,i})V_{V,j,i,2},
+  =\gamma_2^2(D_{f,j,i})V_{V,j,i,2}
+   +V_{f,j,i,2},
 \]
 
 \[
@@ -1113,13 +1328,14 @@ stages.
 Let
 
 \[
-  \tau_1=\gamma_1(T'),
+  \tau_1=\gamma_1(D_T),
   \qquad
-  \tau_2^2=\gamma_2^2(T'),
+  \tau_2^2=\gamma_2^2(D_T),
 \]
 
-where these are the actual convolution-action norms of `T'`, not its modulus
-representative. Public multiplication gives
+where `T'` is first converted to the actual gadget target
+`D_T=G^{-1}(T'G)`. These are the norms of that concrete decomposition, not a
+direct convolution norm or a modulus representative. Public multiplication gives
 
 \[
   E_T\le\tau_1E_{acc},
@@ -1144,10 +1360,10 @@ non-identity `sigma`, use its concrete helper actions:
   V_{tr,2}
   = V_{T,2}+
   \sum_{\sigma\ne id}
-  \left(
-    \gamma_2^2(D_{C,\sigma})V_{T,2}
-    +\left(1+\gamma_2^2(D_{A,\sigma})\right)V_{\chi,2}
-  \right)
+    \left(
+      \gamma_2^2(D_{C,\sigma})V_{T,2}
+      +\left(1+\gamma_2^2(D_{A,\sigma})\right)V_{\chi,2}
+    \right)
 \]
 
 under the same independent automorphism-helper assumption as `Lut`.
@@ -1177,6 +1393,10 @@ mask routes, and fresh-error routes. Their gains are computed from the
 decompositions of the concrete targets; in particular, the simulator never
 uses raw `kappa_t` as an error gain.
 
+The fresh setup state, centered mask/fresh digits, and distinct routed
+PRF-label outputs are independent sources, so their route variances add and
+use the corresponding `gamma_2^2` gains.
+
 Let `R_m,1` and `R_e,t,1` be the summed worst-case route gains, and let
 `E_d,t` be the decoder helper contribution. The pre-refresh operational error
 excluding the nominal mask is
@@ -1189,23 +1409,17 @@ excluding the nominal mask is
    +E_{d,t}.
 \]
 
-For average simulation, the mask and fresh routes reuse the same readout wire.
-They must not be treated as independent. Form the combined linear action
-`D_m + D_e,t` first and compute its actual squared gain
-
-\[
-  R_{m+e,t,2}^2=\gamma_2^2(D_m+D_{e,t}).
-\]
-
-Let `V_{m,digit,2}` and `V_{e,t,digit,2}` be the centered base-`P` digit
-variances after their actual route actions, and let `V_{d,t,2}` be the decoder
-variance.
+For average simulation, mask and fresh routes correspond to distinct
+PRF-label outputs, so their variances add independently. Let
+`V_{m,digit,2}` and `V_{e,t,digit,2}` be the centered base-`P` digit variances
+after their actual route actions, and let `V_{d,t,2}` be the decoder variance.
 Then
 
 \[
   V_{t,2}
   =\gamma_2^2(D_{\kappa,t})V_{state,2}
-   +R_{m+e,t,2}^2V_{read,2}
+   +\gamma_2^2(D_{m,t})V_{read,2}
+   +\gamma_2^2(D_{e,t})V_{read,2}
    +V_{m,digit,2}
    +V_{e,t,digit,2}
    +V_{d,t,2}.
@@ -1227,28 +1441,25 @@ correction `b_tail`, define
    \right\rceil.
 \]
 
-For the selected authority, write `F_t=F_t^worst` or `F_t=F_t^avg`. Define
-
-\[
-  M_m=P^{d_m},\quad B_m=M_m-1,
-  \qquad
-  M_e=P^{d_e},\quad B_e=M_e-1.
-\]
+For the selected authority, write `F_t=F_t^worst` or `F_t=F_t^avg`, and use
+the independently chosen digit ranges `M_m,B_m,M_e,B_e` defined above.
 
 Every CRT slot must satisfy the strict rounding condition
 
 \[
-  2(B_m+F_t)<\kappa_t,
+  B_m+2F_t<\kappa_t,
 \]
 
-and the fresh-error condition
+and the fresh-error condition, for every prime factor \(r\) of every CRT
+modulus \(q_t\),
 
 \[
-  B_e<q_t.
+  B_e < r\quad\text{for all primes }r\mid q_t.
 \]
 
-The latter is checked separately for every prime factor, not only against the
-smallest factor cached elsewhere. Mask coverage and smudging require
+Equivalently, \(B_e < \min\{r:r\text{ is prime and }r\mid q_t\}\). This is
+checked separately for every factor of every tower, not only against the
+composite modulus value or a smallest factor cached elsewhere. Mask coverage and smudging require
 
 \[
   M_m\ge Q,
@@ -1263,7 +1474,7 @@ accepted for these two non-strict conditions.
 
 ### Implementation replacement
 
-Delete the old simulator logic tied to `Unary`, `Binary`, `OneHot`, grouped
+Delete the old simulator logic tied to legacy gate-specific branches, grouped
 mod-`Q_L` reductions, and a terminal rounding LUT. In particular, replace
 `fixed_fuse_transfer`, `fixed_lut_transfer`,
 `monomial_one_hot_transfer`, `simulate_sparse_prf`, and their average variants
@@ -1357,13 +1568,17 @@ maximum for `log2(q)` is added.
 
 ### `mxx-bgg`
 
-- keep `BggPublicKeyWire` and `BggEncodingWire` semantically unchanged;
-- expose multiplication paths that accept an explicit typed `Preimage` rather
-  than decomposing internally;
-- allow an online caller to attach an already-preprocessed ordinary output
-  public key instead of recomputing its matrix arithmetic;
-- reuse one decomposition for vector and public projection in preprocessing;
-  and
+- keep `BggPublicKeyWire` as the materialized `{ matrix, reveal_plaintext }`
+  wire;
+- keep `BggEncodingWire` as `{ vector, plaintext: Option<Mat> }`, with no
+  public-key matrix, decomposition, cache handle, or projection state;
+- expose encoding multiplication paths that accept the explicit typed
+  decomposition `Preimage` and compute
+  `c_public K_private + x_public c_private` on vectors only;
+- let each public-key multiplication retain its materialized matrix result
+  during preprocessing and export the operand decomposition needed by a later
+  encoding consumer; and
+- keep encoding `Add` and family reduction vector-only, with no cache output;
 - reject missing decomposition artifacts in cache-required mode.
 
 ### `mxx-exponent-lut`
@@ -1375,8 +1590,8 @@ maximum for `log2(q)` is added.
 - delete the old one-hot gate and express selection structurally;
 - replace the PRF reduction plan with native accumulation;
 - add `ValueReadout`;
-- generate the public program trace, ordinary public artifacts, and only the
-  required decomposition cache artifacts;
+- generate the preprocessing public-key program and only the required RHS
+  decomposition cache artifacts;
 - import cache artifacts lazily into online evaluation;
 - update routing and half-offsets;
 - replace the old PRF noise recurrence; and
@@ -1408,7 +1623,7 @@ maximum for `log2(q)` is added.
 
 Delete rather than deprecate:
 
-- `ProgramGate::Unary`, `ProgramGate::Binary`, and `ProgramGate::OneHot`;
+- legacy compound gate variants;
 - public-value-family declarations that store clear monomials outside
   `BggEncodingWire::plaintext`;
 - all LUT type, helper, function, artifact, and report names containing
@@ -1453,7 +1668,8 @@ Add focused tests for:
 - `select` equivalence to `MulPrivate`, then `MulPublic`, then `Add`;
 - rejection of `MulPublic` with missing public plaintext;
 - plaintext knowledge propagation;
-- label-independent public matrices;
+- output-indexed public matrices and exact agreement between public and online
+  label-major axes;
 - typed public `Preimage` artifact export/import;
 - file-backed scalar and family artifact round trips;
 - bounded wave loading without full-family materialization;
@@ -1497,7 +1713,8 @@ Implementation is complete only when:
 - native wrap and value readout are functionally correct;
 - all LUT evaluation uses the single implementation and no obsolete naming or
   mode remains;
-- the public matrix is identical across labels;
+- every logical PRF output has its own setup-fixed public matrix family, and
+  the public and online output axes agree exactly;
 - online evaluation performs no public-key decomposition or public-program
   arithmetic in cache-required mode;
 - only decomposition preimages are counted as cache artifacts;

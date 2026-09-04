@@ -391,8 +391,12 @@ impl PolyCircuitCompiler {
         L: PublicLookupLowering<P, Wire = BggEncodingWire, Error = CircuitCompileError>,
         S: SlotOperationLowering<P, Wire = BggEncodingWire, Error = CircuitCompileError>,
     {
-        let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
-        let arithmetic = EncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
+        let compiler = BggEncodingCompiler;
+        let arithmetic = EncodingLowering::<P> {
+            compiler: &compiler,
+            ring: self.public_key.ring.clone(),
+            marker: PhantomData,
+        };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
         lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
@@ -851,6 +855,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicKeyLowering<'_, P> {
 
 struct EncodingLowering<'a, P> {
     compiler: &'a BggEncodingCompiler,
+    ring: mxx_dsl::Ring,
     marker: PhantomData<P>,
 }
 
@@ -870,7 +875,10 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodingLowering<'_, P> {
         match operation {
             PolyGateKind::Add => self.compiler.add(lhs, rhs).map_err(Into::into),
             PolyGateKind::Sub => self.compiler.sub(lhs, rhs).map_err(Into::into),
-            PolyGateKind::Mul => self.compiler.mul(lhs, rhs).map_err(Into::into),
+            PolyGateKind::Mul => unsupported(
+                gate,
+                "cache-required multiplication needs a preprocessing-supplied RHS decomposition",
+            ),
             _ => unsupported(gate, "non-binary operation"),
         }
     }
@@ -881,11 +889,8 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodingLowering<'_, P> {
         scalar: &[u32],
         _gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
-        let scalar = self
-            .compiler
-            .public_key
-            .ring
-            .polynomial(scalar.iter().copied().map(mxx_ir_core::IntExpr::constant));
+        let scalar =
+            self.ring.polynomial(scalar.iter().copied().map(mxx_ir_core::IntExpr::constant));
         Ok(self.compiler.small_scalar_mul(input, &scalar))
     }
 
@@ -895,14 +900,11 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodingLowering<'_, P> {
         scalar: &[BigUint],
         _gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
-        let scalar = self.compiler.public_key.ring.polynomial(
-            scalar
-                .iter()
-                .cloned()
-                .map(num_bigint::BigInt::from)
-                .map(mxx_ir_core::IntExpr::constant),
-        );
-        Ok(self.compiler.large_scalar_mul(input, &scalar))
+        let _ = (input, scalar);
+        unsupported(
+            _gate,
+            "cache-required scalar multiplication needs a preprocessing-supplied decomposition",
+        )
     }
 }
 

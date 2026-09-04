@@ -16,8 +16,11 @@ pub enum IntExpr {
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
     Div(Box<Self>, Box<Self>),
+    FloorDiv(Box<Self>, Box<Self>),
+    Rem(Box<Self>, Box<Self>),
     RoundDiv(Box<Self>, Box<Self>),
     Log2Ceil(Box<Self>),
+    Select { selector: Box<Self>, branches: Vec<Self> },
 }
 
 impl Serialize for IntExpr {
@@ -36,8 +39,11 @@ enum IntExprRepr {
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
     Div(Box<Self>, Box<Self>),
+    FloorDiv(Box<Self>, Box<Self>),
+    Rem(Box<Self>, Box<Self>),
     RoundDiv(Box<Self>, Box<Self>),
     Log2Ceil(Box<Self>),
+    Select { selector: Box<Self>, branches: Vec<Self> },
 }
 
 impl From<IntExpr> for IntExprRepr {
@@ -58,10 +64,20 @@ impl From<IntExpr> for IntExprRepr {
             IntExpr::Div(lhs, rhs) => {
                 Self::Div(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
             }
+            IntExpr::FloorDiv(lhs, rhs) => {
+                Self::FloorDiv(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
+            }
+            IntExpr::Rem(lhs, rhs) => {
+                Self::Rem(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
+            }
             IntExpr::RoundDiv(lhs, rhs) => {
                 Self::RoundDiv(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
             }
             IntExpr::Log2Ceil(value) => Self::Log2Ceil(Box::new(Self::from(*value))),
+            IntExpr::Select { selector, branches } => Self::Select {
+                selector: Box::new(Self::from(*selector)),
+                branches: branches.into_iter().map(Self::from).collect(),
+            },
         }
     }
 }
@@ -377,8 +393,18 @@ impl TryFrom<IntExpr> for IndexExpr {
             IntExpr::Div(lhs, rhs) => {
                 Ok(Self::Divide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
             }
+            IntExpr::FloorDiv(lhs, rhs) => {
+                Ok(Self::Divide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Rem(lhs, rhs) => {
+                Ok(Self::Remainder(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
             IntExpr::RoundDiv(_, _) => Err(IndexExprConversionError::RoundDiv),
             IntExpr::Log2Ceil(value) => Ok(Self::Log2Ceil(Box::new((*value).try_into()?))),
+            IntExpr::Select { selector, branches } => Ok(Self::Select {
+                selector: Box::new((*selector).try_into()?),
+                branches: branches.into_iter().map(TryInto::try_into).collect::<Result<_, _>>()?,
+            }),
         }
     }
 }
@@ -461,6 +487,20 @@ impl IntExpr {
                 }
                 Ok(quotient)
             }
+            Self::FloorDiv(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)?.div_floor(&denominator))
+            }
+            Self::Rem(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)?.mod_floor(&denominator))
+            }
             Self::RoundDiv(lhs, rhs) => {
                 let numerator = lhs.evaluate(env)?;
                 let denominator = rhs.evaluate(env)?;
@@ -480,6 +520,17 @@ impl IntExpr {
                 let is_power_of_two = value == (num_bigint::BigUint::one() << floor as usize);
                 Ok(BigInt::from(if is_power_of_two { floor } else { floor + 1 }))
             }
+            Self::Select { selector, branches } => {
+                let index = selector.evaluate(env)?.to_usize().ok_or_else(|| {
+                    ExprError::UnboundVariable("integer selector is not a nonnegative usize".into())
+                })?;
+                branches
+                    .get(index)
+                    .ok_or_else(|| {
+                        ExprError::UnboundVariable("integer selector out of range".into())
+                    })?
+                    .evaluate(env)
+            }
         }
     }
 
@@ -497,10 +548,16 @@ impl IntExpr {
             Self::Sub(lhs, rhs) |
             Self::Mul(lhs, rhs) |
             Self::Div(lhs, rhs) |
+            Self::FloorDiv(lhs, rhs) |
+            Self::Rem(lhs, rhs) |
             Self::RoundDiv(lhs, rhs) => {
                 lhs.contains_variable(variable) || rhs.contains_variable(variable)
             }
             Self::Log2Ceil(value) => value.contains_variable(variable),
+            Self::Select { selector, branches } => {
+                selector.contains_variable(variable) ||
+                    branches.iter().any(|branch| branch.contains_variable(variable))
+            }
         }
     }
 }
@@ -737,8 +794,11 @@ enum Generator {
     Var(String),
     LoopIndex(u32),
     Div(IntExpr, IntExpr),
+    FloorDiv(IntExpr, IntExpr),
+    Rem(IntExpr, IntExpr),
     RoundDiv(IntExpr, IntExpr),
     Log2Ceil(IntExpr),
+    Select { selector: IntExpr, branches: Vec<IntExpr> },
 }
 
 type Monomial = Vec<Generator>;
@@ -758,10 +818,20 @@ impl Polynomial {
             IntExpr::Div(lhs, rhs) => {
                 Self::generator(Generator::Div(lhs.canonicalize(), rhs.canonicalize()))
             }
+            IntExpr::FloorDiv(lhs, rhs) => {
+                Self::generator(Generator::FloorDiv(lhs.canonicalize(), rhs.canonicalize()))
+            }
+            IntExpr::Rem(lhs, rhs) => {
+                Self::generator(Generator::Rem(lhs.canonicalize(), rhs.canonicalize()))
+            }
             IntExpr::RoundDiv(lhs, rhs) => {
                 Self::generator(Generator::RoundDiv(lhs.canonicalize(), rhs.canonicalize()))
             }
             IntExpr::Log2Ceil(value) => Self::generator(Generator::Log2Ceil(value.canonicalize())),
+            IntExpr::Select { selector, branches } => Self::generator(Generator::Select {
+                selector: selector.canonicalize(),
+                branches: branches.iter().map(IntExpr::canonicalize).collect(),
+            }),
         }
     }
 
@@ -836,8 +906,13 @@ impl Generator {
             Self::Var(name) => IntExpr::Var(name),
             Self::LoopIndex(slot) => IntExpr::LoopIndex(slot),
             Self::Div(lhs, rhs) => IntExpr::Div(Box::new(lhs), Box::new(rhs)),
+            Self::FloorDiv(lhs, rhs) => IntExpr::FloorDiv(Box::new(lhs), Box::new(rhs)),
+            Self::Rem(lhs, rhs) => IntExpr::Rem(Box::new(lhs), Box::new(rhs)),
             Self::RoundDiv(lhs, rhs) => IntExpr::RoundDiv(Box::new(lhs), Box::new(rhs)),
             Self::Log2Ceil(value) => IntExpr::Log2Ceil(Box::new(value)),
+            Self::Select { selector, branches } => {
+                IntExpr::Select { selector: Box::new(selector), branches }
+            }
         }
     }
 }
@@ -975,5 +1050,53 @@ mod tests {
         let expression =
             IntExpr::RoundDiv(Box::new(IntExpr::constant(7)), Box::new(IntExpr::constant(2)));
         assert_eq!(IndexExpr::try_from(expression), Err(IndexExprConversionError::RoundDiv));
+    }
+
+    #[test]
+    fn integer_select_round_trips_and_evaluates_the_selected_branch() {
+        let expression = IntExpr::Select {
+            selector: Box::new(IntExpr::LoopIndex(7)),
+            branches: vec![IntExpr::constant(3), IntExpr::constant(11)],
+        };
+        let encoded = serde_json::to_vec(&expression).expect("select expression encoding");
+        let decoded: IntExpr =
+            serde_json::from_slice(&encoded).expect("select expression decoding");
+        let env = ParamEnv {
+            loop_indices: BTreeMap::from([(7, BigInt::from(1))]),
+            ..ParamEnv::default()
+        };
+        assert_eq!(decoded.evaluate(&env).expect("selected branch"), BigInt::from(11));
+    }
+
+    #[test]
+    fn integer_select_rejects_an_out_of_range_selector() {
+        let expression = IntExpr::Select {
+            selector: Box::new(IntExpr::constant(2)),
+            branches: vec![IntExpr::constant(3), IntExpr::constant(11)],
+        };
+        assert!(expression.evaluate(&ParamEnv::default()).is_err());
+    }
+
+    #[test]
+    fn floor_division_and_remainder_support_structural_index_arithmetic() {
+        let numerator = IntExpr::LoopIndex(3);
+        let denominator = IntExpr::constant(25);
+        let quotient =
+            IntExpr::FloorDiv(Box::new(numerator.clone()), Box::new(denominator.clone()));
+        let remainder = IntExpr::Rem(Box::new(numerator), Box::new(denominator));
+        let env = ParamEnv {
+            loop_indices: BTreeMap::from([(3, BigInt::from(63))]),
+            ..ParamEnv::default()
+        };
+        assert_eq!(quotient.evaluate(&env).expect("floor quotient"), BigInt::from(2));
+        assert_eq!(remainder.evaluate(&env).expect("remainder"), BigInt::from(13));
+        assert_eq!(
+            IndexExpr::try_from(quotient).expect("index quotient").evaluate(&env).unwrap(),
+            BigInt::from(2)
+        );
+        assert_eq!(
+            IndexExpr::try_from(remainder).expect("index remainder").evaluate(&env).unwrap(),
+            BigInt::from(13)
+        );
     }
 }

@@ -6,11 +6,12 @@
 //! content hash before a family handle crosses into evaluation. Selector bits
 //! and sampled packages remain runtime/key-provider data, never public names.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mxx_ir_core::{
     ParamEnv,
     artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId},
+    node::ConstantMatrix,
     types::ConcreteMatrixType,
 };
 use num_traits::ToPrimitive;
@@ -21,14 +22,14 @@ use super::evaluation::PbcEncodedPublicVector;
 use crate::{
     ExponentLutError,
     encoding::{ExponentLutEncodingSampler, ExponentLutSamplingError},
-    pbc::{
+    noise_refresh::pbc::{
         PbcError, PbcGeneratedKeyLayout, PbcLayoutId, PbcLocation, PbcPrivateSchedule,
         PbcPublicLayout,
     },
     rhs::{ExponentRhsPackageArtifactNames, ManifestRhsMetadata},
 };
 use mxx_dsl::{Bytes, Family, HashTag, Mat, Ring};
-use num_bigint::BigInt;
+use mxx_runtime::{Backend, RuntimeValue};
 
 /// Canonical names for one active bucket/slot selector package.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,21 +107,22 @@ impl PbcSelectorArtifactNames {
         if secret_dimension == 0 || target_columns == 0 {
             return Err(PbcError::ArtifactIdentityMismatch);
         }
-        let selector_packages = crate::pbc::layout::PbcActiveCellIndex::build(layout)?
-            .iter()
-            .map(|(bucket, slot, _)| PbcSelectorPackageArtifactNames {
-                bucket,
-                slot,
-                package: ExponentRhsPackageArtifactNames {
-                    gsw_ciphertext: canonical_component_name(
-                        layout.layout_id,
-                        key_instance_id,
-                        bucket,
-                        slot,
-                    ),
-                },
-            })
-            .collect();
+        let selector_packages =
+            crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)?
+                .iter()
+                .map(|(bucket, slot, _)| PbcSelectorPackageArtifactNames {
+                    bucket,
+                    slot,
+                    package: ExponentRhsPackageArtifactNames {
+                        gsw_ciphertext: canonical_component_name(
+                            layout.layout_id,
+                            key_instance_id,
+                            bucket,
+                            slot,
+                        ),
+                    },
+                })
+                .collect();
         Self::canonicalize(layout, key_instance_id, selector_packages)
     }
 
@@ -131,7 +133,7 @@ impl PbcSelectorArtifactNames {
         selector_packages: Vec<PbcSelectorPackageArtifactNames>,
     ) -> Result<Self, PbcError> {
         layout.validate()?;
-        let expected = crate::pbc::layout::PbcActiveCellIndex::build(layout)?
+        let expected = crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)?
             .iter()
             .map(|(bucket, slot, _)| (bucket, slot))
             .collect::<Vec<_>>();
@@ -411,7 +413,7 @@ fn family_metadata(
     target: &mxx_bgg::BggSamplerLayout,
     target_identity: [u8; 32],
 ) -> Result<PbcSelectorFamilyMetadata, PbcError> {
-    let canonical_order = crate::pbc::layout::PbcActiveCellIndex::build(layout)?
+    let canonical_order = crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)?
         .iter()
         .map(|(bucket, slot, _)| PbcLocation { bucket, slot })
         .collect::<Vec<_>>();
@@ -491,18 +493,30 @@ pub fn canonical_component_name(
 
 /// The trusted private selector bits used by the structural producer graph.
 ///
-/// `family` is a single runtime family input.  `values` is the private
+/// `family` is a single runtime family input. `runtime_bits` is the private
 /// key-provider payload for that input and is intentionally kept separate from
 /// the graph: neither selected slots nor support coordinates are represented
-/// in the graph or in any artifact name.  The constructor is the only place
-/// where a private schedule is converted into one-hot values.
+/// in the graph or in any artifact name. The constructor is the only place
+/// where a private schedule is converted into one-hot values. In particular,
+/// it does not create one DSL polynomial node per bit.
 pub struct PbcTrustedSelectorBits {
     layout_id: PbcLayoutId,
     key_instance_id: [u8; 32],
     input_name: String,
     family: Family<Mat>,
-    values: Vec<Mat>,
     runtime_bits: Vec<u8>,
+}
+
+/// Private runtime payload for the one structural selector-family input.
+///
+/// The graph retains only the family input declaration. Concrete zero/one
+/// polynomials are materialized by the execution backend when an execution
+/// request is assembled, never as one DSL node per active selector.
+#[derive(Clone, Debug)]
+pub(crate) struct PbcSelectorRuntimeBinding {
+    input_name: String,
+    matrix_type: ConcreteMatrixType,
+    bits: Vec<u8>,
 }
 
 impl std::fmt::Debug for PbcTrustedSelectorBits {
@@ -512,7 +526,7 @@ impl std::fmt::Debug for PbcTrustedSelectorBits {
             .field("layout_id", &self.layout_id)
             .field("key_instance_id", &self.key_instance_id)
             .field("input_name", &self.input_name)
-            .field("family_count", &self.values.len())
+            .field("family_count", &self.runtime_bits.len())
             .finish()
     }
 }
@@ -532,7 +546,7 @@ impl PbcTrustedSelectorBits {
         let layout = &generated.public_layout;
         layout.validate()?;
         generated.private_schedule().validate(layout)?;
-        let active = crate::pbc::layout::PbcActiveCellIndex::build(layout)?;
+        let active = crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)?;
         let expected = layout
             .parameters
             .universe_size
@@ -566,22 +580,9 @@ impl PbcTrustedSelectorBits {
                 u8::from(generated.private_schedule().selected_slot(bucket) == slot)
             })
             .collect::<Vec<_>>();
-        let values = runtime_bits
-            // Each bit is represented as a constant polynomial supplied at
-            // runtime; it is not embedded in the public graph identity.
-            .iter()
-            .map(|bit| ring.polynomial([BigInt::from(*bit).into()]))
-            .collect::<Vec<_>>();
         let input_name = selector_bit_family_name(layout, key_instance_id);
         let family = ring.input_family(input_name.clone(), expected, (1, 1));
-        Ok(Self {
-            layout_id: layout.layout_id,
-            key_instance_id,
-            input_name,
-            family,
-            values,
-            runtime_bits,
-        })
+        Ok(Self { layout_id: layout.layout_id, key_instance_id, input_name, family, runtime_bits })
     }
 
     /// Builds trusted bits from a host bit vector, for key-provider tests and
@@ -597,7 +598,7 @@ impl PbcTrustedSelectorBits {
     ) -> Result<Self, PbcError> {
         layout.validate()?;
         schedule.validate(layout)?;
-        let active = crate::pbc::layout::PbcActiveCellIndex::build(layout)?;
+        let active = crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)?;
         let expected = active.len();
         if bits.len() != expected || bits.iter().any(|bit| *bit > 1) {
             return Err(PbcError::InvalidSchedule(
@@ -620,8 +621,6 @@ impl PbcTrustedSelectorBits {
                 ));
             }
         }
-        let values =
-            bits.iter().map(|bit| ring.polynomial([BigInt::from(*bit).into()])).collect::<Vec<_>>();
         let input_name = selector_bit_family_name(layout, key_instance_id);
         let family = ring.input_family(input_name.clone(), expected, (1, 1));
         Ok(Self {
@@ -629,7 +628,6 @@ impl PbcTrustedSelectorBits {
             key_instance_id,
             input_name,
             family,
-            values,
             runtime_bits: bits.to_vec(),
         })
     }
@@ -637,11 +635,6 @@ impl PbcTrustedSelectorBits {
     /// The private runtime family consumed by the structural selector loop.
     pub fn family(&self) -> &Family<Mat> {
         &self.family
-    }
-
-    /// Returns the key-provider values to bind to [`Self::family`].
-    pub fn runtime_values(&self) -> &[Mat] {
-        &self.values
     }
 
     /// Returns the trusted binary payload for binding the runtime family to a
@@ -663,6 +656,48 @@ impl PbcTrustedSelectorBits {
     /// Returns the public key-instance identity used for family naming.
     pub fn key_instance_id(&self) -> [u8; 32] {
         self.key_instance_id
+    }
+
+    pub(crate) fn runtime_binding(
+        &self,
+        ring: &Ring,
+    ) -> Result<PbcSelectorRuntimeBinding, ExponentLutError> {
+        Ok(PbcSelectorRuntimeBinding {
+            input_name: self.input_name.clone(),
+            matrix_type: concrete_matrix_type(ring, (1, 1))?,
+            bits: self.runtime_bits.clone(),
+        })
+    }
+}
+
+impl PbcSelectorRuntimeBinding {
+    pub(crate) fn materialize_members<T: Clone, E>(
+        &self,
+        mut materialize_constant: impl FnMut(u8) -> Result<T, E>,
+    ) -> Result<Vec<T>, E> {
+        let zero = materialize_constant(0)?;
+        let one = materialize_constant(1)?;
+        Ok(self.bits.iter().map(|bit| if *bit == 0 { zero.clone() } else { one.clone() }).collect())
+    }
+
+    pub(crate) fn materialize<B: Backend>(
+        &self,
+        backend: &mut B,
+    ) -> Result<BTreeMap<String, RuntimeValue<B>>, B::Error> {
+        let env = ParamEnv::default();
+        let matrix_type = self.matrix_type.clone();
+        let members = self.materialize_members(|bit| {
+            backend
+                .constant_matrix(
+                    &matrix_type,
+                    &ConstantMatrix::Polynomial {
+                        coefficients: vec![mxx_ir_core::IntExpr::constant(bit)],
+                    },
+                    &env,
+                )
+                .map(RuntimeValue::matrix)
+        })?;
+        Ok(BTreeMap::from([(self.input_name.clone(), RuntimeValue::Family(members))]))
     }
 }
 
@@ -693,7 +728,7 @@ pub fn build_structural_selector_families(
     key_instance_id: [u8; 32],
 ) -> Result<PbcStructuralSelectorFamilies, PbcError> {
     layout.validate()?;
-    let active = crate::pbc::layout::PbcActiveCellIndex::build(layout)?;
+    let active = crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)?;
     let expected = active.len();
     if expected == 0 || *bits.count() != mxx_ir_core::IntExpr::constant(expected) {
         return Err(PbcError::InvalidSchedule(

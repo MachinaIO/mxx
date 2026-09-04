@@ -84,16 +84,6 @@ impl ManifestSecretMetadata {
             identity,
         }
     }
-
-    pub(crate) fn sampler(&self) -> mxx_bgg::BggSamplerLayout {
-        mxx_bgg::BggSamplerLayout {
-            modulus: self.modulus.clone(),
-            ring_dimension: self.ring_dimension.clone(),
-            secret_dimension: self.secret_dimension,
-            digit_count: self.digit_count,
-            gadget_base: self.gadget_base.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]

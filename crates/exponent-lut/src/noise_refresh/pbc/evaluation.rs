@@ -7,7 +7,7 @@
 //! `X^{(acc+a'_{b}[i]) mod Q}`. Artifact checks are delegated to `artifacts`.
 
 use super::{PbcCell, PbcError, PbcLayoutId, PbcPublicLayout, artifacts::PbcSelectorArtifacts};
-use crate::{ExponentLutError, encoding::EncodingSelectorFamily, public_key::PublicSelectorFamily};
+use crate::{ExponentLutError, encoding::EncodingRhsFamily, public_key::PublicRhsFamily};
 use mxx_bgg::BggSamplerLayout;
 use mxx_dsl::{DslContext, Family, Mat, Ring};
 use mxx_ir_core::artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId};
@@ -142,9 +142,9 @@ impl PbcEncodedPublicVector {
 ///
 /// The host binding stores one public residue and its active row-major order
 /// for every real or dummy cell, as defined by
-/// [`crate::pbc::PbcActiveCellIndex`]. Padding has no family element. At the
+/// [`crate::noise_refresh::pbc::PbcActiveCellIndex`]. Padding has no family element. At the
 /// DSL runtime boundary, each residue `a` is materialized as the public
-/// monomial factor `X^a` consumed by `OneHot`; the declared `(1, 1)` describes
+/// monomial factor `X^a` consumed by the native selector binding; the declared `(1, 1)` describes
 /// the matrix shape only, not a scalar-output encoding. This is a declaration
 /// and runtime-binding boundary: [`Self::input_family`] and
 /// [`Self::artifact_input_family`] create one structural family input, while
@@ -326,7 +326,7 @@ pub fn derive_lwr_vector(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pbc::{PbcActiveCellIndex, PbcLayoutSeed, PbcParameters};
+    use crate::noise_refresh::pbc::{PbcActiveCellIndex, PbcLayoutSeed, PbcParameters};
 
     fn layout_with_padding() -> PbcPublicLayout {
         let parameters = PbcParameters::custom(4, 2, 2, 3, 1, None);
@@ -407,6 +407,28 @@ mod tests {
             .expect("other toy layout");
         assert!(matches!(decoded.validate(&other), Err(PbcError::LayoutIdentityMismatch)));
     }
+
+    #[test]
+    fn selector_views_preserve_the_imported_layout_identity() {
+        let layout = layout_with_padding();
+        let ring = Ring::new(257, 8);
+        let package_count = PbcActiveCellIndex::build(&layout).unwrap().len();
+        let inputs = PbcSelectorFamilyInputs {
+            layout_id: layout.layout_id,
+            key_instance_id: [0x51; 32],
+            package_count,
+            gsw: ring.input_family("selector-layout-identity", package_count, (2, 4)),
+        };
+
+        assert_eq!(
+            inputs.encoding_family().expect("encoding selector view").layout_id(),
+            Some(layout.layout_id)
+        );
+        assert_eq!(
+            inputs.public_family().expect("public selector view").layout_id(),
+            Some(layout.layout_id)
+        );
+    }
 }
 
 /// Public layout families supplied by the key/label compiler. These are typed
@@ -416,7 +438,7 @@ mod tests {
 /// the artifact model has no first-class integer family artifacts. The other
 /// two families provide the public rotation and active-cell mask.
 pub struct PbcLayoutFamilies {
-    layout_id: crate::pbc::PbcLayoutId,
+    layout_id: crate::noise_refresh::pbc::PbcLayoutId,
     encoded_vector_id: [u8; 32],
     rectangular_count: usize,
     package_indices: Family<Mat>,
@@ -429,7 +451,7 @@ pub struct PbcLayoutFamilies {
 /// inside the structural loop body.
 #[allow(dead_code)]
 pub(crate) struct PbcSelectorFamilyInputs {
-    layout_id: crate::pbc::PbcLayoutId,
+    layout_id: crate::noise_refresh::pbc::PbcLayoutId,
     key_instance_id: [u8; 32],
     package_count: usize,
     gsw: Family<Mat>,
@@ -448,7 +470,7 @@ impl PbcLayoutFamilies {
         layout.validate().map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         encoded.validate(layout).map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let rectangular_count = layout.parameters.bucket_count * layout.bucket_width;
-        let package_count = crate::pbc::layout::PbcActiveCellIndex::build(layout)
+        let package_count = crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .len();
         Ok(Self {
@@ -488,7 +510,7 @@ impl PbcLayoutFamilies {
         let mut families = Self::from_layout(context, ring, layout, encoded)?;
         super::artifacts::validate_manifest_identity(manifest, &production_id)?;
         let rectangular_count = families.rectangular_count;
-        let package_count = crate::pbc::layout::PbcActiveCellIndex::build(layout)
+        let package_count = crate::noise_refresh::pbc::layout::PbcActiveCellIndex::build(layout)
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
             .len();
         let mask_name = super::artifacts::public_family_artifact_name(encoded, "active-masks");
@@ -562,7 +584,7 @@ impl PbcLayoutFamilies {
     }
 
     /// Returns the layout identity committed by these family handles.
-    pub fn layout_id(&self) -> crate::pbc::PbcLayoutId {
+    pub fn layout_id(&self) -> crate::noise_refresh::pbc::PbcLayoutId {
         self.layout_id
     }
 
@@ -662,12 +684,12 @@ impl PbcSelectorFamilyInputs {
     }
 
     /// Converts the fixed-C family to the generic Exponent-LUT selector binding.
-    pub(crate) fn encoding_family(&self) -> Result<EncodingSelectorFamily, ExponentLutError> {
-        EncodingSelectorFamily::new(self.gsw.clone())
+    pub(crate) fn encoding_family(&self) -> Result<EncodingRhsFamily, ExponentLutError> {
+        EncodingRhsFamily::new_for_layout(self.gsw.clone(), self.layout_id)
     }
 
-    /// Converts public projections to the public-key OneHot backend binding.
-    pub(crate) fn public_family(&self) -> Result<PublicSelectorFamily, ExponentLutError> {
-        PublicSelectorFamily::new(self.gsw.clone())
+    /// Converts public projections to the public-key native selector binding.
+    pub(crate) fn public_family(&self) -> Result<PublicRhsFamily, ExponentLutError> {
+        PublicRhsFamily::new_for_layout(self.gsw.clone(), self.layout_id)
     }
 }

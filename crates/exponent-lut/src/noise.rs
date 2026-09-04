@@ -1,245 +1,43 @@
-//! Exact application-specific noise bounds for Exponent-LUT programs.
+//! Noise interpretation of an [`ExponentLutProgram`](crate::program::ExponentLutProgram).
 //!
-//! This module deliberately models the public Exponent-LUT lowering rather than
-//! re-interpreting the executable IR.  Every operation is represented by an
-//! affine transfer `E -> gain * E + additive`; all arithmetic is exact
-//! `BigUint` arithmetic and no centered-residue cap is applied.
+//! This module is independent of sparse-LWR and noise refresh.  It interprets
+//! the same four primitive operations as the public-key and encoding backends,
+//! but its wire value is an exact worst-case coefficient bound together with
+//! an exact rational doubled-coordinate variance.
 
 use std::collections::BTreeMap;
 
-use mxx_noise_simulator::{ProductGeometry, right_action_gain};
-use num_bigint::{BigInt, BigUint, Sign};
-use num_traits::{CheckedMul, Euclid, One, Signed, Zero};
+use mxx_ir_core::ParamEnv;
+use num_bigint::{BigInt, BigUint};
+use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const AVERAGE_CASE_REPORT_SCHEMA_VERSION: u32 = 2;
+use crate::program::{
+    ExponentLutProgram, ExponentProgramLowering, FamilyRange, FamilyRhsSource, FamilyWireSource,
+    Gate, LutId, ProgramBindings, ProgramFamilyBindings, ProgramGateInstance, ProgramInputId,
+    ProgramLowerError, ProgramLoweringTypes, ProgramStep, RhsFamilyId, RhsId, WireFamilyId, WireId,
+    lower_program,
+};
 
-/// Noise channel selected by an application-specific simulation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum NoiseModelKind {
-    WorstCase,
-    AverageCase,
-}
-
-/// Exact squared-domain average magnitude. The denominator is strictly
-/// positive and callers must reduce the pair before serializing it.
+/// Exact rational value used for doubled-coordinate variances.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AverageVariance {
     pub numerator: BigUint,
     pub denominator: BigUint,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum NoiseMagnitude {
-    Worst { hard_bound: BigUint },
-    Average { variance: AverageVariance },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum HeuristicId {
-    H1StateUncorrelated,
-    H2DigitUniformFallback,
-    H3BranchSetupIndependence,
-    H4SlotRhsIndependence,
-    H5PrfLabelIndependence,
-    H6GaussianTailClosure,
-    ExactUnderGaussian,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageCaseConfig {
-    pub failure_exponent: u32,
-    pub input_domain_log2: u32,
-    pub extra_event_log2: u32,
-    pub tail_correction_bits: u32,
-    pub allow_average_acceptance: bool,
-}
-
-impl Default for AverageCaseConfig {
-    fn default() -> Self {
-        Self {
-            failure_exponent: 100,
-            input_domain_log2: 0,
-            extra_event_log2: 0,
-            tail_correction_bits: 0,
-            allow_average_acceptance: false,
-        }
-    }
-}
-
-/// The acceptance authority is deliberately explicit in every average-case
-/// report. Lattice security is harness-owned; setup hard gates and AverageCase
-/// smudging/rounding authorities are reported separately.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AcceptedUnder {
-    WorstCase,
-    AverageCase,
-    Diagnostic,
-}
-
-/// Exact event factors used by the Gaussian tail ledger.  The values are
-/// logarithmic upper bounds, so `log2_events` is an integer and no floating
-/// point logarithm enters the acceptance decision.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageEventBudget {
-    pub input_domain_log2: u32,
-    pub coefficient_log2: u32,
-    pub slot_log2: u32,
-    pub inspection_event_log2: u32,
-}
-
-impl AverageEventBudget {
-    pub fn log2_events(&self) -> Result<u32, NoiseSimulationError> {
-        self.input_domain_log2
-            .checked_add(self.coefficient_log2)
-            .and_then(|value| value.checked_add(self.slot_log2))
-            .and_then(|value| value.checked_add(self.inspection_event_log2))
-            .ok_or(NoiseSimulationError::IntegerConversion)
-    }
-}
-
-impl AverageCaseConfig {
-    pub fn event_budget(&self, coefficient_count: usize, slot_count: usize) -> AverageEventBudget {
-        AverageEventBudget {
-            input_domain_log2: self.input_domain_log2,
-            coefficient_log2: coefficient_count.next_power_of_two().trailing_zeros(),
-            slot_log2: slot_count.next_power_of_two().trailing_zeros(),
-            inspection_event_log2: self.extra_event_log2,
-        }
-    }
-
-    /// Exact `z^2 = 2*(693148/1000000)*(lambda + log2(N_events) + 1)`.
-    pub fn z_squared(
-        &self,
-        events: AverageEventBudget,
-    ) -> Result<AverageVariance, NoiseSimulationError> {
-        let events = BigUint::from(
-            self.failure_exponent
-                .checked_add(events.log2_events()?)
-                .and_then(|value| value.checked_add(1))
-                .ok_or(NoiseSimulationError::IntegerConversion)?,
-        );
-        AverageVariance::new(
-            BigUint::from(2u8) * BigUint::from(693_148u32) * events,
-            BigUint::from(1_000_000u32),
-        )
-    }
-
-    pub fn z_squared_for_log2(
-        &self,
-        event_log2: u32,
-    ) -> Result<AverageVariance, NoiseSimulationError> {
-        let events = self
-            .failure_exponent
-            .checked_add(event_log2)
-            .and_then(|value| value.checked_add(1))
-            .ok_or(NoiseSimulationError::IntegerConversion)?;
-        AverageVariance::new(
-            BigUint::from(2u8) * BigUint::from(693_148u32) * BigUint::from(events),
-            BigUint::from(1_000_000u32),
-        )
-    }
-
-    /// Returns the one event count used by both AverageCase rounding and
-    /// smudging. Topology counts are included as evidence, but never receive
-    /// independent tail multipliers.
-    pub fn joint_event_count(
-        &self,
-        mask_event_count: &BigUint,
-        fresh_event_count: &BigUint,
-    ) -> Result<BigUint, NoiseSimulationError> {
-        let topology = mask_event_count + fresh_event_count;
-        let input_factor = BigUint::one() << self.input_domain_log2;
-        let extra_factor = BigUint::one() << self.extra_event_log2;
-        topology
-            .checked_mul(&input_factor)
-            .and_then(|value| value.checked_mul(&extra_factor))
-            .ok_or(NoiseSimulationError::IntegerConversion)
-    }
-}
-
-fn ceil_log2(value: &BigUint) -> Result<u32, NoiseSimulationError> {
-    if value.is_zero() {
-        return Err(NoiseSimulationError::InvalidAverageEvents);
-    }
-    let bits = value.bits();
-    if value == &(BigUint::one() << (bits - 1)) {
-        u32::try_from(bits - 1).map_err(|_| NoiseSimulationError::IntegerConversion)
-    } else {
-        u32::try_from(bits).map_err(|_| NoiseSimulationError::IntegerConversion)
-    }
-}
-
-fn ceil_div(numerator: &BigUint, denominator: &BigUint) -> Result<BigUint, NoiseSimulationError> {
-    if denominator.is_zero() {
-        return Err(NoiseSimulationError::IntegerConversion);
-    }
-    if numerator.is_zero() {
-        return Ok(BigUint::zero());
-    }
-    Ok((numerator + denominator - BigUint::one()) / denominator)
-}
-
-fn ceil_sqrt(value: &BigUint) -> Result<BigUint, NoiseSimulationError> {
-    if value.is_zero() {
-        return Ok(BigUint::zero());
-    }
-    let mut low = BigUint::zero();
-    let mut high = BigUint::one() << value.bits().div_ceil(2);
-    while low < high {
-        let mid = (&low + &high) >> 1usize;
-        if &mid * &mid < *value {
-            low = mid + BigUint::one();
-        } else {
-            high = mid;
-        }
-    }
-    Ok(low)
-}
-
-fn average_favg(
-    z_sq: &AverageVariance,
-    stochastic_variance: &AverageVariance,
-    tail_correction_bits: u32,
-) -> Result<BigUint, NoiseSimulationError> {
-    let tail_bits =
-        tail_correction_bits.checked_mul(2).ok_or(NoiseSimulationError::IntegerConversion)?;
-    let tail_factor = BigUint::one() << tail_bits;
-    let numerator = &z_sq.numerator * tail_factor * &stochastic_variance.numerator;
-    let denominator = BigUint::from(4u8) * &z_sq.denominator * &stochastic_variance.denominator;
-    ceil_sqrt(&ceil_div(&numerator, &denominator)?)
-}
-
-fn average_smudging_required(
-    lambda: u64,
-    dimension: &BigUint,
-    max_favg: &BigUint,
-) -> Result<BigUint, NoiseSimulationError> {
-    let exponent = lambda.checked_add(1).ok_or(NoiseSimulationError::IntegerConversion)?;
-    BigUint::one()
-        .checked_mul(dimension)
-        .and_then(|value| value.checked_mul(max_favg))
-        .map(|value| (BigUint::one() << exponent) * value)
-        .ok_or(NoiseSimulationError::IntegerConversion)
-}
-
 impl AverageVariance {
-    pub fn new(numerator: BigUint, denominator: BigUint) -> Result<Self, NoiseSimulationError> {
+    pub fn new(numerator: BigUint, denominator: BigUint) -> Result<Self, ProgramNoiseError> {
         if denominator.is_zero() {
-            return Err(NoiseSimulationError::IntegerConversion);
+            return Err(ProgramNoiseError::IntegerConversion);
         }
-        let common = gcd(&numerator, &denominator);
-        Ok(Self { numerator: numerator / &common, denominator: denominator / common })
+        let divisor = gcd(&numerator, &denominator);
+        Ok(Self { numerator: numerator / &divisor, denominator: denominator / divisor })
     }
 
     pub fn zero() -> Self {
         Self { numerator: BigUint::zero(), denominator: BigUint::one() }
-    }
-
-    pub fn scaled(&self, gain_sq: &BigUint) -> Self {
-        Self::new(&self.numerator * gain_sq, self.denominator.clone())
-            .expect("positive denominator")
     }
 
     pub fn add(&self, other: &Self) -> Self {
@@ -247,2024 +45,1745 @@ impl AverageVariance {
             &self.numerator * &other.denominator + &other.numerator * &self.denominator,
             &self.denominator * &other.denominator,
         )
-        .expect("positive denominator")
+        .expect("positive variance denominator")
+    }
+
+    pub fn scaled(&self, gain: &BigUint) -> Self {
+        Self::new(&self.numerator * gain, self.denominator.clone())
+            .expect("positive variance denominator")
     }
 }
 
-/// Exact doubled-coordinate variance after an independent additive Gaussian
-/// helper contribution. This is a small arithmetic primitive used by the
-/// opt-in AverageCase path; WorstCase never calls it.
-pub fn average_variance_transfer(
-    input: &AverageVariance,
-    gain_sq: &BigUint,
-    additive: &AverageVariance,
-) -> Result<AverageVariance, NoiseSimulationError> {
-    let numerator = &input.numerator * gain_sq * &additive.denominator +
-        &additive.numerator * &input.denominator;
-    AverageVariance::new(numerator, &input.denominator * &additive.denominator)
-}
-
-/// One average-case affine transfer in doubled-coordinate squared units.
+/// Coefficient norms of one matrix action on a noise row.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageNoiseTransfer {
-    pub gain_sq: BigUint,
-    pub additive_variance: AverageVariance,
-    pub heuristics: Vec<HeuristicId>,
+pub struct RightActionNoiseGain {
+    pub l1: BigUint,
+    pub l2_squared: BigUint,
 }
 
-impl AverageNoiseTransfer {
-    pub fn apply(&self, input: &AverageVariance) -> AverageVariance {
-        average_variance_transfer(input, &self.gain_sq, &self.additive_variance)
-            .expect("average transfer denominators are positive")
-    }
-
-    pub fn compose(first: &Self, second: &Self) -> Self {
-        Self {
-            gain_sq: &first.gain_sq * &second.gain_sq,
-            additive_variance: second
-                .additive_variance
-                .add(&first.additive_variance.scaled(&second.gain_sq)),
-            heuristics: first.heuristics.iter().chain(second.heuristics.iter()).copied().collect(),
-        }
+impl RightActionNoiseGain {
+    pub fn unit() -> Self {
+        Self { l1: BigUint::one(), l2_squared: BigUint::one() }
     }
 }
 
-/// Strict squared-domain AverageCase refresh threshold. `spacing` and `d2`
-/// use the same doubled coordinate unit; equality is rejected.
-pub fn average_refresh_accepts(
-    spacing: &BigUint,
-    d2: &BigUint,
-    z_sq_num: &BigUint,
-    z_sq_den: &BigUint,
-    tail_correction_bits: u32,
-    variance: &AverageVariance,
-) -> Result<bool, NoiseSimulationError> {
-    if z_sq_den.is_zero() || spacing * 2u8 <= d2 * 2u8 {
-        return Ok(false);
-    }
-    let margin = spacing * 2u8 - d2 * 2u8;
-    let tail_bits =
-        tail_correction_bits.checked_mul(2).ok_or(NoiseSimulationError::IntegerConversion)?;
-    let tail = BigUint::one() << tail_bits;
-    let lhs = &margin * &margin * z_sq_den * &variance.denominator;
-    let rhs = BigUint::from(4u8) * z_sq_num * tail * &variance.numerator;
-    Ok(lhs > rhs)
-}
-
-use crate::{
-    pbc::{PbcActiveCellIndex, PbcPublicLayout},
-    prf::SparseLwrPrfProgram,
-    program::{ExponentLutProgram, LutId, ProgramGate, ProgramInputId, ProgramWireId, RhsInputId},
-};
-
-/// Errors returned by the application-specific bound evaluator.
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
-pub enum NoiseSimulationError {
-    #[error("ring dimension must be positive")]
-    ZeroRingDimension,
-    #[error("secret dimension must be exactly two")]
-    InvalidSecretDimension,
-    #[error("gadget base must be a power of two greater than one")]
-    InvalidGadgetBase,
-    #[error("gadget digit count must be positive")]
-    InvalidGadgetDigitCount,
-    #[error("program input bound is missing: {0:?}")]
-    MissingInputBound(ProgramInputId),
-    #[error("program wire bound is missing: {0:?}")]
-    MissingWireBound(ProgramWireId),
-    #[error("LUT is missing: {0:?}")]
-    MissingLut(LutId),
-    #[error("LUT has no entries")]
-    InvalidLutWidth,
-    #[error("one-hot active count is missing for gate {0}")]
-    MissingActiveCount(usize),
-    #[error("one-hot active count {active} exceeds family width {width}")]
-    ActiveCountExceedsWidth { active: usize, width: usize },
-    #[error("one-hot active count is not representable for gate {0}")]
-    InvalidActiveCount(usize),
-    #[error("program RHS input is missing: {0:?}")]
-    MissingRhsInput(RhsInputId),
-    #[error("program has no output wire")]
-    MissingOutput,
-    #[error("generic program simulation does not support OneHot; use the sparse-PRF path")]
-    UnsupportedOneHot,
-    #[error("invalid refresh parameters: {0}")]
-    InvalidRefresh(&'static str),
-    #[error("CRT modulus does not divide the full modulus")]
-    InvalidCrtDivision,
-    #[error("CRT moduli are not a pairwise-coprime complete factorization")]
-    InvalidCrtFactorization,
-    #[error("integer conversion overflow")]
-    IntegerConversion,
-    #[error("PBC layout is invalid: {0}")]
-    InvalidPbcLayout(String),
-    #[error("noise-simulator bound helper failed: {0}")]
-    BoundHelper(String),
-    #[error("AverageCase acceptance is disabled")]
-    AverageAcceptanceDisabled,
-    #[error("AverageCase addition is not classified as independent or coherent")]
-    UnsupportedAverageAddition,
-    #[error("AverageCase event budget is invalid")]
-    InvalidAverageEvents,
-    #[error("AverageCase setup identity or model snapshot mismatch")]
-    AverageIdentityMismatch,
-    #[error("AverageCase requires a p=2 refresh with complete decoder inputs")]
-    UnsupportedAverageRefresh,
-}
-
-/// One exact affine noise transfer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AffineNoiseTransfer {
-    pub gain: BigUint,
-    pub additive: BigUint,
-}
-
-impl AffineNoiseTransfer {
-    pub fn apply(&self, input: &BigUint) -> BigUint {
-        &self.gain * input + &self.additive
-    }
-}
-
-/// Common structural parameters for the Exponent-LUT lowering.
+/// The source of a balanced decomposition used to derive right-action gains.
 ///
-/// The four gains intentionally remain separate named quantities.  The dense
-/// constructor initializes all of them to the same regular-decomposition
-/// value; keeping them separate preserves the operation-specific report
-/// schema without accepting detached caller-supplied gains.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExponentLutNoiseParameters {
-    ring_dimension: usize,
-    secret_dimension: usize,
-    gadget_base: BigUint,
-    gadget_digit_count: usize,
-    helper_error_bound: BigUint,
-    gamma_fixed_rhs: BigUint,
-    gamma_c: BigUint,
-    gamma_a: BigUint,
-    gamma_selector: BigUint,
-    gamma_fixed_rhs_l2_sq: BigUint,
-    gamma_c_l2_sq: BigUint,
-    gamma_a_l2_sq: BigUint,
-    gamma_selector_l2_sq: BigUint,
+/// `Explicit` is retained for small, already-materialized decomposition
+/// fixtures.  Production setup should use one of the compact variants: they
+/// retain the target shape and evaluate the same balanced base decomposition
+/// without allocating a `(digit_count * rows * columns * N)` tensor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NoiseDecompositionSource {
+    /// Explicit balanced coefficients in
+    /// `[decomposed_row][output_column][ring_coefficient]` order.
+    Explicit(Vec<BigInt>),
+    /// One non-zero target ring coefficient.  `value` is decomposed with the
+    /// same balanced power-of-two algorithm as the matrix implementation.
+    SparseMonomial {
+        target_row: usize,
+        output_column: usize,
+        ring_coefficient: usize,
+        value: BigInt,
+    },
+    /// A unit target coefficient at the selected position.
+    Unit { target_row: usize, output_column: usize, ring_coefficient: usize },
+    /// A diagonal matrix with unit ring coefficients.
+    DiagonalUnit,
+    /// One target coefficient equal to `base^exponent`.
+    /// The unit action gain here describes only the public matrix action; an
+    /// online sampled encoding's own error remains a separate program input.
+    PowerOfBase {
+        target_row: usize,
+        output_column: usize,
+        ring_coefficient: usize,
+        exponent: usize,
+    },
+    /// A scalar times the canonical gadget matrix.  This is the compact
+    /// representation of deterministic `kappa_t G` targets used by refresh;
+    /// its gain is evaluated column-wise without materializing the gadget.
+    GadgetScalar { value: BigInt },
+    /// A sampled bounded matrix whose entries are consumed directly (rather
+    /// than as a gadget decomposition).  The bound is the enforced typed
+    /// preimage bound, not a modulus-derived proxy.
+    BoundedMatrix { coefficient_bound: BigUint },
+    /// Unknown/dense target whose source coefficients have absolute value at
+    /// most `coefficient_bound`.  Per-digit bounds are derived from the base,
+    /// rather than treating the full modulus as a scalar gain.
+    DenseBound { coefficient_bound: BigUint },
 }
 
-impl ExponentLutNoiseParameters {
-    /// Creates the regular power-of-two dense fallback.
-    ///
-    /// For `Delta = beta / 2`, the fallback is
-    /// `F_beta = 2 * ell_beta * n * Delta`.
-    pub fn dense(
+/// Balanced decomposition data used to derive right-action gains.
+///
+/// The shape is always retained, including the ring and output-column axes;
+/// this prevents a compact gain from being paired with a different action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NoiseDecompositionPlan {
+    pub base: BigUint,
+    pub digit_count: usize,
+    /// Number of coefficients in each ring element of the target matrix.
+    pub ring_dimension: usize,
+    pub source: NoiseDecompositionSource,
+    /// CRT tower moduli used by compact target decomposition.  An empty list
+    /// is the legacy one-tower form used only by explicit small fixtures.
+    pub crt_moduli: Vec<BigUint>,
+    /// Balanced digits emitted by each CRT tower.
+    pub digits_per_tower: usize,
+    pub target_rows: usize,
+    pub target_columns: usize,
+    /// Number of rows after all gadget digits are expanded.
+    pub decomposed_rows: usize,
+}
+
+impl NoiseDecompositionPlan {
+    pub fn new(
+        base: BigUint,
+        digit_count: usize,
+        balanced_coefficients: Vec<BigInt>,
+        target_rows: usize,
+        target_columns: usize,
         ring_dimension: usize,
-        gadget_base: BigUint,
-        gadget_digit_count: usize,
-        helper_error_bound: BigUint,
-    ) -> Result<Self, NoiseSimulationError> {
-        if ring_dimension == 0 {
-            return Err(NoiseSimulationError::ZeroRingDimension);
-        }
-        if gadget_base <= BigUint::one() ||
-            (&gadget_base & (&gadget_base - BigUint::one())) != BigUint::zero()
+    ) -> Result<Self, ProgramNoiseError> {
+        if balanced_coefficients.is_empty() ||
+            base < BigUint::from(2u8) ||
+            digit_count == 0 ||
+            ring_dimension == 0 ||
+            target_rows == 0 ||
+            target_columns == 0
         {
-            return Err(NoiseSimulationError::InvalidGadgetBase);
+            return Err(ProgramNoiseError::InvalidDecomposition);
         }
-        if gadget_digit_count == 0 {
-            return Err(NoiseSimulationError::InvalidGadgetDigitCount);
+        let decomposed_rows =
+            target_rows.checked_mul(digit_count).ok_or(ProgramNoiseError::InvalidDecomposition)?;
+        let expected = decomposed_rows
+            .checked_mul(target_columns)
+            .and_then(|value| value.checked_mul(ring_dimension))
+            .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+        if balanced_coefficients.len() != expected {
+            return Err(ProgramNoiseError::InvalidDecomposition);
         }
-        let delta = &gadget_base >> 1;
-        let magnitude: BigUint = delta * BigUint::from(gadget_digit_count);
-        let state =
-            mxx_noise_simulator::MatrixState::new(BigUint::zero(), magnitude.clone(), false)
-                .map_err(|error| NoiseSimulationError::BoundHelper(error.to_string()))?;
-        let dense =
-            right_action_gain(&state, ProductGeometry { inner_dimension: 2, ring_dimension })
-                .map_err(|error| NoiseSimulationError::BoundHelper(error.to_string()))?;
-        let dense_l2_sq =
-            BigUint::from(2u8) * BigUint::from(ring_dimension) * (&magnitude * &magnitude);
-        Ok(Self {
+        let parameters = Self {
+            base,
+            digit_count,
             ring_dimension,
-            secret_dimension: 2,
-            gadget_base,
-            gadget_digit_count,
-            helper_error_bound,
-            gamma_fixed_rhs: dense.clone(),
-            gamma_c: dense.clone(),
-            gamma_a: dense.clone(),
-            gamma_selector: dense,
-            gamma_fixed_rhs_l2_sq: dense_l2_sq.clone(),
-            gamma_c_l2_sq: dense_l2_sq.clone(),
-            gamma_a_l2_sq: dense_l2_sq.clone(),
-            gamma_selector_l2_sq: dense_l2_sq,
+            source: NoiseDecompositionSource::Explicit(balanced_coefficients),
+            crt_moduli: Vec::new(),
+            digits_per_tower: digit_count,
+            target_rows,
+            target_columns,
+            decomposed_rows,
+        };
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
+    /// Creates a compact plan for one sparse target coefficient.
+    pub fn sparse_monomial(
+        base: BigUint,
+        digit_count: usize,
+        target_rows: usize,
+        target_columns: usize,
+        ring_dimension: usize,
+        target_row: usize,
+        output_column: usize,
+        ring_coefficient: usize,
+        value: BigInt,
+    ) -> Result<Self, ProgramNoiseError> {
+        Self::from_source(
+            base,
+            digit_count,
+            target_rows,
+            target_columns,
+            ring_dimension,
+            NoiseDecompositionSource::SparseMonomial {
+                target_row,
+                output_column,
+                ring_coefficient,
+                value,
+            },
+        )
+    }
+
+    /// Creates a compact plan for a unit target coefficient.
+    pub fn unit(
+        base: BigUint,
+        digit_count: usize,
+        target_rows: usize,
+        target_columns: usize,
+        ring_dimension: usize,
+        target_row: usize,
+        output_column: usize,
+        ring_coefficient: usize,
+    ) -> Result<Self, ProgramNoiseError> {
+        Self::from_source(
+            base,
+            digit_count,
+            target_rows,
+            target_columns,
+            ring_dimension,
+            NoiseDecompositionSource::Unit { target_row, output_column, ring_coefficient },
+        )
+    }
+
+    /// Creates a compact plan for a square unit diagonal target.
+    pub fn diagonal_unit(
+        base: BigUint,
+        digit_count: usize,
+        size: usize,
+        ring_dimension: usize,
+    ) -> Result<Self, ProgramNoiseError> {
+        Self::from_source(
+            base,
+            digit_count,
+            size,
+            size,
+            ring_dimension,
+            NoiseDecompositionSource::DiagonalUnit,
+        )
+    }
+
+    /// Creates a compact plan for one power-of-base target coefficient.
+    pub fn power_of_base(
+        base: BigUint,
+        digit_count: usize,
+        target_rows: usize,
+        target_columns: usize,
+        ring_dimension: usize,
+        target_row: usize,
+        output_column: usize,
+        ring_coefficient: usize,
+        exponent: usize,
+    ) -> Result<Self, ProgramNoiseError> {
+        Self::from_source(
+            base,
+            digit_count,
+            target_rows,
+            target_columns,
+            ring_dimension,
+            NoiseDecompositionSource::PowerOfBase {
+                target_row,
+                output_column,
+                ring_coefficient,
+                exponent,
+            },
+        )
+    }
+
+    /// Creates a compact plan for a scalar multiple of the canonical gadget.
+    pub fn gadget_scalar(
+        base: BigUint,
+        digit_count: usize,
+        target_rows: usize,
+        target_columns: usize,
+        ring_dimension: usize,
+        value: BigInt,
+    ) -> Result<Self, ProgramNoiseError> {
+        Self::from_source(
+            base,
+            digit_count,
+            target_rows,
+            target_columns,
+            ring_dimension,
+            NoiseDecompositionSource::GadgetScalar { value },
+        )
+    }
+
+    /// Creates a compact plan for a directly consumed bounded matrix.
+    pub fn bounded_matrix(
+        base: BigUint,
+        target_rows: usize,
+        target_columns: usize,
+        ring_dimension: usize,
+        coefficient_bound: BigUint,
+    ) -> Result<Self, ProgramNoiseError> {
+        Self::from_source(
+            base,
+            1,
+            target_rows,
+            target_columns,
+            ring_dimension,
+            NoiseDecompositionSource::BoundedMatrix { coefficient_bound },
+        )
+    }
+
+    /// Creates a compact conservative plan for an unknown dense target.
+    pub fn dense_bound(
+        base: BigUint,
+        digit_count: usize,
+        target_rows: usize,
+        target_columns: usize,
+        ring_dimension: usize,
+        coefficient_bound: BigUint,
+    ) -> Result<Self, ProgramNoiseError> {
+        Self::from_source(
+            base,
+            digit_count,
+            target_rows,
+            target_columns,
+            ring_dimension,
+            NoiseDecompositionSource::DenseBound { coefficient_bound },
+        )
+    }
+
+    fn from_source(
+        base: BigUint,
+        digit_count: usize,
+        target_rows: usize,
+        target_columns: usize,
+        ring_dimension: usize,
+        source: NoiseDecompositionSource,
+    ) -> Result<Self, ProgramNoiseError> {
+        let decomposed_rows =
+            target_rows.checked_mul(digit_count).ok_or(ProgramNoiseError::InvalidDecomposition)?;
+        let parameters = Self {
+            base,
+            digit_count,
+            ring_dimension,
+            source,
+            crt_moduli: Vec::new(),
+            digits_per_tower: digit_count,
+            target_rows,
+            target_columns,
+            decomposed_rows,
+        };
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
+    /// Binds the actual CRT towers used by a compact decomposition.  Each
+    /// tower is decomposed independently with `digits_per_tower` digits.
+    pub fn bind_crt_layout(
+        mut self,
+        crt_moduli: Vec<BigUint>,
+        digits_per_tower: usize,
+    ) -> Result<Self, ProgramNoiseError> {
+        if crt_moduli.is_empty() ||
+            digits_per_tower == 0 ||
+            crt_moduli.iter().any(|modulus| modulus <= &BigUint::one()) ||
+            crt_moduli.len().checked_mul(digits_per_tower) != Some(self.digit_count)
+        {
+            return Err(ProgramNoiseError::InvalidDecomposition);
+        }
+        self.crt_moduli = crt_moduli;
+        self.digits_per_tower = digits_per_tower;
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn tower_moduli(&self) -> Vec<Option<&BigUint>> {
+        if self.crt_moduli.is_empty() {
+            vec![None]
+        } else {
+            self.crt_moduli.iter().map(Some).collect()
+        }
+    }
+
+    fn sparse_source_valid(&self, value: &BigInt) -> bool {
+        self.tower_moduli().into_iter().all(|modulus| {
+            let tower_value =
+                modulus.map_or_else(|| value.clone(), |modulus| centered_residue(value, modulus));
+            balanced_profile(&tower_value, &self.base, self.digits_per_tower).is_ok()
         })
     }
 
-    pub fn delta(&self) -> BigUint {
-        &self.gadget_base >> 1
-    }
-
-    pub fn ring_dimension(&self) -> usize {
-        self.ring_dimension
-    }
-
-    pub fn gadget_digit_count(&self) -> usize {
-        self.gadget_digit_count
-    }
-
-    pub fn helper_error_bound(&self) -> &BigUint {
-        &self.helper_error_bound
-    }
-
-    pub fn gamma_fixed_rhs(&self) -> &BigUint {
-        &self.gamma_fixed_rhs
-    }
-
-    pub fn gamma_c(&self) -> &BigUint {
-        &self.gamma_c
-    }
-
-    pub fn gamma_a(&self) -> &BigUint {
-        &self.gamma_a
-    }
-
-    pub fn gamma_selector(&self) -> &BigUint {
-        &self.gamma_selector
-    }
-
-    pub fn gamma_fixed_rhs_l2_sq(&self) -> &BigUint {
-        &self.gamma_fixed_rhs_l2_sq
-    }
-
-    pub fn gamma_c_l2_sq(&self) -> &BigUint {
-        &self.gamma_c_l2_sq
-    }
-
-    pub fn gamma_a_l2_sq(&self) -> &BigUint {
-        &self.gamma_a_l2_sq
-    }
-
-    pub fn gamma_selector_l2_sq(&self) -> &BigUint {
-        &self.gamma_selector_l2_sq
-    }
-
-    pub fn regular_dense_gain(&self) -> BigUint {
-        BigUint::from(2u8) *
-            BigUint::from(self.ring_dimension) *
-            BigUint::from(self.gadget_digit_count) *
-            self.delta()
-    }
-
-    /// Conservative exact doubled variance for the balanced digit fallback.
-    /// Each digit is uniform on the centered support and independent across
-    /// gadget positions, hence `V2 = ell * (beta^2 - 1) / 3`.
-    pub fn helper_doubled_variance(&self) -> AverageVariance {
-        AverageVariance::new(
-            BigUint::from(self.gadget_digit_count) *
-                (&self.gadget_base * &self.gadget_base - BigUint::one()),
-            BigUint::from(3u8),
-        )
-        .expect("constant denominator")
-    }
-}
-
-/// Inputs needed to evaluate one public program.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ProgramNoiseInputs {
-    pub input_bounds: BTreeMap<ProgramInputId, BigUint>,
-    /// Exact doubled-coordinate variances for the opt-in AverageCase path.
-    pub input_variances: BTreeMap<ProgramInputId, AverageVariance>,
-    /// Actual active selector count for the internal PRF OneHot path, keyed by
-    /// gate index. Generic [`simulate_program`] rejects OneHot gates.
-    pub one_hot_active_counts: BTreeMap<usize, usize>,
-}
-
-/// One gate's exact affine step.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GateNoiseStep {
-    pub gate_index: usize,
-    pub input_bound: BigUint,
-    pub transfer: AffineNoiseTransfer,
-    pub output_bound: BigUint,
-    pub lut_width: usize,
-    pub active_count: Option<usize>,
-}
-
-/// Full deterministic report for an Exponent-LUT program.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramNoiseReport {
-    pub wire_bounds: BTreeMap<ProgramWireId, BigUint>,
-    pub steps: Vec<GateNoiseStep>,
-    pub output_bound: BigUint,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum AverageAdditionClass {
-    IndependentSum,
-    CoherentScale(BigUint),
-    SharedStateBranchSum(usize),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageGateNoiseStep {
-    pub gate_index: usize,
-    pub input_variance: AverageVariance,
-    pub transfer: AverageNoiseTransfer,
-    pub output_variance: AverageVariance,
-    pub addition: AverageAdditionClass,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageProgramNoiseReport {
-    pub wire_variances: BTreeMap<ProgramWireId, AverageVariance>,
-    pub steps: Vec<AverageGateNoiseStep>,
-    pub output_variance: AverageVariance,
-    pub output_addition: AverageAdditionClass,
-    pub heuristics: Vec<HeuristicId>,
-    pub accepted_under: AcceptedUnder,
-}
-
-fn append_heuristics(into: &mut Vec<HeuristicId>, values: &[HeuristicId]) {
-    for value in values {
-        if !into.contains(value) {
-            into.push(*value);
-        }
-    }
-}
-
-fn variance_ge(left: &AverageVariance, right: &AverageVariance) -> bool {
-    &left.numerator * &right.denominator >= &right.numerator * &left.denominator
-}
-
-/// Simulates the generic public program in the exact doubled-coordinate
-/// squared domain.  OneHot remains intentionally unavailable here because
-/// its monomial support is a PRF-specific structural property, not a generic
-/// program property.
-pub fn simulate_average_program(
-    program: &ExponentLutProgram,
-    parameters: &ExponentLutNoiseParameters,
-    inputs: &ProgramNoiseInputs,
-) -> Result<AverageProgramNoiseReport, NoiseSimulationError> {
-    if parameters.secret_dimension != 2 {
-        return Err(NoiseSimulationError::InvalidSecretDimension);
-    }
-    let mut wire_variances = BTreeMap::new();
-    for (input, wire) in program.input_wires() {
-        let variance = inputs
-            .input_variances
-            .get(input)
-            .ok_or(NoiseSimulationError::MissingInputBound(*input))?;
-        wire_variances.insert(*wire, variance.clone());
-    }
-    let mut steps = Vec::with_capacity(program.gates().len());
-    let mut heuristics = vec![HeuristicId::H1StateUncorrelated];
-    for (gate_index, gate) in program.gates().iter().enumerate() {
-        let (input_wire, output_wire, transfer, addition) = match gate {
-            ProgramGate::Unary { input, lut, output } => {
-                let table = program.lut(*lut).ok_or(NoiseSimulationError::MissingLut(*lut))?;
-                (
-                    *input,
-                    *output,
-                    average_fixed_lut_transfer(parameters, table.values().len())?,
-                    AverageAdditionClass::IndependentSum,
-                )
-            }
-            ProgramGate::Binary { lhs, rhs, lut, output } => {
-                if !program.rhs_inputs().contains_key(rhs) {
-                    return Err(NoiseSimulationError::MissingRhsInput(*rhs));
+    /// Computes exact right-action gains from the balanced coefficients.
+    ///
+    /// A row vector multiplied on the right accumulates into output columns,
+    /// therefore each output-column norm includes every digit-expanded row
+    /// and every coefficient of its ring polynomial.  Coefficients use the
+    /// canonical compact order `[decomposed_row][column][ring_coefficient]`.
+    pub fn action_gain(&self) -> RightActionNoiseGain {
+        match &self.source {
+            NoiseDecompositionSource::Explicit(coefficients) => {
+                let mut column_l1 = vec![BigUint::zero(); self.target_columns];
+                let mut column_l2_squared = vec![BigUint::zero(); self.target_columns];
+                for row in 0..self.decomposed_rows {
+                    for column in 0..self.target_columns {
+                        let start = (row * self.target_columns + column) * self.ring_dimension;
+                        let end = start + self.ring_dimension;
+                        for coefficient in &coefficients[start..end] {
+                            column_l1[column] += coefficient.magnitude();
+                            column_l2_squared[column] += coefficient.magnitude().pow(2u32);
+                        }
+                    }
                 }
-                let table = program.lut(*lut).ok_or(NoiseSimulationError::MissingLut(*lut))?;
-                (
-                    *lhs,
-                    *output,
-                    average_two_input_lut_transfer(
-                        parameters,
-                        table.values().len(),
-                        BigUint::one(),
-                    )?,
-                    AverageAdditionClass::CoherentScale(BigUint::one()),
-                )
-            }
-            ProgramGate::OneHot { .. } => return Err(NoiseSimulationError::UnsupportedOneHot),
-        };
-        let input_variance = wire_variances
-            .get(&input_wire)
-            .ok_or(NoiseSimulationError::MissingWireBound(input_wire))?
-            .clone();
-        let output_variance = transfer.apply(&input_variance);
-        append_heuristics(&mut heuristics, &transfer.heuristics);
-        wire_variances.insert(output_wire, output_variance.clone());
-        steps.push(AverageGateNoiseStep {
-            gate_index,
-            input_variance,
-            transfer,
-            output_variance,
-            addition,
-        });
-    }
-    let output_variances = program
-        .outputs()
-        .iter()
-        .map(|wire| wire_variances.get(wire).ok_or(NoiseSimulationError::MissingWireBound(*wire)))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(Clone::clone)
-        .collect::<Vec<_>>();
-    let (output_variance, output_addition) = match output_variances.as_slice() {
-        [] => return Err(NoiseSimulationError::MissingOutput),
-        [single] => (single.clone(), AverageAdditionClass::IndependentSum),
-        many => {
-            // Outputs from one public program share the input state.  Treat
-            // their fan-out coherently unless a circuit-specific covariance
-            // model is supplied; this is intentionally conservative.
-            let maximum = many.iter().skip(1).fold(many[0].clone(), |current, candidate| {
-                if variance_ge(candidate, &current) { candidate.clone() } else { current }
-            });
-            let width = BigUint::from(many.len());
-            append_heuristics(&mut heuristics, &[HeuristicId::H3BranchSetupIndependence]);
-            (
-                maximum.scaled(&(&width * &width)),
-                AverageAdditionClass::SharedStateBranchSum(many.len()),
-            )
-        }
-    };
-    Ok(AverageProgramNoiseReport {
-        wire_variances,
-        steps,
-        output_variance,
-        output_addition,
-        heuristics,
-        accepted_under: AcceptedUnder::Diagnostic,
-    })
-}
-
-/// Exact transfer for setup-fixed Fuse with a semantic multiplier action.
-///
-/// The semantic action gain is supplied explicitly. For the Exponent-LUT
-/// `Binary` path, RHS values are validated monomials and the caller passes
-/// `1`; no public-value norm is inferred here.
-pub fn fixed_fuse_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    semantic_multiplier_action_gain: BigUint,
-) -> AffineNoiseTransfer {
-    AffineNoiseTransfer {
-        gain: parameters.gamma_fixed_rhs().clone(),
-        additive: semantic_multiplier_action_gain * parameters.helper_error_bound(),
-    }
-}
-
-/// Average-case transfer for setup-fixed Fuse. The squared action gain is
-/// derived from the same dense public structural model as the worst channel.
-pub fn average_fixed_fuse_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    semantic_multiplier_action_gain: BigUint,
-) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
-    let helper = parameters.helper_doubled_variance();
-    let semantic_sq = &semantic_multiplier_action_gain * &semantic_multiplier_action_gain;
-    let additive = helper.scaled(&(BigUint::from(4u8) * semantic_sq));
-    Ok(AverageNoiseTransfer {
-        gain_sq: parameters.gamma_fixed_rhs_l2_sq().clone(),
-        additive_variance: additive,
-        heuristics: vec![HeuristicId::H1StateUncorrelated, HeuristicId::H2DigitUniformFallback],
-    })
-}
-
-/// Exact transfer for a fixed-LUT branch of the public Exponent-LUT lowering.
-pub fn fixed_lut_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    lut_width: usize,
-) -> Result<AffineNoiseTransfer, NoiseSimulationError> {
-    if lut_width == 0 {
-        return Err(NoiseSimulationError::InvalidLutWidth);
-    }
-    let width = BigUint::from(lut_width);
-    Ok(AffineNoiseTransfer {
-        gain: &width * parameters.gamma_c(),
-        additive: &width *
-            (BigUint::one() + parameters.gamma_a()) *
-            parameters.helper_error_bound(),
-    })
-}
-
-/// Average-case fixed LUT transfer.  The branch count is linear in variance;
-/// it is not replaced by a square-rooted worst-case bound.
-pub fn average_fixed_lut_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    lut_width: usize,
-) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
-    if lut_width == 0 {
-        return Err(NoiseSimulationError::InvalidLutWidth);
-    }
-    let width = BigUint::from(lut_width);
-    let helper = parameters.helper_doubled_variance();
-    let additive = helper
-        .scaled(&(BigUint::from(4u8) * &width * (BigUint::one() + parameters.gamma_a_l2_sq())));
-    Ok(AverageNoiseTransfer {
-        gain_sq: width * parameters.gamma_c_l2_sq(),
-        additive_variance: additive,
-        heuristics: vec![HeuristicId::H1StateUncorrelated, HeuristicId::H3BranchSetupIndependence],
-    })
-}
-
-pub fn average_two_input_lut_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    lut_width: usize,
-    semantic_multiplier_action_gain: BigUint,
-) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
-    let fuse = average_fixed_fuse_transfer(parameters, semantic_multiplier_action_gain)?;
-    let lut = average_fixed_lut_transfer(parameters, lut_width)?;
-    Ok(AverageNoiseTransfer::compose(&fuse, &lut))
-}
-
-/// Exact transfer for a fixed-Fuse followed by fixed-LUT two-input branch.
-///
-/// `semantic_multiplier_action_gain` is explicit because it is a property of
-/// the public RHS family. Exponent-LUT monomial RHS values use `1`.
-pub fn two_input_lut_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    lut_width: usize,
-    semantic_multiplier_action_gain: BigUint,
-) -> Result<AffineNoiseTransfer, NoiseSimulationError> {
-    Ok(compose(
-        fixed_fuse_transfer(parameters, semantic_multiplier_action_gain),
-        fixed_lut_transfer(parameters, lut_width)?,
-    ))
-}
-
-/// Exact PRF-specific OneHot transfer for active public monomial values.
-///
-/// The public values must be the validated `X^a` monomials of the sparse-LWR
-/// program, whose coefficient norm is one. `active_count` is the number of
-/// actual non-padding cells supplied by [`PbcActiveCellIndex`], not the
-/// rectangular family width. This contract is intentionally not part of the
-/// generic [`simulate_program`] API.
-pub fn monomial_one_hot_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    active_count: usize,
-    lut_width: usize,
-) -> Result<AffineNoiseTransfer, NoiseSimulationError> {
-    let active = BigUint::from(active_count);
-    let select = AffineNoiseTransfer {
-        gain: &active * parameters.gamma_selector(),
-        additive: &active * parameters.helper_error_bound(),
-    };
-    Ok(compose(select, fixed_lut_transfer(parameters, lut_width)?))
-}
-
-/// Average-case grouped OneHot transfer.  Exactly `active_count` monomial
-/// cells contribute independent variance, while the inherited state is
-/// scaled once by the aggregate selector gain.
-pub fn average_monomial_one_hot_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    active_count: usize,
-    lut_width: usize,
-) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
-    if active_count == 0 {
-        return Err(NoiseSimulationError::InvalidActiveCount(0));
-    }
-    let select = average_monomial_selection_transfer(parameters, active_count)?;
-    let lut = average_fixed_lut_transfer(parameters, lut_width)?;
-    Ok(AverageNoiseTransfer::compose(&select, &lut))
-}
-
-fn average_monomial_selection_transfer(
-    parameters: &ExponentLutNoiseParameters,
-    active_count: usize,
-) -> Result<AverageNoiseTransfer, NoiseSimulationError> {
-    if active_count == 0 {
-        return Err(NoiseSimulationError::InvalidActiveCount(0));
-    }
-    let active = BigUint::from(active_count);
-    let helper = parameters.helper_doubled_variance();
-    Ok(AverageNoiseTransfer {
-        gain_sq: active.clone() * parameters.gamma_selector_l2_sq(),
-        additive_variance: helper.scaled(&(BigUint::from(4u8) * active)),
-        heuristics: vec![HeuristicId::H1StateUncorrelated, HeuristicId::H5PrfLabelIndependence],
-    })
-}
-
-fn compose(first: AffineNoiseTransfer, second: AffineNoiseTransfer) -> AffineNoiseTransfer {
-    AffineNoiseTransfer {
-        gain: &second.gain * &first.gain,
-        additive: &second.gain * &first.additive + &second.additive,
-    }
-}
-
-/// Simulates public `Unary` and `Binary` program gates.
-///
-/// Generic OneHot gates are rejected because their public-value norm is not a
-/// property of [`ExponentLutProgram`]. Use [`simulate_sparse_prf`] for the
-/// validated grouped sparse-LWR path.
-pub fn simulate_program(
-    program: &ExponentLutProgram,
-    parameters: &ExponentLutNoiseParameters,
-    inputs: &ProgramNoiseInputs,
-) -> Result<ProgramNoiseReport, NoiseSimulationError> {
-    simulate_program_inner(program, parameters, inputs, false)
-}
-
-fn simulate_program_inner(
-    program: &ExponentLutProgram,
-    parameters: &ExponentLutNoiseParameters,
-    inputs: &ProgramNoiseInputs,
-    _allow_monomial_one_hot: bool,
-) -> Result<ProgramNoiseReport, NoiseSimulationError> {
-    if parameters.secret_dimension != 2 {
-        return Err(NoiseSimulationError::InvalidSecretDimension);
-    }
-    let mut wire_bounds = BTreeMap::new();
-    for (input, wire) in program.input_wires() {
-        let bound = inputs
-            .input_bounds
-            .get(input)
-            .ok_or(NoiseSimulationError::MissingInputBound(*input))?;
-        wire_bounds.insert(*wire, bound.clone());
-    }
-    let mut steps = Vec::with_capacity(program.gates().len());
-    for (gate_index, gate) in program.gates().iter().enumerate() {
-        let (input_wire, output_wire, lut_id, transfer, active_count) = match gate {
-            ProgramGate::Unary { input, lut, output } => {
-                let lut_table = program.lut(*lut).ok_or(NoiseSimulationError::MissingLut(*lut))?;
-                (
-                    *input,
-                    *output,
-                    *lut,
-                    fixed_lut_transfer(parameters, lut_table.values().len())?,
-                    None,
-                )
-            }
-            ProgramGate::Binary { lhs, rhs, lut, output } => {
-                if !program.rhs_inputs().contains_key(rhs) {
-                    return Err(NoiseSimulationError::MissingRhsInput(*rhs));
+                RightActionNoiseGain {
+                    l1: column_l1.into_iter().max().unwrap_or_default(),
+                    l2_squared: column_l2_squared.into_iter().max().unwrap_or_default(),
                 }
-                let lut_table = program.lut(*lut).ok_or(NoiseSimulationError::MissingLut(*lut))?;
-                (
-                    *lhs,
-                    *output,
-                    *lut,
-                    two_input_lut_transfer(parameters, lut_table.values().len(), BigUint::one())?,
-                    None,
-                )
             }
-            ProgramGate::OneHot { .. } => {
-                return Err(NoiseSimulationError::UnsupportedOneHot);
+            NoiseDecompositionSource::SparseMonomial { output_column, value, .. } => {
+                self.sparse_gain(value, *output_column)
             }
-        };
-        let input_bound = wire_bounds
-            .get(&input_wire)
-            .ok_or(NoiseSimulationError::MissingWireBound(input_wire))?
-            .clone();
-        let output_bound = transfer.apply(&input_bound);
-        wire_bounds.insert(output_wire, output_bound.clone());
-        let lut_width =
-            program.lut(lut_id).ok_or(NoiseSimulationError::MissingLut(lut_id))?.values().len();
-        steps.push(GateNoiseStep {
-            gate_index,
-            input_bound: input_bound.clone(),
-            transfer,
-            output_bound,
-            lut_width,
-            active_count,
-        });
-    }
-    let output_bound = program
-        .outputs()
-        .iter()
-        .map(|wire| wire_bounds.get(wire).ok_or(NoiseSimulationError::MissingWireBound(*wire)))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .cloned()
-        .ok_or(NoiseSimulationError::MissingOutput)?;
-    Ok(ProgramNoiseReport { wire_bounds, steps, output_bound })
-}
-
-/// Report for the sequential sparse-LWR bucket recurrence and final rounding.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SparsePrfBucketNoiseReport {
-    pub bucket: usize,
-    pub active_count: usize,
-    pub input_bound: BigUint,
-    pub gamma_selector: BigUint,
-    pub one_hot_output_bound: BigUint,
-    pub one_hot_additive_bound: BigUint,
-    pub one_hot_bit_growth: isize,
-    pub selection_inherited_bound: BigUint,
-    pub selection_additive_bound: BigUint,
-    pub selection_inherited_bits: usize,
-    pub selection_additive_bits: usize,
-    pub input_bits: usize,
-    pub output_bits: usize,
-    pub gamma_c: BigUint,
-    pub gamma_a: BigUint,
-    pub lut_output_bound: BigUint,
-    pub lut_additive_bound: BigUint,
-    pub lut_bit_growth: isize,
-}
-
-/// Diagnostic for one grouped intermediate reduction.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SparsePrfGroupNoiseReport {
-    pub group: usize,
-    pub start_bucket: usize,
-    pub bucket_len: usize,
-    pub input_bound: BigUint,
-    pub unreduced_bound: BigUint,
-    pub output_bound: BigUint,
-    pub lut_width: usize,
-    pub gamma_c: BigUint,
-    pub gamma_a: BigUint,
-    pub inherited_bound: BigUint,
-    pub base_helper_additive: BigUint,
-    pub gamma_a_additive: BigUint,
-    pub additive_bound: BigUint,
-    pub output_bits: usize,
-    pub bit_growth: isize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SparsePrfNoiseReport {
-    pub q_l: usize,
-    pub p: usize,
-    pub bucket_count: usize,
-    pub k: usize,
-    pub intermediate_groups: usize,
-    pub terminal_start_bucket: usize,
-    pub terminal_bucket_len: usize,
-    pub lut_width: usize,
-    pub bucket_bounds: Vec<BigUint>,
-    pub bucket_stages: Vec<SparsePrfBucketNoiseReport>,
-    pub group_stages: Vec<SparsePrfGroupNoiseReport>,
-    pub terminal_lut_width: usize,
-    pub terminal_input_bound: BigUint,
-    pub terminal_output_bound: BigUint,
-    pub terminal_additive_bound: BigUint,
-    pub terminal_bit_growth: isize,
-    pub terminal_inherited_bound: BigUint,
-    pub terminal_base_helper_additive: BigUint,
-    pub terminal_gamma_a_additive: BigUint,
-    pub terminal_gamma_c: BigUint,
-    pub terminal_gamma_a: BigUint,
-    pub terminal_inherited_bits: usize,
-    pub terminal_base_helper_additive_bits: usize,
-    pub terminal_gamma_a_additive_bits: usize,
-    pub terminal_additive_bits: usize,
-    pub terminal_output_bits: usize,
-    pub rounding: ProgramNoiseReport,
-    pub output_bound: BigUint,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageSparsePrfNoiseReport {
-    pub schema_version: u32,
-    pub q_l: usize,
-    pub p: usize,
-    pub bucket_count: usize,
-    pub k: usize,
-    pub intermediate_groups: usize,
-    pub terminal_start_bucket: usize,
-    pub terminal_bucket_len: usize,
-    pub lut_width: usize,
-    pub bucket_variances: Vec<AverageVariance>,
-    pub group_output_variances: Vec<AverageVariance>,
-    pub terminal_input_variance: AverageVariance,
-    pub output_variance: AverageVariance,
-    pub heuristics: Vec<HeuristicId>,
-    pub accepted_under: AcceptedUnder,
-}
-
-/// Simulates the public grouped sparse-LWR recurrence.  The plan itself is
-/// authoritative: each complete group receives one reduction LUT and the
-/// terminal receives exactly one rounding LUT.
-pub fn simulate_average_sparse_prf(
-    program: &SparseLwrPrfProgram,
-    parameters: &ExponentLutNoiseParameters,
-    layout: &PbcPublicLayout,
-    initial_variance: AverageVariance,
-) -> Result<AverageSparsePrfNoiseReport, NoiseSimulationError> {
-    if program.plan.bucket_count() != layout.parameters.bucket_count ||
-        program.plan.lut_width() != program.lut_width()
-    {
-        return Err(NoiseSimulationError::InvalidPbcLayout("PRF/layout plan mismatch".into()));
-    }
-    let active_counts = PbcActiveCellIndex::build(layout)
-        .map_err(|error| NoiseSimulationError::InvalidPbcLayout(error.to_string()))?
-        .bucket_active_widths()
-        .collect::<Vec<_>>();
-    if active_counts.len() != program.plan.bucket_count() {
-        return Err(NoiseSimulationError::InvalidPbcLayout("bucket count mismatch".into()));
-    }
-    let mut current = initial_variance;
-    let mut bucket_variances = Vec::with_capacity(active_counts.len());
-    let mut group_output_variances = Vec::with_capacity(program.plan.intermediate_groups());
-    let mut heuristics =
-        vec![HeuristicId::H1StateUncorrelated, HeuristicId::H5PrfLabelIndependence];
-    let reduction = average_fixed_lut_transfer(parameters, program.plan.lut_width())?;
-    for (bucket, active) in active_counts.into_iter().enumerate() {
-        let selection = average_monomial_selection_transfer(parameters, active)?;
-        current = selection.apply(&current);
-        append_heuristics(&mut heuristics, &selection.heuristics);
-        bucket_variances.push(current.clone());
-        let end_of_group =
-            bucket + 1 <= program.plan.terminal_start() && (bucket + 1) % program.plan.k() == 0;
-        if end_of_group {
-            current = reduction.apply(&current);
-            append_heuristics(&mut heuristics, &reduction.heuristics);
-            group_output_variances.push(current.clone());
+            NoiseDecompositionSource::Unit { output_column, .. } => {
+                self.sparse_gain(&BigInt::one(), *output_column)
+            }
+            NoiseDecompositionSource::DiagonalUnit => self.sparse_gain(&BigInt::one(), 0),
+            NoiseDecompositionSource::PowerOfBase { output_column, exponent, .. } => {
+                debug_assert!(*exponent < self.digits_per_tower);
+                let value = BigInt::from_biguint(
+                    num_bigint::Sign::Plus,
+                    self.base.pow(u32::try_from(*exponent).expect("validated exponent")),
+                );
+                self.sparse_gain(&value, *output_column)
+            }
+            NoiseDecompositionSource::GadgetScalar { value } => {
+                let mut best =
+                    RightActionNoiseGain { l1: BigUint::zero(), l2_squared: BigUint::zero() };
+                // CRT-bound gadget layouts repeat the local digit axis in
+                // each tower and target row.  Evaluate one representative of
+                // each local digit class; scanning every repeated output
+                // column is mathematically redundant and quadratic in the
+                // effective modulus dimensions.
+                for digit in 0..self.digits_per_tower {
+                    let coefficient = value *
+                        BigInt::from_biguint(
+                            num_bigint::Sign::Plus,
+                            self.base.pow(u32::try_from(digit).expect("validated gadget digit")),
+                        );
+                    let gain = self.sparse_gain(&coefficient, 0);
+                    if gain.l1 > best.l1 {
+                        best = gain;
+                    }
+                }
+                best
+            }
+            NoiseDecompositionSource::BoundedMatrix { coefficient_bound } => {
+                let count = BigUint::from(
+                    self.target_rows
+                        .checked_mul(self.ring_dimension)
+                        .expect("validated bounded matrix shape"),
+                );
+                RightActionNoiseGain {
+                    l1: coefficient_bound * &count,
+                    l2_squared: coefficient_bound.pow(2u32) * count,
+                }
+            }
+            NoiseDecompositionSource::DenseBound { coefficient_bound } => {
+                let mut per_coefficient_l1 = BigUint::zero();
+                let mut per_coefficient_l2_squared = BigUint::zero();
+                for modulus in self.tower_moduli() {
+                    let tower_bound = modulus.map_or_else(
+                        || coefficient_bound.clone(),
+                        |modulus| coefficient_bound.min(&(modulus / 2u8)).clone(),
+                    );
+                    let (l1, l2) = self.dense_coefficient_gain(&tower_bound, self.digits_per_tower);
+                    per_coefficient_l1 += l1;
+                    per_coefficient_l2_squared += l2;
+                }
+                let count = BigUint::from(
+                    self.target_rows
+                        .checked_mul(self.ring_dimension)
+                        .expect("validated dense decomposition shape"),
+                );
+                RightActionNoiseGain {
+                    l1: per_coefficient_l1 * &count,
+                    l2_squared: per_coefficient_l2_squared * count,
+                }
+            }
         }
     }
-    let terminal_input_variance = current.clone();
-    let terminal = average_fixed_lut_transfer(parameters, program.lut_width())?;
-    current = terminal.apply(&current);
-    append_heuristics(&mut heuristics, &terminal.heuristics);
-    heuristics.push(HeuristicId::H6GaussianTailClosure);
-    Ok(AverageSparsePrfNoiseReport {
-        schema_version: AVERAGE_CASE_REPORT_SCHEMA_VERSION,
-        q_l: program.profile().q_l(),
-        p: program.profile().p(),
-        bucket_count: program.plan.bucket_count(),
-        k: program.plan.k(),
-        intermediate_groups: program.plan.intermediate_groups(),
-        terminal_start_bucket: program.plan.terminal_start(),
-        terminal_bucket_len: program.plan.terminal_len(),
-        lut_width: program.plan.lut_width(),
-        bucket_variances,
-        group_output_variances,
-        terminal_input_variance,
-        output_variance: current,
-        heuristics,
-        accepted_under: AcceptedUnder::Diagnostic,
-    })
-}
 
-/// Simulates one shared sparse-LWR bucket body for each actual active width.
-pub fn simulate_sparse_prf(
-    program: &SparseLwrPrfProgram,
-    parameters: &ExponentLutNoiseParameters,
-    layout: &PbcPublicLayout,
-    initial_bound: BigUint,
-) -> Result<SparsePrfNoiseReport, NoiseSimulationError> {
-    if program.plan.bucket_count() != layout.parameters.bucket_count ||
-        program.plan.lut_width() != program.lut_width()
-    {
-        return Err(NoiseSimulationError::InvalidPbcLayout("PRF/layout plan mismatch".into()));
-    }
-    let bucket_active_counts = PbcActiveCellIndex::build(layout)
-        .map_err(|error| NoiseSimulationError::InvalidPbcLayout(error.to_string()))?
-        .bucket_active_widths()
-        .collect::<Vec<_>>();
-    let mut current = initial_bound;
-    if bucket_active_counts.len() != program.plan.bucket_count() {
-        return Err(NoiseSimulationError::InvalidPbcLayout("bucket count mismatch".into()));
-    }
-    let mut bucket_bounds = Vec::with_capacity(bucket_active_counts.len());
-    let mut bucket_stages = Vec::with_capacity(bucket_active_counts.len());
-    let mut group_stages = Vec::with_capacity(program.plan.intermediate_groups());
-    let reduction_transfer = fixed_lut_transfer(parameters, program.plan.lut_width())?;
-    let mut group_input = current.clone();
-    for (bucket, active) in bucket_active_counts.iter().copied().enumerate() {
-        let input_bound = current.clone();
-        let one_hot_transfer = AffineNoiseTransfer {
-            gain: BigUint::from(active) * parameters.gamma_selector().clone(),
-            additive: BigUint::from(active) * parameters.helper_error_bound().clone(),
-        };
-        let selection_inherited_bound = &one_hot_transfer.gain * &input_bound;
-        let selection_additive_bound = one_hot_transfer.additive.clone();
-        let one_hot_output = one_hot_transfer.apply(&input_bound);
-        let one_hot_bit_growth = one_hot_output.bits() as isize - input_bound.bits() as isize;
-        bucket_stages.push(SparsePrfBucketNoiseReport {
-            bucket,
-            active_count: active,
-            input_bound: input_bound.clone(),
-            gamma_selector: parameters.gamma_selector().clone(),
-            one_hot_output_bound: one_hot_output.clone(),
-            one_hot_additive_bound: one_hot_transfer.additive,
-            one_hot_bit_growth,
-            selection_inherited_bound: selection_inherited_bound.clone(),
-            selection_additive_bound: selection_additive_bound.clone(),
-            selection_inherited_bits: selection_inherited_bound.bits() as usize,
-            selection_additive_bits: selection_additive_bound.bits() as usize,
-            input_bits: input_bound.bits() as usize,
-            output_bits: one_hot_output.bits() as usize,
-            gamma_c: parameters.gamma_c().clone(),
-            gamma_a: parameters.gamma_a().clone(),
-            lut_output_bound: one_hot_output.clone(),
-            lut_additive_bound: BigUint::zero(),
-            lut_bit_growth: 0,
-        });
-        current = one_hot_output;
-        bucket_bounds.push(current.clone());
-        let is_intermediate_end =
-            bucket + 1 <= program.plan.terminal_start() && (bucket + 1) % program.plan.k() == 0;
-        if is_intermediate_end {
-            let unreduced_bound = current.clone();
-            let inherited_bound = &reduction_transfer.gain * &unreduced_bound;
-            let base_helper_additive =
-                BigUint::from(program.plan.lut_width()) * parameters.helper_error_bound().clone();
-            let gamma_a_additive = BigUint::from(program.plan.lut_width()) *
-                parameters.gamma_a().clone() *
-                parameters.helper_error_bound().clone();
-            let additive_bound = &base_helper_additive + &gamma_a_additive;
-            current = reduction_transfer.apply(&current);
-            group_stages.push(SparsePrfGroupNoiseReport {
-                group: group_stages.len(),
-                start_bucket: bucket + 1 - program.plan.k(),
-                bucket_len: program.plan.k(),
-                input_bound: group_input,
-                unreduced_bound: unreduced_bound.clone(),
-                output_bound: current.clone(),
-                lut_width: program.plan.lut_width(),
-                gamma_c: parameters.gamma_c().clone(),
-                gamma_a: parameters.gamma_a().clone(),
-                inherited_bound,
-                base_helper_additive,
-                gamma_a_additive,
-                additive_bound,
-                output_bits: current.bits() as usize,
-                bit_growth: current.bits() as isize - unreduced_bound.bits() as isize,
-            });
-            group_input = current.clone();
+    fn sparse_gain(&self, value: &BigInt, output_column: usize) -> RightActionNoiseGain {
+        debug_assert!(output_column < self.target_columns);
+        let mut l1 = BigUint::zero();
+        let mut l2_squared = BigUint::zero();
+        for modulus in self.tower_moduli() {
+            let tower_value =
+                modulus.map_or_else(|| value.clone(), |modulus| centered_residue(value, modulus));
+            let (tower_l1, tower_l2_squared) =
+                balanced_profile(&tower_value, &self.base, self.digits_per_tower)
+                    .expect("validated compact decomposition must fit its digit count");
+            l1 += tower_l1;
+            l2_squared += tower_l2_squared;
         }
+        RightActionNoiseGain { l1, l2_squared }
     }
-    // The profile's declared LUT width is the committed minimal power-of-two
-    // terminal domain for the accumulated exponent; the public constructor
-    // validates this domain against its rounding table.
-    let terminal_lut_width = program.lut_width();
-    let terminal_input_bound = current.clone();
-    let mut rounding_inputs = ProgramNoiseInputs::default();
-    rounding_inputs.input_bounds.insert(program.rounding_input(), current);
-    let rounding = simulate_program(&program.rounding_program, parameters, &rounding_inputs)?;
-    let output_bound = rounding.output_bound.clone();
-    let terminal_output_bound = rounding.output_bound.clone();
-    let terminal_additive_bound = rounding
-        .steps
-        .first()
-        .map(|step| step.transfer.additive.clone())
-        .ok_or(NoiseSimulationError::MissingOutput)?;
-    let terminal_transfer =
-        rounding.steps.first().ok_or(NoiseSimulationError::MissingOutput)?.transfer.clone();
-    let terminal_inherited_bound = &terminal_transfer.gain * &terminal_input_bound;
-    let terminal_base_helper_additive =
-        BigUint::from(terminal_lut_width) * parameters.helper_error_bound().clone();
-    let terminal_gamma_a_additive = BigUint::from(terminal_lut_width) *
-        parameters.gamma_a().clone() *
-        parameters.helper_error_bound().clone();
-    if terminal_additive_bound != terminal_base_helper_additive.clone() + &terminal_gamma_a_additive
-    {
-        return Err(NoiseSimulationError::BoundHelper(
-            "terminal additive components do not match LUT transfer".into(),
-        ));
+
+    fn dense_coefficient_gain(
+        &self,
+        coefficient_bound: &BigUint,
+        digit_count: usize,
+    ) -> (BigUint, BigUint) {
+        let half_base = &self.base >> 1usize;
+        let mut l1 = BigUint::zero();
+        let mut l2_squared = BigUint::zero();
+        let mut state_bound = coefficient_bound.clone();
+        for _ in 0..digit_count {
+            let digit_bound = state_bound.clone().min(half_base.clone());
+            l1 += &digit_bound;
+            l2_squared += digit_bound.pow(2u32);
+            state_bound = balanced_interval_next_bound(&state_bound, &self.base);
+        }
+        (l1, l2_squared)
     }
-    let terminal_bit_growth =
-        terminal_output_bound.bits() as isize - terminal_input_bound.bits() as isize;
-    Ok(SparsePrfNoiseReport {
-        q_l: program.profile().q_l(),
-        p: program.profile().p(),
-        bucket_count: program.plan.bucket_count(),
-        k: program.plan.k(),
-        intermediate_groups: program.plan.intermediate_groups(),
-        terminal_start_bucket: program.plan.terminal_start(),
-        terminal_bucket_len: program.plan.terminal_len(),
-        lut_width: program.plan.lut_width(),
-        bucket_bounds,
-        bucket_stages,
-        group_stages,
-        terminal_lut_width,
-        terminal_input_bound,
-        terminal_output_bound: terminal_output_bound.clone(),
-        terminal_additive_bound: terminal_additive_bound.clone(),
-        terminal_bit_growth,
-        terminal_inherited_bound: terminal_inherited_bound.clone(),
-        terminal_base_helper_additive: terminal_base_helper_additive.clone(),
-        terminal_gamma_a_additive: terminal_gamma_a_additive.clone(),
-        terminal_gamma_c: parameters.gamma_c().clone(),
-        terminal_gamma_a: parameters.gamma_a().clone(),
-        terminal_inherited_bits: terminal_inherited_bound.bits() as usize,
-        terminal_base_helper_additive_bits: terminal_base_helper_additive.bits() as usize,
-        terminal_gamma_a_additive_bits: terminal_gamma_a_additive.bits() as usize,
-        terminal_additive_bits: terminal_additive_bound.bits() as usize,
-        terminal_output_bits: terminal_output_bound.bits() as usize,
-        rounding,
-        output_bound,
-    })
+
+    pub(crate) fn validate(&self) -> Result<(), ProgramNoiseError> {
+        if self.base < BigUint::from(2u8) ||
+            !is_power_of_two(&self.base) ||
+            self.digit_count == 0 ||
+            self.ring_dimension == 0 ||
+            self.target_rows == 0 ||
+            self.target_columns == 0 ||
+            self.decomposed_rows != self.target_rows.checked_mul(self.digit_count).unwrap_or(0) ||
+            self.target_rows.checked_mul(self.ring_dimension).is_none() ||
+            !match &self.source {
+                NoiseDecompositionSource::Explicit(coefficients) => {
+                    coefficients.len() ==
+                        self.decomposed_rows
+                            .checked_mul(self.target_columns)
+                            .and_then(|value| value.checked_mul(self.ring_dimension))
+                            .unwrap_or(0)
+                }
+                NoiseDecompositionSource::SparseMonomial {
+                    target_row,
+                    output_column,
+                    ring_coefficient,
+                    value,
+                } => {
+                    *target_row < self.target_rows &&
+                        *output_column < self.target_columns &&
+                        *ring_coefficient < self.ring_dimension &&
+                        !value.is_zero() &&
+                        self.sparse_source_valid(value)
+                }
+                NoiseDecompositionSource::Unit { target_row, output_column, ring_coefficient } => {
+                    *target_row < self.target_rows &&
+                        *output_column < self.target_columns &&
+                        *ring_coefficient < self.ring_dimension
+                }
+                NoiseDecompositionSource::DiagonalUnit => self.target_rows == self.target_columns,
+                NoiseDecompositionSource::PowerOfBase {
+                    target_row,
+                    output_column,
+                    ring_coefficient,
+                    exponent,
+                } => {
+                    *target_row < self.target_rows &&
+                        *output_column < self.target_columns &&
+                        *ring_coefficient < self.ring_dimension &&
+                        *exponent < self.digits_per_tower &&
+                        u32::try_from(*exponent).is_ok()
+                }
+                NoiseDecompositionSource::GadgetScalar { value } => {
+                    Some(self.target_columns) == self.target_rows.checked_mul(self.digit_count) &&
+                        !value.is_zero()
+                }
+                NoiseDecompositionSource::BoundedMatrix { coefficient_bound } => {
+                    !coefficient_bound.is_zero()
+                }
+                NoiseDecompositionSource::DenseBound { coefficient_bound } => {
+                    !coefficient_bound.is_zero() &&
+                        self.tower_moduli().into_iter().all(|modulus| {
+                            let tower_bound = modulus.map_or_else(
+                                || coefficient_bound.clone(),
+                                |modulus| coefficient_bound.min(&(modulus / 2u8)).clone(),
+                            );
+                            balanced_interval_representable(
+                                &tower_bound,
+                                &self.base,
+                                self.digits_per_tower,
+                            )
+                        })
+                }
+            } && (self.crt_moduli.is_empty() && self.digits_per_tower == self.digit_count ||
+                !self.crt_moduli.is_empty() &&
+                    self.crt_moduli.len().checked_mul(self.digits_per_tower) ==
+                        Some(self.digit_count) &&
+                    self.crt_moduli.iter().all(|modulus| modulus > &BigUint::one()))
+        {
+            return Err(ProgramNoiseError::InvalidDecomposition);
+        }
+        Ok(())
+    }
 }
 
-/// One CRT slot's refresh parameters.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RefreshSlotNoiseParameters {
-    plaintext_modulus: BigUint,
-    /// κ_t = q/q_t, retained as a semantic CRT target and spacing factor.
-    kappa: BigUint,
-    gamma_kappa: BigUint,
-    fresh_error_route_gain: BigUint,
-    decoder_action_gain: BigUint,
-}
-
-/// Exact CRT-local action gains for one refresh route.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RefreshActionGains {
-    pub gamma_kappa: Vec<BigUint>,
-    pub gamma_kappa_l2_sq: Vec<BigUint>,
-    pub mask_digit_gains: Vec<BigUint>,
-    pub mask_digit_l2_sq_gains: Vec<BigUint>,
-    pub fresh_error_digit_gains: Vec<Vec<BigUint>>,
-    pub fresh_error_digit_l2_sq_gains: Vec<Vec<BigUint>>,
-    pub mask_route_gain: BigUint,
-    pub mask_route_l2_sq_gain: BigUint,
-    pub fresh_error_route_gains: Vec<BigUint>,
-    pub fresh_error_route_l2_sq_gains: Vec<BigUint>,
-}
-
-/// Returns the balanced base-`beta` digits used by ordinary DCRT decomposition.
-/// The tie at `beta/2` is rounded to an even quotient, matching the CPU path.
-pub fn balanced_digits_for_tower(
-    value: &BigUint,
-    modulus: &BigUint,
-    beta: &BigUint,
-    digits: usize,
-) -> Result<Vec<BigInt>, NoiseSimulationError> {
-    if modulus.is_zero() || beta <= &BigUint::one() || digits == 0 {
-        return Err(NoiseSimulationError::InvalidRefresh("invalid balanced decomposition inputs"));
-    }
-    let modulus_i = BigInt::from_biguint(Sign::Plus, modulus.clone());
-    let beta_i = BigInt::from_biguint(Sign::Plus, beta.clone());
-    let residue = value % modulus;
-    let residue_i = BigInt::from_biguint(Sign::Plus, residue);
-    let mut current = if &residue_i * 2 > modulus_i { residue_i - &modulus_i } else { residue_i };
-    let half = &beta_i / 2;
-    let mut result = Vec::with_capacity(digits);
-    for _ in 0..digits {
-        let quotient = current.div_euclid(&beta_i);
-        let remainder = current.rem_euclid(&beta_i);
-        let (digit, next) = if remainder < half {
-            (remainder, quotient)
-        } else if remainder > half {
-            (remainder.clone() - &beta_i, quotient + 1)
-        } else if (quotient.clone() % 2u8).is_zero() {
-            (half.clone(), quotient)
-        } else {
-            (half.clone() - &beta_i, quotient + 1)
-        };
-        result.push(digit);
+/// Returns the exact L1 and squared-L2 contribution of one source
+/// coefficient under the balanced power-of-two decomposition.
+pub(crate) fn balanced_profile(
+    value: &BigInt,
+    base: &BigUint,
+    digit_count: usize,
+) -> Result<(BigUint, BigUint), ProgramNoiseError> {
+    let base = BigInt::from_biguint(num_bigint::Sign::Plus, base.clone());
+    let mut current = value.clone();
+    let mut l1 = BigUint::zero();
+    let mut l2_squared = BigUint::zero();
+    for _ in 0..digit_count {
+        let (digit, next) = balanced_digit_step(&current, &base);
         current = next;
+        l1 += digit.magnitude();
+        l2_squared += digit.magnitude().pow(2u32);
     }
     if !current.is_zero() {
-        return Err(NoiseSimulationError::InvalidRefresh(
-            "balanced decomposition carry does not vanish",
-        ));
+        return Err(ProgramNoiseError::InvalidDecomposition);
     }
-    Ok(result)
+    Ok((l1, l2_squared))
 }
 
-/// Returns the exact L1 norm of the balanced decomposition in one CRT tower.
-pub fn balanced_digit_l1_for_tower(
-    value: &BigUint,
-    modulus: &BigUint,
-    beta: &BigUint,
-    digits: usize,
-) -> Result<BigUint, NoiseSimulationError> {
-    Ok(balanced_digits_for_tower(value, modulus, beta, digits)?
-        .into_iter()
-        .map(|digit| digit.abs().to_biguint().unwrap_or_else(BigUint::zero))
-        .fold(BigUint::zero(), |sum, digit| sum + digit))
+pub(crate) fn centered_residue(value: &BigInt, modulus: &BigUint) -> BigInt {
+    let modulus = BigInt::from_biguint(num_bigint::Sign::Plus, modulus.clone());
+    let mut residue = value % &modulus;
+    if residue.sign() == num_bigint::Sign::Minus {
+        residue += &modulus;
+    }
+    if &residue * 2u8 > modulus { residue - modulus } else { residue }
 }
 
-/// Returns the exact squared L2 contribution of a balanced decomposition in
-/// one CRT tower. This uses the same public target and digit shape as the
-/// worst-case L1 gain; no caller-supplied average gain is used.
-pub fn balanced_digit_l2_sq_for_tower(
-    value: &BigUint,
-    modulus: &BigUint,
-    beta: &BigUint,
-    digits: usize,
-) -> Result<BigUint, NoiseSimulationError> {
-    Ok(balanced_digits_for_tower(value, modulus, beta, digits)?
-        .into_iter()
-        .map(|digit| {
-            let magnitude = digit.abs().to_biguint().unwrap_or_else(BigUint::zero);
-            &magnitude * &magnitude
-        })
-        .fold(BigUint::zero(), |sum, digit| sum + digit))
+/// Exact interval recurrence for the balanced round-to-even carry.  The
+/// balanced next-state function is monotone, so its maximum absolute value on
+/// `[-state_bound, state_bound]` is attained at an endpoint.
+pub(crate) fn balanced_interval_next_bound(state_bound: &BigUint, base: &BigUint) -> BigUint {
+    let bound = BigInt::from_biguint(num_bigint::Sign::Plus, state_bound.clone());
+    let negative = -&bound;
+    let base = BigInt::from_biguint(num_bigint::Sign::Plus, base.clone());
+    let (_, next_positive) = balanced_digit_step(&bound, &base);
+    let (_, next_negative) = balanced_digit_step(&negative, &base);
+    next_positive.magnitude().max(next_negative.magnitude()).clone()
 }
 
-fn rank_one_target_gain(
-    target: &BigUint,
-    crt_moduli: &[BigUint],
-    beta: &BigUint,
-    digits_per_tower: usize,
-) -> Result<BigUint, NoiseSimulationError> {
-    crt_moduli
-        .iter()
-        .map(|modulus| balanced_digit_l1_for_tower(target, modulus, beta, digits_per_tower))
-        .try_fold(BigUint::zero(), |sum, gain| Ok(sum + gain?))
+pub(crate) fn balanced_interval_representable(
+    state_bound: &BigUint,
+    base: &BigUint,
+    digit_count: usize,
+) -> bool {
+    let mut bound = state_bound.clone();
+    for _ in 0..digit_count {
+        bound = balanced_interval_next_bound(&bound, base);
+    }
+    bound.is_zero()
 }
 
-fn rank_one_target_l2_sq(
-    target: &BigUint,
-    crt_moduli: &[BigUint],
-    beta: &BigUint,
-    digits_per_tower: usize,
-) -> Result<BigUint, NoiseSimulationError> {
-    crt_moduli
-        .iter()
-        .map(|modulus| balanced_digit_l2_sq_for_tower(target, modulus, beta, digits_per_tower))
-        .try_fold(BigUint::zero(), |sum, gain| Ok(sum + gain?))
+pub(crate) fn balanced_digit_step(value: &BigInt, base: &BigInt) -> (BigInt, BigInt) {
+    let mut quotient = value / base;
+    let mut remainder = value % base;
+    if remainder.sign() == num_bigint::Sign::Minus {
+        remainder += base;
+        quotient -= 1u8;
+    }
+    let half = base / 2u8;
+    let carry = remainder > half || (remainder == half && !(&quotient % 2u8).is_zero());
+    let digit = if carry { &remainder - base } else { remainder };
+    (digit, quotient + u8::from(carry))
 }
 
-/// Computes target-aware CRT-local gains for the refresh routes.
-pub fn refresh_action_gains(
-    full_modulus: &BigUint,
-    crt_moduli: &[BigUint],
-    base_p: &BigUint,
-    mask_digits: usize,
-    fresh_digits: usize,
-    gadget_base: &BigUint,
-    gadget_digit_count: usize,
-    coefficient_count: usize,
-) -> Result<RefreshActionGains, NoiseSimulationError> {
-    if full_modulus.is_zero() ||
-        crt_moduli.is_empty() ||
-        base_p < &BigUint::from(2u8) ||
-        gadget_base <= &BigUint::one() ||
-        (gadget_base & (gadget_base - BigUint::one())) != BigUint::zero() ||
-        gadget_digit_count == 0 ||
-        mask_digits == 0 ||
-        fresh_digits == 0 ||
-        coefficient_count == 0
-    {
-        return Err(NoiseSimulationError::InvalidRefresh("invalid refresh gain inputs"));
-    }
-    validate_crt_factorization(full_modulus, crt_moduli)?;
-    if !gadget_digit_count.is_multiple_of(crt_moduli.len()) {
-        return Err(NoiseSimulationError::InvalidRefresh(
-            "gadget digit count must be divisible by CRT tower count",
-        ));
-    }
-    let digits_per_tower = gadget_digit_count / crt_moduli.len();
-    if digits_per_tower == 0 {
-        return Err(NoiseSimulationError::InvalidRefresh("zero digits per CRT tower"));
-    }
-    let mut gamma_kappa = Vec::with_capacity(crt_moduli.len());
-    let mut gamma_kappa_l2_sq = Vec::with_capacity(crt_moduli.len());
-    let mut fresh_error_digit_gains = Vec::with_capacity(crt_moduli.len());
-    let mut fresh_error_digit_l2_sq_gains = Vec::with_capacity(crt_moduli.len());
-    for modulus in crt_moduli {
-        let kappa = full_modulus / modulus;
-        let mut gamma = BigUint::zero();
-        let mut gamma_l2_sq = BigUint::zero();
-        let mut gadget_power = BigUint::one();
-        for _ in 0..digits_per_tower {
-            let target = &kappa * &gadget_power;
-            gamma = gamma.max(balanced_digit_l1_for_tower(
-                &target,
-                modulus,
-                gadget_base,
-                digits_per_tower,
-            )?);
-            gamma_l2_sq = gamma_l2_sq.max(balanced_digit_l2_sq_for_tower(
-                &target,
-                modulus,
-                gadget_base,
-                digits_per_tower,
-            )?);
-            gadget_power *= gadget_base;
-        }
-        gamma_kappa.push(gamma);
-        gamma_kappa_l2_sq.push(gamma_l2_sq);
-        let mut per_digit = Vec::with_capacity(fresh_digits);
-        let mut per_digit_l2_sq = Vec::with_capacity(fresh_digits);
-        let mut power = BigUint::one();
-        for _ in 0..fresh_digits {
-            let target = &kappa * &power;
-            per_digit.push(rank_one_target_gain(
-                &target,
-                crt_moduli,
-                gadget_base,
-                digits_per_tower,
-            )?);
-            per_digit_l2_sq.push(rank_one_target_l2_sq(
-                &target,
-                crt_moduli,
-                gadget_base,
-                digits_per_tower,
-            )?);
-            power *= base_p;
-        }
-        fresh_error_digit_gains.push(per_digit);
-        fresh_error_digit_l2_sq_gains.push(per_digit_l2_sq);
-    }
-    let mut mask_digit_gains = Vec::with_capacity(mask_digits);
-    let mut mask_digit_l2_sq_gains = Vec::with_capacity(mask_digits);
-    let mut power = BigUint::one();
-    for _ in 0..mask_digits {
-        mask_digit_gains.push(rank_one_target_gain(
-            &power,
-            crt_moduli,
-            gadget_base,
-            digits_per_tower,
-        )?);
-        mask_digit_l2_sq_gains.push(rank_one_target_l2_sq(
-            &power,
-            crt_moduli,
-            gadget_base,
-            digits_per_tower,
-        )?);
-        power *= base_p;
-    }
-    let mask_route_gain = BigUint::from(coefficient_count) *
-        mask_digit_gains.iter().cloned().fold(BigUint::zero(), |sum, gain| sum + gain);
-    let mask_route_l2_sq_gain = BigUint::from(coefficient_count) *
-        mask_digit_l2_sq_gains.iter().cloned().fold(BigUint::zero(), |sum, gain| sum + gain);
-    let fresh_error_route_gains = fresh_error_digit_gains
-        .iter()
-        .map(|gains| {
-            BigUint::from(coefficient_count) *
-                gains.iter().cloned().fold(BigUint::zero(), |sum, gain| sum + gain)
-        })
-        .collect();
-    let fresh_error_route_l2_sq_gains = fresh_error_digit_l2_sq_gains
-        .iter()
-        .map(|gains| {
-            BigUint::from(coefficient_count) *
-                gains.iter().cloned().fold(BigUint::zero(), |sum, gain| sum + gain)
-        })
-        .collect();
-    Ok(RefreshActionGains {
-        gamma_kappa,
-        gamma_kappa_l2_sq,
-        mask_digit_gains,
-        mask_digit_l2_sq_gains,
-        fresh_error_digit_gains,
-        fresh_error_digit_l2_sq_gains,
-        mask_route_gain,
-        mask_route_l2_sq_gain,
-        fresh_error_route_gains,
-        fresh_error_route_l2_sq_gains,
-    })
+fn is_power_of_two(value: &BigUint) -> bool {
+    !value.is_zero() && (value & (value - 1u8)).is_zero()
 }
 
-/// Numeric inputs for exact refresh threshold checking.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RefreshNoiseParameters {
-    full_modulus: BigUint,
-    base_p: BigUint,
-    /// Q_L, the sparse-LWR input modulus that every mask must cover.
-    sparse_lwr_modulus: BigUint,
-    mask_base_p_digit_count: usize,
-    fresh_error_base_p_digit_count: usize,
-    mask_statistical_security_bits: u64,
-    mask_slot_count: usize,
-    coefficient_count: usize,
-    /// Number of public-key columns covered by each aggregate: 2*ell_beta.
-    component_columns: usize,
-    gamma_kappa_l2_sq: Vec<BigUint>,
-    /// Decoder action dimensions retained from setup so AverageCase can
-    /// derive its p=2 scale from the same structural inputs.
-    decoder_columns: usize,
-    decoder_ring_dimension: usize,
-    decoder_preimage_bound: BigUint,
-    mask_digit_gains: Vec<BigUint>,
-    mask_digit_l2_sq_gains: Vec<BigUint>,
-    mask_route_gain: BigUint,
-    mask_route_l2_sq_gain: BigUint,
-    fresh_error_digit_gains: Vec<Vec<BigUint>>,
-    fresh_error_digit_l2_sq_gains: Vec<Vec<BigUint>>,
-    fresh_error_route_gains: Vec<BigUint>,
-    fresh_error_route_l2_sq_gains: Vec<BigUint>,
-    slots: Vec<RefreshSlotNoiseParameters>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GateNoiseOperation {
+    MulPrivate,
+    MulPublic,
+    Add,
+    Lut,
 }
 
-impl RefreshNoiseParameters {
-    /// Builds route, scale, and decoder gains from the structural model.
-    pub(crate) fn from_structural(
-        model: &ExponentLutNoiseParameters,
-        full_modulus: BigUint,
-        base_p: BigUint,
-        sparse_lwr_modulus: BigUint,
-        mask_base_p_digit_count: usize,
-        fresh_error_base_p_digit_count: usize,
-        mask_statistical_security_bits: u64,
-        mask_slot_count: usize,
-        coefficient_count: usize,
-        plaintext_moduli: Vec<BigUint>,
-        decoder_preimage_bound: BigUint,
-    ) -> Result<Self, NoiseSimulationError> {
-        let decoder_columns = model
-            .gadget_digit_count
-            .checked_add(2)
-            .ok_or(NoiseSimulationError::IntegerConversion)?;
-        if model.secret_dimension != 2 ||
-            full_modulus.is_zero() ||
-            base_p < BigUint::from(2u8) ||
-            sparse_lwr_modulus.is_zero() ||
-            mask_base_p_digit_count == 0 ||
-            fresh_error_base_p_digit_count == 0 ||
-            mask_slot_count == 0 ||
-            coefficient_count == 0 ||
-            plaintext_moduli.len() != mask_slot_count ||
-            decoder_preimage_bound.is_zero()
-        {
-            return Err(NoiseSimulationError::InvalidRefresh("inconsistent dimensions"));
-        }
-        validate_crt_factorization(&full_modulus, &plaintext_moduli)?;
-        let component_columns = model
-            .gadget_digit_count
-            .checked_mul(2)
-            .ok_or(NoiseSimulationError::IntegerConversion)?;
-        let gains = refresh_action_gains(
-            &full_modulus,
-            &plaintext_moduli,
-            &base_p,
-            mask_base_p_digit_count,
-            fresh_error_base_p_digit_count,
-            &model.gadget_base,
-            model.gadget_digit_count,
-            coefficient_count,
-        )?;
-        let decoder_action_gain = BigUint::from(2u8) *
-            BigUint::from(decoder_columns) *
-            BigUint::from(model.ring_dimension) *
-            decoder_preimage_bound.clone();
-        let slots = plaintext_moduli
-            .into_iter()
-            .enumerate()
-            .map(|(slot, plaintext_modulus)| RefreshSlotNoiseParameters {
-                kappa: &full_modulus / &plaintext_modulus,
-                gamma_kappa: gains.gamma_kappa[slot].clone(),
-                fresh_error_route_gain: gains.fresh_error_route_gains[slot].clone(),
-                plaintext_modulus,
-                decoder_action_gain: decoder_action_gain.clone(),
-            })
-            .collect();
-        Ok(Self {
-            full_modulus,
-            base_p,
-            sparse_lwr_modulus,
-            mask_base_p_digit_count,
-            fresh_error_base_p_digit_count,
-            mask_statistical_security_bits,
-            mask_slot_count,
-            coefficient_count,
-            component_columns,
-            gamma_kappa_l2_sq: gains.gamma_kappa_l2_sq,
-            decoder_columns,
-            decoder_ring_dimension: model.ring_dimension,
-            decoder_preimage_bound,
-            mask_digit_gains: gains.mask_digit_gains,
-            mask_digit_l2_sq_gains: gains.mask_digit_l2_sq_gains,
-            mask_route_gain: gains.mask_route_gain,
-            mask_route_l2_sq_gain: gains.mask_route_l2_sq_gain,
-            fresh_error_digit_gains: gains.fresh_error_digit_gains,
-            fresh_error_digit_l2_sq_gains: gains.fresh_error_digit_l2_sq_gains,
-            fresh_error_route_gains: gains.fresh_error_route_gains,
-            fresh_error_route_l2_sq_gains: gains.fresh_error_route_l2_sq_gains,
-            slots,
-        })
-    }
-
-    pub fn slot_count(&self) -> usize {
-        self.slots.len()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RefreshSlotNoiseReport {
-    pub slot: usize,
-    pub spacing: BigUint,
-    /// B_m = p^d_m - 1, the maximum mask value before refresh.
-    pub mask_bound: BigUint,
-    /// B_e = p^d_e - 1, the maximum fresh error after refresh.
-    pub fresh_error_bound: BigUint,
-    /// Exact κ_t = q/q_t.
-    pub kappa: BigUint,
-    pub gamma_kappa: BigUint,
-    pub state_term: BigUint,
-    pub prf_mask_term: BigUint,
-    pub prf_fresh_term: BigUint,
-    pub fresh_error_route_gain: BigUint,
-    pub decoder_term: BigUint,
-    /// F_t, excluding the semantic mask B_m.
-    pub operation_noise_bound: BigUint,
-    pub pre_rounding_bound: BigUint,
-    pub twice_pre_rounding_bound: BigUint,
-    /// spacing - 2*(B_m + F_t); positive means strict rounding passes.
-    pub rounding_margin: BigInt,
-    /// q_t - B_e; positive means strict fresh-error check passes.
-    pub fresh_error_margin: BigInt,
-    pub fresh_error_below_plaintext_modulus: bool,
-    pub accepted: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RefreshNoiseReport {
-    pub prf_output_bound: BigUint,
-    pub mask_digit_gains: Vec<BigUint>,
-    pub mask_route_gain: BigUint,
-    pub fresh_error_digit_gains: Vec<Vec<BigUint>>,
-    pub mask_base_p_digit_count: usize,
-    pub fresh_error_base_p_digit_count: usize,
-    pub sparse_lwr_modulus: BigUint,
-    pub mask_modulus: BigUint,
-    pub mask_bound: BigUint,
-    pub fresh_error_modulus: BigUint,
-    pub fresh_error_bound: BigUint,
-    /// mask_slot_count * (2*ell_beta) * coefficient_count.
-    pub exposed_transcript_coordinates: BigUint,
-    pub mask_statistical_security_bits: u64,
-    /// 2^(lambda+1) * D * max_t(F_t). Equality is accepted.
-    pub mask_statistical_required: BigUint,
-    /// M_m - required. Non-negative means the hiding test passes.
-    pub mask_statistical_margin: BigInt,
-    pub mask_statistical_accepted: bool,
-    /// M_m - Q_L; non-negative means the mask range covers the PRF domain.
-    pub mask_domain_margin: BigInt,
-    pub mask_domain_accepted: bool,
-    pub fresh_error_accepted: bool,
-    pub hard_authority: RefreshHardAuthority,
-    pub slots: Vec<RefreshSlotNoiseReport>,
-    pub refreshed_error_bound: Option<BigUint>,
-    pub accepted: bool,
-}
-
-/// Independent WorstCase predicates that form the production refresh
-/// authority.  Rounding is intentionally not part of this authority so an
-/// AverageCase correctness estimate cannot accidentally redefine security or
-/// smudging acceptance.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RefreshHardAuthority {
-    pub mask_domain_accepted: bool,
-    pub mask_statistical_accepted: bool,
-    pub fresh_error_accepted: bool,
-    pub accepted: bool,
-}
-
-/// A setup-bound, secret-free input to the complete sparse-PRF/refresh
-/// simulator.  The constructor is crate-visible so setup code, rather than an
-/// external caller, owns the identity and structural parameters.
-#[derive(Clone, Debug)]
-pub struct ExponentLutNoiseSnapshot {
-    setup_identity: [u8; 32],
-    prf_program: SparseLwrPrfProgram,
-    pbc_layout: PbcPublicLayout,
-    model: ExponentLutNoiseParameters,
-    refresh: RefreshNoiseParameters,
-    initial_state_bound: BigUint,
-    initial_average_variance: AverageVariance,
-}
-
-/// Combined report returned by a setup-bound simulation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExponentLutNoiseReport {
-    pub prf: SparsePrfNoiseReport,
-    pub refresh: RefreshNoiseReport,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExponentLutAverageNoiseReport {
-    pub snapshot_identity: [u8; 32],
-    pub prf: AverageSparsePrfNoiseReport,
-    pub refresh: AverageRefreshNoiseReport,
-    /// Lattice security is decided by the parameter-search harness, not this
-    /// AverageCase production report.
-    pub security_authority: &'static str,
-    pub correctness_authority: NoiseModelKind,
-    pub hard_authority_accepted: bool,
-    pub correctness_accepted: bool,
-    pub accepted: bool,
-}
-
-impl ExponentLutNoiseSnapshot {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_setup(
-        setup_identity: [u8; 32],
-        prf_program: SparseLwrPrfProgram,
-        pbc_layout: PbcPublicLayout,
-        model: ExponentLutNoiseParameters,
-        full_modulus: BigUint,
-        base_p: BigUint,
-        mask_base_p_digit_count: usize,
-        fresh_error_base_p_digit_count: usize,
-        mask_statistical_security_bits: u64,
-        mask_slot_count: usize,
-        coefficient_count: usize,
-        plaintext_moduli: Vec<BigUint>,
-        decoder_preimage_bound: BigUint,
-        initial_state_bound: BigUint,
-        initial_average_variance: AverageVariance,
-    ) -> Result<Self, NoiseSimulationError> {
-        pbc_layout
-            .validate()
-            .map_err(|error| NoiseSimulationError::InvalidPbcLayout(error.to_string()))?;
-        if prf_program.profile().ring_dimension() != model.ring_dimension ||
-            prf_program.bucket_width() != pbc_layout.bucket_width
-        {
-            return Err(NoiseSimulationError::InvalidRefresh("PRF/layout mismatch"));
-        }
-        let refresh = RefreshNoiseParameters::from_structural(
-            &model,
-            full_modulus,
-            base_p.clone(),
-            BigUint::from(prf_program.profile().q_l()),
-            mask_base_p_digit_count,
-            fresh_error_base_p_digit_count,
-            mask_statistical_security_bits,
-            mask_slot_count,
-            coefficient_count,
-            plaintext_moduli,
-            decoder_preimage_bound,
-        )?;
-        Ok(Self {
-            setup_identity,
-            prf_program,
-            pbc_layout,
-            model,
-            refresh,
-            initial_state_bound,
-            initial_average_variance,
-        })
-    }
-
-    pub fn setup_identity(&self) -> &[u8; 32] {
-        &self.setup_identity
-    }
-
-    /// Returns the setup-derived doubled-coordinate starting variance used by
-    /// the AverageCase channel.
-    pub fn initial_average_variance(&self) -> &AverageVariance {
-        &self.initial_average_variance
-    }
-
-    /// Simulates the complete sparse PRF and refresh using only setup-bound
-    /// public layout and structural parameters.
-    pub fn simulate(&self) -> Result<ExponentLutNoiseReport, NoiseSimulationError> {
-        let prf = simulate_sparse_prf(
-            &self.prf_program,
-            &self.model,
-            &self.pbc_layout,
-            self.initial_state_bound.clone(),
-        )?;
-        let refresh = simulate_refresh(
-            &self.model,
-            &self.refresh,
-            self.initial_state_bound.clone(),
-            prf.output_bound.clone(),
-        )?;
-        Ok(ExponentLutNoiseReport { prf, refresh })
-    }
-
-    /// Runs AverageCase only when explicitly enabled. Security is deliberately
-    /// left to the parameter-search harness; this report contains only the
-    /// setup-bound hard gates plus AverageCase rounding/smudging authorities.
-    pub fn simulate_average(
-        &self,
-        config: &AverageCaseConfig,
-    ) -> Result<ExponentLutAverageNoiseReport, NoiseSimulationError> {
-        if !config.allow_average_acceptance {
-            return Err(NoiseSimulationError::AverageAcceptanceDisabled);
-        }
-        let prf = simulate_average_sparse_prf(
-            &self.prf_program,
-            &self.model,
-            &self.pbc_layout,
-            self.initial_average_variance.clone(),
-        )?;
-        let refresh = simulate_average_refresh(
-            &self.model,
-            &self.refresh,
-            self.initial_average_variance.clone(),
-            prf.output_variance.clone(),
-            config,
-        )?;
-        let hard_authority_accepted = refresh.domain_accepted && refresh.fresh_error_accepted;
-        let correctness_accepted = refresh.rounding_accepted && refresh.mask_smudging_accepted;
-        let accepted = hard_authority_accepted && correctness_accepted;
-        Ok(ExponentLutAverageNoiseReport {
-            snapshot_identity: self.setup_identity,
-            prf,
-            refresh,
-            security_authority: "harness",
-            correctness_authority: NoiseModelKind::AverageCase,
-            hard_authority_accepted,
-            correctness_accepted,
-            accepted,
-        })
-    }
-}
-
-/// Exact refresh simulation with strict per-slot inequalities.
-pub fn simulate_refresh(
-    parameters: &ExponentLutNoiseParameters,
-    refresh: &RefreshNoiseParameters,
-    state_bound: BigUint,
-    prf_output_bound: BigUint,
-) -> Result<RefreshNoiseReport, NoiseSimulationError> {
-    if parameters.secret_dimension != 2 {
-        return Err(NoiseSimulationError::InvalidSecretDimension);
-    }
-    if refresh.full_modulus.is_zero() ||
-        refresh.base_p < BigUint::from(2u8) ||
-        refresh.mask_base_p_digit_count == 0 ||
-        refresh.fresh_error_base_p_digit_count == 0 ||
-        refresh.mask_slot_count == 0 ||
-        refresh.coefficient_count == 0 ||
-        refresh.slots.len() != refresh.mask_slot_count
-    {
-        return Err(NoiseSimulationError::InvalidRefresh("inconsistent dimensions"));
-    }
-    let mask_modulus = base_p_power(&refresh.base_p, refresh.mask_base_p_digit_count)?;
-    let fresh_error_modulus =
-        base_p_power(&refresh.base_p, refresh.fresh_error_base_p_digit_count)?;
-    let mask_bound = &mask_modulus - BigUint::one();
-    let fresh_error_bound = &fresh_error_modulus - BigUint::one();
-    let mask_domain_margin = signed_difference(&mask_modulus, &refresh.sparse_lwr_modulus);
-    let mask_domain_accepted = mask_domain_margin >= BigInt::zero();
-    let exposed_transcript_coordinates = BigUint::from(refresh.mask_slot_count) *
-        BigUint::from(refresh.component_columns) *
-        BigUint::from(refresh.coefficient_count);
-    let mut slots = Vec::with_capacity(refresh.slots.len());
-    let mut max_operation_noise_bound = BigUint::zero();
-    for (slot, slot_parameters) in refresh.slots.iter().enumerate() {
-        if slot_parameters.plaintext_modulus <= BigUint::one() {
-            return Err(NoiseSimulationError::InvalidRefresh("invalid slot parameters"));
-        }
-        let remainder = &refresh.full_modulus % &slot_parameters.plaintext_modulus;
-        if !remainder.is_zero() {
-            return Err(NoiseSimulationError::InvalidCrtDivision);
-        }
-        let spacing = &refresh.full_modulus / &slot_parameters.plaintext_modulus;
-        let state_term = &slot_parameters.gamma_kappa * &state_bound;
-        let prf_mask_term = &refresh.mask_route_gain * &prf_output_bound;
-        let prf_fresh_term = &slot_parameters.fresh_error_route_gain * &prf_output_bound;
-        let decoder_term = parameters.helper_error_bound() * &slot_parameters.decoder_action_gain;
-        // F_t = γ_{κ,t} E_state + R_m E_PRF + R_{e,t} E_PRF + E_decoder,t,
-        // where each route gain is the exact balanced DCRT action gain.
-        let operation_noise_bound = &state_term + &prf_mask_term + &prf_fresh_term + &decoder_term;
-        max_operation_noise_bound = max_operation_noise_bound.max(operation_noise_bound.clone());
-        let pre_rounding_bound = &mask_bound + &operation_noise_bound;
-        let twice_pre_rounding_bound = BigUint::from(2u8) * &pre_rounding_bound;
-        let rounding_margin = signed_difference(&spacing, &twice_pre_rounding_bound);
-        let fresh_error_margin =
-            signed_difference(&slot_parameters.plaintext_modulus, &fresh_error_bound);
-        let fresh_error_below_plaintext_modulus = fresh_error_margin > BigInt::zero();
-        let slot_accepted = rounding_margin > BigInt::zero() && fresh_error_below_plaintext_modulus;
-        slots.push(RefreshSlotNoiseReport {
-            slot,
-            spacing,
-            mask_bound: mask_bound.clone(),
-            fresh_error_bound: fresh_error_bound.clone(),
-            kappa: slot_parameters.kappa.clone(),
-            gamma_kappa: slot_parameters.gamma_kappa.clone(),
-            state_term,
-            prf_mask_term,
-            prf_fresh_term,
-            fresh_error_route_gain: slot_parameters.fresh_error_route_gain.clone(),
-            decoder_term,
-            operation_noise_bound,
-            pre_rounding_bound,
-            twice_pre_rounding_bound,
-            rounding_margin,
-            fresh_error_margin,
-            fresh_error_below_plaintext_modulus,
-            accepted: slot_accepted,
-        });
-    }
-    let security_shift = refresh
-        .mask_statistical_security_bits
-        .checked_add(1)
-        .and_then(|bits| usize::try_from(bits).ok())
-        .ok_or(NoiseSimulationError::IntegerConversion)?;
-    let mask_statistical_required = (BigUint::one() << security_shift) *
-        &exposed_transcript_coordinates *
-        &max_operation_noise_bound;
-    let mask_statistical_margin = signed_difference(&mask_modulus, &mask_statistical_required);
-    // M_m >= 2^(λ+1) D max_t(F_t); equality is intentionally accepted.
-    let mask_statistical_accepted = mask_statistical_margin >= BigInt::zero();
-    let fresh_error_accepted = slots.iter().all(|slot| slot.fresh_error_below_plaintext_modulus);
-    let hard_authority = RefreshHardAuthority {
-        mask_domain_accepted,
-        mask_statistical_accepted,
-        fresh_error_accepted,
-        accepted: mask_domain_accepted && mask_statistical_accepted && fresh_error_accepted,
-    };
-    let accepted =
-        mask_domain_accepted && mask_statistical_accepted && slots.iter().all(|slot| slot.accepted);
-    Ok(RefreshNoiseReport {
-        prf_output_bound,
-        mask_digit_gains: refresh.mask_digit_gains.clone(),
-        mask_route_gain: refresh.mask_route_gain.clone(),
-        fresh_error_digit_gains: refresh.fresh_error_digit_gains.clone(),
-        mask_base_p_digit_count: refresh.mask_base_p_digit_count,
-        fresh_error_base_p_digit_count: refresh.fresh_error_base_p_digit_count,
-        sparse_lwr_modulus: refresh.sparse_lwr_modulus.clone(),
-        mask_modulus,
-        mask_bound,
-        fresh_error_modulus,
-        fresh_error_bound: fresh_error_bound.clone(),
-        exposed_transcript_coordinates,
-        mask_statistical_security_bits: refresh.mask_statistical_security_bits,
-        mask_statistical_required,
-        mask_statistical_margin,
-        mask_statistical_accepted,
-        mask_domain_margin,
-        mask_domain_accepted,
-        fresh_error_accepted,
-        hard_authority,
-        slots,
-        refreshed_error_bound: accepted.then_some(fresh_error_bound),
-        accepted,
-    })
-}
-
+/// Setup-derived balanced decompositions for one primitive gate. LUT actions
+/// carry a second plan for their automorphism-helper error.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageRefreshSlotNoiseReport {
-    pub slot: usize,
-    pub spacing: BigUint,
-    pub mask_bound: BigUint,
-    pub fresh_error_bound: BigUint,
-    pub deterministic_term: BigUint,
-    pub state_variance: AverageVariance,
-    pub mask_variance: AverageVariance,
+pub struct GateNoiseDecomposition {
+    pub action: NoiseDecompositionPlan,
+    pub helper_action: Option<NoiseDecompositionPlan>,
+}
+
+/// Noise parameters for one primitive operation occurrence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GateNoiseGains {
+    pub step_index: usize,
+    pub operation_index: usize,
+    pub branch_index: usize,
+    pub operation: GateNoiseOperation,
+    pub gate: String,
+    pub action: RightActionNoiseGain,
+    pub helper_action: Option<RightActionNoiseGain>,
+    pub inherited_bound: BigUint,
+    pub fresh_bound: BigUint,
+    pub output_bound: BigUint,
+    pub inherited_variance: AverageVariance,
     pub fresh_variance: AverageVariance,
-    pub decoder_variance: AverageVariance,
-    pub stochastic_variance: AverageVariance,
-    pub z_sq: AverageVariance,
-    pub favg: BigUint,
-    pub squared_margin: BigInt,
-    pub squared_deficit: BigInt,
-    pub fresh_error_below_plaintext_modulus: bool,
-    pub rounding_accepted: bool,
-    pub accepted: bool,
+    pub output_variance: AverageVariance,
 }
 
+/// Gate-only gain plan consumed by every Exponent-LUT program simulation.
+/// Readout and refresh routes are intentionally outside this type.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AverageRefreshNoiseReport {
-    pub schema_version: u32,
-    pub mode: NoiseModelKind,
-    pub authority: AcceptedUnder,
-    pub centered_coordinates: bool,
-    pub decoder_factor: BigUint,
-    pub mask_bound: BigUint,
-    pub fresh_error_bound: BigUint,
-    pub event_budget: AverageEventBudget,
-    /// Topology counts are evidence; `joint_event_count` is the sole tail
-    /// budget used by all AverageCase inspections.
-    pub mask_event_count: BigUint,
-    pub fresh_event_count: BigUint,
-    pub joint_event_count: BigUint,
-    pub epsilon_joint: AverageVariance,
-    pub masking_distance_bound: AverageVariance,
-    pub z_sq: AverageVariance,
-    pub tail_correction_bits: u32,
-    pub mask_statistical_security_bits: u64,
-    pub mask_smudging_max_favg: BigUint,
-    pub mask_smudging_margin: BigInt,
-    pub mask_smudging_accepted: bool,
-    pub domain_margin: BigInt,
-    pub domain_accepted: bool,
-    pub fresh_error_accepted: bool,
-    pub heuristics: Vec<HeuristicId>,
-    pub slots: Vec<AverageRefreshSlotNoiseReport>,
-    pub rounding_accepted: bool,
-    pub accepted: bool,
+pub struct ProgramNoiseGainPlan {
+    gates: Vec<GateNoiseGains>,
 }
 
-/// Average-case refresh propagation and strict squared-domain threshold.
-/// The p=2 centering transform and decoder factor are derived directly from
-/// the structural refresh inputs; unsupported setups fail closed.
-pub fn simulate_average_refresh(
-    parameters: &ExponentLutNoiseParameters,
-    refresh: &RefreshNoiseParameters,
-    state_variance: AverageVariance,
-    prf_variance: AverageVariance,
-    config: &AverageCaseConfig,
-) -> Result<AverageRefreshNoiseReport, NoiseSimulationError> {
-    if refresh.base_p != BigUint::from(2u8) || refresh.slots.is_empty() {
-        return Err(NoiseSimulationError::UnsupportedAverageRefresh);
+impl ProgramNoiseGainPlan {
+    pub fn new(gates: Vec<GateNoiseGains>) -> Self {
+        Self { gates }
     }
-    // The doubled-coordinate decoder scale is a direct function of the
-    // actual base-p setup and decoder dimensions.  It is deliberately not a
-    // caller-provided flag or proof field.
-    let decoder_factor = refresh.base_p.clone();
-    let decoder_action_gain = &decoder_factor *
-        BigUint::from(refresh.decoder_columns) *
-        BigUint::from(refresh.decoder_ring_dimension) *
-        &refresh.decoder_preimage_bound;
-    if refresh.full_modulus.is_zero() ||
-        refresh.slots.len() != refresh.mask_slot_count ||
-        refresh.mask_digit_gains.len() != refresh.mask_base_p_digit_count ||
-        refresh.mask_digit_l2_sq_gains.len() != refresh.mask_base_p_digit_count ||
-        refresh.fresh_error_digit_gains.len() != refresh.mask_slot_count ||
-        refresh.fresh_error_digit_l2_sq_gains.len() != refresh.mask_slot_count ||
-        refresh.fresh_error_route_gains.len() != refresh.mask_slot_count ||
-        refresh.mask_route_gain.is_zero() ||
-        refresh.fresh_error_route_gains.iter().any(BigUint::is_zero) ||
-        refresh.fresh_error_route_l2_sq_gains.len() != refresh.mask_slot_count ||
-        refresh.gamma_kappa_l2_sq.len() != refresh.mask_slot_count ||
-        refresh
-            .fresh_error_digit_l2_sq_gains
-            .iter()
-            .any(|gains| gains.len() != refresh.fresh_error_base_p_digit_count) ||
-        refresh
-            .fresh_error_digit_gains
-            .iter()
-            .any(|gains| gains.len() != refresh.fresh_error_base_p_digit_count)
-    {
-        return Err(NoiseSimulationError::InvalidRefresh("inconsistent dimensions"));
+
+    pub fn gates(&self) -> &[GateNoiseGains] {
+        &self.gates
     }
-    let events = config.event_budget(refresh.coefficient_count, refresh.mask_slot_count);
-    let mask_event_count = BigUint::from(refresh.mask_slot_count) *
-        BigUint::from(refresh.component_columns) *
-        BigUint::from(refresh.coefficient_count) *
-        BigUint::from(refresh.mask_base_p_digit_count);
-    let fresh_event_count = BigUint::from(refresh.component_columns) *
-        BigUint::from(refresh.coefficient_count) *
-        BigUint::from(refresh.fresh_error_base_p_digit_count);
-    let joint_event_count = config.joint_event_count(&mask_event_count, &fresh_event_count)?;
-    let z_sq = config.z_squared_for_log2(ceil_log2(&joint_event_count)?)?;
-    let epsilon_joint =
-        AverageVariance::new(joint_event_count.clone(), BigUint::one() << config.failure_exponent)?;
-    let masking_distance_bound = AverageVariance::new(
-        BigUint::one(),
-        BigUint::one() << refresh.mask_statistical_security_bits,
-    )?
-    .add(&epsilon_joint);
-    let mask_modulus = base_p_power(&refresh.base_p, refresh.mask_base_p_digit_count)?;
-    let fresh_modulus = base_p_power(&refresh.base_p, refresh.fresh_error_base_p_digit_count)?;
-    let mask_bound = &mask_modulus - BigUint::one();
-    let fresh_bound = &fresh_modulus - BigUint::one();
-    let mask_digit_variances = refresh
-        .mask_digit_l2_sq_gains
-        .iter()
-        .cloned()
-        .fold(BigUint::zero(), |sum, value| sum + value) *
-        BigUint::from(refresh.coefficient_count);
-    let mask_digit_variance = AverageVariance::new(mask_digit_variances, BigUint::one())?;
-    let helper_variance = parameters.helper_doubled_variance();
-    let mut slots = Vec::with_capacity(refresh.slots.len());
-    let mut max_favg = BigUint::zero();
-    let mut heuristics = vec![
-        HeuristicId::H1StateUncorrelated,
-        HeuristicId::H2DigitUniformFallback,
-        HeuristicId::H4SlotRhsIndependence,
-        HeuristicId::H6GaussianTailClosure,
-    ];
-    for (slot, slot_parameters) in refresh.slots.iter().enumerate() {
-        if slot_parameters.plaintext_modulus <= BigUint::one() {
-            return Err(NoiseSimulationError::InvalidRefresh("invalid slot parameters"));
+
+    pub fn topology_event_count(
+        program: &ExponentLutProgram,
+        family_active_counts: &[usize],
+    ) -> Result<usize, ProgramNoiseError> {
+        let mut family_index = 0usize;
+        let mut count = 0usize;
+        for step in program.steps() {
+            let contribution = match step {
+                ProgramStep::Gate(Gate::Lut { lut, .. }) => {
+                    program.lut(*lut).ok_or(ProgramNoiseError::MissingLut)?.values().len()
+                }
+                ProgramStep::Gate(_) => 1,
+                ProgramStep::Family { body, .. } => {
+                    let active = *family_active_counts
+                        .get(family_index)
+                        .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+                    family_index += 1;
+                    active
+                        .checked_mul(family_body_action_count(program, body)?)
+                        .and_then(|value| value.checked_add(1))
+                        .ok_or(ProgramNoiseError::IntegerConversion)?
+                }
+            };
+            count = count.checked_add(contribution).ok_or(ProgramNoiseError::IntegerConversion)?;
         }
-        let spacing = &refresh.full_modulus / &slot_parameters.plaintext_modulus;
-        let fresh_digit_variances = refresh.fresh_error_digit_l2_sq_gains[slot]
-            .iter()
-            .cloned()
-            .fold(BigUint::zero(), |sum, value| sum + value) *
-            BigUint::from(refresh.coefficient_count);
-        // The PRF output is one shared wire reused by the mask and fresh
-        // routes. Until executable provenance proves independence, combine
-        // their scalar L1 gains before squaring.
-        let shared_route_gain = coherent_shared_route_gain(
-            &refresh.mask_route_gain,
-            &refresh.fresh_error_route_gains[slot],
-        );
-        let fresh_variance = AverageVariance::new(fresh_digit_variances, BigUint::one())?;
-        let state_gain_sq = &refresh.gamma_kappa_l2_sq[slot];
-        let decoder_gain_sq = &decoder_action_gain * &decoder_action_gain;
-        let state_term = state_variance.scaled(state_gain_sq);
-        let routed_mask = mask_digit_variance.clone().add(&prf_variance.scaled(&shared_route_gain));
-        let routed_fresh = fresh_variance;
-        let decoder_variance = helper_variance.scaled(&(BigUint::from(4u8) * decoder_gain_sq));
-        let stochastic_variance =
-            state_term.add(&routed_mask).add(&routed_fresh).add(&decoder_variance);
-        let favg = average_favg(&z_sq, &stochastic_variance, config.tail_correction_bits)?;
-        max_favg = max_favg.max(favg.clone());
-        let squared_margin = signed_difference(&(&spacing * 2u8), &(&mask_bound * 2u8));
-        let margin_squared = &squared_margin * &squared_margin;
-        let tail_bits = config
-            .tail_correction_bits
-            .checked_mul(2)
-            .ok_or(NoiseSimulationError::IntegerConversion)?;
-        let lhs = margin_squared *
-            BigInt::from_biguint(
-                Sign::Plus,
-                &z_sq.denominator * &stochastic_variance.denominator,
-            );
-        let rhs = BigInt::from_biguint(
-            Sign::Plus,
-            BigUint::from(4u8) *
-                &z_sq.numerator *
-                (BigUint::one() << tail_bits) *
-                &stochastic_variance.numerator,
-        );
-        let squared_deficit = &lhs - &rhs;
-        let stochastic_ok = squared_margin > BigInt::zero() && squared_deficit > BigInt::zero();
-        let fresh_margin = signed_difference(&slot_parameters.plaintext_modulus, &fresh_bound);
-        let fresh_ok = fresh_margin > BigInt::zero();
-        let deterministic_term = mask_bound.clone();
-        slots.push(AverageRefreshSlotNoiseReport {
-            slot,
-            spacing,
-            mask_bound: mask_bound.clone(),
-            fresh_error_bound: fresh_bound.clone(),
-            deterministic_term,
-            state_variance: state_term,
-            mask_variance: routed_mask,
-            fresh_variance: routed_fresh,
-            decoder_variance,
-            stochastic_variance,
-            z_sq: z_sq.clone(),
-            favg,
-            squared_margin,
-            squared_deficit,
-            fresh_error_below_plaintext_modulus: fresh_ok,
-            rounding_accepted: stochastic_ok,
-            accepted: stochastic_ok && fresh_ok,
-        });
+        if family_index != family_active_counts.len() || count == 0 {
+            return Err(ProgramNoiseError::InvalidDecomposition);
+        }
+        Ok(count)
     }
-    let rounding_accepted = slots.iter().all(|slot| slot.rounding_accepted);
-    let domain_margin = signed_difference(&mask_modulus, &refresh.sparse_lwr_modulus);
-    let domain_accepted = domain_margin >= BigInt::zero();
-    let fresh_error_accepted = slots.iter().all(|slot| slot.fresh_error_below_plaintext_modulus);
-    let smudging_dimension = BigUint::from(refresh.mask_slot_count) *
-        BigUint::from(refresh.component_columns) *
-        BigUint::from(refresh.coefficient_count);
-    let smudging_required = average_smudging_required(
-        refresh.mask_statistical_security_bits,
-        &smudging_dimension,
-        &max_favg,
-    )?;
-    let mask_smudging_margin = signed_difference(&mask_modulus, &smudging_required);
-    let mask_smudging_accepted = mask_smudging_margin >= BigInt::zero();
-    let accepted =
-        domain_accepted && fresh_error_accepted && mask_smudging_accepted && rounding_accepted;
-    Ok(AverageRefreshNoiseReport {
-        schema_version: AVERAGE_CASE_REPORT_SCHEMA_VERSION,
-        mode: NoiseModelKind::AverageCase,
-        authority: AcceptedUnder::AverageCase,
-        centered_coordinates: true,
-        decoder_factor,
-        mask_bound,
-        fresh_error_bound: fresh_bound,
-        event_budget: events,
-        mask_event_count,
-        fresh_event_count,
-        joint_event_count,
-        epsilon_joint,
-        masking_distance_bound,
-        z_sq,
-        tail_correction_bits: config.tail_correction_bits,
-        mask_statistical_security_bits: refresh.mask_statistical_security_bits,
-        mask_smudging_max_favg: max_favg,
-        mask_smudging_margin,
-        mask_smudging_accepted,
-        domain_margin,
-        domain_accepted,
-        fresh_error_accepted,
-        heuristics: {
-            heuristics.sort_by_key(|id| *id as u8);
-            heuristics.dedup();
-            heuristics
-        },
-        slots,
-        rounding_accepted,
-        accepted,
+
+    pub fn validate(
+        &self,
+        program: &ExponentLutProgram,
+        family_active_counts: &[usize],
+    ) -> Result<(), ProgramNoiseError> {
+        let mut expected = 0usize;
+        let mut family_index = 0usize;
+        for (step_index, step) in program.steps().iter().enumerate() {
+            let expected_operations = match step {
+                ProgramStep::Gate(gate) => gate_noise_operations(program, gate)?,
+                ProgramStep::Family { body, .. } => {
+                    let active = *family_active_counts
+                        .get(family_index)
+                        .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+                    if active == 0 {
+                        return Err(ProgramNoiseError::InvalidDecomposition);
+                    }
+                    family_index += 1;
+                    let mut operations = Vec::new();
+                    for gate in body.gates() {
+                        operations.extend(gate_noise_operations(program, gate)?);
+                    }
+                    operations.push(GateNoiseOperation::Add);
+                    operations
+                }
+            };
+            let start = expected;
+            expected = expected
+                .checked_add(expected_operations.len())
+                .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+            if expected > self.gates.len() ||
+                self.gates[start..expected].iter().enumerate().any(|(branch, gain)| {
+                    gain.step_index != step_index ||
+                        gain.branch_index != branch ||
+                        gain.operation != expected_operations[branch]
+                })
+            {
+                return Err(ProgramNoiseError::InvalidDecomposition);
+            }
+        }
+        if family_index != family_active_counts.len() ||
+            self.gates.len() != expected ||
+            self.gates.iter().enumerate().any(|(index, gain)| {
+                gain.operation_index != index ||
+                    gain.action.l1.is_zero() ||
+                    gain.action.l2_squared.is_zero() ||
+                    (gain.operation == GateNoiseOperation::Lut) != gain.helper_action.is_some() ||
+                    gain.helper_action
+                        .as_ref()
+                        .is_some_and(|helper| helper.l1.is_zero() || helper.l2_squared.is_zero())
+            })
+        {
+            return Err(ProgramNoiseError::InvalidDecomposition);
+        }
+        Ok(())
+    }
+}
+
+fn gate_noise_operations(
+    program: &ExponentLutProgram,
+    gate: &Gate,
+) -> Result<Vec<GateNoiseOperation>, ProgramNoiseError> {
+    let (operation, count) = match gate {
+        Gate::MulPrivate { .. } => (GateNoiseOperation::MulPrivate, 1),
+        Gate::MulPublic { .. } => (GateNoiseOperation::MulPublic, 1),
+        Gate::Add { .. } => (GateNoiseOperation::Add, 1),
+        Gate::Lut { lut, .. } => (
+            GateNoiseOperation::Lut,
+            program.lut(*lut).ok_or(ProgramNoiseError::MissingLut)?.values().len(),
+        ),
+    };
+    Ok(vec![operation; count])
+}
+
+fn family_body_action_count(
+    program: &ExponentLutProgram,
+    body: &crate::program::FamilyProgram,
+) -> Result<usize, ProgramNoiseError> {
+    body.gates().iter().try_fold(0usize, |count, gate| {
+        count
+            .checked_add(gate_noise_operations(program, gate)?.len())
+            .ok_or(ProgramNoiseError::IntegerConversion)
     })
 }
 
-fn coherent_shared_route_gain(mask_gain_l1: &BigUint, fresh_gain_l1: &BigUint) -> BigUint {
-    let combined = mask_gain_l1 + fresh_gain_l1;
-    &combined * &combined
+/// Complete error state carried by one simulated exponent-program wire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramNoiseState {
+    pub bound: BigUint,
+    pub doubled_variance: AverageVariance,
 }
 
-fn base_p_power(base_p: &BigUint, digits: usize) -> Result<BigUint, NoiseSimulationError> {
-    let digits = u32::try_from(digits).map_err(|_| NoiseSimulationError::IntegerConversion)?;
-    Ok(base_p.pow(digits))
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FamilyNoiseState {
+    /// A scalar broadcast, or a uniform input family, remains one shared state.
+    /// Its declared capacity is deliberately not materialized.
+    Uniform { state: ProgramNoiseState, active_count: usize },
+    /// Member states are allocated only for genuinely heterogeneous inputs.
+    Members(Vec<ProgramNoiseState>),
 }
 
-fn signed_difference(left: &BigUint, right: &BigUint) -> BigInt {
-    BigInt::from_biguint(Sign::Plus, left.clone()) - BigInt::from_biguint(Sign::Plus, right.clone())
-}
-
-fn validate_crt_factorization(
-    full_modulus: &BigUint,
-    plaintext_moduli: &[BigUint],
-) -> Result<(), NoiseSimulationError> {
-    if plaintext_moduli.is_empty() {
-        return Err(NoiseSimulationError::InvalidCrtFactorization);
+impl FamilyNoiseState {
+    fn active_count(&self) -> usize {
+        match self {
+            Self::Uniform { active_count, .. } => *active_count,
+            Self::Members(values) => values.len(),
+        }
     }
-    let mut product = BigUint::one();
-    for (index, modulus) in plaintext_moduli.iter().enumerate() {
-        if modulus <= &BigUint::one() || full_modulus % modulus != BigUint::zero() {
-            if modulus <= &BigUint::one() {
-                return Err(NoiseSimulationError::InvalidCrtFactorization);
+
+    fn map(
+        &self,
+        mut operation: impl FnMut(&ProgramNoiseState) -> PrimitiveNoiseTransfer,
+    ) -> (Self, Vec<PrimitiveNoiseTransfer>) {
+        match self {
+            Self::Uniform { state, active_count } => {
+                let transfer = operation(state);
+                (
+                    Self::Uniform { state: transfer.output(), active_count: *active_count },
+                    vec![transfer],
+                )
             }
-            return Err(NoiseSimulationError::InvalidCrtDivision);
+            Self::Members(values) => {
+                let transfers = values.iter().map(operation).collect::<Vec<_>>();
+                let outputs = transfers.iter().map(PrimitiveNoiseTransfer::output).collect();
+                (Self::Members(outputs), transfers)
+            }
         }
-        if plaintext_moduli[..index].iter().any(|previous| gcd(previous, modulus) != BigUint::one())
+    }
+
+    fn zip_map(
+        &self,
+        other: &Self,
+        mut operation: impl FnMut(&ProgramNoiseState, &ProgramNoiseState) -> PrimitiveNoiseTransfer,
+    ) -> Result<(Self, Vec<PrimitiveNoiseTransfer>), ProgramNoiseError> {
+        if self.active_count() != other.active_count() {
+            return Err(ProgramNoiseError::FamilyShapeMismatch);
+        }
+        match (self, other) {
+            (Self::Uniform { state: left, active_count }, Self::Uniform { state: right, .. }) => {
+                let transfer = operation(left, right);
+                Ok((
+                    Self::Uniform { state: transfer.output(), active_count: *active_count },
+                    vec![transfer],
+                ))
+            }
+            (Self::Members(left), Self::Members(right)) => {
+                let transfers = left
+                    .iter()
+                    .zip(right)
+                    .map(|(left, right)| operation(left, right))
+                    .collect::<Vec<_>>();
+                let outputs = transfers.iter().map(PrimitiveNoiseTransfer::output).collect();
+                Ok((Self::Members(outputs), transfers))
+            }
+            (Self::Uniform { state, .. }, Self::Members(values)) => {
+                let transfers =
+                    values.iter().map(|value| operation(state, value)).collect::<Vec<_>>();
+                let outputs = transfers.iter().map(PrimitiveNoiseTransfer::output).collect();
+                Ok((Self::Members(outputs), transfers))
+            }
+            (Self::Members(values), Self::Uniform { state, .. }) => {
+                let transfers =
+                    values.iter().map(|value| operation(value, state)).collect::<Vec<_>>();
+                let outputs = transfers.iter().map(PrimitiveNoiseTransfer::output).collect();
+                Ok((Self::Members(outputs), transfers))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NoiseProgramWire {
+    Scalar(ProgramNoiseState),
+    Family(FamilyNoiseState),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NoiseProgramRhs {
+    Scalar,
+    Family { active_count: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramNoiseInputs {
+    pub input_bounds: BTreeMap<ProgramInputId, BigUint>,
+    pub input_variances: BTreeMap<ProgramInputId, AverageVariance>,
+    #[serde(default)]
+    pub public_family_uniform_bounds: BTreeMap<WireFamilyId, BigUint>,
+    #[serde(default)]
+    pub public_family_uniform_variances: BTreeMap<WireFamilyId, AverageVariance>,
+    pub public_family_bounds: BTreeMap<WireFamilyId, Vec<BigUint>>,
+    pub public_family_variances: BTreeMap<WireFamilyId, Vec<AverageVariance>>,
+}
+
+impl Default for ProgramNoiseInputs {
+    fn default() -> Self {
+        Self {
+            input_bounds: BTreeMap::new(),
+            input_variances: BTreeMap::new(),
+            public_family_uniform_bounds: BTreeMap::new(),
+            public_family_uniform_variances: BTreeMap::new(),
+            public_family_bounds: BTreeMap::new(),
+            public_family_variances: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FamilyBodyNoiseStep {
+    pub body_gate_index: usize,
+    pub operation: GateNoiseOperation,
+    pub inherited_bound: BigUint,
+    pub fresh_bound: BigUint,
+    pub output_bound: BigUint,
+    pub inherited_variance: AverageVariance,
+    pub fresh_variance: AverageVariance,
+    pub output_variance: AverageVariance,
+    pub inherited_bits: usize,
+    pub fresh_bits: usize,
+    pub output_bits: usize,
+    pub bit_growth: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramNoiseStep {
+    pub step_index: usize,
+    pub inherited_bound: BigUint,
+    pub fresh_bound: BigUint,
+    pub output_bound: BigUint,
+    pub inherited_variance: AverageVariance,
+    pub fresh_variance: AverageVariance,
+    pub output_variance: AverageVariance,
+    pub constituent_bounds: Vec<BigUint>,
+    pub constituent_variances: Vec<AverageVariance>,
+    pub inherited_bits: usize,
+    pub fresh_bits: usize,
+    pub output_bits: usize,
+    pub family_body: Vec<FamilyBodyNoiseStep>,
+    #[serde(default)]
+    pub family_member_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgramNoiseReport {
+    pub wire_bounds: BTreeMap<WireId, BigUint>,
+    pub wire_variances: BTreeMap<WireId, AverageVariance>,
+    pub steps: Vec<ProgramNoiseStep>,
+    pub output_bound: BigUint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum ProgramNoiseError {
+    #[error("program input bound is missing: {0:?}")]
+    MissingInputBound(ProgramInputId),
+    #[error("program input variance is missing: {0:?}")]
+    MissingInputVariance(ProgramInputId),
+    #[error("public family member error state is missing: family {family:?}, member {member}")]
+    MissingPublicFamilyInput { family: WireFamilyId, member: usize },
+    #[error("program output is missing")]
+    MissingOutput,
+    #[error("integer conversion overflow")]
+    IntegerConversion,
+    #[error("decomposition schema is invalid or incomplete")]
+    InvalidDecomposition,
+    #[error("program LUT declaration is missing")]
+    MissingLut,
+    #[error("noise interpreter received incompatible scalar/family wire kinds")]
+    WireKindMismatch,
+    #[error("noise interpreter received incompatible family shapes")]
+    FamilyShapeMismatch,
+    #[error("program traversal failed: {0}")]
+    ProgramTraversal(String),
+}
+
+#[derive(Clone, Debug)]
+struct PrimitiveNoiseTransfer {
+    inherited_bound: BigUint,
+    fresh_bound: BigUint,
+    output_bound: BigUint,
+    inherited_variance: AverageVariance,
+    fresh_variance: AverageVariance,
+    output_variance: AverageVariance,
+}
+
+impl PrimitiveNoiseTransfer {
+    fn output(&self) -> ProgramNoiseState {
+        ProgramNoiseState {
+            bound: self.output_bound.clone(),
+            doubled_variance: self.output_variance.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OperationRecord {
+    operation: GateNoiseOperation,
+    transfers: Vec<PrimitiveNoiseTransfer>,
+    constituents: Vec<ProgramNoiseState>,
+    active_count: usize,
+}
+
+struct ProgramNoiseInterpreter<'a> {
+    program: &'a ExponentLutProgram,
+    helper_cutoff: &'a BigUint,
+    helper_variance: &'a AverageVariance,
+    actions: &'a [GateNoiseGains],
+    records: BTreeMap<ProgramGateInstance, OperationRecord>,
+}
+
+impl ProgramNoiseInterpreter<'_> {
+    fn action(
+        &self,
+        gate: ProgramGateInstance,
+        operation: GateNoiseOperation,
+    ) -> Result<&GateNoiseGains, ProgramNoiseError> {
+        let (step, range) = action_range(self.program, gate)?;
+        if range.len() != 1 {
+            return Err(ProgramNoiseError::InvalidDecomposition);
+        }
+        let branch = range.start;
+        self.actions
+            .iter()
+            .find(|gain| {
+                gain.step_index == step &&
+                    gain.branch_index == branch &&
+                    gain.operation == operation
+            })
+            .ok_or(ProgramNoiseError::InvalidDecomposition)
+    }
+
+    fn record(
+        &mut self,
+        gate: ProgramGateInstance,
+        operation: GateNoiseOperation,
+        transfers: Vec<PrimitiveNoiseTransfer>,
+        active_count: usize,
+    ) {
+        let constituents = transfers.iter().map(PrimitiveNoiseTransfer::output).collect();
+        self.records
+            .insert(gate, OperationRecord { operation, transfers, constituents, active_count });
+    }
+
+    fn record_with_constituents(
+        &mut self,
+        gate: ProgramGateInstance,
+        operation: GateNoiseOperation,
+        transfers: Vec<PrimitiveNoiseTransfer>,
+        constituents: Vec<ProgramNoiseState>,
+        active_count: usize,
+    ) {
+        self.records
+            .insert(gate, OperationRecord { operation, transfers, constituents, active_count });
+    }
+}
+
+impl ProgramLoweringTypes for ProgramNoiseInterpreter<'_> {
+    type Wire = NoiseProgramWire;
+    type Rhs = NoiseProgramRhs;
+    type HelperSet = ();
+    type Error = ProgramNoiseError;
+}
+
+impl ExponentProgramLowering for ProgramNoiseInterpreter<'_> {
+    fn mul_private(
+        &mut self,
+        lhs: &Self::Wire,
+        rhs: &Self::Rhs,
+        gate: ProgramGateInstance,
+    ) -> Result<Self::Wire, Self::Error> {
+        let action = self.action(gate, GateNoiseOperation::MulPrivate)?.action.clone();
+        match (lhs, rhs) {
+            (NoiseProgramWire::Scalar(state), NoiseProgramRhs::Scalar) => {
+                let transfer =
+                    transfer_mul_private(state, &action, self.helper_cutoff, self.helper_variance);
+                let output = transfer.output();
+                self.record(gate, GateNoiseOperation::MulPrivate, vec![transfer], 1);
+                Ok(NoiseProgramWire::Scalar(output))
+            }
+            (NoiseProgramWire::Family(states), NoiseProgramRhs::Family { active_count })
+                if states.active_count() == *active_count =>
+            {
+                let (output, transfers) = states.map(|state| {
+                    transfer_mul_private(state, &action, self.helper_cutoff, self.helper_variance)
+                });
+                self.record(gate, GateNoiseOperation::MulPrivate, transfers, *active_count);
+                Ok(NoiseProgramWire::Family(output))
+            }
+            _ => Err(ProgramNoiseError::WireKindMismatch),
+        }
+    }
+
+    fn mul_public(
+        &mut self,
+        private: &Self::Wire,
+        public: &Self::Wire,
+        gate: ProgramGateInstance,
+    ) -> Result<Self::Wire, Self::Error> {
+        let action = self.action(gate, GateNoiseOperation::MulPublic)?.action.clone();
+        match (private, public) {
+            (NoiseProgramWire::Scalar(private), NoiseProgramWire::Scalar(public)) => {
+                let transfer = transfer_mul_public(private, public, &action);
+                let output = transfer.output();
+                self.record(gate, GateNoiseOperation::MulPublic, vec![transfer], 1);
+                Ok(NoiseProgramWire::Scalar(output))
+            }
+            (NoiseProgramWire::Family(private), NoiseProgramWire::Family(public)) => {
+                let active_count = private.active_count();
+                let (output, transfers) = private.zip_map(public, |private, public| {
+                    transfer_mul_public(private, public, &action)
+                })?;
+                self.record(gate, GateNoiseOperation::MulPublic, transfers, active_count);
+                Ok(NoiseProgramWire::Family(output))
+            }
+            _ => Err(ProgramNoiseError::WireKindMismatch),
+        }
+    }
+
+    fn add(
+        &mut self,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
+        gate: ProgramGateInstance,
+    ) -> Result<Self::Wire, Self::Error> {
+        let _ = self.action(gate, GateNoiseOperation::Add)?;
+        match (lhs, rhs) {
+            (NoiseProgramWire::Scalar(lhs), NoiseProgramWire::Scalar(rhs)) => {
+                let transfer = transfer_add(lhs, rhs);
+                let output = transfer.output();
+                self.record(gate, GateNoiseOperation::Add, vec![transfer], 1);
+                Ok(NoiseProgramWire::Scalar(output))
+            }
+            (NoiseProgramWire::Family(lhs), NoiseProgramWire::Family(rhs)) => {
+                let active_count = lhs.active_count();
+                let (output, transfers) = lhs.zip_map(rhs, transfer_add)?;
+                self.record(gate, GateNoiseOperation::Add, transfers, active_count);
+                Ok(NoiseProgramWire::Family(output))
+            }
+            _ => Err(ProgramNoiseError::WireKindMismatch),
+        }
+    }
+
+    fn lut(
+        &mut self,
+        program: &ExponentLutProgram,
+        lut: LutId,
+        input: &Self::Wire,
+        _helpers: &Self::HelperSet,
+        gate: ProgramGateInstance,
+    ) -> Result<Self::Wire, Self::Error> {
+        let table = program.lut(lut).ok_or(ProgramNoiseError::MissingLut)?;
+        let (step, range) = action_range(program, gate)?;
+        let branch_actions = range
+            .map(|branch| {
+                self.actions.iter().find(|gain| {
+                    gain.step_index == step &&
+                        gain.branch_index == branch &&
+                        gain.operation == GateNoiseOperation::Lut
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+        if branch_actions.len() != table.values().len() ||
+            branch_actions.iter().any(|gain| gain.operation != GateNoiseOperation::Lut)
         {
-            return Err(NoiseSimulationError::InvalidCrtFactorization);
+            return Err(ProgramNoiseError::InvalidDecomposition);
         }
-        product *= modulus;
+        let evaluate = |state: &ProgramNoiseState| {
+            let branches = branch_actions
+                .iter()
+                .map(|gain| {
+                    transfer_lut_branch(
+                        state,
+                        &gain.action,
+                        gain.helper_action
+                            .as_ref()
+                            .ok_or(ProgramNoiseError::InvalidDecomposition)?,
+                        self.helper_cutoff,
+                        self.helper_variance,
+                    )
+                })
+                .collect::<Result<Vec<_>, ProgramNoiseError>>()?;
+            let aggregate = aggregate_lut_branches(state, &branches);
+            Ok::<_, ProgramNoiseError>((aggregate, branches))
+        };
+        match input {
+            NoiseProgramWire::Scalar(state) => {
+                let (transfer, branches) = evaluate(state)?;
+                let output = transfer.output();
+                let constituents = branches.iter().map(PrimitiveNoiseTransfer::output).collect();
+                self.record_with_constituents(
+                    gate,
+                    GateNoiseOperation::Lut,
+                    vec![transfer],
+                    constituents,
+                    1,
+                );
+                Ok(NoiseProgramWire::Scalar(output))
+            }
+            NoiseProgramWire::Family(states) => {
+                let active_count = states.active_count();
+                let (output, transfers, constituents) = match states {
+                    FamilyNoiseState::Uniform { state, active_count } => {
+                        let (transfer, branches) = evaluate(state)?;
+                        let constituents =
+                            branches.iter().map(PrimitiveNoiseTransfer::output).collect();
+                        (
+                            FamilyNoiseState::Uniform {
+                                state: transfer.output(),
+                                active_count: *active_count,
+                            },
+                            vec![transfer],
+                            constituents,
+                        )
+                    }
+                    FamilyNoiseState::Members(values) => {
+                        let evaluated =
+                            values.iter().map(evaluate).collect::<Result<Vec<_>, _>>()?;
+                        let transfers = evaluated
+                            .iter()
+                            .map(|(transfer, _)| transfer.clone())
+                            .collect::<Vec<_>>();
+                        let outputs = transfers
+                            .iter()
+                            .map(PrimitiveNoiseTransfer::output)
+                            .collect::<Vec<_>>();
+                        let constituents = evaluated
+                            .first()
+                            .map(|(_, branches)| {
+                                branches.iter().map(PrimitiveNoiseTransfer::output).collect()
+                            })
+                            .unwrap_or_default();
+                        (FamilyNoiseState::Members(outputs), transfers, constituents)
+                    }
+                };
+                self.record_with_constituents(
+                    gate,
+                    GateNoiseOperation::Lut,
+                    transfers,
+                    constituents,
+                    active_count,
+                );
+                Ok(NoiseProgramWire::Family(output))
+            }
+        }
     }
-    if product != *full_modulus {
-        return Err(NoiseSimulationError::InvalidCrtFactorization);
+
+    fn public_attribute_available(&self, _wire: &Self::Wire) -> bool {
+        true
     }
-    Ok(())
+
+    fn broadcast_wire(
+        &mut self,
+        wire: &Self::Wire,
+        range: &FamilyRange,
+    ) -> Result<Self::Wire, Self::Error> {
+        let NoiseProgramWire::Scalar(state) = wire else {
+            return Err(ProgramNoiseError::WireKindMismatch);
+        };
+        let active_count = range_count(range)?;
+        // A broadcast is one shared scalar state, not `capacity` copies.  The
+        // multiplicity is applied only when an active family is reduced.
+        Ok(NoiseProgramWire::Family(FamilyNoiseState::Uniform {
+            state: state.clone(),
+            active_count,
+        }))
+    }
+
+    fn reduce_add(
+        &mut self,
+        value: &Self::Wire,
+        range: &FamilyRange,
+        gate: ProgramGateInstance,
+    ) -> Result<Self::Wire, Self::Error> {
+        let NoiseProgramWire::Family(values) = value else {
+            return Err(ProgramNoiseError::WireKindMismatch);
+        };
+        let active_count = range_count(range)?;
+        if values.active_count() != active_count {
+            return Err(ProgramNoiseError::FamilyShapeMismatch);
+        }
+        // Only active members participate.  Explicit Program Add uses the
+        // worst-case coherent standard-deviation bound, represented here as
+        // `r * sum_i V_i`; a uniform family therefore becomes `r^2 V`.
+        let (bound_sum, variance_sum, constituents) = match values {
+            FamilyNoiseState::Uniform { state, .. } => (
+                &state.bound * active_count,
+                state.doubled_variance.scaled(&BigUint::from(active_count)),
+                vec![state.clone()],
+            ),
+            FamilyNoiseState::Members(values) => {
+                let bound = values.iter().fold(BigUint::zero(), |sum, state| sum + &state.bound);
+                let variance = values
+                    .iter()
+                    .fold(AverageVariance::zero(), |sum, state| sum.add(&state.doubled_variance));
+                (bound, variance, values.clone())
+            }
+        };
+        let output_variance = variance_sum.scaled(&BigUint::from(active_count));
+        let transfer = PrimitiveNoiseTransfer {
+            inherited_bound: bound_sum.clone(),
+            fresh_bound: BigUint::zero(),
+            output_bound: bound_sum,
+            inherited_variance: variance_sum,
+            fresh_variance: AverageVariance::zero(),
+            output_variance,
+        };
+        let output = transfer.output();
+        self.record_with_constituents(
+            gate,
+            GateNoiseOperation::Add,
+            vec![transfer],
+            constituents,
+            active_count,
+        );
+        Ok(NoiseProgramWire::Scalar(output))
+    }
+}
+
+fn transfer_mul_private(
+    inherited: &ProgramNoiseState,
+    action: &RightActionNoiseGain,
+    helper_cutoff: &BigUint,
+    helper_variance: &AverageVariance,
+) -> PrimitiveNoiseTransfer {
+    PrimitiveNoiseTransfer {
+        inherited_bound: inherited.bound.clone(),
+        fresh_bound: helper_cutoff.clone(),
+        output_bound: &action.l1 * &inherited.bound + helper_cutoff,
+        inherited_variance: inherited.doubled_variance.clone(),
+        fresh_variance: helper_variance.clone(),
+        output_variance: inherited.doubled_variance.scaled(&action.l2_squared).add(helper_variance),
+    }
+}
+
+fn transfer_mul_public(
+    private: &ProgramNoiseState,
+    public: &ProgramNoiseState,
+    action: &RightActionNoiseGain,
+) -> PrimitiveNoiseTransfer {
+    // The private accumulator itself is acted on by a public monomial (unit
+    // norm), while the public-label encoding error is acted on by K_private.
+    PrimitiveNoiseTransfer {
+        inherited_bound: private.bound.clone(),
+        fresh_bound: &action.l1 * &public.bound,
+        output_bound: &private.bound + &action.l1 * &public.bound,
+        inherited_variance: private.doubled_variance.clone(),
+        fresh_variance: public.doubled_variance.scaled(&action.l2_squared),
+        output_variance: private
+            .doubled_variance
+            .add(&public.doubled_variance.scaled(&action.l2_squared)),
+    }
+}
+
+fn transfer_add(lhs: &ProgramNoiseState, rhs: &ProgramNoiseState) -> PrimitiveNoiseTransfer {
+    let variance_sum = lhs.doubled_variance.add(&rhs.doubled_variance);
+    PrimitiveNoiseTransfer {
+        inherited_bound: lhs.bound.clone(),
+        fresh_bound: rhs.bound.clone(),
+        output_bound: &lhs.bound + &rhs.bound,
+        inherited_variance: lhs.doubled_variance.clone(),
+        fresh_variance: rhs.doubled_variance.clone(),
+        output_variance: variance_sum.scaled(&BigUint::from(2u8)),
+    }
+}
+
+fn transfer_lut_branch(
+    input: &ProgramNoiseState,
+    direct_action: &RightActionNoiseGain,
+    helper_action: &RightActionNoiseGain,
+    helper_cutoff: &BigUint,
+    helper_variance: &AverageVariance,
+) -> Result<PrimitiveNoiseTransfer, ProgramNoiseError> {
+    let helper_weight = BigUint::one() + &helper_action.l1;
+    let helper_variance_gain = BigUint::one() + &helper_action.l2_squared;
+    Ok(PrimitiveNoiseTransfer {
+        inherited_bound: input.bound.clone(),
+        fresh_bound: helper_cutoff * &helper_weight,
+        output_bound: &direct_action.l1 * &input.bound + helper_cutoff * &helper_weight,
+        inherited_variance: input.doubled_variance.clone(),
+        fresh_variance: helper_variance.scaled(&helper_variance_gain),
+        output_variance: input
+            .doubled_variance
+            .scaled(&direct_action.l2_squared)
+            .add(&helper_variance.scaled(&helper_variance_gain)),
+    })
+}
+
+fn aggregate_lut_branches(
+    input: &ProgramNoiseState,
+    branches: &[PrimitiveNoiseTransfer],
+) -> PrimitiveNoiseTransfer {
+    // Flat LUT branch errors use the accepted H3 independent-sum heuristic.
+    // This is intentionally not the conservative transfer for an explicit
+    // Program `Add` gate.
+    PrimitiveNoiseTransfer {
+        inherited_bound: input.bound.clone(),
+        fresh_bound: branches.iter().fold(BigUint::zero(), |sum, branch| sum + &branch.fresh_bound),
+        output_bound: branches
+            .iter()
+            .fold(BigUint::zero(), |sum, branch| sum + &branch.output_bound),
+        inherited_variance: input.doubled_variance.clone(),
+        fresh_variance: branches
+            .iter()
+            .fold(AverageVariance::zero(), |sum, branch| sum.add(&branch.fresh_variance)),
+        output_variance: branches
+            .iter()
+            .fold(AverageVariance::zero(), |sum, branch| sum.add(&branch.output_variance)),
+    }
+}
+
+/// Interprets a complete Exponent-LUT program and records every wire state.
+pub fn simulate_program(
+    program: &ExponentLutProgram,
+    inputs: &ProgramNoiseInputs,
+    helper_cutoff: &BigUint,
+    helper_variance: &AverageVariance,
+    actions: &[GateNoiseGains],
+    family_active_counts: &[usize],
+) -> Result<ProgramNoiseReport, ProgramNoiseError> {
+    let mut scalar_inputs = BTreeMap::new();
+    for (input, _) in program.input_wires() {
+        scalar_inputs.insert(
+            *input,
+            NoiseProgramWire::Scalar(ProgramNoiseState {
+                bound: inputs
+                    .input_bounds
+                    .get(input)
+                    .cloned()
+                    .ok_or(ProgramNoiseError::MissingInputBound(*input))?,
+                doubled_variance: inputs
+                    .input_variances
+                    .get(input)
+                    .cloned()
+                    .ok_or(ProgramNoiseError::MissingInputVariance(*input))?,
+            }),
+        );
+    }
+    let rhs_inputs = program
+        .rhs_inputs()
+        .keys()
+        .map(|id| (*id, NoiseProgramRhs::Scalar))
+        .collect::<BTreeMap<RhsId, _>>();
+    let mut rhs_families = BTreeMap::<RhsFamilyId, NoiseProgramRhs>::new();
+    let mut wire_values = BTreeMap::<WireFamilyId, NoiseProgramWire>::new();
+    let mut helpers = BTreeMap::<LutId, ()>::new();
+    let mut family_ranges = ProgramFamilyBindings::new();
+    let mut family_index = 0usize;
+    for step in program.steps() {
+        match step {
+            ProgramStep::Gate(Gate::Lut { lut, .. }) => {
+                helpers.insert(*lut, ());
+            }
+            ProgramStep::Gate(_) => {}
+            ProgramStep::Family { id, capacity, body, .. } => {
+                let count = *family_active_counts
+                    .get(family_index)
+                    .ok_or(ProgramNoiseError::FamilyShapeMismatch)?;
+                family_index += 1;
+                if count == 0 || count > *capacity {
+                    return Err(ProgramNoiseError::FamilyShapeMismatch);
+                }
+                family_ranges.bind(
+                    *id,
+                    FamilyRange::bounded(0usize, count, *capacity)
+                        .map_err(|error| ProgramNoiseError::ProgramTraversal(error.to_string()))?,
+                );
+                for source in body.rhs_inputs().values() {
+                    let FamilyRhsSource::Member(family) = source;
+                    rhs_families.insert(*family, NoiseProgramRhs::Family { active_count: count });
+                }
+                for source in body.wire_inputs().values() {
+                    let FamilyWireSource::Member(family) = source else { continue };
+                    wire_values.insert(
+                        *family,
+                        NoiseProgramWire::Family(program_family_input(inputs, *family, count)?),
+                    );
+                }
+                for gate in body.gates() {
+                    if let crate::program::Gate::Lut { lut, .. } = gate {
+                        helpers.insert(*lut, ());
+                    }
+                }
+            }
+        }
+    }
+    if family_index != family_active_counts.len() {
+        return Err(ProgramNoiseError::FamilyShapeMismatch);
+    }
+
+    let bindings =
+        ProgramBindings::new(&scalar_inputs, &rhs_inputs, &rhs_families, &wire_values, &helpers);
+    let mut interpreter = ProgramNoiseInterpreter {
+        program,
+        helper_cutoff,
+        helper_variance,
+        actions,
+        records: BTreeMap::new(),
+    };
+    let wires = lower_program(program, &bindings, &family_ranges, &mut interpreter)
+        .map_err(map_lower_error)?;
+    let output_wire = *program.outputs().last().ok_or(ProgramNoiseError::MissingOutput)?;
+    let NoiseProgramWire::Scalar(output) =
+        wires.get(&output_wire).cloned().ok_or(ProgramNoiseError::MissingOutput)?
+    else {
+        return Err(ProgramNoiseError::WireKindMismatch);
+    };
+    let mut wire_bounds = BTreeMap::new();
+    let mut wire_variances = BTreeMap::new();
+    for (wire, value) in &wires {
+        if let NoiseProgramWire::Scalar(state) = value {
+            wire_bounds.insert(*wire, state.bound.clone());
+            wire_variances.insert(*wire, state.doubled_variance.clone());
+        }
+    }
+    let steps = build_step_report(program, &interpreter.records)?;
+    Ok(ProgramNoiseReport { wire_bounds, wire_variances, steps, output_bound: output.bound })
+}
+
+fn program_family_input(
+    inputs: &ProgramNoiseInputs,
+    family: WireFamilyId,
+    count: usize,
+) -> Result<FamilyNoiseState, ProgramNoiseError> {
+    // Binding a uniform family keeps one shared scalar state. Only an
+    // explicitly index-dependent bound or variance allocates active members;
+    // the declared family capacity is never materialized here.
+    let member_bounds = inputs.public_family_bounds.get(&family);
+    let member_variances = inputs.public_family_variances.get(&family);
+    let uniform_bound = inputs.public_family_uniform_bounds.get(&family);
+    let uniform_variance = inputs.public_family_uniform_variances.get(&family);
+    match (member_bounds, member_variances, uniform_bound, uniform_variance) {
+        (Some(bounds), Some(variances), _, _)
+            if bounds.len() == count && variances.len() == count =>
+        {
+            Ok(FamilyNoiseState::Members(
+                bounds
+                    .iter()
+                    .cloned()
+                    .zip(variances.iter().cloned())
+                    .map(|(bound, doubled_variance)| ProgramNoiseState { bound, doubled_variance })
+                    .collect(),
+            ))
+        }
+        (None, None, Some(bound), Some(doubled_variance)) => Ok(FamilyNoiseState::Uniform {
+            state: ProgramNoiseState {
+                bound: bound.clone(),
+                doubled_variance: doubled_variance.clone(),
+            },
+            active_count: count,
+        }),
+        (None, Some(variances), Some(bound), _) if variances.len() == count => {
+            Ok(FamilyNoiseState::Members(
+                variances
+                    .iter()
+                    .cloned()
+                    .map(|doubled_variance| ProgramNoiseState {
+                        bound: bound.clone(),
+                        doubled_variance,
+                    })
+                    .collect(),
+            ))
+        }
+        (Some(bounds), None, _, Some(doubled_variance)) if bounds.len() == count => {
+            Ok(FamilyNoiseState::Members(
+                bounds
+                    .iter()
+                    .cloned()
+                    .map(|bound| ProgramNoiseState {
+                        bound,
+                        doubled_variance: doubled_variance.clone(),
+                    })
+                    .collect(),
+            ))
+        }
+        _ => Err(ProgramNoiseError::MissingPublicFamilyInput { family, member: count }),
+    }
+}
+
+fn build_step_report(
+    program: &ExponentLutProgram,
+    records: &BTreeMap<ProgramGateInstance, OperationRecord>,
+) -> Result<Vec<ProgramNoiseStep>, ProgramNoiseError> {
+    program
+        .steps()
+        .iter()
+        .enumerate()
+        .map(|(step_index, step)| match step {
+            ProgramStep::Gate(_) => {
+                let record = records
+                    .get(&ProgramGateInstance::Gate { step: step_index })
+                    .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+                noise_step(step_index, &record.transfers[0], &record.constituents, Vec::new(), 0)
+            }
+            ProgramStep::Family { body, .. } => {
+                let reduction = records
+                    .get(&ProgramGateInstance::FamilyReduction { step: step_index })
+                    .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+                let family_body = body
+                    .gates()
+                    .iter()
+                    .enumerate()
+                    .map(|(gate_index, _)| {
+                        let record = records
+                            .get(&ProgramGateInstance::FamilyGate {
+                                step: step_index,
+                                gate: gate_index,
+                            })
+                            .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+                        Ok(family_body_noise_step(
+                            gate_index,
+                            record.operation,
+                            &record.transfers[0],
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ProgramNoiseError>>()?;
+                noise_step(
+                    step_index,
+                    &reduction.transfers[0],
+                    &reduction.constituents,
+                    family_body,
+                    reduction.active_count,
+                )
+            }
+        })
+        .collect()
+}
+
+fn noise_step(
+    step_index: usize,
+    transfer: &PrimitiveNoiseTransfer,
+    constituents: &[ProgramNoiseState],
+    family_body: Vec<FamilyBodyNoiseStep>,
+    family_member_count: usize,
+) -> Result<ProgramNoiseStep, ProgramNoiseError> {
+    Ok(ProgramNoiseStep {
+        step_index,
+        inherited_bound: transfer.inherited_bound.clone(),
+        fresh_bound: transfer.fresh_bound.clone(),
+        output_bound: transfer.output_bound.clone(),
+        inherited_variance: transfer.inherited_variance.clone(),
+        fresh_variance: transfer.fresh_variance.clone(),
+        output_variance: transfer.output_variance.clone(),
+        constituent_bounds: constituents.iter().map(|state| state.bound.clone()).collect(),
+        constituent_variances: constituents
+            .iter()
+            .map(|state| state.doubled_variance.clone())
+            .collect(),
+        inherited_bits: bit_length(&transfer.inherited_bound),
+        fresh_bits: bit_length(&transfer.fresh_bound),
+        output_bits: bit_length(&transfer.output_bound),
+        family_body,
+        family_member_count,
+    })
+}
+
+fn family_body_noise_step(
+    body_gate_index: usize,
+    operation: GateNoiseOperation,
+    transfer: &PrimitiveNoiseTransfer,
+) -> FamilyBodyNoiseStep {
+    let inherited_bits = bit_length(&transfer.inherited_bound);
+    let fresh_bits = bit_length(&transfer.fresh_bound);
+    let output_bits = bit_length(&transfer.output_bound);
+    FamilyBodyNoiseStep {
+        body_gate_index,
+        operation,
+        inherited_bound: transfer.inherited_bound.clone(),
+        fresh_bound: transfer.fresh_bound.clone(),
+        output_bound: transfer.output_bound.clone(),
+        inherited_variance: transfer.inherited_variance.clone(),
+        fresh_variance: transfer.fresh_variance.clone(),
+        output_variance: transfer.output_variance.clone(),
+        inherited_bits,
+        fresh_bits,
+        output_bits,
+        bit_growth: output_bits.saturating_sub(inherited_bits.max(fresh_bits)),
+    }
+}
+
+fn action_range(
+    program: &ExponentLutProgram,
+    instance: ProgramGateInstance,
+) -> Result<(usize, std::ops::Range<usize>), ProgramNoiseError> {
+    let step_index = match instance {
+        ProgramGateInstance::Gate { step } |
+        ProgramGateInstance::FamilyGate { step, .. } |
+        ProgramGateInstance::FamilyReduction { step } => step,
+    };
+    let step = program.steps().get(step_index).ok_or(ProgramNoiseError::InvalidDecomposition)?;
+    match (instance, step) {
+        (ProgramGateInstance::Gate { .. }, ProgramStep::Gate(gate)) => {
+            Ok((step_index, 0..gate_noise_operations(program, gate)?.len()))
+        }
+        (ProgramGateInstance::FamilyGate { gate, .. }, ProgramStep::Family { body, .. }) => {
+            let mut start = 0usize;
+            for body_gate in body.gates().iter().take(gate) {
+                start = start
+                    .checked_add(gate_noise_operations(program, body_gate)?.len())
+                    .ok_or(ProgramNoiseError::IntegerConversion)?;
+            }
+            let count = gate_noise_operations(
+                program,
+                body.gates().get(gate).ok_or(ProgramNoiseError::InvalidDecomposition)?,
+            )?
+            .len();
+            Ok((step_index, start..start + count))
+        }
+        (ProgramGateInstance::FamilyReduction { .. }, ProgramStep::Family { body, .. }) => {
+            let start = family_body_action_count(program, body)?;
+            Ok((step_index, start..start + 1))
+        }
+        _ => Err(ProgramNoiseError::InvalidDecomposition),
+    }
+}
+
+fn range_count(range: &FamilyRange) -> Result<usize, ProgramNoiseError> {
+    range
+        .count()
+        .evaluate(&ParamEnv::default())
+        .map_err(|_| ProgramNoiseError::FamilyShapeMismatch)?
+        .to_usize()
+        .filter(|count| *count != 0)
+        .ok_or(ProgramNoiseError::FamilyShapeMismatch)
+}
+
+fn map_lower_error(error: ProgramLowerError<ProgramNoiseError>) -> ProgramNoiseError {
+    match error {
+        ProgramLowerError::Operation { source, .. } => source,
+        ProgramLowerError::Validation(error) => {
+            ProgramNoiseError::ProgramTraversal(error.to_string())
+        }
+    }
 }
 
 fn gcd(left: &BigUint, right: &BigUint) -> BigUint {
@@ -2278,722 +1797,6 @@ fn gcd(left: &BigUint, right: &BigUint) -> BigUint {
     left
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        pbc::{
-            PbcActiveCellIndex, PbcParameters, PbcPublicLayout, PbcRootSeed, derive_attempt_seed,
-        },
-        program::ExponentLutProgramBuilder,
-    };
-
-    fn parameters() -> ExponentLutNoiseParameters {
-        ExponentLutNoiseParameters::dense(8, BigUint::from(4u8), 3, BigUint::from(2u8)).unwrap()
-    }
-
-    #[test]
-    fn average_transfers_derive_l2_squared_gains_from_structural_model() {
-        let parameters = parameters();
-        let transfer = average_fixed_lut_transfer(&parameters, 2).unwrap();
-        assert_eq!(transfer.gain_sq, BigUint::from(2u8) * parameters.gamma_c_l2_sq());
-    }
-
-    #[test]
-    fn average_variance_is_reduced_and_stays_in_doubled_units() {
-        let variance = AverageVariance::new(BigUint::from(8u8), BigUint::from(12u8)).unwrap();
-        assert_eq!(
-            variance,
-            AverageVariance { numerator: BigUint::from(2u8), denominator: BigUint::from(3u8) }
-        );
-        // beta=2, ell=1 has doubled digit variance one exactly.
-        let p =
-            ExponentLutNoiseParameters::dense(8, BigUint::from(2u8), 1, BigUint::one()).unwrap();
-        assert_eq!(
-            p.helper_doubled_variance(),
-            AverageVariance::new(BigUint::one(), BigUint::one()).unwrap()
-        );
-    }
-
-    #[test]
-    fn coherent_shared_mask_and_fresh_routes_use_l1_sum_squared() {
-        let conservative = coherent_shared_route_gain(&BigUint::from(2u8), &BigUint::one());
-        assert_eq!(conservative, BigUint::from(9u8));
-        assert!(conservative > BigUint::from(2u8) * BigUint::from(2u8));
-    }
-
-    #[test]
-    fn average_refresh_propagates_coherent_shared_prf_route_into_slot_variance() {
-        let model = parameters();
-        let refresh = RefreshNoiseParameters::from_structural(
-            &model,
-            BigUint::from(15u8),
-            BigUint::from(2u8),
-            BigUint::from(2u8),
-            1,
-            1,
-            0,
-            1,
-            1,
-            vec![BigUint::from(15u8)],
-            BigUint::one(),
-        )
-        .unwrap();
-        let report = simulate_average_refresh(
-            &model,
-            &refresh,
-            AverageVariance::zero(),
-            AverageVariance::new(BigUint::one(), BigUint::one()).unwrap(),
-            &AverageCaseConfig { allow_average_acceptance: true, ..Default::default() },
-        )
-        .unwrap();
-        let digit_variance = AverageVariance::new(
-            refresh.mask_digit_l2_sq_gains.iter().cloned().sum(),
-            BigUint::one(),
-        )
-        .unwrap();
-        let expected = digit_variance.add(
-            &AverageVariance::new(
-                coherent_shared_route_gain(
-                    &refresh.mask_route_gain,
-                    &refresh.fresh_error_route_gains[0],
-                ),
-                BigUint::one(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(report.slots[0].mask_variance, expected);
-    }
-
-    #[test]
-    fn average_refresh_rejects_malformed_shared_route_gains() {
-        let model = parameters();
-        let mut refresh = RefreshNoiseParameters::from_structural(
-            &model,
-            BigUint::from(15u8),
-            BigUint::from(2u8),
-            BigUint::from(2u8),
-            1,
-            1,
-            0,
-            1,
-            1,
-            vec![BigUint::from(15u8)],
-            BigUint::one(),
-        )
-        .unwrap();
-        let mut zero_refresh = refresh.clone();
-        refresh.fresh_error_route_gains.pop();
-        assert!(
-            simulate_average_refresh(
-                &model,
-                &refresh,
-                AverageVariance::zero(),
-                AverageVariance::new(BigUint::one(), BigUint::one()).unwrap(),
-                &AverageCaseConfig { allow_average_acceptance: true, ..Default::default() },
-            )
-            .is_err()
-        );
-        zero_refresh.fresh_error_route_gains = vec![BigUint::zero()];
-        assert!(
-            simulate_average_refresh(
-                &model,
-                &zero_refresh,
-                AverageVariance::zero(),
-                AverageVariance::new(BigUint::one(), BigUint::one()).unwrap(),
-                &AverageCaseConfig { allow_average_acceptance: true, ..Default::default() },
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn average_tail_budget_is_exact_and_acceptance_is_strict() {
-        let config = AverageCaseConfig {
-            failure_exponent: 10,
-            input_domain_log2: 2,
-            extra_event_log2: 3,
-            tail_correction_bits: 0,
-            allow_average_acceptance: true,
-        };
-        let events = AverageEventBudget {
-            input_domain_log2: 2,
-            coefficient_log2: 1,
-            slot_log2: 2,
-            inspection_event_log2: 3,
-        };
-        assert_eq!(events.log2_events().unwrap(), 8);
-        assert_eq!(
-            config.z_squared(events).unwrap(),
-            AverageVariance::new(
-                BigUint::from(2u8) * BigUint::from(693_148u32) * BigUint::from(19u8),
-                BigUint::from(1_000_000u32),
-            )
-            .unwrap()
-        );
-        let variance = AverageVariance::new(BigUint::one(), BigUint::one()).unwrap();
-        assert!(
-            !average_refresh_accepts(
-                &BigUint::from(2u8),
-                &BigUint::one(),
-                &BigUint::one(),
-                &BigUint::one(),
-                0,
-                &variance
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            average_refresh_accepts(
-                &BigUint::from(2u8),
-                &BigUint::one(),
-                &BigUint::one(),
-                &BigUint::one(),
-                u32::MAX,
-                &variance,
-            ),
-            Err(NoiseSimulationError::IntegerConversion)
-        );
-    }
-
-    #[test]
-    fn average_favg_uses_exact_ceil_sqrt_and_zero_boundary() {
-        assert_eq!(ceil_sqrt(&BigUint::zero()).unwrap(), 0u8.into());
-        assert_eq!(ceil_sqrt(&BigUint::one()).unwrap(), 1u8.into());
-        assert_eq!(ceil_sqrt(&BigUint::from(2u8)).unwrap(), 2u8.into());
-        assert_eq!(ceil_sqrt(&BigUint::from(3u8)).unwrap(), 2u8.into());
-        assert_eq!(ceil_sqrt(&BigUint::from(4u8)).unwrap(), 2u8.into());
-        let z_sq = AverageVariance::new(1u8.into(), 1u8.into()).unwrap();
-        let variance = AverageVariance::new(16u8.into(), 1u8.into()).unwrap();
-        assert_eq!(average_favg(&z_sq, &AverageVariance::zero(), 0).unwrap(), 0u8.into());
-        assert_eq!(average_favg(&z_sq, &variance, 0).unwrap(), 2u8.into());
-        assert_eq!(average_favg(&z_sq, &variance, 1).unwrap(), 4u8.into());
-    }
-
-    #[test]
-    fn average_tail_correction_overflow_fails_closed() {
-        let z_sq = AverageVariance::new(1u8.into(), 1u8.into()).unwrap();
-        let variance = AverageVariance::new(1u8.into(), 1u8.into()).unwrap();
-        assert_eq!(
-            average_favg(&z_sq, &variance, u32::MAX),
-            Err(NoiseSimulationError::IntegerConversion)
-        );
-    }
-
-    #[test]
-    fn average_smudging_equality_is_accepted() {
-        let required =
-            average_smudging_required(3, &BigUint::from(2u8), &BigUint::from(4u8)).unwrap();
-        assert_eq!(required, BigUint::from(128u8));
-        assert!(signed_difference(&required, &required) >= BigInt::zero());
-    }
-
-    #[test]
-    fn average_snapshot_pairs_structural_setup() {
-        let pbc_parameters = PbcParameters::paper_evaluation(10, 4);
-        let layout = PbcPublicLayout::build(
-            &pbc_parameters,
-            derive_attempt_seed(PbcRootSeed([12u8; 32]), 0),
-            0,
-        )
-        .unwrap();
-        let profile = crate::prf::SparseLwrPrfProfile::new(2, 2, 8, 8).unwrap();
-        let program = crate::prf::SparseLwrPrfProgram::new(
-            profile,
-            layout.bucket_width,
-            layout.parameters.bucket_count,
-        )
-        .unwrap();
-        let model = parameters();
-        let snapshot = ExponentLutNoiseSnapshot::from_setup(
-            [9u8; 32],
-            program,
-            layout,
-            model,
-            BigUint::from(60u8),
-            BigUint::from(2u8),
-            3,
-            2,
-            0,
-            3,
-            2,
-            vec![BigUint::from(3u8), BigUint::from(4u8), BigUint::from(5u8)],
-            BigUint::from(5u8),
-            BigUint::zero(),
-            AverageVariance::new(BigUint::from(4u8), BigUint::one()).unwrap(),
-        )
-        .unwrap();
-        let report = snapshot
-            .simulate_average(&AverageCaseConfig {
-                allow_average_acceptance: true,
-                ..AverageCaseConfig::default()
-            })
-            .unwrap();
-        assert_eq!(
-            snapshot.initial_average_variance(),
-            &AverageVariance::new(BigUint::from(4u8), BigUint::one()).unwrap()
-        );
-        assert!(report.refresh.centered_coordinates);
-        assert_eq!(report.refresh.mask_event_count, BigUint::from(108u8));
-        assert_eq!(report.refresh.fresh_event_count, BigUint::from(24u8));
-        assert_eq!(report.refresh.joint_event_count, BigUint::from(132u8));
-        assert!(report.refresh.slots.iter().all(|slot| slot.z_sq == report.refresh.z_sq));
-        assert_eq!(report.refresh.decoder_factor, BigUint::from(2u8));
-        assert_eq!(report.security_authority, "harness");
-        assert_eq!(report.correctness_authority, NoiseModelKind::AverageCase);
-        assert_eq!(report.accepted, report.hard_authority_accepted && report.correctness_accepted);
-    }
-
-    #[test]
-    fn average_refresh_rejects_non_binary_base_without_structural_centering() {
-        let pbc_parameters = PbcParameters::paper_evaluation(10, 4);
-        let layout = PbcPublicLayout::build(
-            &pbc_parameters,
-            derive_attempt_seed(PbcRootSeed([13u8; 32]), 0),
-            0,
-        )
-        .unwrap();
-        let profile = crate::prf::SparseLwrPrfProfile::new(2, 2, 8, 8).unwrap();
-        let program = crate::prf::SparseLwrPrfProgram::new(
-            profile,
-            layout.bucket_width,
-            layout.parameters.bucket_count,
-        )
-        .unwrap();
-        let snapshot = ExponentLutNoiseSnapshot::from_setup(
-            [10u8; 32],
-            program,
-            layout,
-            parameters(),
-            BigUint::from(60u8),
-            BigUint::from(2u8),
-            3,
-            2,
-            0,
-            3,
-            2,
-            vec![BigUint::from(3u8), BigUint::from(4u8), BigUint::from(5u8)],
-            BigUint::from(5u8),
-            BigUint::zero(),
-            AverageVariance::zero(),
-        )
-        .unwrap();
-        let mut refresh = snapshot.refresh.clone();
-        refresh.base_p = BigUint::from(4u8);
-        assert_eq!(
-            simulate_average_refresh(
-                &snapshot.model,
-                &refresh,
-                AverageVariance::zero(),
-                AverageVariance::zero(),
-                &AverageCaseConfig::default(),
-            ),
-            Err(NoiseSimulationError::UnsupportedAverageRefresh)
-        );
-    }
-
-    #[test]
-    fn dense_gain_is_regular_two_component_bound() {
-        let p = parameters();
-        // 2 * ell * n * Delta = 2 * 3 * 8 * 2.
-        assert_eq!(p.regular_dense_gain(), BigUint::from(96u8));
-        assert_eq!(p.delta(), BigUint::from(2u8));
-    }
-
-    #[test]
-    fn non_power_of_two_base_is_rejected() {
-        assert_eq!(
-            ExponentLutNoiseParameters::dense(8, BigUint::from(3u8), 3, BigUint::from(2u8)),
-            Err(NoiseSimulationError::InvalidGadgetBase)
-        );
-    }
-
-    #[test]
-    fn balanced_digits_use_tie_to_even_for_beta_two_four_and_eight() {
-        let cases = [
-            (BigUint::from(2u8), BigUint::from(1u8), vec![BigInt::from(1)]),
-            (
-                BigUint::from(2u8),
-                BigUint::from(3u8),
-                vec![BigInt::from(-1), BigInt::from(0), BigInt::from(1)],
-            ),
-            (BigUint::from(2u8), BigUint::from(16u8), vec![BigInt::from(-1)]),
-            (BigUint::from(4u8), BigUint::from(2u8), vec![BigInt::from(2)]),
-            (BigUint::from(4u8), BigUint::from(6u8), vec![BigInt::from(-2), BigInt::from(2)]),
-            (BigUint::from(4u8), BigUint::from(15u8), vec![BigInt::from(-2)]),
-            (BigUint::from(8u8), BigUint::from(4u8), vec![BigInt::from(4)]),
-            (BigUint::from(8u8), BigUint::from(13u8), vec![BigInt::from(-4)]),
-        ];
-        for (beta, value, expected) in cases {
-            assert_eq!(
-                balanced_digits_for_tower(&value, &BigUint::from(17u8), &beta, expected.len())
-                    .unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn refresh_action_gains_are_target_aware_and_not_dense_scaled() {
-        let gains = refresh_action_gains(
-            &BigUint::from(15u8),
-            &[BigUint::from(3u8), BigUint::from(5u8)],
-            &BigUint::from(2u8),
-            2,
-            2,
-            &BigUint::from(4u8),
-            2,
-            1,
-        )
-        .unwrap();
-        assert_eq!(gains.mask_digit_gains, vec![BigUint::from(2u8), BigUint::from(3u8)]);
-        assert_eq!(gains.mask_digit_l2_sq_gains, vec![BigUint::from(2u8), BigUint::from(5u8)]);
-        assert_eq!(gains.mask_route_gain, BigUint::from(5u8));
-        assert_eq!(gains.mask_route_l2_sq_gain, BigUint::from(7u8));
-        assert_eq!(gains.gamma_kappa, vec![BigUint::one(), BigUint::from(2u8)]);
-        assert_eq!(gains.gamma_kappa_l2_sq, vec![BigUint::one(), BigUint::from(4u8)]);
-        assert_eq!(gains.fresh_error_route_gains, vec![BigUint::from(2u8), BigUint::from(3u8)]);
-        assert_eq!(
-            gains.fresh_error_route_l2_sq_gains,
-            vec![BigUint::from(2u8), BigUint::from(5u8)]
-        );
-        assert_eq!(gains.fresh_error_digit_gains[0], vec![BigUint::one(), BigUint::one()]);
-        assert_eq!(gains.fresh_error_digit_gains[1], vec![BigUint::from(2u8), BigUint::one()]);
-        assert_eq!(gains.fresh_error_digit_l2_sq_gains[0], vec![BigUint::one(), BigUint::one()]);
-        assert_eq!(
-            gains.fresh_error_digit_l2_sq_gains[1],
-            vec![BigUint::from(4u8), BigUint::one()]
-        );
-    }
-
-    #[test]
-    fn program_simulation_covers_unary_binary_and_fuse() {
-        let mut builder = ExponentLutProgramBuilder::new();
-        let input = builder.input(2).unwrap();
-        let family = builder.rhs_family(2).unwrap();
-        let rhs = builder.rhs_input(family, 2, 2).unwrap();
-        let unary_lut =
-            builder.lut(crate::program::LutTable::unary(2, 8, vec![0, 1]).unwrap()).unwrap();
-        let binary_lut = builder
-            .lut(crate::program::LutTable::binary(2, 2, 8, vec![0, 1, 2, 3]).unwrap())
-            .unwrap();
-        let unary = builder.unary(builder.input_wire(input).unwrap(), unary_lut).unwrap();
-        let binary = builder.binary(builder.input_wire(input).unwrap(), rhs, binary_lut).unwrap();
-        builder.output(unary).unwrap();
-        builder.output(binary).unwrap();
-        let program = builder.build().unwrap();
-        let mut inputs = ProgramNoiseInputs::default();
-        inputs.input_bounds.insert(input, BigUint::from(1u8));
-        let report = simulate_program(&program, &parameters(), &inputs).unwrap();
-        assert_eq!(report.steps.len(), 2);
-        assert_eq!(report.steps[1].transfer.gain, BigUint::from(384u32) * BigUint::from(96u32));
-        assert_eq!(
-            report.steps[1].transfer.additive,
-            BigUint::from(384u32) * BigUint::from(2u8) +
-                BigUint::from(4u8) * BigUint::from(97u32) * BigUint::from(2u8)
-        );
-    }
-
-    #[test]
-    fn standalone_transfers_are_exact_and_explicit() {
-        let parameters = parameters();
-        let fuse = fixed_fuse_transfer(&parameters, BigUint::from(3u8));
-        assert_eq!(fuse.gain, BigUint::from(96u8));
-        assert_eq!(fuse.additive, BigUint::from(6u8));
-        let lut = fixed_lut_transfer(&parameters, 4).unwrap();
-        assert_eq!(lut.gain, BigUint::from(384u16));
-        assert_eq!(lut.additive, BigUint::from(776u16));
-        let two_input = two_input_lut_transfer(&parameters, 4, BigUint::from(3u8)).unwrap();
-        assert_eq!(two_input.gain, BigUint::from(384u16) * BigUint::from(96u8));
-        assert_eq!(
-            two_input.additive,
-            BigUint::from(384u16) * BigUint::from(6u8) + BigUint::from(776u16)
-        );
-        let monomial = monomial_one_hot_transfer(&parameters, 2, 4).unwrap();
-        assert_eq!(monomial.gain, BigUint::from(384u16) * BigUint::from(192u8));
-        assert_eq!(monomial.additive, BigUint::from(2312u16));
-    }
-
-    #[test]
-    fn secret_dimension_is_checked_by_simulation() {
-        let mut parameters = parameters();
-        parameters.secret_dimension = 1;
-        let mut builder = ExponentLutProgramBuilder::new();
-        let input = builder.input(2).unwrap();
-        let lut = builder.lut(crate::program::LutTable::unary(2, 4, vec![0, 1]).unwrap()).unwrap();
-        let output = builder.unary(builder.input_wire(input).unwrap(), lut).unwrap();
-        builder.output(output).unwrap();
-        let program = builder.build().unwrap();
-        let mut inputs = ProgramNoiseInputs::default();
-        inputs.input_bounds.insert(input, BigUint::zero());
-        assert_eq!(
-            simulate_program(&program, &parameters, &inputs),
-            Err(NoiseSimulationError::InvalidSecretDimension)
-        );
-    }
-
-    #[test]
-    fn active_widths_are_derived_from_public_layout_and_exclude_padding() {
-        let parameters = PbcParameters::paper_evaluation(10, 4);
-        let layout =
-            PbcPublicLayout::build(&parameters, derive_attempt_seed(PbcRootSeed([7u8; 32]), 0), 0)
-                .unwrap();
-        let active = PbcActiveCellIndex::build(&layout).unwrap();
-        assert!(
-            active
-                .bucket_active_widths()
-                .zip(layout.cells.iter())
-                .any(|(width, row)| width < row.len())
-        );
-    }
-
-    #[test]
-    fn sparse_prf_uses_layout_active_widths_internally() {
-        let pbc_parameters = PbcParameters::paper_evaluation(10, 4);
-        let layout = PbcPublicLayout::build(
-            &pbc_parameters,
-            derive_attempt_seed(PbcRootSeed([8u8; 32]), 0),
-            0,
-        )
-        .unwrap();
-        let profile = crate::prf::SparseLwrPrfProfile::new(2, 2, 8, 8).unwrap();
-        let program = crate::prf::SparseLwrPrfProgram::new(
-            profile,
-            layout.bucket_width,
-            layout.parameters.bucket_count,
-        )
-        .unwrap();
-        let report =
-            simulate_sparse_prf(&program, &parameters(), &layout, BigUint::zero()).unwrap();
-        assert_eq!(report.bucket_bounds.len(), layout.parameters.bucket_count);
-        assert_eq!(report.bucket_bounds.len(), layout.cells.len());
-        assert_eq!(report.bucket_stages.len(), report.bucket_bounds.len());
-        assert!(report.bucket_stages.iter().enumerate().all(|(index, stage)| {
-            stage.bucket == index &&
-                stage.one_hot_output_bound <= stage.lut_output_bound &&
-                stage.active_count <= layout.bucket_width &&
-                stage.selection_inherited_bits == stage.selection_inherited_bound.bits() as usize &&
-                stage.selection_additive_bits == stage.selection_additive_bound.bits() as usize
-        }));
-        assert!(report.group_stages.iter().all(|group| {
-            group.additive_bound == group.base_helper_additive.clone() + &group.gamma_a_additive &&
-                group.output_bound == group.inherited_bound.clone() + &group.additive_bound
-        }));
-        assert_eq!(
-            report.terminal_additive_bound,
-            report.terminal_base_helper_additive.clone() + &report.terminal_gamma_a_additive
-        );
-        assert_eq!(report.terminal_additive_bits, report.terminal_additive_bound.bits() as usize);
-        assert_eq!(report.terminal_inherited_bits, report.terminal_inherited_bound.bits() as usize);
-        assert_eq!(report.terminal_lut_width, report.lut_width);
-        assert_eq!(report.terminal_gamma_c, parameters().gamma_c().clone());
-        assert_eq!(report.terminal_gamma_a, parameters().gamma_a().clone());
-    }
-
-    #[test]
-    fn structural_refresh_route_scale_and_decoder_gains_are_exact() {
-        let model = parameters();
-        let refresh = RefreshNoiseParameters::from_structural(
-            &model,
-            BigUint::from(60u8),
-            BigUint::from(2u8),
-            BigUint::from(8u8),
-            3,
-            2,
-            0,
-            3,
-            2,
-            vec![BigUint::from(3u8), BigUint::from(4u8), BigUint::from(5u8)],
-            BigUint::from(5u8),
-        )
-        .unwrap();
-        assert_eq!(refresh.mask_route_gain, BigUint::from(20u8));
-        assert_eq!(
-            refresh.mask_digit_gains,
-            vec![BigUint::from(3u8), BigUint::from(5u8), BigUint::from(2u8)]
-        );
-        assert_eq!(refresh.slots[0].gamma_kappa, BigUint::one());
-        assert_eq!(refresh.slots[1].gamma_kappa, BigUint::one());
-        assert_eq!(refresh.slots[2].gamma_kappa, BigUint::from(2u8));
-        assert_eq!(refresh.slots[0].fresh_error_route_gain, BigUint::from(4u8));
-        assert_eq!(refresh.slots[1].fresh_error_route_gain, BigUint::from(6u8));
-        assert_eq!(refresh.slots[2].fresh_error_route_gain, BigUint::from(6u8));
-        assert_eq!(refresh.component_columns, 6);
-        assert_eq!(refresh.slots[0].kappa, BigUint::from(20u8));
-        assert_eq!(refresh.slots[1].kappa, BigUint::from(15u8));
-        assert_eq!(refresh.slots[2].kappa, BigUint::from(12u8));
-        let report = simulate_refresh(&model, &refresh, BigUint::zero(), BigUint::zero()).unwrap();
-        assert_eq!(report.exposed_transcript_coordinates, BigUint::from(36u8));
-        assert_eq!(report.slots[0].operation_noise_bound, BigUint::from(800u16));
-        assert_eq!(report.mask_statistical_required, BigUint::from(57_600u32));
-    }
-
-    #[test]
-    fn generic_program_simulation_rejects_one_hot() {
-        let mut builder = ExponentLutProgramBuilder::new();
-        let input = builder.input(4).unwrap();
-        let selector = builder.rhs_family(4).unwrap();
-        let values = builder.public_value_family(4).unwrap();
-        let output =
-            builder.one_hot_select(builder.input_wire(input).unwrap(), selector, values).unwrap();
-        builder.output(output).unwrap();
-        let program = builder.build().unwrap();
-        let mut inputs = ProgramNoiseInputs::default();
-        inputs.input_bounds.insert(input, BigUint::from(3u8));
-        inputs.one_hot_active_counts.insert(0, 2);
-        assert_eq!(
-            simulate_program(&program, &parameters(), &inputs),
-            Err(NoiseSimulationError::UnsupportedOneHot)
-        );
-    }
-
-    #[test]
-    fn refresh_equality_is_rejected_and_success_resets() {
-        let p =
-            ExponentLutNoiseParameters::dense(1, BigUint::from(4u8), 14, BigUint::one()).unwrap();
-        // The largest CRT factor is chosen so its spacing is exactly the
-        // strict rounding boundary. Other factors have strictly larger
-        // spacing, so the rejection is attributable to equality itself.
-        let pre = BigUint::from(8_254u32);
-        let equality_factor = BigUint::from(8_255u32);
-        let q = &pre * &equality_factor;
-        let refresh = RefreshNoiseParameters::from_structural(
-            &p,
-            q,
-            BigUint::from(2u8),
-            BigUint::from(2u8),
-            12,
-            1,
-            0,
-            2,
-            1,
-            vec![pre.clone(), equality_factor],
-            BigUint::one(),
-        )
-        .unwrap();
-        let report = simulate_refresh(&p, &refresh, BigUint::zero(), BigUint::zero()).unwrap();
-        assert!(!report.accepted);
-        assert!(!report.slots[1].accepted);
-        assert_eq!(report.slots[1].rounding_margin, BigInt::zero());
-
-        let success_factor = BigUint::from(8_256u32);
-        let success_spacing_factor = BigUint::from(8_255u32);
-        let q = &success_spacing_factor * &success_factor;
-        let refresh = RefreshNoiseParameters::from_structural(
-            &p,
-            q,
-            BigUint::from(2u8),
-            BigUint::from(2u8),
-            12,
-            1,
-            0,
-            2,
-            1,
-            vec![success_spacing_factor, success_factor],
-            BigUint::one(),
-        )
-        .unwrap();
-        let report = simulate_refresh(&p, &refresh, BigUint::zero(), BigUint::zero()).unwrap();
-        assert!(report.accepted);
-        assert_eq!(report.slots.len(), 2);
-        assert!(report.slots.iter().all(|slot| slot.accepted));
-        assert_eq!(report.slots[1].twice_pre_rounding_bound, BigUint::from(8_254u32));
-        assert_eq!(report.slots[1].spacing, BigUint::from(8_255u32));
-        assert_eq!(report.refreshed_error_bound, Some(BigUint::from(1u8)));
-        assert_eq!(report.fresh_error_bound, BigUint::from(1u8));
-    }
-
-    #[test]
-    fn mask_domain_boundary_is_exact() {
-        let p = parameters();
-        let build = |q_l| {
-            RefreshNoiseParameters::from_structural(
-                &p,
-                BigUint::from(60u8),
-                BigUint::from(3u8),
-                q_l,
-                2,
-                1,
-                0,
-                3,
-                1,
-                vec![BigUint::from(3u8), BigUint::from(4u8), BigUint::from(5u8)],
-                BigUint::one(),
-            )
-            .unwrap()
-        };
-        let equal =
-            simulate_refresh(&p, &build(BigUint::from(9u8)), BigUint::zero(), BigUint::zero())
-                .unwrap();
-        assert!(equal.mask_domain_accepted);
-        assert_eq!(equal.mask_domain_margin, BigInt::zero());
-        let below =
-            simulate_refresh(&p, &build(BigUint::from(10u8)), BigUint::zero(), BigUint::zero())
-                .unwrap();
-        assert!(!below.mask_domain_accepted);
-        assert!(!below.hard_authority.accepted);
-        assert_eq!(below.mask_domain_margin, BigInt::from(-1));
-    }
-
-    #[test]
-    fn fresh_error_boundary_is_strict_per_crt_modulus() {
-        let p = ExponentLutNoiseParameters::dense(8, BigUint::from(4u8), 2, BigUint::from(2u8))
-            .unwrap();
-        let refresh = RefreshNoiseParameters::from_structural(
-            &p,
-            BigUint::from(6u8),
-            BigUint::from(3u8),
-            BigUint::from(8u8),
-            2,
-            1,
-            0,
-            2,
-            1,
-            vec![BigUint::from(2u8), BigUint::from(3u8)],
-            BigUint::one(),
-        )
-        .unwrap();
-        let report = simulate_refresh(&p, &refresh, BigUint::zero(), BigUint::zero()).unwrap();
-        // B_e = 3^1 - 1 = 2: equality at q_0=2 rejects, while q_1=3
-        // satisfies the exact one-below condition B_e=q_1-1.
-        assert_eq!(report.fresh_error_bound, BigUint::from(2u8));
-        assert!(!report.slots[0].fresh_error_below_plaintext_modulus);
-        assert!(!report.fresh_error_accepted);
-        assert!(!report.hard_authority.accepted);
-        assert_eq!(report.slots[0].fresh_error_margin, BigInt::zero());
-        assert!(report.slots[1].fresh_error_below_plaintext_modulus);
-        assert_eq!(report.slots[1].fresh_error_margin, BigInt::one());
-    }
-
-    #[test]
-    fn mask_hiding_equality_is_accepted_exactly() {
-        // ell_beta=2, two CRT mask slots, and one coefficient give D=8.
-        // With the target-aware gamma values, E_state=24 and E_decoder=8,
-        // max(F_t)=32. For lambda=0 the exact required mask modulus is
-        // 2^(0+1)*8*32 = 512 = 2^9.
-        let model =
-            ExponentLutNoiseParameters::dense(1, BigUint::from(2u8), 2, BigUint::one()).unwrap();
-        let refresh = RefreshNoiseParameters::from_structural(
-            &model,
-            BigUint::from(6u8),
-            BigUint::from(2u8),
-            BigUint::from(2u8),
-            9,
-            1,
-            0,
-            2,
-            1,
-            vec![BigUint::from(2u8), BigUint::from(3u8)],
-            BigUint::one(),
-        )
-        .unwrap();
-        let report =
-            simulate_refresh(&model, &refresh, BigUint::from(24u8), BigUint::zero()).unwrap();
-        assert_eq!(report.exposed_transcript_coordinates, BigUint::from(8u8));
-        assert_eq!(report.mask_statistical_required, BigUint::from(512u16));
-        assert_eq!(report.mask_modulus, BigUint::from(512u16));
-        assert_eq!(report.mask_statistical_margin, BigInt::zero());
-        assert!(report.mask_statistical_accepted);
-        assert!(report.hard_authority.accepted);
-    }
+fn bit_length(value: &BigUint) -> usize {
+    value.bits() as usize
 }

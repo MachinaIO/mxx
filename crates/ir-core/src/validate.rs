@@ -331,10 +331,14 @@ fn first_int_loop_index(expression: &IntExpr) -> Option<u32> {
         IntExpr::Sub(left, right) |
         IntExpr::Mul(left, right) |
         IntExpr::Div(left, right) |
+        IntExpr::FloorDiv(left, right) |
+        IntExpr::Rem(left, right) |
         IntExpr::RoundDiv(left, right) => {
             first_int_loop_index(left).or_else(|| first_int_loop_index(right))
         }
         IntExpr::Log2Ceil(value) => first_int_loop_index(value),
+        IntExpr::Select { selector, branches } => first_int_loop_index(selector)
+            .or_else(|| branches.iter().find_map(first_int_loop_index)),
         IntExpr::Const(_) | IntExpr::Var(_) => None,
     }
 }

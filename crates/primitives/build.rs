@@ -42,6 +42,7 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixTrapdoor.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSerde.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixCrt.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
 
         let cuda_arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "89".to_string());
         let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());

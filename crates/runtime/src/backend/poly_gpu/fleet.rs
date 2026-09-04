@@ -444,6 +444,49 @@ impl GpuDcrtBackend {
         self.vram_percent
     }
 
+    /// Builds a local representative of a regular gadget's global column range.
+    ///
+    /// This is used by the estimator's single-device worker. Validation is
+    /// deliberately against the complete declared matrix and gadget layout;
+    /// only allocation and construction are restricted to the measured range.
+    pub fn measurement_gadget_columns(
+        &mut self,
+        full_type: &ConcreteMatrixType,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        global_column_start: usize,
+        local_columns: usize,
+    ) -> Result<GpuFleetMatrix, PolyBackendError> {
+        if self.devices.len() != 1 {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        if full_type.rows == 0 || !full_type.columns.is_multiple_of(full_type.rows) {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        self.validate_gadget_layout(full_type, gadget_base, digit_count, false)?;
+        self.validate_gadget_layout(
+            full_type,
+            gadget_base,
+            full_type.columns / full_type.rows,
+            false,
+        )?;
+        if global_column_start > full_type.columns ||
+            local_columns > full_type.columns - global_column_start
+        {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        self.restart_runtime_pilot_after_fixed_inputs()
+            .map_err(PolyBackendError::GpuCalibration)?;
+        let parameters = self.devices[0].1.parameters(full_type)?;
+        Ok(GpuFleetMatrix::from(GpuDCRTPolyMatrix::gadget_columns(
+            parameters,
+            full_type.rows,
+            false,
+            global_column_start,
+            local_columns,
+        )))
+    }
+
     pub fn set_column_widths_for_operation(
         &mut self,
         operation: [u8; 32],

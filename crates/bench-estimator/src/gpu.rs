@@ -798,6 +798,21 @@ impl GpuNodeMeasurementBackend {
                 }),
             };
         }
+        if matches!(request.kind, NodeKind::GadgetTrapdoor { .. }) {
+            return RepresentativeMeasurement {
+                kind: request.kind.clone(),
+                concrete_argument_types: request.concrete_argument_types.clone(),
+                concrete_output_types: request.concrete_output_types.clone(),
+                fixed_arguments: Self::fixed_arguments(
+                    &request.kind,
+                    &request.concrete_argument_types,
+                ),
+                output_range: Some(IndexRange {
+                    start: global_column_start,
+                    end: global_column_end,
+                }),
+            };
+        }
         if matches!(request.kind, NodeKind::Concat { axis: ConcatAxis::Diagonal }) {
             return RepresentativeMeasurement {
                 kind: request.kind.clone(),
@@ -2242,15 +2257,55 @@ impl GpuNodeMeasurementBackend {
                 })
             }
             NodeKind::GadgetTrapdoor { base, .. } => {
-                let ty = output_matrix_type()?;
+                let (full_ty, digit_count) = node
+                    .concrete_output_types
+                    .iter()
+                    .find_map(|wire_type| match wire_type {
+                        ConcreteWireType::Trapdoor { matrix, digit_count, .. } => {
+                            Some((matrix.clone(), *digit_count))
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        GpuMeasurementError(format!("node {:?} has no trapdoor output", node.id))
+                    })?;
                 let value = ConstantMatrix::Gadget { base: base.clone(), small: false };
-                matrix_outputs(
+                matrix_outputs(if let Some(range) = output_range {
+                    let local_columns = range.end.checked_sub(range.start).ok_or_else(|| {
+                        GpuMeasurementError(
+                            "gadget trapdoor representative range is reversed".to_owned(),
+                        )
+                    })?;
+                    if range.end > full_ty.columns {
+                        return Err(GpuMeasurementError(
+                            "gadget trapdoor representative range is outside its output".to_owned(),
+                        ));
+                    }
+                    let gadget_base = base
+                        .evaluate(bindings)
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?;
                     (0..batch_size)
                         .map(|_| {
-                            backend.constant_matrix(&ty, &value, bindings).map_err(backend_error)
+                            backend
+                                .measurement_gadget_columns(
+                                    &full_ty,
+                                    &gadget_base,
+                                    digit_count,
+                                    range.start,
+                                    local_columns,
+                                )
+                                .map_err(backend_error)
                         })
-                        .collect(),
-                )
+                        .collect()
+                } else {
+                    (0..batch_size)
+                        .map(|_| {
+                            backend
+                                .constant_matrix(&full_ty, &value, bindings)
+                                .map_err(backend_error)
+                        })
+                        .collect()
+                })
             }
             NodeKind::MatrixBinary(operation) => {
                 let inputs = (0..batch_size)
@@ -2826,9 +2881,9 @@ fn compact_matrix_bytes_u128(matrix: &ConcreteMatrixType, max_coefficient_bound:
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuNodeMeasurementBackend, PendingMeasurement, PreparedMeasurement, aggregate_fleet_wave,
-        compact_matrix_bytes, extrapolate_fleet_waves, gpu_capped_waterfill_columns, matrix_bytes,
-        require_exclusive_measurement_context,
+        GpuMeasurementOutput, GpuNodeMeasurementBackend, PendingMeasurement, PreparedMeasurement,
+        aggregate_fleet_wave, compact_matrix_bytes, extrapolate_fleet_waves,
+        gpu_capped_waterfill_columns, matrix_bytes, require_exclusive_measurement_context,
     };
     use crate::{MeasurementNode, NodeMeasurement};
     use mxx_ir_core::{
@@ -2836,7 +2891,14 @@ mod tests {
         node::{ConstantMatrix, HashVariant, IndexRange, MatrixBinaryOp, NodeKind},
         types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId},
     };
-    use mxx_runtime::gpu_calibration::GpuColumnWidths;
+    use mxx_primitives::{
+        matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+        poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
+    };
+    use mxx_runtime::{
+        backend::{poly::PolyBackendError, poly_gpu::gpu_backend},
+        gpu_calibration::GpuColumnWidths,
+    };
     use num_bigint::BigInt;
 
     #[test]
@@ -3359,7 +3421,7 @@ mod tests {
     }
 
     #[test]
-    fn gadget_trapdoor_measurement_uses_column_representative() {
+    fn gadget_trapdoor_ranged_representative_preserves_full_identity() {
         let concrete = ConcreteMatrixType {
             rows: 2,
             columns: 10,
@@ -3375,6 +3437,55 @@ mod tests {
             },
             base: IntExpr::constant(4),
         };
+        let request = PendingMeasurement {
+            key: [0; 32],
+            scope: FrozenGraphScopeId::Root,
+            id: NodeId(1),
+            kind: kind.clone(),
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: vec![ConcreteWireType::Trapdoor {
+                matrix: concrete,
+                sigma: RealExpr::from_integer(4),
+                gadget_base: BigInt::from(4),
+                digit_count: 5,
+                preimage_max_coefficient_bound: BigInt::from(0),
+            }],
+            bindings: ParamEnv::default(),
+            preimage_sample: false,
+        };
+
+        assert!(GpuNodeMeasurementBackend::column_separable(&kind));
+        let representative = GpuNodeMeasurementBackend::representative_at(&request, 3, 4);
+        let NodeKind::GadgetTrapdoor { matrix_type, .. } = &representative.kind else {
+            panic!("gadget trapdoor representative kind");
+        };
+        assert_eq!(matrix_type.columns, IntExpr::constant(10));
+        assert_eq!(representative.concrete_output_types[0].matrix_type().unwrap().columns, 10);
+        assert_eq!(representative.measured_columns(), Some(4));
+        assert_eq!(representative.output_range.map(|range| (range.start, range.end)), Some((3, 7)));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_gadget_trapdoor_ranged_measurement_matches_full_gadget_slice() {
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        let rows = 2;
+        let full_columns = rows * params.modulus_digits();
+        let full_ty = ConcreteMatrixType {
+            rows,
+            columns: full_columns,
+            ring_dimension: 32,
+            modulus: BigInt::from(131_009u32),
+        };
+        let kind = NodeKind::GadgetTrapdoor {
+            matrix_type: MatrixType {
+                rows: IntExpr::constant(rows),
+                columns: IntExpr::constant(full_columns),
+                ring_dimension: IntExpr::constant(32),
+                modulus: IntExpr::constant(131_009),
+            },
+            base: IntExpr::constant(4),
+        };
         let scope = FrozenGraphScopeId::Root;
         let node = MeasurementNode {
             scope: &scope,
@@ -3386,24 +3497,71 @@ mod tests {
             output_types: &[],
             concrete_argument_types: Vec::new(),
             concrete_output_types: vec![ConcreteWireType::Trapdoor {
-                matrix: concrete,
+                matrix: full_ty.clone(),
                 sigma: RealExpr::from_integer(4),
                 gadget_base: BigInt::from(4),
-                digit_count: 5,
+                digit_count: params.modulus_digits(),
                 preimage_max_coefficient_bound: BigInt::from(0),
             }],
         };
-
-        assert!(GpuNodeMeasurementBackend::column_separable(&kind));
-        let (representative, _, outputs, scale, remainder_columns) =
-            GpuNodeMeasurementBackend::representative_node(&node, 4);
-        let NodeKind::GadgetTrapdoor { matrix_type, .. } = representative else {
-            panic!("gadget trapdoor representative kind");
+        let prepared = PreparedMeasurement {
+            arguments: Vec::new(),
+            small_arguments: Vec::new(),
+            preimage_trapdoor: None,
         };
-        assert_eq!(matrix_type.columns, IntExpr::constant(4));
-        assert_eq!(outputs[0].matrix_type().unwrap().columns, 4);
-        assert_eq!(scale, 2.0);
-        assert_eq!(remainder_columns, Some(2));
+        let range = mxx_runtime::backend::IndexRange { start: 7, end: 12 };
+        let operation = [73u8; 32];
+        let mut backend = gpu_backend([params.clone()]);
+        backend.set_column_widths_for_operation(
+            operation,
+            GpuColumnWidths { gpu0: range.end - range.start, nonzero: None },
+        );
+        backend.select_operation(operation).unwrap();
+
+        for (declared_base, declared_digits) in [
+            (BigInt::from(8), params.modulus_digits()),
+            (BigInt::from(4), params.modulus_digits() + 1),
+        ] {
+            let error = backend
+                .measurement_gadget_columns(
+                    &full_ty,
+                    &declared_base,
+                    declared_digits,
+                    range.start,
+                    range.end - range.start,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                PolyBackendError::GadgetLayoutMismatch {
+                    declared_base: actual_base,
+                    declared_digits: actual_digits,
+                    backend_base,
+                    backend_digits,
+                } if actual_base == declared_base &&
+                    actual_digits == declared_digits &&
+                    backend_base == BigInt::from(4) &&
+                    backend_digits == params.modulus_digits()
+            ));
+        }
+
+        let mut outputs = GpuNodeMeasurementBackend::run_node(
+            &mut backend,
+            &node,
+            &ParamEnv::default(),
+            1,
+            &prepared,
+            Some(&range),
+        )
+        .unwrap();
+        let GpuMeasurementOutput::Matrix(actual) = outputs.pop().unwrap() else {
+            panic!("gadget trapdoor measurement must produce a matrix");
+        };
+        assert!(outputs.is_empty());
+        let actual = &actual.shards()[0].value;
+        let expected = GpuDCRTPolyMatrix::gadget_matrix(actual.params(), rows)
+            .slice_columns(range.start, range.end);
+        assert_eq!(actual.to_cpu_matrix(), expected.to_cpu_matrix());
     }
 
     #[test]

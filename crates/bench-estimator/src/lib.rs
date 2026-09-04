@@ -5,7 +5,7 @@ pub mod gpu;
 pub mod harness;
 
 use mxx_ir_core::{
-    FrozenGraphScopeId, ParamEnv, ValidatedGraph, encoding,
+    FrozenGraphScopeId, LivenessSchedule, ParamEnv, ValidatedGraph, encoding,
     node::NodeKind,
     types::{ConcreteWireType, NodeId, WireRef, WireType},
 };
@@ -54,26 +54,19 @@ pub trait MeasurementBackend {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EstimateConfig {
-    pub device_pool_size: usize,
-    pub per_instance_occupancy: usize,
-}
-
-impl Default for EstimateConfig {
-    fn default() -> Self {
-        Self { device_pool_size: 1, per_instance_occupancy: 1 }
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
     pub total_work_seconds: f64,
     /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
     pub preimage_sampling_work_seconds: f64,
+    /// Earliest completion time when every dependency-ready node can start.
     pub critical_path_seconds: f64,
+    /// Maximum sum of active node parallelism in the unlimited-resource DAG schedule.
     pub maximum_parallelism: usize,
+    /// Live persistent bytes sampled after applying the resource changes at
+    /// each distinct event time in the unlimited-resource DAG schedule.
     pub persistent_bytes_over_time: Vec<u64>,
+    /// Maximum sum of workspaces for nodes active at the same event time.
     pub workspace_high_water_bytes: u64,
     pub workspace_high_water_by_node: BTreeMap<String, u64>,
     pub peak_memory_bytes: u64,
@@ -116,18 +109,14 @@ pub enum EstimateError {
     LoopIndexDependentCost { scope: FrozenGraphScopeId, node: NodeId },
 }
 
+/// Estimates an ideal unlimited-resource DAG schedule. Resource limits belong
+/// in the measured primitive implementation, not in graph-level scheduling.
 pub fn estimate<B: MeasurementBackend>(
     validated: &ValidatedGraph,
     backend: &mut B,
-    config: &EstimateConfig,
 ) -> Result<CostReport, EstimateError> {
-    let mut estimator = Estimator {
-        validated,
-        backend,
-        config,
-        cache: HashMap::new(),
-        invocations: BTreeMap::new(),
-    };
+    let mut estimator =
+        Estimator { validated, backend, cache: HashMap::new(), invocations: BTreeMap::new() };
     let mut report = estimator.estimate_scope(&FrozenGraphScopeId::Root, &validated.bindings)?;
     estimator.record_child_invocations(&FrozenGraphScopeId::Root, &validated.bindings, 1)?;
     for (key, count) in estimator.invocations {
@@ -197,9 +186,143 @@ impl CacheKey {
 struct Estimator<'a, B: MeasurementBackend> {
     validated: &'a ValidatedGraph,
     backend: &'a mut B,
-    config: &'a EstimateConfig,
     cache: HashMap<CacheKey, CostReport>,
     invocations: BTreeMap<CacheKey, usize>,
+}
+
+struct ScheduledNode {
+    start: f64,
+    finish: f64,
+    workspace_bytes: u64,
+    transient_bytes: u64,
+    parallelism: usize,
+    arguments: Vec<WireRef>,
+    outputs: Vec<(WireRef, u64)>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ResourceUsage {
+    persistent_bytes: u64,
+    workspace_bytes: u64,
+    transient_bytes: u64,
+    parallelism: usize,
+}
+
+impl ResourceUsage {
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            persistent_bytes: self.persistent_bytes.saturating_add(other.persistent_bytes),
+            workspace_bytes: self.workspace_bytes.saturating_add(other.workspace_bytes),
+            transient_bytes: self.transient_bytes.saturating_add(other.transient_bytes),
+            parallelism: self.parallelism.saturating_add(other.parallelism),
+        }
+    }
+
+    fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            persistent_bytes: self.persistent_bytes.saturating_sub(other.persistent_bytes),
+            workspace_bytes: self.workspace_bytes.saturating_sub(other.workspace_bytes),
+            transient_bytes: self.transient_bytes.saturating_sub(other.transient_bytes),
+            parallelism: self.parallelism.saturating_sub(other.parallelism),
+        }
+    }
+}
+
+enum ResourceEventKind {
+    End(ResourceUsage),
+    Start(ResourceUsage),
+    Instant(ResourceUsage),
+}
+
+struct ResourceEvent {
+    time: f64,
+    kind: ResourceEventKind,
+}
+
+fn push_resource_interval(
+    events: &mut Vec<ResourceEvent>,
+    start: f64,
+    finish: f64,
+    usage: ResourceUsage,
+) {
+    if start < finish {
+        events.push(ResourceEvent { time: start, kind: ResourceEventKind::Start(usage) });
+        events.push(ResourceEvent { time: finish, kind: ResourceEventKind::End(usage) });
+    } else {
+        // A zero-duration operation can still allocate an output or report a
+        // transient high-water mark. Keep that instantaneous peak observable.
+        events.push(ResourceEvent { time: start, kind: ResourceEventKind::Instant(usage) });
+    }
+}
+
+fn aggregate_resources(
+    liveness: &LivenessSchedule,
+    scheduled: &[ScheduledNode],
+    report: &mut CostReport,
+) {
+    let mut last_consumer_finish = BTreeMap::<WireRef, f64>::new();
+    for node in scheduled {
+        for argument in &node.arguments {
+            last_consumer_finish
+                .entry(*argument)
+                .and_modify(|finish| *finish = finish.max(node.finish))
+                .or_insert(node.finish);
+        }
+    }
+
+    let mut events = Vec::new();
+    for node in scheduled {
+        let usage = ResourceUsage {
+            workspace_bytes: node.workspace_bytes,
+            transient_bytes: node.transient_bytes,
+            parallelism: node.parallelism,
+            ..ResourceUsage::default()
+        };
+        push_resource_interval(&mut events, node.start, node.finish, usage);
+
+        for (wire, bytes) in &node.outputs {
+            let death = if liveness.retained.contains(wire) {
+                report.critical_path_seconds
+            } else {
+                last_consumer_finish.get(wire).copied().unwrap_or(node.finish)
+            };
+            push_resource_interval(
+                &mut events,
+                node.start,
+                death,
+                ResourceUsage { persistent_bytes: *bytes, ..ResourceUsage::default() },
+            );
+        }
+    }
+
+    events.sort_by(|left, right| left.time.total_cmp(&right.time));
+    let mut active = ResourceUsage::default();
+    let mut index = 0;
+    while index < events.len() {
+        let time = events[index].time;
+        let mut endings = ResourceUsage::default();
+        let mut starts = ResourceUsage::default();
+        let mut instantaneous = ResourceUsage::default();
+        while index < events.len() && events[index].time == time {
+            match events[index].kind {
+                ResourceEventKind::End(usage) => endings = endings.saturating_add(usage),
+                ResourceEventKind::Start(usage) => starts = starts.saturating_add(usage),
+                ResourceEventKind::Instant(usage) => {
+                    instantaneous = instantaneous.saturating_add(usage);
+                }
+            }
+            index += 1;
+        }
+        active = active.saturating_sub(endings).saturating_add(starts);
+        let sampled = active.saturating_add(instantaneous);
+        report.persistent_bytes_over_time.push(sampled.persistent_bytes);
+        report.workspace_high_water_bytes =
+            report.workspace_high_water_bytes.max(sampled.workspace_bytes);
+        report.maximum_parallelism = report.maximum_parallelism.max(sampled.parallelism);
+        report.peak_memory_bytes = report
+            .peak_memory_bytes
+            .max(sampled.persistent_bytes.saturating_add(sampled.transient_bytes));
+    }
 }
 
 impl<B: MeasurementBackend> Estimator<'_, B> {
@@ -217,9 +340,9 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             .validated
             .scope(scope_id)
             .ok_or_else(|| EstimateError::MissingScope(scope_id.clone()))?;
-        let mut report = CostReport { maximum_parallelism: 1, ..CostReport::default() };
+        let mut report = CostReport::default();
         let mut completion = BTreeMap::<WireRef, f64>::new();
-        let mut live = BTreeMap::<WireRef, u64>::new();
+        let mut scheduled = Vec::with_capacity(plan.execution_order.len());
 
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
@@ -270,13 +393,11 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             report.preimage_sampling_work_seconds += preimage_sampling_work;
             let finish = predecessor + measurement.latency_seconds;
             report.critical_path_seconds = report.critical_path_seconds.max(finish);
-            report.workspace_high_water_bytes =
-                report.workspace_high_water_bytes.max(measurement.workspace_bytes);
             report
                 .workspace_high_water_by_node
                 .insert(format!("{:?}#{}", scope_id, id.0), measurement.workspace_bytes);
-            report.maximum_parallelism = report.maximum_parallelism.max(nested_parallelism);
 
+            let mut outputs = Vec::with_capacity(handle.output_types().len());
             for port in 0..handle.output_types().len() {
                 let wire = WireRef { node: id, port: mxx_ir_core::Port(port as u32) };
                 let bytes = plan
@@ -284,23 +405,20 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     .get(&wire)
                     .map(|wire_type| self.backend.persistent_bytes(wire_type))
                     .unwrap_or(0);
-                live.insert(wire, bytes);
                 completion.insert(wire, finish);
+                outputs.push((wire, bytes));
             }
-            let persistent = live.values().copied().sum::<u64>();
-            report.peak_memory_bytes = report
-                .peak_memory_bytes
-                .max(persistent.saturating_add(measurement.workspace_bytes))
-                .max(persistent.saturating_add(nested_peak));
-            report.persistent_bytes_over_time.push(persistent);
-            for argument in &arguments {
-                if plan.liveness.last_use.get(argument) == Some(&position) &&
-                    !plan.liveness.retained.contains(argument)
-                {
-                    live.remove(argument);
-                }
-            }
+            scheduled.push(ScheduledNode {
+                start: predecessor,
+                finish,
+                workspace_bytes: measurement.workspace_bytes,
+                transient_bytes: measurement.workspace_bytes.max(nested_peak),
+                parallelism: nested_parallelism,
+                arguments,
+                outputs,
+            });
         }
+        aggregate_resources(&plan.liveness, &scheduled, &mut report);
         Ok(report)
     }
 
@@ -335,7 +453,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         EstimateError::Expression("loop count is not usize".to_owned())
                     })?;
                 if count == 0 {
-                    return Ok((NodeMeasurement::default(), 0.0, 0, 1));
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 0));
                 }
                 let child = self
                     .validated
@@ -346,19 +464,16 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
                 let (one, preimage_work, peak, parallelism) =
                     self.cached_child(child, child_bindings)?;
-                let concurrent = (self.config.device_pool_size.max(1) /
-                    self.config.per_instance_occupancy.max(1))
-                .max(1);
-                let active = count.min(concurrent);
+                let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
                 Ok((
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
-                        latency_seconds: one.latency_seconds * count.div_ceil(concurrent) as f64,
-                        workspace_bytes: one.workspace_bytes,
+                        latency_seconds: one.latency_seconds,
+                        workspace_bytes: one.workspace_bytes.saturating_mul(count_u64),
                     },
                     preimage_work * count as f64,
-                    peak.saturating_mul(active as u64),
-                    parallelism.saturating_mul(active),
+                    peak.saturating_mul(count_u64),
+                    parallelism.saturating_mul(count),
                 ))
             }
             NodeKind::SequentialLoop(loop_node) => {
@@ -377,7 +492,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         EstimateError::Expression("sequential loop count is not usize".to_owned())
                     })?;
                 if count == 0 {
-                    return Ok((NodeMeasurement::default(), 0.0, 0, 1));
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 0));
                 }
                 let child = self
                     .validated
@@ -408,7 +523,12 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     } else {
                         0.0
                     };
-                    (measurement, preimage_work, 0, 1)
+                    let parallelism = usize::from(
+                        measurement.latency_seconds > 0.0 ||
+                            measurement.work_seconds > 0.0 ||
+                            measurement.workspace_bytes > 0,
+                    );
+                    (measurement, preimage_work, 0, parallelism)
                 })
                 .map_err(|error| EstimateError::Backend(error.to_string())),
         }
@@ -539,7 +659,7 @@ fn child_bindings(
 mod tests {
     use super::*;
     use mxx_dsl::{DslContext, Int, IntType, Parallel, Ring, Sequential, Subgraph};
-    use std::convert::Infallible;
+    use std::{collections::BTreeSet, convert::Infallible};
 
     struct UnitBackend;
 
@@ -560,6 +680,194 @@ mod tests {
         }
     }
 
+    struct ArithmeticBackend;
+
+    impl MeasurementBackend for ArithmeticBackend {
+        type Error = Infallible;
+
+        fn measure(
+            &mut self,
+            _graph: &str,
+            node: &MeasurementNode<'_>,
+            _bindings: &ParamEnv,
+        ) -> Result<NodeMeasurement, Self::Error> {
+            Ok(if matches!(node.kind, NodeKind::IntBinary(_)) {
+                NodeMeasurement { work_seconds: 2.0, latency_seconds: 2.0, workspace_bytes: 4 }
+            } else {
+                NodeMeasurement::default()
+            })
+        }
+
+        fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
+            match wire_type {
+                ConcreteWireType::IndexedFamily { count, .. } => 8 * *count as u64,
+                ConcreteWireType::Int => 8,
+                _ => 0,
+            }
+        }
+    }
+
+    struct ScriptedBackend {
+        measurements: BTreeMap<NodeId, NodeMeasurement>,
+    }
+
+    impl MeasurementBackend for ScriptedBackend {
+        type Error = Infallible;
+
+        fn measure(
+            &mut self,
+            _graph: &str,
+            node: &MeasurementNode<'_>,
+            _bindings: &ParamEnv,
+        ) -> Result<NodeMeasurement, Self::Error> {
+            Ok(self.measurements.get(&node.id).cloned().unwrap_or_default())
+        }
+
+        fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+            8
+        }
+    }
+
+    fn wire(node: u64) -> WireRef {
+        WireRef { node: NodeId(node), port: mxx_ir_core::Port(0) }
+    }
+
+    fn scheduled_node(
+        start: f64,
+        finish: f64,
+        workspace_bytes: u64,
+        arguments: Vec<WireRef>,
+        output: WireRef,
+    ) -> ScheduledNode {
+        ScheduledNode {
+            start,
+            finish,
+            workspace_bytes,
+            transient_bytes: workspace_bytes,
+            parallelism: 1,
+            arguments,
+            outputs: vec![(output, 8)],
+        }
+    }
+
+    #[test]
+    fn event_schedule_sums_overlapping_fork_resources() {
+        let scheduled = vec![
+            scheduled_node(0.0, 2.0, 10, vec![], wire(0)),
+            scheduled_node(0.0, 3.0, 20, vec![], wire(1)),
+            scheduled_node(3.0, 4.0, 5, vec![wire(0), wire(1)], wire(2)),
+        ];
+        let liveness =
+            LivenessSchedule { last_use: BTreeMap::new(), retained: BTreeSet::from([wire(2)]) };
+        let mut report = CostReport { critical_path_seconds: 4.0, ..CostReport::default() };
+        aggregate_resources(&liveness, &scheduled, &mut report);
+
+        assert_eq!(report.maximum_parallelism, 2);
+        assert_eq!(report.workspace_high_water_bytes, 30);
+        assert_eq!(report.peak_memory_bytes, 46);
+        assert_eq!(report.persistent_bytes_over_time, vec![16, 16, 24, 0]);
+    }
+
+    #[test]
+    fn estimator_derives_overlapping_intervals_from_dag_dependencies() {
+        let left = Int::constant(1);
+        let right = Int::constant(2);
+        let sum = left.add(right);
+        let built = DslContext::new("estimate-fork-join")
+            .int_output("sum", sum)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let mut backend = ScriptedBackend {
+            measurements: BTreeMap::from([
+                (
+                    NodeId(0),
+                    NodeMeasurement {
+                        work_seconds: 2.0,
+                        latency_seconds: 2.0,
+                        workspace_bytes: 10,
+                    },
+                ),
+                (
+                    NodeId(1),
+                    NodeMeasurement {
+                        work_seconds: 3.0,
+                        latency_seconds: 3.0,
+                        workspace_bytes: 20,
+                    },
+                ),
+                (
+                    NodeId(2),
+                    NodeMeasurement { work_seconds: 1.0, latency_seconds: 1.0, workspace_bytes: 5 },
+                ),
+            ]),
+        };
+        let report = estimate(&validated, &mut backend).expect("estimate");
+
+        assert_eq!(report.total_work_seconds, 6.0);
+        assert_eq!(report.critical_path_seconds, 4.0);
+        assert_eq!(report.maximum_parallelism, 2);
+        assert_eq!(report.workspace_high_water_bytes, 30);
+        assert_eq!(report.peak_memory_bytes, 46);
+    }
+
+    #[test]
+    fn event_schedule_keeps_a_chain_sequential() {
+        let scheduled = vec![
+            scheduled_node(0.0, 2.0, 10, vec![], wire(0)),
+            scheduled_node(2.0, 5.0, 20, vec![wire(0)], wire(1)),
+        ];
+        let liveness =
+            LivenessSchedule { last_use: BTreeMap::new(), retained: BTreeSet::from([wire(1)]) };
+        let mut report = CostReport { critical_path_seconds: 5.0, ..CostReport::default() };
+        aggregate_resources(&liveness, &scheduled, &mut report);
+
+        assert_eq!(report.maximum_parallelism, 1);
+        assert_eq!(report.workspace_high_water_bytes, 20);
+        assert_eq!(report.peak_memory_bytes, 36);
+    }
+
+    #[test]
+    fn wire_lifetime_uses_latest_consumer_finish_not_topological_last_use() {
+        let scheduled = vec![
+            scheduled_node(0.0, 1.0, 0, vec![], wire(0)),
+            scheduled_node(1.0, 6.0, 0, vec![wire(0)], wire(1)),
+            scheduled_node(1.0, 2.0, 0, vec![wire(0)], wire(2)),
+        ];
+        let liveness = LivenessSchedule {
+            last_use: BTreeMap::from([(wire(0), 2)]),
+            retained: BTreeSet::from([wire(1), wire(2)]),
+        };
+        let mut report = CostReport { critical_path_seconds: 6.0, ..CostReport::default() };
+        aggregate_resources(&liveness, &scheduled, &mut report);
+
+        assert_eq!(report.persistent_bytes_over_time, vec![8, 24, 24, 0]);
+        assert_eq!(report.maximum_parallelism, 2);
+    }
+
+    #[test]
+    fn zero_duration_resources_contribute_an_instantaneous_peak() {
+        let scheduled = vec![ScheduledNode {
+            start: 0.0,
+            finish: 0.0,
+            workspace_bytes: 7,
+            transient_bytes: 9,
+            parallelism: 1,
+            arguments: vec![],
+            outputs: vec![(wire(0), 5)],
+        }];
+        let liveness =
+            LivenessSchedule { last_use: BTreeMap::new(), retained: BTreeSet::from([wire(0)]) };
+        let mut report = CostReport::default();
+        aggregate_resources(&liveness, &scheduled, &mut report);
+
+        assert_eq!(report.persistent_bytes_over_time, vec![5]);
+        assert_eq!(report.workspace_high_water_bytes, 7);
+        assert_eq!(report.maximum_parallelism, 1);
+        assert_eq!(report.peak_memory_bytes, 14);
+    }
+
     #[test]
     fn estimates_the_validated_root_plan() {
         let ring = Ring::new(17, 8);
@@ -570,10 +878,46 @@ mod tests {
             .build()
             .expect("build");
         let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
-        let report =
-            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        let report = estimate(&validated, &mut UnitBackend).expect("estimate");
         assert_eq!(report.total_work_seconds, 3.0);
         assert_eq!(report.critical_path_seconds, 2.0);
+    }
+
+    fn estimate_parallel_integer_loop(count: usize) -> CostReport {
+        let values = Parallel::range(count)
+            .map_values(|index| index.as_int().add(Int::constant(1)))
+            .expect("parallel map");
+        let built = DslContext::new("estimate-parallel")
+            .int_family_output("values", values)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        estimate(&validated, &mut ArithmeticBackend).expect("estimate")
+    }
+
+    #[test]
+    fn parallel_loop_has_count_independent_latency_and_scaled_resources() {
+        let one = estimate_parallel_integer_loop(1);
+        let four = estimate_parallel_integer_loop(4);
+
+        assert_eq!(one.critical_path_seconds, 2.0);
+        assert_eq!(four.critical_path_seconds, one.critical_path_seconds);
+        assert_eq!(four.total_work_seconds, one.total_work_seconds * 4.0);
+        assert_eq!(four.workspace_high_water_bytes, one.workspace_high_water_bytes * 4);
+        assert_eq!(four.maximum_parallelism, one.maximum_parallelism * 4);
+        assert_eq!(four.peak_memory_bytes, one.peak_memory_bytes * 4);
+    }
+
+    #[test]
+    fn zero_count_parallel_loop_has_no_work_or_resources() {
+        let report = estimate_parallel_integer_loop(0);
+
+        assert_eq!(report.total_work_seconds, 0.0);
+        assert_eq!(report.critical_path_seconds, 0.0);
+        assert_eq!(report.workspace_high_water_bytes, 0);
+        assert_eq!(report.maximum_parallelism, 0);
+        assert_eq!(report.peak_memory_bytes, 0);
     }
 
     #[test]
@@ -590,10 +934,36 @@ mod tests {
             .build()
             .expect("build");
         let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
-        let report =
-            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        let report = estimate(&validated, &mut UnitBackend).expect("estimate");
         assert!(report.critical_path_seconds >= 3.0);
-        assert_eq!(report.maximum_parallelism, 1);
+        assert_eq!(report.maximum_parallelism, 2);
+    }
+
+    #[test]
+    fn sequential_loop_scales_latency_and_work_but_not_resources() {
+        let estimate_loop = |count| {
+            let total = Sequential::range(count)
+                .scan(Int::constant(0), Int::constant(1), |_, total, increment| {
+                    Ok(total.add(increment))
+                })
+                .expect("sequential scan");
+            let built = DslContext::new("estimate-sequential-scaling")
+                .int_output("total", total)
+                .expect("output")
+                .build()
+                .expect("build");
+            let validated =
+                mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+            estimate(&validated, &mut ArithmeticBackend).expect("estimate")
+        };
+        let one = estimate_loop(1);
+        let four = estimate_loop(4);
+
+        assert_eq!(four.total_work_seconds, one.total_work_seconds * 4.0);
+        assert_eq!(four.critical_path_seconds, one.critical_path_seconds * 4.0);
+        assert_eq!(four.workspace_high_water_bytes, one.workspace_high_water_bytes);
+        assert_eq!(four.maximum_parallelism, one.maximum_parallelism);
+        assert_eq!(four.peak_memory_bytes, one.peak_memory_bytes);
     }
 
     #[test]
@@ -616,8 +986,7 @@ mod tests {
             .build()
             .expect("build");
         let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
-        let report =
-            estimate(&validated, &mut UnitBackend, &EstimateConfig::default()).expect("estimate");
+        let report = estimate(&validated, &mut UnitBackend).expect("estimate");
 
         let invocation_count = |needle: &str| {
             report

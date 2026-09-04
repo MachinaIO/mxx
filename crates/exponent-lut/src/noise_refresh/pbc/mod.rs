@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(materialization_count.get(), 2);
         assert_eq!(oracle_members, trusted.runtime_bits());
         let graph = DslContext::new("trusted-selector-runtime-binding")
-            .private_family_output("bits", trusted.family().clone())
+            .private_output("bits", trusted.family().clone())
             .unwrap()
             .build()
             .unwrap()
@@ -792,7 +792,7 @@ mod tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let RuntimeValue::Family(actual) = &result.outputs["bits"] else {
+        let RuntimeValue::IndexedFamily(actual) = &result.outputs["bits"] else {
             panic!("selector output must remain a runtime family")
         };
         assert_eq!(actual.len(), trusted.runtime_bits().len());
@@ -859,7 +859,7 @@ mod tests {
         )
         .unwrap();
         let built = DslContext::new("large-structural-selector-input")
-            .public_family_output("gsw", families.gsw)
+            .public_output("gsw", families.gsw)
             .unwrap()
             .build()
             .unwrap();
@@ -950,7 +950,7 @@ mod tests {
             .root_scope()
             .nodes()
             .iter()
-            .filter(|node| matches!(node.kind(), NodeKind::ParallelGrid(_)))
+            .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
             .count();
         assert_eq!(loops, 1);
         let bit_name = bits.input_name().to_owned();
@@ -1109,7 +1109,7 @@ mod tests {
                         rows: sampler.secret_dimension,
                         columns: sampler.public_key_columns(),
                     }),
-                    family_shape: Some(vec![active_count]),
+                    family_count: Some(active_count),
                     confidentiality: ArtifactConfidentiality::Public,
                     content_hash: Some([9; 32]),
                     layout: None,
@@ -1258,7 +1258,7 @@ mod tests {
             .unwrap(),
             "gsw",
         );
-        wrong_count.artifacts.get_mut(&family_name).unwrap().family_shape = Some(vec![1]);
+        wrong_count.artifacts.get_mut(&family_name).unwrap().family_count = Some(1);
         assert!(
             import(
                 &wrong_count,

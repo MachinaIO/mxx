@@ -6,10 +6,10 @@ use crate::{
     tall_encoding::{BggTallEncodingWire, BggTallPlaintext},
 };
 use mxx_dsl::{
-    Bytes, DslContext, DslError, Family, HashTag, Int, Mat, Preimage, Ring, Trapdoor, parallel_zip,
+    Bytes, DslContext, DslError, Family, FamilyType, GraphValue, HashTag, Int, Mat, MatType,
+    Preimage, PreimageType, Ring, SmallMatrix, SmallMatrixType, Subgraph, Trapdoor, parallel_zip,
+    parallel_zip_bundle_with_broadcast,
 };
-#[cfg(test)]
-use mxx_dsl::{MatFamilyType, Subgraph};
 use mxx_gadgets::{
     Poly,
     circuit::{
@@ -375,7 +375,7 @@ impl LweLookupArtifacts {
 #[derive(Clone)]
 pub struct LweLookupPreprocessingWires {
     pub output_public_key: Mat,
-    pub low_matrices: Family<Preimage>,
+    pub low_matrices: Family<SmallMatrix>,
     pub high_matrices: Family<Preimage>,
     /// Public LUT outputs indexed by the logical input value.
     pub output_plaintexts: Family<Mat>,
@@ -388,7 +388,7 @@ pub struct LweLookupArtifactWires {
     ///
     /// The producer and evaluator share this table-length domain; no physical chunk coordinate is
     /// part of the checker-visible graph identity.
-    pub low_matrices: Family<Preimage>,
+    pub low_matrices: Family<SmallMatrix>,
     pub high_matrices: Family<Preimage>,
     /// The authoritative public output plaintext family, indexed by the lookup input.
     pub output_plaintexts: Family<Mat>,
@@ -435,7 +435,6 @@ pub struct LweLookupPreprocessingLowering<P: Poly> {
     trapdoor: Trapdoor,
     gadget_base: IntExpr,
     digit_count: IntExpr,
-    preimage_max_coefficient_bound: IntExpr,
     call_path_prefix: Vec<usize>,
     registry_tables: BTreeMap<LookupRegistryKey, LweLookupTable>,
     tables: BTreeMap<[u8; 32], LweLookupTable>,
@@ -449,7 +448,6 @@ pub struct NaiveLweLookupPreprocessingLowering<P: Poly> {
     trapdoors: Vec<Trapdoor>,
     gadget_base: IntExpr,
     digit_count: IntExpr,
-    preimage_max_coefficient_bound: IntExpr,
     slot_count: usize,
     call_path_prefix: Vec<usize>,
     registry_tables: BTreeMap<LookupRegistryKey, LweLookupTable>,
@@ -528,8 +526,6 @@ pub enum LweLookupCompileError {
     SlotIdentity { slot: usize },
     #[error("LWE lookup circuit traversal failed: {0}")]
     CircuitStructure(String),
-    #[error("tall lookup kernel requires exactly six family inputs")]
-    TallKernelSchema,
     #[error(transparent)]
     Dsl(#[from] DslError),
 }
@@ -605,6 +601,9 @@ impl LweLookupCompiler {
         table_families: &(Family<Int>, Family<Mat>),
     ) -> Result<LweLookupPreprocessingWires, LweLookupCompileError> {
         self.validate_layout()?;
+        if trapdoor.preimage_max_coefficient_bound() != &self.preimage_max_coefficient_bound {
+            return Err(LweLookupCompileError::ArtifactFamilyLayout);
+        }
         if !same_matrix_type(input_public_key.matrix.matrix_type(), &self.public_key_type) ||
             !same_matrix_type(
                 trapdoor.public_matrix().matrix_type(),
@@ -646,14 +645,13 @@ impl LweLookupCompiler {
                     .lift_to_constant_polynomial(scalar_type.clone());
                 let mut low_tag = HashTag::from(low_tag_prefix.clone());
                 low_tag.push(row);
-                let low_plain_shape = (
-                    IntExpr::Div(Box::new(low_shape.0.clone()), Box::new(digit_count.clone())),
-                    low_shape.1.clone(),
+                let low = ring.hash_decomposed(
+                    hash_key.clone(),
+                    low_tag,
+                    low_shape.clone(),
+                    gadget_base.clone(),
+                    digit_count.clone(),
                 );
-                let low_decomposition = ring
-                    .hash_matrix(hash_key.clone(), low_tag, low_plain_shape)
-                    .decompose(gadget_base.clone(), digit_count.clone());
-                let low = low_decomposition.clone();
                 let extended_input = input_public_key.clone() - gadget.clone() * input_scalar;
                 let target = output_for_loop.clone() - gadget.clone() * output;
                 let adjusted_target = target - extended_input.mul_small_rhs(low.clone());
@@ -692,9 +690,9 @@ impl LweLookupCompiler {
     ) -> Result<DslContext, LweLookupCompileError> {
         Ok(context
             .public_output(names.output_public_key.clone(), wires.output_public_key)?
-            .public_preimage_family_output(names.low_matrices.clone(), wires.low_matrices)?
-            .public_preimage_family_output(names.high_matrices.clone(), wires.high_matrices)?
-            .public_family_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
+            .public_output(names.low_matrices.clone(), wires.low_matrices)?
+            .public_output(names.high_matrices.clone(), wires.high_matrices)?
+            .public_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
     }
 
     pub fn import_artifacts(
@@ -705,23 +703,20 @@ impl LweLookupCompiler {
         self.validate_artifacts(artifacts)?;
         let ring = self.ring();
         let names = LweLookupArtifactNames::for_compiler(self);
-        let low_preimage_bound =
-            IntExpr::Div(Box::new(self.gadget_base.clone()), Box::new(IntExpr::constant(2)))
-                .canonicalize();
         Ok(LweLookupArtifactWires {
             output_public_key: self.import_output_public_key(artifacts),
-            low_matrices: ring.preimage_family_artifact_input(
+            low_matrices: ring.small_matrix_family_artifact_input(
                 artifacts.production_id.clone(),
                 names.low_matrices,
-                vec![IntExpr::constant(artifacts.table_length)],
+                artifacts.table_length,
                 shape(&self.low_matrix_type),
-                low_preimage_bound,
+                balanced_bound(self.gadget_base.clone()),
                 ArtifactConfidentiality::Public,
             ),
             high_matrices: ring.preimage_family_artifact_input(
                 artifacts.production_id.clone(),
                 names.high_matrices,
-                vec![IntExpr::constant(artifacts.table_length)],
+                artifacts.table_length,
                 shape(&self.high_matrix_type),
                 self.preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
@@ -768,7 +763,7 @@ impl LweLookupCompiler {
         let high = artifacts.high_matrices.get(input_index.clone());
         let output_plaintext = artifacts.output_plaintexts.get(input_index.clone());
         Ok(BggEncodingWire {
-            vector: c_b.clone().mul_small_rhs(high) + input.vector.clone().mul_small_rhs(low),
+            vector: high.mul_small_rhs(c_b.clone()) + input.vector.clone().mul_small_rhs(low),
             plaintext: Some(output_plaintext),
         })
     }
@@ -811,9 +806,61 @@ impl LweLookupCompiler {
                 let low = artifact_rows.low_matrices.get(input_index.clone());
                 let high = artifact_rows.high_matrices.get(input_index.clone());
                 let output_plaintext = artifact_rows.output_plaintexts.get(input_index.clone());
-                (c_b.mul_small_rhs(high) + input_row.mul_small_rhs(low), output_plaintext)
+                (high.mul_small_rhs(c_b) + input_row.mul_small_rhs(low), output_plaintext)
             },
         )?;
+        Ok(BggTallEncodingWire {
+            rows,
+            pubkey: output_public_key,
+            plaintext: BggTallPlaintext::Diagonal(plaintexts),
+            canonical_input_exclusive_upper: self
+                .table
+                .canonical_output_exclusive_upper_for_modulus(&self.high_matrix_type.modulus),
+        })
+    }
+
+    fn tall_encoding_with_kernels(
+        &self,
+        input: &BggTallEncodingWire,
+        c_b_rows: &Family<Mat>,
+        artifacts: &LweLookupArtifactWires,
+        kernels: &mut BTreeMap<TallLookupKernelKey, TallLookupKernel>,
+        kernel_name: String,
+    ) -> Result<BggTallEncodingWire, LweLookupCompileError> {
+        let BggTallPlaintext::Diagonal(input_plaintexts) = &input.plaintext else {
+            return Err(LweLookupCompileError::MissingPlaintext);
+        };
+        let expected_c_b_type = MatrixType {
+            modulus: self.high_matrix_type.modulus.clone(),
+            ring_dimension: self.high_matrix_type.ring_dimension.clone(),
+            rows: IntExpr::constant(1),
+            columns: self.high_matrix_type.rows.clone(),
+        };
+        if input.rows.count() != input_plaintexts.count() || input.rows.count() != c_b_rows.count()
+        {
+            return Err(LweLookupCompileError::SlotCountMismatch);
+        }
+        if !same_matrix_type(c_b_rows.element_type(), &expected_c_b_type) {
+            return Err(LweLookupCompileError::MatrixTypeMismatch);
+        }
+        self.validate_artifact_wires(artifacts)?;
+
+        let output_public_key = self.public_key(artifacts);
+        let input_families = (
+            (input.rows.clone(), input_plaintexts.clone(), c_b_rows.clone()),
+            (
+                artifacts.low_matrices.clone(),
+                artifacts.high_matrices.clone(),
+                artifacts.output_plaintexts.clone(),
+            ),
+        );
+        let kernel = tall_lookup_kernel_for(
+            kernels,
+            input_families.clone(),
+            input.canonical_input_exclusive_upper.clone(),
+            kernel_name,
+        )?;
+        let (rows, plaintexts) = kernel.call(input_families)?;
         Ok(BggTallEncodingWire {
             rows,
             pubkey: output_public_key,
@@ -884,11 +931,15 @@ impl LweLookupCompiler {
         artifacts: &LweLookupArtifactWires,
     ) -> Result<(), LweLookupCompileError> {
         let count = IntExpr::constant(self.table.len());
+        let low_schema = artifacts.low_matrices.schema();
+        let high_schema = artifacts.high_matrices.schema();
         if !same_matrix_type(artifacts.output_public_key.matrix_type(), &self.public_key_type) ||
             artifacts.low_matrices.count() != &count ||
-            !same_matrix_type(artifacts.low_matrices.element_type(), &self.low_matrix_type) ||
+            !same_matrix_type(&low_schema.element.matrix, &self.low_matrix_type) ||
+            low_schema.element.max_coefficient_bound != balanced_bound(self.gadget_base.clone()) ||
             artifacts.high_matrices.count() != &count ||
-            !same_matrix_type(artifacts.high_matrices.element_type(), &self.high_matrix_type) ||
+            !same_matrix_type(&high_schema.element.matrix, &self.high_matrix_type) ||
+            high_schema.element.max_coefficient_bound != self.preimage_max_coefficient_bound ||
             artifacts.output_plaintexts.count() != &count ||
             !same_matrix_type(
                 artifacts.output_plaintexts.element_type(),
@@ -907,6 +958,10 @@ impl LweLookupCompiler {
 
 fn shape(matrix_type: &MatrixType) -> (IntExpr, IntExpr) {
     (matrix_type.rows.clone(), matrix_type.columns.clone())
+}
+
+fn balanced_bound(base: IntExpr) -> IntExpr {
+    IntExpr::RoundDiv(Box::new(base), Box::new(IntExpr::constant(2))).canonicalize()
 }
 
 fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
@@ -996,7 +1051,6 @@ impl<P: Poly> LweLookupPreprocessingLowering<P> {
         trapdoor: Trapdoor,
         gadget_base: IntExpr,
         digit_count: IntExpr,
-        preimage_max_coefficient_bound: IntExpr,
         call_path_prefix: Vec<usize>,
     ) -> Self {
         Self {
@@ -1005,7 +1059,6 @@ impl<P: Poly> LweLookupPreprocessingLowering<P> {
             trapdoor,
             gadget_base,
             digit_count,
-            preimage_max_coefficient_bound,
             call_path_prefix,
             registry_tables: BTreeMap::new(),
             tables: BTreeMap::new(),
@@ -1050,7 +1103,7 @@ impl<P: Poly> PublicLookupLowering<P> for LweLookupPreprocessingLowering<P> {
             input.matrix.matrix_type().clone(),
             self.gadget_base.clone(),
             self.digit_count.clone(),
-            self.preimage_max_coefficient_bound.clone(),
+            self.trapdoor.preimage_max_coefficient_bound().clone(),
         )
         .map_err(|source| CircuitCompileError::LweLookup {
             gate: gate.local_gate().index(),
@@ -1098,7 +1151,6 @@ impl<P: Poly> NaiveLweLookupPreprocessingLowering<P> {
         trapdoors: Vec<Trapdoor>,
         gadget_base: IntExpr,
         digit_count: IntExpr,
-        preimage_max_coefficient_bound: IntExpr,
         call_path_prefix: Vec<usize>,
     ) -> Result<Self, LweLookupCompileError> {
         let slot_count = trapdoors.len();
@@ -1111,7 +1163,6 @@ impl<P: Poly> NaiveLweLookupPreprocessingLowering<P> {
             trapdoors,
             gadget_base,
             digit_count,
-            preimage_max_coefficient_bound,
             slot_count,
             call_path_prefix,
             registry_tables: BTreeMap::new(),
@@ -1165,7 +1216,7 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupPreprocessingLowering<P>
                 input.matrices.element_type().clone(),
                 self.gadget_base.clone(),
                 self.digit_count.clone(),
-                self.preimage_max_coefficient_bound.clone(),
+                self.trapdoors[slot].preimage_max_coefficient_bound().clone(),
             )
             .map_err(|source| CircuitCompileError::LweLookup {
                 gate: gate.local_gate().index(),
@@ -1241,9 +1292,9 @@ pub fn bind_naive_lwe_lookup_invocations<P: Poly>(
     public_key_type: MatrixType,
     gadget_base: IntExpr,
     digit_count: IntExpr,
+    preimage_max_coefficient_bound: IntExpr,
     slot_count: usize,
     call_path_prefix: &[usize],
-    preimage_max_coefficient_bound: IntExpr,
 ) -> Result<Vec<NaiveLweLookupInvocation>, LweLookupCompileError> {
     if slot_count == 0 {
         return Err(LweLookupCompileError::EmptySlotInvocations);
@@ -1292,15 +1343,20 @@ pub struct LweLookupEncodingLowering {
 pub struct LweLookupTallEncodingLowering {
     invocations: BTreeMap<LweLookupIdentity, LweLookupInvocation>,
     c_b_rows: Family<Mat>,
+    kernels: BTreeMap<TallLookupKernelKey, TallLookupKernel>,
 }
 
-#[cfg(test)]
-type TallLookupKernel = Subgraph<Vec<Family<Mat>>, (Family<Mat>, Family<Mat>)>;
+type TallLookupInputs =
+    ((Family<Mat>, Family<Mat>, Family<Mat>), (Family<SmallMatrix>, Family<Preimage>, Family<Mat>));
+type TallLookupSchemas = (
+    (FamilyType<MatType>, FamilyType<MatType>, FamilyType<MatType>),
+    (FamilyType<SmallMatrixType>, FamilyType<PreimageType>, FamilyType<MatType>),
+);
+type TallLookupKernel = Subgraph<TallLookupInputs, (Family<Mat>, Family<Mat>)>;
 
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TallLookupKernelKey {
-    input_types: Vec<MatFamilyType>,
+    input_types: TallLookupSchemas,
     canonical_input_exclusive_upper: Option<BigUint>,
 }
 
@@ -1338,33 +1394,29 @@ impl LweLookupTallEncodingLowering {
         invocations: impl IntoIterator<Item = LweLookupInvocation>,
         c_b_rows: Family<Mat>,
     ) -> Result<Self, LweLookupCompileError> {
-        Ok(Self { invocations: collect_invocations(invocations)?, c_b_rows })
+        Ok(Self {
+            invocations: collect_invocations(invocations)?,
+            c_b_rows,
+            kernels: BTreeMap::new(),
+        })
     }
 }
 
-#[cfg(test)]
 fn tall_lookup_kernel_for(
     kernels: &mut BTreeMap<TallLookupKernelKey, TallLookupKernel>,
-    input_families: &[Family<Mat>],
+    input_families: TallLookupInputs,
     canonical_input_exclusive_upper: Option<BigUint>,
     kernel_name: String,
 ) -> Result<TallLookupKernel, LweLookupCompileError> {
-    if input_families.len() != 6 {
-        return Err(LweLookupCompileError::TallKernelSchema);
-    }
+    let (
+        (input_rows, input_plaintexts, c_b_rows),
+        (low_matrices, high_matrices, output_plaintexts),
+    ) = input_families.clone();
     let key = TallLookupKernelKey {
-        input_types: input_families
-            .iter()
-            .map(|family| MatFamilyType {
-                element: MatrixType {
-                    modulus: family.element_type().modulus.canonicalize(),
-                    ring_dimension: family.element_type().ring_dimension.canonicalize(),
-                    rows: family.element_type().rows.canonicalize(),
-                    columns: family.element_type().columns.canonicalize(),
-                },
-                shape: vec![family.count().canonicalize()],
-            })
-            .collect(),
+        input_types: (
+            (input_rows.schema(), input_plaintexts.schema(), c_b_rows.schema()),
+            (low_matrices.schema(), high_matrices.schema(), output_plaintexts.schema()),
+        ),
         canonical_input_exclusive_upper,
     };
     if let Some(kernel) = kernels.get(&key) {
@@ -1372,42 +1424,34 @@ fn tall_lookup_kernel_for(
     }
     let schemas = key.input_types.clone();
     let canonical_upper = key.canonical_input_exclusive_upper.clone();
-    let kernel = Subgraph::try_define(kernel_name, schemas, move |families: Vec<Family<Mat>>| {
-        let [
-            input_rows,
-            input_plaintexts,
-            c_b_rows,
-            low_matrices,
-            high_matrices,
-            output_plaintexts,
-        ] = families.as_slice()
-        else {
-            return Err(DslError::Schema);
-        };
-        let (rows, plaintexts) = Family::<Mat>::parallel_zip_many_with_broadcast_values(
-            vec![input_rows.clone(), input_plaintexts.clone(), c_b_rows.clone()],
-            vec![low_matrices.clone(), high_matrices.clone(), output_plaintexts.clone()],
-            move |_, values, artifacts| {
-                let [input_row, input_plaintext, c_b] = values.as_slice() else {
-                    return Err(DslError::Schema);
-                };
-                let [low_matrices, high_matrices, output_plaintexts] = artifacts.as_slice() else {
-                    return Err(DslError::Schema);
-                };
-                let input_index = input_plaintext
-                    .clone()
-                    .extract_coefficient_with_canonical_input_exclusive_upper(
-                        0,
-                        canonical_upper.clone(),
-                    );
-                let low = low_matrices.get(input_index.clone());
-                let high = high_matrices.get(input_index.clone());
-                let output_plaintext = output_plaintexts.get(input_index);
-                Ok((c_b.clone() * high + input_row.clone() * low, output_plaintext))
-            },
-        )?;
-        Ok((rows, plaintexts))
-    })?;
+    let kernel = Subgraph::try_define(
+        kernel_name,
+        schemas,
+        move |(
+            (input_rows, input_plaintexts, c_b_rows),
+            (low_matrices, high_matrices, output_plaintexts),
+        ): TallLookupInputs| {
+            let (rows, plaintexts) = parallel_zip_bundle_with_broadcast(
+                (input_rows, input_plaintexts, c_b_rows),
+                (low_matrices, high_matrices, output_plaintexts),
+                move |_index,
+                      (input_row, input_plaintext, c_b_row),
+                      (low_matrices, high_matrices, output_plaintexts)| {
+                    let input_index = input_plaintext
+                        .extract_coefficient_with_canonical_input_exclusive_upper(
+                            0,
+                            canonical_upper,
+                        );
+                    let low = low_matrices.get(input_index.clone());
+                    let high = high_matrices.get(input_index.clone());
+                    let output_plaintext = output_plaintexts.get(input_index);
+                    let row = high.mul_small_rhs(c_b_row) + input_row.mul_small_rhs(low);
+                    (row, output_plaintext)
+                },
+            )?;
+            Ok((rows, plaintexts))
+        },
+    )?;
     kernels.insert(key, kernel.clone());
     Ok(kernel)
 }
@@ -1523,9 +1567,16 @@ impl<P: Poly> PublicLookupLowering<P> for LweLookupTallEncodingLowering {
             .compiler
             .import_artifacts(&invocation.artifacts)
             .map_err(|source| lookup_error(gate, source))?;
+        let kernel_name = format!("tall-lookup-kernel-{}", self.kernels.len());
         invocation
             .compiler
-            .tall_encoding(input, &self.c_b_rows, &artifacts)
+            .tall_encoding_with_kernels(
+                input,
+                &self.c_b_rows,
+                &artifacts,
+                &mut self.kernels,
+                kernel_name,
+            )
             .map_err(|source| lookup_error(gate, source))
     }
 }
@@ -1697,23 +1748,21 @@ fn lookup_error(gate: GateInstance<'_>, source: LweLookupCompileError) -> Circui
 
 #[cfg(test)]
 mod tests {
-    const TEST_PREIMAGE_BOUND: usize = 1 << 20;
-
     use super::*;
     use crate::{
         BggPublicKeyCompiler, BggTallEncodingCompiler,
         test_utils::{matrix_output, row},
     };
-    use mxx_dsl::DslContext;
+    use mxx_dsl::{DslContext, parallel_zip_bundle};
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{
         FrozenGraphScopeId, ParamEnv,
-        artifact::SpecHash,
-        node::{GridInputMode, IntBinaryOp, NodeKind},
+        artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+        node::{IntBinaryOp, LoopInputMode, MatrixBinaryOp, NodeKind},
         types::WireType,
     };
     use mxx_primitives::{
-        matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
+        matrix::{PolyMatrix, SmallPolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
             PolyParams,
             dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
@@ -1753,7 +1802,7 @@ mod tests {
             high_matrix_type: matrix_type(parameters, digit_count + 2, digit_count),
             gadget_base: IntExpr::constant(BigInt::from(1u64 << parameters.base_bits())),
             digit_count: IntExpr::constant(digit_count),
-            preimage_max_coefficient_bound: TEST_PREIMAGE_BOUND.into(),
+            preimage_max_coefficient_bound: IntExpr::constant(1_000_000),
         }
     }
 
@@ -1820,9 +1869,9 @@ mod tests {
         let trapdoor = ring.sample_trapdoor(
             1,
             5,
-            lookup.gadget_base.clone(),
+            balanced_bound(lookup.gadget_base.clone()),
             lookup.digit_count.clone(),
-            TEST_PREIMAGE_BOUND,
+            1_000_000,
         );
         let wires = lookup
             .preprocess(
@@ -1843,23 +1892,23 @@ mod tests {
             .unwrap();
         built.validate(&ParamEnv::default()).unwrap();
 
-        let grids = built
+        let loops = built
             .graph
             .scopes()
             .values()
             .flat_map(|scope| scope.nodes())
-            .filter(|node| matches!(node.kind(), NodeKind::ParallelGrid(_)))
+            .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
             .collect::<Vec<_>>();
-        assert_eq!(grids.len(), 1);
-        let NodeKind::ParallelGrid(spec) = grids[0].kind() else { unreachable!() };
-        assert_eq!(spec.shape, vec![IntExpr::constant(3)]);
-        assert_eq!(grids[0].output_types().len(), 2);
-        assert!(grids[0].output_types().iter().all(|output| {
+        assert_eq!(loops.len(), 1);
+        let NodeKind::ParallelLoop(spec) = loops[0].kind() else { unreachable!() };
+        assert_eq!(spec.count, IntExpr::constant(3));
+        assert_eq!(loops[0].output_types().len(), 2);
+        assert!(loops[0].output_types().iter().all(|output| {
             matches!(
                 output,
-                WireType::Family { element, shape }
-                    if matches!(element.as_ref(), WireType::Preimage { .. }) &&
-                        shape == &vec![IntExpr::constant(3)]
+                WireType::IndexedFamily { element, count }
+                    if matches!(element.as_ref(), WireType::SmallMatrix { .. } | WireType::Preimage { .. }) &&
+                        count == &IntExpr::constant(3)
             )
         }));
 
@@ -1871,18 +1920,14 @@ mod tests {
                 NodeKind::IntBinary(IntBinaryOp::Divide | IntBinaryOp::Remainder)
             ));
             if matches!(node.kind(), NodeKind::FamilyPack { .. }) {
-                let Some(output) = node.output_types().first() else {
-                    panic!("family pack output")
-                };
-                assert!(match output {
-                    WireType::Family { element, .. } => {
-                        matches!(element.as_ref(), WireType::Int) ||
+                assert!(matches!(
+                    node.output_types().first(),
+                    Some(WireType::IndexedFamily { element, .. })
+                        if matches!(element.as_ref(), WireType::Int) ||
                             matches!(element.as_ref(), WireType::Matrix(matrix)
                                 if matrix.rows == IntExpr::constant(1) &&
                                     matrix.columns == IntExpr::constant(1))
-                    }
-                    _ => false,
-                });
+                ));
             }
         }
         let dynamic_hashes = built
@@ -1924,7 +1969,7 @@ mod tests {
             5,
             lookup.gadget_base.clone(),
             lookup.digit_count.clone(),
-            TEST_PREIMAGE_BOUND,
+            1_000_000,
         );
         let input_public_key =
             BggPublicKeyWire { matrix: ring.zero((1, digits)), reveal_plaintext: true };
@@ -1940,15 +1985,15 @@ mod tests {
         let public_b = trapdoor.public_matrix();
         let input_a = input_public_key.matrix;
         let output_a = wires.output_public_key.clone();
-        let residuals = parallel_zip(
-            (wires.low_matrices.clone(), wires.high_matrices.clone(), outputs),
+        let high_matrices = wires.high_matrices.clone();
+        let residuals = parallel_zip_bundle(
+            (wires.low_matrices.clone(), high_matrices, outputs),
             move |index, (low, high, output)| {
-                let x = index
-                    .as_int()
-                    .add(Int::constant(0))
-                    .lift_to_constant_polynomial(scalar_type.clone());
+                let index = index.as_int();
+                let x =
+                    index.add(Int::constant(0)).lift_to_constant_polynomial(scalar_type.clone());
                 let y = output.lift_to_constant_polynomial(scalar_type.clone());
-                public_b.clone().mul_small_rhs(high) -
+                high.mul_small_rhs(public_b.clone()) -
                     (output_a.clone() -
                         gadget.clone() * y -
                         (input_a.clone() - gadget.clone() * x).mul_small_rhs(low))
@@ -1956,7 +2001,7 @@ mod tests {
         )
         .unwrap();
         let validated = DslContext::new("shuffled-logical-lwe-preprocessing")
-            .preimage_family_output("low", wires.low_matrices)
+            .public_output("low", wires.low_matrices)
             .unwrap()
             .family_output("residual", residuals)
             .unwrap()
@@ -1981,7 +2026,7 @@ mod tests {
             )
             .unwrap();
             let low = {
-                let RuntimeValue::Family(values) =
+                let RuntimeValue::IndexedFamily(values) =
                     result.materialize_output("low", &backend, &mut store).unwrap()
                 else {
                     panic!("low output must be a family")
@@ -1989,15 +2034,13 @@ mod tests {
                 values
                     .iter()
                     .map(|value| {
-                        let RuntimeValue::SmallMatrix(matrix) = value else {
-                            panic!("low family member must be a compact small matrix")
-                        };
-                        matrix.decode_full().unwrap()
+                        assert!(matches!(value, RuntimeValue::SmallMatrix(_)));
+                        value.clone()
                     })
                     .collect::<Vec<_>>()
             };
             assert_eq!(low.len(), 3);
-            let RuntimeValue::Family(residuals) =
+            let RuntimeValue::IndexedFamily(residuals) =
                 result.materialize_output("residual", &backend, &mut store).unwrap()
             else {
                 panic!("residual output must be a family")
@@ -2013,6 +2056,19 @@ mod tests {
 
         let first = execute_once(&parameters);
         let second = execute_once(&parameters);
+        let canonical = |values: &[RuntimeValue<mxx_runtime::backend::poly::CpuDcrtBackend>]| {
+            values
+                .iter()
+                .map(|value| match value {
+                    RuntimeValue::SmallMatrix(matrix) => {
+                        matrix.to_canonical_coefficients().unwrap()
+                    }
+                    _ => panic!("low output must remain a compact matrix"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = canonical(&first);
+        let second = canonical(&second);
         assert_eq!(first, second);
         assert_ne!(first[0], first[1]);
         assert_ne!(first[0], first[2]);
@@ -2086,32 +2142,40 @@ mod tests {
             (0..slots).map(|slot| ring.input(format!("c-b-{slot}"), (1, digits + 2))).collect(),
         )
         .unwrap();
-        let low_values =
-            (0..4).map(|_| DCRTPolyMatrix::zero(&parameters, digits, digits)).collect::<Vec<_>>();
+        let make_matrix = |rows: usize, columns: usize, offset: usize| {
+            DCRTPolyMatrix::from_poly_vec(
+                &parameters,
+                (0..rows)
+                    .map(|row_index| row(&parameters, columns, offset + row_index).get_row(0))
+                    .collect(),
+            )
+        };
+        let low_values = (0..4)
+            .map(|index| make_matrix(digits, digits, 12 + index * digits))
+            .collect::<Vec<_>>();
+        let high_values = (0..4)
+            .map(|index| make_matrix(digits + 2, digits, 30 + index * (digits + 2)))
+            .collect::<Vec<_>>();
         let names = LweLookupArtifactNames::for_compiler(&lookup);
-        let low_inputs = (0..4)
-            .map(|_| {
-                ring.zero((1, digits))
-                    .decompose(lookup.gadget_base.clone(), lookup.digit_count.clone())
-            })
-            .collect::<Vec<_>>();
-        let helper_trapdoor = ring.sample_trapdoor(
-            1,
-            5,
-            lookup.gadget_base.clone(),
-            lookup.digit_count.clone(),
-            TEST_PREIMAGE_BOUND,
+        let low_inputs = ring.small_matrix_input_family(
+            "low",
+            4,
+            (digits, digits),
+            balanced_bound(lookup.gadget_base.clone()),
         );
-        let high_inputs = (0..4)
-            .map(|_| helper_trapdoor.sample_preimage(ring.zero((1, digits)), (digits + 2, digits)))
-            .collect::<Vec<_>>();
+        let high_inputs = ring.preimage_input_family(
+            "high",
+            4,
+            (digits + 2, digits),
+            lookup.preimage_max_coefficient_bound.clone(),
+        );
         let output_plaintext_inputs = (0..4)
             .map(|index| ring.input(format!("output-plaintext-{index}"), (1, 1)))
             .collect::<Vec<_>>();
         let producer_wires = LweLookupPreprocessingWires {
             output_public_key: ring.input("output-public", (1, digits)),
-            low_matrices: Family::pack(low_inputs).unwrap(),
-            high_matrices: Family::pack(high_inputs).unwrap(),
+            low_matrices: low_inputs,
+            high_matrices: high_inputs,
             output_plaintexts: Family::pack(output_plaintext_inputs).unwrap(),
         };
         let producer = lookup
@@ -2126,6 +2190,39 @@ mod tests {
             RuntimeValue::matrix(DCRTPolyMatrix::zero(&parameters, 1, digits)),
         )]);
         let output_values = [1usize, 1, 1, 0];
+        producer_inputs.insert(
+            "low".to_owned(),
+            RuntimeValue::IndexedFamily(
+                low_values
+                    .iter()
+                    .cloned()
+                    .map(|value| {
+                        RuntimeValue::small_matrix(
+                            mxx_primitives::matrix::CpuSmallMatrix::new(value, BigUint::from(8u8))
+                                .unwrap(),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+        producer_inputs.insert(
+            "high".to_owned(),
+            RuntimeValue::IndexedFamily(
+                high_values
+                    .iter()
+                    .cloned()
+                    .map(|value| {
+                        RuntimeValue::small_matrix(
+                            mxx_primitives::matrix::CpuSmallMatrix::new(
+                                value,
+                                BigUint::from(1_000_000u32),
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
         for index in 0..4 {
             producer_inputs.insert(
                 format!("output-plaintext-{index}"),
@@ -2140,18 +2237,6 @@ mod tests {
         let produced =
             execute(&producer, &mut backend, producer_inputs, &mut store, SamplingMode::Fresh)
                 .unwrap();
-        let RuntimeValue::Family(high_outputs) = &produced.outputs[&names.high_matrices] else {
-            panic!("high preimage output must be a matrix family")
-        };
-        let high_values = high_outputs
-            .iter()
-            .map(|value| {
-                let RuntimeValue::SmallMatrix(matrix) = value else {
-                    panic!("high preimage family member must be a compact small matrix")
-                };
-                matrix.decode_full().unwrap()
-            })
-            .collect::<Vec<_>>();
         let production_id = produced.production_id.expect("helper artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
         let mut v1_manifest = manifest.clone();
@@ -2165,6 +2250,9 @@ mod tests {
             let v1_name = v2_name.replacen("lwe_lookup_v2_", "lwe_lookup_", 1);
             v1_manifest.artifacts.insert(v1_name, artifact);
         }
+        assert_eq!(manifest.artifacts[&names.low_matrices].family_count, Some(4));
+        assert_eq!(manifest.artifacts[&names.high_matrices].family_count, Some(4));
+        assert_eq!(manifest.artifacts[&names.output_plaintexts].family_count, Some(4));
         let artifacts = lookup
             .import_artifacts(&LweLookupArtifacts::for_compiler(production_id.clone(), &lookup))
             .unwrap();
@@ -2221,7 +2309,7 @@ mod tests {
                 .scopes()
                 .values()
                 .flat_map(|scope| scope.nodes())
-                .filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic { .. }))
+                .filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
                 .count(),
             6,
             "each of the two lookup stages uses one shared low/high/output helper selection"
@@ -2234,7 +2322,10 @@ mod tests {
                 .flat_map(|scope| scope.nodes())
                 .filter(|node| {
                     matches!(node.kind(), NodeKind::Select { .. }) &&
-                        matches!(node.output_types().first(), Some(WireType::Family { .. }))
+                        matches!(
+                            node.output_types().first(),
+                            Some(WireType::IndexedFamily { .. })
+                        )
                 })
                 .count(),
             0,
@@ -2320,47 +2411,38 @@ mod tests {
     #[test]
     fn tall_lookup_kernel_cache_keys_canonical_upper_and_reuses_definitions() {
         let ring = Ring::new(17, 8);
-        let family = |prefix: &str| {
-            Family::pack(
-                (0..2).map(|index| ring.input(format!("{prefix}-{index}"), (1, 1))).collect(),
+        let inputs = |prefix: &str| {
+            let mat_family = |name: &str| {
+                Family::pack(
+                    (0..2)
+                        .map(|index| ring.input(format!("{prefix}-{name}-{index}"), (1, 1)))
+                        .collect(),
+                )
+                .unwrap()
+            };
+            (
+                (mat_family("rows"), mat_family("plaintexts"), mat_family("c-b")),
+                (
+                    ring.small_matrix_input_family(format!("{prefix}-low"), 2, (1, 1), 1),
+                    ring.preimage_input_family(format!("{prefix}-high"), 2, (1, 1), 1),
+                    mat_family("output"),
+                ),
             )
-            .unwrap()
         };
-        let first_inputs = vec![
-            family("row"),
-            family("plaintext"),
-            family("c-b"),
-            family("low"),
-            family("high"),
-            family("output"),
-        ];
-        let second_inputs = vec![
-            family("row-second"),
-            family("plaintext-second"),
-            family("c-b-second"),
-            family("low-second"),
-            family("high-second"),
-            family("output-second"),
-        ];
-        let third_inputs = vec![
-            family("row-third"),
-            family("plaintext-third"),
-            family("c-b-third"),
-            family("low-third"),
-            family("high-third"),
-            family("output-third"),
-        ];
+        let first_inputs = inputs("first");
+        let second_inputs = inputs("second");
+        let third_inputs = inputs("third");
         let mut kernels = BTreeMap::new();
         let first = tall_lookup_kernel_for(
             &mut kernels,
-            &first_inputs,
+            first_inputs.clone(),
             Some(BigUint::from(4u8)),
             "tall-lookup-kernel-test-0".to_owned(),
         )
         .unwrap();
         let second = tall_lookup_kernel_for(
             &mut kernels,
-            &first_inputs,
+            first_inputs.clone(),
             Some(BigUint::from(4u8)),
             "tall-lookup-kernel-test-0".to_owned(),
         )
@@ -2368,7 +2450,7 @@ mod tests {
         assert_eq!(kernels.len(), 1);
         let third = tall_lookup_kernel_for(
             &mut kernels,
-            &first_inputs,
+            first_inputs.clone(),
             Some(BigUint::from(5u8)),
             "tall-lookup-kernel-test-1".to_owned(),
         )
@@ -2379,17 +2461,17 @@ mod tests {
         let (other_rows, other_plaintexts) = third.call(third_inputs).unwrap();
         let context = DslContext::new("tall-lookup-kernel-cache");
         let built = context
-            .public_family_output("rows", rows)
+            .public_output("rows", rows)
             .unwrap()
-            .public_family_output("plaintexts", plaintexts)
+            .public_output("plaintexts", plaintexts)
             .unwrap()
-            .public_family_output("second-rows", second_rows)
+            .public_output("second-rows", second_rows)
             .unwrap()
-            .public_family_output("second-plaintexts", second_plaintexts)
+            .public_output("second-plaintexts", second_plaintexts)
             .unwrap()
-            .public_family_output("other-rows", other_rows)
+            .public_output("other-rows", other_rows)
             .unwrap()
-            .public_family_output("other-plaintexts", other_plaintexts)
+            .public_output("other-plaintexts", other_plaintexts)
             .unwrap()
             .build()
             .unwrap();
@@ -2424,14 +2506,15 @@ mod tests {
             scope.nodes().iter().any(|node| {
                 matches!(
                     node.kind(),
-                    NodeKind::ParallelGrid(spec)
-                        if spec.input_modes.len() == 6 &&
-                            spec.input_modes[..3]
-                                .iter()
-                                .all(|mode| matches!(mode, GridInputMode::Reindex { .. })) &&
-                            spec.input_modes[3..]
-                                .iter()
-                                .all(|mode| matches!(mode, GridInputMode::Broadcast))
+                    NodeKind::ParallelLoop(spec)
+                        if spec.input_modes == vec![
+                            LoopInputMode::Zip,
+                            LoopInputMode::Zip,
+                            LoopInputMode::Zip,
+                            LoopInputMode::Broadcast,
+                            LoopInputMode::Broadcast,
+                            LoopInputMode::Broadcast,
+                        ]
                 )
             })
         }));
@@ -2461,23 +2544,6 @@ mod tests {
     }
 
     #[test]
-    fn tall_lookup_kernel_rejects_non_six_family_schema() {
-        let ring = Ring::new(17, 8);
-        let family = Family::pack(vec![ring.input("schema-0", (1, 1))]).unwrap();
-        let mut kernels = BTreeMap::new();
-        assert!(matches!(
-            tall_lookup_kernel_for(
-                &mut kernels,
-                &[family.clone(), family],
-                None,
-                "tall-lookup-kernel-invalid".to_owned(),
-            ),
-            Err(LweLookupCompileError::TallKernelSchema)
-        ));
-        assert!(kernels.is_empty());
-    }
-
-    #[test]
     fn tall_lookup_rejects_hidden_mismatched_and_wrong_width_inputs() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
         let digits = parameters.modulus_digits();
@@ -2497,20 +2563,18 @@ mod tests {
         let diagonal = Family::pack(vec![ring.zero((1, 1)), ring.zero((1, 1))]).unwrap();
         let artifacts = LweLookupArtifactWires {
             output_public_key: ring.zero((1, digits)),
-            low_matrices: Family::pack(
-                (0..2)
-                    .map(|_| ring.zero((digits, digits)).decompose(lookup.gadget_base.clone(), 1))
-                    .collect(),
-            )
-            .unwrap(),
-            high_matrices: Family::pack(
-                (0..2)
-                    .map(|_| {
-                        ring.zero((digits + 2, digits)).decompose(lookup.gadget_base.clone(), 1)
-                    })
-                    .collect(),
-            )
-            .unwrap(),
+            low_matrices: ring.small_matrix_input_family(
+                "low-artifacts",
+                2,
+                (digits, digits),
+                balanced_bound(lookup.gadget_base.clone()),
+            ),
+            high_matrices: ring.preimage_input_family(
+                "high-artifacts",
+                2,
+                (digits + 2, digits),
+                lookup.preimage_max_coefficient_bound.clone(),
+            ),
             output_plaintexts: Family::pack((0..2).map(|_| ring.zero((1, 1))).collect()).unwrap(),
         };
         let wire = |plaintext| BggTallEncodingWire {
@@ -2622,7 +2686,7 @@ mod tests {
             5,
             BigInt::from(1u64 << parameters.base_bits()),
             digit_count,
-            TEST_PREIMAGE_BOUND,
+            1_000_000,
         );
         let mut lookup = LweLookupPreprocessingLowering::new(
             parameters.clone(),
@@ -2630,7 +2694,6 @@ mod tests {
             trapdoor,
             BigInt::from(1u64 << parameters.base_bits()).into(),
             digit_count.into(),
-            TEST_PREIMAGE_BOUND.into(),
             Vec::new(),
         );
         let mut slots = crate::NoSlotOperations::default();
@@ -2682,11 +2745,11 @@ mod tests {
             .values()
             .flat_map(|scope| scope.nodes())
             .filter(|node| {
-                matches!(node.kind(), NodeKind::FamilyPack { shape, .. }
-                    if shape == &vec![IntExpr::constant(2)]) &&
+                matches!(node.kind(), NodeKind::FamilyPack { count }
+                    if count == &IntExpr::constant(2)) &&
                     matches!(
                         node.output_types().first(),
-                        Some(WireType::Family { element, .. })
+                        Some(WireType::IndexedFamily { element, .. })
                             if matches!(element.as_ref(), WireType::Int) ||
                                 matches!(element.as_ref(), WireType::Matrix(matrix)
                                     if matrix.rows == IntExpr::constant(1) &&
@@ -2694,7 +2757,7 @@ mod tests {
                     )
             })
             .count();
-        assert_eq!(table_family_packs, 2, "each logical table remains a rank-N family pack");
+        assert_eq!(table_family_packs, 2);
     }
 
     #[test]
@@ -2717,7 +2780,7 @@ mod tests {
             5,
             BigInt::from(1u64 << parameters.base_bits()),
             digit_count,
-            TEST_PREIMAGE_BOUND,
+            1_000_000,
         );
         let mut lookup = NaiveLweLookupPreprocessingLowering::new(
             parameters.clone(),
@@ -2725,7 +2788,6 @@ mod tests {
             vec![trapdoor.clone(), trapdoor],
             BigInt::from(1u64 << parameters.base_bits()).into(),
             digit_count.into(),
-            TEST_PREIMAGE_BOUND.into(),
             vec![17],
         )
         .unwrap();
@@ -2872,8 +2934,8 @@ mod tests {
                     artifact.artifact_name.ends_with(suffix) &&
                         matches!(
                             wire_type,
-                            WireType::Family { shape, .. }
-                                if shape == &vec![IntExpr::constant(2)]
+                            WireType::IndexedFamily { count, .. }
+                                if count == &IntExpr::constant(2)
                         )
                 }),
                 "logical lookup artifact {suffix} must have table-length domain"
@@ -2881,7 +2943,7 @@ mod tests {
         }
         let dynamic_gets = nodes
             .iter()
-            .filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic { .. }))
+            .filter(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
             .collect::<Vec<_>>();
         assert_eq!(dynamic_gets.len(), 3);
         assert!(dynamic_gets.iter().all(|node| {
@@ -2902,7 +2964,10 @@ mod tests {
                 .iter()
                 .filter(|node| {
                     matches!(node.kind(), NodeKind::Select { .. }) &&
-                        matches!(node.output_types().first(), Some(WireType::Family { .. }))
+                        matches!(
+                            node.output_types().first(),
+                            Some(WireType::IndexedFamily { .. })
+                        )
                 })
                 .count(),
             0,
@@ -2982,11 +3047,77 @@ mod tests {
             .next()
             .expect("one LUT output");
         let output_plaintext = output.plaintext.clone().expect("lookup output plaintext");
-        let built = DslContext::new("single-lwe-public-lookup-encoding")
-            .output("vector", output.vector)
-            .expect("vector output")
-            .output("plaintext", output_plaintext)
-            .expect("plaintext output")
+        let artifacts = LweLookupArtifacts::for_compiler(production_id.clone(), &lookup);
+        let output_public_key_artifact =
+            LweLookupArtifactNames::for_compiler(&lookup).output_public_key;
+        let output_public_key = lookup.public_key(&lookup.import_artifacts(&artifacts).unwrap());
+        let secret = ring.input("lookup-secret", (1, 1));
+        let gadget = ring.gadget(1, lookup.gadget_base.clone(), lookup.digit_count.clone());
+        let signal = secret.clone() * output_public_key.matrix.clone() -
+            output_plaintext.clone() * secret.clone() * gadget.clone();
+
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) = signal.value_handle().node().kind()
+        else {
+            panic!("lookup signal must be a subtraction")
+        };
+        let [left, right] = signal.value_handle().node().arguments() else {
+            panic!("lookup signal subtraction must have two operands")
+        };
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = left.node().kind() else {
+            panic!("lookup signal left side must be secret times output public key")
+        };
+        assert_eq!(
+            left.node().arguments(),
+            [secret.value_handle().clone(), output_public_key.matrix.value_handle().clone()]
+        );
+        let NodeKind::Input { artifact: Some(artifact), .. } =
+            output_public_key.matrix.value_handle().node().kind()
+        else {
+            panic!("lookup output public key must be imported from its exact artifact")
+        };
+        assert_eq!(artifact.production_id, production_id);
+        assert_eq!(artifact.artifact_name, output_public_key_artifact);
+        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = right.node().kind() else {
+            panic!("lookup signal right side must end with a gadget multiplication")
+        };
+        let [plaintext_times_secret, right_gadget] = right.node().arguments() else {
+            panic!("lookup signal gadget product must have two operands")
+        };
+        assert_eq!(right_gadget, gadget.value_handle());
+        let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = plaintext_times_secret.node().kind()
+        else {
+            panic!("lookup signal must multiply its plaintext by the secret before the gadget")
+        };
+        assert_eq!(
+            plaintext_times_secret.node().arguments(),
+            [output_plaintext.value_handle().clone(), secret.value_handle().clone()]
+        );
+        let NodeKind::FamilyGetDynamic = output_plaintext.value_handle().node().kind() else {
+            panic!("lookup output plaintext must use dynamic access to the artifact family")
+        };
+        let [output_family, output_selector] = output_plaintext.value_handle().node().arguments()
+        else {
+            panic!("lookup output plaintext family access has the wrong arity")
+        };
+        let NodeKind::Input { artifact: Some(artifact), .. } = output_family.node().kind() else {
+            panic!("lookup output plaintext must come from the authoritative artifact family")
+        };
+        assert_eq!(artifact.production_id, production_id);
+        assert_eq!(
+            artifact.artifact_name,
+            LweLookupArtifactNames::for_compiler(&lookup).output_plaintexts
+        );
+        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+        let NodeKind::ExtractCoefficient { position, .. } = output_selector.node().kind() else {
+            panic!("lookup output plaintext selector must be the input coefficient")
+        };
+        assert_eq!(position, &IntExpr::constant(0));
+
+        let built = DslContext::new("single-lwe-public-lookup-signal")
+            .output("signal", signal)
+            .expect("signal output")
             .build()
             .expect("encoding graph");
         assert!(

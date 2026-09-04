@@ -4,7 +4,10 @@ use crate::BggPublicKeyWire;
 use mxx_dsl::{
     DslError, FamilyElement, GraphValue, GraphValueSchema, Mat, MatType, Pending, Preimage, Ring,
 };
-use mxx_ir_core::{IntExpr, RealExpr, ValueHandle, WireType, node::IndexRange};
+use mxx_ir_core::{
+    IntExpr, RealExpr, ValueHandle, WireType,
+    node::{ConcatAxis, IndexRange},
+};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -142,18 +145,15 @@ impl BggEncodingCompiler {
     ) -> Result<BggEncodingWire, EncodingCompileError> {
         let plaintext = lhs.plaintext.clone().ok_or(EncodingCompileError::MissingLeftPlaintext)?;
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone().mul_small_rhs(decomposed_rhs) +
-                plaintext * rhs.vector.clone(),
+            vector: decomposed_rhs.mul_small_rhs(lhs.vector.clone()) +
+                rhs.vector.clone() * plaintext,
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
     }
 
     pub fn small_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
-        // For a small scalar t, t C_x is the encoding carrier and t x is its
-        // known plaintext.  The scalar is on the left so it acts on every row
-        // without changing the gadget-column layout.
         BggEncodingWire {
-            vector: scalar.clone() * input.vector.clone(),
+            vector: input.vector.clone() * scalar.clone(),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
     }
@@ -166,7 +166,7 @@ impl BggEncodingCompiler {
         decomposed: Preimage,
     ) -> BggEncodingWire {
         BggEncodingWire {
-            vector: input.vector.clone().mul_small_rhs(decomposed),
+            vector: decomposed.mul_small_rhs(input.vector.clone()),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
     }
@@ -176,7 +176,7 @@ impl BggEncodingCompiler {
         // This is an explicit right action by an arbitrary target matrix.  Its
         // decomposition is used only to consume the input carrier; it does not
         // assert that the projected target itself is a canonical G encoding.
-        BggEncodingWire { vector: input.vector.clone().mul_small_rhs(decomposed), plaintext: None }
+        BggEncodingWire { vector: decomposed.mul_small_rhs(input.vector.clone()), plaintext: None }
     }
 }
 
@@ -231,12 +231,9 @@ pub struct BggEncodingSampler {
 }
 
 impl BggEncodingSampler {
-    /// Builds the packed BGG+ relation
-    /// `s_mask A - ([1|x_1|...|x_t] tensor (s_payload G)) + e`, then exposes
-    /// its column slices. The mask secret controls the public-key term, while
-    /// the payload secret controls the plaintext gadget term. Passing `None`
-    /// for `payload_secret` deliberately reuses the mask secret, which is the
-    /// ordinary one-secret BGG+ construction.
+    /// Builds `s_mask A - ([1|x_1|...|x_t] tensor (s_payload G)) + e` and
+    /// exposes its column slices. Omitting the payload secret reuses the mask
+    /// secret for the ordinary one-secret construction.
     pub fn sample(
         &self,
         mask_secret: Mat,
@@ -265,38 +262,38 @@ impl BggEncodingSampler {
         {
             return Err(BggSampleError::MatrixTypeMismatch);
         }
+        let all_public_keys = Mat::concat(
+            ConcatAxis::Columns,
+            public_keys.iter().map(|key| key.matrix.clone()).collect(),
+        );
         let one = ring.identity(1);
         let mut extended_plaintexts = Vec::with_capacity(count);
         extended_plaintexts.push(one);
         extended_plaintexts.extend(plaintexts.iter().cloned());
+        let encoded_plaintexts = Mat::concat(ConcatAxis::Columns, extended_plaintexts.clone());
         let gadget = ring.gadget(
             self.layout.secret_dimension,
             self.layout.gadget_base.clone(),
             self.layout.digit_count,
         );
-        let packed_error = match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
-            (Some(sigma), Some(bound)) => {
-                ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
-            }
-            (None, None) => ring.zero((1, columns * count)),
-            _ => return Err(BggSampleError::MissingGaussianBound),
-        };
-        // Construct each block against its own public matrix. The error is
-        // sampled once as a packed row and sliced, while the signal term keeps
-        // `G` as its final right operand. This preserves the typed carrier
-        // relation without introducing graph-level concatenation nodes.
+        let packed_vector = mask_secret * all_public_keys -
+            encoded_plaintexts.tensor(payload_secret * gadget) +
+            match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
+                (Some(sigma), Some(bound)) => {
+                    ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                }
+                (None, None) => ring.zero((1, columns * count)),
+                _ => return Err(BggSampleError::MissingGaussianBound),
+            };
         Ok((0..count)
             .map(|index| BggEncodingWire {
-                vector: mask_secret.clone() * public_keys[index].matrix.clone() -
-                    extended_plaintexts[index].clone().tensor(payload_secret.clone()) *
-                        gadget.clone() +
-                    packed_error.clone().slice(
-                        None,
-                        Some(IndexRange {
-                            start: (columns * index).into(),
-                            end: (columns * (index + 1)).into(),
-                        }),
-                    ),
+                vector: packed_vector.clone().slice(
+                    None,
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
+                ),
                 plaintext: public_keys[index]
                     .reveal_plaintext
                     .then(|| extended_plaintexts[index].clone()),
@@ -446,10 +443,7 @@ mod tests {
             1,
             "only the encoding vector consumes the typed decomposition"
         );
-        assert!(kinds.iter().any(|kind| {
-            matches!(kind, NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply))
-        }));
-        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
+        assert!(!kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixScale { .. })));
 
         built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
@@ -605,24 +599,58 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(concat_count, 0, "encoding blocks are built directly without concatenation");
-        assert_eq!(tensor_count, 2, "one plaintext-secret tensor per encoding block");
-        assert!(
-            built.graph.root_scope().nodes().iter().any(|node| {
-                matches!(
-                    node.kind(),
-                    NodeKind::ConstantMatrix {
-                        matrix_type,
-                        value: mxx_ir_core::node::ConstantMatrix::Gadget { .. },
-                    } if matrix_type.rows.canonicalize() == IntExpr::constant(2)
-                )
-            }),
-            "each plaintext-secret row is multiplied by the real gadget"
-        );
+        assert_eq!(concat_count, 2, "packed public keys and packed plaintext row");
+        assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
         assert_eq!(gaussian_types.len(), 1, "one packed error sample");
         assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
         built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
+    #[test]
+    fn payload_secret_none_reuses_the_mask_secret() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let layout = concrete_layout(&parameters, 2);
+        let ring = layout.ring();
+        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
+            ring.bytes_input("key", 32),
+            b"bgg-shared-secret".to_vec(),
+            &[],
+        );
+        let sampler = BggEncodingSampler {
+            layout,
+            gaussian_sigma: None,
+            gaussian_max_coefficient_bound: None,
+        };
+        let shared =
+            sampler.sample(ring.input("shared-secret", (1, 2)), None, &public_keys, &[]).unwrap();
+        let explicit = sampler
+            .sample(
+                ring.input("explicit-mask-secret", (1, 2)),
+                Some(ring.input("explicit-payload-secret", (1, 2))),
+                &public_keys,
+                &[],
+            )
+            .unwrap();
+        let graph = DslContext::new("bgg-shared-secret-fallback")
+            .output("shared", shared[0].vector.clone())
+            .unwrap()
+            .output("explicit", explicit[0].vector.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let secret_value = secret(&parameters, 2);
+        let result = execute_graph(
+            graph,
+            parameters,
+            BTreeMap::from([
+                ("key".to_owned(), RuntimeValue::Bytes([7u8; 32].to_vec())),
+                ("shared-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("explicit-mask-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
+                ("explicit-payload-secret".to_owned(), RuntimeValue::matrix(secret_value)),
+            ]),
+        );
+        assert_eq!(matrix_output(&result, "shared"), matrix_output(&result, "explicit"));
+    }
+
     #[test]
     fn runtime_public_keys_and_encodings_match_the_bgg_sampling_formula() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4);
@@ -682,82 +710,39 @@ mod tests {
             ]),
         );
 
+        let packed = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+            &parameters,
+            key,
+            tag,
+            layout.secret_dimension,
+            layout.public_key_columns() * public_keys.len(),
+            DistType::FinRingDist,
+        );
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
-        let payload_secret_gadget = payload_secret_value.clone() * gadget;
-        let encoded_plaintexts = [
-            DCRTPoly::const_one(&parameters),
-            plaintext_values[0].entry(0, 0),
-            plaintext_values[1].entry(0, 0),
-        ];
+        let encoded_plaintexts = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![
+                DCRTPoly::const_one(&parameters),
+                plaintext_values[0].entry(0, 0),
+                plaintext_values[1].entry(0, 0),
+            ],
+        );
+        let vectors = mask_secret_value * packed.clone() -
+            encoded_plaintexts.tensor(&(payload_secret_value * gadget));
         for index in 0..public_keys.len() {
-            let mut indexed_tag = tag.to_vec();
-            indexed_tag.extend_from_slice(&(index as u64).to_le_bytes());
-            let public = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
-                &parameters,
-                key,
-                &indexed_tag,
-                layout.secret_dimension,
-                layout.public_key_columns(),
-                DistType::FinRingDist,
+            let start = layout.public_key_columns() * index;
+            let end = layout.public_key_columns() * (index + 1);
+            assert_eq!(
+                matrix_output(&result, &format!("public-{index}")),
+                &packed.slice_columns(start, end)
             );
-            let plaintext = DCRTPolyMatrix::from_poly_vec_row(
-                &parameters,
-                vec![encoded_plaintexts[index].clone()],
+            assert_eq!(
+                matrix_output(&result, &format!("vector-{index}")),
+                &vectors.slice_columns(start, end)
             );
-            assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);
-            let vector = mask_secret_value.clone() * public.clone() -
-                plaintext.tensor(&payload_secret_gadget);
-            assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);
-            assert_eq!(matrix_output(&result, &format!("vector-{index}")), &vector);
         }
         assert!(encodings[0].plaintext.is_some());
         assert!(encodings[1].plaintext.is_none());
         assert!(encodings[2].plaintext.is_some());
-    }
-
-    #[test]
-    fn payload_secret_none_reuses_the_mask_secret() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = concrete_layout(&parameters, 2);
-        let ring = layout.ring();
-        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
-            ring.bytes_input("key", 32),
-            b"bgg-shared-secret".to_vec(),
-            &[],
-        );
-        let sampler = BggEncodingSampler {
-            layout,
-            gaussian_sigma: None,
-            gaussian_max_coefficient_bound: None,
-        };
-        let shared =
-            sampler.sample(ring.input("shared-secret", (1, 2)), None, &public_keys, &[]).unwrap();
-        let explicit = sampler
-            .sample(
-                ring.input("explicit-mask-secret", (1, 2)),
-                Some(ring.input("explicit-payload-secret", (1, 2))),
-                &public_keys,
-                &[],
-            )
-            .unwrap();
-        let graph = DslContext::new("bgg-shared-secret-fallback")
-            .output("shared", shared[0].vector.clone())
-            .unwrap()
-            .output("explicit", explicit[0].vector.clone())
-            .unwrap()
-            .build()
-            .unwrap();
-        let secret_value = secret(&parameters, 2);
-        let result = execute_graph(
-            graph,
-            parameters,
-            BTreeMap::from([
-                ("key".to_owned(), RuntimeValue::Bytes([7u8; 32].to_vec())),
-                ("shared-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("explicit-mask-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("explicit-payload-secret".to_owned(), RuntimeValue::matrix(secret_value)),
-            ]),
-        );
-        assert_eq!(matrix_output(&result, "shared"), matrix_output(&result, "explicit"));
     }
 }

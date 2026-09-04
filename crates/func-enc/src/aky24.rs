@@ -31,7 +31,7 @@ use crate::{
         fhe_prg::goldreich::{GoldreichFhePrg, decrypt_bit_decomposed_scalar_outputs},
     },
     lookup::{PltEvaluator, PublicLut},
-    matrix::{PolyMatrix, PolyMatrixSmallRhs, ResidentPolyMatrixColumnSource, SmallPolyMatrix},
+    matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallPolyMatrix},
     noise_refresh::{
         NoiseRefresherNaiveVec, debug_sample_prg_encoding_wires, debug_sample_prg_plaintext_wires,
         debug_sample_prg_public_key_wires,
@@ -40,10 +40,7 @@ use crate::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
-    sampler::{
-        DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        bounds::default_preimage_cutoff,
-    },
+    sampler::{DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler},
     slot_transfer::SlotTransferEvaluator,
 };
 
@@ -69,6 +66,7 @@ where
     pub ring_gsw_public_key_error_sigma: Option<f64>,
     pub bgg_tag: Vec<u8>,
     pub trapdoor_sigma: f64,
+    pub preimage_max_coefficient_bound: BigUint,
     pub encoding_error_sigma: Option<f64>,
     pub b_error_sigma: Option<f64>,
     pub b_matrix: M,
@@ -99,6 +97,7 @@ where
         ring_gsw_public_key_error_sigma: Option<f64>,
         bgg_tag: Vec<u8>,
         trapdoor_sigma: f64,
+        preimage_max_coefficient_bound: BigUint,
         encoding_error_sigma: Option<f64>,
         b_matrix: M,
         b_trapdoor: TD,
@@ -127,6 +126,7 @@ where
             ring_gsw_public_key_error_sigma,
             bgg_tag,
             trapdoor_sigma,
+            preimage_max_coefficient_bound,
             encoding_error_sigma,
             b_error_sigma: encoding_error_sigma,
             b_matrix,
@@ -256,68 +256,10 @@ impl Aky24Func {
 #[derive(Debug, Clone)]
 pub struct Aky24FuncKey<M: PolyMatrix> {
     pub func: Aky24Func,
-    pub preimage: Aky24CompactPreimage,
+    pub preimage_compact_bytes: Vec<u8>,
     pub public_prf_seed: Vec<bool>,
-    pub prf_refresh_preimages: Vec<Aky24CompactPreimage>,
+    pub prf_refresh_preimage_compact_bytes: Vec<Vec<u8>>,
     _m: PhantomData<M>,
-}
-
-/// A bounded preimage is stored as its complete compact owner metadata and
-/// canonical payload.  The dimensions and inclusive bound are part of the
-/// value, so decoding never guesses a shape or silently expands it.
-#[derive(Debug, Clone)]
-pub struct Aky24CompactPreimage {
-    pub rows: usize,
-    pub columns: usize,
-    pub max_coefficient_bound: BigUint,
-    pub canonical_payload: Vec<u8>,
-}
-
-impl Aky24CompactPreimage {
-    fn from_owner<M: PolyMatrixSmallRhs>(owner: &M::SmallMatrix) -> Self {
-        Self {
-            rows: owner.rows(),
-            columns: owner.columns(),
-            max_coefficient_bound: owner.max_coefficient_bound().clone(),
-            canonical_payload: owner
-                .to_canonical_coefficients()
-                .expect("bounded preimage serialization must succeed"),
-        }
-    }
-
-    fn decode<M: PolyMatrixSmallRhs>(
-        &self,
-        params: &<M::P as Poly>::Params,
-    ) -> M::SmallMatrix {
-        M::SmallMatrix::from_canonical_coefficients(
-            params,
-            self.rows,
-            self.columns,
-            self.max_coefficient_bound.clone(),
-            &self.canonical_payload,
-        )
-        .expect("stored bounded preimage metadata and payload must be valid")
-    }
-}
-
-fn aky24_preimage_bound<M, TD>(
-    params: &Aky24Params<M, TD>,
-    public_rows: usize,
-) -> BigUint
-where
-    M: PolyMatrix,
-{
-    let base = 1u32
-        .checked_shl(params.poly_params.base_bits())
-        .expect("AKY24 gadget base must fit in u32");
-    default_preimage_cutoff(
-        params.poly_params.ring_dimension(),
-        public_rows,
-        params.poly_params.modulus_digits(),
-        base,
-        params.trapdoor_sigma,
-    )
-    .expect("AKY24 preimage cutoff must be representable")
 }
 
 #[derive(Debug, Clone)]
@@ -509,18 +451,15 @@ where
                             "AKY24 PRF mask keygen refresh preimage sampling started"
                         );
                         let started = Instant::now();
-                        let target_source =
-                            ResidentPolyMatrixColumnSource::new(refresh_key_slot.matrix.clone());
                         let preimage = trapdoor_sampler
                             .preimage(
-                                &params.poly_params,
-                                &msk.b_trapdoor,
-                                &msk.b_matrix,
-                                &target_source,
-                                aky24_preimage_bound(params, msk.b_matrix.row_size()),
-                                rand::random(),
-                            )
-                            .expect("AKY24 refresh preimage sampling must satisfy its cutoff");
+                            &params.poly_params,
+                            &msk.b_trapdoor,
+                            &msk.b_matrix,
+                            &refresh_key_slot.matrix,
+                            params.preimage_max_coefficient_bound.clone(),
+                        )
+                        .expect("AKY24 refresh preimage sampling");
                         debug!(
                             round_idx,
                             wire_idx,
@@ -529,7 +468,7 @@ where
                             elapsed_ms = started.elapsed().as_millis(),
                             "AKY24 PRF mask keygen refresh preimage sampling finished"
                         );
-                        refresh_preimages.push(Aky24CompactPreimage::from_owner::<M>(&preimage));
+                        refresh_preimages.push(preimage.to_canonical_coefficients().unwrap());
                     }
                 }
                 next_seed_wires.push(a_prime);
@@ -637,8 +576,8 @@ where
             .clone();
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let mask_target = target
-            .multiply_small_rhs(selector.gadget_decompose(false).expect("selector decomposition"))
-            .expect("bounded selector multiplication");
+            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 mask selector decomposition"))
+            .expect("AKY24 mask selector product");
         info!(refresh_preimages = refresh_preimages.len(), "AKY24 PRF mask keygen finished");
         (mask_target, refresh_preimages)
     }
@@ -681,7 +620,7 @@ where
             .and_then(|count| count.checked_mul(fsk.public_prf_seed.len()))
             .expect("AKY24 PRF mask decoder count overflow");
         assert_eq!(
-            fsk.prf_refresh_preimages.len(),
+            fsk.prf_refresh_preimage_compact_bytes.len(),
             decoder_count,
             "AKY24 PRF mask refresh preimage count mismatch"
         );
@@ -747,13 +686,19 @@ where
             let mut decoder_sets = Vec::with_capacity(selected_half_wires.len());
             for _ in selected_half_wires.iter() {
                 let per_wire_decoder_count = one.num_slots() * crt_depth;
-                let decoders = fsk.prf_refresh_preimages
+                let decoders = fsk.prf_refresh_preimage_compact_bytes
                     [preimage_cursor..preimage_cursor + per_wire_decoder_count]
                     .iter()
-                    .map(|preimage| {
-                        ct.c_b
-                            .multiply_small_rhs(preimage.decode::<M>(&params.poly_params))
-                            .expect("AKY24 decoder preimage multiplication must match BGG shape")
+                    .map(|preimage_bytes| {
+                        let preimage = M::SmallMatrix::from_canonical_coefficients(
+                            &params.poly_params,
+                            ct.c_b.col_size(),
+                            1,
+                            params.preimage_max_coefficient_bound.clone(),
+                            preimage_bytes,
+                        )
+                        .expect("AKY24 refresh preimage codec");
+                        ct.c_b.clone().multiply_small_rhs(preimage).expect("AKY24 refresh product")
                     })
                     .collect::<Vec<_>>();
                 preimage_cursor += per_wire_decoder_count;
@@ -863,8 +808,8 @@ where
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let mask_message = evaluated_encoding
             .vector
-            .multiply_small_rhs(selector.gadget_decompose(false).expect("selector decomposition"))
-            .expect("bounded selector multiplication");
+            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 mask selector decomposition"))
+            .expect("AKY24 mask selector product");
         info!("AKY24 PRF mask dec finished");
         mask_message
     }
@@ -1132,8 +1077,8 @@ where
         );
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let preimage_target = evaluated_target
-            .multiply_small_rhs(selector.gadget_decompose(false).expect("selector decomposition"))
-            .expect("bounded selector multiplication");
+            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 target selector decomposition"))
+            .expect("AKY24 target selector product");
         debug!(
             target_rows = preimage_target.row_size(),
             target_cols = preimage_target.col_size(),
@@ -1154,23 +1099,21 @@ where
         );
         let combined_preimage_target = preimage_target + mask_preimage_target;
         info!("AKY24 keygen sampling trapdoor preimage for function output plus PRF mask");
-        let target_source = ResidentPolyMatrixColumnSource::new(combined_preimage_target.clone());
         let preimage = trapdoor_sampler
             .preimage(
-                &params.poly_params,
-                &msk.b_trapdoor,
-                &msk.b_matrix,
-                &target_source,
-                aky24_preimage_bound(params, msk.b_matrix.row_size()),
-                rand::random(),
-            )
-            .expect("AKY24 output preimage sampling must satisfy its cutoff");
+            &params.poly_params,
+            &msk.b_trapdoor,
+            &msk.b_matrix,
+            &combined_preimage_target,
+            params.preimage_max_coefficient_bound.clone(),
+        )
+        .expect("AKY24 function preimage sampling");
         info!(?func, prf_refresh_preimages = prf_refresh_preimages.len(), "AKY24 keygen finished");
         Aky24FuncKey {
             func: *func,
-            preimage: Aky24CompactPreimage::from_owner::<M>(&preimage),
+            preimage_compact_bytes: preimage.to_canonical_coefficients().unwrap(),
             public_prf_seed,
-            prf_refresh_preimages,
+            prf_refresh_preimage_compact_bytes: prf_refresh_preimages,
             _m: PhantomData,
         }
     }
@@ -1223,10 +1166,8 @@ where
                 let selector = g_inverse_identity_selector::<M>(&params.poly_params);
                 let evaluated_message = evaluated_encoding
                     .vector
-                    .multiply_small_rhs(
-                        selector.gadget_decompose(false).expect("selector decomposition"),
-                    )
-                    .expect("bounded selector multiplication");
+                    .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 message selector decomposition"))
+                    .expect("AKY24 message selector product");
                 let mask_message = self.dec_prf_mask_encoding(
                     params,
                     ct,
@@ -1237,12 +1178,20 @@ where
                     wire_count,
                 );
                 let combined_message = evaluated_message + mask_message;
-                let output_preimage = fsk.preimage.decode::<M>(&params.poly_params);
-                let decoded_output = ct
+                let output_preimage = M::SmallMatrix::from_canonical_coefficients(
+                    &params.poly_params,
+                    ct.c_b.col_size(),
+                    1,
+                    params.preimage_max_coefficient_bound.clone(),
+                    &fsk.preimage_compact_bytes,
+                )
+                .expect("AKY24 output preimage codec");
+                let output_product = ct
                     .c_b
+                    .clone()
                     .multiply_small_rhs(output_preimage)
-                    .expect("AKY24 output preimage multiplication must match BGG shape");
-                let noisy_plaintext = combined_message - &decoded_output;
+                    .expect("AKY24 output product");
+                let noisy_plaintext = combined_message - &output_product;
                 assert_eq!(
                     noisy_plaintext.size(),
                     (1, 1),
@@ -1757,6 +1706,7 @@ mod tests {
             Some(0.0),
             b"aky24_test".to_vec(),
             4.578,
+            BigUint::from(1_000_000u32),
             None,
             b_matrix,
             b_trapdoor,
@@ -1768,6 +1718,11 @@ mod tests {
             1,
             [0x24; 32],
         );
+        let zero_bound_params = Aky24Params {
+            preimage_max_coefficient_bound: BigUint::from(0u8),
+            ..params.clone()
+        };
+        assert_eq!(zero_bound_params.preimage_max_coefficient_bound, BigUint::from(0u8));
         let mut scheme = TestFuncEnc::new(None, None, None, None);
         info!("AKY24 GPU test running setup");
         let (enc_key, master_key) = scheme.setup(&params);

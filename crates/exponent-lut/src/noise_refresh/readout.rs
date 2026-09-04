@@ -19,9 +19,7 @@ use crate::{
 };
 use mxx_bgg::{BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
 use mxx_dsl::{Family, Int, Mat, Parallel, ParallelZipTuple, Preimage, Ring};
-use mxx_ir_core::{
-    IndexExpr, IndexMap, IntExpr, ParamEnv, artifact::ArtifactType, types::ConcreteMatrixType,
-};
+use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactType, types::ConcreteMatrixType};
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
@@ -480,7 +478,7 @@ impl ValueReadout {
             })
         })?;
         let aligned_public = (flat_masks, public_decompositions)
-            .parallel_zip_tuple(|_, (mask, public)| mask.mul_small_rhs(public))
+            .parallel_zip_tuple(|_, (mask, public)| public.mul_small_rhs(mask))
             .map_err(|error| {
                 ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
                     stage: "align readout public helper family",
@@ -505,12 +503,15 @@ impl ValueReadout {
             })?;
         let flat_aligned = aligned_public;
         let flat_switches = switch_decompositions
-            .reindex(
-                vec![IntExpr::constant(flat_count)],
-                IndexMap::new([IndexExpr::Remainder(
-                    Box::new(IndexExpr::Axis(0)),
-                    Box::new(IndexExpr::constant(helper_count)),
-                )]),
+            .parallel_gather(
+                Parallel::range(flat_count)
+                    .map_values(|index| index.as_int().rem(Int::constant(helper_count)))
+                    .map_err(|error| {
+                        ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                            stage: "index readout switches",
+                            detail: error.to_string(),
+                        })
+                    })?,
             )
             .map_err(|error| {
                 ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
@@ -534,7 +535,7 @@ impl ValueReadout {
                     )),
                     branches: sigma_branches.clone(),
                 };
-                aligned + transformed.ring_automorphism(sigma).mul_small_rhs(switch)
+                aligned + switch.mul_small_rhs(transformed.ring_automorphism(sigma))
             })
             .map_err(|error| {
                 ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
@@ -821,9 +822,9 @@ impl ValueReadout {
         vectors.push(transformed.vector.clone());
         for helper in helpers {
             let raw_vector = transformed.vector.clone().ring_automorphism(helper.sigma);
-            let switched_vector = raw_vector.mul_small_rhs(helper.switch_decomposition.clone());
+            let switched_vector = helper.switch_decomposition.clone().mul_small_rhs(raw_vector);
             vectors.push(
-                helper.mask.vector.clone().mul_small_rhs(helper.public_decomposition.clone()) +
+                helper.public_decomposition.clone().mul_small_rhs(helper.mask.vector.clone()) +
                     switched_vector,
             );
             if let Some(values) = plaintext.as_mut() {
@@ -934,7 +935,7 @@ impl ValueReadout {
             // helper relation: A_mask * D(A_switched). The switched vector
             // term is private ciphertext data and has no public matrix
             // counterpart, so it must not be added here.
-            let aligned = helper.mask.clone().mul_small_rhs(helper.public_decomposition.clone());
+            let aligned = helper.public_decomposition.clone().mul_small_rhs(helper.mask.clone());
             branches.push(aligned);
         }
         let traced = crate::encoding::balanced_sum_family(
@@ -1020,7 +1021,7 @@ impl ValueReadout {
             return Err(ValueReadoutError::InvalidTraceSet);
         }
         let transformed = (inputs, target_decompositions)
-            .parallel_zip_tuple(|_, (input, target)| input.mul_small_rhs(target))
+            .parallel_zip_tuple(|_, (input, target)| target.mul_small_rhs(input))
             .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
         let helper_indices = Parallel::range(flat_count)
             .map_values(|index| index.as_int().rem(Int::constant(helper_count)))
@@ -1029,7 +1030,7 @@ impl ValueReadout {
             .parallel_gather(helper_indices)
             .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
         let helper_branches = (public_decompositions, flat_masks)
-            .parallel_zip_tuple(|_, (public, mask)| mask.mul_small_rhs(public))
+            .parallel_zip_tuple(|_, (public, mask)| public.mul_small_rhs(mask))
             .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
         let helper_sums =
             reduce_matrix_family_segments(helper_branches, output_count, helper_count)?;
@@ -1053,7 +1054,7 @@ impl ValueReadout {
         )?;
         traced
             .parallel_map_values(|_, matrix| {
-                matrix.mul_small_rhs(normalization_decomposition.clone())
+                normalization_decomposition.clone().mul_small_rhs(matrix)
             })
             .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))
     }
@@ -1236,26 +1237,14 @@ fn reduce_matrix_family_segments(
     if segment_count == 0 || segment_size == 0 {
         return Err(ValueReadoutError::InvalidTraceSet);
     }
-    Parallel::range(segment_count)
-        .try_map_values({
-            let family = family.clone();
-            move |segment| {
-                let start = segment.as_int().mul(Int::constant(segment_size));
-                let indices = Parallel::range(segment_size)
-                    .map_values(|index| start.clone().add(index.as_int()))?;
-                let values = family
-                    .clone()
-                    .parallel_gather(indices)
-                    .map_err(|_| mxx_dsl::DslError::Schema)?;
-                crate::encoding::balanced_sum_family(values).map_err(|_| mxx_dsl::DslError::Schema)
-            }
-        })
-        .map_err(|error| {
+    crate::encoding::reduce_encoding_family_segments(family, segment_count, segment_size).map_err(
+        |error| {
             ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
                 stage: "reduce readout helper segments",
                 detail: error.to_string(),
             })
-        })
+        },
+    )
 }
 
 fn validate_preimage_ring(preimage: &Preimage, ring: &Ring) -> Result<(), ValueReadoutError> {

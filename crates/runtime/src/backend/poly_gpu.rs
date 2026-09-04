@@ -1,13 +1,5 @@
-use super::{
-    Backend, HashSampleRequest, PreimageRequest, UniformSampleRequest,
-    poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError},
-};
-use mxx_ir_core::node::HashVariant;
-use mxx_primitives::{matrix::PolyMatrixSmallRhs, sampler::DistType};
-use num_bigint::{BigInt, Sign};
+use super::poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError};
 use num_traits::ToPrimitive;
-use rand::Rng;
-use rayon::prelude::*;
 use std::{collections::BTreeMap, marker::PhantomData};
 
 impl<M, U, H, T> PolyBackend<M, U, H, T>
@@ -22,24 +14,6 @@ where
             parameters: (0..placements.len()).map(|_| BTreeMap::new()).collect(),
             active_placement: 0,
             preimage_batch_calls: 0,
-            #[cfg(test)]
-            matrix_serialization_batch_calls: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            uniform_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            hash_sampling_batch_calls: std::sync::atomic::AtomicUsize::new(0),
-            uniform_batch_dispatch: None,
-            hash_batch_dispatch: None,
-            #[cfg(test)]
-            preimage_batch_sizes: Vec::new(),
-            #[cfg(test)]
-            multiply_calls: 0,
-            #[cfg(test)]
-            multiply_batch_sizes: Vec::new(),
-            #[cfg(test)]
-            multiply_small_rhs_batch_sizes: Vec::new(),
-            #[cfg(test)]
-            fail_next_release_fence: false,
             _marker: PhantomData,
         };
         for (placement, parameters) in placements.into_iter().enumerate() {
@@ -97,90 +71,7 @@ use mxx_primitives::{
         Poly, PolyParams,
         dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
     },
-    sampler::{
-        PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
-        trapdoor::GpuDCRTPolyTrapdoorSampler,
-    },
 };
-
-type SingleGpuBackend = PolyBackend<
-    GpuDCRTPolyMatrix,
-    GpuDCRTPolyUniformSampler,
-    GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
-    GpuDCRTPolyTrapdoorSampler,
->;
-
-fn random_gpu_seeds(count: usize) -> Vec<mxx_primitives::poly::dcrt::gpu::GpuRngSeed> {
-    (0..count)
-        .map(|_| {
-            let mut bytes = [0u8; 32];
-            rand::rng().fill(&mut bytes);
-            mxx_primitives::poly::dcrt::gpu::GpuRngSeed::from_bytes(bytes)
-        })
-        .collect()
-}
-
-fn gpu_uniform_batch(
-    backend: &mut SingleGpuBackend,
-    requests: Vec<UniformSampleRequest>,
-) -> Result<Vec<GpuDCRTPolyMatrix>, PolyBackendError> {
-    let Some(first) = requests.first() else { return Ok(Vec::new()) };
-    let parameters = backend.parameters(&first.matrix_type)?;
-    let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
-    let expected_range = (BigInt::from(0), modulus - BigInt::from(1));
-    if requests.iter().any(|request| {
-        request.matrix_type != first.matrix_type ||
-            request.range.minimum != expected_range.0 ||
-            request.range.maximum != expected_range.1
-    }) {
-        return Err(PolyBackendError::UnsupportedUniformRange {
-            minimum: first.range.minimum.clone(),
-            maximum: first.range.maximum.clone(),
-        });
-    }
-    let seeds = random_gpu_seeds(requests.len());
-    let outputs = GpuDCRTPolyUniformSampler::new().sample_uniform_batch(
-        parameters,
-        first.matrix_type.rows,
-        first.matrix_type.columns,
-        DistType::FinRingDist,
-        &seeds,
-    );
-    (outputs.len() == requests.len()).then_some(outputs).ok_or(PolyBackendError::InvalidInteger)
-}
-
-fn gpu_hash_batch(
-    backend: &mut SingleGpuBackend,
-    requests: Vec<HashSampleRequest>,
-) -> Result<Vec<GpuDCRTPolyMatrix>, PolyBackendError> {
-    let Some(first) = requests.first() else { return Ok(Vec::new()) };
-    let parameters = backend.parameters(&first.matrix_type)?;
-    if requests.iter().any(|request| {
-        request.matrix_type != first.matrix_type ||
-            request.variant != HashVariant::Plain ||
-            request.gadget_layout.is_some()
-    }) {
-        return Err(PolyBackendError::InvalidInteger);
-    }
-    let keys = requests.iter().map(|request| request.key).collect::<Vec<_>>();
-    let tags = requests.iter().map(|request| request.tag.as_slice()).collect::<Vec<_>>();
-    let outputs = GpuDCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash_batch(
-        parameters,
-        &keys,
-        &tags,
-        first.matrix_type.rows,
-        first.matrix_type.columns,
-        DistType::FinRingDist,
-    );
-    (outputs.len() == requests.len()).then_some(outputs).ok_or(PolyBackendError::InvalidInteger)
-}
-
-impl SingleGpuBackend {
-    fn enable_gpu_sampling_batch(&mut self) {
-        self.set_sampling_batch_dispatch(gpu_uniform_batch, gpu_hash_batch);
-    }
-}
 
 mod fleet;
 pub use fleet::{
@@ -258,121 +149,6 @@ where
         })
         .collect();
     PolyBackend::new_with_placements(placements)
-}
-
-pub(super) fn sample_preimage_batch<M, U, H, T>(
-    backend: &mut PolyBackend<M, U, H, T>,
-    requests: Vec<PreimageRequest<M, T::Trapdoor>>,
-) -> Result<Vec<M::SmallMatrix>, PolyBackendError>
-where
-    M: PolyMatrix + CrtRecomposeMatrix + PolyMatrixSmallRhs + 'static,
-    U: PolyUniformSampler<M = M>,
-    H: PolyHashSampler<[u8; 32], M = M>,
-    T: PolyTrapdoorSampler<M = M>,
-    T::Trapdoor: Clone + std::fmt::Debug,
-{
-    let Some(first) = requests.first() else { return Ok(Vec::new()) };
-    if requests.iter().any(|request| {
-        request.matrix_type != first.matrix_type ||
-            request.sigma != first.sigma ||
-            request.gadget_base != first.gadget_base ||
-            request.digit_count != first.digit_count ||
-            request.max_coefficient_bound != first.max_coefficient_bound
-    }) {
-        return requests
-            .into_iter()
-            .map(|request| {
-                backend.sample_preimage(
-                    &request.matrix_type,
-                    request.sigma,
-                    &request.gadget_base,
-                    request.digit_count,
-                    &request.max_coefficient_bound,
-                    request.trapdoor.as_ref(),
-                    request.public.as_ref(),
-                    request.target.as_ref(),
-                    request.randomness_seed,
-                )
-            })
-            .collect();
-    }
-    let parameters = backend.parameters(&first.matrix_type)?.clone();
-    let sampler = T::new(&parameters, first.sigma);
-    requests
-        .into_iter()
-        .map(|request| {
-            let bound = request
-                .max_coefficient_bound
-                .to_biguint()
-                .ok_or(PolyBackendError::InvalidInteger)?;
-            sampler
-                .preimage(
-                    &parameters,
-                    request.trapdoor.as_ref(),
-                    request.public.as_ref(),
-                    request.target.as_ref(),
-                    bound,
-                    request.randomness_seed,
-                )
-                .map_err(Into::into)
-        })
-        .collect()
-}
-
-pub(super) fn sample_preimage_batches_by_placement<M, U, H, T>(
-    backend: &mut PolyBackend<M, U, H, T>,
-    batches: Vec<(usize, Vec<PreimageRequest<M, T::Trapdoor>>)>,
-) -> Result<Vec<(usize, Vec<M::SmallMatrix>)>, PolyBackendError>
-where
-    M: PolyMatrix + CrtRecomposeMatrix + PolyMatrixSmallRhs + 'static,
-    U: PolyUniformSampler<M = M>,
-    H: PolyHashSampler<[u8; 32], M = M>,
-    T: PolyTrapdoorSampler<M = M>,
-    T::Trapdoor: Clone + std::fmt::Debug,
-{
-    let prepared = batches
-        .into_iter()
-        .map(|(placement, requests)| {
-            let first = requests.first().ok_or(PolyBackendError::EmptyMatrix)?;
-            Ok((placement, backend.parameters_at(placement, &first.matrix_type)?.clone(), requests))
-        })
-        .collect::<Result<Vec<_>, PolyBackendError>>()?;
-    prepared
-        .into_par_iter()
-        .map(|(placement, parameters, requests)| {
-            let first = requests.first().ok_or(PolyBackendError::EmptyMatrix)?;
-            if requests.iter().any(|request| {
-                request.matrix_type != first.matrix_type ||
-                    request.sigma != first.sigma ||
-                    request.gadget_base != first.gadget_base ||
-                    request.digit_count != first.digit_count ||
-                    request.max_coefficient_bound != first.max_coefficient_bound
-            }) {
-                return Err(PolyBackendError::InvalidInteger);
-            }
-            let sampler = T::new(&parameters, first.sigma);
-            requests
-                .into_iter()
-                .map(|request| {
-                    let bound = request
-                        .max_coefficient_bound
-                        .to_biguint()
-                        .ok_or(PolyBackendError::InvalidInteger)?;
-                    sampler
-                        .preimage(
-                            &parameters,
-                            request.trapdoor.as_ref(),
-                            request.public.as_ref(),
-                            request.target.as_ref(),
-                            bound,
-                            request.randomness_seed,
-                        )
-                        .map_err(Into::into)
-                })
-                .collect::<Result<Vec<_>, PolyBackendError>>()
-                .map(|outputs| (placement, outputs))
-        })
-        .collect()
 }
 
 #[cfg(test)]

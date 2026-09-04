@@ -99,7 +99,7 @@ fn gpu_artifact_backed_refresh_replays_across_wave_settings() {
         .collect();
     let online_inputs = BTreeMap::from([(
         "refresh-parameter-search-native-monomials".to_owned(),
-        RuntimeValue::Family(monomials),
+        RuntimeValue::IndexedFamily(monomials),
     )]);
     let mut transcript = TranscriptRecorder::default();
     let first = execute_with_config(

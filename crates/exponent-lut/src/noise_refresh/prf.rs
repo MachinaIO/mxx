@@ -169,7 +169,7 @@ impl NativePrfPublicInputs {
             .evaluate(&mxx_ir_core::ParamEnv::default())
             .ok()
             .and_then(|value| value.to_usize());
-        if output_count == 0 || count == Some(0) || public_keys.shape().len() != 1 {
+        if output_count == 0 || count == Some(0) {
             return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let count = count.ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
@@ -545,11 +545,7 @@ impl NativePrfOnlineBatchInputs {
         plaintexts: Family<mxx_dsl::Mat>,
         label_count: usize,
     ) -> Result<Self, ExponentLutError> {
-        if label_count == 0 ||
-            vectors.shape().len() != 1 ||
-            plaintexts.shape().len() != 1 ||
-            vectors.count() != plaintexts.count()
-        {
+        if label_count == 0 || vectors.count() != plaintexts.count() {
             return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
         let vector_count = vectors
@@ -1094,27 +1090,31 @@ impl SparseLwrPrfProgram {
         helpers: &[ValueReadoutHelper],
     ) -> Result<NativePrfEncodingBatchOutputs, ValueReadoutError> {
         let vectors = with_benchmark_role(BenchmarkRole::EncodingReadout, || {
-            Parallel::range(inputs.label_count)
-                .try_map_values(|label| {
-                    let input = BggEncodingWire {
-                        vector: inputs.vectors.get(label.as_int()),
-                        plaintext: None,
-                    };
-                    let output = self
-                        .readout
-                        .execute_with_preprocessed_artifacts(
-                            compiler,
-                            &input,
-                            artifacts.target_decomposition.clone(),
-                            artifacts.target_schema.clone(),
-                            &helpers,
-                            artifacts.normalization_decomposition.clone(),
-                            artifacts.normalization_schema.clone(),
-                        )
-                        .map_err(|_| mxx_dsl::DslError::Schema)?;
-                    Ok(output.vector)
+            Family::try_parallel_zip_many_values(vec![inputs.vectors.clone()], |_, mut values| {
+                let input = BggEncodingWire {
+                    vector: values.pop().ok_or(mxx_dsl::DslError::Schema)?,
+                    plaintext: None,
+                };
+                let output = self
+                    .readout
+                    .execute_with_preprocessed_artifacts(
+                        compiler,
+                        &input,
+                        artifacts.target_decomposition.clone(),
+                        artifacts.target_schema.clone(),
+                        &helpers,
+                        artifacts.normalization_decomposition.clone(),
+                        artifacts.normalization_schema.clone(),
+                    )
+                    .map_err(|_| mxx_dsl::DslError::Schema)?;
+                Ok(output.vector)
+            })
+            .map_err(|error| {
+                ValueReadoutError::Graph(ExponentLutError::OnlinePrfStage {
+                    stage: "compile readout batch",
+                    detail: error.to_string(),
                 })
-                .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidSparseLwrBlock))
+            })
         })?;
         NativePrfEncodingBatchOutputs::new(vectors, inputs.label_count)
             .map_err(ValueReadoutError::Graph)
@@ -1357,7 +1357,7 @@ impl SparseLwrPrfProgram {
             })
             .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
         let transformed = (inputs, target_decompositions.clone())
-            .parallel_zip_tuple(|_, (input, target)| input.mul_small_rhs(target))
+            .parallel_zip_tuple(|_, (input, target)| target.mul_small_rhs(input))
             .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
         let switch_decompositions = helpers
             .switch_ciphertexts
@@ -1375,11 +1375,13 @@ impl SparseLwrPrfProgram {
         let flat_transformed = transformed
             .parallel_gather(label_indices)
             .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
-        let flat_switches = Parallel::range(flat_count)
-            .map_values(|index| {
-                switch_decompositions
-                    .get(vec![index.as_int().rem(mxx_dsl::Int::constant(helper_count))])
-            })
+        let flat_switches = switch_decompositions
+            .clone()
+            .parallel_gather(
+                Parallel::range(flat_count)
+                    .map_values(|index| index.as_int().rem(mxx_dsl::Int::constant(helper_count)))
+                    .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?,
+            )
             .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
         let sigma_branches =
             helpers.sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
@@ -1398,9 +1400,8 @@ impl SparseLwrPrfProgram {
                     )),
                     branches: sigma_branches.clone(),
                 };
-                transformed
-                    .ring_automorphism(sigma)
-                    .mul_small_rhs(switch)
+                switch
+                    .mul_small_rhs(transformed.ring_automorphism(sigma))
                     .decompose(compiler.public_key.base.clone(), digit_count)
             })
             .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
@@ -1912,9 +1913,9 @@ mod tests {
             vec![3, 5, 7]
         );
         let built = mxx_dsl::DslContext::new("readout-producer")
-            .private_preimage_output("target", artifacts.target_decomposition.clone())
+            .private_output("target", artifacts.target_decomposition.clone())
             .unwrap()
-            .private_preimage_output("normalization", artifacts.normalization_decomposition.clone())
+            .private_output("normalization", artifacts.normalization_decomposition.clone())
             .unwrap()
             .build()
             .unwrap();

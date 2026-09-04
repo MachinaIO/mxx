@@ -11,8 +11,7 @@
 mod test_utils;
 
 use mxx_bench_estimator::{
-    CostReport, EstimateConfig, estimate, gpu::GpuNodeMeasurementBackend,
-    harness::MeasurementHarnessConfig,
+    CostReport, estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
 };
 use mxx_exponent_lut::ExponentLutStorageReport;
 use mxx_ir_core::{BenchmarkRole, Graph, ParamEnv};
@@ -104,6 +103,7 @@ fn log_report(stage: &'static str, report: &CostReport) {
         stage,
         total_work_seconds = report.total_work_seconds,
         total_time_seconds = report.total_time_seconds,
+        estimated_dag_latency_seconds = report.critical_path_seconds,
         preimage_sampling_work_seconds = report.preimage_sampling_work_seconds,
         critical_path_seconds = report.critical_path_seconds,
         maximum_parallelism = report.maximum_parallelism,
@@ -172,6 +172,7 @@ fn log_preprocess_report(preprocessing: &CostReport) {
         stage = "preprocess",
         total_work_seconds = preprocessing.total_work_seconds,
         total_time_seconds = preprocessing.total_time_seconds,
+        estimated_dag_latency_seconds = preprocessing.critical_path_seconds,
         preimage_sampling_work_seconds = preprocessing.preimage_sampling_work_seconds,
         critical_path_seconds = preprocessing.critical_path_seconds,
         maximum_parallelism = preprocessing.maximum_parallelism,
@@ -286,8 +287,10 @@ fn log_prf_cost_per_output_and_information_bit(
         total_prf_work_seconds = total_work_seconds,
         total_prf_latency_seconds = total_latency_seconds,
         work_seconds_per_prf_output = total_work_seconds / prf_output_count as f64,
-        // This is throughput-amortized wall time. The structural output family
-        // runs concurrently, so it is not the latency of an isolated output.
+        // Retained raw fields sum calibrated wave latencies. They do not represent
+        // DAG wall completion or isolated-output latency under unlimited scheduling.
+        latency_accounting = "cumulative_wave_latencies",
+        cumulative_wave_seconds_per_prf_output = total_latency_seconds / prf_output_count as f64,
         latency_seconds_per_prf_output = total_latency_seconds / prf_output_count as f64,
         amortized_latency_seconds_per_prf_output = total_latency_seconds / prf_output_count as f64,
         work_seconds_per_information_bit = total_work_seconds / total_information_bits as f64,
@@ -538,10 +541,6 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     let warm_up_iterations = optional_usize("MXX_EXPONENT_LUT_BENCH_WARMUPS", 1);
     let measured_iterations = optional_usize("MXX_EXPONENT_LUT_BENCH_ITERATIONS", 2);
     assert!(measured_iterations > 0, "benchmark iterations must be positive");
-    // Every measured primitive owns the complete GPU fleet. Its calibrated column width and
-    // speedup are already included in the measured latency, so the graph estimator must not
-    // apply device parallelism a second time.
-    let estimate_config = EstimateConfig { device_pool_size: 1, per_instance_occupancy: 1 };
     let backends = device_ids
         .iter()
         .copied()
@@ -568,7 +567,7 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         let collection_started = Instant::now();
         let (scope_count, node_count) = graph_scope_and_node_counts(&graph.source);
         info!(stage, scope_count, node_count, "starting first Exponent-LUT estimate collection");
-        let collected = estimate(graph, &mut backend, &estimate_config)
+        let collected = estimate(graph, &mut backend)
             .unwrap_or_else(|error| panic!("collect {stage} GPU shapes: {error}"));
         info!(
             stage,
@@ -588,7 +587,7 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     let reports = stages
         .iter()
         .map(|(stage, graph)| {
-            let report = estimate(graph, &mut backend, &estimate_config)
+            let report = estimate(graph, &mut backend)
                 .unwrap_or_else(|error| panic!("estimate {stage} Exponent-LUT graph: {error}"));
             assert!(report.total_work_seconds > 0.0, "{stage} estimate must contain GPU work");
             report

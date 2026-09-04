@@ -133,7 +133,7 @@ impl ExponentRhsPackage {
             .get(&names.gsw_ciphertext)
             .ok_or(ExponentArtifactImportError::MissingArtifact)?;
         if artifact.confidentiality != ArtifactConfidentiality::Public ||
-            artifact.family_shape.is_some()
+            artifact.family_count.is_some()
         {
             return Err(ExponentArtifactImportError::ConfidentialityMismatch);
         }
@@ -220,7 +220,7 @@ mod tests {
                 rows: source.secret_dimension,
                 columns: target.public_key_columns(),
             }),
-            family_shape: None,
+            family_count: None,
             confidentiality: ArtifactConfidentiality::Public,
             content_hash: Some([5; 32]),
             layout: None,

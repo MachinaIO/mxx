@@ -121,7 +121,7 @@ private:
         if (error != cudaSuccess)
         {
             record_failure(cudaGetErrorString(error));
-            // The event and all pointers are intentionally leaked.  Once
+            // The event and pointers are intentionally leaked. Once
             // synchronization is uncertain, freeing host memory could race
             // with an in-flight asynchronous copy.
             return;
@@ -144,7 +144,7 @@ private:
             error = cudaFreeHost(pointer);
             if (error != cudaSuccess)
             {
-                // Do not retry an uncertain free.  The failed pointer is
+                // Do not retry an uncertain free. The failed pointer is
                 // leaked, while independent pointers can still be reclaimed.
                 record_failure(cudaGetErrorString(error));
             }
@@ -779,59 +779,51 @@ namespace
         entries.clear();
     }
 
-    void upload_ntt_small_constants_to_symbol(
+    void upload_ntt_small_constants_to_device(
         int device,
         const std::vector<uint64_t> &limb_moduli,
         const std::vector<uint64_t> &limb_n_inv,
-        const std::vector<uint64_t> &limb_n_inv_shoup)
+        const std::vector<uint64_t> &limb_n_inv_shoup,
+        GpuNttDeviceConstants *out_entry)
     {
         const size_t limb_count = limb_moduli.size();
         if (limb_count == 0 || limb_count > GPU_RUNTIME_MAX_LIMBS)
         {
-            throw std::runtime_error("invalid limb count in upload_ntt_small_constants_to_symbol");
+            throw std::runtime_error("invalid limb count in upload_ntt_small_constants_to_device");
         }
         if (limb_n_inv.size() != limb_count ||
             limb_n_inv_shoup.size() != limb_count)
         {
-            throw std::runtime_error("inconsistent limb constants in upload_ntt_small_constants_to_symbol");
+            throw std::runtime_error("inconsistent limb constants in upload_ntt_small_constants_to_device");
         }
 
+        if (!out_entry)
+        {
+            throw std::runtime_error("null output entry in upload_ntt_small_constants_to_device");
+        }
         cudaError_t err = cudaSetDevice(device);
         if (err != cudaSuccess)
         {
             throw std::runtime_error(cudaGetErrorString(err));
         }
         const size_t limb_bytes = limb_count * sizeof(uint64_t);
-        err = cudaMemcpyToSymbol(gpu_ntt_const_moduli, limb_moduli.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
+        auto alloc_and_copy = [&](uint64_t **dst, const std::vector<uint64_t> &src)
         {
-            throw std::runtime_error(cudaGetErrorString(err));
+            err = cudaMalloc(reinterpret_cast<void **>(dst), limb_bytes);
+            if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+            err = cudaMemcpy(*dst, src.data(), limb_bytes, cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+        };
+        try
+        {
+            alloc_and_copy(&out_entry->moduli, limb_moduli);
+            alloc_and_copy(&out_entry->n_inv, limb_n_inv);
+            alloc_and_copy(&out_entry->n_inv_shoup, limb_n_inv_shoup);
         }
-        err = cudaMemcpyToSymbol(gpu_ntt_const_n_inv, limb_n_inv.data(), limb_bytes, 0, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
+        catch (...)
         {
-            throw std::runtime_error(cudaGetErrorString(err));
-        }
-        err = cudaMemcpyToSymbol(
-            gpu_ntt_const_n_inv_shoup,
-            limb_n_inv_shoup.data(),
-            limb_bytes,
-            0,
-            cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
-        {
-            throw std::runtime_error(cudaGetErrorString(err));
-        }
-        const uint32_t limb_count_u32 = static_cast<uint32_t>(limb_count);
-        err = cudaMemcpyToSymbol(
-            gpu_ntt_const_limb_count,
-            &limb_count_u32,
-            sizeof(limb_count_u32),
-            0,
-            cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
-        {
-            throw std::runtime_error(cudaGetErrorString(err));
+            free_ntt_device_constants_entry(*out_entry);
+            throw;
         }
     }
 
@@ -841,9 +833,6 @@ namespace
         const std::vector<uint64_t> &twiddle_inverse,
         const std::vector<uint64_t> &twiddle_shoup_forward,
         const std::vector<uint64_t> &twiddle_shoup_inverse,
-        const std::vector<uint64_t> &moduli,
-        const std::vector<uint64_t> &n_inv,
-        const std::vector<uint64_t> &n_inv_shoup,
         GpuNttDeviceConstants *out_entry)
     {
         if (!out_entry)
@@ -857,9 +846,6 @@ namespace
             throw std::runtime_error("invalid NTT constants shape in upload_ntt_twiddles_to_device");
         }
         const size_t twiddle_count = limb_count * ring_dimension;
-        if (moduli.size() < limb_count || n_inv.size() < limb_count ||
-            n_inv_shoup.size() < limb_count)
-            throw std::runtime_error("inconsistent modulus constants in upload_ntt_twiddles_to_device");
         if (twiddle_forward.size() != twiddle_count ||
             twiddle_inverse.size() != twiddle_count ||
             twiddle_shoup_forward.size() != twiddle_count ||
@@ -874,15 +860,15 @@ namespace
             throw std::runtime_error(cudaGetErrorString(err));
         }
 
-        auto alloc_and_copy = [&](uint64_t **dst, const uint64_t *src, size_t count)
+        const size_t twiddle_bytes = twiddle_count * sizeof(uint64_t);
+        auto alloc_and_copy = [&](uint64_t **dst, const uint64_t *src)
         {
-            const size_t bytes = count * sizeof(uint64_t);
-            cudaError_t local_err = cudaMalloc(reinterpret_cast<void **>(dst), bytes);
+            cudaError_t local_err = cudaMalloc(reinterpret_cast<void **>(dst), twiddle_bytes);
             if (local_err != cudaSuccess)
             {
                 throw std::runtime_error(cudaGetErrorString(local_err));
             }
-            local_err = cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice);
+            local_err = cudaMemcpy(*dst, src, twiddle_bytes, cudaMemcpyHostToDevice);
             if (local_err != cudaSuccess)
             {
                 throw std::runtime_error(cudaGetErrorString(local_err));
@@ -891,15 +877,10 @@ namespace
 
         try
         {
-            alloc_and_copy(&out_entry->twiddle_forward, twiddle_forward.data(), twiddle_count);
-            alloc_and_copy(&out_entry->twiddle_inverse, twiddle_inverse.data(), twiddle_count);
-            alloc_and_copy(
-                &out_entry->twiddle_shoup_forward, twiddle_shoup_forward.data(), twiddle_count);
-            alloc_and_copy(
-                &out_entry->twiddle_shoup_inverse, twiddle_shoup_inverse.data(), twiddle_count);
-            alloc_and_copy(&out_entry->moduli, moduli.data(), limb_count);
-            alloc_and_copy(&out_entry->n_inv, n_inv.data(), limb_count);
-            alloc_and_copy(&out_entry->n_inv_shoup, n_inv_shoup.data(), limb_count);
+            alloc_and_copy(&out_entry->twiddle_forward, twiddle_forward.data());
+            alloc_and_copy(&out_entry->twiddle_inverse, twiddle_inverse.data());
+            alloc_and_copy(&out_entry->twiddle_shoup_forward, twiddle_shoup_forward.data());
+            alloc_and_copy(&out_entry->twiddle_shoup_inverse, twiddle_shoup_inverse.data());
         }
         catch (...)
         {
@@ -1109,20 +1090,18 @@ extern "C"
                         device,
                         limb_count,
                         static_cast<uint32_t>(n_u64));
-                upload_ntt_small_constants_to_symbol(
+                upload_ntt_small_constants_to_device(
                     device,
                     limb_moduli,
                     limb_n_inv,
-                    limb_n_inv_shoup);
+                    limb_n_inv_shoup,
+                    &device_constants);
                 upload_ntt_twiddles_to_device(
                     device,
                     twiddle_forward,
                     twiddle_inverse,
                     twiddle_shoup_forward,
                     twiddle_shoup_inverse,
-                    limb_moduli,
-                    limb_n_inv,
-                    limb_n_inv_shoup,
                     &device_constants);
                 gpu_ctx->ntt_device_constants.push_back(device_constants);
             }
@@ -1257,8 +1236,8 @@ extern "C"
             if (completion)
             {
                 // The event may have been recorded before the error was
-                // reported.  Keep it leaked along with the pointers rather
-                // than destroying an event that could still be in flight.
+                // reported. Keep it leaked with the pointers rather than
+                // destroying an event that could still be in flight.
                 completion = nullptr;
             }
             ctx->pinned_host_reclaimer->record_uncertain(cudaGetErrorString(error));
@@ -1269,8 +1248,8 @@ extern "C"
             ctx->pinned_host_reclaimer->enqueue(device, completion, std::move(pointers));
         if (enqueue_status != 0)
         {
-            // enqueue retains ownership on success.  On failure, the event
-            // and pointers intentionally remain leaked because their last
+            // Enqueue retains ownership on success. On failure, the event and
+            // pointers intentionally remain leaked because their last
             // asynchronous use cannot be proven complete.
             return set_error("failed to enqueue deferred pinned-host free");
         }

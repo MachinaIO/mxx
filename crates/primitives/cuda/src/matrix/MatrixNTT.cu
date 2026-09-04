@@ -1,8 +1,3 @@
-__constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint64_t gpu_ntt_const_n_inv_shoup[GPU_RUNTIME_MAX_LIMBS];
-__constant__ uint32_t gpu_ntt_const_limb_count;
-
 namespace
 {
     constexpr uint32_t kTransformThreads = 256;
@@ -568,8 +563,7 @@ namespace
             !device_constants.twiddle_inverse ||
             !device_constants.twiddle_shoup_forward ||
             !device_constants.twiddle_shoup_inverse ||
-            !device_constants.moduli ||
-            !device_constants.n_inv ||
+            !device_constants.moduli || !device_constants.n_inv ||
             !device_constants.n_inv_shoup)
         {
             return set_error("null per-device NTT constants in run_matrix_transform_u64");

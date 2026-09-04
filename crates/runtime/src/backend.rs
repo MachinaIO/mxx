@@ -1,6 +1,7 @@
 use mxx_ir_core::{
     ParamEnv,
-    node::{ConcatAxis, ConstantMatrix, HashVariant},
+    artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
+    node::{ConcatAxis, ConstantMatrix},
     types::ConcreteMatrixType,
 };
 use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnSource};
@@ -24,9 +25,7 @@ pub struct PreimageRequest<M, T> {
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,
     pub target: Arc<dyn PolyMatrixColumnSource<M>>,
-    /// Stable cryptographic domain seed for this logical preimage request.
-    /// The sampler derives tile/attempt seeds from this value, so storage
-    /// tiling and placement do not change the sampled result.
+    /// Seed for deterministic GPU sampling with a fixed column schedule.
     pub randomness_seed: [u8; 32],
 }
 
@@ -115,39 +114,14 @@ pub struct SampleRange {
     pub maximum: BigInt,
 }
 
-/// One independent uniform-residue sampling request.
-///
-/// The executor groups requests with the same concrete type and range before
-/// passing them to a backend.  Keeping the request explicit preserves the
-/// original order when a backend returns the sampled matrices.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UniformSampleRequest {
-    pub matrix_type: ConcreteMatrixType,
-    pub range: SampleRange,
-}
-
-/// One independent plain hash-sampling request.
-///
-/// `key` and `tag` are intentionally request data rather than batching keys:
-/// a batch must retain the scalar sampler's domain separation for every draw.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HashSampleRequest {
-    pub matrix_type: ConcreteMatrixType,
-    pub key: [u8; 32],
-    pub tag: Vec<u8>,
-    pub variant: HashVariant,
-    pub gadget_layout: Option<(BigInt, usize)>,
-}
-
 pub trait Backend {
     type Matrix: Clone + Debug + PartialEq + Send + Sync + 'static;
-    /// Compact bounded-RHS storage.  Semantic kind is carried by validated
-    /// wire/artifact metadata, never by this backend storage type.
     type SmallMatrix: Clone + Debug + PartialEq + Send + Sync;
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Selects setup-time GPU calibration for the next primitive.
+    /// Selects the setup-time GPU calibration for the next primitive. CPU and
+    /// non-fleet backends ignore this hook.
     fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -177,13 +151,6 @@ pub trait Backend {
         Ok(value.clone())
     }
     fn small_matrix_is_on_active_placement(&self, _value: &Self::SmallMatrix) -> bool {
-        true
-    }
-    fn small_matrix_matches_schema(
-        &self,
-        _value: &Self::SmallMatrix,
-        _schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
-    ) -> bool {
         true
     }
     /// Waits only for releases queued on backend-owned release streams.
@@ -299,43 +266,6 @@ pub trait Backend {
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
     }
-
-    /// Multiplies a full matrix by a complete bounded RHS owner.  Column
-    /// tiling, if needed, is entirely internal to the backend operation.
-    fn multiply_small_rhs(
-        &mut self,
-        left: &Self::Matrix,
-        right: &Self::SmallMatrix,
-    ) -> Result<Self::Matrix, Self::Error>;
-    fn multiply_small_rhs_batch(
-        &mut self,
-        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::SmallMatrix>)>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
-        inputs.into_iter().map(|(left, right)| self.multiply_small_rhs(&left, &right)).collect()
-    }
-
-    /// Decodes one complete canonical bounded artifact into its owner.
-    /// Backends with a compact codec should override this method.  The default
-    /// is useful for simple test backends whose matrix serialization already is
-    /// their canonical representation.
-    fn small_matrix_from_bytes(
-        &self,
-        expected_schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
-        bytes: &[u8],
-        expected_semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
-    ) -> Result<Self::SmallMatrix, Self::Error>;
-
-    /// Encodes a bounded owner using the canonical artifact representation.
-    fn small_matrix_to_bytes(
-        &self,
-        value: &Self::SmallMatrix,
-        expected_schema: &mxx_ir_core::artifact::ConcreteBoundedMatrixSchema,
-        semantic_kind: mxx_ir_core::artifact::SmallMatrixSemanticKind,
-    ) -> Result<Vec<u8>, Self::Error>;
-    fn small_matrix_to_untyped_bytes(&self, value: &Self::SmallMatrix) -> Vec<u8> {
-        format!("{value:?}").into_bytes()
-    }
-
     fn matrix_mul_accumulate(
         &mut self,
         request: MatrixMulAccumulateRequest<Self::Matrix>,
@@ -384,12 +314,42 @@ pub trait Backend {
         value: &Self::Matrix,
         index: usize,
     ) -> Result<Self::Matrix, Self::Error>;
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, usize)>,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(value, index)| self.ring_automorphism(&value, index)).collect()
     }
+
+    fn preimage_target(
+        &mut self,
+        value: Arc<Self::Matrix>,
+    ) -> Result<(Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>), Self::Error>;
+
+    fn matrix_from_cpu_staging_bytes(
+        &self,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn preimage_target_from_staging(
+        &self,
+        ty: &ConcreteMatrixType,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Self::Error>;
+
+    fn validate_preimage_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        max_coefficient_bound: &BigInt,
+    ) -> Result<(), Self::Error>;
+
     fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
     fn slice(
         &mut self,
@@ -407,33 +367,11 @@ pub trait Backend {
         inputs: &[&Self::Matrix],
         axis: ConcatAxis,
     ) -> Result<Self::Matrix, Self::Error>;
-    /// Writes an ordered wave of one-column matrices into an existing
-    /// row-major destination. Implementations may override this sink to keep
-    /// the final matrix allocation stable while loop waves are released.
-    fn write_columns(
-        &mut self,
-        target: &mut Self::Matrix,
-        offset: usize,
-        columns: &[Self::Matrix],
-    ) -> Result<(), Self::Error>;
     fn sample_uniform(
         &mut self,
         ty: &ConcreteMatrixType,
         range: &SampleRange,
     ) -> Result<Self::Matrix, Self::Error>;
-    /// Samples independent uniform requests in input order.
-    ///
-    /// The default is deliberately scalar so every backend remains correct
-    /// while a device backend can override this hook with one batched launch.
-    fn sample_uniform_batch(
-        &mut self,
-        requests: Vec<UniformSampleRequest>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
-        requests
-            .into_iter()
-            .map(|request| self.sample_uniform(&request.matrix_type, &request.range))
-            .collect()
-    }
     fn sample_gaussian(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -445,60 +383,23 @@ pub trait Backend {
         ty: &ConcreteMatrixType,
         key: [u8; 32],
         tag: &[u8],
-        variant: HashVariant,
-        gadget_layout: Option<(&BigInt, usize)>,
     ) -> Result<Self::Matrix, Self::Error>;
-    fn sample_hash_small(
+    fn sample_hash_decomposed(
         &mut self,
         ty: &ConcreteMatrixType,
         key: [u8; 32],
         tag: &[u8],
-        variant: HashVariant,
-        gadget_layout: (&BigInt, usize),
+        gadget_base: &BigInt,
+        digit_count: usize,
     ) -> Result<Self::SmallMatrix, Self::Error>;
-    fn sample_hash_small_batch(
+    fn sample_hash_small_decomposed(
         &mut self,
-        requests: Vec<HashSampleRequest>,
-    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
-        requests
-            .into_iter()
-            .map(|request| {
-                let layout = request
-                    .gadget_layout
-                    .expect("validated bounded hash request has gadget layout");
-                self.sample_hash_small(
-                    &request.matrix_type,
-                    request.key,
-                    &request.tag,
-                    request.variant,
-                    (&layout.0, layout.1),
-                )
-            })
-            .collect()
-    }
-    /// Samples independent hash requests in input order.
-    ///
-    /// Backends may batch only requests with a compatible concrete layout;
-    /// callers already partition by placement and static node shape.
-    fn sample_hash_batch(
-        &mut self,
-        requests: Vec<HashSampleRequest>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
-        requests
-            .into_iter()
-            .map(|request| {
-                let gadget_layout =
-                    request.gadget_layout.as_ref().map(|(base, digits)| (base, *digits));
-                self.sample_hash(
-                    &request.matrix_type,
-                    request.key,
-                    &request.tag,
-                    request.variant,
-                    gadget_layout,
-                )
-            })
-            .collect()
-    }
+        ty: &ConcreteMatrixType,
+        key: [u8; 32],
+        tag: &[u8],
+        gadget_base: &BigInt,
+        digit_count: usize,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
     fn sample_trapdoor(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -506,24 +407,6 @@ pub trait Backend {
         gadget_base: &BigInt,
         digit_count: usize,
     ) -> Result<(Self::Matrix, Self::Trapdoor), Self::Error>;
-    /// Captures a full logical target at an explicit host-observation
-    /// boundary and exposes row-complete column tiles to preimage sampling.
-    fn preimage_target(
-        &mut self,
-        value: Arc<Self::Matrix>,
-    ) -> Result<(Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>), Self::Error>;
-    fn matrix_from_cpu_staging_bytes(
-        &self,
-        ty: &ConcreteMatrixType,
-        bytes: &[u8],
-    ) -> Result<Self::Matrix, Self::Error>;
-    fn preimage_target_from_staging(
-        &self,
-        ty: &ConcreteMatrixType,
-        rows: usize,
-        columns: usize,
-        bytes: Arc<Vec<u8>>,
-    ) -> Result<Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Self::Error>;
     fn sample_preimage(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -536,17 +419,6 @@ pub trait Backend {
         target: &dyn PolyMatrixColumnSource<Self::Matrix>,
         randomness_seed: [u8; 32],
     ) -> Result<Self::SmallMatrix, Self::Error>;
-    /// Validates a caller-selected inclusive cutoff before sampling starts.
-    /// Every backend must reject a bound below its authoritative supported
-    /// cutoff before entering a retry loop.
-    fn validate_preimage_bound(
-        &self,
-        ty: &ConcreteMatrixType,
-        sigma: f64,
-        gadget_base: &BigInt,
-        digit_count: usize,
-        max_coefficient_bound: &BigInt,
-    ) -> Result<(), Self::Error>;
 
     fn sample_preimage_batch(
         &mut self,
@@ -598,6 +470,11 @@ pub trait Backend {
         value: &Self::Matrix,
         small: bool,
     ) -> Result<Self::SmallMatrix, Self::Error>;
+    fn multiply_small_rhs(
+        &mut self,
+        lhs: &Self::Matrix,
+        rhs: &Self::SmallMatrix,
+    ) -> Result<Self::Matrix, Self::Error>;
     fn extract_coefficient(
         &mut self,
         value: &Self::Matrix,
@@ -631,6 +508,18 @@ pub trait Backend {
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error>;
+    fn small_matrix_to_bytes(
+        &self,
+        value: &Self::SmallMatrix,
+        expected_schema: &ConcreteBoundedMatrixSchema,
+        semantic_kind: SmallMatrixSemanticKind,
+    ) -> Result<Vec<u8>, Self::Error>;
+    fn small_matrix_from_bytes(
+        &self,
+        expected_schema: &ConcreteBoundedMatrixSchema,
+        bytes: &[u8],
+        expected_semantic_kind: SmallMatrixSemanticKind,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
     fn trapdoor_to_bytes(&self, value: &Self::Trapdoor) -> Vec<u8>;
     fn trapdoor_from_bytes(
         &self,
@@ -646,15 +535,11 @@ pub enum RuntimeValue<B: Backend> {
     Bytes(Vec<u8>),
     TypedBlob(Vec<u8>),
     Matrix(Arc<B::Matrix>),
-    /// Host-staged full matrix. Expanded owners are reconstructed only when a
-    /// later operation actually needs them; preimage sampling can use its
-    /// column source directly.
+    /// Host-staged matrix; expanded columns are loaded only when consumed.
     HostMatrix {
         matrix_type: ConcreteMatrixType,
         bytes: Arc<Vec<u8>>,
     },
-    /// A compact bounded RHS.  Shape, bound, and relation semantics live in
-    /// the validated wire/artifact metadata; the backend value is storage only.
     SmallMatrix(Arc<B::SmallMatrix>),
     Trapdoor {
         secret: Option<Arc<B::Trapdoor>>,
@@ -687,7 +572,7 @@ pub enum RuntimeValue<B: Backend> {
         name: String,
         descriptor: mxx_ir_core::artifact::ManifestArtifact,
     },
-    Family(Vec<RuntimeValue<B>>),
+    IndexedFamily(Vec<RuntimeValue<B>>),
 }
 
 impl<B: Backend> Clone for RuntimeValue<B> {
@@ -744,7 +629,7 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                     descriptor: descriptor.clone(),
                 }
             }
-            Self::Family(values) => Self::Family(values.clone()),
+            Self::IndexedFamily(values) => Self::IndexedFamily(values.clone()),
         }
     }
 }
@@ -753,18 +638,20 @@ impl<B: Backend> RuntimeValue<B> {
     pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
         match self {
             Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
-            Self::SmallMatrix(owner) => Arc::strong_count(owner) == 1,
+            Self::SmallMatrix(matrix) => Arc::strong_count(matrix) == 1,
             Self::Trapdoor { secret, public, .. } => {
                 Arc::strong_count(public) == 1 ||
                     secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)
             }
-            Self::Family(values) => values.iter().any(Self::releases_backend_resources_on_drop),
+            Self::IndexedFamily(values) => {
+                values.iter().any(Self::releases_backend_resources_on_drop)
+            }
+            Self::HostMatrix { .. } |
             Self::Int(_) |
             Self::Real(_) |
             Self::Bool(_) |
             Self::Bytes(_) |
             Self::TypedBlob(_) |
-            Self::HostMatrix { .. } |
             Self::LazyArtifact { .. } |
             Self::LazyArtifactFamily { .. } |
             Self::StagedArtifact { .. } |

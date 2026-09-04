@@ -49,6 +49,7 @@ namespace
 {
 constexpr int kSmallThreads = 256;
 constexpr size_t kMaxSmallLimbCount = GPU_RUNTIME_MAX_LIMBS;
+constexpr uint32_t kCompactNttSuffixSize = 4096;
 
 bool small_mul_size(size_t a, size_t b, size_t *out)
 {
@@ -56,6 +57,7 @@ bool small_mul_size(size_t a, size_t b, size_t *out)
     *out = a * b;
     return true;
 }
+
 bool small_add_size(size_t a, size_t b, size_t *out)
 {
     if (!out || b > std::numeric_limits<size_t>::max() - a) return false;
@@ -257,65 +259,63 @@ __global__ void compact_decompose_kernel(
     compact_store_signed(dst + out_idx, magnitude_bytes, digit);
 }
 
-__global__ void compact_unpack_twist_kernel(
+template <class Word>
+__global__ void compact_rhs_dif_first_kernel(
     const uint8_t *payload,
-    uint64_t *workspace,
+    Word *workspace,
     const uint64_t *twiddles,
     const uint64_t *twiddle_shoup,
     const uint64_t *moduli,
     size_t limb_offset,
     size_t limb_count,
-    size_t inner,
+    size_t poly_count,
     size_t cols,
     size_t source_cols,
-    size_t n,
+    uint32_t n,
     size_t magnitude_bytes,
     size_t source_column_offset)
 {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total = limb_count * inner * cols * n;
+    const size_t half = n >> 1;
+    const size_t total = limb_count * poly_count * half;
     if (idx >= total) return;
-    const size_t coeff = idx % n;
-    const size_t q = idx / n;
-    const size_t c = q % cols;
-    const size_t k = (q / cols) % inner;
-    const size_t local_limb = q / (inner * cols);
+    const size_t j = idx % half;
+    const size_t q = idx / half;
+    const size_t poly = q % poly_count;
+    const size_t local_limb = q / poly_count;
+    const size_t limb = limb_offset + local_limb;
+    const uint64_t modulus = moduli[limb];
+    const size_t k = poly / cols;
+    const size_t c = poly % cols;
     const size_t rhs_col = source_column_offset + c;
     const size_t width = 1 + magnitude_bytes;
-    const uint8_t *src = payload + ((k * source_cols + rhs_col) * n + coeff) * width;
-    const uint64_t modulus = moduli[limb_offset + local_limb];
-    uint64_t value = compact_mod_magnitude(src + 1, magnitude_bytes, modulus);
-    if (src[0] == 2 && value != 0) value = modulus - value;
-    const size_t twiddle_index = (limb_offset + local_limb) * n + coeff;
-    workspace[idx] = mul_mod_shoup_u64(
-        value, twiddles[twiddle_index], twiddle_shoup[twiddle_index], modulus);
+    const size_t lower_source_index =
+        ((k * source_cols + rhs_col) * static_cast<size_t>(n) + j) * width;
+    const size_t upper_source_index = lower_source_index + half * width;
+    const uint8_t *lower_source = payload + lower_source_index;
+    const uint8_t *upper_source = payload + upper_source_index;
+    uint64_t lower = compact_mod_magnitude(lower_source + 1, magnitude_bytes, modulus);
+    uint64_t upper = compact_mod_magnitude(upper_source + 1, magnitude_bytes, modulus);
+    if (lower_source[0] == 2 && lower != 0) lower = modulus - lower;
+    if (upper_source[0] == 2 && upper != 0) upper = modulus - upper;
+    const size_t twiddle_base = limb * static_cast<size_t>(n);
+    lower = mul_mod_shoup_u64(
+        lower, twiddles[twiddle_base + j], twiddle_shoup[twiddle_base + j], modulus);
+    upper = mul_mod_shoup_u64(
+        upper, twiddles[twiddle_base + j + half],
+        twiddle_shoup[twiddle_base + j + half], modulus);
+    const size_t workspace_base =
+        (local_limb * poly_count + poly) * static_cast<size_t>(n);
+    workspace[workspace_base + j] = static_cast<Word>(add_mod_u64(lower, upper, modulus));
+    const uint64_t difference = sub_mod_u64(lower, upper, modulus);
+    const size_t stage_twiddle = twiddle_base + 2 * j;
+    workspace[workspace_base + j + half] = static_cast<Word>(mul_mod_shoup_u64(
+        difference, twiddles[stage_twiddle], twiddle_shoup[stage_twiddle], modulus));
 }
 
-__global__ void compact_ntt_bit_reverse_kernel(
-    uint64_t *workspace,
-    size_t limb_count,
-    size_t poly_count,
-    size_t n,
-    uint32_t log_n)
-{
-    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total = limb_count * poly_count * n;
-    if (idx >= total) return;
-    const size_t coeff = idx % n;
-    const size_t q = idx / n;
-    const size_t poly = q % poly_count;
-    const size_t local = q / poly_count;
-    const uint32_t reverse = __brev(static_cast<uint32_t>(coeff)) >> (32 - log_n);
-    if (coeff >= reverse) return;
-    const size_t left = (local * poly_count + poly) * n + coeff;
-    const size_t right = (local * poly_count + poly) * n + reverse;
-    const uint64_t tmp = workspace[left];
-    workspace[left] = workspace[right];
-    workspace[right] = tmp;
-}
-
-__global__ void compact_ntt_stage_kernel(
-    uint64_t *workspace,
+template <class Word>
+__global__ void compact_ntt_dif_stage_kernel(
+    Word *workspace,
     const uint64_t *twiddles,
     const uint64_t *twiddle_shoup,
     const uint64_t *moduli,
@@ -332,28 +332,144 @@ __global__ void compact_ntt_stage_kernel(
     const size_t butterfly = idx % butterflies_per_poly;
     const size_t q = idx / butterflies_per_poly;
     const size_t poly = q % poly_count;
-    const size_t local = q / poly_count;
-    const uint32_t half = len / 2;
+    const size_t local_limb = q / poly_count;
+    const uint32_t half = len >> 1;
     const uint32_t group = static_cast<uint32_t>(butterfly) / half;
     const uint32_t j = static_cast<uint32_t>(butterfly) % half;
     const uint32_t i = group * len + j;
-    const size_t global = limb_offset + local;
-    const uint64_t modulus = moduli[global];
-    const size_t base = (local * poly_count + poly) * n;
-    const uint64_t u = workspace[base + i];
-    const size_t twiddle_index = global * n + 2u * (n / len) * j;
-    const uint64_t v = mul_mod_shoup_u64(
-        workspace[base + i + half], twiddles[twiddle_index], twiddle_shoup[twiddle_index], modulus);
-    workspace[base + i] = add_mod_u64(u, v, modulus);
-    workspace[base + i + half] = sub_mod_u64(u, v, modulus);
+    const size_t limb = limb_offset + local_limb;
+    const uint64_t modulus = moduli[limb];
+    const size_t base = (local_limb * poly_count + poly) * n;
+    const uint64_t lower = workspace[base + i];
+    const uint64_t upper = workspace[base + i + half];
+    workspace[base + i] = static_cast<Word>(add_mod_u64(lower, upper, modulus));
+    const uint64_t difference = sub_mod_u64(lower, upper, modulus);
+    const size_t twiddle_index =
+        limb * n + 2u * (n / len) * j;
+    workspace[base + i + half] = static_cast<Word>(mul_mod_shoup_u64(
+        difference, twiddles[twiddle_index], twiddle_shoup[twiddle_index], modulus));
 }
 
+template <class Word>
+__global__ void compact_rhs_dif_all_shared_kernel(
+    const uint8_t *payload,
+    Word *workspace,
+    const uint64_t *twiddles,
+    const uint64_t *twiddle_shoup,
+    const uint64_t *moduli,
+    size_t limb_offset,
+    size_t limb_count,
+    size_t poly_count,
+    size_t cols,
+    size_t source_cols,
+    uint32_t n,
+    size_t magnitude_bytes,
+    size_t source_column_offset)
+{
+    __shared__ Word values[kCompactNttSuffixSize];
+    const size_t poly = static_cast<size_t>(blockIdx.x);
+    const size_t local_limb = static_cast<size_t>(blockIdx.y);
+    if (poly >= poly_count || local_limb >= limb_count) return;
+    const size_t limb = limb_offset + local_limb;
+    const uint64_t modulus = moduli[limb];
+    const size_t k = poly / cols;
+    const size_t c = poly % cols;
+    const size_t rhs_col = source_column_offset + c;
+    const size_t width = 1 + magnitude_bytes;
+    for (uint32_t coefficient = threadIdx.x; coefficient < n; coefficient += blockDim.x)
+    {
+        const uint8_t *source =
+            payload + ((k * source_cols + rhs_col) * static_cast<size_t>(n) + coefficient) * width;
+        uint64_t value = compact_mod_magnitude(source + 1, magnitude_bytes, modulus);
+        if (source[0] == 2 && value != 0) value = modulus - value;
+        const size_t twiddle_index = limb * static_cast<size_t>(n) + coefficient;
+        values[coefficient] = static_cast<Word>(mul_mod_shoup_u64(
+            value, twiddles[twiddle_index], twiddle_shoup[twiddle_index], modulus));
+    }
+    __syncthreads();
+    for (uint32_t len = n; len >= 2; len >>= 1)
+    {
+        const uint32_t half = len >> 1;
+        for (uint32_t butterfly = threadIdx.x; butterfly < (n >> 1); butterfly += blockDim.x)
+        {
+            const uint32_t group = butterfly / half;
+            const uint32_t j = butterfly % half;
+            const uint32_t i = group * len + j;
+            const uint64_t lower = values[i];
+            const uint64_t upper = values[i + half];
+            values[i] = static_cast<Word>(add_mod_u64(lower, upper, modulus));
+            const uint64_t difference = sub_mod_u64(lower, upper, modulus);
+            const size_t twiddle_index =
+                limb * static_cast<size_t>(n) + 2u * (n / len) * j;
+            values[i + half] = static_cast<Word>(mul_mod_shoup_u64(
+                difference, twiddles[twiddle_index],
+                twiddle_shoup[twiddle_index], modulus));
+        }
+        __syncthreads();
+    }
+    const size_t base = (local_limb * poly_count + poly) * static_cast<size_t>(n);
+    for (uint32_t coefficient = threadIdx.x; coefficient < n; coefficient += blockDim.x)
+        workspace[base + coefficient] = values[coefficient];
+}
+
+template <class Word>
+__global__ void compact_rhs_dif_suffix_kernel(
+    Word *workspace,
+    const uint64_t *twiddles,
+    const uint64_t *twiddle_shoup,
+    const uint64_t *moduli,
+    size_t limb_offset,
+    size_t limb_count,
+    size_t poly_count,
+    uint32_t n)
+{
+    __shared__ Word values[kCompactNttSuffixSize];
+    const size_t segments_per_poly = n / kCompactNttSuffixSize;
+    const size_t flat_segment = static_cast<size_t>(blockIdx.x);
+    const size_t poly = flat_segment / segments_per_poly;
+    const size_t segment = flat_segment % segments_per_poly;
+    const size_t local_limb = static_cast<size_t>(blockIdx.y);
+    if (poly >= poly_count || local_limb >= limb_count) return;
+    const size_t base = (local_limb * poly_count + poly) * static_cast<size_t>(n) +
+                        segment * kCompactNttSuffixSize;
+    for (uint32_t local = threadIdx.x; local < kCompactNttSuffixSize; local += blockDim.x)
+        values[local] = workspace[base + local];
+    __syncthreads();
+    const size_t limb = limb_offset + local_limb;
+    const uint64_t modulus = moduli[limb];
+    for (uint32_t len = kCompactNttSuffixSize; len >= 2; len >>= 1)
+    {
+        const uint32_t half = len >> 1;
+        for (uint32_t butterfly = threadIdx.x;
+             butterfly < (kCompactNttSuffixSize >> 1);
+             butterfly += blockDim.x)
+        {
+            const uint32_t group = butterfly / half;
+            const uint32_t j = butterfly % half;
+            const uint32_t i = group * len + j;
+            const uint64_t lower = values[i];
+            const uint64_t upper = values[i + half];
+            values[i] = static_cast<Word>(add_mod_u64(lower, upper, modulus));
+            const uint64_t difference = sub_mod_u64(lower, upper, modulus);
+            const size_t twiddle_index =
+                limb * static_cast<size_t>(n) + 2u * (n / len) * j;
+            values[i + half] = static_cast<Word>(mul_mod_shoup_u64(
+                difference, twiddles[twiddle_index],
+                twiddle_shoup[twiddle_index], modulus));
+        }
+        __syncthreads();
+    }
+    for (uint32_t local = threadIdx.x; local < kCompactNttSuffixSize; local += blockDim.x)
+        workspace[base + local] = values[local];
+}
+
+template <class Word>
 __global__ void compact_accumulate_kernel(
     const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *lhs_descriptors,
     const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out_descriptors,
     const uint64_t *moduli,
     size_t limb_offset,
-    const uint64_t *workspace,
+    const Word *workspace,
     size_t limb_count,
     size_t rows,
     size_t inner,
@@ -371,8 +487,8 @@ __global__ void compact_accumulate_kernel(
     const size_t local = q / (rows * out_cols);
     const size_t global = limb_offset + local;
     const uint64_t modulus = moduli[global];
-    const auto lhs_descriptor = lhs_descriptors[local];
-    const auto out_descriptor = out_descriptors[local];
+    const auto lhs_descriptor = lhs_descriptors[global];
+    const auto out_descriptor = out_descriptors[global];
     uint64_t acc = 0;
     if (lazy_reduce)
     {
@@ -1236,7 +1352,8 @@ extern "C" int gpu_matrix_mul_small_rhs(
         return set_error("invalid compact RHS multiplication arguments");
     const size_t limbs = static_cast<size_t>(lhs_eval->level + 1);
     if (lhs_eval->level < 0 || limbs == 0 || limbs > kMaxSmallLimbCount || out->level != lhs_eval->level ||
-        out->ctx->limb_gpu_ids.size() < limbs || !is_power_of_two_u32(static_cast<uint32_t>(out->ctx->N)))
+        out->ctx->limb_gpu_ids.size() < limbs || out->ctx->N < 2 ||
+        !is_power_of_two_u32(static_cast<uint32_t>(out->ctx->N)))
         return set_error("invalid compact RHS multiplication level");
     if (small_set_device(rhs_small) != 0) return 1;
     cudaStream_t stream = nullptr;
@@ -1280,12 +1397,6 @@ extern "C" int gpu_matrix_mul_small_rhs(
     const size_t rows = lhs_eval->rows;
     const size_t inner = lhs_eval->cols;
     const size_t cols = rhs_small->cols;
-    size_t workspace_product = 0;
-    if (!small_mul_size(limbs, inner, &workspace_product) ||
-        !small_mul_size(workspace_product, cols, &workspace_product))
-        return set_error("compact RHS workspace shape overflow");
-    uint32_t log_n = 0;
-    for (size_t x = n; x > 1; x >>= 1) ++log_n;
     if (dispatch_slot >= out->ctx->ntt_device_constants.size())
         return set_error("missing compact multiplication NTT partition");
     const auto &constants = out->ctx->ntt_device_constants[dispatch_slot];
@@ -1298,7 +1409,38 @@ extern "C" int gpu_matrix_mul_small_rhs(
     if (!lhs_descriptors || !out_descriptors)
         return set_error("missing compact multiplication matrix descriptors");
 
-    uint64_t *workspace = nullptr;
+    struct LimbGroup
+    {
+        size_t limb_offset;
+        size_t limb_count;
+        size_t typed_limb_offset;
+        bool narrow;
+    };
+    std::vector<LimbGroup> limb_groups;
+    std::vector<uint64_t> active_moduli;
+    active_moduli.reserve(limbs);
+    size_t u32_limb_count = 0;
+    size_t u64_limb_count = 0;
+    for (size_t limb = 0; limb < limbs; ++limb)
+    {
+        if (limb >= out->ctx->limb_prime_ids.size())
+            return set_error("missing compact multiplication limb prime metadata");
+        const int prime_id = out->ctx->limb_prime_ids[limb];
+        if (prime_id < 0 || static_cast<size_t>(prime_id) >= out->ctx->moduli.size())
+            return set_error("invalid compact multiplication limb prime metadata");
+        const uint64_t modulus = out->ctx->moduli[static_cast<size_t>(prime_id)];
+        active_moduli.push_back(modulus);
+        const bool narrow = modulus <= UINT32_MAX;
+        size_t &typed_count = narrow ? u32_limb_count : u64_limb_count;
+        if (limb_groups.empty() || limb_groups.back().narrow != narrow)
+            limb_groups.push_back(LimbGroup{limb, 1, typed_count, narrow});
+        else
+            ++limb_groups.back().limb_count;
+        ++typed_count;
+    }
+
+    uint32_t *workspace_u32 = nullptr;
+    uint64_t *workspace_u64 = nullptr;
     auto release = [&]() -> cudaError_t {
         cudaError_t cleanup_err = cudaSuccess;
         auto free_async = [&](void *ptr) {
@@ -1306,8 +1448,10 @@ extern "C" int gpu_matrix_mul_small_rhs(
             const cudaError_t free_err = cudaFreeAsync(ptr, stream);
             if (cleanup_err == cudaSuccess && free_err != cudaSuccess) cleanup_err = free_err;
         };
-        free_async(workspace);
-        workspace = nullptr;
+        free_async(workspace_u32);
+        free_async(workspace_u64);
+        workspace_u32 = nullptr;
+        workspace_u64 = nullptr;
         return cleanup_err;
     };
     auto fail = [&](cudaError_t failure) -> int {
@@ -1332,10 +1476,19 @@ extern "C" int gpu_matrix_mul_small_rhs(
         return 1;
     const size_t lhs_eval_bytes = lhs_allocation.total_bytes;
     const size_t full_output_bytes = output_allocation.total_bytes;
-    size_t workspace_words = 0;
+    size_t workspace_words_per_limb = 0;
+    size_t workspace_u32_words = 0;
+    size_t workspace_u64_words = 0;
+    size_t workspace_u32_bytes = 0;
+    size_t workspace_u64_bytes = 0;
     size_t expanded_rhs_workspace_bytes = 0;
-    if (!small_mul_size(workspace_product, n, &workspace_words) ||
-        !small_mul_size(workspace_words, sizeof(uint64_t), &expanded_rhs_workspace_bytes))
+    if (!small_mul_size(inner, cols, &workspace_words_per_limb) ||
+        !small_mul_size(workspace_words_per_limb, n, &workspace_words_per_limb) ||
+        !small_mul_size(u32_limb_count, workspace_words_per_limb, &workspace_u32_words) ||
+        !small_mul_size(u64_limb_count, workspace_words_per_limb, &workspace_u64_words) ||
+        !small_mul_size(workspace_u32_words, sizeof(uint32_t), &workspace_u32_bytes) ||
+        !small_mul_size(workspace_u64_words, sizeof(uint64_t), &workspace_u64_bytes) ||
+        !small_add_size(workspace_u32_bytes, workspace_u64_bytes, &expanded_rhs_workspace_bytes))
         return set_error("compact RHS workspace size overflow");
     size_t event_overhead_bytes = 0;
     if (!small_mul_size(limbs + 1, sizeof(cudaEvent_t), &event_overhead_bytes))
@@ -1353,56 +1506,202 @@ extern "C" int gpu_matrix_mul_small_rhs(
     allocation_report->event_overhead_bytes = event_overhead_bytes;
     allocation_report->high_water_bytes = high_water_bytes;
     allocation_report->full_expanded_rhs_bytes = expanded_rhs_workspace_bytes;
+    allocation_report->workspace_word_bytes =
+        u32_limb_count == limbs ? sizeof(uint32_t) :
+        (u64_limb_count == limbs ? sizeof(uint64_t) : 0);
+    allocation_report->u32_workspace_limb_count = u32_limb_count;
+    allocation_report->u64_workspace_limb_count = u64_limb_count;
+    const uint32_t n_u32 = static_cast<uint32_t>(n);
+    size_t launches_per_group = 1;
+    if (n_u32 > kCompactNttSuffixSize)
+    {
+        ++launches_per_group;
+        for (uint32_t len = n_u32 >> 1; len > kCompactNttSuffixSize; len >>= 1)
+            ++launches_per_group;
+    }
+    if (!small_mul_size(
+            launches_per_group, limb_groups.size(),
+            &allocation_report->ntt_preparation_launches))
+        return set_error("compact RHS NTT launch count overflow");
     if (high_water_bytes > residency_budget_bytes)
         return 2;
-    cudaError_t err = cudaMallocAsync(
-        reinterpret_cast<void **>(&workspace),
-        workspace_words * sizeof(uint64_t),
-        stream);
+    cudaError_t err = cudaSuccess;
+    if (workspace_u32_bytes != 0)
+        err = cudaMallocAsync(
+            reinterpret_cast<void **>(&workspace_u32), workspace_u32_bytes, stream);
+    if (err == cudaSuccess && workspace_u64_bytes != 0)
+        err = cudaMallocAsync(
+            reinterpret_cast<void **>(&workspace_u64), workspace_u64_bytes, stream);
     if (err != cudaSuccess) return fail(err);
 
     const size_t poly_count = inner * cols;
-    const size_t current_workspace_words = limbs * poly_count * n;
-    const dim3 unpack_grid((current_workspace_words + kSmallThreads - 1) / kSmallThreads);
-    compact_unpack_twist_kernel<<<unpack_grid, kSmallThreads, 0, stream>>>(
-        rhs_small->payload, workspace, constants.twiddle_forward,
-        constants.twiddle_shoup_forward, constants.moduli, 0, limbs,
-        inner, cols, rhs_small->storage_cols, n, rhs_small->magnitude_bytes,
-        rhs_small->column_offset);
-    err = cudaGetLastError();
+    for (const LimbGroup &group : limb_groups)
+    {
+        if (n_u32 <= kCompactNttSuffixSize)
+        {
+            if (poly_count > std::numeric_limits<uint32_t>::max())
+                return fail(cudaErrorInvalidConfiguration);
+            const dim3 grid(
+                static_cast<uint32_t>(poly_count),
+                static_cast<uint32_t>(group.limb_count));
+            if (group.narrow)
+            {
+                uint32_t *group_workspace =
+                    workspace_u32 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_rhs_dif_all_shared_kernel<<<grid, kSmallThreads, 0, stream>>>(
+                    rhs_small->payload, group_workspace, constants.twiddle_forward,
+                    constants.twiddle_shoup_forward, constants.moduli,
+                    group.limb_offset, group.limb_count, poly_count, cols,
+                    rhs_small->storage_cols, n_u32, rhs_small->magnitude_bytes,
+                    rhs_small->column_offset);
+            }
+            else
+            {
+                uint64_t *group_workspace =
+                    workspace_u64 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_rhs_dif_all_shared_kernel<<<grid, kSmallThreads, 0, stream>>>(
+                    rhs_small->payload, group_workspace, constants.twiddle_forward,
+                    constants.twiddle_shoup_forward, constants.moduli,
+                    group.limb_offset, group.limb_count, poly_count, cols,
+                    rhs_small->storage_cols, n_u32, rhs_small->magnitude_bytes,
+                    rhs_small->column_offset);
+            }
+            err = cudaGetLastError();
+        }
+        else
+        {
+            size_t first_butterflies = 0;
+            if (!small_mul_size(group.limb_count, poly_count, &first_butterflies) ||
+                !small_mul_size(first_butterflies, n / 2, &first_butterflies))
+                return fail(cudaErrorInvalidConfiguration);
+            const size_t first_blocks =
+                (first_butterflies + kSmallThreads - 1) / kSmallThreads;
+            if (first_blocks > std::numeric_limits<uint32_t>::max())
+                return fail(cudaErrorInvalidConfiguration);
+            const dim3 first_grid(static_cast<uint32_t>(first_blocks));
+            if (group.narrow)
+            {
+                uint32_t *group_workspace =
+                    workspace_u32 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_rhs_dif_first_kernel<<<first_grid, kSmallThreads, 0, stream>>>(
+                    rhs_small->payload, group_workspace, constants.twiddle_forward,
+                    constants.twiddle_shoup_forward, constants.moduli,
+                    group.limb_offset, group.limb_count, poly_count, cols,
+                    rhs_small->storage_cols, n_u32, rhs_small->magnitude_bytes,
+                    rhs_small->column_offset);
+            }
+            else
+            {
+                uint64_t *group_workspace =
+                    workspace_u64 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_rhs_dif_first_kernel<<<first_grid, kSmallThreads, 0, stream>>>(
+                    rhs_small->payload, group_workspace, constants.twiddle_forward,
+                    constants.twiddle_shoup_forward, constants.moduli,
+                    group.limb_offset, group.limb_count, poly_count, cols,
+                    rhs_small->storage_cols, n_u32, rhs_small->magnitude_bytes,
+                    rhs_small->column_offset);
+            }
+            err = cudaGetLastError();
+            for (uint32_t len = n_u32 >> 1;
+                 err == cudaSuccess && len > kCompactNttSuffixSize;
+                 len >>= 1)
+            {
+                size_t butterflies = 0;
+                if (!small_mul_size(group.limb_count, poly_count, &butterflies) ||
+                    !small_mul_size(butterflies, n / 2, &butterflies))
+                    return fail(cudaErrorInvalidConfiguration);
+                const size_t blocks =
+                    (butterflies + kSmallThreads - 1) / kSmallThreads;
+                if (blocks > std::numeric_limits<uint32_t>::max())
+                    return fail(cudaErrorInvalidConfiguration);
+                const dim3 grid(static_cast<uint32_t>(blocks));
+                if (group.narrow)
+                {
+                    uint32_t *group_workspace =
+                        workspace_u32 + group.typed_limb_offset * workspace_words_per_limb;
+                    compact_ntt_dif_stage_kernel<<<grid, kSmallThreads, 0, stream>>>(
+                        group_workspace, constants.twiddle_forward,
+                        constants.twiddle_shoup_forward, constants.moduli,
+                        group.limb_offset, group.limb_count, poly_count, n, len);
+                }
+                else
+                {
+                    uint64_t *group_workspace =
+                        workspace_u64 + group.typed_limb_offset * workspace_words_per_limb;
+                    compact_ntt_dif_stage_kernel<<<grid, kSmallThreads, 0, stream>>>(
+                        group_workspace, constants.twiddle_forward,
+                        constants.twiddle_shoup_forward, constants.moduli,
+                        group.limb_offset, group.limb_count, poly_count, n, len);
+                }
+                err = cudaGetLastError();
+            }
+            if (err != cudaSuccess) break;
+            size_t suffix_blocks = 0;
+            if (!small_mul_size(
+                    poly_count, n / kCompactNttSuffixSize, &suffix_blocks) ||
+                suffix_blocks > std::numeric_limits<uint32_t>::max())
+                return fail(cudaErrorInvalidConfiguration);
+            const dim3 suffix_grid(
+                static_cast<uint32_t>(suffix_blocks),
+                static_cast<uint32_t>(group.limb_count));
+            if (group.narrow)
+            {
+                uint32_t *group_workspace =
+                    workspace_u32 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_rhs_dif_suffix_kernel<<<suffix_grid, kSmallThreads, 0, stream>>>(
+                    group_workspace, constants.twiddle_forward,
+                    constants.twiddle_shoup_forward, constants.moduli,
+                    group.limb_offset, group.limb_count, poly_count, n_u32);
+            }
+            else
+            {
+                uint64_t *group_workspace =
+                    workspace_u64 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_rhs_dif_suffix_kernel<<<suffix_grid, kSmallThreads, 0, stream>>>(
+                    group_workspace, constants.twiddle_forward,
+                    constants.twiddle_shoup_forward, constants.moduli,
+                    group.limb_offset, group.limb_count, poly_count, n_u32);
+            }
+            err = cudaGetLastError();
+        }
+        if (err != cudaSuccess) break;
+    }
     if (err == cudaSuccess)
     {
-        const dim3 grid((current_workspace_words + kSmallThreads - 1) / kSmallThreads);
-        compact_ntt_bit_reverse_kernel<<<grid, kSmallThreads, 0, stream>>>(
-            workspace, limbs, poly_count, n, log_n);
-        err = cudaGetLastError();
-    }
-    for (uint32_t len = 2; err == cudaSuccess && len <= n; len <<= 1)
-    {
-        const size_t butterflies = limbs * poly_count * (n / 2);
-        const dim3 grid((butterflies + kSmallThreads - 1) / kSmallThreads);
-        compact_ntt_stage_kernel<<<grid, kSmallThreads, 0, stream>>>(
-            workspace, constants.twiddle_forward, constants.twiddle_shoup_forward,
-            constants.moduli, 0, limbs, poly_count, n, len);
-        err = cudaGetLastError();
-    }
-    if (err == cudaSuccess)
-    {
-        const dim3 grid((current_workspace_words + kSmallThreads - 1) / kSmallThreads);
-        compact_ntt_bit_reverse_kernel<<<grid, kSmallThreads, 0, stream>>>(
-            workspace, limbs, poly_count, n, log_n);
-        err = cudaGetLastError();
-    }
-    if (err == cudaSuccess)
-    {
-        const bool lazy_reduce = compact_lazy_dot_is_safe(
-            rhs_small->ctx->moduli, 0, limbs, inner);
-        const size_t output_words = limbs * rows * cols * n;
-        const dim3 grid((output_words + kSmallThreads - 1) / kSmallThreads);
-        compact_accumulate_kernel<<<grid, kSmallThreads, 0, stream>>>(
-            lhs_descriptors, out_descriptors, constants.moduli, 0, workspace, limbs,
-            rows, inner, cols, n, lazy_reduce);
-        err = cudaGetLastError();
+        for (const LimbGroup &group : limb_groups)
+        {
+            const bool lazy_reduce = compact_lazy_dot_is_safe(
+                active_moduli, group.limb_offset, group.limb_count, inner);
+            size_t output_words = 0;
+            if (!small_mul_size(group.limb_count, rows, &output_words) ||
+                !small_mul_size(output_words, cols, &output_words) ||
+                !small_mul_size(output_words, n, &output_words))
+                return fail(cudaErrorInvalidConfiguration);
+            const size_t blocks = (output_words + kSmallThreads - 1) / kSmallThreads;
+            if (blocks > std::numeric_limits<uint32_t>::max())
+                return fail(cudaErrorInvalidConfiguration);
+            const dim3 grid(static_cast<uint32_t>(blocks));
+            if (group.narrow)
+            {
+                const uint32_t *group_workspace =
+                    workspace_u32 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_accumulate_kernel<<<grid, kSmallThreads, 0, stream>>>(
+                    lhs_descriptors, out_descriptors, constants.moduli,
+                    group.limb_offset, group_workspace, group.limb_count,
+                    rows, inner, cols, n, lazy_reduce);
+            }
+            else
+            {
+                const uint64_t *group_workspace =
+                    workspace_u64 + group.typed_limb_offset * workspace_words_per_limb;
+                compact_accumulate_kernel<<<grid, kSmallThreads, 0, stream>>>(
+                    lhs_descriptors, out_descriptors, constants.moduli,
+                    group.limb_offset, group_workspace, group.limb_count,
+                    rows, inner, cols, n, lazy_reduce);
+            }
+            err = cudaGetLastError();
+            if (err != cudaSuccess) break;
+        }
     }
     if (err != cudaSuccess) return fail(err);
     for (size_t limb = 0; limb < limbs; ++limb)

@@ -21,8 +21,8 @@ use crate::{
     rhs::ExponentRhsPackage,
 };
 use mxx_bgg::BggPublicKeyWire;
-use mxx_dsl::{Bytes, DslError, Family, HashTag, Int, Mat, Parallel, ParallelZipTuple, Preimage};
-use mxx_ir_core::{IndexExpr, IndexMap, IntExpr, ParamEnv};
+use mxx_dsl::{Bytes, Family, HashTag, Int, Mat, Parallel, ParallelZipTuple, Preimage};
+use mxx_ir_core::{IntExpr, ParamEnv};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 
@@ -156,8 +156,12 @@ impl ProgramCacheBatchBindings {
             selected.insert_family(
                 step,
                 body_gate,
-                Parallel::range(count)
-                    .map_values(move |index| values.get(vec![base.clone().add(index.as_int())]))
+                values
+                    .parallel_gather(
+                        Parallel::range(count)
+                            .map_values(move |index| base.clone().add(index.as_int()))
+                            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
+                    )
                     .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
             );
         }
@@ -664,13 +668,15 @@ impl ExponentLutPublicKeyCompiler {
                 })
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             let shared_for_outputs = shared_selector_decompositions.clone();
-            let selector_decompositions = Parallel::range(flat_count)
-                .map_values(move |index| {
-                    shared_for_outputs.get(vec![index.as_int().rem(Int::constant(count))])
-                })
+            let selector_decompositions = shared_for_outputs
+                .parallel_gather(
+                    Parallel::range(flat_count)
+                        .map_values(move |index| index.as_int().rem(Int::constant(count)))
+                        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
+                )
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             let selected = (lhs, selector_decompositions)
-                .parallel_zip_tuple(|_, (lhs, decomposition)| lhs.mul_small_rhs(decomposition))
+                .parallel_zip_tuple(|_, (lhs, decomposition)| decomposition.mul_small_rhs(lhs))
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             cache.insert_shared_family(step, 0, count, shared_selector_decompositions)?;
 
@@ -694,7 +700,7 @@ impl ExponentLutPublicKeyCompiler {
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             let weighted = (values, selected_decompositions.clone())
                 .parallel_zip_tuple(|_, (public, decomposition)| {
-                    public.mul_small_rhs(decomposition)
+                    decomposition.mul_small_rhs(public)
                 })
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             cache.insert_family(step, 1, count, selected_decompositions)?;
@@ -756,11 +762,11 @@ impl ExponentLutPublicKeyCompiler {
         rhs: &ExponentRhsPackage,
     ) -> Result<Mat, ExponentLutError> {
         // Public projection of Fuse: multiply `A` by the digit matrix of C.
-        Ok(input.clone().mul_small_rhs(
-            rhs.gsw_ciphertext()
-                .clone()
-                .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone()),
-        ))
+        Ok(rhs
+            .gsw_ciphertext()
+            .clone()
+            .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+            .mul_small_rhs(input.clone()))
     }
 
     /// Cache-required public Fuse boundary. The typed RHS decomposition is
@@ -770,7 +776,7 @@ impl ExponentLutPublicKeyCompiler {
         input: &Mat,
         decomposition: Preimage,
     ) -> Result<Mat, ExponentLutError> {
-        Ok(input.clone().mul_small_rhs(decomposition))
+        Ok(decomposition.mul_small_rhs(input.clone()))
     }
     #[cfg(all(test, feature = "gpu"))]
     pub(crate) fn single_input_lut(
@@ -842,41 +848,40 @@ impl ExponentLutPublicKeyCompiler {
         .map_err(|_| ExponentLutError::InvalidLut)?;
         let masks = Family::pack(helpers.iter().map(|helper| helper.mask().clone()).collect())
             .map_err(|_| ExponentLutError::InvalidLut)?;
-        let branches =
-            Family::try_parallel_zip_many_values(
-                vec![raw_publics, switches, masks],
-                move |_index, mut items| {
-                    // The families were zipped as `[raw_publics, switches, masks]`;
-                    // `pop` therefore yields the public mask, the concrete
-                    // setup-fixed selector ciphertext `C_{sigma,L}`, then the
-                    // automorphed public-key matrix `A^{\sigma}`.
-                    let mask = items.pop().ok_or(DslError::Schema)?;
-                    // `mask` is the public matrix from the mask-alignment helper
-                    // encoding. Its private vector switches the mask secret from
-                    // `sigma(s)` back to `s` after the automorphed fixed-C Fuse;
-                    // this public closure computes only that helper's projection.
-                    let switch = items.pop().ok_or(DslError::Schema)?;
-                    // `switch` is the concrete setup-fixed GSW ciphertext
-                    // `C_{sigma,L}`, wrapped below for fixed-RHS shape validation.
-                    let raw = items.pop().ok_or(DslError::Schema)?;
-                    // `raw = A^\sigma` is the automorphed public-key matrix; no
-                    // payload or plaintext term is formed on this public path.
-                    let rhs = ExponentRhsPackage::new(switch).map_err(|_| DslError::Schema)?;
-                    // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
-                    let fused = raw.mul_small_rhs(rhs.gsw_ciphertext().clone().decompose(
-                        self.public_key.base.clone(),
-                        self.public_key.digit_count.clone(),
-                    ));
-                    // `decomp = G^{-1}(fused)` has the gadget-digit shape needed
-                    // by `mask`; `mask * decomp` is the helper's public projection
-                    // that accompanies the private vector-side alignment.
-                    Ok(mask.mul_small_rhs(fused.decompose(
-                        self.public_key.base.clone(),
-                        self.public_key.digit_count.clone(),
-                    )))
-                },
-            )
-            .map_err(|_| ExponentLutError::InvalidLut)?;
+        let branches = Family::try_parallel_zip_many_values(
+            vec![raw_publics, switches, masks],
+            move |_index, mut items| {
+                // The families were zipped as `[raw_publics, switches, masks]`;
+                // `pop` therefore yields the public mask, the concrete
+                // setup-fixed selector ciphertext `C_{sigma,L}`, then the
+                // automorphed public-key matrix `A^{\sigma}`.
+                let mask = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
+                // `mask` is the public matrix from the mask-alignment helper
+                // encoding. Its private vector switches the mask secret from
+                // `sigma(s)` back to `s` after the automorphed fixed-C Fuse;
+                // this public closure computes only that helper's projection.
+                let switch = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
+                // `switch` is the concrete setup-fixed GSW ciphertext
+                // `C_{sigma,L}`, wrapped below for fixed-RHS shape validation.
+                let raw = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
+                // `raw = A^\sigma` is the automorphed public-key matrix; no
+                // payload or plaintext term is formed on this public path.
+                let rhs = ExponentRhsPackage::new(switch).map_err(|_| mxx_dsl::DslError::Schema)?;
+                // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
+                let fused = rhs
+                    .gsw_ciphertext()
+                    .clone()
+                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+                    .mul_small_rhs(raw);
+                // `decomp = G^{-1}(fused)` has the gadget-digit shape needed
+                // by `mask`; `mask * decomp` is the helper's public projection
+                // that accompanies the private vector-side alignment.
+                Ok(fused
+                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+                    .mul_small_rhs(mask))
+            },
+        )
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         balanced_sum_family(branches)
     }
 
@@ -924,7 +929,7 @@ impl ExponentLutPublicKeyCompiler {
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let aligned = (masks, cache.branch.clone())
             .parallel_zip_tuple_result(|_, (mask, decomposition)| {
-                Ok(mask.mul_small_rhs(decomposition))
+                Ok(decomposition.mul_small_rhs(mask))
             })
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let _ = input;
@@ -962,10 +967,9 @@ impl ExponentLutPublicKeyCompiler {
                 .gsw_ciphertext()
                 .clone()
                 .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-            let switched = input
+            let switched = switch_decomposition
                 .clone()
-                .ring_automorphism(sigmas[index])
-                .mul_small_rhs(switch_decomposition.clone());
+                .mul_small_rhs(input.clone().ring_automorphism(sigmas[index]));
             switch.push(switch_decomposition);
             branch.push(
                 switched
@@ -986,7 +990,7 @@ impl ExponentLutPublicKeyCompiler {
     ) -> Result<ProgramLutCache, ExponentLutError> {
         let member_count = concrete_mat_family_count(inputs)?;
         let width = table.values().len();
-        let first = inputs.get(vec![Int::constant(0)]);
+        let first = inputs.get(Int::constant(0));
         let n = first
             .matrix_type()
             .ring_dimension
@@ -1025,12 +1029,10 @@ impl ExponentLutPublicKeyCompiler {
             .parallel_gather(member_indices)
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let flat_switches = switch_base
-            .reindex(
-                vec![IntExpr::constant(flat_count)],
-                IndexMap::new([IndexExpr::Remainder(
-                    Box::new(IndexExpr::Axis(0)),
-                    Box::new(IndexExpr::constant(width)),
-                )]),
+            .parallel_gather(
+                Parallel::range(flat_count)
+                    .map_values(|index| index.as_int().rem(Int::constant(width)))
+                    .map_err(|_| ExponentLutError::InvalidLut)?,
             )
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let sigma_values = sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
@@ -1047,9 +1049,8 @@ impl ExponentLutPublicKeyCompiler {
                 );
                 let sigma =
                     IntExpr::Select { selector: Box::new(branch), branches: sigma_values.clone() };
-                input
-                    .ring_automorphism(sigma)
-                    .mul_small_rhs(switch)
+                switch
+                    .mul_small_rhs(input.ring_automorphism(sigma))
                     .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
             })
             .map_err(|_| ExponentLutError::InvalidLut)?;
@@ -1079,7 +1080,7 @@ impl ExponentLutPublicKeyCompiler {
             .parallel_gather(branch_indices)
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let aligned = (masks, cache.branch.clone())
-            .parallel_zip_tuple_result(|_, (mask, branch)| Ok(mask.mul_small_rhs(branch)))
+            .parallel_zip_tuple_result(|_, (mask, branch)| Ok(branch.mul_small_rhs(mask)))
             .map_err(|_| ExponentLutError::InvalidLut)?;
         reduce_family_segments(aligned, member_count, width)
     }
@@ -1121,7 +1122,7 @@ impl ExponentLutPublicKeyCompiler {
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let matrices = (inputs, decompositions)
             .parallel_zip_tuple_result(|_, (matrix, decomposition)| {
-                Ok(matrix.mul_small_rhs(decomposition))
+                Ok(decomposition.mul_small_rhs(matrix))
             })
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         Ok(PublicFamilyIntermediate { matrices })
@@ -1170,7 +1171,7 @@ impl ExponentLutPublicKeyCompiler {
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let matrices = (values, decompositions)
             .parallel_zip_tuple_result(|_, (value, decomposition)| {
-                Ok(value.mul_small_rhs(decomposition))
+                Ok(decomposition.mul_small_rhs(value))
             })
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         Ok(PublicFamilyIntermediate { matrices })
@@ -1246,7 +1247,7 @@ impl ExponentProgramLowering for PublicProgramLowering<'_> {
                     cache.insert_gate(step, decomposition.clone());
                 }
                 Ok(PublicProgramWire::Scalar(BggPublicKeyWire {
-                    matrix: lhs.matrix.clone().mul_small_rhs(decomposition),
+                    matrix: decomposition.mul_small_rhs(lhs.matrix.clone()),
                     reveal_plaintext: false,
                 }))
             }
@@ -1542,15 +1543,7 @@ fn reduce_family_segments(
     segment_count: usize,
     segment_size: usize,
 ) -> Result<Family<Mat>, ExponentLutError> {
-    Parallel::range(segment_count)
-        .try_map_values(move |segment| {
-            let start = segment.as_int().mul(Int::constant(segment_size));
-            let indices = Parallel::range(segment_size)
-                .map_values(|index| start.clone().add(index.as_int()))?;
-            let values = family.clone().parallel_gather(indices).map_err(|_| DslError::Schema)?;
-            balanced_sum_family(values).map_err(|_| DslError::Schema)
-        })
-        .map_err(|_| ExponentLutError::InvalidLut)
+    crate::encoding::reduce_encoding_family_segments(family, segment_count, segment_size)
 }
 
 #[cfg(test)]
@@ -1602,7 +1595,7 @@ mod tests {
         let input = ring.zero((2, 2));
         let rhs = ExponentRhsPackage::new(ring.zero((2, 2))).unwrap();
         let output = compiler.fuse_public(&input, &rhs).unwrap();
-        let expected = input.mul_small_rhs(rhs.gsw_ciphertext().clone().decompose(4, 2));
+        let expected = rhs.gsw_ciphertext().clone().decompose(4, 2).mul_small_rhs(input);
         assert_eq!(output.matrix_type(), expected.matrix_type());
         assert!(matches!(
             output.value_handle().node().kind(),
@@ -1726,11 +1719,11 @@ mod tests {
             (output_count * active_count).into()
         );
         let graph = DslContext::new("public-prf-output-axis")
-            .public_family_output("outputs", preprocessing.outputs)
+            .public_output("outputs", preprocessing.outputs)
             .unwrap()
-            .public_preimage_family_output("shared-selector-cache", shared.clone())
+            .public_output("shared-selector-cache", shared.clone())
             .unwrap()
-            .public_preimage_family_output("output-private-cache", private.clone())
+            .public_output("output-private-cache", private.clone())
             .unwrap()
             .build()
             .unwrap();

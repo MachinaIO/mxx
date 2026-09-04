@@ -118,14 +118,11 @@ impl AttributeEncodingCompiler {
         public_inputs: impl IntoIterator<Item = Mat>,
     ) -> Result<Vec<AttributeEncodingWire>, AttributeEvaluationError> {
         let rows = one.public_matrix.matrix_type().rows.clone();
-        let gadget =
-            self.ring.gadget(rows.clone(), self.gadget_base.clone(), self.digit_count.clone());
+        let gadget = self.ring.gadget(rows, self.gadget_base.clone(), self.digit_count.clone());
         let zero_rows = one.vector.matrix_type().rows.clone();
+        let zero_columns = one.vector.matrix_type().columns.clone();
         let public_inputs = public_inputs.into_iter().map(|attribute| AttributeEncodingWire {
-            // A public attribute a is represented by the carrier-preserving
-            // pair (0 * G, G * a), so it enters the same algebra as a sampled
-            // encoding without losing gadget columns.
-            vector: self.ring.zero((zero_rows.clone(), rows.clone())) * gadget.clone(),
+            vector: self.ring.zero((zero_rows.clone(), zero_columns.clone())),
             public_matrix: gadget.clone() * attribute.clone(),
             attribute,
         });
@@ -149,9 +146,8 @@ impl AttributeEncodingCompiler {
             let terms = (0..output_rows)
                 .map(|row| {
                     let target = self.unit_column(output_rows, row);
-                    outputs[row * output_columns + column]
-                        .clone()
-                        .mul_small_rhs(self.decompose(target))
+                    self.decompose(target)
+                        .mul_small_rhs(outputs[row * output_columns + column].clone())
                 })
                 .collect::<Vec<_>>();
             columns.push(sum_matrices(terms));
@@ -174,9 +170,8 @@ impl AttributeEncodingCompiler {
             let terms = (0..output_rows)
                 .map(|row| {
                     let target = self.unit_column(output_rows, row);
-                    outputs[row * output_columns + column]
-                        .clone()
-                        .mul_small_rhs(self.decompose(target))
+                    self.decompose(target)
+                        .mul_small_rhs(outputs[row * output_columns + column].clone())
                 })
                 .collect::<Vec<_>>();
             columns.push(sum_matrices(terms));
@@ -204,11 +199,8 @@ impl AttributeEncodingCompiler {
                 let output = &outputs[row * output_columns + column];
                 let target = self.unit_column(output_rows, row);
                 let decomposed = self.decompose(target.clone());
-                // This unit-column target is an arbitrary output projection:
-                // its decomposition is consumed on the right, but the target
-                // is not thereby a canonical G encoding.
-                vector_terms.push(output.vector.clone().mul_small_rhs(decomposed.clone()));
-                public_terms.push(output.public_matrix.clone().mul_small_rhs(decomposed));
+                vector_terms.push(decomposed.clone().mul_small_rhs(output.vector.clone()));
+                public_terms.push(decomposed.mul_small_rhs(output.public_matrix.clone()));
                 value_terms.push(target * output.attribute.clone());
             }
             vectors.push(sum_matrices(vector_terms));
@@ -243,8 +235,8 @@ impl AttributeEncodingCompiler {
                 let output = &outputs[row * output_columns + column];
                 let target = self.unit_column(output_rows, row);
                 let decomposed = self.decompose(target.clone());
-                vector_terms.push(output.vector.clone().mul_small_rhs(decomposed.clone()));
-                public_terms.push(output.public_matrix.clone().mul_small_rhs(decomposed));
+                vector_terms.push(decomposed.clone().mul_small_rhs(output.vector.clone()));
+                public_terms.push(decomposed.mul_small_rhs(output.public_matrix.clone()));
                 value_terms.push(target * output.attribute.clone());
             }
             vectors.push(sum_matrices(vector_terms));
@@ -269,7 +261,7 @@ impl AttributeEncodingCompiler {
     fn large_scalar_decomposition(&self, public_matrix: &Mat, scalar: Mat) -> mxx_dsl::Preimage {
         let rows = public_matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.gadget_base.clone(), self.digit_count.clone());
-        self.decompose(scalar * gadget)
+        self.decompose(gadget * scalar)
     }
 
     fn unit_column(&self, rows: usize, row: usize) -> Mat {
@@ -318,7 +310,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicAttributeLowering<'_> {
             PolyGateKind::Add => Ok(lhs.clone() + rhs.clone()),
             PolyGateKind::Sub => Ok(lhs.clone() - rhs.clone()),
             PolyGateKind::Mul => {
-                Ok(lhs.clone().mul_small_rhs(self.compiler.decompose(rhs.clone())))
+                Ok(self.compiler.decompose(rhs.clone()).mul_small_rhs(lhs.clone()))
             }
             _ => unsupported(gate, "non-arithmetic gate"),
         }
@@ -347,7 +339,7 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicAttributeLowering<'_> {
                 .map(num_bigint::BigInt::from)
                 .map(mxx_ir_core::IntExpr::constant),
         );
-        Ok(input.clone().mul_small_rhs(self.compiler.large_scalar_decomposition(input, scalar)))
+        Ok(self.compiler.large_scalar_decomposition(input, scalar).mul_small_rhs(input.clone()))
     }
 }
 
@@ -412,15 +404,11 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
     ) -> Result<AttributeEncodingWire, Self::Error> {
         match operation {
             PolyGateKind::Add => Ok(AttributeEncodingWire {
-                // Addition keeps the synchronized relation
-                // (C_L + C_R, A_L + A_R, x_L + x_R).
                 vector: lhs.vector.clone() + rhs.vector.clone(),
                 public_matrix: lhs.public_matrix.clone() + rhs.public_matrix.clone(),
                 attribute: lhs.attribute.clone() + rhs.attribute.clone(),
             }),
             PolyGateKind::Sub => Ok(AttributeEncodingWire {
-                // Subtraction applies the same component-wise relation with
-                // differences in the carrier, public matrix, and attribute.
                 vector: lhs.vector.clone() - rhs.vector.clone(),
                 public_matrix: lhs.public_matrix.clone() - rhs.public_matrix.clone(),
                 attribute: lhs.attribute.clone() - rhs.attribute.clone(),
@@ -431,11 +419,9 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
                 // encoding of the product under the public product matrix.
                 let decomposed_rhs = self.compiler.decompose(rhs.public_matrix.clone());
                 Ok(AttributeEncodingWire {
-                    // This is C_L K_R + x_L C_R with G K_R=A_R; the two
-                    // expanded encodings cancel their cross term.
-                    vector: lhs.vector.clone().mul_small_rhs(decomposed_rhs.clone()) +
-                        lhs.attribute.clone() * rhs.vector.clone(),
-                    public_matrix: lhs.public_matrix.clone().mul_small_rhs(decomposed_rhs),
+                    vector: decomposed_rhs.clone().mul_small_rhs(lhs.vector.clone()) +
+                        rhs.vector.clone() * lhs.attribute.clone(),
+                    public_matrix: decomposed_rhs.mul_small_rhs(lhs.public_matrix.clone()),
                     attribute: lhs.attribute.clone() * rhs.attribute.clone(),
                 })
             }
@@ -451,10 +437,8 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
     ) -> Result<AttributeEncodingWire, Self::Error> {
         let scalar =
             self.compiler.scalar(scalar.iter().copied().map(mxx_ir_core::IntExpr::constant));
-        // A small scalar t acts directly as tC and tA, while metadata records
-        // the ordinary attribute product t x.
         Ok(AttributeEncodingWire {
-            vector: scalar.clone() * input.vector.clone(),
+            vector: input.vector.clone() * scalar.clone(),
             public_matrix: input.public_matrix.clone() * scalar.clone(),
             attribute: input.attribute.clone() * scalar,
         })
@@ -475,11 +459,9 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodedAttributeLowering<'_> {
         );
         let decomposed =
             self.compiler.large_scalar_decomposition(&input.public_matrix, scalar.clone());
-        // A large scalar is carried by tG: K_t is decomposed from tG and is
-        // applied on the right of both vector and public-matrix relations.
         Ok(AttributeEncodingWire {
-            vector: input.vector.clone().mul_small_rhs(decomposed.clone()),
-            public_matrix: input.public_matrix.clone().mul_small_rhs(decomposed),
+            vector: decomposed.clone().mul_small_rhs(input.vector.clone()),
+            public_matrix: decomposed.mul_small_rhs(input.public_matrix.clone()),
             attribute: input.attribute.clone() * scalar,
         })
     }
@@ -546,7 +528,6 @@ mod tests {
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output, row};
     use mxx_dsl::DslContext;
-    use mxx_ir_core::node::{MatrixBinaryOp, NodeKind};
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -556,46 +537,6 @@ mod tests {
     };
     use mxx_runtime::RuntimeValue;
     use std::collections::BTreeMap;
-
-    #[test]
-    fn public_zero_attribute_encoding_is_a_zero_gain_gadget_product() {
-        let ring = Ring::new(257, 8);
-        let compiler = AttributeEncodingCompiler {
-            ring: ring.clone(),
-            gadget_base: 4.into(),
-            digit_count: 4.into(),
-        };
-        let one = AttributeEncodingWire {
-            vector: ring.input("one-vector", (1, 8)),
-            public_matrix: ring.input("one-public", (2, 8)),
-            attribute: ring.identity(1),
-        };
-        let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let input = circuit.input(1).as_single_wire();
-        circuit.output([input]);
-        let output = compiler
-            .evaluate_encoded_mixed(&circuit, one, [], [ring.identity(1)])
-            .unwrap()
-            .remove(0);
-        let built = DslContext::new("attribute-public-zero-carrier")
-            .output("vector", output.vector)
-            .unwrap()
-            .build()
-            .unwrap();
-        let nodes = built.graph.scopes().values().flat_map(|scope| scope.nodes());
-        assert!(nodes.into_iter().any(|node| {
-            matches!(node.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)) &&
-                node.arguments().get(1).is_some_and(|right| {
-                    matches!(
-                        right.node().kind(),
-                        NodeKind::ConstantMatrix {
-                            value: mxx_ir_core::node::ConstantMatrix::Gadget { .. },
-                            ..
-                        }
-                    )
-                })
-        }));
-    }
 
     #[test]
     fn mixed_public_input_satisfies_the_btvw17_key_equation_at_runtime() {

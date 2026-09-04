@@ -34,19 +34,19 @@ extern "C"
         GpuMatrix *const *outputs,
         const GpuMatrix *const *inputs,
         size_t matrix_count);
-    int gpu_matrix_ring_automorphism_batch(
+    int gpu_matrix_mul_batch(
         GpuMatrix *const *outputs,
-        const GpuMatrix *const *inputs,
-        const size_t *indices,
+        const GpuMatrix *const *left,
+        const GpuMatrix *const *right,
         size_t matrix_count);
     int gpu_matrix_validate_ring_automorphism(
         size_t ring_dimension,
         const size_t *indices,
         size_t matrix_count);
-    int gpu_matrix_mul_batch(
+    int gpu_matrix_ring_automorphism_batch(
         GpuMatrix *const *outputs,
-        const GpuMatrix *const *left,
-        const GpuMatrix *const *right,
+        const GpuMatrix *const *inputs,
+        const size_t *indices,
         size_t matrix_count);
     int gpu_matrix_mul_accumulate_batch(
         GpuMatrix *const *outputs,
@@ -62,12 +62,12 @@ extern "C"
         const GpuMatrix *const *matrices,
         const GpuMatrix *const *scalars,
         size_t matrix_count);
-    int gpu_matrix_intt_batch(GpuMatrix *const *matrices, size_t matrix_count);
-    int gpu_matrix_ntt_batch(GpuMatrix *const *matrices, size_t matrix_count);
-    int gpu_matrix_ntt_in_place_batch(GpuMatrix *const *matrices, size_t matrix_count);
     int gpu_matrix_intt_out_of_place_batch(
         GpuMatrix *const *outputs,
         const GpuMatrix *const *inputs,
+        size_t matrix_count);
+    int gpu_matrix_ntt_in_place_batch(
+        GpuMatrix *const *matrices,
         size_t matrix_count);
 
 #ifdef __cplusplus

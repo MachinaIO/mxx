@@ -16,17 +16,19 @@ cutoffs reference declared integer parameters and are resolved by `ParamEnv`; th
 converts an unresolved `RealExpr` sigma itself.
 
 `Subgraph::define` stores one reusable body. Runtime values crossing its boundary are explicit.
-`Family` is one rank-N, row-major abstraction. `Parallel::grid` and the one-dimensional convenience
-combinators create structural `ParallelGrid` nodes rather than expanding one body per member.
+`Family::parallel_map`, `parallel_zip`, and `Parallel::range` create structural
+`ParallelLoop` nodes rather than expanding one body per member.
 
-Sealing remaps body-local handles and captured values to the exact sealed scope before freezing.
-Ordinary DSL users receive only `BuiltGraph`; construction state is not a second expression
-language.
+Protocol builders may use crate-internal traced variants of these loop combinators to retain the
+handles of operations they just created for correctness certificates. Sealing remaps body-local
+handles and captured values to the exact sealed scope before freezing. Ordinary DSL users still
+receive only `BuiltGraph`; construction traces and the temporary freeze map are not runtime graph
+state or a second expression language.
 
-Fixed public circuit descriptions use `DslContext::int_family_input`. Deterministic
-`FamilyReindex` uses typed `IndexMap` expressions, while runtime-dependent indexing uses
-`FamilyGather` or `FamilySelectAxis`. Selector identity is preserved by explicit aliases, not
-inferred from equal ranges.
+Fixed public circuit descriptions use `DslContext::int_family_input`. `parallel_gather` broadcasts
+one read-only source family and dynamically gathers one member for every zipped index. Heterogeneous
+zip bundles keep composite values such as a BGG encoding's vector, public key, and plaintext in one
+parallel iteration while still lowering every component to ordinary core wires.
 
 `Parallel::range(count).map_values` can also return `Trapdoor`. Because one trapdoor consists of a
 public matrix wire and a private trapdoor wire, the result is a `TrapdoorFamily` that keeps those
@@ -36,10 +38,8 @@ preprocessing without expanding a parameterized count. Persist the public half w
 `public_family_output` and the private half with `private_trapdoor_family_output`; import the pair
 with `trapdoor_family_artifact_input`.
 
-`Preimage` is distinct from `Mat`. `Mat::apply_preimage` and `Mat::mul_decomposed` lower to
-`ApplyPreimage`, the only multiplication that consumes a relation. `Preimage::materialize_exact`
-is accepted by the simulator only when the registered relation target has zero error.
-`Decomposition` exposes relation-preserving consumption and guarded scalar entries; there is no
-unrestricted conversion to `Mat`.
+Correctness declarations use `IdealSpec::new` and `PurePredicateSpec::new`. These wrappers reject
+sampling nodes and retain a deterministic graph consumed by `mxx-correctness::ProtocolDecl`.
+There is no virtual matrix, assumption, symbolic overlay, or second expression DAG.
 
-See `docs/runtime.md` for execution and `docs/noise-simulator-spec.md` for simulation semantics.
+See `docs/runtime.md` for execution and `docs/correctness/operational-protocol-inventory.md` for checking semantics.

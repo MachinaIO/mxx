@@ -433,7 +433,6 @@ impl IndexMap {
         Self { input_indices: self.input_indices.iter().map(IndexExpr::normalize).collect() }
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ExprError {
     #[error("unbound compile variable: {0}")]

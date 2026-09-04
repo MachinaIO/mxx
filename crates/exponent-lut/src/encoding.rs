@@ -878,10 +878,9 @@ impl ExponentLutEncodingCompiler {
                 .gsw_ciphertext()
                 .clone()
                 .decompose(self.gadget_base.clone(), self.digit_count.clone());
-            let switched = public_input
+            let switched = switch_decomposition
                 .clone()
-                .ring_automorphism(helper.sigma())
-                .mul_small_rhs(switch_decomposition.clone());
+                .mul_small_rhs(public_input.clone().ring_automorphism(helper.sigma()));
             switch.push(switch_decomposition);
             branch.push(switched.decompose(self.gadget_base.clone(), self.digit_count.clone()));
         }
@@ -924,11 +923,11 @@ impl ExponentLutEncodingCompiler {
         helpers: &[LutHelper],
     ) -> Result<BggEncodingWire, ExponentLutError> {
         let fused = BggEncodingWire {
-            vector: lhs.vector.clone().mul_small_rhs(
-                rhs.gsw_ciphertext()
-                    .clone()
-                    .decompose(self.gadget_base.clone(), self.digit_count.clone()),
-            ),
+            vector: rhs
+                .gsw_ciphertext()
+                .clone()
+                .decompose(self.gadget_base.clone(), self.digit_count.clone())
+                .mul_small_rhs(lhs.vector.clone()),
             plaintext: None,
         };
         let cache = self.test_lut_cache(&fused, helpers)?;
@@ -1031,14 +1030,9 @@ impl ExponentLutEncodingCompiler {
         let mask_vectors =
             Family::pack(helpers.iter().map(|helper| helper.mask().vector.clone()).collect())
                 .map_err(|_| ExponentLutError::InvalidLut)?;
-        let vectors = Parallel::range(width)
-            .try_map_values(|index| {
-                let index = vec![index.as_int()];
-                let raw = raw_vectors.get(index.clone());
-                let switch = cache.switch.get(index.clone());
-                let mask = mask_vectors.get(index.clone());
-                let branch = cache.branch.get(index);
-                Ok(mask.mul_small_rhs(branch) + raw.mul_small_rhs(switch))
+        let vectors = (raw_vectors, cache.switch.clone(), mask_vectors, cache.branch.clone())
+            .parallel_zip_tuple(|_, (raw, switch, mask, branch)| {
+                branch.mul_small_rhs(mask) + switch.mul_small_rhs(raw)
             })
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let plaintext = input_plaintext.cloned().map(|value| {
@@ -1118,11 +1112,11 @@ impl ExponentLutEncodingCompiler {
                     selector: Box::new(branch_index),
                     branches: sigma_values.clone(),
                 };
-                raw.ring_automorphism(sigma).mul_small_rhs(switch)
+                switch.mul_small_rhs(raw.ring_automorphism(sigma))
             })
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let aligned = (flat_masks, cache.branch.clone())
-            .parallel_zip_tuple(|_, (mask, branch)| mask.mul_small_rhs(branch))
+            .parallel_zip_tuple(|_, (mask, branch)| branch.mul_small_rhs(mask))
             .map_err(|_| ExponentLutError::InvalidLut)?;
         let branches = (switched, aligned)
             .parallel_zip_tuple(|_, (switched, aligned)| switched + aligned)
@@ -1224,7 +1218,7 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
                     .and_then(|cache| cache.gate_entry(step))
                     .ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
                 Ok(EncodingProgramWire::Scalar(BggEncodingWire {
-                    vector: lhs.vector.clone().mul_small_rhs(decomposition.clone()),
+                    vector: decomposition.clone().mul_small_rhs(lhs.vector.clone()),
                     plaintext: None,
                 }))
             }
@@ -1243,7 +1237,7 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
                 let vectors = decompositions
                     .clone()
                     .parallel_map_values(|_, decomposition| {
-                        input.vector.clone().mul_small_rhs(decomposition)
+                        decomposition.mul_small_rhs(input.vector.clone())
                     })
                     .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 Ok(EncodingProgramWire::Materialized {
@@ -1274,7 +1268,7 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
                 let plaintext =
                     public.plaintext.clone().ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
                 Ok(EncodingProgramWire::Scalar(BggEncodingWire {
-                    vector: public.vector.clone().mul_small_rhs(decomposition.clone()) +
+                    vector: decomposition.clone().mul_small_rhs(public.vector.clone()) +
                         plaintext * private.vector.clone(),
                     plaintext: program_binary_plaintext(public, private, |left, right| {
                         left * right
@@ -1322,7 +1316,7 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
                     .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 let first = (values_vector, decompositions.clone())
                     .parallel_zip_tuple_result(|_, (value, decomposition)| {
-                        Ok(value.mul_small_rhs(decomposition))
+                        Ok(decomposition.mul_small_rhs(value))
                     })
                     .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 let second = (values_plaintext, mapped.vectors.clone())
@@ -1550,20 +1544,56 @@ fn concrete_preimage_family_count(family: &Family<Preimage>) -> Result<usize, Ex
         .ok_or(ExponentLutError::InvalidLut)
 }
 
-fn reduce_encoding_family_segments(
+pub(crate) fn reduce_encoding_family_segments(
     family: Family<Mat>,
     segment_count: usize,
     segment_size: usize,
 ) -> Result<Family<Mat>, ExponentLutError> {
-    Parallel::range(segment_count)
-        .try_map_values(move |segment| {
-            let start = segment.as_int().mul(Int::constant(segment_size));
-            let indices = Parallel::range(segment_size)
-                .map_values(|index| start.clone().add(index.as_int()))?;
-            let values = family.clone().parallel_gather(indices).map_err(|_| DslError::Schema)?;
-            balanced_sum_family(values).map_err(|_| DslError::Schema)
-        })
-        .map_err(|_| ExponentLutError::InvalidLut)
+    if segment_count == 0 ||
+        segment_size == 0 ||
+        segment_count.checked_mul(segment_size) != Some(concrete_mat_family_count(&family)?)
+    {
+        return Err(ExponentLutError::InvalidLut);
+    }
+    let mut current = family;
+    let mut width = segment_size;
+    while width > 1 {
+        let next_width = width.div_ceil(2);
+        let count = segment_count.checked_mul(next_width).ok_or(ExponentLutError::InvalidLut)?;
+        let indices = |offset| {
+            Parallel::range(count).map_values(|index| {
+                let flat = index.as_int();
+                let segment = flat.clone().div(Int::constant(next_width));
+                let member = flat.rem(Int::constant(next_width)).mul(Int::constant(2));
+                segment
+                    .mul(Int::constant(width))
+                    .add(member.add(Int::constant(offset)).rem(Int::constant(width)))
+            })
+        };
+        let left = current
+            .clone()
+            .parallel_gather(indices(0).map_err(|_| ExponentLutError::InvalidLut)?)
+            .map_err(|_| ExponentLutError::InvalidLut)?;
+        let right = current
+            .parallel_gather(indices(1).map_err(|_| ExponentLutError::InvalidLut)?)
+            .map_err(|_| ExponentLutError::InvalidLut)?;
+        current = (left, right)
+            .parallel_zip_tuple_result(|index, (left, right)| {
+                if width % 2 == 0 {
+                    Ok(left + right)
+                } else {
+                    index
+                        .as_int()
+                        .rem(Int::constant(next_width))
+                        .equal(Int::constant(next_width - 1))
+                        .to_int()
+                        .select(vec![left.clone() + right, left])
+                }
+            })
+            .map_err(|_| ExponentLutError::InvalidLut)?;
+        width = next_width;
+    }
+    Ok(current)
 }
 
 /// Setup-fixed family of GSW ciphertexts consumed by both public-key
@@ -1717,8 +1747,8 @@ pub(crate) fn balanced_sum_family(family: Family<Mat>) -> Result<Mat, ExponentLu
             .map_err(|_| ExponentLutError::InvalidLut)?;
         current =
             Family::try_parallel_zip_many_values(vec![left, right], move |index, mut items| {
-                let l = items.pop().ok_or(DslError::Schema)?;
                 let r = items.pop().ok_or(DslError::Schema)?;
+                let l = items.pop().ok_or(DslError::Schema)?;
                 if count % 2 == 1 {
                     let last = index.as_int().equal(mxx_dsl::Int::constant(next - 1)).to_int();
                     last.select(vec![l.clone() + r, l])
@@ -1777,6 +1807,64 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn odd_width_segmented_reduction_matches_scalar_addition() {
+        let parameters = DCRTPolyParams::new(4, 1, 20, 4);
+        let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 4);
+        let mut context = DslContext::new("odd-width-segmented-reduction");
+        for width in [1usize, 3, 5] {
+            let values = (0..2 * width)
+                .map(|index| ring.polynomial([(index + 1).into()]))
+                .collect::<Vec<_>>();
+            let actual = super::reduce_encoding_family_segments(
+                Family::pack(values.clone()).unwrap(),
+                2,
+                width,
+            )
+            .unwrap();
+            for segment in 0..2 {
+                let inputs = &values[segment * width..(segment + 1) * width];
+                let expected = inputs.iter().cloned().reduce(|left, right| left + right).unwrap();
+                context = context
+                    .output(format!("actual-{width}-{segment}"), actual.get_static(segment))
+                    .unwrap()
+                    .output(format!("expected-{width}-{segment}"), expected)
+                    .unwrap()
+                    .output(
+                        format!("scalar-{width}-{segment}"),
+                        super::balanced_sum_family(Family::pack(inputs.to_vec()).unwrap()).unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        for width in [1usize, 3, 5] {
+            for segment in 0..2 {
+                let RuntimeValue::Matrix(expected) =
+                    &result.outputs[&format!("expected-{width}-{segment}")]
+                else {
+                    panic!("expected matrix")
+                };
+                for prefix in ["actual", "scalar"] {
+                    let RuntimeValue::Matrix(actual) =
+                        &result.outputs[&format!("{prefix}-{width}-{segment}")]
+                    else {
+                        panic!("reduced matrix")
+                    };
+                    assert_eq!(actual.as_ref(), expected.as_ref());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bgg_encoding_family_rejects_wrong_ring_and_empty_count() {
         let ring = Ring::new(97, 4);
         let valid = Family::pack(vec![ring.zero((1, 5))]).unwrap();
@@ -1822,10 +1910,9 @@ mod tests {
                 .gsw_ciphertext()
                 .clone()
                 .decompose(compiler.gadget_base.clone(), compiler.digit_count.clone());
-            let switched = public_input
+            let switched = switch_decomposition
                 .clone()
-                .ring_automorphism(helper.sigma())
-                .mul_small_rhs(switch_decomposition.clone());
+                .mul_small_rhs(public_input.clone().ring_automorphism(helper.sigma()));
             switch.push(switch_decomposition);
             branch.push(
                 switched.decompose(compiler.gadget_base.clone(), compiler.digit_count.clone()),
@@ -2699,15 +2786,10 @@ mod tests {
         let mut sequential_loops = 0;
         for node in nodes {
             match node.kind() {
-                mxx_ir_core::node::NodeKind::ParallelGrid(grid) => {
-                    let shape = grid
-                        .shape
-                        .iter()
-                        .map(|extent| {
-                            extent.evaluate(&ParamEnv::default()).unwrap().to_usize().unwrap()
-                        })
-                        .collect::<Vec<_>>();
-                    if shape == [2] && grid.input_modes.len() == 4 {
+                mxx_ir_core::node::NodeKind::ParallelLoop(grid) => {
+                    let count =
+                        grid.count.evaluate(&ParamEnv::default()).unwrap().to_usize().unwrap();
+                    if count == 2 && grid.input_modes.len() == 4 {
                         private_branch_grids += 1;
                     }
                 }
@@ -2747,11 +2829,11 @@ mod tests {
             .unwrap();
         assert_eq!(helpers.sigmas.len(), 1023);
         let graph = DslContext::new("native-readout-helper-family")
-            .public_family_output("switches", helpers.switch_ciphertexts)
+            .public_output("switches", helpers.switch_ciphertexts)
             .unwrap()
-            .public_family_output("masks", helpers.public_masks)
+            .public_output("masks", helpers.public_masks)
             .unwrap()
-            .private_family_output("online-masks", helpers.online_mask_vectors)
+            .private_output("online-masks", helpers.online_mask_vectors)
             .unwrap()
             .build()
             .unwrap();
@@ -2770,8 +2852,8 @@ mod tests {
                 .iter()
                 .filter(|node| matches!(
                     node.kind(),
-                    mxx_ir_core::node::NodeKind::ParallelGrid(grid)
-                        if grid.shape == [mxx_ir_core::IntExpr::constant(1023)]
+                    mxx_ir_core::node::NodeKind::ParallelLoop(grid)
+                        if grid.count == mxx_ir_core::IntExpr::constant(1023)
                 ))
                 .count(),
             1

@@ -6,11 +6,11 @@ Both stages declare `instance_width`, `witness_width`, `depth`, and `max_layer_w
 parameters. A runtime compiler binds those parameters from its configured shape, while gate data
 and the selected output remain ordinary runtime inputs.
 
-Input-injector transitions use a logical `[level, state, digit]` family. Their source/trapdoor
-family has shape `[level, state]`, so the source is independent of the final branch axis while the
-preimage and target vary with the digit. BGG+ public keys and witness projection preimages are also
-typed artifacts. Online injection carries one fixed-width state family through a `SequentialLoop`;
-independent work uses rank-N `ParallelGrid` nodes.
+Input-injector transitions, BGG+ public keys, and witness projection preimages are each exported as
+one flat family artifact. Transition slots use a rectangular `(level, digit, state)` layout; inactive
+state padding is never selected by the protocol. Online injection carries one fixed-width state
+family through a `SequentialLoop`, while independent transition generation and application use
+`ParallelLoop` nodes.
 
 ## Circuit interface
 
@@ -22,13 +22,14 @@ indices, invalid active counts, invalid output sources, and nonzero padding befo
 execution.
 
 The logical input order is instance bits followed by witness bits. They are represented by separate
-zero-padded families so the encryption stage receives the instance but never the witness. Witness
-bits are packed into input-injector digits inside the DSL graph; host code does not specialize the
-graph to their values.
+zero-padded families so the encryption stage receives the instance but never the witness. The pure
+satisfaction predicate combines those families only while interpreting the ideal Boolean circuit.
+Witness bits are packed into input-injector digits inside the DSL graph; host code does not
+specialize the graph to their values.
 
 Layers are evaluated by one carried-state `SequentialLoop`. Each layer gathers predecessor families
 with dynamic `FamilyGetDynamic` operations and evaluates independent gate slots with structural
-`ParallelGrid` nodes. The six supported operations are
+`ParallelLoop` nodes. The six supported operations are
 constant false, constant true, copy, not, and, and xor. BGG+ selection keeps each encoding vector,
 public key, and revealed plaintext from the same selected candidate.
 
@@ -39,38 +40,36 @@ the protocol's gadget base and digit count. Gadget decomposition is deterministi
 ciphertext or artifact field. The exported `diamond_r_decomposed` value is unrelated: it is the
 separate projection used by the final decoder.
 
-## Noise simulation and parameters
+## Correctness and parameters
 
-`DiamondParameterSearch` freezes linked encryption and decryption graphs, supplies concrete
-external input facts, and requests the noisy plaintext matrix from `mxx-noise-simulator`. The
-simulator returns a coefficient-error bound. Diamond applies its Boolean decoder interval outside
-the simulator; the simulator has no Diamond-specific rule, decoder kind, ideal program, or
-predicate.
+The Rust operational checker is the active acceptance path for the constructed closed protocol
+and registered-rule analysis. There is currently no end-to-end correctness theorem; the checker
+uses explicit hard bounds and the executable parameter checker instead.
 
-Noise parameters use deterministic coefficient bounds. The default helper functions compute
+`DiamondWeProtocolFamily::protocol_decl` returns a validated `WitnessEncryptionProtocolDecl`. The
+declaration is built directly from symbolic circuit and cryptographic parameters; it does not own a
+concrete circuit shape or a parameter-search candidate. Its sole fixed value is the BGG domain tag.
+Consequently, changing a runtime `ParamEnv` does not change the protocol hash. The declaration links
+the encryption and decryption graphs, checks every artifact and protocol-input mapping, includes a
+pure circuit-data validity predicate, includes a pure Boolean satisfiability predicate, and compares
+the decrypted Boolean with the unchanged ideal message. `DiamondWeCompiler::protocol_decl` delegates
+to the same family declaration, while its concrete shape remains confined to runtime validation and
+parameter binding.
+
+Correctness parameters are intended to use deterministic coefficient bounds. The default helper functions compute
 `floor(6.5 * sigma)` exactly; the preimage helper first computes a rational upper bound for the
 existing preimage sigma formula. CPU Gaussian sampling rejection-resamples coefficients outside the
 declared cutoff. CPU preimage sampling rejects a whole candidate, preserving the preimage equation.
 
 `DiamondParameterSearch` fixes the circuit shape and searches ring dimension and modulus depth. It
-uses the ordinary untruncated Gaussian only for lattice-security estimation. Candidate evaluation
-runs direct executable-IR noise simulation with full ring and inner-dimension factors, then applies
-the decoder condition before accepting a candidate.
+uses the ordinary untruncated Gaussian only for lattice-security estimation. Correctness uses a
+worst-case recurrence with full ring and inner-dimension factors, then invokes the Rust
+checker before accepting a candidate. The checker receives all 15 symbolic protocol parameters,
+including the four circuit-family dimensions and both sampler sigmas. Rational sigmas are passed as
+exact numerator/denominator pairs. Candidate acceptance therefore evaluates the generated
+parameter-validity predicate and the Diamond parameter relations, rather than only the derived
+hard-bound arithmetic.
 
-One verified integration-test run used `witness_size=10` and requested 128 security bits. It
-selected CRT depth 4, ring dimension 16384, 60-bit CRT moduli, 240 total modulus bits, and a 30-bit
-gadget base, giving two digits per CRT modulus. The estimator reported 215 achieved security bits.
-The post-fix noise bound was
-`251688648476311380159013360416031481340377932611078873344980140687360`, with 960 planned wires
-and 640 transfer steps. The report contained 68 meaningful carrier-precision-loss diagnostics from
-concat/slice, branch selection, and distinct-source addition/subtraction on intermediate paths. It
-contained no ordinary-multiplication false positives. These diagnostics do not weaken the numeric
-noise bound, and every `ApplyPreimage` remains fail-closed when its required carrier is unavailable.
-
-These values are evidence from that concrete test environment and search range, not universal
-defaults. After parameter search and simulation, the run stopped at the integration test's explicit
-no-GPU assertion; it did not execute GPU cost measurement or the encryption/decryption round trip.
-
-The GPU integration path requires detected hardware after CPU-only parameter search and noise
-simulation. A no-GPU stop therefore establishes the search/simulation result only, not GPU runtime
-acceptance.
+Certified GPU Diamond execution is not exposed. The GPU Gaussian and preimage paths must enforce
+the same bounded support, including whole-candidate preimage rejection, before a GPU integration
+path can claim the bounded-sampler theorem.

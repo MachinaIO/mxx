@@ -733,7 +733,7 @@ fn route_prf_family(
     route_preimages: Family<Preimage>,
 ) -> Result<Family<Mat>, RefreshError> {
     (vectors, route_preimages)
-        .parallel_zip_tuple_result(|_, (vector, rhs)| Ok(vector.mul_small_rhs(rhs)))
+        .parallel_zip_tuple_result(|_, (vector, rhs)| Ok(rhs.mul_small_rhs(vector)))
         .map_err(|_| RefreshError::InvalidLayout)
 }
 
@@ -1079,7 +1079,7 @@ impl RefreshAnchor {
     pub(crate) fn with_equation(b: Mat, k: Preimage) -> Self {
         // Construct the issuer target here so callers cannot attach an
         // unrelated matrix while claiming it is B*K.
-        let target = b.mul_small_rhs(k);
+        let target = k.mul_small_rhs(b);
         Self { equation: Some(RefreshAnchorEquation { target }) }
     }
 }
@@ -1337,7 +1337,7 @@ impl RefreshCompiler {
             // `target = A_{sum,t} - mu_t A'`; the imported preimage K_t must
             // satisfy `B K_t = target` and is checked by RefreshDecoderPreimage.
             let decoder =
-                BggEncodingWire { vector: base.vector.mul_small_rhs(k.clone()), plaintext: None };
+                BggEncodingWire { vector: k.clone().mul_small_rhs(base.vector), plaintext: None };
             let anchor = RefreshAnchor::with_equation(public_b.clone(), k.clone());
             let decoder = RefreshDecoderPreimage::bind(&anchor, decoder, &target)?;
             packages.push(RefreshScalarPackage::new(
@@ -1813,7 +1813,7 @@ mod tests {
         )
         .expect("valid route family");
         let graph = mxx_dsl::DslContext::new("route-preimages-two-row-target")
-            .public_preimage_family_output("routes", routes)
+            .public_output("routes", routes)
             .expect("route output")
             .build()
             .expect("route graph");

@@ -9,11 +9,11 @@ use super::{
         PrivatePrfeLayerWires,
     },
 };
-use mxx_dsl::{BuiltGraph, DslContext, Family, Mat, Preimage, Ring};
+use mxx_dsl::{BuiltGraph, DslContext, Family, Mat, Ring};
 use mxx_gadgets::{
     circuit::PolyCircuit,
     circuit_gadgets::fhe_prg::goldreich::{
-        GoldreichGraph, GoldreichGraphGeneration, goldreich_output_bound_holds,
+        goldreich_output_bound_holds, GoldreichGraph, GoldreichGraphGeneration,
     },
 };
 use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId};
@@ -158,7 +158,7 @@ impl Aky24CascadeCompiler {
         let universal_key = self.layers[0].keygen(&universal_high, &universal_low, &[])?;
 
         struct BranchFamilies {
-            preimages: Family<Preimage>,
+            preimages: Family<Mat>,
             nonces: Vec<Family<Mat>>,
             masked_payloads: Family<Mat>,
             randomness: Vec<Family<Mat>>,
@@ -231,7 +231,7 @@ impl Aky24CascadeCompiler {
                 )?;
         }
         context = context
-            .public_preimage_output(Aky24ArtifactNames::FINAL_KEY_PREIMAGE, universal_key.preimage)?
+            .public_output(Aky24ArtifactNames::FINAL_KEY_PREIMAGE, universal_key.preimage)?
             .public_output(Aky24ArtifactNames::FUNCTION_CIPHERTEXT_C_B, final_ciphertext.c_b)?
             .public_output(Aky24ArtifactNames::FUNCTION_CIPHERTEXT_X, final_ciphertext.x)?
             .public_family_output(
@@ -243,7 +243,7 @@ impl Aky24CascadeCompiler {
         for (input, branch) in branches.iter().enumerate() {
             for (choice, bit) in [false, true].into_iter().enumerate() {
                 context = context
-                    .public_preimage_output(
+                    .public_output(
                         Aky24ArtifactNames::input_ciphertext_preimage(input, bit),
                         branch.preimages.get_static(choice),
                     )?
@@ -545,7 +545,11 @@ fn zero_veval(input_count: usize, output_count: usize) -> PolyCircuit<DCRTPoly> 
 }
 
 fn bit_mat(ring: &Ring, bit: bool) -> Mat {
-    if bit { ring.identity(1) } else { ring.zero((1, 1)) }
+    if bit {
+        ring.identity(1)
+    } else {
+        ring.zero((1, 1))
+    }
 }
 
 fn sample_scalar_bits(ring: &Ring, count: usize) -> Result<Vec<Mat>, Aky24CascadeGraphError> {
@@ -612,11 +616,10 @@ mod tests {
     use super::*;
     use crate::aky24::config::Aky24GoldreichPrf;
     use mxx_ir_core::{
-        ParamEnv, RealExpr,
-        artifact::{SpecHash, export_validated_manifest},
+        artifact::{export_validated_manifest, ArtifactType, SpecHash},
         node::NodeKind,
+        ParamEnv, RealExpr,
     };
-    use num_bigint::BigInt;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn config() -> Aky24IoConfig {
@@ -626,13 +629,13 @@ mod tests {
             input_size: 5,
             gadget_base: 2.into(),
             digit_count: 9,
+            preimage_max_coefficient_bound: 1_000_000.into(),
             modulus_split: 1.into(),
             trapdoor_sigma: RealExpr::from_integer(4),
             secret_sigma: RealExpr::from_integer(2),
             b_error_sigma: RealExpr::from_integer(1),
             fhe_error_sigma: RealExpr::from_integer(1),
             attribute_error_sigma: RealExpr::from_integer(1),
-            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             security_parameter_bits: 8,
             cascade_randomness_bits: 8,
             gaussian_sample_bits: 8,
@@ -719,12 +722,19 @@ mod tests {
         let validated_producer = producer.graph.validate(&ParamEnv::default()).unwrap();
         let production = ProductionId { spec_hash: SpecHash([17; 32]), execution_nonce: [23; 32] };
         let manifest = export_validated_manifest(production.clone(), &validated_producer).unwrap();
-        assert!(
-            manifest
-                .artifacts
-                .values()
-                .all(|artifact| artifact.confidentiality == ArtifactConfidentiality::Public)
-        );
+        assert!(manifest
+            .artifacts
+            .values()
+            .all(|artifact| artifact.confidentiality == ArtifactConfidentiality::Public));
+        for (name, artifact) in &manifest.artifacts {
+            if name.ends_with("/preimage") || name == Aky24ArtifactNames::FINAL_KEY_PREIMAGE {
+                assert!(matches!(
+                    &artifact.artifact_type,
+                    ArtifactType::Preimage { max_coefficient_bound, .. }
+                        if max_coefficient_bound == &compiler.config.preimage_max_coefficient_bound
+                ));
+            }
+        }
         let input = [false, true, false, true, true];
         let consumer = compiler.build_evaluation(&input, production.clone()).unwrap();
         consumer
@@ -758,10 +768,8 @@ mod tests {
                 assert!(imported.contains(&name), "selected artifact {name} was not imported");
             }
             let opposite = !selected_bit;
-            assert!(
-                !imported
-                    .contains(&Aky24ArtifactNames::input_ciphertext_preimage(index, opposite,))
-            );
+            assert!(!imported
+                .contains(&Aky24ArtifactNames::input_ciphertext_preimage(index, opposite,)));
             assert!(!imported.contains(&Aky24ArtifactNames::input_ske_nonce(index, opposite)));
             assert!(
                 !imported.contains(&Aky24ArtifactNames::input_ske_masked_payload(index, opposite,))

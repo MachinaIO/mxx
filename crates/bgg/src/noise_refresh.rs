@@ -5,12 +5,13 @@ use crate::{
     NaiveBggVecCompiler, NaiveVecCompileError,
 };
 use mxx_dsl::{
-    Bytes, DslContext, DslError, Family, HashTag, Mat, Parallel, Preimage, Ring, Trapdoor,
+    Bytes, DslContext, DslError, Family, GraphValue, HashTag, Mat, Parallel, Preimage, Ring,
+    Trapdoor,
 };
 use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactConfidentiality, ProductionId},
-    node::{ConcatAxis, ConstantMatrix},
+    node::{ConcatAxis, ConstantMatrix, IndexRange},
     types::MatrixType,
 };
 use thiserror::Error;
@@ -107,6 +108,11 @@ impl NaiveBggNoiseRefreshCompiler {
     ) -> Result<NaiveBggNoiseRefreshPreprocessingWires, NaiveBggNoiseRefreshError> {
         self.validate_public_bundle(one)?;
         self.validate_public_bundle(refreshed_input)?;
+        if decoder_trapdoor.preimage_max_coefficient_bound() !=
+            &self.decoder_preimage_max_coefficient_bound
+        {
+            return Err(NaiveBggNoiseRefreshError::FamilyLayoutMismatch);
+        }
         let refresh_terms = self.public_refresh_terms(decoded_material)?;
         let a_prime = self.sample_a_prime(hash_key, refresh_id)?;
         let decoder_by_crt =
@@ -141,11 +147,8 @@ impl NaiveBggNoiseRefreshCompiler {
         wires: NaiveBggNoiseRefreshPreprocessingWires,
     ) -> Result<DslContext, NaiveBggNoiseRefreshError> {
         Ok(context
-            .public_family_output(NOISE_REFRESH_A_PRIME, wires.a_prime.matrices)?
-            .public_preimage_family_output(
-                NOISE_REFRESH_DECODER_PREIMAGES,
-                wires.decoder_preimages,
-            )?)
+            .public_output(NOISE_REFRESH_A_PRIME, wires.a_prime.matrices)?
+            .public_output(NOISE_REFRESH_DECODER_PREIMAGES, wires.decoder_preimages)?)
     }
 
     pub fn import_artifacts(
@@ -168,7 +171,7 @@ impl NaiveBggNoiseRefreshCompiler {
             decoder_preimages: ring.preimage_family_artifact_input(
                 artifacts.production_id.clone(),
                 NOISE_REFRESH_DECODER_PREIMAGES,
-                vec![IntExpr::constant(self.flat_decoder_count())],
+                self.flat_decoder_count(),
                 (self.decoder_public_columns, self.public_key_columns()),
                 self.decoder_preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
@@ -181,17 +184,17 @@ impl NaiveBggNoiseRefreshCompiler {
         decoder_state: Mat,
         preimages: Family<Preimage>,
     ) -> Result<Family<Mat>, NaiveBggNoiseRefreshError> {
+        let preimage_schema = preimages.schema();
         if decoder_state.matrix_type() != &self.decoder_state_type() ||
-            preimages.element_type() != &self.decoder_preimage_type() ||
+            preimage_schema.element.matrix != self.decoder_preimage_type() ||
+            preimage_schema.element.max_coefficient_bound !=
+                self.decoder_preimage_max_coefficient_bound ||
             preimages.count() != &IntExpr::constant(self.flat_decoder_count())
         {
             return Err(NaiveBggNoiseRefreshError::FamilyLayoutMismatch);
         }
-        // Applying each decoder preimage is the explicit projection
-        // D K_j: the state row is multiplied by the supplied K_j on the
-        // right, so the preimage relation is consumed rather than inferred.
-        Ok(Parallel::range(self.flat_decoder_count()).map_values(move |index| {
-            decoder_state.clone().mul_small_rhs(preimages.get(vec![index.as_int()]))
+        Ok(preimages.parallel_map_values(move |_, preimage| {
+            preimage.mul_small_rhs(decoder_state.clone())
         })?)
     }
 
@@ -257,9 +260,6 @@ impl NaiveBggNoiseRefreshCompiler {
             (self.secret_size, 1),
             ConstantMatrix::UnitColumn { index: IntExpr::constant(self.secret_size - 1) },
         );
-        // The unit column is an arbitrary projection target used to collapse
-        // decoded public matrices; its decomposition is an action target, not
-        // a claim that the column is a canonical gadget encoding.
         let collapsed = decoded
             .iter()
             .map(|value| {
@@ -280,8 +280,6 @@ impl NaiveBggNoiseRefreshCompiler {
             (self.secret_size, 1),
             ConstantMatrix::UnitColumn { index: IntExpr::constant(self.secret_size - 1) },
         );
-        // Apply the same target projection to decoded encoding vectors before
-        // assembling the CRT refresh terms, preserving the vector carrier.
         let collapsed = decoded
             .iter()
             .map(|value| {
@@ -296,9 +294,6 @@ impl NaiveBggNoiseRefreshCompiler {
         if family.count() != &IntExpr::constant(self.slot_count) {
             return Err(NaiveBggNoiseRefreshError::FamilyLayoutMismatch);
         }
-        // A slot family is collapsed as sum_i C_i R_i, where R_i is the
-        // rotation monomial for slot i; each term retains its original row
-        // carrier while moving it into the common coefficient position.
         Ok((0..self.slot_count)
             .map(|slot| {
                 family.get_static(slot) *
@@ -388,9 +383,6 @@ impl NaiveBggNoiseRefreshCompiler {
                                 },
                                 &(gadget.clone() * self.ring().polynomial([scale.clone()])),
                             );
-                            // This public decoder target combines the scaled
-                            // refreshed-input term, the CRT refresh term, and
-                            // the scaled one term as input + refresh - one.
                             input_term.matrix + refresh_terms[crt].get_static(slot) -
                                 one_term.matrix
                         })
@@ -423,15 +415,12 @@ impl NaiveBggNoiseRefreshCompiler {
                             let a_decomposed = (a_prime.matrices.get_static(slot) *
                                 self.ring().polynomial([scale.clone()]))
                             .decompose(self.public_key.base.clone(), self.digit_count);
-                            let gadget_decomposed = (self.ring().polynomial([scale.clone()]) *
-                                gadget.clone())
+                            let gadget_decomposed = (gadget.clone() *
+                                self.ring().polynomial([scale.clone()]))
                             .decompose(self.public_key.base.clone(), self.digit_count);
-                            // The online level computes refreshed*K_g + R -
-                            // one*K_a - decoder, with each decomposition
-                            // consumed on the right in its existing carrier.
-                            refreshed.vectors.get_static(slot).mul_small_rhs(gadget_decomposed) +
+                            gadget_decomposed.mul_small_rhs(refreshed.vectors.get_static(slot)) +
                                 refresh_terms[crt].get_static(slot) -
-                                one.vectors.get_static(slot).mul_small_rhs(a_decomposed) -
+                                a_decomposed.mul_small_rhs(one.vectors.get_static(slot)) -
                                 decoders[crt].get_static(slot)
                         })
                         .collect(),
@@ -445,15 +434,29 @@ impl NaiveBggNoiseRefreshCompiler {
         &self,
         levels: &[Family<Mat>],
     ) -> Result<Family<Mat>, NaiveBggNoiseRefreshError> {
+        let wide_levels = levels
+            .iter()
+            .map(|level| {
+                Mat::concat(
+                    ConcatAxis::Columns,
+                    (0..self.slot_count).map(|slot| level.get_static(slot)).collect(),
+                )
+            })
+            .collect();
+        let wide = Mat::crt_recompose(
+            wide_levels,
+            self.crt_plaintext_moduli.clone(),
+            self.reconstruction_coefficients.clone(),
+        );
         Ok(Family::pack(
             (0..self.slot_count)
                 .map(|slot| {
-                    // CRT recomposition is the coefficient-wise linear
-                    // combination of all plaintext-modulus levels.
-                    Mat::crt_recompose(
-                        levels.iter().map(|level| level.get_static(slot)).collect(),
-                        self.crt_plaintext_moduli.clone(),
-                        self.reconstruction_coefficients.clone(),
+                    wide.clone().slice(
+                        None,
+                        Some(IndexRange {
+                            start: IntExpr::constant(slot * self.public_key_columns()),
+                            end: IntExpr::constant((slot + 1) * self.public_key_columns()),
+                        }),
                     )
                 })
                 .collect(),
@@ -556,8 +559,6 @@ impl NaiveBggNoiseRefreshCompiler {
 
 #[cfg(test)]
 mod tests {
-    const TEST_PREIMAGE_BOUND: usize = 1 << 20;
-
     use super::*;
     use crate::test_utils::{execute_graph, matrix_output};
 
@@ -607,7 +608,7 @@ mod tests {
             decoder_public_columns: digit_count + 2,
             decoder_zero_rows: 0,
             decoder_trapdoor_sigma: RealExpr::from_integer(5),
-            decoder_preimage_max_coefficient_bound: TEST_PREIMAGE_BOUND.into(),
+            decoder_preimage_max_coefficient_bound: IntExpr::constant(1_000_000),
         };
         assert_eq!(depth, compiler.crt_depth());
 
@@ -630,7 +631,6 @@ mod tests {
         let decoded = encoding("decoded");
         let decoded_material =
             vec![decoded; compiler.slot_count * compiler.crt_depth() * compiler.digit_count];
-        let modulus = compiler.modulus.clone();
         let artifacts = NaiveBggNoiseRefreshArtifactWires {
             a_prime: NaiveBggPublicKeyVecWire {
                 matrices: ring.input_family(
@@ -640,14 +640,12 @@ mod tests {
                 ),
                 reveal_plaintext: true,
             },
-            decoder_preimages: ring
-                .input_family(
-                    "unused-preimages",
-                    compiler.flat_decoder_count(),
-                    (compiler.decoder_public_columns, compiler.public_key_columns()),
-                )
-                .parallel_map_values(move |_, preimage| preimage.decompose(modulus.clone(), 1))
-                .unwrap(),
+            decoder_preimages: ring.preimage_input_family(
+                "unused-preimages",
+                compiler.flat_decoder_count(),
+                (compiler.decoder_public_columns, compiler.public_key_columns()),
+                compiler.decoder_preimage_max_coefficient_bound.clone(),
+            ),
         };
         let projected = ring.input_family(
             "projected-decoders",
@@ -668,7 +666,9 @@ mod tests {
         let zero_public =
             DCRTPolyMatrix::zero(&parameters, compiler.secret_size, compiler.public_key_columns());
         let family = |value: &DCRTPolyMatrix, count: usize| {
-            RuntimeValue::Family((0..count).map(|_| RuntimeValue::matrix(value.clone())).collect())
+            RuntimeValue::IndexedFamily(
+                (0..count).map(|_| RuntimeValue::matrix(value.clone())).collect(),
+            )
         };
         let slot_values = (0..compiler.slot_count)
             .map(|slot| {
@@ -711,7 +711,7 @@ mod tests {
                 ("a-prime".to_owned(), family(&zero_public, compiler.slot_count)),
                 (
                     "projected-decoders".to_owned(),
-                    RuntimeValue::Family(
+                    RuntimeValue::IndexedFamily(
                         projected_values.into_iter().map(RuntimeValue::matrix).collect(),
                     ),
                 ),

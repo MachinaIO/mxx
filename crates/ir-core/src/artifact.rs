@@ -51,14 +51,11 @@ pub enum SmallMatrixSemanticKind {
 #[serde(tag = "tag", content = "value")]
 pub enum ArtifactType {
     Matrix(ConcreteMatrixType),
-    /// A bounded compact matrix, persisted in canonical row-major form.
     SmallMatrix {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
     },
-    /// A bounded relation-bearing compact matrix. This remains distinct from
-    /// both ordinary and generic bounded matrices across artifact boundaries.
     Preimage {
         matrix: ConcreteMatrixType,
         #[serde(with = "serde_support::bigint")]
@@ -119,18 +116,37 @@ impl ArtifactType {
             ConcreteWireType::Int |
             ConcreteWireType::Real |
             ConcreteWireType::Bool |
-            ConcreteWireType::Family { .. } => None,
+            ConcreteWireType::IndexedFamily { .. } => None,
+        }
+    }
+
+    pub fn bounded_matrix_schema(
+        &self,
+    ) -> Option<(ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind)> {
+        match self {
+            Self::SmallMatrix { matrix, max_coefficient_bound } => Some((
+                ConcreteBoundedMatrixSchema {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                },
+                SmallMatrixSemanticKind::Generic,
+            )),
+            Self::Preimage { matrix, max_coefficient_bound } => Some((
+                ConcreteBoundedMatrixSchema {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                },
+                SmallMatrixSemanticKind::Preimage,
+            )),
+            _ => None,
         }
     }
 }
 
-/// Canonical payload layout for bounded small-RHS artifacts.
-pub const SMALL_RHS_ROW_MAJOR_LAYOUT: &str = "small-rhs-row-major";
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
-    pub family_shape: Option<Vec<usize>>,
+    pub family_count: Option<usize>,
     pub confidentiality: ArtifactConfidentiality,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
@@ -140,70 +156,24 @@ pub struct ManifestArtifact {
 pub enum ManifestValidationError {
     #[error("private artifact {name} must not expose a content hash")]
     PrivateContentHash { name: String },
-    #[error("artifact {name} has an empty family shape")]
-    EmptyFamilyShape { name: String },
-    #[error("artifact {name} family shape product overflows usize")]
-    FamilyShapeOverflow { name: String },
     #[error("bounded artifact {name} has a negative coefficient bound")]
     NegativeCoefficientBound { name: String },
-    #[error("bounded artifact {name} must use the canonical small-RHS layout")]
-    MissingBoundedLayout { name: String },
-    #[error("artifact {name} has an invalid small-RHS layout")]
-    InvalidLayout { name: String },
-    #[error("unbounded artifact {name} must not specify a small-RHS layout")]
-    UnexpectedLayout { name: String },
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationError> {
     for (name, artifact) in &manifest.artifacts {
-        if let Some(shape) = &artifact.family_shape {
-            if shape.is_empty() {
-                return Err(ManifestValidationError::EmptyFamilyShape { name: name.clone() });
-            }
-            shape
-                .iter()
-                .try_fold(1usize, |product, extent| product.checked_mul(*extent))
-                .ok_or_else(|| ManifestValidationError::FamilyShapeOverflow {
-                    name: name.clone(),
-                })?;
-        }
         if artifact.confidentiality == ArtifactConfidentiality::Private &&
             artifact.content_hash.is_some()
         {
             return Err(ManifestValidationError::PrivateContentHash { name: name.clone() });
         }
-        let bounded = match &artifact.artifact_type {
+        let bound = match &artifact.artifact_type {
             ArtifactType::SmallMatrix { max_coefficient_bound, .. } |
-            ArtifactType::Preimage { max_coefficient_bound, .. } => {
-                if max_coefficient_bound.is_negative() {
-                    return Err(ManifestValidationError::NegativeCoefficientBound {
-                        name: name.clone(),
-                    });
-                }
-                true
-            }
-            ArtifactType::Trapdoor { preimage_max_coefficient_bound, .. } => {
-                if preimage_max_coefficient_bound.is_negative() {
-                    return Err(ManifestValidationError::NegativeCoefficientBound {
-                        name: name.clone(),
-                    });
-                }
-                false
-            }
-            _ => false,
+            ArtifactType::Preimage { max_coefficient_bound, .. } => Some(max_coefficient_bound),
+            _ => None,
         };
-        match (bounded, artifact.layout.as_deref()) {
-            (true, Some(layout)) if layout == SMALL_RHS_ROW_MAJOR_LAYOUT => {}
-            (true, Some(_)) => {
-                return Err(ManifestValidationError::InvalidLayout { name: name.clone() });
-            }
-            (true, None) => {
-                return Err(ManifestValidationError::MissingBoundedLayout { name: name.clone() });
-            }
-            (false, Some(_)) => {
-                return Err(ManifestValidationError::UnexpectedLayout { name: name.clone() });
-            }
-            (false, None) => {}
+        if bound.is_some_and(|bound| bound.is_negative()) {
+            return Err(ManifestValidationError::NegativeCoefficientBound { name: name.clone() });
         }
     }
     Ok(())
@@ -213,7 +183,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationEr
 pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
-    pub family_shape: Option<Vec<usize>>,
+    pub family_count: Option<usize>,
     pub confidentiality: ArtifactConfidentiality,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
@@ -242,7 +212,7 @@ pub fn export_manifest(
                 name.clone(),
                 ManifestArtifact {
                     artifact_type: artifact.artifact_type.clone(),
-                    family_shape: artifact.family_shape.clone(),
+                    family_count: artifact.family_count,
                     confidentiality: artifact.confidentiality,
                     content_hash: match artifact.confidentiality {
                         ArtifactConfidentiality::Public => artifact.content_hash,
@@ -278,29 +248,23 @@ pub fn export_validated_manifest(
                     .wire_types
                     .get(&output.value)
                     .ok_or_else(|| ManifestExportError::MissingOutput { name: name.clone() })?;
-                let (element_type, first_class_family_shape) = match wire_type {
-                    ConcreteWireType::Family { element, shape } => {
-                        (element.as_ref(), Some(shape.clone()))
+                let (element_type, first_class_family_count) = match wire_type {
+                    ConcreteWireType::IndexedFamily { element, count } => {
+                        (element.as_ref(), Some(*count))
                     }
                     scalar => (scalar, None),
                 };
                 let artifact_type = ArtifactType::from_wire_type(element_type)
                     .ok_or_else(|| ManifestExportError::UnsupportedOutput { name: name.clone() })?;
-                let layout = match &artifact_type {
-                    ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. } => {
-                        Some(SMALL_RHS_ROW_MAJOR_LAYOUT.to_owned())
-                    }
-                    _ => None,
-                };
                 Ok((
                     name.clone(),
                     ExportArtifact {
                         wire: id,
                         artifact_type,
-                        family_shape: first_class_family_shape,
+                        family_count: first_class_family_count,
                         confidentiality,
                         content_hash: None,
-                        layout,
+                        layout: None,
                     },
                 ))
             })())
@@ -322,7 +286,7 @@ mod tests {
                 "private".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
-                    family_shape: None,
+                    family_count: None,
                     confidentiality: ArtifactConfidentiality::Private,
                     content_hash: Some([3; 32]),
                     layout: None,
@@ -337,61 +301,65 @@ mod tests {
     }
 
     #[test]
-    fn bounded_artifact_types_preserve_semantic_kind_and_bound() {
-        let matrix = ConcreteMatrixType::scalar(17.into(), 8);
-        let bound = BigInt::from(3);
+    fn bounded_artifact_kinds_remain_distinct() {
+        let matrix = ConcreteMatrixType::scalar(BigInt::from(257), 8);
+        let small = ConcreteWireType::SmallMatrix {
+            matrix: matrix.clone(),
+            max_coefficient_bound: BigInt::from(3),
+        };
+        let preimage = ConcreteWireType::Preimage {
+            matrix: matrix.clone(),
+            max_coefficient_bound: BigInt::from(3),
+        };
         assert_eq!(
-            ArtifactType::from_wire_type(&ConcreteWireType::Preimage {
+            ArtifactType::from_wire_type(&small),
+            Some(ArtifactType::SmallMatrix {
                 matrix: matrix.clone(),
-                max_coefficient_bound: bound.clone(),
-            }),
-            Some(ArtifactType::Preimage {
-                matrix: matrix.clone(),
-                max_coefficient_bound: bound.clone(),
+                max_coefficient_bound: BigInt::from(3),
             })
         );
-        assert_ne!(
-            ArtifactType::from_wire_type(&ConcreteWireType::SmallMatrix {
-                matrix: matrix.clone(),
-                max_coefficient_bound: bound.clone(),
-            }),
-            ArtifactType::from_wire_type(&ConcreteWireType::Matrix(matrix))
+        assert_eq!(
+            ArtifactType::from_wire_type(&preimage),
+            Some(ArtifactType::Preimage { matrix, max_coefficient_bound: BigInt::from(3) })
+        );
+        assert_ne!(ArtifactType::from_wire_type(&small), ArtifactType::from_wire_type(&preimage));
+
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
+            max_coefficient_bound: BigInt::from(3),
+        };
+        assert_eq!(
+            ArtifactType::from_wire_type(&small).unwrap().bounded_matrix_schema(),
+            Some((schema.clone(), SmallMatrixSemanticKind::Generic))
+        );
+        assert_eq!(
+            ArtifactType::from_wire_type(&preimage).unwrap().bounded_matrix_schema(),
+            Some((schema, SmallMatrixSemanticKind::Preimage))
         );
     }
 
     #[test]
-    fn manifest_requires_canonical_layout_for_bounded_artifacts() {
-        let matrix = ConcreteMatrixType::scalar(17.into(), 8);
-        let production_id = ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] };
-        let artifact = |bound: BigInt, layout: Option<&str>| Manifest {
+    fn manifest_rejects_negative_bounded_artifact_bounds() {
+        let manifest = Manifest {
             ir_version: IR_VERSION,
-            production_id: production_id.clone(),
+            production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
             artifacts: BTreeMap::from([(
-                "rhs".to_owned(),
+                "negative".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::SmallMatrix {
-                        matrix: matrix.clone(),
-                        max_coefficient_bound: bound,
+                        matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
+                        max_coefficient_bound: BigInt::from(-1),
                     },
-                    family_shape: None,
+                    family_count: None,
                     confidentiality: ArtifactConfidentiality::Public,
                     content_hash: None,
-                    layout: layout.map(str::to_owned),
+                    layout: None,
                 },
             )]),
         };
         assert!(matches!(
-            validate_manifest(&artifact(3.into(), None)),
-            Err(ManifestValidationError::MissingBoundedLayout { .. })
-        ));
-        assert!(matches!(
-            validate_manifest(&artifact(3.into(), Some("legacy"))),
-            Err(ManifestValidationError::InvalidLayout { .. })
-        ));
-        assert!(validate_manifest(&artifact(3.into(), Some(SMALL_RHS_ROW_MAJOR_LAYOUT))).is_ok());
-        assert!(matches!(
-            validate_manifest(&artifact((-1).into(), Some(SMALL_RHS_ROW_MAJOR_LAYOUT))),
-            Err(ManifestValidationError::NegativeCoefficientBound { .. })
+            validate_manifest(&manifest),
+            Err(ManifestValidationError::NegativeCoefficientBound { name }) if name == "negative"
         ));
     }
 }

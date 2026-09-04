@@ -364,59 +364,6 @@ namespace
         return (value + alignment - 1) & ~(alignment - 1);
     }
 
-    int acquire_matrix_aux_workspace(
-        const GpuMatrix *aux_owner,
-        const dim3 *aux_limb_id,
-        size_t bytes,
-        void **out_ptr,
-        bool *out_shared,
-        cudaStream_t stream)
-    {
-        if (!out_ptr || !out_shared)
-        {
-            return set_error("invalid acquire_matrix_aux_workspace arguments");
-        }
-        *out_ptr = nullptr;
-        *out_shared = false;
-        if (bytes == 0)
-        {
-            return 0;
-        }
-        if (aux_owner && aux_limb_id && matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
-        {
-            *out_shared = true;
-            return 0;
-        }
-        if (!stream)
-        {
-            return set_error("null stream in acquire_matrix_aux_workspace");
-        }
-        cudaError_t err = cudaMallocAsync(out_ptr, bytes, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        return 0;
-    }
-
-    int release_matrix_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream)
-    {
-        if (!ptr || from_shared)
-        {
-            return 0;
-        }
-        if (!stream)
-        {
-            return set_error("null stream in release_matrix_aux_workspace");
-        }
-        cudaError_t err = cudaFreeAsync(ptr, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        return 0;
-    }
-
     int launch_block_kernel_all_limbs(
         const uint8_t *const *lhs_bases,
         const uint8_t *const *rhs_bases,

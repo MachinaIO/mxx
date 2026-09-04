@@ -8,11 +8,7 @@
 use crate::{layout::ExpLayout, noise_refresh::readout::ValueReadoutIdentity};
 use mxx_dsl::{DslContext, Family, GraphValue, Preimage, Ring};
 use mxx_ir_core::{
-    IndexExpr, IntExpr,
-    artifact::{
-        ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-        SMALL_RHS_ROW_MAJOR_LAYOUT,
-    },
+    artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId},
     types::ConcreteMatrixType,
     validate::ValidatedGraph,
 };
@@ -106,10 +102,15 @@ impl DecompositionCacheArtifact {
     pub fn manifest_artifact(&self, confidentiality: ArtifactConfidentiality) -> ManifestArtifact {
         ManifestArtifact {
             artifact_type: self.artifact_type.clone(),
-            family_shape: self.family_shape.clone(),
+            family_count: self.family_shape.as_ref().map(|shape| {
+                shape
+                    .iter()
+                    .try_fold(1usize, |count, extent| count.checked_mul(*extent))
+                    .expect("cache family count overflow")
+            }),
             confidentiality,
             content_hash: None,
-            layout: Some(SMALL_RHS_ROW_MAJOR_LAYOUT.to_owned()),
+            layout: None,
         }
     }
 }
@@ -224,25 +225,23 @@ impl ReadoutCacheFamily {
             rows: matrix.rows.into(),
             columns: matrix.columns.into(),
         };
-        if schema.element != expected_element ||
-            schema.max_coefficient_bound != max_coefficient_bound.clone().into() ||
-            schema.shape !=
+        if schema.element.matrix != expected_element ||
+            schema.element.max_coefficient_bound != max_coefficient_bound.clone().into() ||
+            schema.count !=
                 self.declaration
                     .family_shape()
                     .ok_or(mxx_dsl::DslError::Schema)?
                     .iter()
-                    .copied()
-                    .map(IntExpr::from)
-                    .collect::<Vec<_>>()
+                    .try_fold(1usize, |count, extent| count.checked_mul(*extent))
+                    .ok_or(mxx_dsl::DslError::Schema)?
+                    .into()
         {
             return Err(mxx_dsl::DslError::Schema);
         }
         match self.confidentiality {
-            ArtifactConfidentiality::Public => {
-                context.public_preimage_family_output(self.artifact_name(), family)
-            }
+            ArtifactConfidentiality::Public => context.public_output(self.artifact_name(), family),
             ArtifactConfidentiality::Private => {
-                context.private_preimage_family_output(self.artifact_name(), family)
+                context.private_output(self.artifact_name(), family)
             }
         }
     }
@@ -264,7 +263,7 @@ impl ReadoutCacheFamily {
         // commitment and are checked by FileArtifactStore; they do not alter
         // the typed preimage declaration.
         if actual.artifact_type != expected.artifact_type ||
-            actual.family_shape != expected.family_shape ||
+            actual.family_count != expected.family_count ||
             actual.confidentiality != expected.confidentiality ||
             actual.layout != expected.layout
         {
@@ -319,7 +318,7 @@ impl ReadoutCacheFamily {
         // manifest's concrete ArtifactType.  Keep this construction purely
         // typed and lazy: no store load occurs here.
         let _ = matrix;
-        let Some(family_shape) = family_shape else {
+        let Some(_) = family_shape else {
             return Ok(ring.preimage_artifact_input(
                 self.production_id.clone(),
                 self.artifact_name().to_owned(),
@@ -328,24 +327,16 @@ impl ReadoutCacheFamily {
                 self.confidentiality,
             ));
         };
-        let graph_family_shape = family_shape.iter().copied().map(IntExpr::from).collect();
-        let mut remaining = index;
-        let mut coordinates = Vec::with_capacity(family_shape.len());
-        for extent in family_shape.iter().rev() {
-            coordinates.push(IndexExpr::constant(remaining % *extent));
-            remaining /= *extent;
-        }
-        coordinates.reverse();
         Ok(ring
             .preimage_family_artifact_input(
                 self.production_id.clone(),
                 self.artifact_name().to_owned(),
-                graph_family_shape,
+                count,
                 (matrix.rows, matrix.columns),
                 max_coefficient_bound.clone(),
                 self.confidentiality,
             )
-            .get_static(coordinates))
+            .get_static(index))
     }
 }
 
@@ -432,12 +423,6 @@ impl ExponentLutStorageReport {
     }
 }
 
-fn family_cardinality(shape: Option<&Vec<usize>>) -> u128 {
-    shape
-        .map(|shape| shape.iter().fold(1u128, |count, extent| count * (*extent as u128)))
-        .unwrap_or(1)
-}
-
 fn matrix_coefficient_bytes(matrix: &ConcreteMatrixType) -> u64 {
     let modulus_bytes = matrix.modulus.bits().div_ceil(8).max(1);
     u64::try_from(matrix.rows)
@@ -484,7 +469,7 @@ fn artifact_member_bytes(artifact: &ManifestArtifact) -> u64 {
 }
 
 fn artifact_persistent_bytes(artifact: &ManifestArtifact) -> u128 {
-    u128::from(artifact_member_bytes(artifact)) * family_cardinality(artifact.family_shape.as_ref())
+    u128::from(artifact_member_bytes(artifact)) * artifact.family_count.unwrap_or(1) as u128
 }
 
 fn canonical_artifact_name(
@@ -551,7 +536,7 @@ mod tests {
         assert!(matches!(artifact.artifact_type(), ArtifactType::Preimage { .. }));
         assert!(artifact.artifact_name().contains("exponent-lut/decomposition/"));
         let manifest = artifact.manifest_artifact(ArtifactConfidentiality::Public);
-        assert_eq!(manifest.layout.as_deref(), Some(SMALL_RHS_ROW_MAJOR_LAYOUT));
+        assert_eq!(manifest.layout.as_deref(), None);
         let roundtrip: DecompositionCacheArtifact =
             serde_json::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
         assert_eq!(roundtrip, artifact);
@@ -622,7 +607,7 @@ mod tests {
         let family_wire = ring.preimage_family_artifact_input(
             production_id.clone(),
             family.artifact_name().to_owned(),
-            vec![3usize.into()],
+            3usize,
             (4, 1),
             7,
             ArtifactConfidentiality::Private,
@@ -654,7 +639,7 @@ mod tests {
                     },
                     family.declaration().artifact_type(),
                     ArtifactConfidentiality::Private,
-                    Some(SMALL_RHS_ROW_MAJOR_LAYOUT),
+                    None,
                     ArtifactPayload::SmallMatrix(payload.clone()),
                 )
                 .unwrap();
@@ -774,7 +759,7 @@ mod tests {
                 artifact_key.clone(),
                 family.declaration().artifact_type(),
                 ArtifactConfidentiality::Public,
-                Some(SMALL_RHS_ROW_MAJOR_LAYOUT),
+                None,
                 ArtifactPayload::SmallMatrix(payload.clone()),
             )
             .unwrap();
@@ -799,15 +784,15 @@ mod tests {
             rows: 2,
             columns: 3,
         };
-        let compact = |confidentiality, family_shape| ManifestArtifact {
+        let compact = |confidentiality, family_count| ManifestArtifact {
             artifact_type: ArtifactType::Preimage {
                 matrix: matrix.clone(),
                 max_coefficient_bound: BigInt::from(7),
             },
-            family_shape,
+            family_count,
             confidentiality,
             content_hash: None,
-            layout: Some(SMALL_RHS_ROW_MAJOR_LAYOUT.to_owned()),
+            layout: None,
         };
         let manifest = Manifest {
             ir_version: mxx_ir_core::encoding::IR_VERSION,
@@ -817,14 +802,14 @@ mod tests {
                     "public-matrix".to_owned(),
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix.clone()),
-                        family_shape: None,
+                        family_count: None,
                         confidentiality: ArtifactConfidentiality::Public,
                         content_hash: None,
                         layout: None,
                     },
                 ),
-                ("cache".to_owned(), compact(ArtifactConfidentiality::Public, Some(vec![4]))),
-                ("decoder".to_owned(), compact(ArtifactConfidentiality::Private, Some(vec![4]))),
+                ("cache".to_owned(), compact(ArtifactConfidentiality::Public, Some(4))),
+                ("decoder".to_owned(), compact(ArtifactConfidentiality::Private, Some(4))),
             ]),
         };
         let report = ExponentLutStorageReport::from_metadata([&manifest], std::iter::empty());
@@ -858,10 +843,10 @@ mod tests {
                 matrix: ConcreteMatrixType::scalar(BigInt::from(257), 8),
                 max_coefficient_bound: BigInt::from(7),
             },
-            family_shape: Some(vec![usize::MAX, 2]),
+            family_count: Some(usize::MAX),
             confidentiality: ArtifactConfidentiality::Public,
             content_hash: None,
-            layout: Some(SMALL_RHS_ROW_MAJOR_LAYOUT.to_owned()),
+            layout: None,
         };
         let manifest = Manifest {
             ir_version: mxx_ir_core::encoding::IR_VERSION,

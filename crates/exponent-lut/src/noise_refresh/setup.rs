@@ -53,7 +53,10 @@ use crate::{
 };
 use bigdecimal::BigDecimal;
 use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout};
-use mxx_dsl::{Bool, BuiltGraph, Bytes, DslContext, Family, HashTag, Int, Mat, Parallel, Preimage};
+use mxx_dsl::{
+    Bool, BuiltGraph, Bytes, DslContext, Family, HashTag, Int, Mat, Parallel, ParallelZipTuple,
+    Preimage,
+};
 use mxx_ir_core::{
     BenchmarkRole, IntExpr, ParamEnv, ScopedWireRef,
     artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId},
@@ -2149,7 +2152,7 @@ impl RefreshPreprocessingProducer {
         let state_scaling_family = Family::pack(state_scaling.clone())?;
         let scaled_state_family =
             state_scaling_family.parallel_map_values(|_, decomposition| {
-                state_public.matrix.clone().mul_small_rhs(decomposition)
+                decomposition.mul_small_rhs(state_public.matrix.clone())
             })?;
         // Build every slot target in one structural loop, then sample all
         // preimages in a second structural loop. Each family element computes
@@ -2409,7 +2412,7 @@ impl RefreshPreprocessingProducer {
             let target = scaled_state + w.masks[slot].clone() + w.scaled_fresh[slot].clone() -
                 scale * w.a_prime.clone();
             if !same_matrix_type(
-                w.public_b.clone().mul_small_rhs(k.clone()).matrix_type(),
+                k.clone().mul_small_rhs(w.public_b.clone()).matrix_type(),
                 target.matrix_type(),
             ) {
                 return Err(RefreshSetupError::InvalidManifest);
@@ -2981,7 +2984,7 @@ impl ImportedRefreshSetup {
             ring.preimage_family_artifact_input(
                 production_id.clone(),
                 n.readout.target_decomposition.clone(),
-                vec![output_count.into()],
+                output_count,
                 (matrix.rows, matrix.columns),
                 readout_bound.clone(),
                 ArtifactConfidentiality::Public,
@@ -2998,7 +3001,7 @@ impl ImportedRefreshSetup {
             ring.preimage_family_artifact_input(
                 production_id.clone(),
                 name.to_owned(),
-                vec![count.into()],
+                count,
                 (matrix.rows.clone(), matrix.columns.clone()),
                 readout_bound.clone(),
                 ArtifactConfidentiality::Public,
@@ -3025,13 +3028,13 @@ impl ImportedRefreshSetup {
             .ring()
             .matrix_type((parameters.component_count * parameters.layout.digit_count, cols));
         let family_count = |name: &str| -> Result<usize, RefreshSetupError> {
-            let shape = manifest
+            let count = manifest
                 .artifacts
                 .get(name)
-                .and_then(|artifact| artifact.family_shape.as_deref())
+                .and_then(|artifact| artifact.family_count)
                 .ok_or(RefreshSetupError::InvalidManifest)?;
-            match shape {
-                [count] if *count > 0 => Ok(*count),
+            match count {
+                count if count > 0 => Ok(count),
                 _ => Err(RefreshSetupError::InvalidManifest),
             }
         };
@@ -3044,7 +3047,7 @@ impl ImportedRefreshSetup {
         let setup_public_key_rhs = setup_public_key_ring.preimage_family_artifact_input(
             production_id.clone(),
             n.setup_public_key_rhs.clone(),
-            vec![IntExpr::constant(setup_public_key_count)],
+            setup_public_key_count,
             (setup_public_key_matrix.rows.clone(), setup_public_key_matrix.columns.clone()),
             readout_bound.clone(),
             ArtifactConfidentiality::Public,
@@ -3072,7 +3075,7 @@ impl ImportedRefreshSetup {
             Ok(ring.preimage_family_artifact_input(
                 production_id.clone(),
                 name.to_owned(),
-                vec![IntExpr::constant(count)],
+                count,
                 (matrix.rows.clone(), matrix.columns.clone()),
                 readout_bound.clone(),
                 ArtifactConfidentiality::Public,
@@ -3096,7 +3099,7 @@ impl ImportedRefreshSetup {
                 return Err(RefreshSetupError::InvalidManifest);
             }
             let rhs_matrix = cache_matrix.clone();
-            let shape = vec![IntExpr::constant(flat_count)];
+            let shape = IntExpr::constant(flat_count);
             let rhs_ring =
                 mxx_dsl::Ring::new(rhs_matrix.modulus.clone(), rhs_matrix.ring_dimension.clone());
             let family = rhs_ring.preimage_family_artifact_input(
@@ -3537,16 +3540,13 @@ fn add_setup_outputs(
     // vectors are deliberately absent from this preprocessing graph.
     context = context
         .private_output(names.setup_secret_t.clone(), wires.setup_secret_t.clone())?
-        .public_family_output(names.selector_gsw.clone(), wires.selector_gsw.clone())?
-        .public_preimage_family_output(
-            names.setup_public_key_rhs.clone(),
-            wires.setup_public_key_rhs.clone(),
-        )?
-        .public_preimage_family_output(
+        .public_output(names.selector_gsw.clone(), wires.selector_gsw.clone())?
+        .public_output(names.setup_public_key_rhs.clone(), wires.setup_public_key_rhs.clone())?
+        .public_output(
             names.mask_route_rhs_decompositions.clone(),
             wires.mask_route_rhs_decompositions.clone(),
         )?
-        .public_preimage_family_output(
+        .public_output(
             names.fresh_route_rhs_decompositions.clone(),
             wires.fresh_route_rhs_decompositions.clone(),
         )?
@@ -3557,30 +3557,28 @@ fn add_setup_outputs(
         context = context.public_output(names.refresh_targets[slot].clone(), target.clone())?;
     }
     for (slot, decomposition) in wires.state_scaling.iter().enumerate() {
-        context = context
-            .public_preimage_output(names.state_scaling[slot].clone(), decomposition.clone())?;
+        context =
+            context.public_output(names.state_scaling[slot].clone(), decomposition.clone())?;
     }
     for slot in 0..wires.masks.len() {
-        context = context.private_preimage_output(
-            names.preimages[slot].clone(),
-            wires.preimages[slot].clone(),
-        )?;
+        context =
+            context.private_output(names.preimages[slot].clone(), wires.preimages[slot].clone())?;
     }
     let readout = &names.readout;
     context = context
-        .public_preimage_family_output(
+        .public_output(
             readout.target_decomposition.clone(),
             wires.readout_artifacts.target_decompositions().clone(),
         )?
-        .public_preimage_output(
+        .public_output(
             readout.normalization_decomposition.clone(),
             wires.readout_artifacts.normalization_decomposition().clone(),
         )?
-        .public_preimage_family_output(
+        .public_output(
             readout.helper_switch_decompositions.clone(),
             wires.readout_artifacts.helper_switch_decompositions().clone(),
         )?
-        .public_preimage_family_output(
+        .public_output(
             readout.helper_public_decompositions.clone(),
             wires.readout_artifacts.helper_public_decompositions().clone(),
         )?;
@@ -3595,7 +3593,7 @@ fn add_setup_outputs(
         if per_output_count != entry.count || output_indexed != entry.output_indexed {
             return Err(RefreshSetupError::InvalidManifest);
         }
-        context = context.public_preimage_family_output(entry.rhs.clone(), rhs.clone())?;
+        context = context.public_output(entry.rhs.clone(), rhs.clone())?;
     }
     Ok(context)
 }
@@ -3741,8 +3739,8 @@ fn expected_setup_artifact_count(
         .and_then(|count| count.checked_add(program_cache_artifact_count))
 }
 
-fn exact_family_shape(actual: Option<&[usize]>, expected_count: usize) -> bool {
-    actual == Some(&[expected_count])
+fn exact_family_count(actual: Option<usize>, expected_count: usize) -> bool {
+    actual == Some(expected_count)
 }
 
 /// Validates one setup helper's ordinary vector/public-matrix artifact pair.
@@ -3783,7 +3781,7 @@ fn validate_manifest(
      -> Result<(), RefreshSetupError> {
         let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
         if artifact.confidentiality != confidentiality ||
-            artifact.family_shape.is_some() ||
+            artifact.family_count.is_some() ||
             artifact.artifact_type != artifact_type ||
             (confidentiality == ArtifactConfidentiality::Private &&
                 artifact.content_hash.is_some()) ||
@@ -3844,8 +3842,8 @@ fn validate_manifest(
     }
     check(&n.setup_secret_t, ArtifactConfidentiality::Private, 1, p.layout.secret_dimension)?;
     let selector = m.artifacts.get(&n.selector_gsw).ok_or(RefreshSetupError::InvalidManifest)?;
-    let active_count = match selector.family_shape.as_deref() {
-        Some([count]) if *count != 0 => *count,
+    let active_count = match selector.family_count {
+        Some(count) if count != 0 => count,
         _ => return Err(RefreshSetupError::InvalidManifest),
     };
     if selector.confidentiality != ArtifactConfidentiality::Public ||
@@ -3902,7 +3900,7 @@ fn validate_manifest(
     ] {
         let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
         if artifact.confidentiality != ArtifactConfidentiality::Public ||
-            artifact.family_shape.as_deref() != Some(&[expected_count]) ||
+            artifact.family_count != Some(expected_count) ||
             artifact.artifact_type !=
                 (ArtifactType::Preimage {
                     matrix: ConcreteMatrixType {
@@ -3935,7 +3933,7 @@ fn validate_manifest(
     let setup_public_key_rhs =
         m.artifacts.get(&n.setup_public_key_rhs).ok_or(RefreshSetupError::InvalidManifest)?;
     if setup_public_key_rhs.confidentiality != ArtifactConfidentiality::Public ||
-        !exact_family_shape(setup_public_key_rhs.family_shape.as_deref(), setup_public_key_count) ||
+        !exact_family_count(setup_public_key_rhs.family_count, setup_public_key_count) ||
         setup_public_key_rhs.artifact_type !=
             (ArtifactType::Preimage {
                 matrix: cache_matrix.clone(),
@@ -3945,7 +3943,7 @@ fn validate_manifest(
     {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    let check_cache = |name: &str, family_shape: Option<Vec<usize>>| {
+    let check_cache = |name: &str, family_count: Option<usize>| {
         let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
         if artifact.confidentiality != ArtifactConfidentiality::Public ||
             artifact.artifact_type !=
@@ -3953,7 +3951,7 @@ fn validate_manifest(
                     matrix: cache_matrix.clone(),
                     max_coefficient_bound: cache_bound.clone(),
                 }) ||
-            artifact.family_shape != family_shape ||
+            artifact.family_count != family_count ||
             artifact.content_hash.is_none()
         {
             return Err(RefreshSetupError::InvalidManifest);
@@ -3972,7 +3970,7 @@ fn validate_manifest(
         } else {
             entry.count
         };
-        check_cache(&entry.rhs, Some(vec![count]))?;
+        check_cache(&entry.rhs, Some(count))?;
     }
     for name in &n.state_scaling {
         check_cache(name, None)?;
@@ -3983,7 +3981,7 @@ fn validate_manifest(
     ] {
         let artifact = m.artifacts.get(name.as_str()).ok_or(RefreshSetupError::InvalidManifest)?;
         if artifact.confidentiality != ArtifactConfidentiality::Public ||
-            !exact_family_shape(artifact.family_shape.as_deref(), expected_count) ||
+            !exact_family_count(artifact.family_count, expected_count) ||
             artifact.artifact_type !=
                 (ArtifactType::Preimage {
                     matrix: cache_matrix.clone(),
@@ -4283,7 +4281,7 @@ fn sample_online_label_vector_from_preimage(
     );
     let mask_secret_gadget = online_secret_s.clone() * gadget.clone();
     let payload_secret_gadget = online_secret_s.clone() * gadget;
-    let public_term = mask_secret_gadget.mul_small_rhs(decomposition);
+    let public_term = decomposition.mul_small_rhs(mask_secret_gadget);
     let error = match (&sampler.gaussian_sigma, &sampler.gaussian_max_coefficient_bound) {
         (Some(sigma), Some(bound)) => {
             ring.gaussian((1, sampler.layout.public_key_columns()), sigma.clone(), bound.clone())
@@ -4821,10 +4819,8 @@ impl RefreshParameterSimulationRequest {
             ring.input_family("refresh-parameter-search-native-monomials", total_labels, (1, 1));
         let online_secret_for_labels = online_secret.clone();
         let label_plaintext_family_for_sampling = label_plaintext_family.clone();
-        let label_vectors = Parallel::range(total_labels)
-            .try_map_values(move |index| {
-                let rhs = setup_public_key_rhs.get(vec![index.as_int()]);
-                let plaintext = label_plaintext_family_for_sampling.get(vec![index.as_int()]);
+        let label_vectors = (setup_public_key_rhs, label_plaintext_family_for_sampling)
+            .parallel_zip_tuple_result(move |_, (rhs, plaintext)| {
                 sample_online_label_vector_from_preimage(
                     &sampler,
                     &online_secret_for_labels,
@@ -4863,8 +4859,16 @@ impl RefreshParameterSimulationRequest {
             .private_output("refreshed-encoding-vector", refreshed.encoding().vector.clone())?
             .build()?;
         validate_cache_required_online_graph(&benchmark_online_graph)?;
-        let preprocessing_graph = BuiltGraph { graph: producer.built().graph.clone() };
-        let benchmark_preprocessing_graph = BuiltGraph { graph: preprocessing_graph.graph.clone() };
+        let preprocessing_graph = BuiltGraph {
+            graph: producer.built().graph.clone(),
+            anchors: producer.built().anchors.clone(),
+            derivation_attachments: producer.built().derivation_attachments.clone(),
+        };
+        let benchmark_preprocessing_graph = BuiltGraph {
+            graph: preprocessing_graph.graph.clone(),
+            anchors: preprocessing_graph.anchors.clone(),
+            derivation_attachments: preprocessing_graph.derivation_attachments.clone(),
+        };
         let public_identity = producer.declaration().identity;
         let (gain_plan, route_decompositions) = producer.noise_snapshot_plans()?;
         let noise_snapshot = setup.build_noise_snapshot(
@@ -4878,7 +4882,11 @@ impl RefreshParameterSimulationRequest {
         }
         if benchmark_only {
             return Ok(RefreshParameterSimulationBundle {
-                selector_graph: BuiltGraph { graph: producer.built().graph.clone() },
+                selector_graph: BuiltGraph {
+                    graph: producer.built().graph.clone(),
+                    anchors: producer.built().anchors.clone(),
+                    derivation_attachments: producer.built().derivation_attachments.clone(),
+                },
                 preprocessing_graph: None,
                 verification_graph: None,
                 benchmark_preprocessing_graph,
@@ -4917,7 +4925,11 @@ impl RefreshParameterSimulationRequest {
             setup.base_p.into(),
         )?;
         Ok(RefreshParameterSimulationBundle {
-            selector_graph: BuiltGraph { graph: producer.built().graph.clone() },
+            selector_graph: BuiltGraph {
+                graph: producer.built().graph.clone(),
+                anchors: producer.built().anchors.clone(),
+                derivation_attachments: producer.built().derivation_attachments.clone(),
+            },
             preprocessing_graph: Some(preprocessing_graph),
             verification_graph: Some(verification_graph),
             benchmark_preprocessing_graph,
@@ -5021,9 +5033,9 @@ mod tests {
         )
         .expect("structural setup public-key families");
         let graph = DslContext::new("structural-setup-public-key-families")
-            .public_family_output("public-keys", public_keys)
+            .public_output("public-keys", public_keys)
             .expect("public-key family output")
-            .public_preimage_family_output("decompositions", decompositions)
+            .public_output("decompositions", decompositions)
             .expect("decomposition family output")
             .build()
             .expect("setup family graph");
@@ -5082,15 +5094,14 @@ mod tests {
         );
         let active_count = 5usize;
         let setup_public_key_count = output_count.checked_mul(active_count).unwrap();
-        assert!(exact_family_shape(Some(&[setup_public_key_count]), setup_public_key_count));
+        assert!(exact_family_count(Some(setup_public_key_count), setup_public_key_count));
     }
 
     #[test]
     fn setup_family_count_contract_rejects_nonexact_and_overflowing_shapes() {
-        assert!(!exact_family_shape(None, 7));
-        assert!(!exact_family_shape(Some(&[]), 7));
-        assert!(!exact_family_shape(Some(&[6]), 7));
-        assert!(!exact_family_shape(Some(&[7, 1]), 7));
+        assert!(!exact_family_count(None, 7));
+        assert!(!exact_family_count(Some(0), 7));
+        assert!(!exact_family_count(Some(6), 7));
         let mut overflowing = parameters(4, 2);
         overflowing.coefficient_count = usize::MAX;
         assert!(

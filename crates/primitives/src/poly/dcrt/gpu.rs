@@ -52,6 +52,10 @@ pub(crate) struct GpuSmallMatrixAllocationReportRaw {
     pub event_overhead_bytes: usize,
     pub high_water_bytes: usize,
     pub full_expanded_rhs_bytes: usize,
+    pub workspace_word_bytes: usize,
+    pub ntt_preparation_launches: usize,
+    pub u32_workspace_limb_count: usize,
+    pub u64_workspace_limb_count: usize,
 }
 
 #[repr(C)]
@@ -152,15 +156,6 @@ unsafe extern "C" {
         cols: usize,
         format: c_int,
         out_mat: *mut *mut GpuMatrixOpaque,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_create_batch(
-        ctx: *mut GpuContextOpaque,
-        level: c_int,
-        rows: usize,
-        cols: usize,
-        format: c_int,
-        output_count: usize,
-        outputs: *mut *mut GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_query_allocation_bytes(
         ctx: *const GpuContextOpaque,
@@ -272,6 +267,12 @@ unsafe extern "C" {
         outputs: *const *mut GpuMatrixOpaque,
         left: *const *const GpuMatrixOpaque,
         right: *const *const GpuMatrixOpaque,
+        matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_ring_automorphism_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        indices: *const usize,
         matrix_count: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_mul_accumulate_batch(
@@ -391,15 +392,6 @@ unsafe extern "C" {
         max_coefficient_bound: u64,
         coefficient_modulus: u64,
         seed: GpuRngSeed,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_sample_distribution_batch(
-        outputs: *const *mut GpuMatrixOpaque,
-        output_count: usize,
-        dist_type: c_int,
-        sigma: f64,
-        max_coefficient_bound: u64,
-        coefficient_modulus: u64,
-        seeds: *const GpuRngSeed,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution_columns(
         out: *mut GpuMatrixOpaque,

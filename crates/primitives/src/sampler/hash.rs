@@ -49,6 +49,7 @@ where
         attempt = attempt.wrapping_add(1);
     }
 }
+
 pub struct DCRTPolyHashSampler<H: OutputSizeUser + digest::Digest> {
     _h: PhantomData<H>,
 }
@@ -244,29 +245,5 @@ mod tests {
         let chunk =
             sampler.sample_hash_columns(&params, key, tag, 4, 9, 2, 3, DistType::FinRingDist);
         assert_eq!(chunk, full.slice_columns(2, 5));
-
-        let decomposed = sampler.sample_hash_decomposed_columns(
-            &params,
-            key,
-            tag,
-            4,
-            9,
-            2,
-            3,
-            DistType::FinRingDist,
-        );
-        assert_eq!(decomposed, full.slice_columns(2, 5).decompose());
-
-        let small_decomposed = sampler.sample_hash_small_decomposed_columns(
-            &params,
-            key,
-            tag,
-            4,
-            9,
-            2,
-            3,
-            DistType::FinRingDist,
-        );
-        assert_eq!(small_decomposed, full.slice_columns(2, 5).small_decompose());
     }
 }

@@ -220,7 +220,7 @@ impl PbcSelectorArtifacts {
             return Err(PbcError::ArtifactIdentityMismatch);
         }
         context
-            .public_family_output(selector_family_artifact_name(self, "gsw"), families.gsw)
+            .public_output(selector_family_artifact_name(self, "gsw"), families.gsw)
             .map_err(|_| PbcError::ArtifactIdentityMismatch)
     }
 
@@ -394,7 +394,7 @@ pub(crate) fn require_family_descriptor(
         return Err(PbcError::ArtifactIdentityMismatch);
     };
     if descriptor.artifact_type != expected_type ||
-        descriptor.family_shape != Some(vec![expected_count]) ||
+        descriptor.family_count != Some(expected_count) ||
         descriptor.confidentiality != confidentiality ||
         (require_content_hash && descriptor.content_hash.is_none()) ||
         (!require_content_hash && descriptor.content_hash.is_some())
@@ -697,7 +697,7 @@ impl PbcSelectorRuntimeBinding {
                 )
                 .map(RuntimeValue::matrix)
         })?;
-        Ok(BTreeMap::from([(self.input_name.clone(), RuntimeValue::Family(members))]))
+        Ok(BTreeMap::from([(self.input_name.clone(), RuntimeValue::IndexedFamily(members))]))
     }
 }
 
@@ -709,7 +709,7 @@ pub struct PbcStructuralSelectorFamilies {
     pub(crate) gsw: Family<Mat>,
 }
 
-/// Samples all selector RHS packages in one reusable `ParallelGrid`.
+/// Samples all selector RHS packages in one reusable `ParallelLoop`.
 ///
 /// The selector bit is the only selector-dependent input to the structural
 /// loop.  Each resulting GSW ciphertext is fixed during setup and is emitted

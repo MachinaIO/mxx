@@ -50,7 +50,7 @@ int gpu_device_get_identity(
     size_t *out_total_global_memory);
 
 /// Transfers ownership of pinned host pointers to the context-owned
-/// reclaimer.  The reclaimer records a completion event on `stream`, waits
+/// reclaimer. The reclaimer records a completion event on `stream`, waits
 /// for that event on its worker thread, and only then calls cudaFreeHost.
 /// A non-zero return means that ownership was retained as a fail-closed leak.
 int gpu_defer_pinned_frees(
@@ -102,13 +102,6 @@ struct GpuNttDeviceConstants
 };
 
 struct PinnedHostReclaimer;
-
-#if defined(__CUDACC__)
-extern __constant__ uint64_t gpu_ntt_const_moduli[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint64_t gpu_ntt_const_n_inv[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint64_t gpu_ntt_const_n_inv_shoup[GPU_RUNTIME_MAX_LIMBS];
-extern __constant__ uint32_t gpu_ntt_const_limb_count;
-#endif
 
 struct GpuContext
 {

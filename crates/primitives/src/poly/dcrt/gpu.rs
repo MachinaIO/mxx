@@ -52,6 +52,10 @@ pub(crate) struct GpuSmallMatrixAllocationReportRaw {
     pub event_overhead_bytes: usize,
     pub high_water_bytes: usize,
     pub full_expanded_rhs_bytes: usize,
+    pub workspace_word_bytes: usize,
+    pub ntt_preparation_launches: usize,
+    pub u32_workspace_limb_count: usize,
+    pub u64_workspace_limb_count: usize,
 }
 
 #[repr(C)]
@@ -965,6 +969,11 @@ impl GpuDCRTPolyParams {
 
     pub fn vram_budget_bytes(&self) -> usize {
         self.ctx.vram_budget_bytes
+    }
+
+    /// Percentage fixed when this parameter set's GPU context was created.
+    pub fn vram_percent(&self) -> u32 {
+        self.vram_percent
     }
 
     pub(crate) fn matrix_allocation_bytes(

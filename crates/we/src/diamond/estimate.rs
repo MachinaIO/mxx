@@ -1,7 +1,5 @@
 use super::{DiamondCompileError, DiamondWeCompiler};
-use mxx_bench_estimator::{
-    CostReport, EstimateConfig, EstimateError, MeasurementBackend, estimate,
-};
+use mxx_bench_estimator::{CostReport, EstimateError, MeasurementBackend, estimate};
 use mxx_ir_core::{
     artifact::{export_validated_manifest, production_id},
     encoding::spec_hash,
@@ -31,7 +29,6 @@ pub enum DiamondEstimateError {
 pub fn estimate_diamond_cost<B>(
     compiler: &DiamondWeCompiler,
     backend: &mut B,
-    config: &EstimateConfig,
 ) -> Result<DiamondCostEstimate, DiamondEstimateError>
 where
     B: MeasurementBackend,
@@ -50,7 +47,7 @@ where
     );
     let artifact_manifest = export_validated_manifest(encryption_id.clone(), &validated_encryption)
         .map_err(|error| DiamondEstimateError::Manifest(error.to_string()))?;
-    let encryption_report = estimate(&validated_encryption, backend, config)?;
+    let encryption_report = estimate(&validated_encryption, backend)?;
     info!(
         elapsed_seconds = encryption_started.elapsed().as_secs_f64(),
         total_work_seconds = encryption_report.total_work_seconds,
@@ -64,7 +61,7 @@ where
     let validated_decryption = decryption
         .validate_with_manifests(&bindings, &BTreeMap::from([(encryption_id, artifact_manifest)]))
         .map_err(|error| DiamondEstimateError::Validation(error.to_string()))?;
-    let decryption_report = estimate(&validated_decryption, backend, config)?;
+    let decryption_report = estimate(&validated_decryption, backend)?;
     info!(
         elapsed_seconds = decryption_started.elapsed().as_secs_f64(),
         total_work_seconds = decryption_report.total_work_seconds,
@@ -139,12 +136,7 @@ mod tests {
             },
         )
         .unwrap();
-        let estimate = estimate_diamond_cost(
-            &compiler,
-            &mut UnitBackend,
-            &EstimateConfig { device_pool_size: 2, per_instance_occupancy: 1 },
-        )
-        .unwrap();
+        let estimate = estimate_diamond_cost(&compiler, &mut UnitBackend).unwrap();
         assert!(estimate.encryption.total_work_seconds > 0.0);
         assert!(estimate.decryption.total_work_seconds > 0.0);
         assert!(estimate.encryption.peak_memory_bytes > 0);

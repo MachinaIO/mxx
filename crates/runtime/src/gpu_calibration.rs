@@ -7,9 +7,9 @@
 //! otherwise-identical GPUs.
 
 use mxx_ir_core::{
-    IntExpr, ParamEnv, encoding,
+    FrozenGraphScopeId, IntExpr, ParamEnv, concretize_wire_type, encoding,
     node::{ConcatAxis, ConstantMatrix, IndexRange, MatrixBinaryOp, NodeKind},
-    types::ConcreteWireType,
+    types::{ConcreteMatrixType, ConcreteWireType, NodeId, WireType},
 };
 use mxx_primitives::poly::dcrt::gpu::GpuDeviceIdentity;
 use serde::Serialize;
@@ -58,6 +58,7 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
             NodeKind::UniformIntervalSample { .. } |
             NodeKind::GaussianSample { .. } |
             NodeKind::HashSample { .. } |
+            NodeKind::GadgetTrapdoor { .. } |
             NodeKind::PreimageSample { .. } |
             NodeKind::GadgetDecompose { .. } |
             NodeKind::MatrixScale { .. } |
@@ -73,10 +74,75 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
     )
 }
 
+/// Refines the kind-level range capability using validated concrete operand types.
+pub fn gpu_operation_is_column_separable_for_types(
+    kind: &NodeKind,
+    concrete_argument_types: &[ConcreteWireType],
+) -> bool {
+    fn matrix_type(ty: &ConcreteWireType) -> Option<&ConcreteMatrixType> {
+        match ty {
+            ConcreteWireType::IndexedFamily { element, .. } => matrix_type(element),
+            _ => ty.matrix_type(),
+        }
+    }
+    if !gpu_operation_is_column_separable(kind) {
+        return false;
+    }
+    let NodeKind::MatrixMulAccumulate { coefficients, .. } = kind else {
+        return true;
+    };
+    coefficients.iter().enumerate().all(|(product, _)| {
+        concrete_argument_types.get(2 * product).and_then(matrix_type).is_some() &&
+            concrete_argument_types.get(2 * product + 1).and_then(matrix_type).is_some()
+    })
+}
+
+pub(crate) fn gpu_calibration_groups(
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    kind: &NodeKind,
+    declared_argument_types: &[WireType],
+    declared_output_types: &[WireType],
+    envs: &[ParamEnv],
+) -> Result<Vec<(Option<[u8; 32]>, Vec<usize>)>, String> {
+    let mut groups = Vec::<(Option<[u8; 32]>, Vec<usize>)>::new();
+    for (instance, env) in envs.iter().enumerate() {
+        let argument_types = declared_argument_types
+            .iter()
+            .map(|ty| concretize_wire_type(ty, env, scope_id, node_id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let output_types = declared_output_types
+            .iter()
+            .map(|ty| concretize_wire_type(ty, env, scope_id, node_id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let operation = gpu_operation_is_column_separable_for_types(kind, &argument_types)
+            .then(|| gpu_calibration_operation_identity(kind, &argument_types, &output_types, env))
+            .transpose()?;
+        if let Some((_, members)) = groups.iter_mut().find(|(candidate, _)| *candidate == operation)
+        {
+            members.push(instance);
+        } else {
+            groups.push((operation, vec![instance]));
+        }
+    }
+    Ok(groups)
+}
+
+pub fn gpu_matrix_multiply_scales_left(
+    left_rows: usize,
+    left_columns: usize,
+    right_rows: usize,
+    right_columns: usize,
+) -> bool {
+    (right_rows, right_columns) == (1, 1) && (left_rows, left_columns) != (1, 1)
+}
+
 /// Canonical per-primitive identity shared by estimator collection and runtime
 /// preflight. Selector-only loop values and hash-domain tags do not affect the
-/// allocation/kernel path and are deliberately erased; concrete types retain
-/// every loop-dependent shape and bound that does affect it.
+/// allocation/kernel path and are deliberately erased;
+/// concrete types retain every loop-dependent shape and bound that does affect it.
 pub fn gpu_calibration_operation_identity(
     kind: &NodeKind,
     concrete_argument_types: &[ConcreteWireType],
@@ -102,7 +168,14 @@ pub fn gpu_calibration_operation_identity(
             ConcreteWireType::SmallMatrix { matrix, .. } |
             ConcreteWireType::Preimage { matrix, .. } |
             ConcreteWireType::Trapdoor { matrix, .. } => matrix.columns = 1,
+            ConcreteWireType::IndexedFamily { element, .. } => one_column(element),
             _ => {}
+        }
+    }
+    fn matrix_type(ty: &ConcreteWireType) -> Option<&ConcreteMatrixType> {
+        match ty {
+            ConcreteWireType::IndexedFamily { element, .. } => matrix_type(element),
+            _ => ty.matrix_type(),
         }
     }
     fn normalize_output(types: &mut [ConcreteWireType]) {
@@ -125,8 +198,21 @@ pub fn gpu_calibration_operation_identity(
     let mut argument_types = concrete_argument_types.to_vec();
     let mut output_types = concrete_output_types.to_vec();
     let mut shape_kind = kind.clone();
+    let column_separable_for_types =
+        gpu_operation_is_column_separable_for_types(kind, concrete_argument_types);
     match &mut shape_kind {
-        NodeKind::ConstantMatrix { matrix_type, .. } => {
+        NodeKind::ConstantMatrix { matrix_type, value } => {
+            matrix_type.columns = IntExpr::constant(1);
+            normalize_output(&mut output_types);
+            match value {
+                ConstantMatrix::UnitRow { index } | ConstantMatrix::UnitColumn { index } => {
+                    *index = IntExpr::constant(0);
+                }
+                ConstantMatrix::Rotation { exponent } => *exponent = IntExpr::constant(0),
+                _ => {}
+            }
+        }
+        NodeKind::GadgetTrapdoor { matrix_type, .. } => {
             matrix_type.columns = IntExpr::constant(1);
             normalize_output(&mut output_types);
         }
@@ -156,22 +242,51 @@ pub fn gpu_calibration_operation_identity(
             argument_types.iter_mut().for_each(one_column);
             normalize_output(&mut output_types);
         }
-        NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) | NodeKind::MatrixMulSmallRhs => {
+        NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => {
+            let scale_left = matches!(
+                (argument_types.first().and_then(matrix_type),
+                 argument_types.get(1).and_then(matrix_type)),
+                (Some(left), Some(right))
+                    if gpu_matrix_multiply_scales_left(
+                        left.rows, left.columns, right.rows, right.columns)
+            );
+            let scalable_argument = if scale_left { 0 } else { 1 };
+            if let Some(argument) = argument_types.get_mut(scalable_argument) {
+                one_column(argument);
+            }
+            normalize_output(&mut output_types);
+        }
+        NodeKind::MatrixMulSmallRhs => {
             if let Some(rhs) = argument_types.get_mut(1) {
                 one_column(rhs);
             }
             normalize_output(&mut output_types);
         }
-        NodeKind::MatrixMulAccumulate { has_bias, .. } => {
+        NodeKind::MatrixMulAccumulate { has_bias, .. } if column_separable_for_types => {
             let product_argument_count = argument_types.len() - usize::from(*has_bias);
-            for rhs in (1..product_argument_count).step_by(2) {
-                one_column(&mut argument_types[rhs]);
+            for left_index in (0..product_argument_count).step_by(2) {
+                let left =
+                    matrix_type(&argument_types[left_index]).expect("validated fused multiply LHS");
+                let right = matrix_type(&argument_types[left_index + 1])
+                    .expect("validated fused multiply RHS");
+                let scalable = if gpu_matrix_multiply_scales_left(
+                    left.rows,
+                    left.columns,
+                    right.rows,
+                    right.columns,
+                ) {
+                    left_index
+                } else {
+                    left_index + 1
+                };
+                one_column(&mut argument_types[scalable]);
             }
             if *has_bias {
                 one_column(argument_types.last_mut().expect("bias argument exists"));
             }
             normalize_output(&mut output_types);
         }
+        NodeKind::MatrixMulAccumulate { .. } => {}
         NodeKind::CrtRecompose { .. } | NodeKind::Concat { axis: ConcatAxis::Rows } => {
             argument_types.iter_mut().for_each(one_column);
             normalize_output(&mut output_types);
@@ -236,6 +351,9 @@ pub fn gpu_calibration_operation_identity(
                 end: IntExpr::constant(rows),
             });
             *columns = Some(IndexRange { start: IntExpr::constant(0), end: IntExpr::constant(1) });
+        }
+        NodeKind::ExtractCoefficient { position, .. } => {
+            *position = IntExpr::constant(0);
         }
         _ => {}
     }
@@ -488,6 +606,56 @@ impl GpuColumnWidths {
     }
 }
 
+/// Assigns one wave using the smallest common cap that covers the requested columns.
+/// The result is deterministic in device order and sums to at most one fleet wave.
+pub fn gpu_capped_waterfill_columns(
+    widths: GpuColumnWidths,
+    gpu_count: usize,
+    remaining_columns: usize,
+) -> Result<Vec<usize>, GpuCalibrationError> {
+    let fleet_capacity = widths.columns_per_wave(gpu_count)?;
+    let target = remaining_columns.min(fleet_capacity);
+    if target == 0 {
+        return Ok(vec![0; gpu_count]);
+    }
+    let nonzero = widths.nonzero.unwrap_or(widths.gpu0);
+    let capacities = (0..gpu_count)
+        .map(|device| if device == 0 { widths.gpu0 } else { nonzero })
+        .collect::<Vec<_>>();
+    let mut low = 1usize;
+    let mut high = capacities.iter().copied().max().expect("nonempty GPU capacities");
+    while low < high {
+        let level = low + (high - low) / 2;
+        let covered = capacities
+            .iter()
+            .try_fold(0usize, |sum, capacity| sum.checked_add((*capacity).min(level)))
+            .ok_or(GpuCalibrationError::ArithmeticOverflow)?;
+        if covered >= target {
+            high = level;
+        } else {
+            low = level + 1;
+        }
+    }
+    let level = low;
+    let mut assigned =
+        capacities.iter().map(|capacity| (*capacity).min(level - 1)).collect::<Vec<_>>();
+    let baseline = assigned.iter().try_fold(0usize, |sum, columns| {
+        sum.checked_add(*columns).ok_or(GpuCalibrationError::ArithmeticOverflow)
+    })?;
+    let mut remainder = target - baseline;
+    for (columns, capacity) in assigned.iter_mut().zip(capacities) {
+        if remainder == 0 {
+            break;
+        }
+        if capacity >= level {
+            *columns += 1;
+            remainder -= 1;
+        }
+    }
+    debug_assert_eq!(remainder, 0);
+    Ok(assigned)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GpuCalibrationError {
     #[error("GPU calibration pilot must contain at least one column")]
@@ -667,6 +835,77 @@ mod tests {
     }
 
     #[test]
+    fn calibration_groups_preserve_loop_dependent_preimage_bounds() {
+        let matrix = mxx_ir_core::types::MatrixType {
+            modulus: IntExpr::constant(257),
+            ring_dimension: IntExpr::constant(16),
+            rows: IntExpr::constant(2),
+            columns: IntExpr::constant(4),
+        };
+        let bound = IntExpr::Add(Box::new(IntExpr::constant(7)), Box::new(IntExpr::LoopIndex(0)));
+        let kind = NodeKind::PreimageSample {
+            matrix_type: matrix.clone(),
+            max_coefficient_bound: bound.clone(),
+        };
+        let arguments = vec![
+            WireType::Matrix(matrix.clone()),
+            WireType::Matrix(matrix.clone()),
+            WireType::Matrix(matrix.clone()),
+        ];
+        let outputs = vec![WireType::Preimage { matrix, max_coefficient_bound: bound }];
+        let env = |index| ParamEnv {
+            loop_indices: [(0, BigInt::from(index))].into_iter().collect(),
+            ..ParamEnv::default()
+        };
+        let groups = gpu_calibration_groups(
+            &FrozenGraphScopeId::Root,
+            NodeId(9),
+            &kind,
+            &arguments,
+            &outputs,
+            &[env(0), env(1), env(0)],
+        )
+        .unwrap();
+
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|(operation, _)| operation.is_some()));
+        assert_eq!(groups[0].1, vec![0, 2]);
+        assert_eq!(groups[1].1, vec![1]);
+        assert_ne!(groups[0].0, groups[1].0);
+    }
+
+    #[test]
+    fn calibration_key_preserves_bounds_after_column_normalization() {
+        let matrix = ConcreteMatrixType {
+            modulus: BigInt::from(257u16),
+            ring_dimension: 16,
+            rows: 3,
+            columns: 29,
+        };
+        let kind = NodeKind::GadgetDecompose {
+            base: IntExpr::constant(4),
+            small: false,
+            digit_count: IntExpr::constant(3),
+        };
+        let operation = |bound| {
+            gpu_calibration_operation_identity(
+                &kind,
+                &[ConcreteWireType::Matrix(matrix.clone())],
+                &[ConcreteWireType::Preimage {
+                    matrix: matrix.clone(),
+                    max_coefficient_bound: BigInt::from(bound),
+                }],
+                &ParamEnv::default(),
+            )
+            .unwrap()
+        };
+
+        let first = GpuCalibrationKey::new(operation(7), &b"same-environment"[..]);
+        let second = GpuCalibrationKey::new(operation(8), &b"same-environment"[..]);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn operation_identity_preserves_tensor_segments_and_diagonal_block_layout() {
         let matrix = |rows, columns| {
             ConcreteWireType::Matrix(ConcreteMatrixType {
@@ -719,6 +958,198 @@ mod tests {
     }
 
     #[test]
+    fn multiply_identity_normalizes_the_runtime_scaled_operand() {
+        let matrix = |rows, columns| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(257u16),
+                ring_dimension: 16,
+                rows,
+                columns,
+            })
+        };
+        let identity = |arguments: &[ConcreteWireType], output: ConcreteWireType| {
+            gpu_calibration_operation_identity(
+                &NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
+                arguments,
+                &[output],
+                &ParamEnv::default(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            identity(&[matrix(1, 1), matrix(1, 10)], matrix(1, 10)),
+            identity(&[matrix(1, 1), matrix(1, 1)], matrix(1, 1))
+        );
+        assert_eq!(
+            identity(&[matrix(2, 10), matrix(1, 1)], matrix(2, 10)),
+            identity(&[matrix(2, 1), matrix(1, 1)], matrix(2, 1))
+        );
+        assert_eq!(
+            identity(&[matrix(2, 3), matrix(3, 10)], matrix(2, 10)),
+            identity(&[matrix(2, 3), matrix(3, 1)], matrix(2, 1))
+        );
+    }
+
+    #[test]
+    fn fused_multiply_separability_and_identity_support_both_orientations() {
+        let matrix = |rows, columns| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(257u16),
+                ring_dimension: 16,
+                rows,
+                columns,
+            })
+        };
+        let kind = NodeKind::MatrixMulAccumulate {
+            coefficients: vec![IntExpr::constant(1)],
+            has_bias: false,
+        };
+
+        assert!(gpu_operation_is_column_separable_for_types(&kind, &[matrix(1, 1), matrix(1, 10)]));
+        assert!(gpu_operation_is_column_separable_for_types(&kind, &[matrix(2, 3), matrix(3, 10)]));
+        assert!(gpu_operation_is_column_separable_for_types(&kind, &[matrix(2, 10), matrix(1, 1)]));
+
+        let unsupported_full = gpu_calibration_operation_identity(
+            &kind,
+            &[matrix(2, 10), matrix(1, 1)],
+            &[matrix(2, 10)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        let unsupported_reduced = gpu_calibration_operation_identity(
+            &kind,
+            &[matrix(2, 1), matrix(1, 1)],
+            &[matrix(2, 1)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(unsupported_full, unsupported_reduced);
+
+        let mixed_kind = NodeKind::MatrixMulAccumulate {
+            coefficients: vec![IntExpr::constant(1), IntExpr::constant(1)],
+            has_bias: false,
+        };
+        assert!(gpu_operation_is_column_separable_for_types(
+            &mixed_kind,
+            &[matrix(1, 1), matrix(2, 10), matrix(2, 10), matrix(1, 1)]
+        ));
+        let mixed_full = gpu_calibration_operation_identity(
+            &mixed_kind,
+            &[matrix(1, 1), matrix(2, 10), matrix(2, 10), matrix(1, 1)],
+            &[matrix(2, 10)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        let mixed_reduced = gpu_calibration_operation_identity(
+            &mixed_kind,
+            &[matrix(1, 1), matrix(2, 1), matrix(2, 1), matrix(1, 1)],
+            &[matrix(2, 1)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(mixed_full, mixed_reduced);
+    }
+
+    #[test]
+    fn gadget_trapdoor_is_column_separable_and_normalized() {
+        let kind = |columns| NodeKind::GadgetTrapdoor {
+            matrix_type: mxx_ir_core::types::MatrixType {
+                modulus: IntExpr::constant(257),
+                ring_dimension: IntExpr::constant(16),
+                rows: IntExpr::constant(3),
+                columns: IntExpr::constant(columns),
+            },
+            base: IntExpr::constant(4),
+        };
+        let output = |columns| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(257u16),
+                ring_dimension: 16,
+                rows: 3,
+                columns,
+            })
+        };
+
+        assert!(gpu_operation_is_column_separable(&kind(30)));
+        assert_eq!(
+            gpu_calibration_operation_identity(&kind(30), &[], &[output(30)], &ParamEnv::default())
+                .unwrap(),
+            gpu_calibration_operation_identity(&kind(1), &[], &[output(1)], &ParamEnv::default())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn operation_identity_normalizes_only_proven_selectors() {
+        let matrix_type = mxx_ir_core::types::MatrixType {
+            modulus: IntExpr::constant(257),
+            ring_dimension: IntExpr::constant(16),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(8),
+        };
+        let concrete = ConcreteWireType::Matrix(ConcreteMatrixType {
+            modulus: BigInt::from(257u16),
+            ring_dimension: 16,
+            rows: 1,
+            columns: 8,
+        });
+        let constant_identity = |value| {
+            gpu_calibration_operation_identity(
+                &NodeKind::ConstantMatrix { matrix_type: matrix_type.clone(), value },
+                &[],
+                std::slice::from_ref(&concrete),
+                &ParamEnv::default(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            constant_identity(ConstantMatrix::Rotation { exponent: IntExpr::constant(1) }),
+            constant_identity(ConstantMatrix::Rotation { exponent: IntExpr::constant(7) })
+        );
+        assert_eq!(
+            constant_identity(ConstantMatrix::UnitRow { index: IntExpr::constant(1) }),
+            constant_identity(ConstantMatrix::UnitRow { index: IntExpr::constant(7) })
+        );
+        assert_eq!(
+            constant_identity(ConstantMatrix::UnitColumn { index: IntExpr::constant(1) }),
+            constant_identity(ConstantMatrix::UnitColumn { index: IntExpr::constant(7) })
+        );
+        assert_ne!(
+            constant_identity(ConstantMatrix::PowerOfBase {
+                base: IntExpr::constant(4),
+                exponent: IntExpr::constant(1),
+            }),
+            constant_identity(ConstantMatrix::PowerOfBase {
+                base: IntExpr::constant(4),
+                exponent: IntExpr::constant(2),
+            })
+        );
+        assert_ne!(
+            constant_identity(ConstantMatrix::Polynomial {
+                coefficients: vec![IntExpr::constant(1)],
+            }),
+            constant_identity(ConstantMatrix::Polynomial {
+                coefficients: vec![IntExpr::constant(2)],
+            })
+        );
+
+        let extract = |position| {
+            gpu_calibration_operation_identity(
+                &NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(position),
+                    canonical_input_exclusive_upper: None,
+                },
+                std::slice::from_ref(&concrete),
+                &[ConcreteWireType::Int],
+                &ParamEnv::default(),
+            )
+            .unwrap()
+        };
+        assert_eq!(extract(1), extract(7));
+    }
+
+    #[test]
     fn gpu0_and_nonzero_widths_use_separate_baselines() {
         let profile =
             GpuCalibrationProfile { gpu0: calibration(2, 200), nonzero: Some(calibration(4, 320)) };
@@ -767,6 +1198,80 @@ mod tests {
                 bytes_per_column: 4,
             })
         );
+    }
+
+    #[test]
+    fn capped_waterfill_balances_equal_and_unequal_capacities() {
+        assert_eq!(
+            gpu_capped_waterfill_columns(GpuColumnWidths { gpu0: 100, nonzero: Some(100) }, 2, 176)
+                .unwrap(),
+            vec![88, 88]
+        );
+        assert_eq!(
+            gpu_capped_waterfill_columns(GpuColumnWidths { gpu0: 20, nonzero: Some(100) }, 3, 176)
+                .unwrap(),
+            vec![20, 78, 78]
+        );
+        assert_eq!(
+            gpu_capped_waterfill_columns(GpuColumnWidths { gpu0: 10, nonzero: Some(10) }, 4, 2)
+                .unwrap(),
+            vec![1, 1, 0, 0]
+        );
+        assert_eq!(
+            gpu_capped_waterfill_columns(
+                GpuColumnWidths { gpu0: 2, nonzero: Some(3) },
+                3,
+                usize::MAX
+            )
+            .unwrap(),
+            vec![2, 3, 3]
+        );
+    }
+
+    #[test]
+    fn capped_waterfill_exhaustively_preserves_capacity_and_minimal_level() {
+        for gpu_count in 1..=5 {
+            for gpu0 in 1..=7 {
+                for nonzero in 1..=7 {
+                    let widths =
+                        GpuColumnWidths { gpu0, nonzero: (gpu_count > 1).then_some(nonzero) };
+                    let capacities = (0..gpu_count)
+                        .map(|device| if device == 0 { gpu0 } else { nonzero })
+                        .collect::<Vec<_>>();
+                    let capacity = capacities.iter().sum::<usize>();
+                    for requested in 0..=capacity + 2 {
+                        let assigned =
+                            gpu_capped_waterfill_columns(widths, gpu_count, requested).unwrap();
+                        let target = requested.min(capacity);
+                        assert_eq!(assigned.len(), gpu_count);
+                        assert_eq!(assigned.iter().sum::<usize>(), target);
+                        assert!(assigned.iter().zip(&capacities).all(|(used, cap)| used <= cap));
+                        if target >= gpu_count {
+                            assert!(assigned.iter().all(|used| *used > 0));
+                        }
+                        if target > 0 {
+                            let level = assigned.iter().copied().max().unwrap();
+                            assert!(assigned.iter().zip(&capacities).all(|(used, cap)| {
+                                *used == (*cap).min(level) || *used == (*cap).min(level - 1)
+                            }));
+                            assert!(
+                                capacities.iter().map(|cap| (*cap).min(level)).sum::<usize>() >=
+                                    target
+                            );
+                            if level > 1 {
+                                assert!(
+                                    capacities
+                                        .iter()
+                                        .map(|cap| (*cap).min(level - 1))
+                                        .sum::<usize>() <
+                                        target
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

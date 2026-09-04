@@ -96,6 +96,93 @@ pub struct GpuSmallMatrixAllocationReport {
     pub event_overhead_bytes: usize,
     pub high_water_bytes: usize,
     pub full_expanded_rhs_bytes: usize,
+    /// Bytes used by one residue when every active limb has the same width.
+    /// Mixed `u32`/`u64` workspaces report zero and expose each limb count.
+    pub workspace_word_bytes: usize,
+    /// Kernel launches used to prepare the expanded RHS in OpenFHE evaluation
+    /// order, excluding the final matrix accumulation.
+    pub ntt_preparation_launches: usize,
+    /// Active CRT limbs whose actual modulus fits in the exact `u32` backend.
+    pub u32_workspace_limb_count: usize,
+    /// Active CRT limbs that require the exact `u64` backend.
+    pub u64_workspace_limb_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SmallRhsWorkspaceLayout {
+    workspace_word_bytes: usize,
+    bytes_per_coefficient: usize,
+    u32_limb_count: usize,
+    u64_limb_count: usize,
+    contiguous_width_groups: usize,
+}
+
+fn small_rhs_workspace_layout(moduli: &[u64]) -> Result<SmallRhsWorkspaceLayout, SmallMatrixError> {
+    if moduli.is_empty() {
+        return Err(SmallMatrixError::InvalidConfig);
+    }
+    let mut u32_limb_count = 0usize;
+    let mut u64_limb_count = 0usize;
+    let mut contiguous_width_groups = 0usize;
+    let mut previous_is_u32 = None;
+    for &modulus in moduli {
+        let is_u32 = modulus <= u32::MAX as u64;
+        if previous_is_u32 != Some(is_u32) {
+            contiguous_width_groups = contiguous_width_groups
+                .checked_add(1)
+                .ok_or(SmallMatrixError::DimensionOverflow)?;
+            previous_is_u32 = Some(is_u32);
+        }
+        if is_u32 {
+            u32_limb_count =
+                u32_limb_count.checked_add(1).ok_or(SmallMatrixError::DimensionOverflow)?;
+        } else {
+            u64_limb_count =
+                u64_limb_count.checked_add(1).ok_or(SmallMatrixError::DimensionOverflow)?;
+        }
+    }
+    let bytes_per_coefficient = u32_limb_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .and_then(|value| {
+            u64_limb_count
+                .checked_mul(std::mem::size_of::<u64>())
+                .and_then(|wide| value.checked_add(wide))
+        })
+        .ok_or(SmallMatrixError::DimensionOverflow)?;
+    let workspace_word_bytes = if u64_limb_count == 0 {
+        std::mem::size_of::<u32>()
+    } else if u32_limb_count == 0 {
+        std::mem::size_of::<u64>()
+    } else {
+        0
+    };
+    Ok(SmallRhsWorkspaceLayout {
+        workspace_word_bytes,
+        bytes_per_coefficient,
+        u32_limb_count,
+        u64_limb_count,
+        contiguous_width_groups,
+    })
+}
+
+fn small_rhs_ntt_preparation_launches(
+    ring_dimension: usize,
+    contiguous_width_groups: usize,
+) -> Result<usize, SmallMatrixError> {
+    if ring_dimension < 2 || !ring_dimension.is_power_of_two() {
+        return Err(SmallMatrixError::InvalidConfig);
+    }
+    if contiguous_width_groups == 0 {
+        return Err(SmallMatrixError::InvalidConfig);
+    }
+    // Natural-order decoding and twisting are fused with the first DIF stage.
+    // Global DIF stages stop at length 8192, and one shared-memory suffix
+    // finishes lengths 4096 through 2 directly in OpenFHE bit-reversed order.
+    let log_n = ring_dimension.ilog2() as usize;
+    let launches_per_group = if ring_dimension <= 4096 { 1 } else { log_n - 11 };
+    launches_per_group
+        .checked_mul(contiguous_width_groups)
+        .ok_or(SmallMatrixError::DimensionOverflow)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +223,29 @@ fn validate_small_rhs_budget(
         requested_bytes: report.high_water_bytes,
         budget_bytes,
     })
+}
+
+fn validate_small_rhs_runtime_report(
+    planned: &GpuSmallMatrixAllocationReport,
+    actual: &GpuSmallMatrixAllocationReportRaw,
+    budget_bytes: usize,
+) -> Result<(), SmallMatrixError> {
+    if actual.lhs_eval_bytes == planned.lhs_eval_bytes &&
+        actual.compact_rhs_bytes == planned.compact_rhs_bytes &&
+        actual.full_output_bytes == planned.full_output_bytes &&
+        actual.expanded_rhs_workspace_bytes == planned.expanded_rhs_workspace_bytes &&
+        actual.event_overhead_bytes == planned.event_overhead_bytes &&
+        actual.high_water_bytes == planned.high_water_bytes &&
+        actual.full_expanded_rhs_bytes == planned.full_expanded_rhs_bytes &&
+        actual.workspace_word_bytes == planned.workspace_word_bytes &&
+        actual.ntt_preparation_launches == planned.ntt_preparation_launches &&
+        actual.u32_workspace_limb_count == planned.u32_workspace_limb_count &&
+        actual.u64_workspace_limb_count == planned.u64_workspace_limb_count &&
+        actual.high_water_bytes <= budget_bytes
+    {
+        return Ok(());
+    }
+    Err(SmallMatrixError::InvalidConfig)
 }
 
 unsafe impl Send for GpuSmallMatrix {}
@@ -551,7 +661,7 @@ impl GpuSmallMatrix {
     ) -> Result<GpuSmallMatrixAllocationReport, SmallMatrixError> {
         let n = self.params.ring_dimension() as usize;
         let limbs = self.params.crt_depth();
-        let word_bytes = std::mem::size_of::<u64>();
+        let workspace_layout = small_rhs_workspace_layout(self.params.moduli())?;
         if self.rows == 0 || self.columns == 0 || limbs == 0 {
             return Err(SmallMatrixError::InvalidConfig);
         }
@@ -559,11 +669,11 @@ impl GpuSmallMatrix {
         // Matrix owners persist their device descriptors in their auxiliary
         // allocation; a single-placement limb index is derived in-kernel.
         let metadata_bytes = 0usize;
-        let expanded_rhs_workspace_bytes = limbs
-            .checked_mul(self.rows)
-            .and_then(|value| value.checked_mul(self.columns))
+        let expanded_rhs_workspace_bytes = self
+            .rows
+            .checked_mul(self.columns)
             .and_then(|value| value.checked_mul(n))
-            .and_then(|value| value.checked_mul(word_bytes))
+            .and_then(|value| value.checked_mul(workspace_layout.bytes_per_coefficient))
             .ok_or(SmallMatrixError::DimensionOverflow)?;
         // This accounts only for the known event handles. CUDA's allocator
         // and event implementation overhead is reported authoritatively by
@@ -587,6 +697,13 @@ impl GpuSmallMatrix {
             event_overhead_bytes,
             high_water_bytes,
             full_expanded_rhs_bytes: expanded_rhs_workspace_bytes,
+            workspace_word_bytes: workspace_layout.workspace_word_bytes,
+            ntt_preparation_launches: small_rhs_ntt_preparation_launches(
+                n,
+                workspace_layout.contiguous_width_groups,
+            )?,
+            u32_workspace_limb_count: workspace_layout.u32_limb_count,
+            u64_workspace_limb_count: workspace_layout.u64_limb_count,
         })
     }
 }
@@ -713,11 +830,7 @@ impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
             });
         }
         check_status(status, "gpu_matrix_mul_small_rhs");
-        if raw_report.full_expanded_rhs_bytes != raw_report.expanded_rhs_workspace_bytes ||
-            raw_report.high_water_bytes > budget
-        {
-            return Err(SmallMatrixError::InvalidConfig);
-        }
+        validate_small_rhs_runtime_report(&report, &raw_report, budget)?;
         Ok(out)
     }
 }
@@ -3606,6 +3719,33 @@ mod tests {
         )
     }
 
+    fn signed_cycle_cpu_matrix(
+        params: &DCRTPolyParams,
+        rows: usize,
+        columns: usize,
+    ) -> DCRTPolyMatrix {
+        let minus_one = params.modulus().as_ref() - BigUint::from(1u8);
+        DCRTPolyMatrix::from_poly_vec(
+            params,
+            (0..rows)
+                .map(|row| {
+                    (0..columns)
+                        .map(|column| {
+                            let coefficients = (0..params.ring_dimension() as usize)
+                                .map(|coefficient| match (coefficient + row + column) % 3 {
+                                    0 => BigUint::ZERO,
+                                    1 => BigUint::from(1u8),
+                                    _ => minus_one.clone(),
+                                })
+                                .collect::<Vec<_>>();
+                            DCRTPoly::from_biguints(params, &coefficients)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     #[sequential]
     fn test_gpu_compact_batch_is_byte_identical_to_scalar_serialization() {
@@ -4440,12 +4580,105 @@ mod tests {
             event_overhead_bytes: 23,
             high_water_bytes: 83,
             full_expanded_rhs_bytes: 0,
+            workspace_word_bytes: 8,
+            ntt_preparation_launches: 5,
+            u32_workspace_limb_count: 0,
+            u64_workspace_limb_count: 1,
         };
         assert_eq!(validate_small_rhs_budget(&report, 83), Ok(()));
         assert!(matches!(
             validate_small_rhs_budget(&report, 82),
             Err(SmallMatrixError::ResourceExhausted { requested_bytes: 83, budget_bytes: 82 })
         ));
+    }
+
+    #[test]
+    fn test_gpu_small_rhs_runtime_report_validation_is_fail_closed() {
+        let planned = GpuSmallMatrixAllocationReport {
+            lhs_eval_bytes: 11,
+            compact_rhs_bytes: 13,
+            full_output_bytes: 17,
+            expanded_rhs_workspace_bytes: 19,
+            event_overhead_bytes: 23,
+            high_water_bytes: 83,
+            full_expanded_rhs_bytes: 19,
+            workspace_word_bytes: 0,
+            ntt_preparation_launches: 21,
+            u32_workspace_limb_count: 2,
+            u64_workspace_limb_count: 1,
+        };
+        let mut actual = GpuSmallMatrixAllocationReportRaw {
+            lhs_eval_bytes: planned.lhs_eval_bytes,
+            compact_rhs_bytes: planned.compact_rhs_bytes,
+            full_output_bytes: planned.full_output_bytes,
+            expanded_rhs_workspace_bytes: planned.expanded_rhs_workspace_bytes,
+            event_overhead_bytes: planned.event_overhead_bytes,
+            high_water_bytes: planned.high_water_bytes,
+            full_expanded_rhs_bytes: planned.full_expanded_rhs_bytes,
+            workspace_word_bytes: planned.workspace_word_bytes,
+            ntt_preparation_launches: planned.ntt_preparation_launches,
+            u32_workspace_limb_count: planned.u32_workspace_limb_count,
+            u64_workspace_limb_count: planned.u64_workspace_limb_count,
+        };
+        assert_eq!(validate_small_rhs_runtime_report(&planned, &actual, 83), Ok(()));
+        actual.u32_workspace_limb_count = 1;
+        assert_eq!(
+            validate_small_rhs_runtime_report(&planned, &actual, 83),
+            Err(SmallMatrixError::InvalidConfig)
+        );
+        actual.u32_workspace_limb_count = 2;
+        assert_eq!(
+            validate_small_rhs_runtime_report(&planned, &actual, 82),
+            Err(SmallMatrixError::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn test_gpu_small_rhs_ntt_launch_accounting() {
+        assert_eq!(small_rhs_ntt_preparation_launches(2, 1), Ok(1));
+        assert_eq!(small_rhs_ntt_preparation_launches(256, 1), Ok(1));
+        assert_eq!(small_rhs_ntt_preparation_launches(4096, 1), Ok(1));
+        assert_eq!(small_rhs_ntt_preparation_launches(8192, 1), Ok(2));
+        assert_eq!(small_rhs_ntt_preparation_launches(1 << 16, 1), Ok(5));
+        assert_eq!(small_rhs_ntt_preparation_launches(1 << 16, 3), Ok(15));
+        assert!(matches!(
+            small_rhs_ntt_preparation_launches(3, 1),
+            Err(SmallMatrixError::InvalidConfig)
+        ));
+        assert!(matches!(
+            small_rhs_ntt_preparation_launches(1 << 16, 0),
+            Err(SmallMatrixError::InvalidConfig)
+        ));
+    }
+
+    #[test]
+    fn test_gpu_small_rhs_workspace_backend_selection_and_mixed_accounting() {
+        let narrow = small_rhs_workspace_layout(&[u32::MAX as u64, 65_537]).unwrap();
+        assert_eq!(narrow.workspace_word_bytes, 4);
+        assert_eq!(narrow.bytes_per_coefficient, 8);
+        assert_eq!(narrow.u32_limb_count, 2);
+        assert_eq!(narrow.u64_limb_count, 0);
+        assert_eq!(narrow.contiguous_width_groups, 1);
+
+        let wide = small_rhs_workspace_layout(&[u32::MAX as u64 + 1]).unwrap();
+        assert_eq!(wide.workspace_word_bytes, 8);
+        assert_eq!(wide.bytes_per_coefficient, 8);
+        assert_eq!(wide.u32_limb_count, 0);
+        assert_eq!(wide.u64_limb_count, 1);
+
+        let mixed = small_rhs_workspace_layout(&[
+            65_537,
+            u32::MAX as u64 + 2,
+            u32::MAX as u64 + 4,
+            114_689,
+        ])
+        .unwrap();
+        assert_eq!(mixed.workspace_word_bytes, 0);
+        assert_eq!(mixed.bytes_per_coefficient, 24);
+        assert_eq!(mixed.u32_limb_count, 2);
+        assert_eq!(mixed.u64_limb_count, 2);
+        assert_eq!(mixed.contiguous_width_groups, 3);
+        assert_eq!(small_rhs_workspace_layout(&[]), Err(SmallMatrixError::InvalidConfig));
     }
 
     #[test]
@@ -4503,9 +4736,12 @@ mod tests {
             dimension *
             dimension *
             params.ring_dimension() as usize *
-            std::mem::size_of::<u64>();
+            std::mem::size_of::<u32>();
         assert_eq!(report.expanded_rhs_workspace_bytes, shard_workspace_bytes);
         assert_eq!(report.full_expanded_rhs_bytes, shard_workspace_bytes);
+        assert_eq!(report.workspace_word_bytes, std::mem::size_of::<u32>());
+        assert_eq!(report.u32_workspace_limb_count, params.crt_depth());
+        assert_eq!(report.u64_workspace_limb_count, 0);
     }
 
     #[test]
@@ -4673,6 +4909,156 @@ mod tests {
         .unwrap();
         let actual = lhs.multiply_small_rhs(&rhs).unwrap();
         assert_eq!(actual.to_cpu_matrix(), expected);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_small_rhs_direct_dif_ntt_matches_openfhe_profiles() {
+        gpu_device_sync();
+        let ring_dimension = std::env::var("MXX_TEST_GPU_NTT_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().expect("invalid test GPU NTT ring dimension"))
+            .unwrap_or(256);
+        assert!(ring_dimension >= 2 && ring_dimension.is_power_of_two());
+
+        for crt_bits in [28usize, 50] {
+            let cpu_params = DCRTPolyParams::new(ring_dimension, 2, crt_bits, 8);
+            let gpu_params = gpu_params_from_cpu(&cpu_params);
+            let mut random = rng();
+            let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
+            let rhs_cpu = random_cpu_matrix(&cpu_params, 3, 5, &mut random);
+            let expected = &lhs_cpu * &rhs_cpu;
+            let lhs = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &lhs_cpu);
+            let payload_owner =
+                CpuSmallMatrix::new(rhs_cpu, cpu_params.modulus().as_ref().clone()).unwrap();
+            let rhs = GpuSmallMatrix::from_canonical_coefficients(
+                &gpu_params,
+                3,
+                5,
+                payload_owner.max_coefficient_bound().clone(),
+                &payload_owner.to_canonical_coefficients().unwrap(),
+            )
+            .unwrap();
+
+            let production = lhs.multiply_small_rhs(&rhs).unwrap();
+            assert_eq!(
+                production.to_cpu_matrix(),
+                expected,
+                "OpenFHE-order result mismatch for {crt_bits}-bit limbs"
+            );
+
+            let report = rhs.allocation_report(&lhs).unwrap();
+            let expected_word_bytes = if crt_bits <= 32 { 4 } else { 8 };
+            assert_eq!(report.workspace_word_bytes, expected_word_bytes);
+            assert_eq!(
+                report.ntt_preparation_launches,
+                small_rhs_ntt_preparation_launches(ring_dimension as usize, 1).unwrap()
+            );
+            assert_eq!(report.u32_workspace_limb_count, usize::from(crt_bits <= 32) * 2);
+            assert_eq!(report.u64_workspace_limb_count, usize::from(crt_bits > 32) * 2);
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_small_rhs_mixed_width_groups_match_openfhe() {
+        gpu_device_sync();
+        let ring_dimension = std::env::var("MXX_TEST_GPU_NTT_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().expect("invalid test GPU NTT ring dimension"))
+            .unwrap_or(256);
+        assert!(ring_dimension >= 2 && ring_dimension.is_power_of_two());
+        let (narrow_moduli, _, _) = DCRTPolyParams::new(ring_dimension, 1, 28, 8).to_crt();
+        let (wide_moduli, _, _) = DCRTPolyParams::new(ring_dimension, 1, 50, 8).to_crt();
+        let params =
+            GpuDCRTPolyParams::new(ring_dimension, vec![narrow_moduli[0], wide_moduli[0]], 8);
+        assert!(params.moduli()[0] <= u32::MAX as u64);
+        assert!(params.moduli()[1] > u32::MAX as u64);
+
+        let lhs = gpu_constant_matrix(&params, 2, 3, 0);
+        let rhs_full = gpu_constant_matrix(&params, 3, 5, 0);
+        let expected = lhs.to_cpu_matrix() * rhs_full.to_cpu_matrix();
+        let rhs_coeff = rhs_full.into_coeff_domain();
+        let mut rhs = GpuSmallMatrix::new_empty(&params, 3, 5, BigUint::from(15u8)).unwrap();
+        rhs.prepare_preimage_hard_cutoff();
+        assert!(rhs.try_pack_preimage_hard_cutoff_tile(&rhs_coeff, 0, 0, 3, 5).unwrap());
+
+        let production = lhs.multiply_small_rhs(&rhs).unwrap();
+        assert_eq!(production.to_cpu_matrix(), expected);
+
+        let report = rhs.allocation_report(&lhs).unwrap();
+        assert_eq!(report.workspace_word_bytes, 0);
+        assert_eq!(report.u32_workspace_limb_count, 1);
+        assert_eq!(report.u64_workspace_limb_count, 1);
+        assert_eq!(
+            report.ntt_preparation_launches,
+            small_rhs_ntt_preparation_launches(ring_dimension as usize, 2).unwrap()
+        );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_small_rhs_direct_dif_covers_small_shapes_and_column_tails() {
+        gpu_device_sync();
+        for ring_dimension in [32u32, 64] {
+            for crt_bits in [28usize, 50] {
+                let cpu_params = DCRTPolyParams::new(ring_dimension, 2, crt_bits, 8);
+                let gpu_params = gpu_params_from_cpu(&cpu_params);
+                for lhs_rows in [1usize, 2] {
+                    let mut random = rng();
+                    let lhs_cpu = random_cpu_matrix(&cpu_params, lhs_rows, 3, &mut random);
+                    let lhs = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &lhs_cpu);
+                    for rhs_columns in [1usize, 2, 3, 4, 8, 9, 10, 176] {
+                        let rhs_cpu = signed_cycle_cpu_matrix(&cpu_params, 3, rhs_columns);
+                        let expected = &lhs_cpu * &rhs_cpu;
+                        let payload_owner =
+                            CpuSmallMatrix::new(rhs_cpu, BigUint::from(1u8)).unwrap();
+                        let rhs = GpuSmallMatrix::from_canonical_coefficients(
+                            &gpu_params,
+                            3,
+                            rhs_columns,
+                            BigUint::from(1u8),
+                            &payload_owner.to_canonical_coefficients().unwrap(),
+                        )
+                        .unwrap();
+                        let production = lhs.multiply_small_rhs(&rhs).unwrap();
+                        assert_eq!(
+                            production.to_cpu_matrix(),
+                            expected,
+                            "OpenFHE mismatch for N={ring_dimension}, crt_bits={crt_bits}, rows={lhs_rows}, columns={rhs_columns}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_small_rhs_column_shards_reconstruct_full_result() {
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(64, 2, 28, 8);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let mut random = rng();
+        let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
+        let rhs_cpu = signed_cycle_cpu_matrix(&cpu_params, 3, 10);
+        let expected = &lhs_cpu * &rhs_cpu;
+        let lhs = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &lhs_cpu);
+        let payload_owner = CpuSmallMatrix::new(rhs_cpu, BigUint::from(1u8)).unwrap();
+        let rhs = GpuSmallMatrix::from_canonical_coefficients(
+            &gpu_params,
+            3,
+            10,
+            BigUint::from(1u8),
+            &payload_owner.to_canonical_coefficients().unwrap(),
+        )
+        .unwrap();
+
+        let full = lhs.multiply_small_rhs(&rhs).unwrap();
+        let first = lhs.multiply_small_rhs(&rhs.slice_columns(0, 1)).unwrap();
+        let middle = lhs.multiply_small_rhs(&rhs.slice_columns(1, 4)).unwrap();
+        let last = lhs.multiply_small_rhs(&rhs.slice_columns(4, 10)).unwrap();
+        let reconstructed = first.concat_columns_owned(vec![middle, last]);
+        assert_eq!(reconstructed, full);
+        assert_eq!(reconstructed.to_cpu_matrix(), expected);
     }
 
     #[test]

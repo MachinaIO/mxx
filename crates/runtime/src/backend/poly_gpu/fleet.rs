@@ -6,6 +6,7 @@ use crate::{
     gpu_calibration::{
         FrozenGpuCalibrationRegistry, GpuCalibrationError, GpuCalibrationKey,
         GpuCalibrationProfile, GpuColumnWidths, GpuDeviceCalibration, GpuDeviceMemory,
+        gpu_capped_waterfill_columns, gpu_matrix_multiply_scales_left,
     },
 };
 use mxx_ir_core::{
@@ -15,7 +16,6 @@ use mxx_ir_core::{
     types::ConcreteMatrixType,
 };
 use mxx_primitives::{
-    env::gpu_vram_percent,
     matrix::{
         PolyMatrix, PolyMatrixSmallRhs, SmallPolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
@@ -86,12 +86,12 @@ fn fleet_column_ranges(
     widths: GpuColumnWidths,
 ) -> Vec<(usize, usize, usize)> {
     assert!(device_count > 0, "a GPU fleet needs at least one device");
-    let nonzero = widths.nonzero.unwrap_or(widths.gpu0);
     let mut ranges = Vec::new();
     let mut start = 0usize;
     while start < columns {
-        for device in 0..device_count {
-            let width = if device == 0 { widths.gpu0 } else { nonzero };
+        let assigned = gpu_capped_waterfill_columns(widths, device_count, columns - start)
+            .expect("validated GPU column capacities");
+        for (device, width) in assigned.into_iter().enumerate() {
             let end = start.saturating_add(width).min(columns);
             if start < end {
                 ranges.push((device, start, end));
@@ -109,11 +109,12 @@ fn fleet_column_wave(
     widths: GpuColumnWidths,
     duplicate_nonzero_pilot: bool,
 ) -> Vec<(usize, usize, usize)> {
-    let nonzero = widths.nonzero.unwrap_or(widths.gpu0);
+    let assigned =
+        gpu_capped_waterfill_columns(widths, device_count, columns.saturating_sub(start))
+            .expect("validated GPU column capacities");
     let mut next = start;
     let mut wave = Vec::with_capacity(device_count);
-    for device in 0..device_count {
-        let width = if device == 0 { widths.gpu0 } else { nonzero };
+    for (device, width) in assigned.into_iter().enumerate() {
         let end = next.saturating_add(width).min(columns);
         if next < end {
             wave.push((device, next, end));
@@ -135,6 +136,39 @@ fn pilot_interval_was_contaminated(baseline: &[u64], used_current: &[u64]) -> bo
 
 fn contaminated_pilot_can_retry(attempts: usize) -> bool {
     attempts < MAX_RUNTIME_PILOT_ATTEMPTS
+}
+
+fn fleet_context_vram_percent<T>(
+    placements: &[Vec<T>],
+    fixed_percent: impl Fn(&T) -> u32,
+    fixed_budget: impl Fn(&T) -> usize,
+) -> Result<u32, String> {
+    let first = placements
+        .first()
+        .and_then(|placement| placement.first())
+        .ok_or_else(|| "a GPU fleet needs nonempty device parameters".to_owned())?;
+    let fleet_percent = fixed_percent(first);
+    for (placement, parameters) in placements.iter().enumerate() {
+        let first = parameters
+            .first()
+            .ok_or_else(|| format!("GPU placement {placement} has no parameters"))?;
+        let placement_budget = fixed_budget(first);
+        for parameters in parameters {
+            let percent = fixed_percent(parameters);
+            if percent != fleet_percent {
+                return Err(format!(
+                    "GPU fleet contexts disagree on fixed VRAM percentage: expected {fleet_percent}, got {percent} at placement {placement}"
+                ));
+            }
+            let budget = fixed_budget(parameters);
+            if budget != placement_budget {
+                return Err(format!(
+                    "GPU placement {placement} contexts disagree on fixed VRAM budget: expected {placement_budget}, got {budget}"
+                ));
+            }
+        }
+    }
+    Ok(fleet_percent)
 }
 
 fn derive_runtime_widths(
@@ -363,6 +397,12 @@ struct RuntimePilot {
 impl GpuDcrtBackend {
     pub(super) fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
         assert!(!placements.is_empty(), "a GPU fleet needs at least one device");
+        let vram_percent = fleet_context_vram_percent(
+            &placements,
+            GpuDCRTPolyParams::vram_percent,
+            GpuDCRTPolyParams::vram_budget_bytes,
+        )
+        .unwrap_or_else(|error| panic!("invalid GPU fleet context configuration: {error}"));
         let devices = placements
             .into_iter()
             .map(|parameters| {
@@ -383,7 +423,7 @@ impl GpuDcrtBackend {
             pending_pilot: None,
             active_operation: None,
             calibration_registry: FrozenGpuCalibrationRegistry::default(),
-            vram_percent: gpu_vram_percent().expect("invalid MXX_GPU_VRAM_PERCENT"),
+            vram_percent,
             matrix_replicas: HashMap::new(),
         }
     }
@@ -397,6 +437,11 @@ impl GpuDcrtBackend {
 
     pub fn calibration_registry(&self) -> &FrozenGpuCalibrationRegistry {
         &self.calibration_registry
+    }
+
+    /// Percentage of physical VRAM fixed when this fleet context was created.
+    pub fn vram_percent(&self) -> u32 {
+        self.vram_percent
     }
 
     pub fn set_column_widths_for_operation(
@@ -1147,6 +1192,65 @@ mod tests {
         assert!(backend.column_widths(operation).is_some());
     }
 
+    fn first_bidirectional_peer_pair(
+        detected: &[i32],
+        parameters: &GpuDCRTPolyParams,
+    ) -> Option<[i32; 2]> {
+        for (index, &left_device) in detected.iter().enumerate() {
+            for &right_device in &detected[index + 1..] {
+                let left_params = parameters.params_for_device(left_device);
+                let right_params = parameters.params_for_device(right_device);
+                let left = GpuDCRTPolyMatrix::zero(&left_params, 1, 1);
+                if left.copy_to_params_direct(&right_params).is_none() {
+                    continue;
+                }
+                let right = GpuDCRTPolyMatrix::zero(&right_params, 1, 1);
+                if right.copy_to_params_direct(&left_params).is_some() {
+                    return Some([left_device, right_device]);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn gpu_fleet_uses_context_vram_percent_after_environment_changes() {
+        let device = detected_gpu_device_ids()[0];
+        super::super::wait_for_gpu_test_context_quiescence(device);
+        let name = "MXX_GPU_VRAM_PERCENT";
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, "37") };
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        unsafe { std::env::set_var(name, "91") };
+        let backend = super::super::gpu_backend_on([parameters], [device]);
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        assert_eq!(backend.vram_percent(), 37);
+    }
+
+    #[test]
+    fn fleet_vram_configuration_rejects_inconsistent_contexts() {
+        assert!(
+            fleet_context_vram_percent(
+                &[vec![(37, 3_700)], vec![(80, 8_000)]],
+                |value| value.0,
+                |value| value.1
+            )
+            .is_err()
+        );
+        assert!(
+            fleet_context_vram_percent(
+                &[vec![(37, 3_700), (37, 3_701)]],
+                |value| value.0,
+                |value| value.1
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn fleet_ranges_preserve_role_widths_across_multiple_waves() {
         let ranges = fleet_column_ranges(3, 17, GpuColumnWidths { gpu0: 2, nonzero: Some(3) });
@@ -1163,6 +1267,22 @@ mod tests {
             ]
         );
         assert!(ranges.windows(2).all(|pair| pair[0].2 == pair[1].1));
+    }
+
+    #[test]
+    fn fleet_ranges_waterfill_every_partial_wave() {
+        let equal = GpuColumnWidths { gpu0: 100, nonzero: Some(100) };
+        assert_eq!(fleet_column_wave(2, 0, 176, equal, false), vec![(0, 0, 88), (1, 88, 176)]);
+        assert_eq!(
+            fleet_column_ranges(2, 250, equal),
+            vec![(0, 0, 100), (1, 100, 200), (0, 200, 225), (1, 225, 250)]
+        );
+
+        let unequal = GpuColumnWidths { gpu0: 20, nonzero: Some(100) };
+        assert_eq!(
+            fleet_column_wave(3, 0, 176, unequal, false),
+            vec![(0, 0, 20), (1, 20, 98), (2, 98, 176)]
+        );
     }
 
     #[test]
@@ -1271,6 +1391,96 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires at least two GPUs with bidirectional peer access"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_bidirectional_peer_fleet_small_rhs_waves_match_single_device_canonical_output() {
+        let detected = detected_gpu_device_ids();
+        assert!(detected.len() >= 2, "this ignored test requires at least two detected GPUs");
+        for &device in &detected {
+            super::super::wait_for_gpu_test_context_quiescence(device);
+        }
+
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let devices = first_bidirectional_peer_pair(&detected, &parameters).unwrap_or_else(|| {
+            panic!(
+                "this ignored test requires a GPU pair with bidirectional CUDA peer access; \
+                 detected devices {detected:?} have no compatible pair"
+            )
+        });
+        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let gadget_base = BigInt::from(1u8) << parameters.base_bits();
+        let operation = [117u8; 32];
+        let hash_key: [u8; 32] = rand::random();
+        let mut fleet = super::super::gpu_backend_on([parameters.clone()], devices.iter().copied());
+        assert!(
+            fleet.devices.iter().map(|(device, _)| *device).eq(devices),
+            "test backend must use exactly the selected bidirectional peer pair"
+        );
+        fleet.set_column_widths_for_operation(
+            operation,
+            GpuColumnWidths { gpu0: 1, nonzero: Some(1) },
+        );
+        fleet.select_operation(operation).unwrap();
+
+        let source_type = ConcreteMatrixType {
+            modulus: modulus.clone(),
+            ring_dimension: 32,
+            rows: 1,
+            columns: 9,
+        };
+        let source = fleet.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
+        assert!(source.shards().len() > devices.len(), "test must use multiple waves");
+        assert!(
+            devices
+                .iter()
+                .all(|device| { source.shards().iter().any(|shard| shard.device_id == *device) })
+        );
+
+        let decomposed = fleet.gadget_decompose(&source, false).unwrap();
+        let digits = parameters.modulus_digits();
+        let gadget_type = ConcreteMatrixType { rows: 1, columns: digits, ..source_type.clone() };
+        let gadget = fleet
+            .constant_matrix(
+                &gadget_type,
+                &ConstantMatrix::Gadget {
+                    base: IntExpr::constant(gadget_base.clone()),
+                    small: false,
+                },
+                &ParamEnv::default(),
+            )
+            .unwrap();
+        let fleet_output = fleet.multiply_small_rhs(&gadget, &decomposed).unwrap();
+        assert!(fleet_output.shards().len() > devices.len());
+        assert!(
+            devices
+                .iter()
+                .all(|device| fleet_output.shards().iter().any(|shard| shard.device_id == *device))
+        );
+        let fleet_source_bytes = fleet.matrix_to_bytes(&source);
+        let fleet_output_bytes = fleet.matrix_to_bytes(&fleet_output);
+        assert_eq!(fleet_output_bytes, fleet_source_bytes);
+
+        let mut single = super::super::gpu_backend_on([parameters], [devices[0]]);
+        single.set_column_widths_for_operation(
+            operation,
+            GpuColumnWidths { gpu0: source_type.columns, nonzero: None },
+        );
+        single.select_operation(operation).unwrap();
+        let single_source =
+            single.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
+        let single_decomposed = single.gadget_decompose(&single_source, false).unwrap();
+        let single_gadget = single
+            .constant_matrix(
+                &gadget_type,
+                &ConstantMatrix::Gadget { base: IntExpr::constant(gadget_base), small: false },
+                &ParamEnv::default(),
+            )
+            .unwrap();
+        let single_output = single.multiply_small_rhs(&single_gadget, &single_decomposed).unwrap();
+        assert_eq!(fleet_output_bytes, single.matrix_to_bytes(&single_output));
+    }
+
+    #[test]
     #[serial_test::serial(gpu_context)]
     fn gpu_runtime_miss_records_a_profile_and_cache_hit_defers_width_derivation() {
         let device = detected_gpu_device_ids()[0];
@@ -1336,6 +1546,7 @@ mod tests {
         };
         let source = backend.sample_hash(&ty, [11u8; 32], b"wide-pilot-input").unwrap();
         assert_eq!(source.shards().len(), 1);
+        let expected_source = backend.gather_matrix_for_host(&source).unwrap();
         let scalar_ty = ConcreteMatrixType { columns: 1, ..ty.clone() };
         let scalar = backend
             .constant_matrix(&scalar_ty, &ConstantMatrix::Identity, &ParamEnv::default())
@@ -1365,11 +1576,21 @@ mod tests {
             ty.columns.div_ceil(backend.column_widths(&multiply_operation).unwrap().gpu0)
         );
 
+        let scalar_right_operation = [35u8; 32];
+        backend.select_operation(scalar_right_operation).unwrap();
+        let scalar_right = backend.multiply(&source, &scalar).unwrap();
+        assert_eq!((scalar_right.rows, scalar_right.columns), (ty.rows, ty.columns));
+        assert_eq!(backend.gather_matrix_for_host(&scalar_right).unwrap(), expected_source);
+
         let accumulate_operation = [34u8; 32];
         backend.select_operation(accumulate_operation).unwrap();
         let accumulated = backend
             .matrix_mul_accumulate(MatrixMulAccumulateRequest {
-                products: vec![(BigInt::from(1u8), Arc::new(scalar), Arc::new(source))],
+                products: vec![(
+                    BigInt::from(1u8),
+                    Arc::new(scalar.clone()),
+                    Arc::new(source.clone()),
+                )],
                 bias: None,
             })
             .unwrap();
@@ -1377,6 +1598,29 @@ mod tests {
             accumulated.shards().len(),
             ty.columns.div_ceil(backend.column_widths(&accumulate_operation).unwrap().gpu0)
         );
+
+        let mixed_operation = [36u8; 32];
+        backend.select_operation(mixed_operation).unwrap();
+        let mixed = backend
+            .matrix_mul_accumulate(MatrixMulAccumulateRequest {
+                products: vec![
+                    (BigInt::from(0u8), Arc::new(scalar.clone()), Arc::new(source.clone())),
+                    (BigInt::from(1u8), Arc::new(source.clone()), Arc::new(scalar)),
+                ],
+                bias: None,
+            })
+            .unwrap();
+        assert_eq!(backend.active_operation, Some(mixed_operation));
+        assert_eq!((mixed.rows, mixed.columns), (ty.rows, ty.columns));
+        assert!(mixed.shards.windows(2).all(|pair| {
+            pair[0].global_column_start + pair[0].value.col_size() == pair[1].global_column_start
+        }));
+        assert_eq!(
+            mixed.shards.last().unwrap().global_column_start +
+                mixed.shards.last().unwrap().value.col_size(),
+            ty.columns
+        );
+        assert_eq!(backend.gather_matrix_for_host(&mixed).unwrap(), expected_source);
     }
 
     #[test]
@@ -1709,22 +1953,48 @@ impl Backend for GpuDcrtBackend {
         request: MatrixMulAccumulateRequest<Self::Matrix>,
     ) -> Result<Self::Matrix, Self::Error> {
         let first = request.products.first().expect("validated request has a product");
-        let output_columns = first.2.columns;
-        let output_rows = first.1.rows;
-        let mut left_replicas = Vec::with_capacity(request.products.len());
-        for (_, left, _) in &request.products {
-            left_replicas.push(
+        let first_scales_left = gpu_matrix_multiply_scales_left(
+            first.1.rows,
+            first.1.columns,
+            first.2.rows,
+            first.2.columns,
+        );
+        let output_columns = if first_scales_left { first.1.columns } else { first.2.columns };
+        let output_rows = if first.1.size() == (1, 1) { first.2.rows } else { first.1.rows };
+        let mut fixed_replicas = Vec::with_capacity(request.products.len());
+        for (_, left, right) in &request.products {
+            let scales_left =
+                gpu_matrix_multiply_scales_left(left.rows, left.columns, right.rows, right.columns);
+            let product_rows = if left.size() == (1, 1) { right.rows } else { left.rows };
+            let product_columns = if scales_left { left.columns } else { right.columns };
+            if (product_rows, product_columns) != (output_rows, output_columns) {
+                return Err(PolyBackendError::InvalidInteger);
+            }
+            let fixed = if scales_left { right } else { left };
+            fixed_replicas.push(
                 (0..self.devices.len())
-                    .map(|device| self.full_matrix_on_device(device, left))
+                    .map(|device| self.full_matrix_on_device(device, fixed))
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
         if self.runtime_pilot_is_pending() {
-            request.products.iter().for_each(|(_, _, right)| right.wait_until_ready());
+            request.products.iter().for_each(|(_, left, right)| {
+                let scalable = if gpu_matrix_multiply_scales_left(
+                    left.rows,
+                    left.columns,
+                    right.rows,
+                    right.columns,
+                ) {
+                    left
+                } else {
+                    right
+                };
+                scalable.wait_until_ready();
+            });
             if let Some(bias) = &request.bias {
                 bias.wait_until_ready();
             }
-            left_replicas.iter().flatten().for_each(|replica| replica.wait_until_ready());
+            fixed_replicas.iter().flatten().for_each(|replica| replica.wait_until_ready());
         }
         self.restart_runtime_pilot_after_fixed_inputs()
             .map_err(PolyBackendError::GpuCalibration)?;
@@ -1740,17 +2010,25 @@ impl Backend for GpuDcrtBackend {
                 .filter_map(|(device, (device_id, backend))| {
                     let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
                     let mut products = Vec::with_capacity(request.products.len());
-                    for (product, replicas) in request.products.iter().zip(&left_replicas) {
-                        let right =
-                            match Self::matrix_piece_on_device(backend, &product.2, start, end) {
-                                Ok(right) => right,
+                    for (product, replicas) in request.products.iter().zip(&fixed_replicas) {
+                        let scales_left = gpu_matrix_multiply_scales_left(
+                            product.1.rows,
+                            product.1.columns,
+                            product.2.rows,
+                            product.2.columns,
+                        );
+                        let scalable = if scales_left { &product.1 } else { &product.2 };
+                        let piece =
+                            match Self::matrix_piece_on_device(backend, scalable, start, end) {
+                                Ok(piece) => Arc::new(piece),
                                 Err(error) => return Some(Err(error)),
                             };
-                        products.push((
-                            product.0.clone(),
-                            replicas[device].clone(),
-                            Arc::new(right),
-                        ));
+                        let (left, right) = if scales_left {
+                            (piece, replicas[device].clone())
+                        } else {
+                            (replicas[device].clone(), piece)
+                        };
+                        products.push((product.0.clone(), left, right));
                     }
                     let bias = match request.bias.as_ref() {
                         Some(bias) => match Self::matrix_piece_on_device(backend, bias, start, end)

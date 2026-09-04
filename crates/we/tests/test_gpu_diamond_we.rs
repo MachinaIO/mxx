@@ -1,7 +1,7 @@
 #![cfg(feature = "gpu")]
 
 use keccak_asm::Keccak256;
-use mxx_bench_estimator::{EstimateConfig, harness::MeasurementHarnessConfig};
+use mxx_bench_estimator::harness::MeasurementHarnessConfig;
 use mxx_gadgets::circuit::{
     BooleanCircuitData, BooleanCircuitShape, BooleanGateData, BooleanGateKind,
 };
@@ -117,12 +117,8 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
             ..MeasurementHarnessConfig::default()
         },
     );
-    let estimate = estimate_diamond_cost(
-        &selected.compiler,
-        &mut measurement_backend,
-        &EstimateConfig { device_pool_size: effective_parallel_width, per_instance_occupancy: 1 },
-    )
-    .expect("GPU Diamond WE graph cost estimation");
+    let estimate = estimate_diamond_cost(&selected.compiler, &mut measurement_backend)
+        .expect("GPU Diamond WE graph cost estimation");
     info!(
         encryption_work_seconds = estimate.encryption.total_work_seconds,
         encryption_critical_path_seconds = estimate.encryption.critical_path_seconds,

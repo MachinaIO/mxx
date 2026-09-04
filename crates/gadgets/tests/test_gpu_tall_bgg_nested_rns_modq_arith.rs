@@ -2,8 +2,7 @@
 
 use bigdecimal::BigDecimal;
 use mxx_bench_estimator::{
-    CostReport, EstimateConfig, estimate, gpu::GpuNodeMeasurementBackend,
-    harness::MeasurementHarnessConfig,
+    CostReport, estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
 };
 use mxx_bgg::{
     BggEncodingWire, BggPublicKeyCompiler, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
@@ -1674,10 +1673,6 @@ fn benchmark_estimation(
         measured_iterations: config.benchmark_iterations,
         memory_poll_interval: Duration::from_millis(1),
     };
-    // A measured GPU primitive consumes the complete fleet. Do not count the device count again
-    // as independent estimator capacity; column concurrency is calibrated inside the backend.
-    let estimator_config = EstimateConfig { device_pool_size: 1, per_instance_occupancy: 1 };
-    let preprocessing_estimator_config = estimator_config.clone();
     info!(
         gpu_count = device_ids.len(),
         measurement_workers = device_ids.len(),
@@ -1691,10 +1686,8 @@ fn benchmark_estimation(
     let mut backend =
         GpuNodeMeasurementBackend::new(backends, harness, selected.parameters.to_crt().2);
     info!("collecting unique GPU measurement shapes");
-    estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
-        .map_err(|error| error.to_string())?;
-    estimate(&encoding_graph, &mut backend, &estimator_config)
-        .map_err(|error| error.to_string())?;
+    estimate(&preprocessing_graph, &mut backend).map_err(|error| error.to_string())?;
+    estimate(&encoding_graph, &mut backend).map_err(|error| error.to_string())?;
     let measurement_started = Instant::now();
     backend.measure_collected().map_err(|error| error.to_string())?;
     info!(
@@ -1705,8 +1698,7 @@ fn benchmark_estimation(
     let preprocessing_started = Instant::now();
     info!(subgraph = "preprocessing", "benchmark subgraph estimation begin");
     let preprocessing_report =
-        estimate(&preprocessing_graph, &mut backend, &preprocessing_estimator_config)
-            .map_err(|error| error.to_string())?;
+        estimate(&preprocessing_graph, &mut backend).map_err(|error| error.to_string())?;
     info!(subgraph = "preprocessing", elapsed = ?preprocessing_started.elapsed(), "benchmark subgraph estimation complete");
     info!(
         lookup_preimage_count = selected.lookup_preimage_count,
@@ -1716,8 +1708,8 @@ fn benchmark_estimation(
     log_cost_report("TallBggPreprocessing", &preprocessing_report);
     let encoding_started = Instant::now();
     info!(subgraph = "encoding", "benchmark subgraph estimation begin");
-    let encoding_report = estimate(&encoding_graph, &mut backend, &estimator_config)
-        .map_err(|error| error.to_string())?;
+    let encoding_report =
+        estimate(&encoding_graph, &mut backend).map_err(|error| error.to_string())?;
     info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggEncoding", &encoding_report);
     let calibration_registry = backend.calibration_registry().freeze();

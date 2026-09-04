@@ -33,7 +33,7 @@ pub use circuit::{
 };
 pub use encoding::{
     BggEncodingCompiler, BggEncodingSampler, BggEncodingType, BggEncodingWire, BggSampleError,
-    BggSamplerLayout, EncodingCompileError, PreimageCoefficientBound,
+    BggSamplerLayout, EncodingCompileError,
 };
 pub use lwe_lookup::{
     LweLookupArtifactNames, LweLookupArtifactWires, LweLookupArtifacts, LweLookupCompileError,

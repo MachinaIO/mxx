@@ -19,9 +19,7 @@ int launch_sample_distribution_multi_limb_kernel(
     uint64_t max_coefficient_bound,
     uint64_t coefficient_modulus,
     gpu_chacha::GpuRngSeed seed,
-    cudaStream_t stream,
-    const GpuMatrix *,
-    const dim3 *);
+    cudaStream_t stream);
 
 #ifdef __cplusplus
 extern "C"
@@ -45,15 +43,6 @@ extern "C"
         gpu_chacha::GpuRngSeed seed,
         size_t full_ncol,
         size_t col_offset);
-
-    int gpu_matrix_sample_distribution_batch(
-        GpuMatrix *const *outputs,
-        size_t output_count,
-        int dist_type,
-        double sigma,
-        uint64_t max_coefficient_bound,
-        uint64_t coefficient_modulus,
-        const gpu_chacha::GpuRngSeed *seeds);
 
 #ifdef __cplusplus
 }

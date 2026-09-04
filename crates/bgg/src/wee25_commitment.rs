@@ -111,7 +111,7 @@ impl Wee25CommitmentCompiler {
     ) -> Result<DslContext, DslError> {
         context
             .public_output("wee25_commitment", tree.root)?
-            .public_family_output("wee25_commitment_nodes", tree.cached_nodes)
+            .public_output("wee25_commitment_nodes", tree.cached_nodes)
     }
 
     fn commit_level(
@@ -165,13 +165,12 @@ impl Wee25CommitmentCompiler {
                     tag,
                     (self.secret_size, self.public_columns()),
                 );
-                let digit = self
-                    .ring()
-                    .constant(
+                let digit = decomposition
+                    .clone()
+                    .mul_small_rhs(self.ring().constant(
                         (1, self.gadget_rows()),
                         ConstantMatrix::UnitRow { index: digit_row.into() },
-                    )
-                    .mul_small_rhs(decomposition.clone())
+                    ))
                     .slice(
                         Some(IndexRange { start: 0.into(), end: 1.into() }),
                         Some(IndexRange { start: column.into(), end: (column + 1).into() }),

@@ -24,6 +24,4 @@ pub use graph::{
 pub use parameter_search::{
     DiamondParameterSearch, DiamondParameterSearchError, DiamondSelectedParameters,
 };
-pub use runtime::{
-    DiamondDecryptionResult, DiamondRuntimeError, DiamondWeCiphertext, DiamondWeRuntime,
-};
+pub use runtime::{DiamondRuntimeError, DiamondWeCiphertext, DiamondWeRuntime};

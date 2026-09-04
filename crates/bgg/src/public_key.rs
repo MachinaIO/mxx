@@ -5,7 +5,7 @@ use mxx_dsl::{
     Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Parallel, Pending,
     Preimage, Ring,
 };
-use mxx_ir_core::{IntExpr, ValueHandle};
+use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
 #[derive(Clone)]
 pub struct BggPublicKeyWire {
@@ -70,9 +70,6 @@ pub struct BggPublicKeyCompiler {
 
 impl BggPublicKeyCompiler {
     pub fn add(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
-        // Public matrices add in the same coordinates as their encodings:
-        // A_out = A_L + A_R, with the reveal bit retained only when both
-        // plaintext relations are known.
         BggPublicKeyWire {
             matrix: lhs.matrix.clone() + rhs.matrix.clone(),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
@@ -80,8 +77,6 @@ impl BggPublicKeyCompiler {
     }
 
     pub fn sub(&self, lhs: &BggPublicKeyWire, rhs: &BggPublicKeyWire) -> BggPublicKeyWire {
-        // Subtraction forms A_out = A_L - A_R component by component; no
-        // decomposition is needed because the gadget-column layout is fixed.
         BggPublicKeyWire {
             matrix: lhs.matrix.clone() - rhs.matrix.clone(),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
@@ -100,16 +95,13 @@ impl BggPublicKeyCompiler {
         rhs: &BggPublicKeyWire,
         decomposed_rhs: Preimage,
     ) -> BggPublicKeyWire {
-        // If G K_R = A_R, then A_L K_R is the public-key product A_L G^-1(A_R).
         BggPublicKeyWire {
-            matrix: lhs.matrix.clone().mul_small_rhs(decomposed_rhs),
+            matrix: decomposed_rhs.mul_small_rhs(lhs.matrix.clone()),
             reveal_plaintext: lhs.reveal_plaintext && rhs.reveal_plaintext,
         }
     }
 
     pub fn small_scalar_mul(&self, input: &BggPublicKeyWire, scalar: &Mat) -> BggPublicKeyWire {
-        // Small-scalar multiplication is the direct relation A_out = A * t;
-        // the scalar does not require gadget decomposition.
         BggPublicKeyWire {
             matrix: input.matrix.clone() * scalar.clone(),
             reveal_plaintext: input.reveal_plaintext,
@@ -123,11 +115,8 @@ impl BggPublicKeyCompiler {
 
     pub fn matrix_mul(&self, input: &BggPublicKeyWire, target: &Mat) -> BggPublicKeyWire {
         let decomposed = target.clone().decompose(self.base.clone(), self.digit_count.clone());
-        // For an arbitrary target T, this computes A G^-1(T) by the relation
-        // G K_T = T.  T is only a consumed matrix target, not a claim that it
-        // is itself a canonical gadget encoding.
         BggPublicKeyWire {
-            matrix: input.matrix.clone().mul_small_rhs(decomposed),
+            matrix: decomposed.mul_small_rhs(input.matrix.clone()),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -138,7 +127,7 @@ impl BggPublicKeyCompiler {
         decomposed: Preimage,
     ) -> BggPublicKeyWire {
         BggPublicKeyWire {
-            matrix: input.matrix.clone().mul_small_rhs(decomposed),
+            matrix: decomposed.mul_small_rhs(input.matrix.clone()),
             reveal_plaintext: input.reveal_plaintext,
         }
     }
@@ -150,10 +139,7 @@ impl BggPublicKeyCompiler {
     ) -> Preimage {
         let rows = input.matrix.matrix_type().rows.clone();
         let gadget = self.ring.gadget(rows, self.base.clone(), self.digit_count.clone());
-        // A large scalar t must be converted into a gadget-carried target tG.
-        // Decomposing `t * G` therefore yields K_t with G K_t = tG, so applying
-        // K_t has exactly the intended scalar action on the public matrix.
-        (scalar.clone() * gadget).decompose(self.base.clone(), self.digit_count.clone())
+        (gadget * scalar.clone()).decompose(self.base.clone(), self.digit_count.clone())
     }
 }
 
@@ -176,13 +162,23 @@ impl BggPublicKeySampler {
     ) -> Result<BggPublicKeyFamily, DslError> {
         let count = count.into();
         let columns = public_key_columns.into();
-        let ring = self.layout.ring();
-        let base_tag = tag.into();
-        let rows = self.layout.secret_dimension;
-        let matrices = Parallel::range(count).map_values(move |index| {
-            let mut indexed_tag = base_tag.clone();
-            indexed_tag.push(index);
-            ring.hash_matrix(hash_key.clone(), indexed_tag, (rows, columns.clone()))
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (
+                IntExpr::constant(self.layout.secret_dimension),
+                IntExpr::Mul(Box::new(columns.clone()), Box::new(count.clone())),
+            ),
+        );
+        let matrices = Parallel::range(count).map_values(|index| {
+            let start = IntExpr::Mul(Box::new(columns.clone()), Box::new(index.expression()));
+            packed.clone().slice(
+                None,
+                Some(IndexRange {
+                    start: start.clone(),
+                    end: IntExpr::Add(Box::new(start), Box::new(columns.clone())),
+                }),
+            )
         })?;
         Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
     }
@@ -196,19 +192,20 @@ impl BggPublicKeySampler {
     ) -> Vec<BggPublicKeyWire> {
         let count = reveal_plaintexts.len() + 1;
         let columns = self.layout.public_key_columns();
-        let ring = self.layout.ring();
-        let base_tag = tag.into();
-        let rows = self.layout.secret_dimension;
-        let matrices = Parallel::range(count)
-            .map_values(move |index| {
-                let mut indexed_tag = base_tag.clone();
-                indexed_tag.push(index);
-                ring.hash_matrix(hash_key.clone(), indexed_tag, (rows, columns))
-            })
-            .expect("static public-key family layout is valid");
+        let packed = self.layout.ring().hash_matrix(
+            hash_key,
+            tag,
+            (self.layout.secret_dimension, columns * count),
+        );
         (0..count)
             .map(|index| BggPublicKeyWire {
-                matrix: matrices.get_static(index),
+                matrix: packed.clone().slice(
+                    None,
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
+                ),
                 reveal_plaintext: index == 0 || reveal_plaintexts[index - 1],
             })
             .collect()
@@ -241,19 +238,14 @@ mod tests {
             .expect("output")
             .build()
             .expect("build");
-        mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid graph");
-        let kinds = built
-            .graph
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .map(|node| node.kind())
-            .collect::<Vec<_>>();
+        let nodes =
+            built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
         assert_eq!(
-            kinds.iter().filter(|kind| matches!(kind, NodeKind::MatrixMulSmallRhs)).count(),
-            1,
-            "public-key multiplication must consume the bounded decomposition directly",
+            nodes.iter().filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)).count(),
+            1
         );
+        assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
+        mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid graph");
     }
 
     #[test]

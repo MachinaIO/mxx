@@ -21,6 +21,8 @@ pub struct Aky24IoConfig {
     pub input_size: usize,
     pub gadget_base: BigInt,
     pub digit_count: usize,
+    /// Inclusive coefficient bound for compact preimages produced by B.1.
+    pub preimage_max_coefficient_bound: BigInt,
     /// The Appendix B.1 high/low decomposition divisor `M`.
     pub modulus_split: BigInt,
     pub trapdoor_sigma: RealExpr,
@@ -31,10 +33,6 @@ pub struct Aky24IoConfig {
     pub fhe_error_sigma: RealExpr,
     /// Appendix B.1 error distribution for every `e_att` block.
     pub attribute_error_sigma: RealExpr,
-    /// Explicit coefficient cutoff carried by every AKY24 preimage artifact
-    /// and trapdoor sampler.  This is part of the protocol configuration;
-    /// graph construction must never substitute an unrelated default.
-    pub preimage_max_coefficient_bound: BigInt,
     pub security_parameter_bits: usize,
     pub cascade_randomness_bits: usize,
     /// Random bits used by each bounded inverse-CDF discrete-Gaussian sample
@@ -66,6 +64,8 @@ pub enum Aky24ConfigError {
     InvalidModulusSplit,
     #[error("the AKY24 attribute encoding requires a binary gadget covering the modulus")]
     InvalidBinaryGadget,
+    #[error("the AKY24 compact preimage coefficient bound must be non-negative")]
+    InvalidPreimageBound,
 }
 
 impl Aky24IoConfig {
@@ -79,10 +79,12 @@ impl Aky24IoConfig {
             self.gaussian_sample_bits == 0 ||
             self.gaussian_sample_bits > 52 ||
             self.uniform_statistical_bits == 0 ||
-            self.function.output_bits == 0 ||
-            self.preimage_max_coefficient_bound <= BigInt::from(0)
+            self.function.output_bits == 0
         {
             return Err(Aky24ConfigError::NonPositiveParameter);
+        }
+        if self.preimage_max_coefficient_bound < BigInt::from(0) {
+            return Err(Aky24ConfigError::InvalidPreimageBound);
         }
         let bindings = ParamEnv::default();
         if [
@@ -143,13 +145,13 @@ mod tests {
             input_size: 8,
             gadget_base: 2.into(),
             digit_count: 9,
+            preimage_max_coefficient_bound: 1_000_000.into(),
             modulus_split: 1.into(),
             trapdoor_sigma: RealExpr::from_integer(4),
             secret_sigma: RealExpr::from_integer(2),
             b_error_sigma: RealExpr::from_integer(1),
             fhe_error_sigma: RealExpr::from_integer(1),
             attribute_error_sigma: RealExpr::from_integer(1),
-            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
             security_parameter_bits: 128,
             cascade_randomness_bits: 128,
             gaussian_sample_bits: 16,
@@ -228,11 +230,10 @@ mod tests {
     }
 
     #[test]
-    fn preimage_cutoff_must_be_strictly_positive() {
+    fn preimage_bound_is_explicit_and_non_negative() {
         let mut invalid = config();
-        invalid.preimage_max_coefficient_bound = BigInt::from(0);
-        assert_eq!(invalid.validate(), Err(Aky24ConfigError::NonPositiveParameter));
-        invalid.preimage_max_coefficient_bound = BigInt::from(-1);
-        assert_eq!(invalid.validate(), Err(Aky24ConfigError::NonPositiveParameter));
+        invalid.preimage_max_coefficient_bound = (-1).into();
+        assert_eq!(invalid.validate(), Err(Aky24ConfigError::InvalidPreimageBound));
+        assert_eq!(config().preimage_max_coefficient_bound, 1_000_000.into());
     }
 }

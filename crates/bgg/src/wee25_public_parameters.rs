@@ -91,10 +91,10 @@ impl Wee25PublicParameterCompiler {
     ) -> Result<DslContext, DslError> {
         context = context.public_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
         context = context.private_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
-        context = context.public_family_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
+        context = context.public_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
         for (index, family) in wires.public_parameters.t_top.into_iter().enumerate() {
             let part_count = self.layout.public_parameter_part_count();
-            context = context.public_preimage_family_output(
+            context = context.public_output(
                 self.layout.public_parameter_top_name(index / part_count, index % part_count),
                 family,
             )?;
@@ -137,7 +137,7 @@ impl Wee25PublicParameterCompiler {
                                 end: ((secret_row + 1) * self.layout.digit_count).into(),
                             }),
                         );
-                        gadget_block.mul_small_rhs(row)
+                        row.mul_small_rhs(gadget_block)
                     })
                     .reduce(|sum, term| sum + term)
                     .unwrap_or_else(|| {
@@ -307,7 +307,7 @@ mod tests {
                 let family = digit_row * layout.public_parameter_part_count() + part;
                 for block in 0..layout.public_parameter_block_count() {
                     context = context
-                        .preimage_output(
+                        .output(
                             format!("top-{digit_row}-{part}-{block}"),
                             wires.public_parameters.t_top[family].get_static(block),
                         )

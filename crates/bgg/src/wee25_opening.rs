@@ -77,7 +77,7 @@ impl Wee25CommitmentCompiler {
                 ring.preimage_family_artifact_input(
                     artifacts.production_id.clone(),
                     name,
-                    vec![self.public_parameter_block_count().into()],
+                    self.public_parameter_block_count(),
                     (self.public_columns(), self.public_columns()),
                     artifacts.preimage_max_coefficient_bound.clone(),
                     ArtifactConfidentiality::Public,
@@ -289,7 +289,7 @@ impl Wee25CommitmentCompiler {
             child_column,
             verifier_cache,
         );
-        Ok(z_prime.mul_small_rhs(verifier.decompose(self.gadget_base.clone(), self.digit_count)) +
+        Ok(verifier.decompose(self.gadget_base.clone(), self.digit_count).mul_small_rhs(z_prime) +
             z_child)
     }
 
@@ -315,20 +315,21 @@ impl Wee25CommitmentCompiler {
                             .get_static(message_column)
                     })
                     .collect::<Vec<_>>();
-                let scalar = self
-                    .ring()
-                    .constant(
-                        (
-                            1,
-                            IntExpr::Mul(
-                                Box::new(message.matrix_type().rows.clone()),
-                                Box::new(self.digit_count.into()),
-                            )
-                            .canonicalize(),
+                let scalar = decomposition
+                    .clone()
+                    .mul_small_rhs(
+                        self.ring().constant(
+                            (
+                                1,
+                                IntExpr::Mul(
+                                    Box::new(message.matrix_type().rows.clone()),
+                                    Box::new(self.digit_count.into()),
+                                )
+                                .canonicalize(),
+                            ),
+                            ConstantMatrix::UnitRow { index: digit_row.into() },
                         ),
-                        ConstantMatrix::UnitRow { index: digit_row.into() },
                     )
-                    .mul_small_rhs(decomposition.clone())
                     .slice(
                         Some(IndexRange { start: 0.into(), end: 1.into() }),
                         Some(IndexRange {
@@ -340,7 +341,7 @@ impl Wee25CommitmentCompiler {
                 concat_columns(
                     chunks
                         .into_iter()
-                        .map(|chunk| scalar_identity.clone().mul_small_rhs(chunk))
+                        .map(|chunk| chunk.mul_small_rhs(scalar_identity.clone()))
                         .collect(),
                 )
             })
@@ -352,11 +353,10 @@ impl Wee25CommitmentCompiler {
         if !leaf {
             return opening;
         }
-        opening.mul_small_rhs(
-            self.ring()
-                .identity(self.public_columns())
-                .decompose(self.gadget_base.clone(), self.digit_count),
-        )
+        self.ring()
+            .identity(self.public_columns())
+            .decompose(self.gadget_base.clone(), self.digit_count)
+            .mul_small_rhs(opening)
     }
 
     fn verifier_base(&self, parameters: &Wee25PublicParameterWires, leaf: bool) -> Mat {
@@ -368,9 +368,10 @@ impl Wee25CommitmentCompiler {
             return bottom;
         }
         let columns = self.tree_base * self.public_columns();
-        bottom.mul_small_rhs(
-            self.ring().identity(columns).decompose(self.gadget_base.clone(), self.digit_count),
-        )
+        self.ring()
+            .identity(columns)
+            .decompose(self.gadget_base.clone(), self.digit_count)
+            .mul_small_rhs(bottom)
     }
 
     fn verifier_recursive(
@@ -398,15 +399,15 @@ impl Wee25CommitmentCompiler {
                 self.verifier_recursive(base, base_last, child_count, column % child_count, cache);
             let sibling = column / child_count;
             let width = self.public_columns() * self.digit_count;
-            base.clone()
-                .slice(
+            child.decompose(self.gadget_base.clone(), self.digit_count).mul_small_rhs(
+                base.clone().slice(
                     None,
                     Some(IndexRange {
                         start: (width * sibling).into(),
                         end: (width * (sibling + 1)).into(),
                     }),
-                )
-                .mul_small_rhs(child.decompose(self.gadget_base.clone(), self.digit_count))
+                ),
+            )
         };
         cache.insert((block_count, column), result.clone());
         result
@@ -470,9 +471,9 @@ mod tests {
         let bottom = parameters.t_bottom.get_static(0);
         let lhs =
             compiler.ring().input("lhs", (compiler.public_columns(), compiler.public_columns()));
-        let product = lhs.mul_small_rhs(top.clone());
+        let product = top.clone().mul_small_rhs(lhs);
         let built = DslContext::new("wee25-imported-kinds")
-            .preimage_output("top", top)
+            .output("top", top)
             .unwrap()
             .output("bottom", bottom)
             .unwrap()
@@ -489,7 +490,7 @@ mod tests {
         assert!(nodes.iter().any(|node| {
             matches!(node.kind(), NodeKind::Input { name, .. } if name.starts_with("artifact:wee25_t_top")) &&
                 node.output_types().iter().any(|wire| {
-                    matches!(wire, WireType::Family { element, .. } if matches!(element.as_ref(), WireType::Preimage {
+                    matches!(wire, WireType::IndexedFamily { element, .. } if matches!(element.as_ref(), WireType::Preimage {
                         max_coefficient_bound, ..
                     } if *max_coefficient_bound == 31.into()))
                 })
@@ -497,7 +498,7 @@ mod tests {
         assert!(nodes.iter().any(|node| {
             matches!(node.kind(), NodeKind::Input { name, .. } if name.ends_with(WEE25_T_BOTTOM)) &&
                 node.output_types().iter().any(|wire| {
-                    matches!(wire, WireType::Family { element, .. } if matches!(element.as_ref(), WireType::Matrix(_)))
+                    matches!(wire, WireType::IndexedFamily { element, .. } if matches!(element.as_ref(), WireType::Matrix(_)))
                 })
         }));
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
@@ -759,31 +760,29 @@ mod tests {
             .expect("commitment tree");
         let mut top_families = Vec::with_capacity(compiler.public_parameter_top_family_count());
         for family in 0..compiler.public_parameter_top_family_count() {
+            let name = format!("top-family-{family}");
             let values = (0..compiler.public_parameter_block_count())
                 .map(|block| {
-                    let name = format!("top-family-{family}-block-{block}");
-                    inputs.insert(
-                        name.clone(),
-                        RuntimeValue::small_matrix(
-                            mxx_primitives::matrix::CpuSmallMatrix::new(
-                                t_top_values[block *
-                                    compiler.gadget_rows() *
-                                    compiler.public_parameter_part_count() +
-                                    family]
-                                    .clone(),
-                                BigUint::from(1_000_000u32),
-                            )
-                            .unwrap(),
-                        ),
-                    );
-                    ring.preimage_input(
-                        name,
-                        (compiler.public_columns(), compiler.public_columns()),
-                        1_000_000,
+                    RuntimeValue::small_matrix(
+                        mxx_primitives::matrix::CpuSmallMatrix::new(
+                            t_top_values[block *
+                                compiler.gadget_rows() *
+                                compiler.public_parameter_part_count() +
+                                family]
+                                .clone(),
+                            BigUint::from(1_000_000u32),
+                        )
+                        .unwrap(),
                     )
                 })
-                .collect::<Vec<_>>();
-            top_families.push(Family::pack(values).unwrap());
+                .collect();
+            inputs.insert(name.clone(), RuntimeValue::IndexedFamily(values));
+            top_families.push(ring.preimage_input_family(
+                name,
+                compiler.public_parameter_block_count(),
+                (compiler.public_columns(), compiler.public_columns()),
+                1_000_000,
+            ));
         }
         let bottom_wires = t_bottom_values
             .iter()

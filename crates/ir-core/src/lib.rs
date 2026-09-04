@@ -16,7 +16,7 @@ pub mod types;
 pub mod validate;
 
 pub use constraints::{ParamConstraint, derive_param_constraints};
-pub use expr::{IndexExpr, IndexMap, IntExpr, ParamEnv, Rational, RealExpr};
+pub use expr::{IntExpr, ParamEnv, Rational, RealExpr};
 pub use graph::{
     CapturePolicy, CapturedValue, CompileParameter, CompileParameterKind, ConstructionScopeId,
     FreezeError, FreezeMap, FreezeResolveError, FrozenGraphScopeId, Graph, GraphOutput, GraphScope,
@@ -25,6 +25,6 @@ pub use graph::{
 };
 pub use types::{NodeId, Port, WireRef, WireType};
 pub use validate::{
-    LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError, validate,
-    validate_structure, validate_with_manifests,
+    LivenessSchedule, ValidatedGraph, ValidatedScope, ValidationError, concretize_wire_type,
+    validate, validate_structure, validate_with_manifests,
 };

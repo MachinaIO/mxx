@@ -1,13 +1,13 @@
 use crate::{
     artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId, validate_manifest},
     checks::{
-        CheckError, ElaborationWarning, WarningKind, check_add_shape, check_same_ring,
-        check_topological, multiplication_type,
+        CheckError, ElaborationWarning, WarningKind, check_add_shape, check_topological,
+        multiplication_type,
     },
-    expr::{ExprError, IndexExpr, IndexMap, IntExpr, ParamEnv, RealExpr},
+    expr::{ExprError, IntExpr, ParamEnv},
     graph::{CompileParameterKind, FrozenGraphScopeId, Graph, GraphScope, NodeHandle},
     node::{
-        ConcatAxis, ConstantMatrix, GridInputMode, HashVariant, IntBinaryOp, MatrixBinaryOp,
+        ConcatAxis, ConstantMatrix, HashVariant, IntBinaryOp, LoopInputMode, MatrixBinaryOp,
         NodeKind,
     },
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireRef, WireType},
@@ -28,25 +28,7 @@ pub struct ValidatedScope {
     pub execution_order: Vec<NodeHandle>,
     pub liveness: LivenessSchedule,
     pub wire_types: BTreeMap<WireRef, ConcreteWireType>,
-    /// Symbolic schemas are retained alongside the index-zero elaboration.
-    /// A loop body is validated structurally once, but its bounded RHS
-    /// expressions must be evaluated again for each concrete lane.
-    pub wire_schemas: BTreeMap<WireRef, WireType>,
     pub artifact_inputs: BTreeMap<WireRef, ManifestArtifact>,
-    /// Symbolic compact-RHS metadata keyed by multiplication node. The
-    /// per-instance bound is evaluated by downstream execution in its concrete
-    /// loop environment, rather than being frozen during index-zero scope
-    /// validation.
-    pub small_rhs_metadata: BTreeMap<NodeId, SmallRhsMetadata>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SmallRhsMetadata {
-    /// This remains symbolic until the executor has the concrete loop
-    /// environment for the instance.  In particular, it must not be replaced
-    /// by the value obtained while elaborating loop index zero.
-    pub max_coefficient_bound: IntExpr,
-    pub relation_bearing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -158,8 +140,8 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                 };
                 let binding_names = match node.kind() {
                     NodeKind::SubgraphCall(call) => &call.bindings,
+                    NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
                     NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
-                    NodeKind::ParallelGrid(grid_spec) => &grid_spec.bindings,
                     _ => continue,
                 };
                 let target = declared_by_scope.entry(child.clone()).or_default();
@@ -191,8 +173,8 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                 };
                 let bindings = match node.kind() {
                     NodeKind::SubgraphCall(call) => &call.bindings,
+                    NodeKind::ParallelLoop(loop_spec) => &loop_spec.bindings,
                     NodeKind::SequentialLoop(loop_spec) => &loop_spec.bindings,
-                    NodeKind::ParallelGrid(grid_spec) => &grid_spec.bindings,
                     _ => continue,
                 };
                 next.entry(child).or_default().extend(child_loop_dependencies(&parent, bindings));
@@ -217,7 +199,7 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
             }
             let mut node_allowed_slots = allowed_slots.clone();
             match node.kind() {
-                NodeKind::SequentialLoop(loop_spec) => {
+                NodeKind::ParallelLoop(loop_spec) => {
                     let value =
                         serde_json::to_value(&loop_spec.count).expect("IntExpr is serializable");
                     let mut ignored = BTreeSet::new();
@@ -231,8 +213,19 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                     }
                     node_allowed_slots.insert(loop_spec.index_slot);
                 }
-                NodeKind::ParallelGrid(grid_spec) => {
-                    node_allowed_slots.extend(grid_spec.index_slots.iter().copied());
+                NodeKind::SequentialLoop(loop_spec) => {
+                    let value =
+                        serde_json::to_value(&loop_spec.count).expect("IntExpr is serializable");
+                    let mut ignored = BTreeSet::new();
+                    let mut count_slots = BTreeSet::new();
+                    collect_expression_references(&value, &mut ignored, &mut count_slots);
+                    if count_slots.contains(&loop_spec.index_slot) {
+                        return Err(ValidationError::IllegalLoopIndex {
+                            scope: scope_id.clone(),
+                            slot: loop_spec.index_slot,
+                        });
+                    }
+                    node_allowed_slots.insert(loop_spec.index_slot);
                 }
                 _ => {}
             }
@@ -257,21 +250,12 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
                     "loop-dependent family access must use FamilyGetDynamic",
                 );
             }
-            if let NodeKind::FamilyGetStatic { indices } = node.kind() {
-                if indices.iter().any(index_expr_has_loop_or_parameter) {
-                    return node_error(
-                        scope_id,
-                        NodeId(position as u64),
-                        "loop-dependent family access must use FamilyGetDynamic",
-                    );
-                }
-            }
             for wire_type in node.output_types() {
-                // Bounded RHS cutoffs are execution-instance metadata, not
-                // structural dimensions.  A loop body may therefore carry a
-                // bound such as `i + 1`; all matrix dimensions, family
-                // extents, and other structural expressions remain frozen.
-                if let Some(slot) = first_structural_loop_index(wire_type) {
+                let value = serde_json::to_value(wire_type).expect("WireType is serializable");
+                let mut ignored = BTreeSet::new();
+                let mut structural_slots = BTreeSet::new();
+                collect_expression_references(&value, &mut ignored, &mut structural_slots);
+                if let Some(slot) = structural_slots.into_iter().next() {
                     return Err(ValidationError::StructuralLoopIndex {
                         scope: scope_id.clone(),
                         slot,
@@ -281,76 +265,6 @@ pub fn validate_structure(graph: &Graph) -> Result<(), ValidationError> {
         }
     }
     Ok(())
-}
-
-fn first_structural_loop_index(wire_type: &WireType) -> Option<u32> {
-    match wire_type {
-        WireType::Bytes { length } => first_int_loop_index(length),
-        WireType::Matrix(matrix) => first_matrix_loop_index(matrix),
-        WireType::Trapdoor {
-            matrix,
-            sigma,
-            gadget_base,
-            digit_count,
-            preimage_max_coefficient_bound,
-        } => first_matrix_loop_index(matrix)
-            .or_else(|| first_real_loop_index(sigma))
-            .or_else(|| first_int_loop_index(gadget_base))
-            .or_else(|| first_int_loop_index(digit_count))
-            .or_else(|| first_int_loop_index(preimage_max_coefficient_bound)),
-        // The bound is intentionally omitted: it is evaluated per concrete
-        // loop instance by the runtime.  Its matrix shape is still structural.
-        WireType::SmallMatrix { matrix, .. } | WireType::Preimage { matrix, .. } => {
-            first_matrix_loop_index(matrix)
-        }
-        WireType::Family { element, shape } => shape
-            .iter()
-            .find_map(first_int_loop_index)
-            .or_else(|| first_structural_loop_index(element)),
-        WireType::ConstantInt |
-        WireType::ConstantReal |
-        WireType::ConstantBool |
-        WireType::Int |
-        WireType::Real |
-        WireType::Bool |
-        WireType::TypedBlob { .. } => None,
-    }
-}
-
-fn first_matrix_loop_index(matrix: &MatrixType) -> Option<u32> {
-    first_int_loop_index(&matrix.modulus)
-        .or_else(|| first_int_loop_index(&matrix.ring_dimension))
-        .or_else(|| first_int_loop_index(&matrix.rows))
-        .or_else(|| first_int_loop_index(&matrix.columns))
-}
-
-fn first_int_loop_index(expression: &IntExpr) -> Option<u32> {
-    match expression {
-        IntExpr::LoopIndex(slot) => Some(*slot),
-        IntExpr::Add(left, right) |
-        IntExpr::Sub(left, right) |
-        IntExpr::Mul(left, right) |
-        IntExpr::Div(left, right) |
-        IntExpr::RoundDiv(left, right) => {
-            first_int_loop_index(left).or_else(|| first_int_loop_index(right))
-        }
-        IntExpr::Log2Ceil(value) => first_int_loop_index(value),
-        IntExpr::Const(_) | IntExpr::Var(_) => None,
-    }
-}
-
-fn first_real_loop_index(expression: &RealExpr) -> Option<u32> {
-    match expression {
-        RealExpr::FromInt(value) => first_int_loop_index(value),
-        RealExpr::Add(left, right) |
-        RealExpr::Sub(left, right) |
-        RealExpr::Mul(left, right) |
-        RealExpr::Div(left, right) => {
-            first_real_loop_index(left).or_else(|| first_real_loop_index(right))
-        }
-        RealExpr::Sqrt(value) => first_real_loop_index(value),
-        RealExpr::Rational(_) | RealExpr::Var(_) => None,
-    }
 }
 
 fn structural_loop_slots(graph: &Graph, scope: &FrozenGraphScopeId) -> BTreeSet<u32> {
@@ -363,36 +277,13 @@ fn structural_loop_slots(graph: &Graph, scope: &FrozenGraphScopeId) -> BTreeSet<
             _ => break,
         };
         match graph.scope(parent).and_then(|scope| scope.node(*owner)).map(NodeHandle::kind) {
+            Some(NodeKind::ParallelLoop(loop_spec)) => {
+                slots.insert(loop_spec.index_slot);
+            }
             Some(NodeKind::SequentialLoop(loop_spec)) => {
                 slots.insert(loop_spec.index_slot);
             }
-            Some(NodeKind::ParallelGrid(grid_spec)) => {
-                slots.extend(grid_spec.index_slots.iter().copied());
-            }
             _ => {}
-        }
-        current = parent;
-    }
-    slots
-}
-
-fn sequential_loop_slots(graph: &Graph, scope: &FrozenGraphScopeId) -> BTreeSet<u32> {
-    let mut slots = BTreeSet::new();
-    let mut current = scope;
-    loop {
-        let (parent, owner) = match current {
-            FrozenGraphScopeId::SequentialBody { parent, owner } => (parent, owner),
-            FrozenGraphScopeId::ParallelBody { parent, owner } => {
-                current = parent;
-                let _ = owner;
-                continue;
-            }
-            _ => break,
-        };
-        if let Some(NodeKind::SequentialLoop(spec)) =
-            graph.scope(parent).and_then(|scope| scope.node(*owner)).map(NodeHandle::kind)
-        {
-            slots.insert(spec.index_slot);
         }
         current = parent;
     }
@@ -483,8 +374,7 @@ pub fn validate_with_manifests(
         let scope_env = scope_bindings
             .get(scope_id)
             .ok_or_else(|| ValidationError::MissingScope { scope: scope_id.clone() })?;
-        let validated =
-            validate_scope(graph, scope_id, scope, scope_env, manifests, &mut warnings)?;
+        let validated = validate_scope(scope_id, scope, scope_env, manifests, &mut warnings)?;
         scopes.insert(scope_id.clone(), validated);
     }
     validate_structural_boundaries(graph, bindings, &scopes)?;
@@ -508,17 +398,15 @@ fn collect_scope_bindings(
         };
         let child_env = match node.kind() {
             NodeKind::SubgraphCall(call) => child_bindings(&env, &call.bindings)?,
-            NodeKind::SequentialLoop(loop_spec) => {
+            NodeKind::ParallelLoop(loop_spec) => {
                 let mut loop_env = env.clone();
                 loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
                 child_bindings(&loop_env, &loop_spec.bindings)?
             }
-            NodeKind::ParallelGrid(grid_spec) => {
-                let mut grid_env = env.clone();
-                for slot in &grid_spec.index_slots {
-                    grid_env.loop_indices.insert(*slot, BigInt::zero());
-                }
-                child_bindings(&grid_env, &grid_spec.bindings)?
+            NodeKind::SequentialLoop(loop_spec) => {
+                let mut loop_env = env.clone();
+                loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
+                child_bindings(&loop_env, &loop_spec.bindings)?
             }
             _ => continue,
         };
@@ -544,7 +432,6 @@ fn check_manifests(manifests: &BTreeMap<ProductionId, Manifest>) -> Result<(), V
 }
 
 fn validate_scope(
-    graph: &Graph,
     scope_id: &FrozenGraphScopeId,
     scope: &GraphScope,
     bindings: &ParamEnv,
@@ -552,9 +439,7 @@ fn validate_scope(
     warnings: &mut Vec<ElaborationWarning>,
 ) -> Result<ValidatedScope, ValidationError> {
     let mut wire_types = BTreeMap::new();
-    let mut wire_schemas = BTreeMap::new();
     let mut artifact_inputs = BTreeMap::new();
-    let mut small_rhs_metadata = BTreeMap::new();
     for (position, handle) in scope.nodes().iter().enumerate() {
         let node = NodeView {
             id: NodeId(position as u64),
@@ -563,15 +448,12 @@ fn validate_scope(
             output_types: handle.output_types(),
         };
         validate_node(
-            graph,
             scope_id,
             &node,
             bindings,
             manifests,
             &mut wire_types,
-            &mut wire_schemas,
             &mut artifact_inputs,
-            &mut small_rhs_metadata,
             warnings,
         )?;
     }
@@ -585,9 +467,7 @@ fn validate_scope(
         execution_order: scope.nodes().to_vec(),
         liveness,
         wire_types,
-        wire_schemas,
         artifact_inputs,
-        small_rhs_metadata,
     })
 }
 
@@ -599,22 +479,18 @@ struct NodeView<'a> {
 }
 
 fn validate_node(
-    graph: &Graph,
     scope: &FrozenGraphScopeId,
     node: &NodeView<'_>,
     env: &ParamEnv,
     manifests: &BTreeMap<ProductionId, Manifest>,
     values: &mut BTreeMap<WireRef, ConcreteWireType>,
-    schemas: &mut BTreeMap<WireRef, WireType>,
     artifact_inputs: &mut BTreeMap<WireRef, ManifestArtifact>,
-    small_rhs_metadata: &mut BTreeMap<NodeId, SmallRhsMetadata>,
     warnings: &mut Vec<ElaborationWarning>,
 ) -> Result<(), ValidationError> {
-    let sequential_slots = sequential_loop_slots(graph, scope);
     let inferred = match node.kind {
         NodeKind::Input { wire_type, artifact, .. } => {
             require_arity(scope, node, 0)?;
-            let declared = concrete_wire(wire_type, env, scope, node.id)?;
+            let declared = concretize_wire_type(wire_type, env, scope, node.id)?;
             if let Some(artifact) = artifact {
                 let manifest = manifests.get(&artifact.production_id).ok_or_else(|| {
                     ValidationError::MissingManifest(artifact.production_id.clone())
@@ -638,9 +514,9 @@ fn validate_node(
                         "artifact confidentiality does not match manifest",
                     );
                 }
-                let (element, shape) = family_element_shape(&declared);
+                let (element, count) = family_element(&declared);
                 if ArtifactType::from_wire_type(element).as_ref() != Some(&stored.artifact_type) ||
-                    shape != stored.family_shape.as_deref()
+                    count != stored.family_count
                 {
                     return node_error(scope, node.id, "artifact type does not match manifest");
                 }
@@ -683,9 +559,7 @@ fn validate_node(
             let digit_count = matrix.columns / matrix.rows;
             vec![ConcreteWireType::Trapdoor {
                 matrix,
-                sigma: crate::RealExpr::Rational(crate::expr::Rational::from_integer(
-                    gadget_base.clone(),
-                )),
+                sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone())),
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound: BigInt::zero(),
@@ -755,13 +629,6 @@ fn validate_node(
             };
             vec![ConcreteWireType::Matrix(output)]
         }
-        NodeKind::MatrixMulSmallRhs => {
-            require_arity(scope, node, 2)?;
-            let left = matrix_argument(scope, values, node, 0)?;
-            let (right, metadata) = bounded_rhs_argument(scope, values, schemas, node, 1)?;
-            small_rhs_metadata.insert(node.id, metadata);
-            vec![ConcreteWireType::Matrix(small_rhs_multiplication_type(&left, &right)?)]
-        }
         NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
             if coefficients.is_empty() {
                 return Err(ValidationError::Node {
@@ -790,45 +657,38 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(output)]
         }
+        NodeKind::MatrixMulSmallRhs => {
+            require_arity(scope, node, 2)?;
+            let lhs = matrix_argument(scope, values, node, 0)?;
+            let (rhs, bound) = bounded_matrix_argument(scope, values, node, 1)?;
+            if lhs.modulus != rhs.modulus || lhs.ring_dimension != rhs.ring_dimension {
+                return Err(ValidationError::Check(crate::checks::CheckError::RingMismatch));
+            }
+            if lhs.columns != rhs.rows {
+                return Err(ValidationError::Check(crate::checks::CheckError::ShapeMismatch {
+                    left: lhs,
+                    right: rhs,
+                }));
+            }
+            if bound.is_negative() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "small RHS coefficient bound must be nonnegative",
+                );
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType {
+                rows: lhs.rows,
+                columns: rhs.columns,
+                ..lhs
+            })]
+        }
         NodeKind::MatrixNegate | NodeKind::MatrixScale { .. } => {
             require_arity(scope, node, 1)?;
             if let NodeKind::MatrixScale { scalar } = node.kind {
                 scalar.evaluate(env)?;
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
-        }
-        NodeKind::RingAutomorphism { index } => {
-            require_arity(scope, node, 1)?;
-            // An automorphism is a matrix-level operation.  A typed preimage
-            // carries a relation witness and must be consumed by an explicit
-            // preimage operation before it can enter this path.
-            let input = match argument(scope, values, node, 0)? {
-                ConcreteWireType::Matrix(matrix) => matrix.clone(),
-                _ => {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "ring automorphism requires an ordinary matrix argument",
-                    )
-                }
-            };
-            if !input.ring_dimension.is_power_of_two() {
-                return node_error(
-                    scope,
-                    node.id,
-                    "ring automorphism requires a power-of-two ring dimension",
-                );
-            }
-            let index = index.evaluate(env)?;
-            let upper = BigInt::from(input.ring_dimension) * BigInt::from(2_u8);
-            if index <= BigInt::from(0_u8) || index >= upper || (&index % 2_u8).is_zero() {
-                return node_error(
-                    scope,
-                    node.id,
-                    "ring automorphism index must be odd and lie in 1..2*ring_dimension",
-                );
-            }
-            vec![ConcreteWireType::Matrix(input)]
         }
         NodeKind::Transpose => {
             require_arity(scope, node, 1)?;
@@ -926,7 +786,7 @@ fn validate_node(
                 }
             }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let max_coefficient_bound = match variant {
+            let bound = match variant {
                 HashVariant::Plain if base.is_none() && digit_count.is_none() => None,
                 HashVariant::Plain => {
                     return node_error(
@@ -943,16 +803,16 @@ fn validate_node(
                     if base <= BigInt::one() {
                         return node_error(scope, node.id, "gadget base must be greater than one");
                     }
-                    let Some(digit_count) = digit_count else {
+                    let Some(count) = digit_count else {
                         return node_error(scope, node.id, "decomposed hash requires a digit count")
                     };
-                    let digit_count = positive_usize(
-                        digit_count.evaluate(env)?,
+                    let count = positive_usize(
+                        count.evaluate(env)?,
                         "decomposition digit count",
                         scope,
                         node.id,
                     )?;
-                    if matrix.rows % digit_count != 0 {
+                    if matrix.rows % count != 0 {
                         return node_error(
                             scope,
                             node.id,
@@ -966,7 +826,7 @@ fn validate_node(
                     })
                 }
             };
-            match max_coefficient_bound {
+            match bound {
                 Some(max_coefficient_bound) => {
                     vec![ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound }]
                 }
@@ -1026,92 +886,26 @@ fn validate_node(
             ]
         }
         NodeKind::PreimageSample { matrix_type, max_coefficient_bound } => {
-            // The three arguments instantiate the typed equation B*K=T: the public matrix B,
-            // trapdoor metadata for B, and target T determine the witness shape checked below.
             require_arity(scope, node, 3)?;
             if max_coefficient_bound.evaluate(env)?.is_negative() {
                 return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
             }
             let public = matrix_argument(scope, values, node, 0)?;
             let trapdoor = trapdoor_argument(scope, values, node, 1)?;
+            if public != trapdoor {
+                return node_error(
+                    scope,
+                    node.id,
+                    "preimage public matrix does not match its trapdoor type",
+                );
+            }
             let target = matrix_argument(scope, values, node, 2)?;
             let output = concrete_matrix(matrix_type, env, scope, node.id)?;
-            // Matrix multiplication fixes the witness dimensions, and equality of the resulting
-            // shape with T is the structural part of the relation B*K=T.
-            check_preimage_equation(scope, node.id, &public, &trapdoor, &target, &output)?;
-            vec![ConcreteWireType::Preimage {
-                matrix: output,
-                max_coefficient_bound: max_coefficient_bound.evaluate(env)?,
-            }]
+            check_add_shape(&multiplication_type(&trapdoor, &output)?, &target)?;
+            let bound = max_coefficient_bound.evaluate(env)?;
+            vec![ConcreteWireType::Preimage { matrix: output, max_coefficient_bound: bound }]
         }
-        NodeKind::FamilyPreimageSample { matrix_type, max_coefficient_bound } => {
-            // A source/trapdoor family indexed by i is paired with a target family indexed by
-            // (i,j), yielding witnesses K_i,j that satisfy B_i*K_i,j=T_i,j independently.
-            require_arity(scope, node, 3)?;
-            if max_coefficient_bound.evaluate(env)?.is_negative() {
-                return node_error(scope, node.id, "preimage coefficient bound must be nonnegative");
-            }
-            let public = argument(scope, values, node, 0)?;
-            let trapdoor = argument(scope, values, node, 1)?;
-            let (public_element, public_shape) = family_element_shape(public);
-            let (trapdoor_element, trapdoor_shape) = family_element_shape(trapdoor);
-            if public_shape != trapdoor_shape {
-                return node_error(scope, node.id, "preimage public/trapdoor family does not match");
-            }
-            let ConcreteWireType::Matrix(public_matrix) = public_element else {
-                return node_error(scope, node.id, "preimage public source must contain matrices");
-            };
-            let ConcreteWireType::Trapdoor { matrix: trapdoor_matrix, .. } = trapdoor_element
-            else {
-                return node_error(
-                    scope,
-                    node.id,
-                    "preimage trapdoor source must contain trapdoors",
-                );
-            };
-            let target = family_argument(scope, values, node, 2)?;
-            let output = concrete_matrix(matrix_type, env, scope, node.id)?;
-            let (target_element, target_shape) =
-                family_parts(&target).ok_or_else(|| ValidationError::Node {
-                    scope: scope.to_owned(),
-                    node: node.id,
-                    message: "family preimage target must be a family".into(),
-                })?;
-            let public_shape = public_shape.unwrap_or_default();
-            if target_shape.len() != public_shape.len() + 1 ||
-                target_shape[..public_shape.len()] != *public_shape ||
-                !matches!(target_element, ConcreteWireType::Matrix(_))
-            {
-                return node_error(
-                    scope,
-                    node.id,
-                    "family preimage shapes or element types do not match",
-                );
-            }
-            let ConcreteWireType::Matrix(target_matrix) = target_element else {
-                unreachable!("target matrix family checked")
-            };
-            check_preimage_equation(
-                scope,
-                node.id,
-                public_matrix,
-                trapdoor_matrix,
-                &target_matrix,
-                &output,
-            )?;
-            // The output keeps every source axis and the target's final branch axis, so relation
-            // identity is preserved at each concrete family coordinate.
-            vec![ConcreteWireType::Family {
-                element: Box::new(ConcreteWireType::Preimage {
-                    matrix: output,
-                    max_coefficient_bound: max_coefficient_bound.evaluate(env)?,
-                }),
-                shape: target_shape,
-            }]
-        }
-        NodeKind::GadgetDecompose { base, small, digit_count } => {
-            // GadgetDecompose creates a typed witness K whose row expansion is chosen so the
-            // universal gadget equation G*K=T is dimensionally valid.
+        NodeKind::GadgetDecompose { base, digit_count, small } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
             let base = base.evaluate(env)?;
@@ -1129,16 +923,11 @@ fn validate_node(
                 node: node.id,
                 message: "gadget decomposition row count overflow".to_owned(),
             })?;
-            // Only the witness row count changes: multiplying G (with digit-expanded columns) by
-            // K reconstructs the original target T without changing its column count.
-            let bound = if *small {
-                base.clone() - BigInt::from(1_u8)
-            } else {
-                base.clone() / BigInt::from(2_u8)
-            };
+            let max_coefficient_bound =
+                if *small { base - BigInt::one() } else { (base + BigInt::one()) / 2 };
             vec![ConcreteWireType::Preimage {
                 matrix: ConcreteMatrixType { rows, ..input },
-                max_coefficient_bound: bound,
+                max_coefficient_bound,
             }]
         }
         NodeKind::ExtractCoefficient { position, .. } => {
@@ -1245,9 +1034,8 @@ fn validate_node(
                     }
                 })?;
             match argument(scope, values, node, 0)? {
-                ConcreteWireType::Family { element, shape }
-                    if element.as_ref() == &ConcreteWireType::Bool &&
-                        shape == &vec![expected_count] => {}
+                ConcreteWireType::IndexedFamily { element, count }
+                    if element.as_ref() == &ConcreteWireType::Bool && *count == expected_count => {}
                 _ => {
                     return node_error(
                         scope,
@@ -1258,21 +1046,18 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(output)]
         }
-        NodeKind::SubgraphCall(_) | NodeKind::SequentialLoop(_) => node
+        NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => node
             .output_types
             .iter()
-            .map(|ty| concrete_wire(ty, env, scope, node.id))
+            .map(|ty| concretize_wire_type(ty, env, scope, node.id))
             .collect::<Result<Vec<_>, _>>()?,
-        NodeKind::FamilyPack { shape } => {
-            // Packing lays out ∏_a n_a scalar elements in row-major order, so a rank-r shape
-            // describes coordinates u and the flat offset sum_a u_a*∏_{b>a} n_b.
-            let shape = concrete_shape(shape, env, scope, node.id)?;
-            let count = shape_product(&shape, scope, node.id)?;
+        NodeKind::FamilyPack { count } => {
+            let count = positive_usize(count.evaluate(env)?, "family count", scope, node.id)?;
             if node.args.len() != count || count == 0 {
                 return node_error(scope, node.id, "family pack argument count mismatch");
             }
             let first = argument(scope, values, node, 0)?.clone();
-            if is_family(&first) {
+            if matches!(first, ConcreteWireType::IndexedFamily { .. }) {
                 return node_error(scope, node.id, "family members must have one non-family type");
             }
             for index in 1..count {
@@ -1284,146 +1069,31 @@ fn validate_node(
                     );
                 }
             }
-            vec![ConcreteWireType::Family { element: Box::new(first), shape }]
+            vec![ConcreteWireType::IndexedFamily { element: Box::new(first), count }]
         }
-        NodeKind::FamilyGetStatic { indices } => {
-            // Static access evaluates the row-major coordinate u and returns exactly X[u].
+        NodeKind::FamilyGetStatic { index } => {
             require_arity(scope, node, 1)?;
-            let ConcreteWireType::Family { element, shape } =
+            let ConcreteWireType::IndexedFamily { element, count } =
                 argument(scope, values, node, 0)?.clone()
             else {
-                return node_error(scope, node.id, "family access requires a rank-N family");
+                return node_error(scope, node.id, "family access requires an indexed family");
             };
-            if indices.len() != shape.len() {
-                return node_error(scope, node.id, "family index rank mismatch");
-            }
-            for (axis, index) in indices.iter().enumerate() {
-                if nonnegative_usize(index.evaluate(env)?, "family index", scope, node.id)? >=
-                    shape[axis]
-                {
-                    return node_error(scope, node.id, "family index is out of range");
-                }
+            if nonnegative_usize(index.evaluate(env)?, "family index", scope, node.id)? >= count {
+                return node_error(scope, node.id, "family index is out of range");
             }
             vec![*element]
         }
-        NodeKind::FamilyGetDynamic { rank } => {
-            // Dynamic access accepts runtime coordinates u and returns X[u]; bounds remain a
-            // runtime concern, while rank and scalar-index types are checked here.
-            require_arity(scope, node, rank.saturating_add(1))?;
-            let ConcreteWireType::Family { element, shape } =
+        NodeKind::FamilyGetDynamic => {
+            require_arity(scope, node, 2)?;
+            let ConcreteWireType::IndexedFamily { element, .. } =
                 argument(scope, values, node, 0)?.clone()
             else {
-                return node_error(scope, node.id, "family access requires a rank-N family");
+                return node_error(scope, node.id, "family access requires an indexed family");
             };
-            if shape.len() != *rank {
-                return node_error(scope, node.id, "family rank mismatch");
-            }
-            for index in 0..*rank {
-                require_scalar(scope, values, node, index + 1, is_integer, "integer")?;
-            }
+            require_scalar(scope, values, node, 1, is_integer, "integer")?;
             warnings.push(runtime_bounds_warning(node.id, "family index is checked at runtime"));
             vec![*element]
         }
-        NodeKind::FamilySelectAxis { axis } => {
-            // Selecting axis a removes that extent. For each remaining coordinate u, the selected
-            // value is X[u with coordinate a replaced by selector(u)].
-            require_arity(scope, node, 2)?;
-            let family = family_argument(scope, values, node, 0)?;
-            let (element, shape) = family_parts(&family).ok_or_else(|| ValidationError::Node {
-                scope: scope.to_owned(),
-                node: node.id,
-                message: "family selection requires a family".into(),
-            })?;
-            if *axis >= shape.len() {
-                return node_error(scope, node.id, "family axis is out of range");
-            }
-            let selector = argument(scope, values, node, 1)?;
-            let mut output_shape = shape;
-            output_shape.remove(*axis);
-            let valid_selector =
-                matches!(selector, ConcreteWireType::Int | ConcreteWireType::ConstantInt) ||
-                    family_parts(selector).is_some_and(|(selector_element, selector_shape)| {
-                        matches!(
-                            selector_element,
-                            ConcreteWireType::Int | ConcreteWireType::ConstantInt
-                        ) && selector_shape == output_shape
-                    });
-            if !valid_selector {
-                return node_error(
-                    scope,
-                    node.id,
-                    "family selector must be scalar or an exact prefix/suffix integer family",
-                );
-            }
-            if output_shape.is_empty() {
-                vec![element]
-            } else {
-                vec![ConcreteWireType::Family { element: Box::new(element), shape: output_shape }]
-            }
-        }
-        NodeKind::FamilyReindex { output_shape, map } => {
-            // Reindexing defines Y[u]=X[f(u)] for every output coordinate u; only the index map
-            // and output shape change, while the element (including Preimage) type is preserved.
-            require_arity(scope, node, 1)?;
-            let shape = concrete_shape(output_shape, env, scope, node.id)?;
-            let input = family_argument(scope, values, node, 0)?;
-            let (element, input_shape) =
-                family_parts(&input).ok_or_else(|| ValidationError::Node {
-                    scope: scope.to_owned(),
-                    node: node.id,
-                    message: "family reindex requires a family".into(),
-                })?;
-            validate_index_map(
-                map,
-                shape.len(),
-                &input_shape,
-                env,
-                scope,
-                node.id,
-                &sequential_slots,
-            )?;
-            vec![ConcreteWireType::Family { element: Box::new(element), shape }]
-        }
-        NodeKind::FamilyGather { output_shape, input_rank } => {
-            // Gather forms f(u)=(s_0[u],...,s_{r-1}[u]) from one selector family per input axis,
-            // then returns Y[u]=X[f(u)] with the declared output shape.
-            require_arity(scope, node, input_rank.saturating_add(1))?;
-            let shape = concrete_shape(output_shape, env, scope, node.id)?;
-            let input = family_argument(scope, values, node, 0)?;
-            let (element, input_shape) =
-                family_parts(&input).ok_or_else(|| ValidationError::Node {
-                    scope: scope.to_owned(),
-                    node: node.id,
-                    message: "family gather requires a family".into(),
-                })?;
-            if input_shape.len() != *input_rank {
-                return node_error(scope, node.id, "family gather input rank mismatch");
-            }
-            for index in 0..*input_rank {
-                let selector = family_argument(scope, values, node, index + 1)?;
-                let (selector_element, selector_shape) =
-                    family_parts(&selector).ok_or_else(|| ValidationError::Node {
-                        scope: scope.to_owned(),
-                        node: node.id,
-                        message: "family gather selectors must be families".into(),
-                    })?;
-                if !matches!(
-                    selector_element,
-                    ConcreteWireType::Int | ConcreteWireType::ConstantInt
-                ) || selector_shape != shape
-                {
-                    return node_error(scope, node.id, "family gather selector shape mismatch");
-                }
-            }
-            vec![ConcreteWireType::Family { element: Box::new(element), shape }]
-        }
-        // A grid body computes Y[u] once for each u in ∏_a [0,n_a); concrete output family
-        // types therefore wrap each body output with exactly the grid shape.
-        NodeKind::ParallelGrid(_) => node
-            .output_types
-            .iter()
-            .map(|ty| concrete_wire(ty, env, scope, node.id))
-            .collect::<Result<Vec<_>, _>>()?,
         NodeKind::Select { count } => {
             require_scalar(scope, values, node, 0, is_integer, "integer")?;
             let count =
@@ -1445,7 +1115,7 @@ fn validate_node(
     let declared = node
         .output_types
         .iter()
-        .map(|ty| concrete_wire(ty, env, scope, node.id))
+        .map(|ty| concretize_wire_type(ty, env, scope, node.id))
         .collect::<Result<Vec<_>, _>>()?;
     if inferred != declared {
         return node_error(
@@ -1455,9 +1125,7 @@ fn validate_node(
         );
     }
     for (port, ty) in inferred.into_iter().enumerate() {
-        let wire = WireRef { node: node.id, port: Port(port as u32) };
-        values.insert(wire, ty);
-        schemas.insert(wire, node.output_types[port].clone());
+        values.insert(WireRef { node: node.id, port: Port(port as u32) }, ty);
     }
     Ok(())
 }
@@ -1543,53 +1211,25 @@ fn validate_structural_boundaries(
             let modes = match handle.kind() {
                 NodeKind::SubgraphCall(call) => {
                     let _ = child_bindings(env, &call.bindings)?;
-                    vec![GridInputMode::Broadcast; args.len()]
+                    vec![LoopInputMode::Broadcast; args.len()]
                 }
-                NodeKind::ParallelGrid(grid_spec) => {
-                    // A reindexed input is transported by X_u=X[f(u)], while a broadcast input is
-                    // X_u=X. Validate f against the input family shape before binding body input.
-                    if grid_spec.input_modes.len() != args.len() {
-                        return node_error(
-                            scope_id,
-                            node_id,
-                            "parallel grid input mode count mismatch",
-                        );
+                NodeKind::ParallelLoop(loop_spec) => {
+                    let count = nonnegative_usize(
+                        loop_spec.count.evaluate(env)?,
+                        "parallel count",
+                        scope_id,
+                        node_id,
+                    )?;
+                    if count < loop_spec.minimum_count {
+                        return node_error(scope_id, node_id, "parallel count is below its minimum");
                     }
-                    let output_shape = concrete_shape(&grid_spec.shape, env, scope_id, node_id)?;
-                    for (arg, mode) in args.iter().zip(&grid_spec.input_modes) {
-                        if let crate::node::GridInputMode::Reindex { map } = mode {
-                            if map.input_indices.iter().any(index_expr_has_loop_index) {
-                                return node_error(
-                                    scope_id,
-                                    node_id,
-                                    "parallel grid reindex maps cannot use loop indices",
-                                );
-                            }
-                            let outer = validated.wire_types.get(arg).ok_or_else(|| {
-                                ValidationError::MissingWire {
-                                    scope: scope_id.clone(),
-                                    node: node_id,
-                                    wire: *arg,
-                                }
-                            })?;
-                            let (_, input_shape) =
-                                family_parts(outer).ok_or_else(|| ValidationError::Node {
-                                    scope: scope_id.clone(),
-                                    node: node_id,
-                                    message: "parallel grid reindex input must be a family".into(),
-                                })?;
-                            validate_index_map(
-                                map,
-                                output_shape.len(),
-                                &input_shape,
-                                env,
-                                scope_id,
-                                node_id,
-                                &BTreeSet::new(),
-                            )?;
-                        }
+                    if loop_spec.input_modes.len() != args.len() {
+                        return node_error(scope_id, node_id, "parallel input mode count mismatch");
                     }
-                    grid_spec.input_modes.clone()
+                    let mut loop_env = env.clone();
+                    loop_env.loop_indices.insert(loop_spec.index_slot, BigInt::zero());
+                    let _ = child_bindings(&loop_env, &loop_spec.bindings)?;
+                    loop_spec.input_modes.clone()
                 }
                 _ => unreachable!(),
             };
@@ -1600,9 +1240,7 @@ fn validate_structural_boundaries(
                     "child input count does not match call arguments",
                 );
             }
-            for (index, ((arg, input), mode)) in
-                args.iter().zip(child_scope.inputs()).zip(modes).enumerate()
-            {
+            for ((arg, input), mode) in args.iter().zip(child_scope.inputs()).zip(modes) {
                 let outer =
                     validated.wire_types.get(arg).ok_or_else(|| ValidationError::MissingWire {
                         scope: scope_id.clone(),
@@ -1615,27 +1253,30 @@ fn validate_structural_boundaries(
                         node: input.node,
                         wire: *input,
                     })?;
-                let actual = match handle.kind() {
-                    NodeKind::ParallelGrid(spec)
-                        if matches!(spec.input_modes[index], GridInputMode::Reindex { .. }) =>
-                    {
-                        match outer {
-                            ConcreteWireType::Family { element, .. } => element.as_ref(),
-                            _ => {
-                                return node_error(
-                                    scope_id,
-                                    node_id,
-                                    "parallel grid reindex input must be a family",
-                                )
+                let actual = match mode {
+                    LoopInputMode::Broadcast => outer,
+                    LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
+                        let ConcreteWireType::IndexedFamily { element, count } = outer else {
+                            return node_error(scope_id, node_id, "zipped input is not a family");
+                        };
+                        if let NodeKind::ParallelLoop(spec) = handle.kind() {
+                            let iterations = nonnegative_usize(
+                                spec.count.evaluate(env)?,
+                                "parallel count",
+                                scope_id,
+                                node_id,
+                            )?;
+                            let offset = match mode {
+                                LoopInputMode::Zip => 0,
+                                LoopInputMode::ZipOffset { offset } => offset,
+                                _ => 0,
+                            };
+                            if *count < iterations.saturating_add(offset) {
+                                return node_error(scope_id, node_id, "zipped family is too short");
                             }
                         }
+                        element.as_ref()
                     }
-                    _ => match mode {
-                        // Broadcast preserves the complete value, including a typed preimage
-                        // relation; reindexing above has selected one family element.
-                        GridInputMode::Broadcast => outer,
-                        GridInputMode::Reindex { .. } => unreachable!("reindex handled above"),
-                    },
                 };
                 if actual != expected {
                     return node_error(scope_id, node_id, "child input type mismatch");
@@ -1648,33 +1289,21 @@ fn validate_structural_boundaries(
                 let child_type = &child.wire_types[output];
                 let call_type =
                     &validated.wire_types[&WireRef { node: node_id, port: Port(port as u32) }];
-                let expected = if let NodeKind::ParallelGrid(spec) = handle.kind() {
-                    // A single body result Y is lifted to Y[u] over every grid coordinate, so
-                    // the call output must be exactly the body element wrapped by this shape.
-                    let shape = concrete_shape(&spec.shape, env, scope_id, node_id)?;
-                    ConcreteWireType::Family { element: Box::new(child_type.clone()), shape }
+                let expected = if matches!(handle.kind(), NodeKind::ParallelLoop(_)) {
+                    let NodeKind::ParallelLoop(spec) = handle.kind() else { unreachable!() };
+                    ConcreteWireType::IndexedFamily {
+                        element: Box::new(child_type.clone()),
+                        count: nonnegative_usize(
+                            spec.count.evaluate(env)?,
+                            "parallel count",
+                            scope_id,
+                            node_id,
+                        )?,
+                    }
                 } else {
                     child_type.clone()
                 };
-                // A structurally constant integer is a valid realization of
-                // the ordinary integer family element.  DSL construction may
-                // fold a loop predicate's BoolToInt body to ConstantInt,
-                // while the sealed family schema intentionally remains Int;
-                // preserve that subtype relation at the grid boundary.
-                let compatible = match (handle.kind(), call_type, &expected) {
-                    (
-                        NodeKind::ParallelGrid(_),
-                        ConcreteWireType::Family { element: actual, shape: actual_shape },
-                        ConcreteWireType::Family { element: wanted, shape: wanted_shape },
-                    ) if actual_shape == wanted_shape => {
-                        matches!(
-                            (&**actual, &**wanted),
-                            (ConcreteWireType::Int, ConcreteWireType::ConstantInt)
-                        )
-                    }
-                    _ => false,
-                };
-                if *call_type != expected && !compatible {
+                if *call_type != expected {
                     return node_error(scope_id, node_id, "child output type mismatch");
                 }
             }
@@ -1724,64 +1353,19 @@ fn matrix_argument(
     }
 }
 
-fn bounded_rhs_argument(
+fn bounded_matrix_argument(
     scope: &FrozenGraphScopeId,
     values: &BTreeMap<WireRef, ConcreteWireType>,
-    schemas: &BTreeMap<WireRef, WireType>,
     node: &NodeView<'_>,
     index: usize,
-) -> Result<(ConcreteMatrixType, SmallRhsMetadata), ValidationError> {
-    let wire = *node.args.get(index).ok_or_else(|| ValidationError::Node {
-        scope: scope.clone(),
-        node: node.id,
-        message: format!("missing argument {index}"),
-    })?;
-    let metadata = match schemas.get(&wire) {
-        Some(WireType::SmallMatrix { max_coefficient_bound, .. }) => SmallRhsMetadata {
-            max_coefficient_bound: max_coefficient_bound.clone(),
-            relation_bearing: false,
-        },
-        Some(WireType::Preimage { max_coefficient_bound, .. }) => SmallRhsMetadata {
-            max_coefficient_bound: max_coefficient_bound.clone(),
-            relation_bearing: true,
-        },
-        _ => return node_error(scope, node.id, "small RHS requires a bounded matrix or preimage"),
-    };
+) -> Result<(ConcreteMatrixType, BigInt), ValidationError> {
     match argument(scope, values, node, index)? {
         ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
         ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-            if max_coefficient_bound.is_negative() {
-                return node_error(
-                    scope,
-                    node.id,
-                    "small RHS coefficient bound must be nonnegative",
-                );
-            }
-            // The concrete value is checked at this scope's representative
-            // environment.  The returned metadata deliberately comes from
-            // the symbolic schema above so loop-dependent bounds are not
-            // frozen at index zero.
-            let _ = max_coefficient_bound;
-            Ok((matrix.clone(), metadata))
+            Ok((matrix.clone(), max_coefficient_bound.clone()))
         }
-        _ => node_error(scope, node.id, "small RHS requires a bounded matrix or preimage"),
+        _ => node_error(scope, node.id, "expected SmallMatrix or Preimage right-hand side"),
     }
-}
-
-fn small_rhs_multiplication_type(
-    left: &ConcreteMatrixType,
-    right: &ConcreteMatrixType,
-) -> Result<ConcreteMatrixType, CheckError> {
-    check_same_ring(left, right)?;
-    if left.columns != right.rows {
-        return Err(CheckError::ShapeMismatch { left: left.clone(), right: right.clone() });
-    }
-    Ok(ConcreteMatrixType {
-        modulus: left.modulus.clone(),
-        ring_dimension: left.ring_dimension,
-        rows: left.rows,
-        columns: right.columns,
-    })
 }
 
 fn trapdoor_argument(
@@ -1794,23 +1378,6 @@ fn trapdoor_argument(
         ConcreteWireType::Trapdoor { matrix, .. } => Ok(matrix.clone()),
         _ => node_error(scope, node.id, "expected trapdoor argument"),
     }
-}
-
-fn check_preimage_equation(
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-    public: &ConcreteMatrixType,
-    trapdoor: &ConcreteMatrixType,
-    target: &ConcreteMatrixType,
-    preimage: &ConcreteMatrixType,
-) -> Result<(), ValidationError> {
-    // Both scalar and family samplers instantiate the same equation B*K=T. The family validator
-    // strips only the common outer coordinate shape before checking these leaf matrix schemas.
-    if public != trapdoor {
-        return node_error(scope, node, "preimage public matrix does not match its trapdoor type");
-    }
-    check_add_shape(&multiplication_type(trapdoor, preimage)?, target)?;
-    Ok(())
 }
 
 fn require_scalar(
@@ -1844,7 +1411,12 @@ fn require_arity(
     }
 }
 
-fn concrete_wire(
+/// Evaluates a symbolic wire type under one concrete execution environment.
+///
+/// The scope and node identify the originating graph location in validation
+/// errors. Runtime calibration uses this to preserve loop-dependent shapes and
+/// coefficient bounds when several instances share one execution wave.
+pub fn concretize_wire_type(
     ty: &WireType,
     env: &ParamEnv,
     scope: &FrozenGraphScopeId,
@@ -1866,30 +1438,24 @@ fn concrete_wire(
         WireType::Matrix(matrix) => {
             ConcreteWireType::Matrix(concrete_matrix(matrix, env, scope, node)?)
         }
-        // A Preimage wire is deliberately distinct from Matrix: the former carries a witness K
-        // for some registered B*K=T, whereas the latter carries only the runtime matrix value.
         WireType::SmallMatrix { matrix, max_coefficient_bound } => {
-            let bound = max_coefficient_bound.evaluate(env)?;
-            if bound.is_negative() {
-                return node_error(
-                    scope,
-                    node,
-                    "small matrix coefficient bound must be nonnegative",
-                );
+            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+            if max_coefficient_bound.is_negative() {
+                return node_error(scope, node, "small RHS coefficient bound must be nonnegative");
             }
             ConcreteWireType::SmallMatrix {
                 matrix: concrete_matrix(matrix, env, scope, node)?,
-                max_coefficient_bound: bound,
+                max_coefficient_bound,
             }
         }
         WireType::Preimage { matrix, max_coefficient_bound } => {
-            let bound = max_coefficient_bound.evaluate(env)?;
-            if bound.is_negative() {
+            let max_coefficient_bound = max_coefficient_bound.evaluate(env)?;
+            if max_coefficient_bound.is_negative() {
                 return node_error(scope, node, "preimage coefficient bound must be nonnegative");
             }
             ConcreteWireType::Preimage {
                 matrix: concrete_matrix(matrix, env, scope, node)?,
-                max_coefficient_bound: bound,
+                max_coefficient_bound,
             }
         }
         WireType::Trapdoor {
@@ -1905,318 +1471,15 @@ fn concrete_wire(
             digit_count: positive_usize(digit_count.evaluate(env)?, "digit count", scope, node)?,
             preimage_max_coefficient_bound: preimage_max_coefficient_bound.evaluate(env)?,
         },
-        WireType::Family { element, shape } => {
-            let element = concrete_wire(element, env, scope, node)?;
-            if is_family(&element) {
-                return node_error(scope, node, "nested families are unsupported");
+        WireType::IndexedFamily { element, count } => {
+            let element = concretize_wire_type(element, env, scope, node)?;
+            if matches!(element, ConcreteWireType::IndexedFamily { .. }) {
+                return node_error(scope, node, "nested indexed families are unsupported");
             }
-            ConcreteWireType::Family {
+            ConcreteWireType::IndexedFamily {
                 element: Box::new(element),
-                shape: concrete_shape(shape, env, scope, node)?,
+                count: nonnegative_usize(count.evaluate(env)?, "family count", scope, node)?,
             }
-        }
-    })
-}
-
-fn is_family(ty: &ConcreteWireType) -> bool {
-    matches!(ty, ConcreteWireType::Family { .. })
-}
-
-fn family_parts(ty: &ConcreteWireType) -> Option<(ConcreteWireType, Vec<usize>)> {
-    // Family metadata is separated from its element so rank and coordinate equations can be
-    // checked without changing the element identity (including a Preimage relation marker).
-    match ty {
-        ConcreteWireType::Family { element, shape } => {
-            Some((element.as_ref().clone(), shape.clone()))
-        }
-        _ => None,
-    }
-}
-
-fn validate_index_map(
-    map: &IndexMap,
-    output_rank: usize,
-    input_shape: &[usize],
-    env: &ParamEnv,
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-    sequential_slots: &BTreeSet<u32>,
-) -> Result<(), ValidationError> {
-    // Every input axis must receive one coordinate expression. A concrete expression is checked
-    // against its input extent; an axis-dependent expression is retained for runtime checking.
-    if map.input_indices.len() != input_shape.len() {
-        return node_error(scope, node, "index map arity does not match input family rank");
-    }
-    for (axis, expression) in map.input_indices.iter().enumerate() {
-        let value =
-            validate_index_expr(expression, output_rank, env, scope, node, sequential_slots)?;
-        if let Some(value) = value {
-            let Some(index) = value.to_usize() else {
-                return node_error(scope, node, "index map result must be nonnegative");
-            };
-            if index >= input_shape[axis] {
-                return node_error(scope, node, "index map result is outside input shape");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_index_expr(
-    expression: &IndexExpr,
-    output_rank: usize,
-    env: &ParamEnv,
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-    sequential_slots: &BTreeSet<u32>,
-) -> Result<Option<BigInt>, ValidationError> {
-    // `Some(v)` means the coordinate is compile-time evaluable; `None` means it depends on an
-    // output axis or loop binder and must remain a symbolic coordinate equation.
-    let value = match expression {
-        IndexExpr::Axis(axis) => {
-            if *axis >= output_rank {
-                return node_error(scope, node, "index map axis is outside output rank");
-            }
-            None
-        }
-        IndexExpr::Parameter(name) => {
-            Some(env.integers.get(name).cloned().ok_or_else(|| ValidationError::Node {
-                scope: scope.clone(),
-                node,
-                message: format!("index map parameter {name} is unresolved"),
-            })?)
-        }
-        IndexExpr::LoopIndex(slot) => {
-            if !sequential_slots.contains(slot) {
-                return node_error(
-                    scope,
-                    node,
-                    "index map loop index is not from a sequential loop",
-                );
-            }
-            None
-        }
-        IndexExpr::Constant(value) => Some(value.clone()),
-        IndexExpr::Add(lhs, rhs) => {
-            index_binary(lhs, rhs, output_rank, env, scope, node, sequential_slots, |a, b| a + b)?
-        }
-        IndexExpr::Subtract(lhs, rhs) => {
-            index_binary(lhs, rhs, output_rank, env, scope, node, sequential_slots, |a, b| a - b)?
-        }
-        IndexExpr::Multiply(lhs, rhs) => {
-            index_binary(lhs, rhs, output_rank, env, scope, node, sequential_slots, |a, b| a * b)?
-        }
-        IndexExpr::Divide(lhs, rhs) => index_binary_checked(
-            lhs,
-            rhs,
-            output_rank,
-            env,
-            scope,
-            node,
-            sequential_slots,
-            |a, b| a / b,
-        )?,
-        IndexExpr::Remainder(lhs, rhs) => index_binary_checked(
-            lhs,
-            rhs,
-            output_rank,
-            env,
-            scope,
-            node,
-            sequential_slots,
-            |a, b| a % b,
-        )?,
-        IndexExpr::Equal(lhs, rhs) => {
-            index_binary(lhs, rhs, output_rank, env, scope, node, sequential_slots, |a, b| {
-                BigInt::from(a == b)
-            })?
-        }
-        IndexExpr::Less(lhs, rhs) => {
-            index_binary(lhs, rhs, output_rank, env, scope, node, sequential_slots, |a, b| {
-                BigInt::from(a < b)
-            })?
-        }
-        IndexExpr::LessEqual(lhs, rhs) => {
-            index_binary(lhs, rhs, output_rank, env, scope, node, sequential_slots, |a, b| {
-                BigInt::from(a <= b)
-            })?
-        }
-        IndexExpr::Log2Ceil(value) => {
-            let Some(value) =
-                validate_index_expr(value, output_rank, env, scope, node, sequential_slots)?
-            else {
-                return Ok(None);
-            };
-            let positive =
-                value.to_biguint().filter(|value| !value.is_zero()).ok_or_else(|| {
-                    ValidationError::Node {
-                        scope: scope.clone(),
-                        node,
-                        message: "index map log2ceil argument must be positive".to_owned(),
-                    }
-                })?;
-            let floor = positive.bits() - 1;
-            Some(BigInt::from(if positive == (num_bigint::BigUint::one() << floor as usize) {
-                floor
-            } else {
-                floor + 1
-            }))
-        }
-        IndexExpr::Select { selector, branches } => {
-            if branches.is_empty() {
-                return node_error(scope, node, "index map select must have at least one branch");
-            }
-            let selector =
-                validate_index_expr(selector, output_rank, env, scope, node, sequential_slots)?;
-            let branches = branches
-                .iter()
-                .map(|branch| {
-                    validate_index_expr(branch, output_rank, env, scope, node, sequential_slots)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            match selector {
-                Some(value) => {
-                    let Some(index) = value.to_usize() else {
-                        return node_error(scope, node, "index map select selector is out of range");
-                    };
-                    branches.get(index).cloned().ok_or_else(|| ValidationError::Node {
-                        scope: scope.clone(),
-                        node,
-                        message: "index map select selector is out of range".to_owned(),
-                    })?
-                }
-                None => None,
-            }
-        }
-    };
-    Ok(value)
-}
-
-fn index_expr_has_loop_index(expression: &IndexExpr) -> bool {
-    match expression {
-        IndexExpr::LoopIndex(_) => true,
-        IndexExpr::Add(lhs, rhs) |
-        IndexExpr::Subtract(lhs, rhs) |
-        IndexExpr::Multiply(lhs, rhs) |
-        IndexExpr::Divide(lhs, rhs) |
-        IndexExpr::Remainder(lhs, rhs) |
-        IndexExpr::Equal(lhs, rhs) |
-        IndexExpr::Less(lhs, rhs) |
-        IndexExpr::LessEqual(lhs, rhs) => {
-            index_expr_has_loop_index(lhs) || index_expr_has_loop_index(rhs)
-        }
-        IndexExpr::Select { selector, branches } => {
-            index_expr_has_loop_index(selector) || branches.iter().any(index_expr_has_loop_index)
-        }
-        IndexExpr::Log2Ceil(value) => index_expr_has_loop_index(value),
-        IndexExpr::Axis(_) | IndexExpr::Parameter(_) | IndexExpr::Constant(_) => false,
-    }
-}
-
-fn index_expr_has_loop_or_parameter(expression: &IndexExpr) -> bool {
-    match expression {
-        IndexExpr::Axis(_) | IndexExpr::LoopIndex(_) | IndexExpr::Parameter(_) => true,
-        IndexExpr::Log2Ceil(value) => index_expr_has_loop_or_parameter(value),
-        IndexExpr::Add(lhs, rhs) |
-        IndexExpr::Subtract(lhs, rhs) |
-        IndexExpr::Multiply(lhs, rhs) |
-        IndexExpr::Divide(lhs, rhs) |
-        IndexExpr::Remainder(lhs, rhs) |
-        IndexExpr::Equal(lhs, rhs) |
-        IndexExpr::Less(lhs, rhs) |
-        IndexExpr::LessEqual(lhs, rhs) => {
-            index_expr_has_loop_or_parameter(lhs) || index_expr_has_loop_or_parameter(rhs)
-        }
-        IndexExpr::Select { selector, branches } => {
-            index_expr_has_loop_or_parameter(selector) ||
-                branches.iter().any(index_expr_has_loop_or_parameter)
-        }
-        IndexExpr::Constant(_) => false,
-    }
-}
-
-fn index_binary(
-    lhs: &IndexExpr,
-    rhs: &IndexExpr,
-    output_rank: usize,
-    env: &ParamEnv,
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-    sequential_slots: &BTreeSet<u32>,
-    operation: impl FnOnce(BigInt, BigInt) -> BigInt,
-) -> Result<Option<BigInt>, ValidationError> {
-    // For compile-time operands this computes f(u)=lhs(u) op rhs(u); symbolic operands remain
-    // unresolved so the same coordinate equation can be checked at execution time.
-    let lhs = validate_index_expr(lhs, output_rank, env, scope, node, sequential_slots)?;
-    let rhs = validate_index_expr(rhs, output_rank, env, scope, node, sequential_slots)?;
-    Ok(lhs.zip(rhs).map(|(lhs, rhs)| operation(lhs, rhs)))
-}
-
-fn index_binary_checked(
-    lhs: &IndexExpr,
-    rhs: &IndexExpr,
-    output_rank: usize,
-    env: &ParamEnv,
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-    sequential_slots: &BTreeSet<u32>,
-    operation: impl FnOnce(BigInt, BigInt) -> BigInt,
-) -> Result<Option<BigInt>, ValidationError> {
-    // This is the same f(u)=lhs(u) op rhs(u) calculation with an explicit nonzero divisor guard
-    // for division and remainder.
-    let lhs = validate_index_expr(lhs, output_rank, env, scope, node, sequential_slots)?;
-    let rhs = validate_index_expr(rhs, output_rank, env, scope, node, sequential_slots)?;
-    if rhs.as_ref().is_some_and(Zero::is_zero) {
-        return node_error(scope, node, "index map division by zero");
-    }
-    Ok(lhs.zip(rhs).map(|(lhs, rhs)| operation(lhs, rhs)))
-}
-
-fn family_argument(
-    scope: &FrozenGraphScopeId,
-    values: &BTreeMap<WireRef, ConcreteWireType>,
-    node: &NodeView<'_>,
-    index: usize,
-) -> Result<ConcreteWireType, ValidationError> {
-    // Family-valued arguments retain their complete coordinate domain; selecting an element is a
-    // separate operation because it changes X[u] into one concrete X[u_0].
-    let value = argument(scope, values, node, index)?.clone();
-    if is_family(&value) {
-        Ok(value)
-    } else {
-        node_error(scope, node.id, "expected family argument")
-    }
-}
-
-fn concrete_shape(
-    shape: &[IntExpr],
-    env: &ParamEnv,
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-) -> Result<Vec<usize>, ValidationError> {
-    // Each symbolic extent n_a is evaluated independently; the resulting vector is the concrete
-    // Cartesian domain shape `(n_0,...,n_{r-1})` used by all rank-N equations below.
-    if shape.is_empty() {
-        return node_error(scope, node, "family shape must be nonempty");
-    }
-    shape
-        .iter()
-        .map(|extent| nonnegative_usize(extent.evaluate(env)?, "family extent", scope, node))
-        .collect()
-}
-
-fn shape_product(
-    shape: &[usize],
-    scope: &FrozenGraphScopeId,
-    node: NodeId,
-) -> Result<usize, ValidationError> {
-    // Flattened family cardinality is the product |I|=∏_a n_a, with checked multiplication to
-    // keep the coordinate domain finite and representable.
-    shape.iter().try_fold(1usize, |product, extent| product.checked_mul(*extent)).ok_or_else(|| {
-        ValidationError::Node {
-            scope: scope.to_owned(),
-            node,
-            message: "family shape product overflow".to_owned(),
         }
     })
 }
@@ -2372,9 +1635,9 @@ fn child_bindings(
     Ok(child)
 }
 
-fn family_element_shape(ty: &ConcreteWireType) -> (&ConcreteWireType, Option<&[usize]>) {
+fn family_element(ty: &ConcreteWireType) -> (&ConcreteWireType, Option<usize>) {
     match ty {
-        ConcreteWireType::Family { element, shape } => (element, Some(shape.as_slice())),
+        ConcreteWireType::IndexedFamily { element, count } => (element, Some(*count)),
         scalar => (scalar, None),
     }
 }
@@ -2443,9 +1706,9 @@ fn node_error<T>(
 mod tests {
     use super::*;
     use crate::{
-        graph::{CompileParameter, GraphOutput, SubgraphHandle, ValueHandle},
-        node::{GridInputMode, ParallelGrid, SampleRange, SequentialLoop},
-        with_new_construction_scope,
+        artifact::SpecHash,
+        graph::{GraphOutput, ValueHandle},
+        node::{ArtifactInput, LoopInputMode, ParallelLoop, SampleRange, SequentialLoop},
     };
 
     fn matrix_type(modulus: i64, rows: i64, columns: i64) -> MatrixType {
@@ -2458,10 +1721,7 @@ mod tests {
     }
 
     fn input(name: &str, matrix_type: MatrixType) -> ValueHandle {
-        typed_input(name, WireType::Matrix(matrix_type))
-    }
-
-    fn typed_input(name: &str, wire_type: WireType) -> ValueHandle {
+        let wire_type = WireType::Matrix(matrix_type);
         NodeHandle::new(
             NodeKind::Input { name: name.to_owned(), wire_type: wire_type.clone(), artifact: None },
             Vec::new(),
@@ -2471,12 +1731,139 @@ mod tests {
         .expect("matrix input")
     }
 
+    fn bounded_input(
+        name: &str,
+        matrix_type: MatrixType,
+        max_coefficient_bound: i64,
+        preimage: bool,
+    ) -> ValueHandle {
+        let wire_type = if preimage {
+            WireType::Preimage {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        } else {
+            WireType::SmallMatrix {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        };
+        NodeHandle::new(
+            NodeKind::Input { name: name.to_owned(), wire_type: wire_type.clone(), artifact: None },
+            Vec::new(),
+            vec![wire_type],
+        )
+        .output(0)
+        .expect("bounded matrix input")
+    }
+
+    fn bounded_artifact_input(
+        matrix_type: MatrixType,
+        max_coefficient_bound: i64,
+        preimage: bool,
+        artifact_type: ArtifactType,
+    ) -> (ValueHandle, BTreeMap<ProductionId, Manifest>) {
+        let production_id = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] };
+        let artifact_name = "bounded".to_owned();
+        let wire_type = if preimage {
+            WireType::Preimage {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        } else {
+            WireType::SmallMatrix {
+                matrix: matrix_type,
+                max_coefficient_bound: IntExpr::constant(max_coefficient_bound),
+            }
+        };
+        let value = NodeHandle::new(
+            NodeKind::Input {
+                name: artifact_name.clone(),
+                wire_type: wire_type.clone(),
+                artifact: Some(ArtifactInput {
+                    production_id: production_id.clone(),
+                    artifact_name: artifact_name.clone(),
+                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
+                }),
+            },
+            Vec::new(),
+            vec![wire_type],
+        )
+        .output(0)
+        .expect("bounded artifact input");
+        let manifest = Manifest {
+            ir_version: crate::encoding::IR_VERSION,
+            production_id: production_id.clone(),
+            artifacts: BTreeMap::from([(
+                artifact_name,
+                ManifestArtifact {
+                    artifact_type,
+                    family_count: None,
+                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+        };
+        (value, BTreeMap::from([(production_id, manifest)]))
+    }
+
     fn value(
         kind: NodeKind,
         arguments: Vec<ValueHandle>,
         output_types: Vec<WireType>,
     ) -> ValueHandle {
         NodeHandle::new(kind, arguments, output_types).output(0).expect("node has an output")
+    }
+
+    fn hash_sample(
+        matrix_type: MatrixType,
+        variant: HashVariant,
+        base: Option<IntExpr>,
+        digit_count: Option<IntExpr>,
+    ) -> ValueHandle {
+        let output_type = match (&variant, &base) {
+            (HashVariant::Plain, _) => WireType::Matrix(matrix_type.clone()),
+            (HashVariant::Decomposed, Some(base)) => WireType::SmallMatrix {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: IntExpr::RoundDiv(
+                    Box::new(base.clone()),
+                    Box::new(IntExpr::constant(2)),
+                )
+                .canonicalize(),
+            },
+            (HashVariant::SmallDecomposed, Some(base)) => WireType::SmallMatrix {
+                matrix: matrix_type.clone(),
+                max_coefficient_bound: IntExpr::Sub(
+                    Box::new(base.clone()),
+                    Box::new(IntExpr::constant(1)),
+                )
+                .canonicalize(),
+            },
+            _ => WireType::Matrix(matrix_type.clone()),
+        };
+        let key_type = WireType::Bytes { length: IntExpr::constant(32) };
+        let key = NodeHandle::new(
+            NodeKind::Input { name: "key".to_owned(), wire_type: key_type.clone(), artifact: None },
+            Vec::new(),
+            vec![key_type],
+        )
+        .output(0)
+        .expect("hash key");
+        value(
+            NodeKind::HashSample {
+                matrix_type: matrix_type.clone(),
+                variant,
+                tag_prefix: Vec::new(),
+                tag_expressions: Vec::new(),
+                tag_decimal_expressions: Vec::new(),
+                tag_u64_le_expressions: Vec::new(),
+                base,
+                digit_count,
+            },
+            vec![key],
+            vec![output_type],
+        )
     }
 
     fn graph(name: &str, output: ValueHandle) -> Graph {
@@ -2531,89 +1918,287 @@ mod tests {
     }
 
     #[test]
-    fn small_rhs_multiplication_requires_bounded_rhs_and_exact_shared_dimension() {
-        let left = input("left", matrix_type(17, 3, 2));
-        let rhs_type = matrix_type(17, 2, 4);
-        let rhs = typed_input(
-            "rhs",
-            WireType::SmallMatrix {
-                matrix: rhs_type.clone(),
-                max_coefficient_bound: IntExpr::constant(2),
-            },
-        );
+    fn small_rhs_multiplication_accepts_only_bounded_typed_rhs() {
+        let lhs = input("lhs", matrix_type(17, 2, 3));
+        let rhs = bounded_input("rhs", matrix_type(17, 3, 4), 7, false);
         let product = value(
             NodeKind::MatrixMulSmallRhs,
-            vec![left, rhs],
-            vec![WireType::Matrix(matrix_type(17, 3, 4))],
+            vec![lhs, rhs],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
         );
-        let validated = validate(&graph("small-rhs-valid", product), &ParamEnv::default())
-            .expect("bounded product validates");
-        assert_eq!(validated.root_scope().small_rhs_metadata.len(), 1);
-        assert_eq!(
-            validated.root_scope().small_rhs_metadata.values().next().unwrap(),
-            &SmallRhsMetadata {
-                max_coefficient_bound: IntExpr::constant(2),
-                relation_bearing: false,
-            }
-        );
+        let validated = validate(&graph("small-rhs", product), &ParamEnv::default()).unwrap();
+        assert!(validated.root_scope().wire_types.values().any(|ty| {
+            matches!(
+                ty,
+                ConcreteWireType::SmallMatrix { max_coefficient_bound, .. }
+                    if max_coefficient_bound == &BigInt::from(7)
+            )
+        }));
 
-        let ordinary_rhs = input("ordinary-rhs", rhs_type.clone());
-        let invalid = value(
+        let preimage = value(
             NodeKind::MatrixMulSmallRhs,
-            vec![input("left", matrix_type(17, 3, 2)), ordinary_rhs],
-            vec![WireType::Matrix(matrix_type(17, 3, 4))],
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input("preimage-rhs", matrix_type(17, 3, 4), 7, true),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
         );
-        assert_eq!(
-            node_message(
-                validate(&graph("small-rhs-ordinary", invalid), &ParamEnv::default()).unwrap_err()
-            ),
-            "small RHS requires a bounded matrix or preimage"
-        );
+        validate(&graph("preimage-rhs", preimage), &ParamEnv::default()).unwrap();
 
-        let negative = typed_input(
-            "negative-rhs",
-            WireType::Preimage { matrix: rhs_type, max_coefficient_bound: IntExpr::constant(-1) },
-        );
-        let invalid_bound = value(
+        let ordinary_rhs = input("ordinary-rhs", matrix_type(17, 3, 4));
+        let product = value(
             NodeKind::MatrixMulSmallRhs,
-            vec![input("left", matrix_type(17, 3, 2)), negative],
-            vec![WireType::Matrix(matrix_type(17, 3, 4))],
+            vec![input("lhs", matrix_type(17, 2, 3)), ordinary_rhs],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
         );
-        assert_eq!(
+        assert!(
             node_message(
-                validate(&graph("small-rhs-negative", invalid_bound), &ParamEnv::default())
-                    .unwrap_err()
-            ),
-            "bounded matrix coefficient bound"
+                validate(&graph("ordinary-rhs", product), &ParamEnv::default()).unwrap_err()
+            )
+            .contains("SmallMatrix or Preimage")
         );
     }
 
     #[test]
-    fn loop_dependent_bounded_rhs_preserves_symbolic_bound_per_instance() {
-        let bound = IntExpr::Add(Box::new(IntExpr::LoopIndex(7)), Box::new(IntExpr::constant(1)));
-        let ty = WireType::SmallMatrix {
-            matrix: matrix_type(17, 2, 2),
-            max_coefficient_bound: bound.clone(),
-        };
-        // The cutoff is instance metadata and is therefore allowed to depend
-        // on the enclosing loop.  Matrix dimensions remain structural.
-        assert_eq!(first_structural_loop_index(&ty), None);
-        let mut first = ParamEnv::default();
-        first.loop_indices.insert(7, BigInt::zero());
-        let mut later = first.clone();
-        later.loop_indices.insert(7, BigInt::from(5));
-        assert_eq!(bound.evaluate(&first).unwrap(), BigInt::from(1));
-        assert_eq!(bound.evaluate(&later).unwrap(), BigInt::from(6));
+    fn hash_sample_metadata_matches_variant_and_output_schema() {
+        let plain_with_base = hash_sample(
+            matrix_type(17, 1, 1),
+            HashVariant::Plain,
+            Some(IntExpr::constant(4)),
+            None,
+        );
+        assert!(
+            node_message(
+                validate(&graph("plain-with-base", plain_with_base), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("plain hash cannot have decomposition metadata")
+        );
 
-        let metadata = SmallRhsMetadata { max_coefficient_bound: bound, relation_bearing: false };
-        assert_eq!(metadata.max_coefficient_bound.evaluate(&first).unwrap(), BigInt::from(1));
-        assert_eq!(metadata.max_coefficient_bound.evaluate(&later).unwrap(), BigInt::from(6));
+        let plain_with_digits = hash_sample(
+            matrix_type(17, 1, 1),
+            HashVariant::Plain,
+            None,
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(&graph("plain-with-digits", plain_with_digits), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("plain hash cannot have decomposition metadata")
+        );
 
-        let invalid_dimensions = WireType::SmallMatrix {
-            matrix: MatrixType { rows: IntExpr::LoopIndex(7), ..matrix_type(17, 2, 2) },
-            max_coefficient_bound: IntExpr::constant(1),
-        };
-        assert_eq!(first_structural_loop_index(&invalid_dimensions), Some(7));
+        let decomposed_without_base = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            None,
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("decomposed-without-base", decomposed_without_base),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("decomposed hash requires a gadget base")
+        );
+
+        let decomposed_without_digits = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            None,
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("decomposed-without-digits", decomposed_without_digits),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("decomposed hash requires a digit count")
+        );
+
+        let nonpositive_digits = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(0)),
+        );
+        assert!(
+            node_message(
+                validate(
+                    &graph("nonpositive-hash-digits", nonpositive_digits),
+                    &ParamEnv::default()
+                )
+                .unwrap_err()
+            )
+            .contains("decomposition digit count")
+        );
+
+        let invalid_base = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::SmallDecomposed,
+            Some(IntExpr::constant(1)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(&graph("invalid-hash-base", invalid_base), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("gadget base must be greater than one")
+        );
+
+        let nondivisible_rows = hash_sample(
+            matrix_type(17, 3, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            node_message(
+                validate(&graph("nondivisible-hash-rows", nondivisible_rows), &ParamEnv::default())
+                    .unwrap_err()
+            )
+            .contains("hash output rows must be divisible")
+        );
+
+        let valid_balanced = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::Decomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            validate(&graph("valid-balanced-hash", valid_balanced), &ParamEnv::default()).is_ok()
+        );
+
+        let valid_unsigned = hash_sample(
+            matrix_type(17, 4, 1),
+            HashVariant::SmallDecomposed,
+            Some(IntExpr::constant(4)),
+            Some(IntExpr::constant(2)),
+        );
+        assert!(
+            validate(&graph("valid-unsigned-hash", valid_unsigned), &ParamEnv::default()).is_ok()
+        );
+    }
+
+    #[test]
+    fn small_rhs_multiplication_rejects_shape_and_negative_bound() {
+        let product = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input("rhs", matrix_type(17, 4, 1), 1, false),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 1))],
+        );
+        assert!(matches!(
+            validate(&graph("small-rhs-shape", product), &ParamEnv::default()),
+            Err(ValidationError::Check(CheckError::ShapeMismatch { .. }))
+        ));
+
+        let negative = bounded_input("negative", matrix_type(17, 1, 1), -1, false);
+        assert!(
+            node_message(
+                validate(&graph("negative-bound", negative), &ParamEnv::default()).unwrap_err()
+            )
+            .contains("small RHS coefficient bound")
+        );
+    }
+
+    #[test]
+    fn small_rhs_multiplication_rejects_modulus_and_ring_dimension_mismatches() {
+        let modulus_mismatch = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input("rhs", matrix_type(19, 3, 4), 1, false),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+        );
+        assert!(matches!(
+            validate(&graph("small-rhs-modulus-mismatch", modulus_mismatch), &ParamEnv::default()),
+            Err(ValidationError::Check(CheckError::RingMismatch))
+        ));
+
+        let ring_dimension_mismatch = value(
+            NodeKind::MatrixMulSmallRhs,
+            vec![
+                input("lhs", matrix_type(17, 2, 3)),
+                bounded_input(
+                    "rhs",
+                    MatrixType { ring_dimension: IntExpr::constant(16), ..matrix_type(17, 3, 4) },
+                    1,
+                    false,
+                ),
+            ],
+            vec![WireType::Matrix(matrix_type(17, 2, 4))],
+        );
+        assert!(matches!(
+            validate(
+                &graph("small-rhs-ring-dimension-mismatch", ring_dimension_mismatch),
+                &ParamEnv::default()
+            ),
+            Err(ValidationError::Check(CheckError::RingMismatch))
+        ));
+    }
+
+    #[test]
+    fn artifact_manifest_rejects_bounded_kind_bound_and_shape_mismatches() {
+        let matrix = matrix_type(17, 1, 1);
+        let cases = [
+            (
+                "kind",
+                ArtifactType::Preimage {
+                    matrix: crate::types::ConcreteMatrixType {
+                        modulus: BigInt::from(17),
+                        ring_dimension: 8,
+                        rows: 1,
+                        columns: 1,
+                    },
+                    max_coefficient_bound: BigInt::from(3),
+                },
+            ),
+            (
+                "bound",
+                ArtifactType::SmallMatrix {
+                    matrix: crate::types::ConcreteMatrixType {
+                        modulus: BigInt::from(17),
+                        ring_dimension: 8,
+                        rows: 1,
+                        columns: 1,
+                    },
+                    max_coefficient_bound: BigInt::from(4),
+                },
+            ),
+            (
+                "shape",
+                ArtifactType::SmallMatrix {
+                    matrix: crate::types::ConcreteMatrixType {
+                        modulus: BigInt::from(17),
+                        ring_dimension: 8,
+                        rows: 2,
+                        columns: 1,
+                    },
+                    max_coefficient_bound: BigInt::from(3),
+                },
+            ),
+        ];
+        for (label, artifact_type) in cases {
+            let (input, manifests) =
+                bounded_artifact_input(matrix.clone(), 3, false, artifact_type);
+            let error =
+                validate_with_manifests(&graph(label, input), &ParamEnv::default(), &manifests)
+                    .expect_err("manifest mismatch must be rejected");
+            assert!(node_message(error).contains("artifact type does not match manifest"));
+        }
     }
 
     #[test]
@@ -2681,323 +2266,6 @@ mod tests {
     }
 
     #[test]
-    fn ring_automorphism_rejects_typed_preimage_input() {
-        let target_type = matrix_type(17, 1, 1);
-        let decomposition_type = MatrixType { rows: IntExpr::constant(2), ..target_type.clone() };
-        let target = input("target", target_type.clone());
-        let decomposition = value(
-            NodeKind::GadgetDecompose {
-                base: IntExpr::constant(4),
-                digit_count: IntExpr::constant(2),
-                small: false,
-            },
-            vec![target],
-            vec![WireType::Preimage {
-                matrix: decomposition_type.clone(),
-                max_coefficient_bound: IntExpr::constant(2),
-            }],
-        );
-        let automorphism = value(
-            NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
-            vec![decomposition],
-            vec![WireType::Matrix(decomposition_type)],
-        );
-        let error = validate(&graph("automorphism-preimage", automorphism), &ParamEnv::default())
-            .expect_err("typed preimages must not enter a ring automorphism");
-        assert_eq!(node_message(error), "ring automorphism requires an ordinary matrix argument");
-    }
-
-    #[test]
-    fn trapdoor_digit_count_must_be_positive_in_nodes_and_wire_types() {
-        let trapdoor_sample = |digit_count: i64| {
-            let matrix = matrix_type(17, 1, digit_count + 2);
-            let trapdoor = WireType::Trapdoor {
-                matrix: matrix.clone(),
-                sigma: crate::RealExpr::from_integer(1),
-                gadget_base: IntExpr::constant(2),
-                digit_count: IntExpr::constant(digit_count),
-                preimage_max_coefficient_bound: IntExpr::constant(8),
-            };
-            NodeHandle::new(
-                NodeKind::TrapdoorSample {
-                    matrix_type: matrix.clone(),
-                    sigma: crate::RealExpr::from_integer(1),
-                    gadget_base: IntExpr::constant(2),
-                    digit_count: IntExpr::constant(digit_count),
-                    preimage_max_coefficient_bound: IntExpr::constant(8),
-                },
-                Vec::new(),
-                vec![WireType::Matrix(matrix), trapdoor],
-            )
-            .output(0)
-            .expect("trapdoor sample matrix output")
-        };
-
-        assert!(
-            node_message(
-                validate(&graph("zero-trapdoor-digits", trapdoor_sample(0)), &ParamEnv::default())
-                    .unwrap_err()
-            )
-            .contains("digit count")
-        );
-        validate(&graph("positive-trapdoor-digits", trapdoor_sample(1)), &ParamEnv::default())
-            .expect("a trapdoor with one gadget digit is valid");
-
-        let trapdoor_input = |digit_count: i64| {
-            let matrix = matrix_type(17, 1, digit_count + 2);
-            let wire_type = WireType::Trapdoor {
-                matrix,
-                sigma: crate::RealExpr::from_integer(1),
-                gadget_base: IntExpr::constant(2),
-                digit_count: IntExpr::constant(digit_count),
-                preimage_max_coefficient_bound: IntExpr::constant(8),
-            };
-            value(
-                NodeKind::Input {
-                    name: format!("trapdoor-{digit_count}"),
-                    wire_type: wire_type.clone(),
-                    artifact: None,
-                },
-                Vec::new(),
-                vec![wire_type],
-            )
-        };
-
-        assert!(
-            node_message(
-                validate(
-                    &graph("zero-trapdoor-wire-digits", trapdoor_input(0)),
-                    &ParamEnv::default()
-                )
-                .unwrap_err()
-            )
-            .contains("trapdoor digit count")
-        );
-        validate(&graph("positive-trapdoor-wire-digits", trapdoor_input(1)), &ParamEnv::default())
-            .expect("a trapdoor wire with one gadget digit is valid");
-    }
-
-    #[test]
-    fn family_preimage_requires_matching_matrix_and_trapdoor_leaf_types() {
-        fn family(element: WireType, shape: &[i64]) -> WireType {
-            WireType::Family {
-                element: Box::new(element),
-                shape: shape.iter().copied().map(IntExpr::constant).collect(),
-            }
-        }
-
-        fn trapdoor(matrix: MatrixType) -> WireType {
-            WireType::Trapdoor {
-                matrix,
-                sigma: crate::RealExpr::from_integer(4),
-                gadget_base: IntExpr::constant(2),
-                digit_count: IntExpr::constant(2),
-                preimage_max_coefficient_bound: IntExpr::constant(8),
-            }
-        }
-
-        fn sampled(
-            public_type: WireType,
-            trapdoor_type: WireType,
-            target_type: MatrixType,
-            preimage_type: MatrixType,
-        ) -> ValueHandle {
-            let public = typed_input("public", public_type);
-            let trapdoor = typed_input("trapdoor", trapdoor_type);
-            let target = typed_input("target", family(WireType::Matrix(target_type), &[2, 4]));
-            value(
-                NodeKind::FamilyPreimageSample {
-                    matrix_type: preimage_type.clone(),
-                    max_coefficient_bound: IntExpr::constant(8),
-                },
-                vec![public, trapdoor, target],
-                vec![family(
-                    WireType::Preimage {
-                        matrix: preimage_type,
-                        max_coefficient_bound: IntExpr::constant(8),
-                    },
-                    &[2, 4],
-                )],
-            )
-        }
-
-        let public_matrix = matrix_type(17, 2, 3);
-        let target_matrix = matrix_type(17, 2, 1);
-        let preimage_matrix = matrix_type(17, 3, 1);
-        let valid = sampled(
-            family(WireType::Matrix(public_matrix.clone()), &[2]),
-            family(trapdoor(public_matrix.clone()), &[2]),
-            target_matrix.clone(),
-            preimage_matrix.clone(),
-        );
-        assert!(validate(&graph("valid-family-preimage", valid), &ParamEnv::default()).is_ok());
-
-        let matrix_trapdoor = sampled(
-            family(WireType::Matrix(public_matrix.clone()), &[2]),
-            family(WireType::Matrix(public_matrix.clone()), &[2]),
-            target_matrix.clone(),
-            preimage_matrix.clone(),
-        );
-        assert_eq!(
-            node_message(
-                validate(&graph("matrix-family-trapdoor", matrix_trapdoor), &ParamEnv::default())
-                    .unwrap_err()
-            ),
-            "preimage trapdoor source must contain trapdoors"
-        );
-
-        let mismatched_trapdoor_matrix = matrix_type(19, 2, 3);
-        let mismatched = sampled(
-            family(WireType::Matrix(public_matrix), &[2]),
-            family(trapdoor(mismatched_trapdoor_matrix), &[2]),
-            target_matrix,
-            preimage_matrix,
-        );
-        assert_eq!(
-            node_message(
-                validate(&graph("mismatched-family-trapdoor", mismatched), &ParamEnv::default())
-                    .unwrap_err()
-            ),
-            "preimage public matrix does not match its trapdoor type"
-        );
-    }
-
-    #[test]
-    fn index_select_rejects_invalid_constants_and_preserves_dynamic_axes() {
-        let evaluate = |selector| {
-            validate_index_expr(
-                &IndexExpr::Select {
-                    selector: Box::new(selector),
-                    branches: vec![IndexExpr::constant(3), IndexExpr::constant(7)],
-                },
-                1,
-                &ParamEnv::default(),
-                &FrozenGraphScopeId::Root,
-                NodeId(0),
-                &BTreeSet::new(),
-            )
-        };
-
-        assert_eq!(evaluate(IndexExpr::constant(1)).unwrap(), Some(BigInt::from(7)));
-        for selector in [-1, 2] {
-            assert_eq!(
-                node_message(evaluate(IndexExpr::constant(selector)).unwrap_err()),
-                "index map select selector is out of range"
-            );
-        }
-        assert_eq!(evaluate(IndexExpr::Axis(0)).unwrap(), None);
-    }
-
-    #[test]
-    fn constant_log2ceil_is_validated_in_family_and_grid_reindex_maps() {
-        let evaluate_log2ceil = |value| {
-            validate_index_expr(
-                &IndexExpr::Log2Ceil(Box::new(value)),
-                1,
-                &ParamEnv::default(),
-                &FrozenGraphScopeId::Root,
-                NodeId(0),
-                &BTreeSet::new(),
-            )
-        };
-        assert_eq!(evaluate_log2ceil(IndexExpr::constant(1)).unwrap(), Some(BigInt::from(0)));
-        assert_eq!(evaluate_log2ceil(IndexExpr::constant(8)).unwrap(), Some(BigInt::from(3)));
-        assert_eq!(evaluate_log2ceil(IndexExpr::constant(3)).unwrap(), Some(BigInt::from(2)));
-        assert_eq!(evaluate_log2ceil(IndexExpr::Axis(0)).unwrap(), None);
-
-        let matrix = matrix_type(17, 1, 1);
-        let log2ceil =
-            |value| IndexExpr::Log2Ceil(Box::new(IndexExpr::Constant(BigInt::from(value))));
-        let family_reindex = |name: &str, input_extent: i64, index: IndexExpr| {
-            let input_type = WireType::Family {
-                element: Box::new(WireType::Matrix(matrix.clone())),
-                shape: vec![IntExpr::constant(input_extent)],
-            };
-            let input = typed_input("family", input_type);
-            let output = value(
-                NodeKind::FamilyReindex {
-                    output_shape: vec![IntExpr::constant(1)],
-                    map: IndexMap::new([index]),
-                },
-                vec![input],
-                vec![WireType::Family {
-                    element: Box::new(WireType::Matrix(matrix.clone())),
-                    shape: vec![IntExpr::constant(1)],
-                }],
-            );
-            graph(name, output)
-        };
-        let parallel_reindex = |name: &str, input_extent: i64, index: IndexExpr| {
-            let input_type = WireType::Family {
-                element: Box::new(WireType::Matrix(matrix.clone())),
-                shape: vec![IntExpr::constant(input_extent)],
-            };
-            let input = typed_input("family", input_type);
-            let body = with_new_construction_scope(|scope| {
-                let element = typed_input("element", WireType::Matrix(matrix.clone()));
-                SubgraphHandle::new(
-                    "log2ceil-grid-body",
-                    scope,
-                    vec![element.clone()],
-                    vec![element],
-                )
-                .unwrap()
-            });
-            let output = NodeHandle::parallel_grid(
-                body,
-                vec![input],
-                vec![WireType::Family {
-                    element: Box::new(WireType::Matrix(matrix.clone())),
-                    shape: vec![IntExpr::constant(1)],
-                }],
-                ParallelGrid {
-                    shape: vec![IntExpr::constant(1)],
-                    index_slots: vec![0],
-                    bindings: Vec::new(),
-                    input_modes: vec![GridInputMode::Reindex { map: IndexMap::new([index]) }],
-                },
-            )
-            .output(0)
-            .unwrap();
-            graph(name, output)
-        };
-
-        validate(&family_reindex("valid-family-log2ceil", 4, log2ceil(8)), &ParamEnv::default())
-            .unwrap();
-        validate(&parallel_reindex("valid-grid-log2ceil", 4, log2ceil(8)), &ParamEnv::default())
-            .unwrap();
-        for invalid in [
-            family_reindex("outside-family-log2ceil", 2, log2ceil(8)),
-            parallel_reindex("outside-grid-log2ceil", 2, log2ceil(8)),
-        ] {
-            assert_eq!(
-                node_message(validate(&invalid, &ParamEnv::default()).unwrap_err()),
-                "index map result is outside input shape"
-            );
-        }
-        assert_eq!(
-            node_message(
-                validate(
-                    &family_reindex("zero-family-log2ceil", 4, log2ceil(0)),
-                    &ParamEnv::default(),
-                )
-                .unwrap_err()
-            ),
-            "index map log2ceil argument must be positive"
-        );
-        assert_eq!(
-            node_message(
-                validate(
-                    &parallel_reindex("negative-grid-log2ceil", 4, log2ceil(-1)),
-                    &ParamEnv::default(),
-                )
-                .unwrap_err()
-            ),
-            "index map log2ceil argument must be positive"
-        );
-    }
-
-    #[test]
     fn crt_and_decode_validate_all_metadata_against_the_input_type() {
         let level = input("level", matrix_type(257, 1, 2));
         let crt = value(
@@ -3038,11 +2306,11 @@ mod tests {
             .map(|_| value(NodeKind::ConstantBool(false), Vec::new(), vec![WireType::ConstantBool]))
             .collect::<Vec<_>>();
         let family = value(
-            NodeKind::FamilyPack { shape: vec![IntExpr::constant(8)] },
+            NodeKind::FamilyPack { count: IntExpr::constant(8) },
             bools,
-            vec![WireType::Family {
+            vec![WireType::IndexedFamily {
                 element: Box::new(WireType::ConstantBool),
-                shape: vec![IntExpr::constant(8)],
+                count: IntExpr::constant(8),
             }],
         );
         let packed = value(
@@ -3063,173 +2331,15 @@ mod tests {
     }
 
     #[test]
-    fn parallel_grid_preserves_nested_family_body_output() {
-        let matrix = matrix_type(17, 1, 1);
-        let (body, _) = with_new_construction_scope(|scope| {
-            let first = value(
-                NodeKind::ConstantMatrix {
-                    matrix_type: matrix.clone(),
-                    value: ConstantMatrix::Zero,
-                },
-                Vec::new(),
-                vec![WireType::Matrix(matrix.clone())],
-            );
-            (
-                SubgraphHandle::new(
-                    "legacy-loop-family-body",
-                    scope,
-                    Vec::new(),
-                    vec![first.clone()],
-                )
-                .unwrap(),
-                first,
-            )
-        });
-        let output = NodeHandle::parallel_grid(
-            body,
-            Vec::new(),
-            vec![WireType::Family {
-                element: Box::new(WireType::Matrix(matrix.clone())),
-                shape: vec![IntExpr::Var("count".into())],
-            }],
-            ParallelGrid {
-                shape: vec![IntExpr::Var("count".into())],
-                index_slots: vec![0],
-                bindings: Vec::new(),
-                input_modes: Vec::new(),
-            },
-        )
-        .output(0)
-        .unwrap();
-        let graph = Graph::freeze(
-            "legacy-loop-family",
-            vec![CompileParameter { name: "count".into(), kind: CompileParameterKind::Integer }],
-            BTreeMap::from([("out".into(), GraphOutput { value: output, confidentiality: None })]),
-            Vec::new(),
-            Vec::new(),
-            BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
-        let mut environment = ParamEnv::default();
-        environment.integers.insert("count".into(), 3.into());
-        let validated = validate(&graph, &environment).unwrap();
-        assert_eq!(
-            validated.root_scope().wire_types[&WireRef { node: NodeId(0), port: Port(0) }],
-            ConcreteWireType::Family {
-                element: Box::new(ConcreteWireType::Matrix(ConcreteMatrixType::scalar(
-                    17.into(),
-                    8
-                ))),
-                shape: vec![3],
-            }
-        );
-    }
-
-    #[test]
-    fn parallel_grid_allows_constant_integer_body_only_in_matching_family_shape() {
-        let make = |name: &str, call_element: WireType, call_shape: i64, grid_shape: i64| {
-            let (body, _) = with_new_construction_scope(|scope| {
-                let constant = value(
-                    NodeKind::ConstantInt(BigInt::from(0)),
-                    Vec::new(),
-                    vec![WireType::ConstantInt],
-                );
-                (
-                    SubgraphHandle::new(name, scope, Vec::new(), vec![constant.clone()]).unwrap(),
-                    constant,
-                )
-            });
-            let output = NodeHandle::parallel_grid(
-                body,
-                Vec::new(),
-                vec![WireType::Family {
-                    element: Box::new(call_element),
-                    shape: vec![IntExpr::constant(call_shape)],
-                }],
-                ParallelGrid {
-                    shape: vec![IntExpr::constant(grid_shape)],
-                    index_slots: vec![0],
-                    bindings: Vec::new(),
-                    input_modes: Vec::new(),
-                },
-            )
-            .output(0)
-            .unwrap();
-            graph(name, output)
-        };
-
-        validate(&make("constant-grid", WireType::Int, 3, 3), &ParamEnv::default()).unwrap();
-        assert!(validate(&make("shape-grid", WireType::Int, 3, 4), &ParamEnv::default()).is_err());
-        assert!(
-            validate(
-                &make("matrix-grid", WireType::Matrix(matrix_type(17, 1, 1)), 3, 3),
-                &ParamEnv::default()
-            )
-            .is_err()
-        );
-        assert!(
-            validate(
-                &make("bytes-grid", WireType::Bytes { length: IntExpr::constant(1) }, 3, 3),
-                &ParamEnv::default()
-            )
-            .is_err()
-        );
-        assert!(
-            validate(
-                &make(
-                    "nested-family-grid",
-                    WireType::Family {
-                        element: Box::new(WireType::Int),
-                        shape: vec![IntExpr::constant(2)],
-                    },
-                    3,
-                    3,
-                ),
-                &ParamEnv::default()
-            )
-            .is_err()
-        );
-
-        let (body, _) = with_new_construction_scope(|scope| {
-            let input = typed_input("flag", WireType::Bool);
-            let output = value(NodeKind::BoolToInt, vec![input.clone()], vec![WireType::Int]);
-            (
-                SubgraphHandle::new("integer-grid-body", scope, vec![input], vec![output.clone()])
-                    .unwrap(),
-                output,
-            )
-        });
-        let flag = typed_input("flag", WireType::Bool);
-        let reversed = NodeHandle::parallel_grid(
-            body,
-            vec![flag],
-            vec![WireType::Family {
-                element: Box::new(WireType::ConstantInt),
-                shape: vec![IntExpr::constant(3)],
-            }],
-            ParallelGrid {
-                shape: vec![IntExpr::constant(3)],
-                index_slots: vec![0],
-                bindings: Vec::new(),
-                input_modes: vec![GridInputMode::Broadcast],
-            },
-        )
-        .output(0)
-        .unwrap();
-        assert!(validate(&graph("reversed-grid", reversed), &ParamEnv::default()).is_err());
-    }
-
-    #[test]
     fn family_validation_rejects_heterogeneous_members_and_warns_for_dynamic_indices() {
         let left = input("left", matrix_type(17, 1, 1));
         let right = input("right", matrix_type(17, 2, 1));
         let heterogeneous = value(
-            NodeKind::FamilyPack { shape: vec![IntExpr::constant(2)] },
+            NodeKind::FamilyPack { count: IntExpr::constant(2) },
             vec![left, right],
-            vec![WireType::Family {
+            vec![WireType::IndexedFamily {
                 element: Box::new(WireType::Matrix(matrix_type(17, 1, 1))),
-                shape: vec![IntExpr::constant(2)],
+                count: IntExpr::constant(2),
             }],
         );
         assert_eq!(
@@ -3242,19 +2352,19 @@ mod tests {
 
         let first = input("first", matrix_type(17, 1, 1));
         let second = input("second", matrix_type(17, 1, 1));
-        let family_type = WireType::Family {
+        let family_type = WireType::IndexedFamily {
             element: Box::new(WireType::Matrix(matrix_type(17, 1, 1))),
-            shape: vec![IntExpr::constant(2)],
+            count: IntExpr::constant(2),
         };
         let family = value(
-            NodeKind::FamilyPack { shape: vec![IntExpr::constant(2)] },
+            NodeKind::FamilyPack { count: IntExpr::constant(2) },
             vec![first, second],
             vec![family_type],
         );
         let index =
             value(NodeKind::ConstantInt(BigInt::from(1)), Vec::new(), vec![WireType::ConstantInt]);
         let selected = value(
-            NodeKind::FamilyGetDynamic { rank: 1 },
+            NodeKind::FamilyGetDynamic,
             vec![family, index],
             vec![WireType::Matrix(matrix_type(17, 1, 1))],
         );
@@ -3265,9 +2375,9 @@ mod tests {
 
     #[test]
     fn loop_dependent_family_access_requires_dynamic_indexing() {
-        let family_type = WireType::Family {
+        let family_type = WireType::IndexedFamily {
             element: Box::new(WireType::Int),
-            shape: vec![IntExpr::constant(2)],
+            count: IntExpr::constant(2),
         };
         let family = value(
             NodeKind::Input {
@@ -3299,15 +2409,13 @@ mod tests {
                         vec![WireType::ConstantInt],
                     );
                     value(
-                        NodeKind::FamilyGetDynamic { rank: 1 },
+                        NodeKind::FamilyGetDynamic,
                         vec![input.clone(), index],
                         vec![WireType::Int],
                     )
                 } else {
                     value(
-                        NodeKind::FamilyGetStatic {
-                            indices: vec![IndexExpr::try_from(loop_index.clone()).unwrap()],
-                        },
+                        NodeKind::FamilyGetStatic { index: loop_index },
                         vec![input.clone()],
                         vec![WireType::Int],
                     )
@@ -3321,22 +2429,23 @@ mod tests {
                 vec![selected],
             )
             .unwrap();
-            NodeHandle::parallel_grid(
+            NodeHandle::parallel_loop(
                 body,
                 vec![family.clone()],
-                vec![WireType::Family {
+                vec![WireType::IndexedFamily {
                     element: Box::new(WireType::Int),
-                    shape: vec![IntExpr::constant(2)],
+                    count: IntExpr::constant(2),
                 }],
-                ParallelGrid {
-                    shape: vec![IntExpr::constant(2)],
-                    index_slots: vec![0],
+                ParallelLoop {
+                    count: IntExpr::constant(2),
+                    minimum_count: 0,
+                    index_slot: 0,
                     bindings: if aliased {
                         vec![("i".to_owned(), IntExpr::LoopIndex(0))]
                     } else {
                         Vec::new()
                     },
-                    input_modes: vec![GridInputMode::Broadcast],
+                    input_modes: vec![LoopInputMode::Broadcast],
                 },
             )
             .output(0)
@@ -3389,15 +2498,13 @@ mod tests {
                         vec![WireType::ConstantInt],
                     );
                     value(
-                        NodeKind::FamilyGetDynamic { rank: 1 },
+                        NodeKind::FamilyGetDynamic,
                         vec![invariant.clone(), index],
                         vec![WireType::Int],
                     )
                 } else {
                     value(
-                        NodeKind::FamilyGetStatic {
-                            indices: vec![IndexExpr::try_from(loop_index.clone()).unwrap()],
-                        },
+                        NodeKind::FamilyGetStatic { index: loop_index },
                         vec![invariant.clone()],
                         vec![WireType::Int],
                     )

@@ -55,8 +55,6 @@ impl NaiveBggVecCompiler {
         }
         let compiler = self.public_key.clone();
         let reveal = input.reveal_plaintext;
-        // Each slot applies the large-scalar relation A K_t with G K_t = tG;
-        // the family operation changes only which slot receives the scalar.
         let matrices = input.matrices.clone().parallel_zip(scalars, move |_, matrix, scalar| {
             compiler
                 .large_scalar_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &scalar)
@@ -78,14 +76,18 @@ impl NaiveBggVecCompiler {
         }
         let vector_compiler = self.public_key.clone();
         let reveal = input.pubkey_reveal_plaintext;
-        // For every slot, K_t (defined by G K_t = tG) acts on the vector and
-        // the matching public matrix, while revealed plaintext records t x.
-        let vectors = mxx_dsl::parallel_zip_bundle_result(
-            (input.vectors.clone(), input.pubkeys.clone(), scalars.clone()),
-            move |_, (vector, matrix, scalar)| {
-                let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
-                Ok(vector.mul_small_rhs(vector_compiler.large_scalar_decomposition(&key, &scalar)))
+        let factors = mxx_dsl::parallel_zip_bundle(
+            (input.pubkeys.clone(), scalars.clone()),
+            move |_, (matrix, scalar)| {
+                vector_compiler.large_scalar_decomposition(
+                    &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
+                    &scalar,
+                )
             },
+        )?;
+        let vectors = mxx_dsl::parallel_zip_bundle(
+            (input.vectors.clone(), factors),
+            |_, (vector, factor)| factor.mul_small_rhs(vector),
         )?;
         let key_compiler = self.public_key.clone();
         let pubkeys =
@@ -184,19 +186,20 @@ impl NaiveBggVecCompiler {
         validate_encoding_pair(lhs, rhs)?;
         let lhs_plaintexts =
             lhs.plaintexts.clone().ok_or(NaiveVecCompileError::MissingLeftPlaintext)?;
-        // Slotwise BGG+ multiplication is C_L K_R + x_L C_R, where
-        // G K_R = A_R.  One decomposition is reused for all family slots so
-        // the rightmost carrier is consumed consistently.
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        let first =
-            lhs.vectors.clone().parallel_zip(rhs.pubkeys.clone(), move |_, left, right| {
-                left.mul_small_rhs(right.decompose(base.clone(), digits.clone()))
-            })?;
+        let decomposed_rhs = rhs
+            .pubkeys
+            .clone()
+            .parallel_map_values(move |_, matrix| matrix.decompose(base.clone(), digits.clone()))?;
+        let first = mxx_dsl::parallel_zip_bundle(
+            (lhs.vectors.clone(), decomposed_rhs),
+            |_, (left, right)| right.mul_small_rhs(left),
+        )?;
         let second = rhs
             .vectors
             .clone()
-            .parallel_zip(lhs_plaintexts, |_, right, plaintext| plaintext * right)?;
+            .parallel_zip(lhs_plaintexts, |_, right, plaintext| right * plaintext)?;
         let vectors = first.parallel_zip(second, |_, left, right| left + right)?;
         let pubkeys =
             self.key_family_binary(lhs, rhs, |compiler, left, right| compiler.mul(left, right))?;
@@ -238,12 +241,11 @@ impl NaiveBggVecCompiler {
         validate_encoding(input)?;
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        // This is a slotwise action by an arbitrary target T.  Decomposing T
-        // consumes the current carrier; it does not call T a canonical G
-        // encoding.
-        let vectors = input.vectors.clone().parallel_map(move |_, value| {
-            value.mul_small_rhs(target.clone().decompose(base.clone(), digits.clone()))
-        })?;
+        let decomposed = target.clone().decompose(base, digits);
+        let vectors = input
+            .vectors
+            .clone()
+            .parallel_map(move |_, value| decomposed.clone().mul_small_rhs(value))?;
         let key_compiler = self.public_key.clone();
         let target_for_keys = target.clone();
         let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
@@ -355,25 +357,39 @@ impl NaiveBggVecCompiler {
         large: bool,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding(input)?;
-        // Small scalars use direct t C.  Large scalars use the decomposition
-        // of tG, while any revealed plaintext family is updated by t x.
-        let vectors = if large {
-            let compiler = self.public_key.clone();
-            let reveal = input.pubkey_reveal_plaintext;
-            input.vectors.clone().parallel_zip(input.pubkeys.clone(), move |_, value, matrix| {
-                let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
-                value.mul_small_rhs(compiler.large_scalar_decomposition(&key, scalar))
-            })?
+        let vector_factor = if large {
+            let rows = input.pubkeys.clone().parallel_map_values({
+                let compiler = self.public_key.clone();
+                let scalar = scalar.clone();
+                move |_, matrix| {
+                    compiler.large_scalar_decomposition(
+                        &BggPublicKeyWire {
+                            matrix,
+                            reveal_plaintext: input.pubkey_reveal_plaintext,
+                        },
+                        &scalar,
+                    )
+                }
+            })?;
+            Some(rows)
         } else {
-            let scalar = scalar.clone();
-            input.vectors.clone().parallel_map(move |_, value| scalar.clone() * value)?
+            None
+        };
+        let vectors = match vector_factor {
+            Some(factors) => mxx_dsl::parallel_zip_bundle(
+                (input.vectors.clone(), factors),
+                |_, (value, factor)| factor.mul_small_rhs(value),
+            )?,
+            None => {
+                let scalar = scalar.clone();
+                input.vectors.clone().parallel_map(move |_, value| value * scalar.clone())?
+            }
         };
         let compiler = self.public_key.clone();
         let scalar_for_keys = scalar.clone();
         let reveal = input.pubkey_reveal_plaintext;
         let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
             let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
-            // The public-key side uses the same K_t satisfying G K_t = tG.
             if large {
                 compiler.large_scalar_mul(&key, &scalar_for_keys).matrix
             } else {
@@ -480,13 +496,9 @@ impl NaiveBggPublicKeyVecSampler {
 }
 
 impl NaiveBggEncodingVecSampler {
-    /// Samples per-slot BGG+ vectors using separate secrets for the public-key
-    /// mask and the plaintext gadget payload. `None` for `payload_secret`
-    /// reuses `mask_secret`, preserving the ordinary one-secret construction.
     pub fn sample(
         &self,
-        mask_secret: Mat,
-        payload_secret: Option<Mat>,
+        secret: Mat,
         public_keys: &[NaiveBggPublicKeyVecWire],
         plaintexts: &[Family<Mat>],
     ) -> Result<Vec<NaiveBggEncodingVecWire>, BggSampleError> {
@@ -501,40 +513,30 @@ impl NaiveBggEncodingVecSampler {
         }
         let layout = &self.scalar.layout;
         let ring = layout.ring();
-        let payload_secret = payload_secret.unwrap_or_else(|| mask_secret.clone());
-        if !same_matrix_type(
-            mask_secret.matrix_type(),
-            &ring.matrix_type((1, layout.secret_dimension)),
-        ) || !same_matrix_type(
-            payload_secret.matrix_type(),
-            &ring.matrix_type((1, layout.secret_dimension)),
-        ) || public_keys.par_iter().any(|key| {
-            !same_matrix_type(
-                key.matrices.element_type(),
-                &ring.matrix_type((layout.secret_dimension, layout.public_key_columns())),
-            )
-        }) || plaintexts
-            .par_iter()
-            .any(|value| !same_matrix_type(value.element_type(), &ring.matrix_type((1, 1))))
+        if !same_matrix_type(secret.matrix_type(), &ring.matrix_type((1, layout.secret_dimension))) ||
+            public_keys.par_iter().any(|key| {
+                !same_matrix_type(
+                    key.matrices.element_type(),
+                    &ring.matrix_type((layout.secret_dimension, layout.public_key_columns())),
+                )
+            }) ||
+            plaintexts
+                .par_iter()
+                .any(|value| !same_matrix_type(value.element_type(), &ring.matrix_type((1, 1))))
         {
             return Err(BggSampleError::MatrixTypeMismatch);
         }
-        // Every family member uses C_x = sA - (x tensor s)G + e.  The scalar
-        // sampler keeps G rightmost and preserves the shaped zero operation
-        // as 0*G rather than dropping the carrier columns.
         let outputs = (0..public_keys.len())
             .map(|output| {
                 let vectors = if output == 0 {
                     public_keys[0].matrices.clone().parallel_map({
                         let sampler = self.scalar.clone();
-                        let mask_secret = mask_secret.clone();
-                        let payload_secret = payload_secret.clone();
+                        let secret = secret.clone();
                         let reveal = public_keys[0].reveal_plaintext;
                         move |_, one_key| {
                             sampler
                                 .sample(
-                                    mask_secret.clone(),
-                                    Some(payload_secret.clone()),
+                                    secret.clone(),
                                     &[BggPublicKeyWire {
                                         matrix: one_key,
                                         reveal_plaintext: reveal,
@@ -555,15 +557,13 @@ impl NaiveBggEncodingVecSampler {
                         ),
                         {
                             let sampler = self.scalar.clone();
-                            let mask_secret = mask_secret.clone();
-                            let payload_secret = payload_secret.clone();
+                            let secret = secret.clone();
                             let one_reveal = public_keys[0].reveal_plaintext;
                             let reveal = public_keys[output].reveal_plaintext;
                             move |_, (one_key, key, plaintext)| {
                                 sampler
                                     .sample(
-                                        mask_secret.clone(),
-                                        Some(payload_secret.clone()),
+                                        secret.clone(),
                                         &[
                                             BggPublicKeyWire {
                                                 matrix: one_key,
@@ -876,12 +876,7 @@ mod tests {
                 gaussian_max_coefficient_bound: None,
             },
         }
-        .sample(
-            ring.input("mask-secret", (1, layout.secret_dimension)),
-            Some(ring.input("payload-secret", (1, layout.secret_dimension))),
-            &public_keys,
-            &[plaintexts],
-        )
+        .sample(ring.input("secret", (1, layout.secret_dimension)), &public_keys, &[plaintexts])
         .unwrap();
         let mut context = DslContext::new("naive-bgg-sampler-runtime");
         for output in 0..public_keys.len() {
@@ -900,26 +895,14 @@ mod tests {
             }
         }
         let graph = context.build().unwrap();
-        let mask_secret_value = secret(&parameters, layout.secret_dimension);
-        let payload_secret_value = DCRTPolyMatrix::from_poly_vec_row(
-            &parameters,
-            (0..layout.secret_dimension)
-                .map(|index| {
-                    DCRTPoly::const_rotate_poly(
-                        &parameters,
-                        (index + 1) % parameters.ring_dimension() as usize,
-                    )
-                })
-                .collect(),
-        );
+        let secret_value = secret(&parameters, layout.secret_dimension);
         let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 5)];
         let result = execute_graph(
             graph,
             parameters.clone(),
             BTreeMap::from([
                 ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
-                ("mask-secret".to_owned(), RuntimeValue::matrix(mask_secret_value.clone())),
-                ("payload-secret".to_owned(), RuntimeValue::matrix(payload_secret_value.clone())),
+                ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
                 ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
                 ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
             ]),
@@ -955,8 +938,8 @@ mod tests {
                 } else {
                     plaintext_values[slot].clone()
                 };
-                let expected_vector = mask_secret_value.clone() * expected_public -
-                    plaintext.tensor(&(payload_secret_value.clone() * gadget.clone()));
+                let expected_vector = secret_value.clone() * expected_public -
+                    plaintext.tensor(&(secret_value.clone() * gadget.clone()));
                 assert_eq!(
                     matrix_output(&result, &format!("vector-{output}-{slot}")),
                     &expected_vector
@@ -965,91 +948,5 @@ mod tests {
         }
         assert!(public_keys.iter().all(|key| key.reveal_plaintext));
         assert!(encodings.iter().all(|encoding| encoding.plaintexts.is_some()));
-    }
-
-    #[test]
-    fn naive_sampler_payload_secret_none_matches_explicit_shared_secret() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = concrete_layout(&parameters, 2);
-        let ring = layout.ring();
-        let public_keys =
-            NaiveBggPublicKeyVecSampler { layout: layout.clone(), slot_count: 2.into() }
-                .sample(ring.bytes_input("key", 32), b"naive-shared-secret", &[true])
-                .unwrap();
-        let plaintexts =
-            Family::pack((0..2).map(|slot| ring.input(format!("plain-{slot}"), (1, 1))).collect())
-                .unwrap();
-        let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 5)];
-        let sampler = NaiveBggEncodingVecSampler {
-            scalar: BggEncodingSampler {
-                layout,
-                gaussian_sigma: None,
-                gaussian_max_coefficient_bound: None,
-            },
-        };
-        let shared = sampler
-            .sample(ring.input("shared-secret", (1, 2)), None, &public_keys, &[plaintexts.clone()])
-            .unwrap();
-        let explicit = sampler
-            .sample(
-                ring.input("explicit-mask-secret", (1, 2)),
-                Some(ring.input("explicit-payload-secret", (1, 2))),
-                &public_keys,
-                &[plaintexts],
-            )
-            .unwrap();
-        let mut context = DslContext::new("naive-shared-secret-fallback");
-        for slot in 0..2 {
-            context = context
-                .output(format!("shared-{slot}"), shared[1].vectors.get_static(slot))
-                .unwrap()
-                .output(format!("explicit-{slot}"), explicit[1].vectors.get_static(slot))
-                .unwrap();
-        }
-        let graph = context.build().unwrap();
-        let secret_value = secret(&parameters, 2);
-        let result = execute_graph(
-            graph,
-            parameters.clone(),
-            BTreeMap::from([
-                ("key".to_owned(), RuntimeValue::Bytes([9u8; 32].to_vec())),
-                ("shared-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("explicit-mask-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("explicit-payload-secret".to_owned(), RuntimeValue::matrix(secret_value)),
-                ("plain-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
-                ("plain-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
-            ]),
-        );
-        for slot in 0..2 {
-            assert_eq!(
-                matrix_output(&result, &format!("shared-{slot}")),
-                matrix_output(&result, &format!("explicit-{slot}")),
-            );
-        }
-    }
-
-    #[test]
-    fn naive_sampler_rejects_payload_secret_with_wrong_shape() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = concrete_layout(&parameters, 2);
-        let ring = layout.ring();
-        let public_keys =
-            NaiveBggPublicKeyVecSampler { layout: layout.clone(), slot_count: 1.into() }
-                .sample(ring.bytes_input("key", 32), b"naive-shape", &[])
-                .unwrap();
-        let sampler = NaiveBggEncodingVecSampler {
-            scalar: BggEncodingSampler {
-                layout,
-                gaussian_sigma: None,
-                gaussian_max_coefficient_bound: None,
-            },
-        };
-        let result = sampler.sample(
-            ring.input("mask-secret", (1, 2)),
-            Some(ring.input("wrong-payload-secret", (1, 3))),
-            &public_keys,
-            &[],
-        );
-        assert!(matches!(result, Err(BggSampleError::MatrixTypeMismatch)));
     }
 }

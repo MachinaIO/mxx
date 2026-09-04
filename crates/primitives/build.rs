@@ -33,6 +33,7 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/Matrix.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixUtils.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixData.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixArith.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixDecompose.cuh");

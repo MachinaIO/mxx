@@ -465,7 +465,6 @@ dependencies = [
 name = "mxx-bgg"
 version = "0.1.0"
 dependencies = [
- "bigdecimal",
  "keccak-asm",
  "mxx-dsl",
  "mxx-gadgets",
@@ -478,6 +477,28 @@ dependencies = [
  "serial_test",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "mxx-correctness"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mxx-bgg",
+ "mxx-dsl",
+ "mxx-gadgets",
+ "mxx-ir-core",
+ "mxx-primitives",
+ "num-bigint",
+ "num-traits",
+ "rayon",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -521,6 +542,7 @@ dependencies = [
  "keccak-asm",
  "mxx-bench-estimator",
  "mxx-bgg",
+ "mxx-correctness",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",
@@ -553,18 +575,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
-]
-
-[[package]]
-name = "mxx-noise-simulator"
-version = "0.1.0"
-dependencies = [
- "mxx-ir-core",
- "num-bigint",
- "num-traits",
- "serde",
- "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -619,10 +629,10 @@ dependencies = [
  "keccak-asm",
  "mxx-bench-estimator",
  "mxx-bgg",
+ "mxx-correctness",
  "mxx-dsl",
  "mxx-gadgets",
  "mxx-ir-core",
- "mxx-noise-simulator",
  "mxx-primitives",
  "mxx-runtime",
  "num-bigint",

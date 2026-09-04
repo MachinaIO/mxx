@@ -113,8 +113,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         format!("{prefix}: preimage coefficient bound"),
                     );
                 }
-                NodeKind::PreimageSample { max_coefficient_bound, .. } |
-                NodeKind::FamilyPreimageSample { max_coefficient_bound, .. } => nonnegative(
+                NodeKind::PreimageSample { max_coefficient_bound, .. } => nonnegative(
                     &mut constraints,
                     max_coefficient_bound,
                     format!("{prefix}: preimage coefficient bound"),
@@ -150,33 +149,21 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                     });
                     positive(&mut constraints, length, format!("{prefix}: decode length"));
                 }
-                NodeKind::FamilyPack { shape } => {
-                    for extent in shape {
-                        nonnegative(&mut constraints, extent, format!("{prefix}: family extent"));
-                    }
-                }
-                NodeKind::Select { count } => {
+                NodeKind::FamilyPack { count } | NodeKind::Select { count } => {
                     positive(&mut constraints, count, format!("{prefix}: family count"));
                 }
+                NodeKind::FamilyGetStatic { index } |
                 NodeKind::ExtractCoefficient { position: index, .. } |
                 NodeKind::BitExtract { bit: index } => {
                     nonnegative(&mut constraints, index, format!("{prefix}: index"));
                 }
-                NodeKind::RingAutomorphism { index } => {
-                    positive(&mut constraints, index, format!("{prefix}: automorphism index"));
+                NodeKind::ParallelLoop(loop_spec) => {
+                    nonnegative(
+                        &mut constraints,
+                        &loop_spec.count,
+                        format!("{prefix}: loop count"),
+                    );
                 }
-                NodeKind::MatrixMulSmallRhs => {}
-                NodeKind::FamilyGetStatic { indices } => {
-                    let _ = indices;
-                }
-                NodeKind::FamilySelectAxis { .. } => {}
-                NodeKind::FamilyReindex { output_shape, .. } |
-                NodeKind::FamilyGather { output_shape, .. } => {
-                    for extent in output_shape {
-                        nonnegative(&mut constraints, extent, format!("{prefix}: family extent"));
-                    }
-                }
-                NodeKind::ParallelGrid(_) => {}
                 NodeKind::SequentialLoop(loop_spec) => {
                     nonnegative(
                         &mut constraints,
@@ -203,6 +190,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RealSqrt |
                 NodeKind::MatrixBinary(_) |
                 NodeKind::MatrixMulAccumulate { .. } |
+                NodeKind::MatrixMulSmallRhs |
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
                 NodeKind::Transpose |
@@ -212,7 +200,7 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::CrtRecompose { .. } |
                 NodeKind::PackPolynomialCoefficients { .. } |
                 NodeKind::SubgraphCall(_) |
-                NodeKind::FamilyGetDynamic { .. } => {}
+                NodeKind::FamilyGetDynamic => {}
             }
         }
     }
@@ -242,11 +230,7 @@ fn derive_wire_constraints(wire_type: &WireType, output: &mut Vec<ParamConstrain
         WireType::SmallMatrix { matrix, max_coefficient_bound } |
         WireType::Preimage { matrix, max_coefficient_bound } => {
             constraints_for_matrix(matrix, output);
-            nonnegative(
-                output,
-                max_coefficient_bound,
-                "bounded matrix coefficient bound".to_owned(),
-            );
+            nonnegative(output, max_coefficient_bound, "small RHS coefficient bound".to_owned());
         }
         WireType::Trapdoor {
             matrix,
@@ -270,10 +254,8 @@ fn derive_wire_constraints(wire_type: &WireType, output: &mut Vec<ParamConstrain
         }
         WireType::Bytes { length } => nonnegative(output, length, "byte length".to_owned()),
         WireType::TypedBlob { .. } => {}
-        WireType::Family { element, shape } => {
-            for extent in shape {
-                nonnegative(output, extent, "family extent".to_owned());
-            }
+        WireType::IndexedFamily { element, count } => {
+            nonnegative(output, count, "family count".to_owned());
             derive_wire_constraints(element, output);
         }
         WireType::ConstantInt |

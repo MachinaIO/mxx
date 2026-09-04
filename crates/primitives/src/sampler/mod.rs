@@ -1,5 +1,5 @@
 use crate::{
-    matrix::{PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError},
+    matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError},
     poly::Poly,
 };
 use num_bigint::BigUint;
@@ -33,6 +33,7 @@ pub enum DistType {
     /// Distribution that produces random bits (-1,0,1).
     TernaryDist,
 }
+
 /// Trait for sampling a polynomial based on a hash function.
 pub trait PolyHashSampler<K: AsRef<[u8]>> {
     type M: PolyMatrix;
@@ -54,8 +55,8 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
     ) -> Self::M;
 
     /// Samples the matrix that will immediately be gadget-decomposed.
-    /// Backends may keep the result in coefficient form to avoid a redundant
-    /// transform; the default preserves ordinary hash-sampling semantics.
+    /// Backends may preserve a coefficient-domain result to avoid a redundant
+    /// transform; the default keeps the ordinary sampling semantics.
     fn sample_hash_gadget_source<B: AsRef<[u8]>>(
         &self,
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
@@ -109,60 +110,6 @@ pub trait PolyHashSampler<K: AsRef<[u8]>> {
     ) -> Self::M {
         self.sample_hash_columns(params, key, tag, nrow, total_ncol, col_start, col_len, dist)
     }
-
-    fn sample_hash_decomposed<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        ncol: usize,
-        dist: DistType,
-    ) -> Self::M {
-        self.sample_hash(params, key, tag, nrow, ncol, dist).decompose_owned()
-    }
-
-    fn sample_hash_decomposed_columns<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        total_ncol: usize,
-        col_start: usize,
-        col_len: usize,
-        dist: DistType,
-    ) -> Self::M {
-        self.sample_hash_columns(params, key, tag, nrow, total_ncol, col_start, col_len, dist)
-            .decompose_owned()
-    }
-
-    fn sample_hash_small_decomposed<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        ncol: usize,
-        dist: DistType,
-    ) -> Self::M {
-        self.sample_hash(params, key, tag, nrow, ncol, dist).small_decompose_owned()
-    }
-
-    fn sample_hash_small_decomposed_columns<B: AsRef<[u8]>>(
-        &self,
-        params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
-        key: [u8; 32],
-        tag: B,
-        nrow: usize,
-        total_ncol: usize,
-        col_start: usize,
-        col_len: usize,
-        dist: DistType,
-    ) -> Self::M {
-        self.sample_hash_columns(params, key, tag, nrow, total_ncol, col_start, col_len, dist)
-            .small_decompose_owned()
-    }
 }
 
 pub trait PolyUniformSampler {
@@ -186,7 +133,7 @@ pub trait PolyUniformSampler {
 }
 
 pub trait PolyTrapdoorSampler {
-    type M: PolyMatrix + PolyMatrixSmallRhs;
+    type M: PolyMatrixSmallRhs;
     type Trapdoor: Send + Sync;
 
     fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self;
@@ -209,9 +156,8 @@ pub trait PolyTrapdoorSampler {
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         trapdoor: &Self::Trapdoor,
         public_matrix: &Self::M,
-        target: &dyn PolyMatrixColumnSource<Self::M>,
+        target: &Self::M,
         max_coefficient_bound: BigUint,
-        randomness_seed: [u8; 32],
     ) -> Result<<Self::M as PolyMatrixSmallRhs>::SmallMatrix, SmallMatrixError>;
 
     // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.

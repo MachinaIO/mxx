@@ -144,6 +144,21 @@ pub trait BooleanLayerGate<T> {
     fn candidates(&self, slot: GateSlot, left: T, right: T) -> Result<[T; 6], DslError>;
 }
 
+/// Optional owner hooks for matrix-valued Boolean evaluation.
+///
+/// The generic gadget does not assign symbolic meaning.  An owning implementation may retain
+/// frozen derivation references on the initial family and each selected lane value; the Rust
+/// operational checker validates and applies those references.
+pub trait BooleanMatrixLayerGate: BooleanLayerGate<Mat> {
+    fn retain_initial_family(&self, family: Family<Mat>) -> Result<Family<Mat>, DslError> {
+        Ok(family)
+    }
+
+    fn retain_selected_value(&self, value: Mat) -> Result<Mat, DslError> {
+        Ok(value)
+    }
+}
+
 fn layer_metadata(
     context: &DslContext,
     params: &BooleanCircuitFamilyParams,
@@ -168,12 +183,13 @@ pub fn evaluate_boolean_matrix_family<H>(
     handler: H,
 ) -> Result<Family<Mat>, DslError>
 where
-    H: BooleanLayerGate<Mat> + Clone,
+    H: BooleanMatrixLayerGate + Clone,
 {
     let invariants = (
         circuit.active_gate_counts,
         (circuit.gate_kinds, (circuit.left_sources, circuit.right_sources)),
     );
+    let preceding = handler.retain_initial_family(preceding)?;
     Sequential::range(params.depth.clone()).scan(
         preceding,
         invariants,
@@ -194,7 +210,7 @@ where
                     let active =
                         index.as_int().less_equal(active_count.clone().sub(Int::constant(1)));
                     let selected = active.to_int().select(vec![constant_false, selected])?;
-                    Ok(selected)
+                    layer_handler.retain_selected_value(selected)
                 },
             )
         },
@@ -293,14 +309,14 @@ fn reduce_bool_family(values: Family<Bool>, count: IntExpr) -> Result<Bool, DslE
     })
 }
 
-/// Builds the executable well-formedness graph for a symbolic circuit family.
+/// Builds the authoritative sampler-free well-formedness predicate.
 ///
 /// The initial input family and every carried layer have `max_layer_width` entries. Therefore the
 /// predicate requires `instance_width + witness_width <= max_layer_width`; unused input and gate
 /// slots use canonical zero padding.
 pub fn boolean_circuit_validity_predicate(
     context: DslContext,
-) -> Result<mxx_dsl::BuiltGraph, DslError> {
+) -> Result<mxx_dsl::PurePredicateSpec, DslError> {
     let (context, params) = BooleanCircuitFamilyParams::declare(context);
     let circuit = BooleanCircuitFamilyInputs::protocol_inputs(&context, &params);
     let instance_width = context.evaluate_int(params.instance_width.clone());
@@ -368,10 +384,14 @@ pub fn boolean_circuit_validity_predicate(
         Int::constant(1).less_equal(max_width.clone()),
         input_width.less_equal(max_width),
     ]);
-    context.bool_output("valid", bool_all([params_valid, records_valid, output_valid]))?.build()
+    mxx_dsl::PurePredicateSpec::new(
+        context
+            .bool_output("valid", bool_all([params_valid, records_valid, output_valid]))?
+            .build()?,
+    )
 }
 
-/// Builds the executable satisfaction graph for the symbolic circuit family.
+/// Builds a sampler-free ideal evaluator for the symbolic circuit family.
 ///
 /// Instance and witness inputs are separate integer families of length `max_layer_width`, so a
 /// protocol can expose the witness only to its final stage. The first `instance_width` and
@@ -380,7 +400,7 @@ pub fn boolean_circuit_validity_predicate(
 /// circuit output is true. Circuit-data validity is checked by the separate validity predicate.
 pub fn boolean_circuit_satisfaction_predicate(
     context: DslContext,
-) -> Result<mxx_dsl::BuiltGraph, DslError> {
+) -> Result<mxx_dsl::PurePredicateSpec, DslError> {
     let (context, params) = BooleanCircuitFamilyParams::declare(context);
     let circuit = BooleanCircuitFamilyInputs::protocol_inputs(&context, &params);
     let instance_width = context.evaluate_int(params.instance_width.clone());
@@ -442,7 +462,9 @@ pub fn boolean_circuit_satisfaction_predicate(
     let final_layer = evaluate_boolean_family(&context, &params, circuit.clone(), inputs)?;
     let output = select_boolean_output(&circuit, &final_layer);
     let inputs_valid = reduce_bool_family(input_validity, params.max_layer_width)?;
-    context.bool_output("satisfied", bool_and(inputs_valid, output))?.build()
+    mxx_dsl::PurePredicateSpec::new(
+        context.bool_output("satisfied", bool_and(inputs_valid, output))?.build()?,
+    )
 }
 
 #[cfg(test)]
@@ -493,13 +515,13 @@ mod tests {
     }
 
     fn runtime_family(values: &[i32]) -> RuntimeValue<CpuDcrtBackend> {
-        RuntimeValue::Family(
+        RuntimeValue::IndexedFamily(
             values.iter().map(|value| RuntimeValue::Int((*value).into())).collect(),
         )
     }
 
     fn execute_predicate(
-        predicate: &mxx_dsl::BuiltGraph,
+        predicate: &mxx_dsl::PurePredicateSpec,
         bindings: &ParamEnv,
         inputs: BTreeMap<String, RuntimeValue<CpuDcrtBackend>>,
         output: &str,
@@ -548,7 +570,7 @@ mod tests {
                 .scopes()
                 .values()
                 .flat_map(|scope| scope.nodes())
-                .any(|node| { matches!(node.kind(), NodeKind::FamilyGetDynamic { .. }) })
+                .any(|node| { matches!(node.kind(), NodeKind::FamilyGetDynamic) })
         );
         assert!(
             graph
@@ -556,7 +578,7 @@ mod tests {
                 .scopes()
                 .values()
                 .flat_map(|scope| scope.nodes())
-                .any(|node| { matches!(node.kind(), NodeKind::ParallelGrid(_)) })
+                .any(|node| { matches!(node.kind(), NodeKind::ParallelLoop(_)) })
         );
     }
 

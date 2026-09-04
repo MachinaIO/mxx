@@ -1,5 +1,4 @@
 #include "matrix/Matrix.cuh"
-#include "matrix/MatrixSmallRhs.cuh"
 #include "ChaCha.cuh"
 
 #include <algorithm>
@@ -23,4 +22,4 @@
 #include "MatrixSerde.cu"
 #include "MatrixSerdeBatch.cu"
 #include "MatrixCrt.cu"
-#include "MatrixSmallRhs.cu"
+#include "MatrixSmallRhs.cu" // compact bounded RHS implementation and staged kernels

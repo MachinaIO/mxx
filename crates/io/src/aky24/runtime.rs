@@ -173,7 +173,7 @@ where
             SamplingMode::Fresh,
         )
         .map_err(|error| Aky24IoRuntimeError::Execution(error.to_string()))?;
-        let Some(RuntimeValue::Family(outputs)) =
+        let Some(RuntimeValue::IndexedFamily(outputs)) =
             result.outputs.get(Aky24ArtifactNames::OUTPUT)
         else {
             return Err(Aky24IoRuntimeError::OutputLayout);

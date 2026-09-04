@@ -66,36 +66,6 @@ namespace
             outputs[matrix_limb], poly_idx, coefficient_idx, stride, bytes, negated);
     }
 
-    __global__ void matrix_ring_automorphism_batch_kernel(
-        const uint8_t *const *inputs,
-        uint8_t *const *outputs,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
-        const uint64_t *moduli,
-        const size_t *indices,
-        size_t limb_count,
-        size_t coefficients_per_limb,
-        size_t total_coefficients,
-        size_t n)
-    {
-        const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (idx >= total_coefficients) return;
-        const size_t matrix_limb = idx / coefficients_per_limb;
-        const size_t matrix_idx = matrix_limb / limb_count;
-        const size_t limb = matrix_limb % limb_count;
-        const size_t local = idx % coefficients_per_limb;
-        const size_t polynomial = local / n;
-        const size_t source = local % n;
-        const size_t exponent = (source * indices[matrix_idx]) % (2 * n);
-        const size_t target = exponent < n ? exponent : exponent - n;
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
-        const uint64_t modulus = moduli[limb];
-        uint64_t value = matrix_load_limb_u64(inputs[matrix_limb], polynomial, source, stride, bytes);
-        if (exponent >= n && value != 0) value = modulus - value;
-        matrix_store_limb_u64(outputs[matrix_limb], polynomial, target, stride, bytes, value);
-    }
-
     __global__ void matrix_scalar_mul_batch_kernel(
         const uint8_t *const *matrices,
         const uint8_t *const *scalars,
@@ -707,81 +677,6 @@ extern "C" int gpu_matrix_negate_batch(
     }
     status = finish_matrix_batch(metadata, outputs, inputs, nullptr);
     for (size_t matrix_idx = 0; matrix_idx < matrix_count; ++matrix_idx) outputs[matrix_idx]->format = inputs[matrix_idx]->format;
-    release();
-    return status;
-}
-
-extern "C" int gpu_matrix_validate_ring_automorphism(
-    size_t ring_dimension,
-    const size_t *indices,
-    size_t matrix_count)
-{
-    if (ring_dimension == 0 || (ring_dimension & (ring_dimension - 1)) != 0)
-        return set_error("ring automorphism requires a power-of-two ring dimension");
-    if (matrix_count != 0 && !indices)
-        return set_error("null ring automorphism indices");
-    if (ring_dimension > SIZE_MAX / 2)
-        return set_error("ring automorphism dimension overflow");
-    for (size_t matrix = 0; matrix < matrix_count; ++matrix)
-    {
-        if (indices[matrix] == 0 || indices[matrix] >= 2 * ring_dimension || indices[matrix] % 2 == 0)
-            return set_error("invalid ring automorphism index");
-    }
-    return 0;
-}
-
-extern "C" int gpu_matrix_ring_automorphism_batch(
-    GpuMatrix *const *outputs,
-    const GpuMatrix *const *inputs,
-    const size_t *indices,
-    size_t matrix_count)
-{
-    MatrixBatchMetadata metadata;
-    int status = prepare_matrix_batch(outputs, inputs, nullptr, matrix_count, 0, &metadata);
-    if (status != 0) return status;
-    if (inputs[0]->format != GPU_POLY_FORMAT_COEFF)
-        return set_error("ring automorphism requires coefficient format");
-    status = gpu_matrix_validate_ring_automorphism(metadata.n, indices, matrix_count);
-    if (status != 0) return status;
-    const size_t coefficients_per_limb = metadata.inner * metadata.n;
-    const size_t total_coefficients = matrix_count * metadata.limb_count * coefficients_per_limb;
-    const size_t pointer_count = matrix_count * metadata.limb_count;
-    const uint8_t **d_inputs = nullptr;
-    uint8_t **d_outputs = nullptr;
-    size_t *d_strides = nullptr;
-    uint8_t *d_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
-    size_t *d_indices = nullptr;
-    auto release = [&]() {
-        if (d_indices) cudaFreeAsync(d_indices, metadata.stream);
-        if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
-        if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
-        if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
-        if (d_outputs) cudaFreeAsync(d_outputs, metadata.stream);
-        if (d_inputs) cudaFreeAsync(d_inputs, metadata.stream);
-    };
-    cudaError_t error = cudaMallocAsync(reinterpret_cast<void **>(&d_inputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_outputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_indices), matrix_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_inputs, metadata.left.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_outputs, metadata.outputs.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count, cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_indices, indices, matrix_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error != cudaSuccess) { release(); return set_error(error); }
-    constexpr int threads = 256;
-    const int blocks = static_cast<int>((total_coefficients + threads - 1) / threads);
-    matrix_ring_automorphism_batch_kernel<<<blocks, threads, 0, metadata.stream>>>(
-        d_inputs, d_outputs, d_strides, d_bytes, d_moduli, d_indices,
-        metadata.limb_count, coefficients_per_limb, total_coefficients, metadata.n);
-    error = cudaGetLastError();
-    if (error != cudaSuccess) { release(); return set_error(error); }
-    status = finish_matrix_batch(metadata, outputs, inputs, nullptr);
-    for (size_t matrix = 0; matrix < matrix_count; ++matrix) outputs[matrix]->format = GPU_POLY_FORMAT_COEFF;
     release();
     return status;
 }

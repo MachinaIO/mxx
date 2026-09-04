@@ -1,11 +1,11 @@
 //! Declarative BGG+ encoding graph values.
 
 use crate::{BggPublicKeyCompiler, BggPublicKeyType, BggPublicKeyWire};
-use bigdecimal::BigDecimal;
 use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Ring};
-use mxx_ir_core::{IntExpr, RealExpr, ValueHandle, WireType, node::IndexRange};
-use num_bigint::ToBigInt;
-use num_traits::{ToPrimitive, Zero};
+use mxx_ir_core::{
+    IntExpr, RealExpr, ValueHandle, WireType,
+    node::{ConcatAxis, IndexRange},
+};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -116,9 +116,6 @@ impl BggEncodingCompiler {
         lhs: &BggEncodingWire,
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
-        // If C_L and C_R are encodings, their additive carrier is C_L + C_R and
-        // their known message is x_L + x_R; the public-key relation is added in
-        // the same coordinate system, so no carrier or column is discarded.
         Ok(BggEncodingWire {
             vector: lhs.vector.clone() + rhs.vector.clone(),
             pubkey: self.public_key.add(&lhs.pubkey, &rhs.pubkey),
@@ -131,8 +128,6 @@ impl BggEncodingCompiler {
         lhs: &BggEncodingWire,
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
-        // Subtraction is the same component-wise relation with signs reversed:
-        // C_L - C_R carries x_L - x_R and A_L - A_R, respectively.
         Ok(BggEncodingWire {
             vector: lhs.vector.clone() - rhs.vector.clone(),
             pubkey: self.public_key.sub(&lhs.pubkey, &rhs.pubkey),
@@ -152,24 +147,17 @@ impl BggEncodingCompiler {
             .matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        // For C_L = s_L A_L - x_L s_L G + e_L and the decomposition
-        // G K_R = A_R, the two terms C_L K_R + x_L C_R cancel the
-        // cross term and leave an encoding of x_L x_R.  `mul_small_rhs`
-        // keeps K_R as the rightmost carrier consumed by C_L.
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone().mul_small_rhs(decomposed_rhs) +
-                plaintext * rhs.vector.clone(),
+            vector: decomposed_rhs.mul_small_rhs(lhs.vector.clone()) +
+                rhs.vector.clone() * plaintext,
             pubkey: self.public_key.mul(&lhs.pubkey, &rhs.pubkey),
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
     }
 
     pub fn small_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
-        // For a small scalar t, t C_x is the encoding carrier and t x is its
-        // known plaintext.  The scalar is on the left so it acts on every row
-        // without changing the gadget-column layout.
         BggEncodingWire {
-            vector: scalar.clone() * input.vector.clone(),
+            vector: input.vector.clone() * scalar.clone(),
             pubkey: self.public_key.small_scalar_mul(&input.pubkey, scalar),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
@@ -177,11 +165,8 @@ impl BggEncodingCompiler {
 
     pub fn large_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
         let decomposed = self.public_key.large_scalar_decomposition(&input.pubkey, scalar);
-        // A large scalar t is represented by the decomposition of tG.  Thus
-        // C_x G^-1(tG) is the carrier-preserving form of t C_x, while the
-        // metadata records the ordinary plaintext product t x.
         BggEncodingWire {
-            vector: input.vector.clone().mul_small_rhs(decomposed.clone()),
+            vector: decomposed.clone().mul_small_rhs(input.vector.clone()),
             pubkey: self.public_key.large_scalar_mul_with_decomposition(&input.pubkey, decomposed),
             plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
         }
@@ -191,11 +176,8 @@ impl BggEncodingCompiler {
         let decomposed = target
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        // This is an explicit right action by an arbitrary target matrix.  Its
-        // decomposition is used only to consume the input carrier; it does not
-        // assert that the projected target itself is a canonical G encoding.
         BggEncodingWire {
-            vector: input.vector.clone().mul_small_rhs(decomposed),
+            vector: decomposed.mul_small_rhs(input.vector.clone()),
             pubkey: self.public_key.matrix_mul(&input.pubkey, target),
             plaintext: None,
         }
@@ -217,121 +199,6 @@ pub struct BggSamplerLayout {
     pub secret_dimension: usize,
     pub digit_count: usize,
     pub gadget_base: IntExpr,
-}
-
-/// Policy for the coefficient cutoff used when sampling a BGG-related
-/// preimage.
-///
-/// `Official` delegates to the authoritative bound calculation in
-/// `mxx-primitives`.  `Explicit` is available for reviewed parameter studies
-/// and test fixtures that intentionally select a different cutoff.  The
-/// policy is resolved by the owning application once all concrete dimensions
-/// are known; it is not an IR node or a runtime sampling mode.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PreimageCoefficientBound {
-    /// Compute the cutoff from the official preimage sigma formula.
-    Official,
-    /// Use this exact coefficient cutoff instead of the official formula.
-    Explicit(IntExpr),
-}
-
-impl Default for PreimageCoefficientBound {
-    fn default() -> Self {
-        Self::Official
-    }
-}
-
-impl PreimageCoefficientBound {
-    /// Resolves this policy to the concrete integer cutoff used by trapdoor
-    /// preimage rejection.  The official policy is shared by all BGG-based
-    /// applications and delegates its numerical constants to the primitive
-    /// sampler bounds module.  Symbolic or invalid inputs are rejected before
-    /// any graph node is constructed.
-    pub fn resolve(
-        &self,
-        layout: &BggSamplerLayout,
-        trapdoor_rows: usize,
-        sigma: &mxx_ir_core::RealExpr,
-    ) -> Result<IntExpr, BggSampleError> {
-        match self {
-            Self::Explicit(bound) => {
-                let value = bound.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(|_| {
-                    BggSampleError::InvalidPreimageBound("explicit preimage bound must be concrete")
-                })?;
-                if value <= num_bigint::BigInt::zero() {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "explicit preimage bound must be positive",
-                    ));
-                }
-                Ok(IntExpr::constant(value))
-            }
-            Self::Official => {
-                let n = layout
-                    .ring_dimension
-                    .evaluate(&mxx_ir_core::ParamEnv::default())
-                    .ok()
-                    .and_then(|value| value.to_u64())
-                    .filter(|value| *value > 0)
-                    .ok_or(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound requires a positive concrete ring dimension",
-                    ))?;
-                let base = layout.gadget_base.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(
-                    |_| {
-                        BggSampleError::InvalidPreimageBound(
-                            "official preimage bound requires a concrete gadget base",
-                        )
-                    },
-                )?;
-                if base < num_bigint::BigInt::from(2) {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound requires gadget base >= 2",
-                    ));
-                }
-                let m_g = trapdoor_rows
-                    .checked_mul(layout.digit_count)
-                    .and_then(|value| u64::try_from(value).ok())
-                    .filter(|value| *value > 0)
-                    .ok_or(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound dimensions overflow",
-                    ))?;
-                let sigma =
-                    sigma.evaluate_f64(&mxx_ir_core::ParamEnv::default()).map_err(|_| {
-                        BggSampleError::InvalidPreimageBound(
-                            "official preimage bound requires concrete finite sigma",
-                        )
-                    })?;
-                if !sigma.is_finite() || sigma <= 0.0 {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound requires positive finite sigma",
-                    ));
-                }
-                let ring_dim_sqrt =
-                    BigDecimal::from(n).sqrt().ok_or(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound ring dimension sqrt failed",
-                    ))?;
-                let base = BigDecimal::from_bigint(base, 0);
-                let sigma_bound = mxx_primitives::sampler::bounds::compute_preimage_sigma(
-                    &ring_dim_sqrt,
-                    m_g,
-                    &base,
-                    None,
-                    Some(sigma),
-                );
-                let cutoff =
-                    mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound)
-                        .to_bigint()
-                        .ok_or(BggSampleError::InvalidPreimageBound(
-                            "official preimage bound conversion failed",
-                        ))?;
-                if cutoff <= num_bigint::BigInt::zero() {
-                    return Err(BggSampleError::InvalidPreimageBound(
-                        "official preimage bound resolved to zero",
-                    ));
-                }
-                Ok(IntExpr::constant(cutoff))
-            }
-        }
-    }
 }
 
 impl BggSamplerLayout {
@@ -356,8 +223,6 @@ pub enum BggSampleError {
     SlotCountMismatch,
     #[error("BGG+ Gaussian sampling requires both a sigma and an explicit coefficient cutoff")]
     MissingGaussianBound,
-    #[error("invalid BGG+ preimage coefficient bound: {0}")]
-    InvalidPreimageBound(&'static str),
     #[error(transparent)]
     Dsl(#[from] mxx_dsl::DslError),
 }
@@ -370,16 +235,13 @@ pub struct BggEncodingSampler {
 }
 
 impl BggEncodingSampler {
-    /// Builds the packed BGG+ relation
-    /// `s_mask A - ([1|x_1|...|x_t] tensor (s_payload G)) + e`, then exposes
-    /// its column slices. The mask secret controls the public-key term, while
-    /// the payload secret controls the plaintext gadget term. Passing `None`
-    /// for `payload_secret` deliberately reuses the mask secret, which is the
-    /// ordinary one-secret BGG+ construction.
+    /// Builds the packed relation `sA - ([1|x_1|...|x_t] tensor sG) + e`, then
+    /// exposes its column slices. This preserves the executable dataflow of the
+    /// original sampler; the symbolic layer represents Concat and Tensor
+    /// directly without changing the runtime formula.
     pub fn sample(
         &self,
-        mask_secret: Mat,
-        payload_secret: Option<Mat>,
+        secret: Mat,
         public_keys: &[BggPublicKeyWire],
         plaintexts: &[Mat],
     ) -> Result<Vec<BggEncodingWire>, BggSampleError> {
@@ -392,9 +254,7 @@ impl BggEncodingSampler {
         let secret_type = ring.matrix_type((1, self.layout.secret_dimension));
         let public_key_type = ring.matrix_type((self.layout.secret_dimension, columns));
         let plaintext_type = ring.matrix_type((1, 1));
-        let payload_secret = payload_secret.unwrap_or_else(|| mask_secret.clone());
-        if !same_matrix_type(mask_secret.matrix_type(), &secret_type) ||
-            !same_matrix_type(payload_secret.matrix_type(), &secret_type) ||
+        if !same_matrix_type(secret.matrix_type(), &secret_type) ||
             public_keys
                 .par_iter()
                 .any(|key| !same_matrix_type(key.matrix.matrix_type(), &public_key_type)) ||
@@ -404,38 +264,38 @@ impl BggEncodingSampler {
         {
             return Err(BggSampleError::MatrixTypeMismatch);
         }
+        let all_public_keys = Mat::concat(
+            ConcatAxis::Columns,
+            public_keys.iter().map(|key| key.matrix.clone()).collect(),
+        );
         let one = ring.identity(1);
         let mut extended_plaintexts = Vec::with_capacity(count);
         extended_plaintexts.push(one);
         extended_plaintexts.extend(plaintexts.iter().cloned());
+        let encoded_plaintexts = Mat::concat(ConcatAxis::Columns, extended_plaintexts.clone());
         let gadget = ring.gadget(
             self.layout.secret_dimension,
             self.layout.gadget_base.clone(),
             self.layout.digit_count,
         );
-        let packed_error = match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
-            (Some(sigma), Some(bound)) => {
-                ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
-            }
-            (None, None) => ring.zero((1, columns * count)),
-            _ => return Err(BggSampleError::MissingGaussianBound),
-        };
-        // Construct each block against its own public matrix. The error is
-        // sampled once as a packed row and sliced, while the signal term keeps
-        // `G` as its final right operand. This preserves the typed carrier
-        // relation without introducing graph-level concatenation nodes.
+        let packed_vector = secret.clone() * all_public_keys -
+            encoded_plaintexts.tensor(secret.clone() * gadget) +
+            match (&self.gaussian_sigma, &self.gaussian_max_coefficient_bound) {
+                (Some(sigma), Some(bound)) => {
+                    ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                }
+                (None, None) => ring.zero((1, columns * count)),
+                _ => return Err(BggSampleError::MissingGaussianBound),
+            };
         Ok((0..count)
             .map(|index| BggEncodingWire {
-                vector: mask_secret.clone() * public_keys[index].matrix.clone() -
-                    extended_plaintexts[index].clone().tensor(payload_secret.clone()) *
-                        gadget.clone() +
-                    packed_error.clone().slice(
-                        None,
-                        Some(IndexRange {
-                            start: (columns * index).into(),
-                            end: (columns * (index + 1)).into(),
-                        }),
-                    ),
+                vector: packed_vector.clone().slice(
+                    None,
+                    Some(IndexRange {
+                        start: (columns * index).into(),
+                        end: (columns * (index + 1)).into(),
+                    }),
+                ),
                 pubkey: public_keys[index].clone(),
                 plaintext: public_keys[index]
                     .reveal_plaintext
@@ -608,13 +468,9 @@ mod tests {
         );
         assert_eq!(
             kinds.iter().filter(|kind| matches!(kind, NodeKind::MatrixMulSmallRhs)).count(),
-            2,
-            "the encoding vector and public key must consume their bounded decomposition relations"
+            2
         );
-        assert!(kinds.iter().any(|kind| {
-            matches!(kind, NodeKind::MatrixBinary(mxx_ir_core::node::MatrixBinaryOp::Multiply))
-        }));
-        assert!(kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixBinary(_))));
+        assert!(!kinds.iter().any(|kind| matches!(kind, NodeKind::MatrixScale { .. })));
 
         built.validate(&ParamEnv::default()).expect("valid executable graph");
     }
@@ -714,12 +570,7 @@ mod tests {
             gaussian_sigma: Some(3.into()),
             gaussian_max_coefficient_bound: Some(19.into()),
         }
-        .sample(
-            ring.input("secret", (1, 2)),
-            None,
-            &public_keys,
-            &[ring.input("plaintext", (1, 1))],
-        )
+        .sample(ring.input("secret", (1, 2)), &public_keys, &[ring.input("plaintext", (1, 1))])
         .expect("compatible sampler inputs");
         let built = DslContext::new("bgg-sampling")
             .private_output("constant", encodings[0].vector.clone())
@@ -752,20 +603,8 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(concat_count, 0, "encoding blocks are built directly without concatenation");
-        assert_eq!(tensor_count, 2, "one plaintext-secret tensor per encoding block");
-        assert!(
-            built.graph.root_scope().nodes().iter().any(|node| {
-                matches!(
-                    node.kind(),
-                    NodeKind::ConstantMatrix {
-                        matrix_type,
-                        value: mxx_ir_core::node::ConstantMatrix::Gadget { .. },
-                    } if matrix_type.rows.canonicalize() == IntExpr::constant(2)
-                )
-            }),
-            "each plaintext-secret row is multiplied by the real gadget"
-        );
+        assert_eq!(concat_count, 2, "packed public keys and packed plaintext row");
+        assert_eq!(tensor_count, 1, "one packed plaintext/secret-gadget tensor");
         assert_eq!(gaussian_types.len(), 1, "one packed error sample");
         assert_eq!(gaussian_types[0].columns.canonicalize(), IntExpr::constant(16));
         built.validate(&ParamEnv::default()).expect("valid executable graph");
@@ -788,8 +627,7 @@ mod tests {
             gaussian_max_coefficient_bound: None,
         }
         .sample(
-            ring.input("mask-secret", (1, layout.secret_dimension)),
-            Some(ring.input("payload-secret", (1, layout.secret_dimension))),
+            ring.input("secret", (1, layout.secret_dimension)),
             &public_keys,
             &[ring.input("plaintext-0", (1, 1)), ring.input("plaintext-1", (1, 1))],
         )
@@ -804,107 +642,52 @@ mod tests {
         }
         let graph = context.build().unwrap();
 
-        let mask_secret_value = secret(&parameters, layout.secret_dimension);
-        let payload_secret_value = DCRTPolyMatrix::from_poly_vec_row(
-            &parameters,
-            (0..layout.secret_dimension)
-                .map(|index| {
-                    DCRTPoly::const_rotate_poly(
-                        &parameters,
-                        (index + 1) % parameters.ring_dimension() as usize,
-                    )
-                })
-                .collect(),
-        );
+        let secret_value = secret(&parameters, layout.secret_dimension);
         let plaintext_values = [scalar(&parameters, 2), scalar(&parameters, 3)];
         let result = execute_graph(
             graph,
             parameters.clone(),
             BTreeMap::from([
                 ("key".to_owned(), RuntimeValue::Bytes(key.to_vec())),
-                ("mask-secret".to_owned(), RuntimeValue::matrix(mask_secret_value.clone())),
-                ("payload-secret".to_owned(), RuntimeValue::matrix(payload_secret_value.clone())),
+                ("secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
                 ("plaintext-0".to_owned(), RuntimeValue::matrix(plaintext_values[0].clone())),
                 ("plaintext-1".to_owned(), RuntimeValue::matrix(plaintext_values[1].clone())),
             ]),
         );
 
+        let packed = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+            &parameters,
+            key,
+            tag,
+            layout.secret_dimension,
+            layout.public_key_columns() * public_keys.len(),
+            DistType::FinRingDist,
+        );
         let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
-        let payload_secret_gadget = payload_secret_value.clone() * gadget;
-        let encoded_plaintexts = [
-            DCRTPoly::const_one(&parameters),
-            plaintext_values[0].entry(0, 0),
-            plaintext_values[1].entry(0, 0),
-        ];
+        let encoded_plaintexts = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![
+                DCRTPoly::const_one(&parameters),
+                plaintext_values[0].entry(0, 0),
+                plaintext_values[1].entry(0, 0),
+            ],
+        );
+        let vectors = secret_value.clone() * packed.clone() -
+            encoded_plaintexts.tensor(&(secret_value * gadget));
         for index in 0..public_keys.len() {
-            let mut indexed_tag = tag.to_vec();
-            indexed_tag.extend_from_slice(&(index as u64).to_le_bytes());
-            let public = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
-                &parameters,
-                key,
-                &indexed_tag,
-                layout.secret_dimension,
-                layout.public_key_columns(),
-                DistType::FinRingDist,
+            let start = layout.public_key_columns() * index;
+            let end = layout.public_key_columns() * (index + 1);
+            assert_eq!(
+                matrix_output(&result, &format!("public-{index}")),
+                &packed.slice_columns(start, end)
             );
-            let plaintext = DCRTPolyMatrix::from_poly_vec_row(
-                &parameters,
-                vec![encoded_plaintexts[index].clone()],
+            assert_eq!(
+                matrix_output(&result, &format!("vector-{index}")),
+                &vectors.slice_columns(start, end)
             );
-            assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);
-            let vector = mask_secret_value.clone() * public.clone() -
-                plaintext.tensor(&payload_secret_gadget);
-            assert_eq!(matrix_output(&result, &format!("public-{index}")), &public);
-            assert_eq!(matrix_output(&result, &format!("vector-{index}")), &vector);
         }
         assert!(encodings[0].plaintext.is_some());
         assert!(encodings[1].plaintext.is_none());
         assert!(encodings[2].plaintext.is_some());
-    }
-
-    #[test]
-    fn payload_secret_none_reuses_the_mask_secret() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
-        let layout = concrete_layout(&parameters, 2);
-        let ring = layout.ring();
-        let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
-            ring.bytes_input("key", 32),
-            b"bgg-shared-secret".to_vec(),
-            &[],
-        );
-        let sampler = BggEncodingSampler {
-            layout,
-            gaussian_sigma: None,
-            gaussian_max_coefficient_bound: None,
-        };
-        let shared =
-            sampler.sample(ring.input("shared-secret", (1, 2)), None, &public_keys, &[]).unwrap();
-        let explicit = sampler
-            .sample(
-                ring.input("explicit-mask-secret", (1, 2)),
-                Some(ring.input("explicit-payload-secret", (1, 2))),
-                &public_keys,
-                &[],
-            )
-            .unwrap();
-        let graph = DslContext::new("bgg-shared-secret-fallback")
-            .output("shared", shared[0].vector.clone())
-            .unwrap()
-            .output("explicit", explicit[0].vector.clone())
-            .unwrap()
-            .build()
-            .unwrap();
-        let secret_value = secret(&parameters, 2);
-        let result = execute_graph(
-            graph,
-            parameters,
-            BTreeMap::from([
-                ("key".to_owned(), RuntimeValue::Bytes([7u8; 32].to_vec())),
-                ("shared-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("explicit-mask-secret".to_owned(), RuntimeValue::matrix(secret_value.clone())),
-                ("explicit-payload-secret".to_owned(), RuntimeValue::matrix(secret_value)),
-            ]),
-        );
-        assert_eq!(matrix_output(&result, "shared"), matrix_output(&result, "explicit"));
     }
 }

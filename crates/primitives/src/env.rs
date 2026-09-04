@@ -14,6 +14,7 @@ pub fn cuda_stream_pool_size() -> usize {
 pub fn block_size() -> usize {
     std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)
 }
+
 fn positive_usize(name: &str, default: usize) -> Result<usize, String> {
     match std::env::var(name) {
         Ok(value) => value

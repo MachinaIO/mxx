@@ -24,8 +24,11 @@ pub fn hard_cutoff_from_sigma_bound(sigma_bound: &BigDecimal) -> BigUint {
         .expect("nonnegative cutoff must convert to BigUint")
 }
 
-/// Returns the authoritative minimum inclusive bound accepted by preimage
-/// sampling for the supplied concrete sampler parameters.
+/// Returns the default hard cutoff for a trapdoor preimage with the supplied public-matrix
+/// shape and sampler parameters.
+///
+/// This is the single authoritative bridge from the existing preimage sigma formula to the
+/// integer coefficient bound used by compact and full preimage samplers.
 pub fn default_preimage_cutoff(
     ring_dimension: u32,
     public_rows: usize,

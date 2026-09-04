@@ -50,7 +50,6 @@ impl DCRTPoly {
 
     #[inline]
     pub(crate) fn eval_bytes(&self) -> Vec<u8> {
-        let _native = crate::openfhe_guard::native_guard();
         self.ptr_poly.GetEvaluationBytes()
     }
 
@@ -74,7 +73,6 @@ impl DCRTPoly {
     }
 
     pub(crate) fn poly_gen_from_vec(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
-        let _native = crate::openfhe_guard::native_guard();
         let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
         let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
         let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
@@ -88,7 +86,6 @@ impl DCRTPoly {
     }
 
     fn poly_gen_from_vec_eval(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
-        let _native = crate::openfhe_guard::native_guard();
         let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
         let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
         let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
@@ -118,10 +115,7 @@ impl Poly for DCRTPoly {
 
     #[inline]
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let poly_encoding = {
-            let _native = crate::openfhe_guard::native_guard();
-            self.ptr_poly.GetCoefficientsBytes()
-        };
+        let poly_encoding = self.ptr_poly.GetCoefficientsBytes();
         let parsed_values = parse_coefficients_bytes(&poly_encoding);
         let coeffs = parsed_values.coefficients;
         let modulus = parsed_values.modulus;
@@ -374,7 +368,6 @@ impl PartialEq for DCRTPoly {
         if self.ptr_poly.is_null() || other.ptr_poly.is_null() {
             return false;
         }
-        let _native = crate::openfhe_guard::native_guard();
         self.ptr_poly.IsEqual(&other.ptr_poly)
     }
 }
@@ -394,12 +387,10 @@ impl Hash for DCRTPoly {
 }
 
 impl_binop_with_refs!(DCRTPoly => Add::add(self, rhs: &DCRTPoly) -> DCRTPoly {
-    let _native = crate::openfhe_guard::native_guard();
     DCRTPoly::new(ffi::DCRTPolyAdd(&rhs.ptr_poly, &self.ptr_poly))
 });
 
 impl_binop_with_refs!(DCRTPoly => Mul::mul(self, rhs: &DCRTPoly) -> DCRTPoly {
-    let _native = crate::openfhe_guard::native_guard();
     DCRTPoly::new(ffi::DCRTPolyMul(&rhs.ptr_poly, &self.ptr_poly))
 });
 
@@ -419,7 +410,6 @@ impl Neg for &DCRTPoly {
     type Output = DCRTPoly;
 
     fn neg(self) -> Self::Output {
-        let _native = crate::openfhe_guard::native_guard();
         DCRTPoly::new(self.ptr_poly.Negate())
     }
 }

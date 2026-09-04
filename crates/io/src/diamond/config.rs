@@ -40,6 +40,7 @@ pub struct DiamondIoConfig {
     pub digit_count: usize,
     pub trapdoor_sigma: RealExpr,
     pub error_sigma: RealExpr,
+    pub error_max_coefficient_bound: BigInt,
     pub preimage_max_coefficient_bound: BigInt,
     pub bgg_tag: Vec<u8>,
     pub seed_bits: usize,
@@ -224,6 +225,7 @@ impl DiamondIoConfig {
             digit_count: self.digit_count,
             trapdoor_sigma: self.trapdoor_sigma.clone(),
             error_sigma: self.error_sigma.clone(),
+            error_max_coefficient_bound: self.error_max_coefficient_bound.clone(),
             preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
         }
     }
@@ -298,6 +300,7 @@ mod tests {
             digit_count: 4,
             trapdoor_sigma: RealExpr::from_integer(5),
             error_sigma: RealExpr::from_integer(1),
+            error_max_coefficient_bound: 1_000_000.into(),
             preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-io-test".to_vec(),
             seed_bits: 64,
@@ -322,6 +325,17 @@ mod tests {
         assert_eq!(config.goldreich_stream_sizes(&function).unwrap(), [128, 160, 9]);
         assert_eq!(config.minimum_goldreich_seed_bits(&function).unwrap(), 38);
         config.validate(&function).unwrap();
+    }
+
+    #[test]
+    fn rejects_negative_sampler_bounds_from_the_authoritative_config() {
+        let function = DiamondIoFunction::GoldreichPrf { output_bits: 1 };
+        let mut config = config();
+        config.preimage_max_coefficient_bound = (-1).into();
+        assert_eq!(
+            config.validate(&function),
+            Err(DiamondIoConfigError::Input(DiamondInputConfigError::InvalidSamplerBound))
+        );
     }
 
     #[test]

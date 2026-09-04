@@ -342,7 +342,7 @@ where
         inputs.extend(seed_bindings.into_iter().map(|(name, matrices)| {
             (
                 name,
-                RuntimeValue::Family(
+                RuntimeValue::IndexedFamily(
                     matrices.into_iter().map(RuntimeValue::matrix).collect(),
                 ),
             )
@@ -409,7 +409,7 @@ where
                 .map_err(|error| DiamondIoRuntimeError::Execution(error.to_string()))?;
         (0..obfuscation.function.output_bits())
             .map(|output| {
-                let Some(RuntimeValue::Family(slots)) =
+                let Some(RuntimeValue::IndexedFamily(slots)) =
                     result.outputs.get(&output_name(output))
                 else {
                     return Err(DiamondIoRuntimeError::OutputLayout);
@@ -610,6 +610,7 @@ mod tests {
             digit_count: parameters.modulus_digits(),
             trapdoor_sigma: RealExpr::from_f64_exact(4.578).unwrap(),
             error_sigma: RealExpr::from_integer(1),
+            error_max_coefficient_bound: 1_000_000.into(),
             preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-io-runtime-test".to_vec(),
             seed_bits: 5,

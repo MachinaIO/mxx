@@ -1,6 +1,6 @@
-# Bounded Small-RHS Multiplication with Tiled DCRT Expansion
+# Small-RHS multiplication plan
 
-## Status
+## Objective and non-negotiable boundaries
 
 Replace the conceptual `mul_decomposed`/`apply_preimage` data flow for
 small-coefficient right-hand sides with one explicit `mul_small_rhs` operation.
@@ -10,190 +10,152 @@ receives exactly one runtime shard of at most W columns and processes all of its
 columns, K rows, and CRT limbs concurrently. Larger logical matrices are split
 only by the runtime fleet.
 
-The reviewed upstream revisions are:
+The priority order is: mathematical correctness, a simple final ownership and
+type/data flow, then performance within the VRAM and asynchronous-GPU
+constraints.  The migration is allowed to delete APIs, formats, wrappers, and
+old artifacts.  It must not retain compatibility shims, dual paths, hidden
+decomposition, flags on full matrices, or fixture-specific fallbacks.
 
-- base: `9c61347bf54595e35bb900257155626076314d35`;
-- initial PR revision: `7c497376f19c65943532e6a8949d1ba558eb7647`;
-- GPU optimization revision: `5ad6819a37a846b8f71d81909f8a26a353bd0eda`;
-- current reviewed PR head: `174ae6e53a7de9d09932339ac56f8fd4f30a0c0d`.
+The existing DSL/IR distinction is authoritative.  A `Preimage` remains a
+preimage wire from construction through validation, lowering, execution,
+families, and artifacts.  `Preimage::as_mat` and its scale-by-one erasure are
+deleted.  A preimage is consumed by an explicit `MatrixMulSmallRhs` node/API;
+that node means ordinary matrix multiplication with a bounded RHS, not a
+sampler and not an implicit decomposition.
 
-The updated revision adds persistent GPU matrix descriptors, owner-local
-completion waits, coefficient-domain hash sources, batched domain conversion,
-and compact-multiplication kernel improvements. It does not change the PR's
-original plan document or its row-major compact payload. This plan therefore
-specifies the final combined design rather than prescribing a commit-level
-cherry-pick.
+## Types and contracts
 
-The current head additionally restores per-instance evaluation of preimage
-coefficient bounds. A bounded schema may depend on a parallel-loop environment;
-it must never be frozen using the loop-index-zero validation environment.
+### IR and DSL
 
-Implementation uses the PR as the primary code source. Copy compatible files,
-functions, tests, and CUDA kernels directly from the reviewed PR revision, then
-apply only the deltas required by this document and by the current branch. Do
-not independently rebuild behavior already implemented correctly in the PR.
-The principal intentional divergences are complete owner-schema validation,
-per-instance bound preservation, stable-coordinate sampling, and
-current-branch integration.
-
-This document authorizes no implementation by itself. Implementation begins
-only after this plan is approved.
-
-## Objective
-
-Introduce one explicit operation for ordinary matrix multiplication with a
-bounded small-coefficient right-hand side:
-
-\[
-  Y = A S,
-  \qquad
-  A \in R_q^{m\times K},
-  \quad
-  S \in R^{K\times C},
-  \quad
-  Y \in R_q^{m\times C}.
-\]
-
-The operation must:
-
-1. preserve the full mathematical dimensions of every input and output;
-2. avoid materializing `S` as a full DCRT/NTT matrix;
-3. represent generic bounded matrices and relation-bearing preimages without
-   erasing their semantic distinction;
-4. keep the complete `O((log q)^2)` small matrix resident in compact signed
-   coefficient form, while streaming only its DCRT/NTT expansion by columns;
-5. retain `O(log q)` matrix objects on the GPU when they fit the configured
-   residency budget;
-6. use the same production path in runtime execution and benchmark estimates;
-7. keep GPU work asynchronous except at an explicit host-observation boundary;
-8. make output values and serialized artifacts independent of tile, wave, and
-   device scheduling choices; and
-9. require only the smallest exhaustive-match update in
-   `mxx-noise-simulator`, because that simulator is expected to be retired.
-
-Correctness and exact value semantics take precedence over performance. Peak
-memory is controlled by compact coefficient storage plus bounded DCRT
-workspace streaming, never by shrinking a matrix, changing dimensions,
-omitting columns, or replacing the production operation with a smaller
-mathematical problem.
-
-## Non-goals
-
-This migration does not:
-
-- preserve backward compatibility with old APIs, artifacts, environment
-  variables, or type-erasing conversions;
-- redesign an application's noise authority;
-- improve or otherwise expand the generic noise simulator;
-- add a CPU fallback for failed GPU execution;
-- cache values that depend on an unavailable secret;
-- change the algebraic preimage relation;
-- make column tiles or wave widths part of artifact identity; or
-- run integration tests unless separately requested.
-
-## Architectural boundaries
-
-The implementation follows the workspace dependency direction:
-
-- `mxx-ir-core` owns wire types, node semantics, validation, and artifact
-  schemas;
-- `mxx-dsl` exposes typed construction APIs;
-- `mxx-primitives` owns concrete compact matrices, preimage sampling, DCRT
-  matrices, GPU wrappers, and CUDA;
-- `mxx-runtime` owns lazy artifact access, placement, execution, and value
-  lifetime;
-- `mxx-bgg` and reusable gadgets consume the typed operation;
-- application crates own their program-specific use and simulation;
-- `mxx-noise-simulator` depends only on lower-level IR and must never depend on
-  an application crate; and
-- application crates do not depend on one another.
-
-GPU-specific Rust code must live in a file whose name contains `gpu`. CUDA
-headers declare only cross-file or Rust-facing interfaces; implementations
-belong in CUDA source files.
-
-## Terminology and size classes
-
-Let:
-
-- `N` be the ring dimension;
-- `L` be the active CRT-limb count;
-- `m` be the left-hand-side row count;
-- `K` be the shared matrix dimension and small-RHS row count;
-- `C` be the total small-RHS/output column count;
-- `B` be the inclusive centered coefficient bound of the small RHS;
-- `beta = 2^base_bits` be the power-of-two gadget base;
-- `ell_beta = sum_i ceil(log2(q_i) / base_bits)` be the total active
-  per-CRT gadget digit count (equal to
-  `L * ceil(crt_bits / base_bits)` when all active limbs use `crt_bits`);
-- `s_B` be the canonical bytes per small coefficient;
-- `w_i` be the evaluation-word byte width for CRT limb `i`;
-- `C_t` be the resident target-column count;
-- `K_t` be the multiplication reduction tile; and
-- `ell` be the active limb-wave width.
-
-An `O(log q)` matrix has only one dimension proportional to the gadget digit
-count and may remain resident when the exact allocation fits. A matrix with
-both row and column counts proportional to the gadget digit count has
-`O((log q)^2)` elements and must be column-streamed. This classification uses
-actual checked dimensions, not type names or paper-specific symbols.
-The symbol `ell_beta` is used only for gadget decomposition digits. It is not a
-mask-digit count, fresh-error-digit count, plaintext-base digit count, or
-secret dimension.
-
-## Semantic model
-
-### Bounded matrix types
-
-Add the following logical wire types:
+Add a generic bounded `SmallMatrix` wire alongside the relation-carrying
+`Preimage` wire.  Change `WireType::Preimage` and
+`ConcreteWireType::Preimage` from an unbounded matrix wrapper to a structured
+bounded type, and give `SmallMatrix` the same shape-plus-bound fields:
 
 ```text
-SmallMatrix {
-    matrix: MatrixType,
-    max_coefficient_bound: IntExpr,
-}
-
-Preimage {
-    matrix: MatrixType,
-    max_coefficient_bound: IntExpr,
-}
+SmallMatrix { matrix: MatrixType, max_coefficient_bound: IntExpr }
+Preimage { matrix: MatrixType, max_coefficient_bound: IntExpr }
+ConcreteSmallMatrix { matrix: ConcreteMatrixType,
+                      max_coefficient_bound: BigInt }
+ConcretePreimage { matrix: ConcreteMatrixType,
+                   max_coefficient_bound: BigInt }
 ```
 
-and their concrete counterparts:
+The concrete bound is non-negative and is part of equality, hashing, schema
+validation, artifact metadata, and execution diagnostics.  The bound is
+inclusive: a centered coefficient is accepted exactly when its absolute value
+is `<= B`, matching the existing `matrix_within_coefficient_bound` contract.
+Do not infer a bound from a serialized payload.  `SmallMatrix` means only
+"bounded coefficients"; it does not assert a cryptographic preimage relation.
+`Preimage` is the semantic relation-bearing wire for a bounded value; its
+schema contains only the matrix type and inclusive bound.  Relation identity
+is the exact producing node and its operand edges, as preserved by the graph
+and correctness `StaticLhsKey`/`Job` state; no producer attachment strings or
+owner/plan field is added to the Preimage schema.
+
+There are two explicit decomposition producers.  Regular `decompose` uses the
+current balanced digit step with `base = 2^base_bits`: each digit is in the
+inclusive interval `[-ceil(base/2), ceil(base/2)]` (the tie rule permits either endpoint),
+and produces `D = ceil(crt_bits/base_bits) * crt_depth` rows per input row.
+`small_decompose` uses the unsigned OpenFHE digits in `[0, base-1]` and
+produces `d = ceil(crt_bits/base_bits)` rows per input row.  Both return a
+bounded compact value and both `GadgetDecompose` modes always lower to a
+relation-typed `Preimage` output with the corresponding fixed bound and row
+count.  Generic hash decomposition has no relation: regular balanced and
+unsigned hash-decomposition producers always lower to generic `SmallMatrix`
+outputs, with bounds `ceil(base/2)` and `base-1` respectively.  These are fixed IR
+validation/output rules, not context-dependent runtime choices.
+
+For the balanced tie case, when the remainder is exactly `base/2`, choose
+`+base/2` when the Euclidean quotient is even and `-base/2` when it is odd;
+this is the current `balanced_digit_step` rule and fixes the endpoint without
+leaving the bound as an estimate.
+
+Families use one generic `FamilyType<S> { element: S, count: IntExpr }`
+schema and one one-wire `FamilyElement` contract for `Mat`, `SmallMatrix`,
+`Preimage`, `Int`, and `Bool`; there are no parallel concrete matrix-family
+schema types.  Same-count branch selection is likewise generic over a
+one-wire `FamilyElement` and requires identical complete element wire types,
+so selecting `Family<Preimage>` preserves its exact matrix schema and bound.
+`TrapdoorFamily` remains the explicit multi-wire exception.
+
+Add `NodeKind::MatrixMulSmallRhs` with exactly two arguments: a `Matrix` lhs
+and either a `Preimage` or generic `SmallMatrix` rhs, and one `Matrix` output.
+Validation requires matching modulus/ring dimension, `lhs.columns == rhs.rows`,
+and a non-negative checked RHS bound.  The node has ordinary multiplication semantics;
+operational-noise lowering must not add a decomposition or sampling term.
+Add `Mat::mul_small_rhs(self, rhs: SmallMatrix) -> Mat` and
+`Preimage::mul_small_rhs(self, lhs: Mat) -> Mat`.  Both construct the same node; the
+first accepts only generic `SmallMatrix`, while the second accepts only a
+relation-typed `Preimage`.  There is no `Mat` conversion, relabeling, or bound
+discarding adapter.  Thus `mul_small_rhs` accepts exactly these two typed RHS
+forms and no ordinary matrix, while the runtime backend has one compact owner
+for both.
+
+`small_decompose`, regular `decompose`, generic hash-decomposition, and
+preimage sampling are the only producers used by these RHS paths.  They
+produce their declared bounded type directly; `mul_small_rhs` never calls a
+decomposition routine.  Any remaining regular decomposition consumer must be
+made explicit and must not be routed through an ordinary untyped matrix.
+
+### Runtime/backend types
+
+At the primitive boundary, make `PolyTrapdoorSampler::M` implement
+`PolyMatrixSmallRhs`; do not add a duplicate sampler-level associated owner.
+Its bounded `preimage` takes the inclusive `max_coefficient_bound` and returns
+`Result<<Self::M as PolyMatrixSmallRhs>::SmallMatrix, SmallMatrixError>`.
+Delete the public expanded preimage path, `GpuPreimageRequest`, and
+`preimage_batched_sharded`; the GPU compact sampler is the single trait
+implementation, not an inherent side API hidden behind a runtime adapter.
+Keep `preimage_extend(...) -> M` because the distinct `[B,C]D=U` construction
+still has full-matrix primitive semantics; its implementation may use a private
+expanded-candidate helper but must never route through compact `preimage`.
+Consequently runtime has no private `CompactPreimageSampler` compatibility
+trait.  Remove the old expanded decomposed methods from `PolyHashSampler` once
+their call sites use the explicit compact backend producers.
+
+Extend `Backend` with one associated compact owner type, `SmallMatrix`, and
+separate semantic-producing operations:
 
 ```text
-ConcreteSmallMatrix {
-    matrix: ConcreteMatrixType,
-    max_coefficient_bound: BigInt,
-}
-
-ConcretePreimage {
-    matrix: ConcreteMatrixType,
-    max_coefficient_bound: BigInt,
-}
+gadget_decompose(..., small=false|true) -> SmallMatrix
+sample_hash_decomposed / sample_hash_small_decomposed -> SmallMatrix
+sample_preimage(...)             -> SmallMatrix
+multiply_small_rhs(lhs: Matrix, rhs: SmallMatrix) -> Matrix
+small_matrix_to_active_placement / small_matrix_to_placements
+small_matrix_to_bytes(value, expected_schema, semantic_kind) /
+small_matrix_from_bytes(expected_schema, bytes, expected_semantic_kind)
 ```
 
-The bound is non-negative, inclusive, and part of type equality, hashing,
-validation, artifact metadata, and diagnostics. Every centered coefficient
-`x` must satisfy `abs(x) <= B`.
+The CPU backend may use its existing matrix reference representation as
+`SmallMatrix`; its API contract still says that every coefficient is bounded
+and canonical.  The GPU backend must use a distinct `GpuSmallMatrix` compact
+owner.  Do not add a `small`/`compact`/`is_preimage` flag to
+`GpuDCRTPolyMatrix`, and do not make `RuntimeValue::Matrix` carry one.
 
-The symbolic bound remains an `IntExpr` until a concrete execution instance is
-known. For every scalar or parallel instance, evaluate it in that instance's
-`ParamEnv`. Batch construction, sampler requests, runtime owner metadata, and
-artifact descriptors use this evaluated value. A batching key includes the
-complete concrete bounded schema, including the evaluated bound; instances
-with different bounds may not share a request that assumes one common cutoff.
-This evaluation occurs before every branch-specific early return, including a
-`gadget_small` decomposition shortcut. Such a shortcut may select a different
-producer, but it may not bypass the instance's bound evaluation, owner-schema
-construction, or output validation.
+Define one concrete bounded schema passed by these calls:
+`ConcreteBoundedMatrixSchema { matrix: ConcreteMatrixType,
+max_coefficient_bound: BigInt }`.  The IR/runtime and artifact
+descriptor/manifest validate this complete schema once.  `SmallMatrix` is
+semantic-kind-free: the
+backend owner stores only bounded coefficients and shape.  The artifact layer
+supplies the expected schema and `SmallMatrix` or `Preimage` semantic kind to
+the codec call, and the codec performs only O(1) header equality checks against
+that already-validated schema before constructing an owner.  No semantic-kind
+field is duplicated in `GpuSmallMatrix` or `RuntimeValue::SmallMatrix`.
 
-`SmallMatrix` asserts only coefficient boundedness. `Preimage` additionally
-retains the exact producer relation already represented by the graph. A
-generic bounded matrix cannot be relabeled as a preimage. Neither type can be
-converted to an ordinary `Mat` merely to access multiplication.
+Add `RuntimeValue::SmallMatrix(Arc<B::SmallMatrix>)`, including clone/drop,
+placement, family, staging, materialisation, output, and value-kind error
+handling.  Both `ConcreteWireType::SmallMatrix` and
+`ConcreteWireType::Preimage` materialise to `RuntimeValue::SmallMatrix`; a
+`Matrix` wire materialises only to `RuntimeValue::Matrix`.  The runtime keeps
+the wire kind in validated metadata even though the backend owner is shared.
+A mismatch is an error, never a conversion attempt.  Placement code must
+replicate a small matrix to each device once, keep all DCRT limbs of a full
+matrix on one placement, and retain the preimage type through indexed
+families.
 
-### Matrix multiplication node
+### Canonical coefficients and serialization
 
 Define one canonical signed coefficient representation for all CPU/GPU
 boundaries.  The exact linear coefficient index is
@@ -341,11 +303,7 @@ runtime-selected `C <= W` shard does. Delete
 `mul_decompose` implementations and timing scaffolding; no old environment
 variable may silently control the new operation.
 
-- equal ring dimension and modulus parameters;
-- `lhs.columns == rhs.rows`;
-- a non-negative checked RHS bound;
-- an output shape of `lhs.rows x rhs.columns`; and
-- no implicit decomposition, sampling, scaling, or relation conversion.
+### Residency bound (mandatory asymptotic check)
 
 Let `D = ceil(crt_bits / base_bits) * crt_depth`, `N` be the ring dimension,
 and `C <= W` be one runtime shard. The full logical matrix may have many such
@@ -540,13 +498,17 @@ cargo bench -p mxx-primitives --bench bench_small_rhs_gpu --features gpu --no-ru
 The resulting binary was executed five times without changing its environment.
 The benchmark entry point is `crates/primitives/benches/bench_small_rhs_gpu.rs`.
 
-```rust
-lhs.mul_small_rhs(rhs)
-```
+## Producers, artifacts, and semantics
 
-Use a sealed `BoundedRhs` trait, or an equivalent closed typed interface, so
-only `SmallMatrix` and `Preimage` are accepted. Do not accept an ordinary
-`Mat`, a raw matrix identifier, or an unvalidated coefficient buffer.
+Gadget decomposition must write directly into the CPU `SmallMatrix` or GPU
+compact buffer.  The GPU sampler currently batches full-DCRT candidates; replace
+that with bounded draws over all rows and target-column tiles.  Set the sampler
+row tile `K_s=K` always: the preimage equation `A*x=t` couples all rows, so
+rows cannot be sampled independently.  Fix `draw_batch=1`; do not add a draw
+batch control in this migration.  Tile only target columns `C_s` (and retry
+one draw at a time).  If one full-row, one-column draw cannot fit the budget,
+fail with a resource/shape error rather than tiling rows or silently falling
+back to a full expanded matrix.
 
 Use the actual `GpuContext` allocation plan for every full `GpuMatrix`; do not
 estimate it from a symbolic limb count.  Add one side-effect-free
@@ -597,25 +559,27 @@ wrappers and `mul_small_rhs` remain asynchronous.  A host wait is permitted
 outside adaptive control only when a caller explicitly requests canonical D2H
 artifact bytes, at the artifact store return boundary described above.
 
-Every producer declares its output type and exact inclusive bound:
+Accepted preimages, gadget outputs, and artifact loads all use the same bound
+validation and canonical encoding.  Device-only artifact store/load wrappers
+remain asynchronous; a D2H artifact serialization necessarily waits at the
+host-return boundary for the returned bytes (and only there).  Artifact stores
+use the compact serializer, and artifact loads decode directly to the
+backend's `SmallMatrix`.
 
-| Producer | Output semantic type | Bound |
-| --- | --- | --- |
-| balanced gadget decomposition | `Preimage` when relation-bearing, otherwise `SmallMatrix` | the exact balanced-digit endpoint |
-| unsigned gadget decomposition | `Preimage` when relation-bearing, otherwise `SmallMatrix` | `beta - 1` |
-| hash gadget source/decomposition | `SmallMatrix` | decomposition-mode bound |
-| trapdoor preimage sampling | `Preimage` | caller-validated sampler cutoff |
-| artifact import | descriptor-selected type | descriptor bound, checked during decode |
+Update only the minimal exhaustive matches in correctness lowering and its
+normal-form/arena/job plumbing so `MatrixMulSmallRhs` is represented as the
+existing ordinary multiplication operator with a typed bounded RHS.  Preserve
+existing semantics and preimage relation metadata where compilation requires
+it; do not redesign the noise simulator, add error terms, or change its model.
+Do not replace the node with a scale-by-one or infer a relation from a matrix
+number.  This plan explicitly excludes noise-simulator accuracy work and
+simulator validation as acceptance gates.
 
-The sampler cutoff is inclusive. A caller-selected tight cutoff below the
-authoritative default preimage cutoff is rejected before sampling or any retry
-attempt begins; it is never silently treated as the default.
+## File-by-file implementation slices
 
-For power-of-two gadget base `beta = 2^base_bits`, keep the existing balanced
-tie convention. The exact inclusive balanced-digit bound is `beta/2`; the
-unsigned bound is `beta-1`. Do not infer a bound
-by scanning a payload after import, and do not substitute a gadget-digit bound
-for a sampled-preimage cutoff.
+The following slices are serialized Luna ownership units.  Sol decides only
+design questions that this plan leaves open; Luna implements one slice, runs
+its gate, and records the exact result for the next daily review.
 
 1. **IR/DSL contract:** `crates/ir-core/src/types.rs`, `node.rs`,
    `validate.rs`, `artifact.rs`, `constraints.rs`, `crates/dsl/src/lib.rs`.
@@ -673,7 +637,7 @@ for a sampled-preimage cutoff.
    one-call production path, compact RHS bytes, exact `L*K*W*N` workspace, and
    full-output persistence; remove estimates that count Preimage as full DCRT.
 
-### Full logical artifact and all-column compact owner
+## Validation matrix and review gates
 
 No integration tests are part of this plan.  Each implementation slice must
 first pass `cargo +nightly fmt --all`, focused unit tests for its
@@ -686,30 +650,58 @@ without naming the tests.  GPU tests run outside the sandbox and are repeated
 with identical commands (3--5 repetitions for smoke/correctness, and the
 repository-required repeated run for synchronization-sensitive tests).
 
-```text
-SmallMatrixArtifact {
-    schema,
-    semantic_kind,
-    total_rows,
-    total_columns,
-    canonical_payload_locator,
-}
+Required correctness tests include:
 
-GpuSmallMatrix {
-    schema,
-    rows,
-    columns,
-    device,
-    compact_device_owner,
-    ready_event,
-}
-```
+- IR round-trip/serde/hash and rejection tests for bounds, shape, wrong wire
+  kind, generic-vs-preimage artifact semantic mismatch, negative zero,
+  malformed width, and stale artifact format.  Codec/runtime tests must also
+  reject an expected-schema modulus mismatch, an owner/backend-context or
+  placement mismatch, schema shape or ring-dimension mismatch, and bound
+  mismatch before large allocation; these are descriptor/schema contract
+  failures, not coefficient-payload data.
+  Header-mismatch cases must fail through the O(1) contract checks without a
+  second payload scan, norm recomputation, or other heavy validation.
+- DSL graph assertions proving no `MatrixScale(1)` or hidden decomposition is
+  inserted and that `MatrixMulSmallRhs` has Matrix/(Preimage or
+  SmallMatrix)/Matrix types.
+- Slice 5 operational-lowering proof: two same-schema `Preimage` producers,
+  `Family<Preimage>::get` followed by `mul_small_rhs` preserves the exact
+  selected expression; the relation/recomposition rule uses that exact source,
+  and `MatrixMulSmallRhs` adds neither a sampler nor a decomposition.
+- CPU decomposition and preimage relation tests, signed boundary tests, all
+  zero, negative, maximum-bound, multi-column, family, store/load, and
+  ordinary-multiply equivalence against the trusted primitive.
+- GPU compact load/store/hash tests, producer relation tests, wrong-device and
+  format failures, multi-column/full-output tests, and repeated equivalence of
+  `mul_small_rhs` against CPU/trusted full-DCRT multiplication.  Include
+  distinct-prime checks demonstrating that per-prime NTT embedding is done and
+  no limb is accidentally reused.
+- Focused sampler tests for first-attempt success, retry-then-success, exact
+  exhaustion at the configured maximum, invalid zero
+  `MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS`, and event-safe buffer reuse after a
+  rejected draw.  Retry tests must use genuine relation-valid GPU candidates
+  and the production centered check/pack path: choose a bound between two
+  observed distinct centered maxima for reject-then-success, and below every
+  observed nonzero maximum for exhaustion.  Candidate search is test-bounded
+  and diagnostic; it must not inject acceptance Booleans, fixed candidate
+  bytes, or fixture-specific coefficients.  The exhaustion assertion checks
+  tile identity, exact attempt count, no extra draw, and event-safe cleanup.
+- Allocation-query tests cover single- and multi-GPU contexts, a decomposition
+  count different from CRT depth, checked-overflow parity with creation,
+  repeated side-effect-free queries with unchanged device memory, and creation
+  through the same shared plan.
+- Runtime placement, lazy/staged artifact, indexed-family, liveness/drop, and
+  ordinary-lowering compile/unit tests; estimator tests for compact bytes, tile
+  workspace, and column-independent temporary memory.  Existing correctness
+  tests may be run as ordinary workspace unit tests, but noise-simulator
+  accuracy or model changes are not an acceptance criterion here.
 
-Both objects represent all `K*C*N` coefficients. `GpuSmallMatrix` stores each
-coefficient in the canonical sign-plus-magnitude width `s_B`, not once per CRT
-limb. This all-column compact allocation is intentional and is the mechanism
-that makes the quadratic matrix resident. It contains no full-DCRT limb array,
-NTT representation, or host matrix clone.
+Before/after measurement is mandatory for acceptance, but is not itself a
+correctness claim: record the old column-chunk-one latency/peak and the new
+one-call latency/peak on the same parameters, device, seed policy, and
+artifact load/store flow.  Report raw per-stage timings, tile/limb settings,
+compact RHS size, full output size, allocator high-water mark, and command plus
+commit.  Do not invent benchmark success from estimates or no-run builds.
 
 Final gates are CPU/GPU no-run builds with no new warnings attributable to this
 change, nightly formatting, all allowed unit tests, repeated GPU tests,

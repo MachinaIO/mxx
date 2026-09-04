@@ -160,6 +160,7 @@ mod tests {
             digit_count: 4,
             trapdoor_sigma: RealExpr::from_integer(5),
             error_sigma: RealExpr::from_integer(1),
+            error_max_coefficient_bound: 1_000_000.into(),
             preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-io-artifacts".to_vec(),
             seed_bits: 5,

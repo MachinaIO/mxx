@@ -1,10 +1,13 @@
 //! BGG+ handlers for parameterized dynamic Boolean circuit families.
 
 use crate::{BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
-use mxx_dsl::{DslContext, DslError, Family, Int, LoopIndex, Mat, Parallel, Sequential};
+use mxx_dsl::{
+    DerivationAttachmentValue, DslContext, DslError, Family, GraphValue, Int, LoopIndex, Mat,
+    Parallel, Sequential,
+};
 use mxx_gadgets::circuit::{
-    BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanLayerGate, GateSlot,
-    evaluate_boolean_matrix_family,
+    BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanLayerGate,
+    BooleanMatrixLayerGate, GateSlot, evaluate_boolean_matrix_family,
 };
 use thiserror::Error;
 
@@ -41,6 +44,15 @@ impl BggPublicKeyFamily {
     }
 }
 
+fn attach_public_key_signal_group<T: GraphValue>(value: T) -> Result<T, DslError> {
+    let wire = value.flatten().into_iter().next().ok_or(DslError::Schema)?;
+    value.derivation_attachment(
+        "mxx-bgg",
+        "public-key-signal-grouping",
+        vec![("value".to_owned(), wire)],
+    )
+}
+
 impl BggEncodingFamily {
     pub fn pack(values: Vec<BggEncodingWire>) -> Result<Self, DynamicBooleanBggError> {
         if values.iter().any(|value| !value.pubkey.reveal_plaintext || value.plaintext.is_none()) {
@@ -63,6 +75,28 @@ impl BggEncodingFamily {
             return Err(DynamicBooleanBggError::FamilyLayout);
         }
         Ok(())
+    }
+
+    /// Retains the exact vector/public-key/plaintext pairing for checked operational analysis.
+    ///
+    /// Only frozen wire references are attached.  No equation, role, or numeric bound is supplied
+    /// by Rust; the checker first derives all three ordinary executable facts itself.
+    fn attach_operational_pairing(mut self) -> Result<Self, DslError> {
+        let vector = self.vectors.flatten().into_iter().next().ok_or(DslError::Schema)?;
+        let public_key =
+            self.public_keys.matrices.flatten().into_iter().next().ok_or(DslError::Schema)?;
+        let plaintext = self.plaintexts.flatten().into_iter().next().ok_or(DslError::Schema)?;
+        self.vectors = self.vectors.derivation_attachment(
+            "mxx-bgg",
+            "encoding-family-pairing",
+            vec![
+                ("vector".to_owned(), vector),
+                ("public-key".to_owned(), public_key),
+                ("plaintext".to_owned(), plaintext),
+            ],
+        )?;
+        self.public_keys.matrices = attach_public_key_signal_group(self.public_keys.matrices)?;
+        Ok(self)
     }
 
     fn gather(self, indices: Family<mxx_dsl::Int>) -> Result<Self, DynamicBooleanBggError> {
@@ -111,6 +145,7 @@ pub fn evaluate_boolean_encoding_layers(
     compiler: BggEncodingCompiler,
 ) -> Result<BggEncodingFamily, DynamicBooleanBggError> {
     preceding.validate()?;
+    let preceding = preceding.attach_operational_pairing()?;
     if !one.pubkey.reveal_plaintext || one.plaintext.is_none() {
         return Err(DynamicBooleanBggError::PlaintextRequired);
     }
@@ -196,7 +231,8 @@ pub fn evaluate_boolean_encoding_layers(
                     reveal_plaintext: true,
                 },
                 plaintexts: output_plaintexts,
-            };
+            }
+            .attach_operational_pairing()?;
             Ok((output.vectors, output.public_keys.matrices, output.plaintexts))
         },
     )?;
@@ -236,6 +272,16 @@ impl BooleanLayerGate<Mat> for PublicKeyBooleanGate {
             product.matrix,
             xor.matrix,
         ])
+    }
+}
+
+impl BooleanMatrixLayerGate for PublicKeyBooleanGate {
+    fn retain_initial_family(&self, family: Family<Mat>) -> Result<Family<Mat>, DslError> {
+        attach_public_key_signal_group(family)
+    }
+
+    fn retain_selected_value(&self, value: Mat) -> Result<Mat, DslError> {
+        attach_public_key_signal_group(value)
     }
 }
 
@@ -395,27 +441,24 @@ fn encoding_multiply(
 ) -> Result<BggEncodingFamily, DynamicBooleanBggError> {
     left.validate()?;
     right.validate()?;
+    let base = compiler.public_key.base.clone();
+    let digits = compiler.public_key.digit_count.clone();
+    let decomposed_right = right
+        .public_keys
+        .matrices
+        .clone()
+        .parallel_map_values(move |_, key| key.decompose(base, digits))?;
     let public_keys = mxx_dsl::parallel_zip_bundle_result(
-        (left.public_keys.matrices.clone(), right.public_keys.matrices.clone()),
-        {
-            let base = compiler.public_key.base.clone();
-            let digits = compiler.public_key.digit_count.clone();
-            move |_, (key, rhs)| Ok(key.mul_small_rhs(rhs.decompose(base.clone(), digits.clone())))
-        },
+        (left.public_keys.matrices.clone(), decomposed_right.clone()),
+        |_, (key, decomposition)| Ok(decomposition.mul_small_rhs(key)),
     )?;
     let first = mxx_dsl::parallel_zip_bundle_result(
-        (left.vectors.clone(), right.public_keys.matrices.clone()),
-        {
-            let base = compiler.public_key.base.clone();
-            let digits = compiler.public_key.digit_count.clone();
-            move |_, (vector, rhs)| {
-                Ok(vector.mul_small_rhs(rhs.decompose(base.clone(), digits.clone())))
-            }
-        },
+        (left.vectors.clone(), decomposed_right.clone()),
+        |_, (vector, decomposition)| Ok(decomposition.mul_small_rhs(vector)),
     )?;
     let second = mxx_dsl::parallel_zip_bundle_result(
         (right.vectors.clone(), left.plaintexts.clone()),
-        |_, (vector, plaintext)| Ok(plaintext * vector),
+        |_, (vector, plaintext)| Ok(vector * plaintext),
     )?;
     let vectors = mxx_dsl::parallel_zip_bundle_result(
         (first.clone(), second.clone()),
@@ -441,7 +484,7 @@ fn encoding_scalar(
     let public_keys = key_scalar(&compiler.public_key, &input.public_keys, scalar.clone())?;
     let vectors = input.vectors.clone().parallel_map_values({
         let scalar = scalar.clone();
-        move |_, value| scalar * value
+        move |_, value| value * scalar
     })?;
     let plaintexts =
         input.plaintexts.clone().parallel_map_values(move |_, value| value * scalar)?;
@@ -545,19 +588,18 @@ mod tests {
             .flat_map(|scope| scope.nodes())
             .filter(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
             .count();
-        assert!(
-            decomposition_count >= 1,
-            "the encoding family contains an explicit deterministic decomposition"
+        assert_eq!(
+            decomposition_count, 1,
+            "the encoding family reuses one deterministic right-key decomposition"
         );
-        assert!(
-            encoding_graph
-                .graph
-                .scopes()
-                .values()
-                .flat_map(|scope| scope.nodes())
-                .any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)),
-            "dynamic BGG multiplication must consume the decomposition relation"
-        );
+        let small_rhs_count = encoding_graph
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs))
+            .count();
+        assert_eq!(small_rhs_count, 2);
     }
 
     fn bindings() -> ParamEnv {

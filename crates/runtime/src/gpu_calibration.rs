@@ -7,9 +7,9 @@
 //! otherwise-identical GPUs.
 
 use mxx_ir_core::{
-    IntExpr, ParamEnv, encoding,
+    FrozenGraphScopeId, IntExpr, ParamEnv, concretize_wire_type, encoding,
     node::{ConcatAxis, ConstantMatrix, IndexRange, MatrixBinaryOp, NodeKind},
-    types::{ConcreteMatrixType, ConcreteWireType},
+    types::{ConcreteMatrixType, ConcreteWireType, NodeId, WireType},
 };
 use mxx_primitives::poly::dcrt::gpu::GpuDeviceIdentity;
 use serde::Serialize;
@@ -60,10 +60,8 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
             NodeKind::HashSample { .. } |
             NodeKind::GadgetTrapdoor { .. } |
             NodeKind::PreimageSample { .. } |
-            NodeKind::FamilyPreimageSample { .. } |
             NodeKind::GadgetDecompose { .. } |
             NodeKind::MatrixScale { .. } |
-            NodeKind::RingAutomorphism { .. } |
             NodeKind::MatrixNegate |
             NodeKind::MatrixBinary(_) |
             NodeKind::MatrixMulAccumulate { .. } |
@@ -83,7 +81,7 @@ pub fn gpu_operation_is_column_separable_for_types(
 ) -> bool {
     fn matrix_type(ty: &ConcreteWireType) -> Option<&ConcreteMatrixType> {
         match ty {
-            ConcreteWireType::Family { element, .. } => matrix_type(element),
+            ConcreteWireType::IndexedFamily { element, .. } => matrix_type(element),
             _ => ty.matrix_type(),
         }
     }
@@ -99,6 +97,39 @@ pub fn gpu_operation_is_column_separable_for_types(
     })
 }
 
+pub(crate) fn gpu_calibration_groups(
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    kind: &NodeKind,
+    declared_argument_types: &[WireType],
+    declared_output_types: &[WireType],
+    envs: &[ParamEnv],
+) -> Result<Vec<(Option<[u8; 32]>, Vec<usize>)>, String> {
+    let mut groups = Vec::<(Option<[u8; 32]>, Vec<usize>)>::new();
+    for (instance, env) in envs.iter().enumerate() {
+        let argument_types = declared_argument_types
+            .iter()
+            .map(|ty| concretize_wire_type(ty, env, scope_id, node_id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let output_types = declared_output_types
+            .iter()
+            .map(|ty| concretize_wire_type(ty, env, scope_id, node_id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let operation = gpu_operation_is_column_separable_for_types(kind, &argument_types)
+            .then(|| gpu_calibration_operation_identity(kind, &argument_types, &output_types, env))
+            .transpose()?;
+        if let Some((_, members)) = groups.iter_mut().find(|(candidate, _)| *candidate == operation)
+        {
+            members.push(instance);
+        } else {
+            groups.push((operation, vec![instance]));
+        }
+    }
+    Ok(groups)
+}
+
 pub fn gpu_matrix_multiply_scales_left(
     left_rows: usize,
     left_columns: usize,
@@ -109,8 +140,8 @@ pub fn gpu_matrix_multiply_scales_left(
 }
 
 /// Canonical per-primitive identity shared by estimator collection and runtime
-/// preflight. Automorphism selectors, selector-only loop values, and hash-domain
-/// tags do not affect the allocation/kernel path and are deliberately erased;
+/// preflight. Selector-only loop values and hash-domain tags do not affect the
+/// allocation/kernel path and are deliberately erased;
 /// concrete types retain every loop-dependent shape and bound that does affect it.
 pub fn gpu_calibration_operation_identity(
     kind: &NodeKind,
@@ -137,13 +168,13 @@ pub fn gpu_calibration_operation_identity(
             ConcreteWireType::SmallMatrix { matrix, .. } |
             ConcreteWireType::Preimage { matrix, .. } |
             ConcreteWireType::Trapdoor { matrix, .. } => matrix.columns = 1,
-            ConcreteWireType::Family { element, .. } => one_column(element),
+            ConcreteWireType::IndexedFamily { element, .. } => one_column(element),
             _ => {}
         }
     }
     fn matrix_type(ty: &ConcreteWireType) -> Option<&ConcreteMatrixType> {
         match ty {
-            ConcreteWireType::Family { element, .. } => matrix_type(element),
+            ConcreteWireType::IndexedFamily { element, .. } => matrix_type(element),
             _ => ty.matrix_type(),
         }
     }
@@ -192,8 +223,7 @@ pub fn gpu_calibration_operation_identity(
             matrix_type.columns = IntExpr::constant(1);
             normalize_output(&mut output_types);
         }
-        NodeKind::PreimageSample { matrix_type, .. } |
-        NodeKind::FamilyPreimageSample { matrix_type, .. } => {
+        NodeKind::PreimageSample { matrix_type, .. } => {
             matrix_type.columns = IntExpr::constant(1);
             if let Some(target) = argument_types.get_mut(2) {
                 one_column(target);
@@ -203,15 +233,6 @@ pub fn gpu_calibration_operation_identity(
         NodeKind::GadgetDecompose { .. } |
         NodeKind::MatrixScale { .. } |
         NodeKind::MatrixNegate => {
-            if let Some(input) = argument_types.first_mut() {
-                one_column(input);
-            }
-            normalize_output(&mut output_types);
-        }
-        NodeKind::RingAutomorphism { index } => {
-            // The automorphism selector changes values but not the GPU kernel shape or cost.
-            // Normalize only this calibration identity; the graph's semantic kind is untouched.
-            *index = IntExpr::constant(1);
             if let Some(input) = argument_types.first_mut() {
                 one_column(input);
             }
@@ -811,52 +832,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full, representative);
+    }
 
-        let kind = NodeKind::RingAutomorphism { index: IntExpr::constant(3) };
-        let full = gpu_calibration_operation_identity(
+    #[test]
+    fn calibration_groups_preserve_loop_dependent_preimage_bounds() {
+        let matrix = mxx_ir_core::types::MatrixType {
+            modulus: IntExpr::constant(257),
+            ring_dimension: IntExpr::constant(16),
+            rows: IntExpr::constant(2),
+            columns: IntExpr::constant(4),
+        };
+        let bound = IntExpr::Add(Box::new(IntExpr::constant(7)), Box::new(IntExpr::LoopIndex(0)));
+        let kind = NodeKind::PreimageSample {
+            matrix_type: matrix.clone(),
+            max_coefficient_bound: bound.clone(),
+        };
+        let arguments = vec![
+            WireType::Matrix(matrix.clone()),
+            WireType::Matrix(matrix.clone()),
+            WireType::Matrix(matrix.clone()),
+        ];
+        let outputs = vec![WireType::Preimage { matrix, max_coefficient_bound: bound }];
+        let env = |index| ParamEnv {
+            loop_indices: [(0, BigInt::from(index))].into_iter().collect(),
+            ..ParamEnv::default()
+        };
+        let groups = gpu_calibration_groups(
+            &FrozenGraphScopeId::Root,
+            NodeId(9),
             &kind,
-            &[matrix(29)],
-            &[matrix(29)],
-            &ParamEnv::default(),
+            &arguments,
+            &outputs,
+            &[env(0), env(1), env(0)],
         )
         .unwrap();
-        assert_eq!(kind, NodeKind::RingAutomorphism { index: IntExpr::constant(3) });
-        let representative = gpu_calibration_operation_identity(
-            &NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
-            &[matrix(1)],
-            &[matrix(1)],
-            &ParamEnv::default(),
-        )
-        .unwrap();
-        assert_eq!(full, representative);
 
-        let different_index = gpu_calibration_operation_identity(
-            &NodeKind::RingAutomorphism { index: IntExpr::constant(5) },
-            &[matrix(29)],
-            &[matrix(29)],
-            &ParamEnv::default(),
-        )
-        .unwrap();
-        assert_eq!(full, different_index);
-
-        let different_shape = gpu_calibration_operation_identity(
-            &kind,
-            &[ConcreteWireType::Matrix(ConcreteMatrixType {
-                modulus: BigInt::from(257u16),
-                ring_dimension: 16,
-                rows: 4,
-                columns: 29,
-            })],
-            &[ConcreteWireType::Matrix(ConcreteMatrixType {
-                modulus: BigInt::from(257u16),
-                ring_dimension: 16,
-                rows: 4,
-                columns: 29,
-            })],
-            &ParamEnv::default(),
-        )
-        .unwrap();
-        assert_ne!(full, different_shape);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|(operation, _)| operation.is_some()));
+        assert_eq!(groups[0].1, vec![0, 2]);
+        assert_eq!(groups[1].1, vec![1]);
+        assert_ne!(groups[0].0, groups[1].0);
     }
 
     #[test]

@@ -132,7 +132,6 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             lookup.trapdoors.clone(),
             self.config.gadget_base.clone().into(),
             self.config.digit_count.into(),
-            self.config.preimage_max_coefficient_bound.clone().into(),
             prefix,
         )?;
         let mut slots = NaivePublicKeySlotOperations;
@@ -167,7 +166,6 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             self.config.digit_count.into(),
             self.config.ring_dimension,
             &prefix,
-            self.config.preimage_max_coefficient_bound.clone().into(),
         )?;
         let mut lowering =
             NaiveLweLookupEncodingLowering::new(invocations, lookup.c_b_by_slot.clone())?;
@@ -310,15 +308,9 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             .collect::<Result<Vec<_>, DiamondIoCompileError>>()?;
 
         let mut context = DslContext::new("diamond-io-preprocessing")
-            .public_family_output(
-                DiamondIoArtifactNames::INJECTOR_INITIAL_STATE,
-                injection.initial,
-            )?
+            .public_output(DiamondIoArtifactNames::INJECTOR_INITIAL_STATE, injection.p)?
             .public_bytes_output(DiamondIoArtifactNames::HASH_KEY, hash_key)?
-            .public_preimage_family_output(
-                DiamondIoArtifactNames::INJECTOR_TRANSITIONS,
-                injection.transitions,
-            )?;
+            .public_output(DiamondIoArtifactNames::INJECTOR_TRANSITIONS, injection.transitions)?;
         context = self.export_public_key(
             context,
             DiamondIoArtifactNames::SCALAR_ONE_PUBLIC_KEY,
@@ -343,7 +335,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             &k,
             &input_bits,
         )?;
-        context = context.public_preimage_family_output(
+        context = context.public_output(
             DiamondIoArtifactNames::LOOKUP_BASE_PROJECTION,
             lookup_base_projection,
         )?;
@@ -366,11 +358,11 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                     round.refresh[0][wire].a_prime.matrices.clone(),
                 )?;
                 for branch in 0..self.config.branch_count()? {
-                    context = context.public_preimage_family_output(
+                    context = context.public_output(
                         DiamondIoArtifactNames::round_rebase_preimages(round_index, branch, wire),
                         round.branch_rebase_preimages[branch][wire].clone(),
                     )?;
-                    context = context.public_preimage_family_output(
+                    context = context.public_output(
                         DiamondIoArtifactNames::round_refresh_decoder_preimages(
                             round_index,
                             branch,
@@ -401,7 +393,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                     DiamondIoArtifactNames::final_mask_public_bottom(output),
                     wires.mask_bottom.matrices,
                 )?
-                .public_preimage_family_output(
+                .public_output(
                     DiamondIoArtifactNames::final_decoder_preimages(output),
                     preimages,
                 )?;
@@ -426,14 +418,9 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             ArtifactConfidentiality::Public,
         );
         let injector = DiamondInputInjector::new(self.config.input_config())?;
-        let max_states = self
-            .config
-            .input_config()
-            .state_count_at_level(self.config.input_count)?;
-        let initial = ring.family_artifact_input(
+        let initial = ring.artifact_input(
             production.clone(),
             DiamondIoArtifactNames::INJECTOR_INITIAL_STATE,
-            max_states,
             (1, self.config.input_config().state_columns()?),
             ArtifactConfidentiality::Public,
         );
@@ -449,14 +436,14 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
         let lookup_base_preimages = ring.preimage_family_artifact_input(
             production.clone(),
             DiamondIoArtifactNames::LOOKUP_BASE_PROJECTION,
-            vec![IntExpr::constant(self.config.ring_dimension)],
+            self.config.ring_dimension,
             (self.config.input_config().state_columns()?, self.config.digit_count + 2),
             self.config.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
         );
         let root_state = states.get_static(0);
         let c_b_by_slot = lookup_base_preimages
-            .parallel_map_values(move |_, preimage| root_state.clone().mul_small_rhs(preimage))?;
+            .parallel_map_values(move |_, preimage| preimage.mul_small_rhs(root_state.clone()))?;
         let mut lookups =
             LookupEvaluation { production: production.clone(), c_b_by_slot, next_circuit: 0 };
         let one_public = self.import_public_key(
@@ -579,7 +566,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             let preimages = ring.preimage_family_artifact_input(
                 production.clone(),
                 DiamondIoArtifactNames::final_decoder_preimages(output),
-                vec![IntExpr::constant(self.config.ring_dimension)],
+                self.config.ring_dimension,
                 (self.config.input_config().state_columns()?, 1),
                 self.config.preimage_max_coefficient_bound.clone(),
                 ArtifactConfidentiality::Public,
@@ -661,8 +648,12 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             digit_count: self.config.digit_count,
             gadget_base: self.config.gadget_base.clone().into(),
             trapdoor_sigma: self.config.trapdoor_sigma.clone(),
-            preimage_max_coefficient_bound: self.config.preimage_max_coefficient_bound.clone().into(),
             coefficient_count: self.config.ring_dimension,
+            preimage_max_coefficient_bound: self
+                .config
+                .preimage_max_coefficient_bound
+                .clone()
+                .into(),
         }
     }
 
@@ -1115,11 +1106,11 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
         k: &NaiveBggPublicKeyVecWire,
         input_bits: &[NaiveBggPublicKeyVecWire],
     ) -> Result<DslContext, DiamondIoCompileError> {
-        context = context.public_preimage_family_output(
+        context = context.public_output(
             DiamondIoArtifactNames::ONE_PROJECTION,
             self.projection_preimages(trapdoors.get_static(0), one, true, false)?,
         )?;
-        context = context.public_preimage_family_output(
+        context = context.public_output(
             DiamondIoArtifactNames::K_PROJECTION,
             self.projection_preimages(trapdoors.get_static(0), k, false, true)?,
         )?;
@@ -1127,7 +1118,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             let digit = bit / self.config.batch_bits;
             let bit_in_digit = bit % self.config.batch_bits;
             let state = self.config.input_config().bit_state_index(digit, bit_in_digit)?;
-            context = context.public_preimage_family_output(
+            context = context.public_output(
                 DiamondIoArtifactNames::input_projection(bit),
                 self.projection_preimages(trapdoors.get_static(state), key, false, true)?,
             )?;
@@ -1164,7 +1155,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
         let preimages = self.ring().preimage_family_artifact_input(
             production,
             projection,
-            vec![IntExpr::constant(self.config.ring_dimension)],
+            self.config.ring_dimension,
             (
                 self.config.input_config().state_columns().expect("validated layout"),
                 self.config.public_key_columns(),
@@ -1173,8 +1164,8 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
             ArtifactConfidentiality::Public,
         );
         let state = state.clone();
-        let vectors = preimages
-            .parallel_map_values(move |_, preimage| state.clone().mul_small_rhs(preimage))?;
+        let vectors =
+            preimages.parallel_map_values(move |_, preimage| preimage.mul_small_rhs(state.clone()))?;
         let plaintexts = plaintext
             .map(|value| Parallel::range(self.config.ring_dimension).map(move |_| value.clone()))
             .transpose()?;
@@ -1196,11 +1187,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
         self.ring().preimage_family_artifact_input(
             production,
             DiamondIoArtifactNames::INJECTOR_TRANSITIONS,
-            vec![
-                IntExpr::constant(self.config.input_count),
-                IntExpr::constant(max_states),
-                IntExpr::constant(self.config.digit_base),
-            ],
+            self.config.input_count * self.config.digit_base * max_states,
             (state_columns, state_columns),
             self.config.preimage_max_coefficient_bound.clone(),
             ArtifactConfidentiality::Public,
@@ -1233,7 +1220,7 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                         ring.preimage_family_artifact_input(
                             production.clone(),
                             DiamondIoArtifactNames::round_rebase_preimages(round, branch, wire),
-                            vec![IntExpr::constant(self.config.ring_dimension)],
+                            self.config.ring_dimension,
                             (
                                 self.config.input_config().state_columns().expect("layout"),
                                 self.config.public_key_columns(),
@@ -1264,10 +1251,8 @@ impl<P: DiamondIoPoly + 'static> DiamondIoCompiler<P> {
                             DiamondIoArtifactNames::round_refresh_decoder_preimages(
                                 round, branch, wire,
                             ),
-                            vec![IntExpr::constant(
-                                self.config.ring_dimension *
-                                    self.config.refresh_crt_plaintext_moduli.len(),
-                            )],
+                            self.config.ring_dimension *
+                                self.config.refresh_crt_plaintext_moduli.len(),
                             (
                                 self.config.input_config().state_columns().expect("layout"),
                                 self.config.refresh_decoder_public_columns,
@@ -1451,7 +1436,7 @@ impl DiamondIoRoundCompiler {
                 let preimages = preprocessing.branch_rebase_preimages[branch][wire].clone();
                 let projected = preimages.parallel_map_values({
                     let final_state = final_state.clone();
-                    move |_, preimage| final_state.clone().mul_small_rhs(preimage)
+                    move |_, preimage| preimage.mul_small_rhs(final_state.clone())
                 })?;
                 let vectors =
                     projected.parallel_zip(masked.vectors, |_, left, right| left + right)?;
@@ -1568,25 +1553,16 @@ impl DiamondIoRoundCompiler {
         selected: Int,
         branches: Vec<NaiveBggNoiseRefreshArtifactWires>,
     ) -> Result<NaiveBggNoiseRefreshArtifactWires, DiamondIoRoundError> {
-        let slot_count = self.config.ring_dimension;
         let a_prime = NaiveBggPublicKeyVecWire {
-            matrices: Family::pack(
-                (0..slot_count)
-                    .map(|slot| {
-                        selected.clone().select(
-                            branches
-                                .iter()
-                                .map(|branch| branch.a_prime.matrices.get_static(slot))
-                                .collect(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
+            matrices: Family::select(
+                selected.clone(),
+                branches.iter().map(|branch| branch.a_prime.matrices.clone()).collect(),
             )?,
             reveal_plaintext: true,
         };
-        let decoder_preimages = Family::<Preimage>::select(
+        let decoder_preimages = Family::select(
             selected,
-            branches.into_iter().map(|branch| branch.decoder_preimages).collect(),
+            branches.iter().map(|branch| branch.decoder_preimages.clone()).collect(),
         )?;
         Ok(NaiveBggNoiseRefreshArtifactWires { a_prime, decoder_preimages })
     }
@@ -1645,8 +1621,11 @@ impl DiamondIoRoundCompiler {
             decoder_public_columns: self.config.refresh_decoder_public_columns,
             decoder_zero_rows: 1,
             decoder_trapdoor_sigma: self.config.trapdoor_sigma.clone(),
-            decoder_preimage_max_coefficient_bound:
-                self.config.preimage_max_coefficient_bound.clone().into(),
+            decoder_preimage_max_coefficient_bound: self
+                .config
+                .preimage_max_coefficient_bound
+                .clone()
+                .into(),
         }
     }
 
@@ -1696,7 +1675,11 @@ mod tests {
     use crate::diamond::DiamondIoFunction;
     use mxx_dsl::DslContext;
     use mxx_gadgets::{circuit::PolyCircuit, circuit_gadgets::arith::NestedRnsPolyContext};
-    use mxx_ir_core::{ParamEnv, RealExpr};
+    use mxx_ir_core::{
+        ParamEnv, RealExpr,
+        node::NodeKind,
+        types::WireType,
+    };
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{
@@ -1744,7 +1727,8 @@ mod tests {
             digit_count: parameters.modulus_digits(),
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
-            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
+            error_max_coefficient_bound: 1_000_000.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-top-level".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -1886,7 +1870,8 @@ mod tests {
             digit_count: 2,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
-            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
+            error_max_coefficient_bound: 1_000_000.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-round-test".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -1929,7 +1914,8 @@ mod tests {
             })
             .collect::<Vec<Vec<Vec<_>>>>();
         let hash_key = ring.bytes_input("hash-key", 32);
-        let final_trapdoor = ring.sample_trapdoor(2, 4, 4, 2, 1u64 << 20);
+        let final_trapdoor =
+            ring.sample_trapdoor(2, 4, 4, 2, config.preimage_max_coefficient_bound.clone());
         let preprocessing = compiler
             .preprocess_round(
                 0,
@@ -1941,6 +1927,17 @@ mod tests {
                 final_trapdoor,
             )
             .unwrap();
+        let rebase_preimage = preprocessing.branch_rebase_preimages[0][0].get_static(0);
+        assert!(matches!(
+            rebase_preimage.value_handle().wire_type(),
+            WireType::Preimage { max_coefficient_bound, .. }
+                if *max_coefficient_bound == config.preimage_max_coefficient_bound.clone().into()
+        ));
+        assert!(matches!(
+            preprocessing.refresh[0][0].decoder_preimages.get_static(0).value_handle().wire_type(),
+            WireType::Preimage { max_coefficient_bound, .. }
+                if *max_coefficient_bound == config.preimage_max_coefficient_bound.clone().into()
+        ));
 
         let encoding = |name: &str, keys: Family<Mat>| NaiveBggEncodingVecWire {
             vectors: ring.input_family(format!("{name}-vectors"), 2, (1, 2)),
@@ -1995,7 +1992,19 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        graph.validate(&ParamEnv::default()).unwrap();
+        let validated = graph.validate(&ParamEnv::default()).unwrap();
+        let nodes = validated
+            .source
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .collect::<Vec<_>>();
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::PreimageSample { .. })));
+        assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
+        assert!(!nodes.iter().any(|node| matches!(
+            node.kind(),
+            NodeKind::MatrixScale { scalar } if *scalar == mxx_ir_core::IntExpr::constant(1)
+        )));
     }
 
     #[test]
@@ -2014,7 +2023,8 @@ mod tests {
             digit_count,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
-            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
+            error_max_coefficient_bound: 1_000_000.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-round-runtime".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -2161,7 +2171,7 @@ mod tests {
                 )
             };
             let family = |rows: usize, columns: usize, value: usize| {
-                RuntimeValue::Family(
+                RuntimeValue::IndexedFamily(
                     (0..2).map(|_| RuntimeValue::matrix(matrix(rows, columns, value))).collect(),
                 )
             };
@@ -2200,7 +2210,7 @@ mod tests {
             )
             .unwrap();
             let family_output = |name: &str| match &result.outputs[name] {
-                RuntimeValue::Family(values) => values
+                RuntimeValue::IndexedFamily(values) => values
                     .iter()
                     .map(|value| match value {
                         RuntimeValue::Matrix(matrix) => matrix.as_ref().clone(),
@@ -2230,7 +2240,8 @@ mod tests {
             digit_count,
             trapdoor_sigma: RealExpr::from_integer(4),
             error_sigma: RealExpr::from_integer(1),
-            preimage_max_coefficient_bound: BigInt::from(1u64 << 20),
+            error_max_coefficient_bound: 1_000_000.into(),
+            preimage_max_coefficient_bound: 1_000_000.into(),
             bgg_tag: b"diamond-rebase-sign".to_vec(),
             seed_bits: 5,
             prf_mask_output_coeff_bits: 1,
@@ -2351,7 +2362,7 @@ mod tests {
             )
         };
         let family = |value: usize| {
-            RuntimeValue::Family(
+            RuntimeValue::IndexedFamily(
                 (0..2).map(|_| RuntimeValue::matrix(matrix(1, digit_count, value))).collect(),
             )
         };

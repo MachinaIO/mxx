@@ -1,6 +1,6 @@
 use crate::{
     artifact::{ArtifactConfidentiality, ProductionId},
-    expr::{IndexExpr, IndexMap, IntExpr, RealExpr},
+    expr::{IntExpr, RealExpr},
     types::WireType,
 };
 use num_bigint::{BigInt, BigUint};
@@ -41,11 +41,6 @@ pub enum NodeKind {
     RealBinary(RealBinaryOp),
     RealSqrt,
     MatrixBinary(MatrixBinaryOp),
-    /// Multiplies a full matrix by an explicitly bounded compact RHS.
-    ///
-    /// The RHS must be a `SmallMatrix` or relation-bearing `Preimage`; the
-    /// operation does not infer boundedness from an ordinary matrix wire.
-    MatrixMulSmallRhs,
     /// Computes `bias + sum(coefficients[t] * left[t] * right[t])`.
     /// This is an execution fusion; its semantics are ordinary multiply,
     /// integer scale, and add operations.
@@ -53,14 +48,11 @@ pub enum NodeKind {
         coefficients: Vec<IntExpr>,
         has_bias: bool,
     },
+    /// Ordinary matrix multiplication with a bounded compact right-hand side.
+    MatrixMulSmallRhs,
     MatrixNegate,
     MatrixScale {
         scalar: IntExpr,
-    },
-    /// Applies the raw negacyclic ring automorphism `sigma_k: X -> X^k` entrywise.
-    /// Concrete validation requires `0 < k < 2n` and odd `k`.
-    RingAutomorphism {
-        index: IntExpr,
     },
     Transpose,
     Slice {
@@ -109,28 +101,10 @@ pub enum NodeKind {
         digit_count: IntExpr,
         preimage_max_coefficient_bound: IntExpr,
     },
-    /// Samples a typed matrix `K` for the registered public source `B` and target `T`.
-    ///
-    /// The node's output is not merely a matrix of the declared shape: its type records the
-    /// relation `B * K = T`, with multiplication performed in the ring represented by the
-    /// matrix type. The public source, trapdoor, and target are the three input arguments.
     PreimageSample {
         matrix_type: crate::types::MatrixType,
         max_coefficient_bound: IntExpr,
     },
-    /// Samples branch-indexed witnesses for a shared source/trapdoor family.
-    ///
-    /// For each source branch `i` and final target branch `j`, the output witness `K_i,j` is typed
-    /// by `B_i * K_i,j = T_i,j`; the source branch axes are preserved and the target contributes
-    /// one final branch axis.
-    FamilyPreimageSample {
-        matrix_type: crate::types::MatrixType,
-        max_coefficient_bound: IntExpr,
-    },
-    /// Builds the universal gadget relation for an ordinary matrix `T`.
-    ///
-    /// With digit count `ℓ`, the output witness `K` has `ℓ` times as many rows as `T` and is typed
-    /// by `G * K = T`, where `G` is the gadget matrix determined by `base` and `small`.
     GadgetDecompose {
         base: IntExpr,
         small: bool,
@@ -150,9 +124,6 @@ pub enum NodeKind {
         length: IntExpr,
         output_bool: bool,
     },
-    /// Applies coefficient-wise nearest CRT scale-and-round to each input
-    /// level, then embeds and combines the rounded levels using the supplied
-    /// reconstruction coefficients.
     CrtRecompose {
         plaintext_moduli: Vec<IntExpr>,
         reconstruction_coefficients: Vec<IntExpr>,
@@ -166,50 +137,15 @@ pub enum NodeKind {
         coefficient_bits: IntExpr,
     },
     SubgraphCall(SubgraphCall),
+    ParallelLoop(ParallelLoop),
     SequentialLoop(SequentialLoop),
-    /// Packs `∏_a n_a` same-typed values into a rank-`r` family with shape `(n_0, ..., n_{r-1})`.
-    ///
-    /// The flat argument order is row-major: a coordinate `i` maps to flat offset
-    /// `sum_a i_a * ∏_{b>a} n_b`.
     FamilyPack {
-        shape: Vec<IntExpr>,
+        count: IntExpr,
     },
-    /// Reads the family element at a statically known coordinate `i`, producing `X[i]`.
     FamilyGetStatic {
-        indices: Vec<IndexExpr>,
+        index: IntExpr,
     },
-    /// Reads the family element at runtime coordinates `i`, producing `X[i]`.
-    FamilyGetDynamic {
-        rank: usize,
-    },
-    /// Selects one axis using a scalar or coordinate-wise selector.
-    ///
-    /// If `X` has shape `(n_0, ..., n_{r-1})` and axis `a` is selected, the output shape removes
-    /// `n_a`; for each remaining coordinate `u`, the result is `X[u with axis a = selector(u)]`.
-    FamilySelectAxis {
-        axis: usize,
-    },
-    /// Reindexes a family by a deterministic coordinate map `f`.
-    ///
-    /// For output coordinate `u`, the resulting element is `Y[u] = X[f(u)]`; the map preserves
-    /// the element type while changing the declared family shape.
-    FamilyReindex {
-        output_shape: Vec<IntExpr>,
-        map: IndexMap,
-    },
-    /// Gathers a family using one integer selector family per input axis.
-    ///
-    /// For output coordinate `u`, selectors `s_a` define the source coordinate
-    /// `f(u) = (s_0[u], ..., s_{r-1}[u])`, so the result is `Y[u] = X[f(u)]`.
-    FamilyGather {
-        output_shape: Vec<IntExpr>,
-        input_rank: usize,
-    },
-    /// Executes one body per coordinate of a rank-`r` Cartesian grid.
-    ///
-    /// The body is evaluated at `u ∈ ∏_a [0, n_a)`, and its output is stored as the family
-    /// element `Y[u]`; `shape` therefore determines exactly the output index set.
-    ParallelGrid(ParallelGrid),
+    FamilyGetDynamic,
     Select {
         count: IntExpr,
     },
@@ -309,26 +245,13 @@ pub struct SubgraphCall {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParallelLoop {
     pub count: IntExpr,
+    #[serde(default)]
     pub minimum_count: usize,
     pub index_slot: u32,
     pub bindings: Vec<(String, IntExpr)>,
     pub input_modes: Vec<LoopInputMode>,
-    /// Determines how the body outputs are assembled.
-    pub output_mode: ParallelOutputMode,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ParallelOutputMode {
-    Family,
-    CollectColumns,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum LoopInputMode {
-    Broadcast,
-    Zip,
-    ZipOffset { offset: usize },
-}
 /// A structural loop whose body consumes and returns a carried state.
 ///
 /// Arguments are ordered as the initial carried values followed by loop-invariant values. The
@@ -342,22 +265,9 @@ pub struct SequentialLoop {
     pub carried_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GridInputMode {
-    /// Uses the same input value at every grid coordinate: `X_u = X`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LoopInputMode {
     Broadcast,
-    /// Uses `X_u = X[f(u)]`, where `f` maps output coordinates to input coordinates.
-    Reindex { map: IndexMap },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ParallelGrid {
-    /// Extents `(n_0, ..., n_{r-1})` of the output coordinate set `∏_a [0, n_a)`.
-    pub shape: Vec<IntExpr>,
-    /// Loop slots carrying the current coordinate components `u_a` into the body.
-    pub index_slots: Vec<u32>,
-    /// Compile-time bindings used to instantiate expressions inside the body.
-    pub bindings: Vec<(String, IntExpr)>,
-    /// Per-input equation selecting broadcast or coordinate-reindexed transport.
-    pub input_modes: Vec<GridInputMode>,
+    Zip,
+    ZipOffset { offset: usize },
 }

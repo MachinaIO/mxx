@@ -18,6 +18,10 @@ typedef struct GpuSmallMatrixAllocationReport
     size_t event_overhead_bytes;
     size_t high_water_bytes;
     size_t full_expanded_rhs_bytes;
+    size_t workspace_word_bytes;
+    size_t ntt_preparation_launches;
+    size_t u32_workspace_limb_count;
+    size_t u64_workspace_limb_count;
 } GpuSmallMatrixAllocationReport;
 
 int gpu_small_matrix_create(
@@ -72,7 +76,6 @@ int gpu_matrix_mul_small_rhs(
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
     GpuSmallMatrixAllocationReport *allocation_report);
-
 #ifdef __cplusplus
 }
 #endif

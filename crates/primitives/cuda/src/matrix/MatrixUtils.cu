@@ -221,11 +221,6 @@ uint8_t *matrix_limb_ptr_by_id(GpuMatrix *mat, size_t poly_idx, const dim3 &limb
     {
         return nullptr;
     }
-    // `device_descriptors` resides in CUDA device memory and is consumed only
-    // by kernels.  Host-side serde and matrix helpers must derive addresses
-    // from the mirrored host metadata instead of dereferencing that device
-    // pointer.  For packed views `buffer.ptr` already includes the view
-    // offset, while `base_offset` selects the requested local limb.
     return buffer.ptr + offset_bytes;
 }
 
@@ -404,16 +399,33 @@ int matrix_track_limb_consumer_readonly(
     }
 
     cudaError_t err = cudaSetDevice(consumer_device);
-    if (err != cudaSuccess) return set_error(err);
-    cudaEvent_t consumer_done = nullptr;
-    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
-    if (err == cudaSuccess) err = cudaEventRecord(consumer_done, consumer_stream);
-    if (err == cudaSuccess)
-        err = cudaStreamWaitEvent(src->ctx->release_streams_by_partition[limb_id.x], consumer_done, 0);
-    const cudaError_t destroy_err = consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
-    if (err == cudaSuccess) err = destroy_err;
     if (err != cudaSuccess)
     {
+        return set_error(err);
+    }
+    cudaEvent_t consumer_done = nullptr;
+    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
+    if (err == cudaSuccess)
+    {
+        err = cudaEventRecord(consumer_done, consumer_stream);
+    }
+    if (err == cudaSuccess)
+    {
+        err = cudaStreamWaitEvent(
+            src->ctx->release_streams_by_partition[limb_id.x],
+            consumer_done,
+            0);
+    }
+    const cudaError_t destroy_err = consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
+    if (err == cudaSuccess)
+    {
+        err = destroy_err;
+    }
+    if (err != cudaSuccess)
+    {
+        // The caller may release the source immediately after an error.  A
+        // synchronous error-path fence keeps that release safe without
+        // changing the producer's write_done event.
         cudaStreamSynchronize(consumer_stream);
         return set_error(err);
     }
@@ -451,35 +463,6 @@ int matrix_record_limb_write(GpuMatrix *dst, const dim3 &limb_id, cudaStream_t s
         return set_error(err);
     }
     state->write_done_valid = true;
-    return 0;
-}
-
-int matrix_set_limb_completion_event(GpuMatrix *dst, const dim3 &limb_id, cudaEvent_t event)
-{
-    if (!dst || !dst->ctx || !event)
-    {
-        return set_error("invalid matrix_set_limb_completion_event arguments");
-    }
-    auto *state = matrix_limb_state(
-        dst, limb_id, "invalid limb index in matrix_set_limb_completion_event");
-    if (!state)
-    {
-        return 1;
-    }
-    cudaError_t err = cudaSetDevice(state->device);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    cudaEvent_t previous = state->write_done;
-    state->write_done = event;
-    state->write_done_valid = true;
-    if (previous && previous != event)
-    {
-        // Event destruction is asynchronous with respect to outstanding
-        // waits; it does not introduce a host-side synchronization point.
-        cudaEventDestroy(previous);
-    }
     return 0;
 }
 
@@ -561,10 +544,14 @@ int matrix_acquire_aux_workspace(
     {
         return 0;
     }
-    if (aux_owner && aux_limb_id && matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
+    if (aux_owner && aux_limb_id)
     {
-        *out_shared = true;
-        return 0;
+        if (matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
+        {
+            *out_shared = true;
+            return 0;
+        }
+        return set_error("preallocated matrix auxiliary workspace is insufficient");
     }
     if (!stream)
     {

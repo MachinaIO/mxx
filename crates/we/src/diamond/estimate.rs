@@ -1,7 +1,5 @@
 use super::{DiamondCompileError, DiamondWeCompiler};
-use mxx_bench_estimator::{
-    CostReport, EstimateConfig, EstimateError, MeasurementBackend, estimate,
-};
+use mxx_bench_estimator::{CostReport, EstimateError, MeasurementBackend, estimate};
 use mxx_ir_core::{
     artifact::{export_validated_manifest, production_id},
     encoding::spec_hash,
@@ -31,7 +29,6 @@ pub enum DiamondEstimateError {
 pub fn estimate_diamond_cost<B>(
     compiler: &DiamondWeCompiler,
     backend: &mut B,
-    config: &EstimateConfig,
 ) -> Result<DiamondCostEstimate, DiamondEstimateError>
 where
     B: MeasurementBackend,
@@ -50,7 +47,7 @@ where
     );
     let artifact_manifest = export_validated_manifest(encryption_id.clone(), &validated_encryption)
         .map_err(|error| DiamondEstimateError::Manifest(error.to_string()))?;
-    let encryption_report = estimate(&validated_encryption, backend, config)?;
+    let encryption_report = estimate(&validated_encryption, backend)?;
     info!(
         elapsed_seconds = encryption_started.elapsed().as_secs_f64(),
         total_work_seconds = encryption_report.total_work_seconds,
@@ -64,7 +61,7 @@ where
     let validated_decryption = decryption
         .validate_with_manifests(&bindings, &BTreeMap::from([(encryption_id, artifact_manifest)]))
         .map_err(|error| DiamondEstimateError::Validation(error.to_string()))?;
-    let decryption_report = estimate(&validated_decryption, backend, config)?;
+    let decryption_report = estimate(&validated_decryption, backend)?;
     info!(
         elapsed_seconds = decryption_started.elapsed().as_secs_f64(),
         total_work_seconds = decryption_report.total_work_seconds,
@@ -79,7 +76,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diamond::{DiamondWeCompiler, DiamondWeConfig};
+    use crate::diamond::{
+        DiamondWeCompiler, DiamondWeConfig, default_preimage_max_coefficient_bound,
+    };
     use mxx_bench_estimator::{MeasurementNode, NodeMeasurement};
     use mxx_gadgets::circuit::BooleanCircuitShape;
     use mxx_ir_core::{ParamEnv, RealExpr, types::ConcreteWireType};
@@ -111,6 +110,9 @@ mod tests {
 
     #[test]
     fn estimator_consumes_the_actual_encryption_and_decryption_graphs() {
+        let preimage_max_coefficient_bound =
+            default_preimage_max_coefficient_bound(&RealExpr::from_integer(4), 8, 2, &4.into())
+                .unwrap();
         let compiler = DiamondWeCompiler::new(
             DiamondWeConfig {
                 modulus: 257.into(),
@@ -123,7 +125,7 @@ mod tests {
                 trapdoor_sigma: RealExpr::from_integer(4),
                 error_sigma: RealExpr::from_integer(1),
                 error_max_coefficient_bound: 6.into(),
-                preimage_max_coefficient_bound: 26.into(),
+                preimage_max_coefficient_bound,
                 bgg_tag: b"diamond-estimate-test".to_vec(),
             },
             BooleanCircuitShape {
@@ -134,15 +136,10 @@ mod tests {
             },
         )
         .unwrap();
-        let estimate = estimate_diamond_cost(
-            &compiler,
-            &mut UnitBackend,
-            &EstimateConfig { device_pool_size: 2, per_instance_occupancy: 1 },
-        )
-        .unwrap();
+        let estimate = estimate_diamond_cost(&compiler, &mut UnitBackend).unwrap();
         assert!(estimate.encryption.total_work_seconds > 0.0);
         assert!(estimate.decryption.total_work_seconds > 0.0);
         assert!(estimate.encryption.peak_memory_bytes > 0);
-        assert!(estimate.decryption.maximum_parallelism >= 1);
+        assert!(estimate.decryption.maximum_parallelism >= 2);
     }
 }

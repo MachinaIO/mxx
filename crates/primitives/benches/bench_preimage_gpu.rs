@@ -9,11 +9,13 @@ const SIGMA: f64 = 4.578;
 const TRAPDOOR_SIZE: usize = 1;
 #[cfg(feature = "gpu")]
 const TARGET_COLS: usize = 50;
+#[cfg(feature = "gpu")]
+const PREIMAGE_BOUND_BITS: usize = 48;
 
 #[cfg(feature = "gpu")]
 fn bench_gpu_preimage() {
     use mxx_primitives::{
-        matrix::{PolyMatrix, ResidentPolyMatrixColumnSource, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+        matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
         poly::{
             PolyParams,
             dcrt::{
@@ -22,10 +24,11 @@ fn bench_gpu_preimage() {
             },
         },
         sampler::{
-            DistType, PolyTrapdoorSampler, PolyUniformSampler, bounds::default_preimage_cutoff,
+            DistType, PolyTrapdoorSampler, PolyUniformSampler,
             trapdoor::GpuDCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
         },
     };
+    use num_bigint::BigUint;
 
     gpu_device_sync();
     let _ = tracing_subscriber::fmt::try_init();
@@ -50,23 +53,20 @@ fn bench_gpu_preimage() {
 
     gpu_device_sync();
     let start = Instant::now();
-    let bound = default_preimage_cutoff(
-        params.ring_dimension(),
-        public_matrix.row_size(),
-        params.modulus_digits(),
-        1u32 << params.base_bits(),
-        SIGMA,
-    )
-    .expect("preimage cutoff");
-    let target_source = ResidentPolyMatrixColumnSource::new(target);
     let preimage = trapdoor_sampler
-        .preimage(&params, &trapdoor, &public_matrix, &target_source, bound, rand::random())
-        .expect("compact preimage sampling");
+        .preimage(
+            &params,
+            &trapdoor,
+            &public_matrix,
+            &target,
+            BigUint::from(1u8) << PREIMAGE_BOUND_BITS,
+        )
+        .expect("bounded compact GPU preimage sampling failed");
     gpu_device_sync();
     let elapsed = start.elapsed();
     black_box(preimage);
 
-    info!("GPU DCRT preimage: {:?}", elapsed);
+    info!("GPU compact bounded DCRT preimage: {:?}", elapsed);
 }
 
 #[cfg(not(feature = "gpu"))]

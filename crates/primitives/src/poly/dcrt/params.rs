@@ -58,7 +58,6 @@ impl PolyParams for DCRTPolyParams {
     }
 
     fn to_crt(&self) -> (Vec<u64>, usize, usize) {
-        let _native = crate::openfhe_guard::native_guard();
         let moduli = ffi::GenCRTBasis(self.ring_dimension, self.crt_depth, self.crt_bits)
             .into_iter()
             .map(|m| m.parse::<u64>().expect("invalid CRT modulus string"))
@@ -78,14 +77,8 @@ impl DCRTPolyParams {
     pub fn new(ring_dimension: u32, crt_depth: usize, crt_bits: usize, base_bits: u32) -> Self {
         // assert that ring_dimension is a power of 2
         assert!(ring_dimension.is_power_of_two(), "ring_dimension must be a power of 2");
-        let modulus = {
-            let _native = crate::openfhe_guard::native_guard();
-            ffi::GenModulus(ring_dimension, crt_depth, crt_bits)
-        };
-        // Constructing any DCRT polynomial may lazily initialize OpenFHE's global NTT tables.
-        // Do that once at the parameter boundary so callers can safely create polynomials from
-        // independent Rayon tasks without racing the native lazy initialization.
-        crate::openfhe_guard::ensure_openfhe_warmup_params(ring_dimension, crt_depth, crt_bits);
+        let modulus =
+            crate::openfhe_guard::gen_modulus_and_warmup(ring_dimension, crt_depth, crt_bits);
         let decompose_last_mask = if crt_bits.is_multiple_of(base_bits as usize) {
             None
         } else {

@@ -88,10 +88,9 @@ pub enum WireType {
         matrix: MatrixType,
         max_coefficient_bound: IntExpr,
     },
-    /// A flat row-major family with one logical rank-N shape.
-    Family {
+    IndexedFamily {
         element: Box<WireType>,
-        shape: Vec<IntExpr>,
+        count: IntExpr,
     },
 }
 
@@ -131,9 +130,9 @@ pub enum ConcreteWireType {
         #[serde(with = "serde_support::bigint")]
         max_coefficient_bound: BigInt,
     },
-    Family {
+    IndexedFamily {
         element: Box<ConcreteWireType>,
-        shape: Vec<usize>,
+        count: usize,
     },
 }
 

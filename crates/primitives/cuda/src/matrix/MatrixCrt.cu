@@ -389,17 +389,12 @@ extern "C" int gpu_matrix_crt_recompose(
         if (d_source_bases) cudaFreeAsync(const_cast<uint8_t **>(d_source_bases), dispatch_stream);
         if (!pinned_metadata.empty())
         {
-            // Every asynchronous H2D copy above reads from these buffers.
-            // Keep them alive until all copies, the CRT kernel, and the
-            // stream-ordered device frees have completed.
             (void)gpu_defer_pinned_frees(
                 out->ctx,
                 dispatch_device,
                 dispatch_stream,
                 pinned_metadata.data(),
                 pinned_metadata.size());
-            // The reclaimer retains ownership even on its fail-closed error
-            // path, where uncertain pointers are intentionally leaked.
             pinned_metadata.clear();
         }
     };

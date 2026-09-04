@@ -88,7 +88,7 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
 }
 
 #[test]
-fn test_gpu_parallel_grid_executes_batched_matrix_arithmetic() {
+fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
     let parameters = DCRTPolyParams::new(8, 1, 20, 4);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
@@ -298,8 +298,8 @@ fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
             .scopes()
             .values()
             .flat_map(|scope| scope.nodes())
-            .any(|node| matches!(node.kind(), NodeKind::ParallelGrid(_))),
-        "Ring-GSW column calls must lower to an IR parallel grid"
+            .any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))),
+        "Ring-GSW column calls must lower to an IR parallel loop"
     );
     let runtime_inputs = cpu_inputs
         .iter()

@@ -1,6 +1,6 @@
 import MxxPrimitives
-import MxxPrimitives.CrtRadix
-import MxxPrimitives.CrtDecomposition
+import PrimitivesCrtRadix
+import PrimitivesCrtDecomposition
 
 namespace MxxRuntime
 

@@ -182,6 +182,10 @@ Owners: primitive, gadget, and BGG crates.
 
 Selectively port from `7cb9d089d`:
 
+The table uses paths from that historical commit. Current shared Lean modules live directly in
+their crate's `lean/` directory, with crate-qualified filenames such as `PrimitivesNegacyclic.lean`
+and `BggEncoding.lean`.
+
 | Prior files | Action |
 | --- | --- |
 | `crates/primitives/lean/MxxPrimitives/Negacyclic.lean`, `Matrix.lean`, `Reduction.lean` | Reuse quotient-ring and coefficient-view foundations after checking interfaces |

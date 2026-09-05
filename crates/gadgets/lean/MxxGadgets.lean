@@ -1,2 +1,2 @@
-import MxxGadgets.GadgetMatrix
-import MxxGadgets.Decomposition
+import GadgetsGadgetMatrix
+import GadgetsDecomposition

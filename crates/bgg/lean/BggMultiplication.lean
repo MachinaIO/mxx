@@ -1,4 +1,4 @@
-import MxxBgg.Encoding
+import BggEncoding
 
 namespace Mxx.Bgg
 

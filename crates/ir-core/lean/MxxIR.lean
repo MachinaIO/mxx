@@ -1,8 +1,8 @@
-import MxxIR.Rel
-import MxxIR.IterRuns
-import MxxIR.ScopeSpec
-import MxxIR.Expr
-import MxxIR.Regression
+import IRRel
+import IRIterRuns
+import IRScopeSpec
+import IRExpr
+import IRRegression
 
 /-! Generic relational semantics used by the mechanical frozen-IR exporter.
 

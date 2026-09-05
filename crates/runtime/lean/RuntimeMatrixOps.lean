@@ -1,4 +1,4 @@
-import MxxRuntime.Primitives
+import RuntimePrimitives
 
 namespace MxxRuntime
 

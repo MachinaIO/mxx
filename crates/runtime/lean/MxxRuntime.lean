@@ -1,6 +1,6 @@
-import MxxRuntime.Primitives
-import MxxRuntime.MatrixOps
-import MxxRuntime.Hash
+import RuntimePrimitives
+import RuntimeMatrixOps
+import RuntimeHash
 
 /-! Concrete successful-sampling relations used by generated scope relations.
 

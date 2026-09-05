@@ -20,3 +20,8 @@ path = "../../gadgets/lean"
 
 [[lean_lib]]
 name = "MxxBgg"
+roots = [
+  "BggEncoding",
+  "BggMultiplication",
+  "MxxBgg",
+]

@@ -2,6 +2,11 @@
 
 Build this package with `lake build` from `crates/ir-core/lean`.
 
+The handwritten modules are flat: `IRExpr.lean`, `IRIterRuns.lean`, `IRRel.lean`,
+`IRScopeSpec.lean`, and `IRRegression.lean`. `MxxIR.lean` is the common import entry point;
+the library's explicit roots also build the regression module. The mathematical namespace
+remains `MxxIR`, regardless of filenames.
+
 Fixture generators are ordinary unit tests, not example executables. From the repository root:
 
 ```sh

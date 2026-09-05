@@ -85,6 +85,13 @@ round-trip remains available; it is not a substitute for a proved noisy bound.
 
 ## Generated Lean artifacts
 
+Each crate keeps its handwritten Lean modules directly under `lean/`, without a nested package-name
+directory. Shared modules have crate-qualified filenames such as `PrimitivesBounds.lean` and
+`RuntimeMatrixOps.lean`, avoiding collisions when several packages share one Lean search path.
+Lake libraries list their module roots explicitly. The `MxxPrimitives.lean`, `MxxRuntime.lean`,
+`MxxIR.lean`, `MxxGadgets.lean`, and `MxxBgg.lean` entry modules collect reusable imports; mathematical
+namespaces and theorem names are independent of this file layout.
+
 Diamond parameter search generates and checks Lean artifacts through the production library API;
 the GPU integration test uses that same search. No separate example executable is required.
 Crates do not contain example targets: reusable extraction fixtures live in ordinary unit-test

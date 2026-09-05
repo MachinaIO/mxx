@@ -1,4 +1,4 @@
-import MxxPrimitives.Matrix
+import PrimitivesMatrix
 import Mathlib.Data.Finset.Max
 import Mathlib.Data.ZMod.ValMinAbs
 

@@ -1,6 +1,6 @@
 import Stage_decrypt
 import Backend
-import MxxBgg.Multiplication
+import BggMultiplication
 import DiamondProofParameters
 
 open Mxx.Primitives MxxRuntime

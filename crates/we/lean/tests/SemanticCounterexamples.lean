@@ -1,5 +1,5 @@
-import MxxRuntime.Primitives
-import MxxBgg.Multiplication
+import RuntimePrimitives
+import BggMultiplication
 
 /- Small semantic regression checks, not parameter-security or runtime acceptance tests.
    All matrices inhabit the actual negacyclic quotient, with one row and one column.

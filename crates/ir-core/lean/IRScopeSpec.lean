@@ -1,4 +1,4 @@
-import MxxIR.Rel
+import IRRel
 
 namespace MxxIR
 

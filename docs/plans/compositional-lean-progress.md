@@ -46,7 +46,7 @@ without adding semantic placeholders. Final coherent package validation is track
 
 ## Runtime public-gadget API checkpoint
 
-`crates/runtime/lean/MxxRuntime/Primitives.lean` now separates the two runtime
+`crates/runtime/lean/RuntimePrimitives.lean` now separates the two runtime
 paths:
 
 - `preimageRuns` remains the sampled-secret relation used by existing fixtures.

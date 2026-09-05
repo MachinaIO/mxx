@@ -1,4 +1,4 @@
-import MxxPrimitives.Bounds
+import PrimitivesBounds
 import Mathlib.Data.ZMod.QuotientRing
 
 namespace Mxx.Primitives

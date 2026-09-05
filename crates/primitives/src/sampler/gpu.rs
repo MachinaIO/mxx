@@ -317,12 +317,17 @@ mod tests {
     use serial_test::serial as sequential;
 
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 16, 8)
+        DCRTPolyParams::new(128, 2, 16, 8, None)
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
         let (moduli, _, _) = params.to_crt();
-        GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+        GpuDCRTPolyParams::new(
+            params.ring_dimension(),
+            moduli,
+            params.base_bits(),
+            Some(params.dropped_moduli()),
+        )
     }
 
     #[test]

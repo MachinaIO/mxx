@@ -95,6 +95,7 @@ fn test_gpu_diamond_io_parameter_search_and_round_trip() {
         selected.parameters.ring_dimension(),
         moduli,
         selected.parameters.base_bits(),
+        None,
     );
     let mut native_circuit = PolyCircuit::<GpuDCRTPoly>::new();
     let nested_rns = Arc::new(NestedRnsPolyContext::setup(

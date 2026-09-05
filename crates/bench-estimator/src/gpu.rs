@@ -3468,7 +3468,7 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_gadget_trapdoor_ranged_measurement_matches_full_gadget_slice() {
-        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
         let rows = 2;
         let full_columns = rows * params.modulus_digits();
         let full_ty = ConcreteMatrixType {

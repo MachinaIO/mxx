@@ -52,16 +52,16 @@ theorem active_product_gate_bounded (hashModel : HashModel)
         regularDecomposeMatrix DiamondBackend.layout0 right = right := by
   obtain ⟨digits, hdecomp, hout⟩ :=
     active_product_gate _ _ _ _ _ _ _ _ _ _ hactive hrun
-  rcases hdecomp with ⟨layout, hlookup, _, _, hwidth, hdigits⟩
+  rcases hdecomp with ⟨layout, hlookup, _, _, hwidth, hdigits, _⟩
   have hl : layout = DiamondBackend.layout0 := by
     simpa [DiamondBackend.backend] using hlookup.symm
   subst layout
   have hd : digits = regularDecomposeMatrix DiamondBackend.layout0 right := by
-    simpa only [castMatrixRows] using hdigits
-  subst digits
-  refine ⟨_, hout, ?_, rfl, ?_⟩
-  · exact regularDecomposeMatrix_bounded DiamondBackend.layout0 right (by decide) (by decide)
-  · exact regularGadgetMatrix_reconstruct DiamondBackend.layout0 right (by decide) (by decide)
+    simpa [castMatrixRows] using hdigits
+  refine ⟨digits, hout, ?_, hd, ?_⟩
+  · rw [hd]
+    exact regularDecomposeMatrix_bounded DiamondBackend.layout0 right (by decide) (by decide)
+  · exact regularGadgetMatrix_reconstruct DiamondBackend.layout0 right (by decide) (by decide) (by decide)
 
 #print axioms active_product_gate_bounded
 

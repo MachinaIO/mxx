@@ -761,7 +761,7 @@ mod tests {
     }
 
     fn create_test_context(circuit: &mut PolyCircuit<DCRTPoly>) -> Arc<CKKSContext<DCRTPoly>> {
-        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS, None);
         create_test_context_with_params(circuit, &params)
     }
 
@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_ckks_sample_relinearization_eval_key_slots_matches_switching_identity_without_error() {
-        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CKKS_MUL_TEST_CRT_DEPTH, 24, 12);
+        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CKKS_MUL_TEST_CRT_DEPTH, 24, 12, None);
         let secret_key = sample_ternary_secret_key(&params);
         let eval_keys =
             sample_relinearization_eval_key_slots(&params, &secret_key, RELIN_EXTRA_LEVELS, 0.0);
@@ -1016,8 +1016,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + relinearization_extra_levels,
             24,
-            12,
-        );
+            12, None);
         let secret_key = sample_ternary_secret_key(&params);
         let eval_keys = sample_relinearization_eval_key_slots(
             &params,
@@ -1046,8 +1045,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + relinearization_extra_levels,
             24,
-            12,
-        );
+            12, None);
         let secret_key = sample_ternary_secret_key(&params);
         let eval_key_polys = sample_relinearization_eval_key_slots(
             &params,
@@ -1096,7 +1094,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_ckks_add_returns_ciphertext_that_decrypts_to_expected_slotwise_sum() {
-        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS, None);
         let secret_key = sample_ternary_secret_key(&params);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = create_test_context(&mut circuit);
@@ -1148,7 +1146,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_ckks_add_with_input_c0_error_keeps_decrypted_coeff_error_within_bound() {
-        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS, None);
         let secret_key = sample_ternary_secret_key(&params);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = create_test_context_with_params_and_relin_levels_and_error_sigma(
@@ -1241,8 +1239,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
             24,
-            12,
-        );
+            12, None);
         let secret_key = sample_ternary_secret_key(&params);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = create_test_context_with_params_and_relin_levels(
@@ -1316,8 +1313,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
             24,
-            12,
-        );
+            12, None);
         let secret_key = sample_ternary_secret_key(&params);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = create_test_context_with_params_and_relin_levels_and_error_sigma(
@@ -1427,8 +1423,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
             crt_bits,
-            12,
-        );
+            12, None);
         let scale_u64 =
             1u64.checked_shl(crt_bits as u32).expect("test scale 2^crt_bits must fit in u64");
         let scale = BigUint::from(scale_u64);
@@ -1574,8 +1569,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
             crt_bits,
-            12,
-        );
+            12, None);
         let scale_u64 =
             1u64.checked_shl(crt_bits as u32).expect("test scale 2^crt_bits must fit in u64");
         let scale = BigUint::from(scale_u64);
@@ -1722,8 +1716,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
             crt_bits,
-            12,
-        );
+            12, None);
         let scale_u64 =
             1u64.checked_shl(crt_bits as u32).expect("test scale 2^crt_bits must fit in u64");
         let scale = BigUint::from(scale_u64);
@@ -1876,8 +1869,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
             crt_bits,
-            12,
-        );
+            12, None);
         let scale_u64 =
             1u64.checked_shl(crt_bits as u32).expect("test scale 2^crt_bits must fit in u64");
         let scale = BigUint::from(scale_u64);
@@ -2025,8 +2017,7 @@ mod tests {
             NUM_SLOTS as u32,
             NUM_LEFT_MODULI + CKKS_MUL_DEPTH + mul_relin_extra_levels,
             24,
-            12,
-        );
+            12, None);
         let secret_key = sample_ternary_secret_key(&params);
         let eval_key_polys = sample_relinearization_eval_key_slots(
             &params,
@@ -2173,7 +2164,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_ckks_rescale_returns_ciphertext_that_decrypts_to_expected_exact_division() {
-        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(NUM_SLOTS as u32, CRT_DEPTH, 18, BASE_BITS, None);
         let secret_key = sample_ternary_secret_key(&params);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = create_test_context(&mut circuit);
@@ -2222,7 +2213,7 @@ mod tests {
         let num_slots = 1usize << 10;
         let relinearization_extra_levels = 1usize;
         let active_levels = 1usize;
-        let params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, BASE_BITS);
+        let params = DCRTPolyParams::new(ring_dim, crt_depth, crt_bits, BASE_BITS, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = std::sync::Arc::new(CKKSContext::new(
             &mut circuit,

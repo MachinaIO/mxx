@@ -318,7 +318,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn commitment_root_and_cache_order_match_the_concrete_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let compiler = Wee25CommitmentCompiler {
             modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
             ring_dimension: IntExpr::constant(parameters.ring_dimension()),

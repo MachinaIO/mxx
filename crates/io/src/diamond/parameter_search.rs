@@ -154,8 +154,7 @@ impl DiamondIoParameterSearch {
                 ring_dimension,
                 depth,
                 self.crt_modulus_bits,
-                self.gadget_base_bits,
-            );
+                self.gadget_base_bits, None);
             let achieved = estimate_security(&parameters, self.error_sigma)?
                 .min(estimate_security(&parameters, self.native_ring_gsw_error_sigma)?);
             if achieved >= self.security_bits as u64 {
@@ -185,8 +184,7 @@ impl DiamondIoParameterSearch {
             ring_dimension,
             depth,
             self.crt_modulus_bits,
-            self.gadget_base_bits,
-        );
+            self.gadget_base_bits, None);
         let compiler = self.compiler_for(&parameters, function)?;
         let simulation = simulate_diamond_io_noise(&compiler, function)?;
         let correct = simulation.within_threshold;

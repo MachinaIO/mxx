@@ -1295,7 +1295,7 @@ mod tests {
             .unwrap();
         let result = execute(
             &graph,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -1324,7 +1324,7 @@ mod tests {
             let validated = mxx_ir_core::validate(&predicate.graph, bindings).unwrap();
             let result = execute(
                 &validated,
-                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
                 BTreeMap::new(),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,

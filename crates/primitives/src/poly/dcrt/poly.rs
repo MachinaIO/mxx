@@ -249,7 +249,8 @@ impl Poly for DCRTPoly {
         let base_bits = params.base_bits() as usize;
 
         // Calculate the number of digits needed in the decomposition
-        let num_digits = params.modulus_digits();
+        let num_digits =
+            params.crt_bits().div_ceil(params.base_bits() as usize) * params.crt_depth();
 
         // Create a mask for extracting the base_bits bits
         let base_mask = (BigUint::from(1u32) << base_bits) - BigUint::from(1u32);
@@ -623,7 +624,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "constant coefficient does not fit in u64")]
     fn test_const_coeff_u64_panics_when_constant_term_exceeds_u64() {
-        let params = DCRTPolyParams::new(8, 4, 20, 1);
+        let params = DCRTPolyParams::new(8, 4, 20, 1, None);
         let poly = DCRTPoly::from_biguint_to_constant(&params, BigUint::from(u64::MAX) + 1u32);
         let _ = poly.const_coeff_u64();
     }
@@ -638,7 +639,7 @@ mod tests {
         let x = rng.random_range(12..20);
         let size = rng.random_range(1..20);
         let n = 2_i32.pow(x) as u32;
-        let params = DCRTPolyParams::new(n, size, 51, 2);
+        let params = DCRTPolyParams::new(n, size, 51, 2, None);
         let q = params.modulus();
         let mut coeffs: Vec<FinRingElem> = Vec::new();
         for _ in 0..n {

@@ -34,10 +34,10 @@ fn bench_gpu_preimage() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Keep parameters aligned with the CPU benchmark for a fair comparison.
-    let cpu_params = DCRTPolyParams::new(16384, 10, 24, 12);
+    let cpu_params = DCRTPolyParams::new(16384, 10, 24, 12, None);
     let (moduli, _, _) = cpu_params.to_crt();
     let params =
-        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());
+        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits(), None);
 
     let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
     let uniform_sampler = DCRTPolyUniformSampler::new();

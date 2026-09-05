@@ -1760,6 +1760,16 @@ where
                     ));
                 }
                 let (value, sampled) = if let Some(small) = gadget_small {
+                    if !small &&
+                        self.backend
+                            .gadget_error_bound(&target_type)
+                            .map_err(Self::backend_error)? !=
+                            BigInt::from(0u8)
+                    {
+                        return Err(ExecutionError::Manifest(
+                            "exact public gadget preimage requires dropped_moduli = 0".into(),
+                        ));
+                    }
                     self.backend
                         .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                         .map_err(Self::backend_error)?;
@@ -2300,6 +2310,14 @@ where
             }
             if let Some(small) = gadget_small {
                 let target_type = self.matrix_type(scope_id, &paths[instance], node.args[2])?;
+                if !small &&
+                    self.backend.gadget_error_bound(&target_type).map_err(Self::backend_error)? !=
+                        BigInt::from(0u8)
+                {
+                    return Err(ExecutionError::Manifest(
+                        "exact public gadget preimage requires dropped_moduli = 0".into(),
+                    ));
+                }
                 self.backend
                     .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                     .map_err(Self::backend_error)?;
@@ -4439,7 +4457,7 @@ mod tests {
 
     #[test]
     fn canonical_polynomial_coefficient_bits_roundtrip_on_cpu() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = parameters.modulus();
         let coefficient_bits = parameters.modulus_bits();
         let ring_dimension = parameters.ring_dimension() as usize;
@@ -4481,7 +4499,7 @@ mod tests {
 
     #[test]
     fn integer_lift_writes_only_the_constant_polynomial_coefficient() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let context = DslContext::new("integer-lift-constant-polynomial");
@@ -4676,7 +4694,7 @@ mod tests {
 
     #[test]
     fn decomposed_hash_executes_as_a_generic_small_rhs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u8) << parameters.base_bits();
@@ -4709,7 +4727,7 @@ mod tests {
 
     #[test]
     fn generic_small_rhs_input_and_artifact_keep_the_compact_runtime_kind() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let lhs = ring.input("lhs", (1, 1));
@@ -4819,7 +4837,7 @@ mod tests {
     #[test]
     #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn trapdoor_families_sample_preimages_and_persist_each_member() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u64 << parameters.base_bits());
@@ -5086,7 +5104,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_preserves_preimage_small_owner_and_relation() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u8) << parameters.base_bits();
@@ -5152,7 +5170,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::from([(
                 "increments".to_owned(),
                 RuntimeValue::IndexedFamily(vec![
@@ -5181,7 +5199,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -5207,7 +5225,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -5237,7 +5255,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::from([(
                 "bits".to_owned(),
                 RuntimeValue::IndexedFamily(
@@ -5422,7 +5440,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_and_trace_preserve_sampled_execution_exactly() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sample = ring.gaussian((1, 1), 3, 19);
@@ -5464,7 +5482,7 @@ mod tests {
 
     #[test]
     fn resumable_session_reuses_draws_and_rejects_changed_inputs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sampled = DslContext::new("runtime-resumable-sample")
@@ -5591,7 +5609,7 @@ mod tests {
         .expect("freeze")
         .0;
         let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let result = execute(
             &validated,
             &mut cpu_backend([parameters]),
@@ -5640,7 +5658,7 @@ mod tests {
         assert!(matches!(
             execute(
                 &validated,
-                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
                 BTreeMap::new(),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
@@ -5651,7 +5669,7 @@ mod tests {
 
     #[test]
     fn dynamic_family_access_selects_the_runtime_index_and_rejects_out_of_range() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let family = Family::pack(vec![ring.polynomial([10.into()]), ring.polynomial([20.into()])])

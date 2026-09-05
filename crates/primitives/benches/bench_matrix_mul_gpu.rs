@@ -19,14 +19,14 @@ fn bench_gpu_matrix_mul() {
 
     gpu_device_sync();
     let _ = tracing_subscriber::fmt::try_init();
-    let cpu_params = DCRTPolyParams::new(16384, 15, 24, 12);
+    let cpu_params = DCRTPolyParams::new(16384, 15, 24, 12, None);
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let left_cpu = uniform_sampler.sample_uniform(&cpu_params, 1, 30, DistType::FinRingDist);
     let right_cpu = uniform_sampler.sample_uniform(&cpu_params, 30, 120, DistType::FinRingDist);
 
     let (moduli, _, _) = cpu_params.to_crt();
     let params =
-        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());
+        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits(), None);
     let left = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &left_cpu);
     let right = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &right_cpu);
 

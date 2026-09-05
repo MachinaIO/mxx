@@ -80,6 +80,11 @@ impl GpuDCRTTrapdoor {
     }
 
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
+        assert_eq!(
+            params.dropped_moduli(),
+            0,
+            "exact trapdoor sampling requires dropped_moduli = 0"
+        );
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
@@ -442,6 +447,11 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
     type Trapdoor = GpuDCRTTrapdoor;
 
     fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self {
+        assert_eq!(
+            params.dropped_moduli(),
+            0,
+            "exact trapdoor sampling requires dropped_moduli = 0"
+        );
         let base = 1 << params.base_bits();
         let c = preimage_c(base, sigma);
         Self { sigma, base, c }
@@ -481,6 +491,9 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         target: &Self::M,
         max_coefficient_bound: BigUint,
     ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        if params.dropped_moduli() != 0 {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
         let minimum = default_preimage_cutoff(
             params.ring_dimension(),
             public_matrix.row_size(),
@@ -677,7 +690,7 @@ mod tests {
     const SIGMA: f64 = 4.578;
 
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 16, 8)
+        DCRTPolyParams::new(128, 2, 16, 8, None)
     }
 
     fn sample_pert_square_mat_gpu_native(
@@ -718,7 +731,7 @@ mod tests {
     fn test_gpu_preimage_perturbation_keeps_single_column_tail() {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _) = trapdoor_sampler.trapdoor(&params, size);
@@ -943,7 +956,12 @@ mod tests {
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
         let (moduli, _, _) = params.to_crt();
-        GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+        GpuDCRTPolyParams::new(
+            params.ring_dimension(),
+            moduli,
+            params.base_bits(),
+            Some(params.dropped_moduli()),
+        )
     }
 
     fn permissive_preimage_bound(params: &GpuDCRTPolyParams) -> BigUint {
@@ -1148,7 +1166,7 @@ mod tests {
     #[test]
     #[sequential]
     fn test_gpu_preimage_sampler_parameters_follow_instance_sigma() {
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let base = 1u32 << params.base_bits();
         let default_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
@@ -1218,7 +1236,7 @@ mod tests {
     ) {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, sigma);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
@@ -1268,7 +1286,7 @@ mod tests {
     fn test_gpu_p_hat_coefficients_below_compute_preimage_sigma() {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
@@ -1332,7 +1350,7 @@ mod tests {
         }
 
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let base_params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&base_params, SIGMA);
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();

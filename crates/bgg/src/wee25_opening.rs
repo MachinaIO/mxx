@@ -710,7 +710,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn partial_range_opening_and_verifier_match_direct_recursive_oracles() {
-        let parameters = DCRTPolyParams::new(4, 1, 12, 4);
+        let parameters = DCRTPolyParams::new(4, 1, 12, 4, None);
         let compiler = Wee25CommitmentCompiler {
             modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
             ring_dimension: IntExpr::constant(parameters.ring_dimension()),
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn generated_parameters_opening_and_verifier_have_zero_residual() {
-        let parameters = DCRTPolyParams::new(4, 1, 12, 4);
+        let parameters = DCRTPolyParams::new(4, 1, 12, 4, None);
         let compiler = Wee25CommitmentCompiler {
             modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
             ring_dimension: IntExpr::constant(parameters.ring_dimension()),

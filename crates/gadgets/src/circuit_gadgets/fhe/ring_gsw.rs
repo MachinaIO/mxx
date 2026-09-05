@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn ciphertext_arithmetic_matches_primitive_matrix_operations_at_runtime() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let arithmetic = Arc::new(ScalarArithmeticContext { q_modulus: parameters.to_crt().0[0] });
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let context = Arc::new(RingGswContext::from_arith_context(
@@ -1004,7 +1004,7 @@ mod tests {
     fn scalar_test_context(
         circuit: &mut PolyCircuit<DCRTPoly>,
     ) -> Arc<RingGswContext<DCRTPoly, ScalarArithmeticEntry>> {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let arithmetic = Arc::new(ScalarArithmeticContext { q_modulus: parameters.to_crt().0[0] });
         Arc::new(RingGswContext::from_arith_context(
             circuit,

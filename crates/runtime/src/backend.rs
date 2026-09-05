@@ -348,6 +348,11 @@ pub trait Backend {
     ) -> Result<(), Self::Error> {
         Ok(())
     }
+    /// Inclusive full-modulus reconstruction error for this backend's regular gadget.
+    /// Exact non-CRT backends keep the default zero bound.
+    fn gadget_error_bound(&self, _ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
+        Ok(BigInt::from(0u8))
+    }
     fn gadget_decompose(
         &mut self,
         value: &Self::Matrix,

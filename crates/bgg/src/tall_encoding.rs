@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn tall_arithmetic_matches_row_wise_runtime_formulas() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let digits = parameters.modulus_digits();
         let columns = secret_size * digits;
@@ -1045,7 +1045,7 @@ mod tests {
 
     #[test]
     fn direct_tall_rotation_encoding_matches_the_two_step_matrix_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let digits = parameters.modulus_digits();
         let columns = secret_size * digits;
@@ -1184,7 +1184,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_uses_master_secret_rows_in_the_bgg_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_is_blockwise_for_three_keys_and_uses_one_packed_error() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
@@ -1398,7 +1398,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_blockwise_runtime_matches_identity_and_plaintext_formulas() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_supports_one_key_without_plaintext_blocks() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let slots = 1;
         let layout = BggSamplerLayout {
@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     fn tall_rotation_encoding_artifacts_roundtrip_and_match_cross_row_secrets() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let slots = 4;
         let digits = parameters.modulus_digits();
@@ -1712,7 +1712,7 @@ mod tests {
 
     #[test]
     fn tall_rotation_encoding_public_key_pass_matches_lookup_input() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let secret_size = 2;
         let slots = 4;
         let digits = parameters.modulus_digits();

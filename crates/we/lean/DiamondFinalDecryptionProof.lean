@@ -32,7 +32,7 @@ theorem generated_final_root
     w31, w32, w33, w35, w36, w37, w38, w40, w42, w43, w44, w45, w46, w47,
     w48, w49, w50, w53, w54, w55, w56, w57, w58, w59, w60, w61, w62,
     w67a, w67b, w67c, w70, circuit, coefficient⟩
-  dsimp only [Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
+  dsimp only [Stage_decrypt.generatedRoot.body, Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
   have hextract : extractCoefficient 0
       (state * inputs.2.2.2.1 - (state * inputs.2.2.2.2.1 +
         (state * inputs.2.2.2.2.2.1 - circuit) *

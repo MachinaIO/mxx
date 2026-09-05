@@ -202,6 +202,10 @@ pub struct RootBoundary {
 pub struct ScopeProofShape {
     /// Root scopes use one named record; child scopes retain their existential telescope.
     pub witness_record: Option<String>,
+    /// Exact root body at one fixed witness, for composing intermediate-node proofs.
+    pub body_relation: Option<String>,
+    /// Emitted value right-hand sides; references name earlier entries or root arguments.
+    pub value_expressions: BTreeMap<String, String>,
     /// Witness fields (roots) or binders (children), in exact exported order. Pure lets
     /// are deliberately absent: Lean unfolds them while eliminating `Runs`.
     pub witnesses: Vec<(String, String)>,
@@ -404,6 +408,7 @@ struct Emitter<'a> {
     current_uses_hash_model: bool,
     current_witnesses: Vec<(String, String)>,
     current_root: bool,
+    current_value_expressions: BTreeMap<String, String>,
     scope_proofs: BTreeMap<FrozenGraphScopeId, ScopeProofShape>,
 }
 
@@ -453,6 +458,7 @@ impl<'a> Emitter<'a> {
             current_uses_hash_model: false,
             current_witnesses: Vec::new(),
             current_root: false,
+            current_value_expressions: BTreeMap::new(),
             scope_proofs: BTreeMap::new(),
             requires_hash_model: graph.scopes().values().any(|scope| {
                 scope.nodes().iter().any(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
@@ -677,6 +683,7 @@ impl<'a> Emitter<'a> {
     fn emit_scope(&mut self, scope_id: &FrozenGraphScopeId) -> Result<(), ExportError> {
         self.indent = 1;
         self.current_witnesses.clear();
+        self.current_value_expressions.clear();
         self.current_root = matches!(scope_id, FrozenGraphScopeId::Root);
         let scope = self.graph.scope(scope_id).expect("scope key came from graph");
         let validated = self.validated.scopes.get(scope_id).expect("validated scope");
@@ -731,9 +738,6 @@ impl<'a> Emitter<'a> {
         // Keep the configuration argument part of the generated relation even for a closed graph;
         // the underscore binding suppresses Lean's unused-binder warning without changing its
         // semantics, and parameterized expressions still refer to `params` directly below.
-        if self.current_root {
-            self.source.push_str(&format!("  ∃ witness : {}.Witness,\n", self.scopes[scope_id]));
-        }
         self.source.push_str("  let _params := params\n");
         if self.requires_backend {
             self.source.push_str("  let _backend := backend\n");
@@ -790,6 +794,10 @@ impl<'a> Emitter<'a> {
                 witness_record: self.current_root.then(|| {
                     format!("{}.{}.Witness", self.options.namespace, self.scopes[scope_id])
                 }),
+                body_relation: self
+                    .current_root
+                    .then(|| format!("{}.{}.body", self.options.namespace, self.scopes[scope_id])),
+                value_expressions: self.current_value_expressions.clone(),
                 witnesses: self.current_witnesses.clone(),
                 node_constraints,
                 constraint_count: relations.len(),
@@ -852,8 +860,27 @@ impl<'a> Emitter<'a> {
         } else {
             String::new()
         };
-        self.source
-            .insert_str(declaration_start, &(record + &constraint_definition + &final_header));
+        if self.current_root {
+            let name = &self.scopes[scope_id];
+            let body_header =
+                final_header.replacen(&format!("def {name} "), &format!("abbrev {name}.body "), 1);
+            let witness_name =
+                if self.current_witnesses.is_empty() { "_witness" } else { "witness" };
+            let body_header = format!(
+                "{}({witness_name} : {name}.Witness) : Prop :=\n",
+                body_header.strip_suffix(": Prop :=\n").expect("scope header")
+            );
+            self.source
+                .insert_str(declaration_start, &(record + &constraint_definition + &body_header));
+            let wrapper_header = final_header
+                .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)");
+            let backend = if self.requires_backend { "backend " } else { "" };
+            let hash = if self.requires_hash_model { "hashModel " } else { "" };
+            let input = if inputs.is_empty() { "()" } else { "inputs" };
+            self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {input} outputs witness\n\n"));
+        } else {
+            self.source.insert_str(declaration_start, &(constraint_definition + &final_header));
+        }
         Ok(())
     }
 
@@ -1740,6 +1767,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn let_output(&mut self, name: &str, term: &str) {
+        self.current_value_expressions.insert(name.to_owned(), term.to_owned());
         let ty = &self.current_wire_types[name];
         let binder = if self.current_referenced_wires.contains(name) {
             name
@@ -1863,6 +1891,10 @@ impl<'a> Emitter<'a> {
         Ok(layout.clone())
     }
     fn bind_existential(&mut self, name: &str, ty: &str) {
+        self.current_value_expressions.insert(
+            name.to_owned(),
+            if self.current_root { format!("witness.{name}") } else { name.to_owned() },
+        );
         self.current_scope_values.push((name.to_owned(), ty.to_owned()));
         self.current_witnesses.push((name.to_owned(), ty.to_owned()));
         if self.current_root {
@@ -3169,6 +3201,8 @@ mod tests {
         let proof = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
         assert_eq!(proof.node_constraints[&NodeId(1)], 0..7);
         assert_eq!(proof.node_constraints[&NodeId(2)], 7..8);
+        assert_eq!(proof.body_relation.as_deref(), Some("Generated.generatedRoot.body"));
+        assert_eq!(proof.value_expressions["w_1_0"], "witness.w_1_0");
         assert_eq!(proof.constraint_count, 8);
         let projection = |position: usize, last: bool| {
             format!("h{}{}", ".2".repeat(position), if last { "" } else { ".1" })
@@ -3181,6 +3215,7 @@ mod tests {
             projection(proof.constraint_count, true)
         );
         fixture.push_str("\nexample (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2) :\n    Generated.generatedRoot params () output ↔\n    ∃ sliced transformed : Mxx.Primitives.ExactMatrix 17 2 1 2,\n      MxxRuntime.sliceMatrix (0 : Mxx.Primitives.ExactMatrix 17 2 2 2) 0 1 0 2 sliced ∧\n      MxxRuntime.ringAutomorphismRuns 1 sliced transformed ∧ output = transformed := by\n  constructor\n  · exact sliceProjectionForward params output\n  · rintro ⟨sliced, transformed, hs, ht, ho⟩\n    exact ⟨⟨sliced, transformed⟩, by decide, by decide, by decide, by decide, by decide, by decide, hs, ht, ho⟩\n");
+        fixture.push_str("\nexample (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2) :\n    Generated.generatedRoot params () output ↔ ∃ witness, Generated.generatedRoot.body params () output witness := Iff.rfl\n");
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_data/lean_scope_projections");
         std::fs::create_dir_all(&directory).unwrap();

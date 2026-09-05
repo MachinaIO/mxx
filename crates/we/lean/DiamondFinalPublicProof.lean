@@ -50,7 +50,7 @@ theorem generated_final_public_witness
     decoderTarget, decoder, w46, w51, w52, w53, w55, keyTarget, key, gadget,
     oneTarget, one, w65, w66, t66, w67, w68, w69, w70, w71, w72, w73,
     w74, w75, t75, w76, w77, w78⟩
-  dsimp only [Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at h
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at h
   have hpublic : publicOne = publicInputs 0 := by
     obtain ⟨i, hi, hv⟩ : familyGetStatic publicInputs 0 publicOne := by tauto
     have hiz : i = 0 := Fin.ext (by change i.val = 0; omega)

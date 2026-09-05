@@ -33,7 +33,7 @@ theorem generated_decrypt_injector_context
     w31, w32, w33, w35, w36, w37, w38, w40, w42, w43, w44, w45, w46, w47,
     w48, w49, w50, w53, w54, w55, w56, w57, w58, w59, w60, w61, w62,
     w67a, w67b, w67c, w70, circuit, coefficient⟩
-  dsimp only [Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
+  dsimp only [Stage_decrypt.generatedRoot.body, Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
   have hinit : ∀ state : Fin stateCount, Stage_decrypt.parallel_generatedRoot_2 backend params state.val
       inputs.1 (w2 state) := by tauto
   have hindices : ∀ i : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_3 backend params i.val ()

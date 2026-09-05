@@ -266,7 +266,7 @@ theorem generated_accepting_requirement_plaintext
   obtain ⟨rootWitness, h⟩ := hroot
   rcases rootWitness with ⟨instanceChecks, witnessChecks, inputChecks, validInputs, witnessIndices,
     selectedWitnesses, referenceInitial, referenceOutput, selectedIndex, accepted⟩
-  dsimp only [Requirement_2.generatedRoot.constraints_0] at h
+  dsimp only [Requirement_2.generatedRoot.body, Requirement_2.generatedRoot.constraints_0] at h
   rcases h with ⟨_, _, _, _, _, _, _, _, _, hindices, _, hwitnesses, _, hinitial,
     _, hloop, _, _, hsource, _, _, houtput, hsuccess⟩
   have haccept : accepted = true := by

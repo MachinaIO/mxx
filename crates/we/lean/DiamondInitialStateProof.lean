@@ -41,7 +41,7 @@ theorem generated_injector_root
     w_44_0, w_45_0, w_46_0, w_51_0, w_52_0, w_53_0, w_55_0, w_58_0, w_59_0, w_60_0,
     w_63_0, w_64_0, w_65_0, w_66_0, w_66_1, w_67_0, w_68_0, w_69_0, w_70_0, w_71_0,
     w_72_0, w_73_0, w_74_0, w_75_0, w_75_1, w_76_0, w_77_0, w_78_0⟩
-  dsimp only [Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at hrelations
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at hrelations
   have hwhole := hrelations
   rcases hrelations with ⟨hstateCount, hterminalIndices, _, hbases, _, hterminalBases,
     hterminalBase, _, _, _, _, _, _, _, _, _, _, _, _, _, _,

@@ -745,20 +745,7 @@ fn reduce_family_segments(
     if segment_count == 0 || segment_size == 0 {
         return Err(RefreshError::InvalidLayout);
     }
-    Parallel::range(segment_count)
-        .try_map_values({
-            let family = family.clone();
-            move |segment| {
-                let start = segment.as_int().mul(Int::constant(segment_size));
-                let indices = Parallel::range(segment_size)
-                    .map_values(|index| start.clone().add(index.as_int()))?;
-                let values = family
-                    .clone()
-                    .parallel_gather(indices)
-                    .map_err(|_| mxx_dsl::DslError::Schema)?;
-                crate::encoding::balanced_sum_family(values).map_err(|_| mxx_dsl::DslError::Schema)
-            }
-        })
+    crate::encoding::reduce_encoding_family_segments(family, segment_count, segment_size)
         .map_err(|_| RefreshError::InvalidLayout)
 }
 
@@ -921,7 +908,7 @@ pub(crate) fn route_preimage_family(
     // the two-row BGG+ target shape needed by `u_2`; only its public type is
     // used, and its value is not copied into the route target.
     let targets = Parallel::range(count)
-        .try_map_values(|index| {
+        .try_map_values(Vec::<Mat>::new(), |index, _| {
             let flat = index.expression();
             let group_size = component_count
                 .checked_mul(coefficient_count)

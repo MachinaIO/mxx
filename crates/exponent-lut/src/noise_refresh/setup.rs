@@ -2675,20 +2675,7 @@ fn reduce_public_family_segments(
     if segment_count == 0 || segment_size == 0 {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    Parallel::range(segment_count)
-        .try_map_values({
-            let family = family.clone();
-            move |segment| {
-                let start = segment.as_int().mul(Int::constant(segment_size));
-                let indices = Parallel::range(segment_size)
-                    .map_values(|index| start.clone().add(index.as_int()))?;
-                let values = family
-                    .clone()
-                    .parallel_gather(indices)
-                    .map_err(|_| mxx_dsl::DslError::Schema)?;
-                crate::encoding::balanced_sum_family(values).map_err(|_| mxx_dsl::DslError::Schema)
-            }
-        })
+    crate::encoding::reduce_encoding_family_segments(family, segment_count, segment_size)
         .map_err(RefreshSetupError::from)
 }
 
@@ -5075,6 +5062,22 @@ mod tests {
         // decoder preimage; all helpers share two family artifact names. The
         // online decoder anchor is intentionally not an artifact.
         assert_eq!(expected_setup_artifact_count(2, 3, 10), Some(28));
+    }
+
+    #[test]
+    fn public_refresh_segments_preserve_slot_axis_without_implicit_family_capture() {
+        let ring = mxx_dsl::Ring::new(97, 4);
+        let routed = ring.input_family("routed-public-prf", 15, (2, 4));
+        let reduced = reduce_public_family_segments(routed, 3, 5).unwrap();
+        assert_eq!(reduced.count(), &IntExpr::constant(3));
+        assert_eq!(reduced.element_type(), &ring.matrix_type((2, 4)));
+        DslContext::new("public-refresh-segments")
+            .output("slot-targets", reduced)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
     }
 
     #[test]

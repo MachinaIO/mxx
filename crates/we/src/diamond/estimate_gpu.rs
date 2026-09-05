@@ -303,7 +303,13 @@ impl DiamondGpuMeasurementBackend {
             slowest = slowest.max(seconds);
         }
         assert!(self.backend.set_active_placement(original));
-        Ok(NodeMeasurement { work_seconds: slowest, latency_seconds: slowest, workspace_bytes: 0 })
+        Ok(NodeMeasurement {
+            work_seconds: slowest,
+            latency_seconds: slowest,
+            cumulative_wave_seconds: slowest,
+            independent_wave_count: 1,
+            workspace_bytes: 0,
+        })
     }
 
     fn prepare_inputs(

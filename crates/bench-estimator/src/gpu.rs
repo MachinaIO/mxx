@@ -287,11 +287,14 @@ impl RepresentativeMeasurement {
 }
 
 fn extrapolate_fleet_waves(full_wave: &NodeMeasurement, wave_count: usize) -> NodeMeasurement {
-    let wave_count = wave_count as f64;
     NodeMeasurement {
-        work_seconds: full_wave.work_seconds * wave_count,
-        latency_seconds: full_wave.latency_seconds * wave_count,
-        workspace_bytes: full_wave.workspace_bytes,
+        work_seconds: full_wave.work_seconds * wave_count as f64,
+        latency_seconds: full_wave.latency_seconds,
+        cumulative_wave_seconds: full_wave.latency_seconds * wave_count as f64,
+        independent_wave_count: wave_count,
+        workspace_bytes: full_wave
+            .workspace_bytes
+            .saturating_mul(u64::try_from(wave_count).unwrap_or(u64::MAX)),
     }
 }
 
@@ -304,6 +307,7 @@ fn aggregate_fleet_wave(
         // coordinated enqueue/completion join and is installed after aggregating device work.
         fleet.work_seconds += device.work_seconds;
         fleet.latency_seconds = fleet_latency_seconds;
+        fleet.cumulative_wave_seconds = fleet_latency_seconds;
         fleet.workspace_bytes = fleet.workspace_bytes.saturating_add(device.workspace_bytes);
         fleet
     })
@@ -1093,14 +1097,23 @@ impl GpuNodeMeasurementBackend {
         let full_wave =
             aggregate_fleet_wave(measurements.into_iter().flatten(), fleet_latency_seconds);
         let measurement = extrapolate_fleet_waves(&full_wave, wave_count);
+        info!(
+            scope = ?request.scope, node = request.id.0, kind = ?request.kind,
+            wave_count, fleet_wave_latency_seconds = full_wave.latency_seconds,
+            work_seconds = measurement.work_seconds,
+            cumulative_wave_seconds = measurement.cumulative_wave_seconds,
+            fleet_wave_workspace_bytes = full_wave.workspace_bytes,
+            "measured independent GPU fleet waves"
+        );
         if request.preimage_sample {
             info!(
                 scope = ?request.scope,
                 node = request.id.0,
                 work_seconds = measurement.work_seconds,
-                latency_seconds = measurement.latency_seconds,
-                workspace_bytes = measurement.workspace_bytes,
-                "measured fleet-wide GPU preimage sampler"
+                dependency_latency_seconds = measurement.latency_seconds,
+                cumulative_wave_seconds = measurement.cumulative_wave_seconds,
+                ideal_concurrent_workspace_bytes = measurement.workspace_bytes,
+                "estimated fleet-wide GPU preimage sampler from measured waves"
             );
         }
         Ok(measurement)
@@ -1950,6 +1963,8 @@ impl GpuNodeMeasurementBackend {
                 Ok(Some(NodeMeasurement {
                     work_seconds: seconds,
                     latency_seconds: seconds,
+                    cumulative_wave_seconds: seconds,
+                    independent_wave_count: 1,
                     workspace_bytes,
                 }))
             })
@@ -2071,7 +2086,13 @@ impl GpuNodeMeasurementBackend {
         outputs.iter().for_each(GpuMeasurementOutput::finish);
         let latency_seconds = started.elapsed().as_secs_f64();
         let workspace_bytes = finish_gpu_memory_measurement(worker.device_id, baseline)?;
-        Ok(NodeMeasurement { work_seconds: latency_seconds, latency_seconds, workspace_bytes })
+        Ok(NodeMeasurement {
+            work_seconds: latency_seconds,
+            latency_seconds,
+            cumulative_wave_seconds: latency_seconds,
+            independent_wave_count: 1,
+            workspace_bytes,
+        })
     }
 
     fn run_node(
@@ -2972,27 +2993,54 @@ mod tests {
 
     #[test]
     fn fleet_wave_extrapolation_uses_conservative_full_waves() {
-        let full_wave =
-            NodeMeasurement { work_seconds: 38.0, latency_seconds: 39.0, workspace_bytes: 56 };
+        let full_wave = NodeMeasurement {
+            work_seconds: 38.0,
+            latency_seconds: 39.0,
+            cumulative_wave_seconds: 39.0,
+            independent_wave_count: 1,
+            workspace_bytes: 56,
+        };
         let measurement = extrapolate_fleet_waves(&full_wave, 7);
 
         assert_eq!(measurement.work_seconds, 266.0);
-        assert_eq!(measurement.latency_seconds, 273.0);
-        assert_eq!(measurement.workspace_bytes, 56);
+        assert_eq!(measurement.latency_seconds, 39.0);
+        assert_eq!(measurement.cumulative_wave_seconds, 273.0);
+        assert_eq!(measurement.independent_wave_count, 7);
+        assert_eq!(measurement.workspace_bytes, 392);
+
+        // The accepted B packed public-key request has this production wave count.
+        // Its ideal dependency latency must not acquire a 39-trillion-wave multiplier.
+        let packed = extrapolate_fleet_waves(&full_wave, 39_347_154_233_648);
+        assert_eq!(packed.latency_seconds, 39.0);
+        assert_eq!(packed.cumulative_wave_seconds, 39.0 * 39_347_154_233_648_f64);
+        assert_eq!(packed.work_seconds, 38.0 * 39_347_154_233_648_f64);
     }
 
     #[test]
     fn fleet_wave_sums_work_and_workspace_and_uses_measured_wall_latency() {
         let measurement = aggregate_fleet_wave(
             [
-                NodeMeasurement { work_seconds: 2.0, latency_seconds: 2.0, workspace_bytes: 30 },
-                NodeMeasurement { work_seconds: 3.0, latency_seconds: 3.0, workspace_bytes: 20 },
+                NodeMeasurement {
+                    work_seconds: 2.0,
+                    latency_seconds: 2.0,
+                    cumulative_wave_seconds: 2.0,
+                    independent_wave_count: 1,
+                    workspace_bytes: 30,
+                },
+                NodeMeasurement {
+                    work_seconds: 3.0,
+                    latency_seconds: 3.0,
+                    cumulative_wave_seconds: 3.0,
+                    independent_wave_count: 1,
+                    workspace_bytes: 20,
+                },
             ],
             3.25,
         );
 
         assert_eq!(measurement.work_seconds, 5.0);
         assert_eq!(measurement.latency_seconds, 3.25);
+        assert_eq!(measurement.cumulative_wave_seconds, 3.25);
         assert_eq!(measurement.workspace_bytes, 50);
     }
 

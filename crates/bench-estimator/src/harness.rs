@@ -128,6 +128,8 @@ where
     Ok(NodeMeasurement {
         work_seconds: seconds,
         latency_seconds: seconds,
+        cumulative_wave_seconds: seconds,
+        independent_wave_count: 1,
         workspace_bytes: peak.load(Ordering::Acquire).saturating_sub(baseline),
     })
 }

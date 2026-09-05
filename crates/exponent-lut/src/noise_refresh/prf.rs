@@ -994,41 +994,52 @@ impl SparseLwrPrfProgram {
         }
         let construction_error = std::cell::RefCell::new(None);
         let vectors_result = with_benchmark_role(BenchmarkRole::EncodingPrfAccumulation, || {
-            Parallel::range(inputs.label_count).try_map_values(|label| {
-                let output_cache = cache.output(label.clone()).map_err(|error| {
-                    construction_error.replace(Some(error));
-                    mxx_dsl::DslError::Schema
-                })?;
-                let labels = inputs.label(label).map_err(|error| {
-                    construction_error.replace(Some(ExponentLutError::OnlinePrfStage {
-                        stage: "select label family",
-                        detail: error.to_string(),
-                    }));
-                    mxx_dsl::DslError::Schema
-                })?;
-                let output = self
-                    .compile_encoding_with_preprocessed_artifacts(
-                        compiler,
-                        initial.clone(),
-                        selectors,
-                        &labels,
-                        layout,
-                        &output_cache,
-                    )
-                    .map_err(|error| {
+            Parallel::range(inputs.label_count).try_map_values(
+                (inputs.vectors.clone(), inputs.plaintexts.clone(), selectors.gsw().clone()),
+                |label, (vectors, plaintexts, gsw)| {
+                    let inputs = NativePrfOnlineBatchInputs {
+                        vectors,
+                        plaintexts,
+                        label_count: inputs.label_count,
+                        layout_id: inputs.layout_id,
+                    };
+                    let selectors = EncodingRhsFamily::new_for_layout(gsw, layout.layout_id)
+                        .map_err(|_| mxx_dsl::DslError::Schema)?;
+                    let output_cache = cache.output(label.clone()).map_err(|error| {
                         construction_error.replace(Some(error));
                         mxx_dsl::DslError::Schema
                     })?;
-                Ok(output.vector)
-            })
+                    let labels = inputs.label(label).map_err(|error| {
+                        construction_error.replace(Some(ExponentLutError::OnlinePrfStage {
+                            stage: "select label family",
+                            detail: error.to_string(),
+                        }));
+                        mxx_dsl::DslError::Schema
+                    })?;
+                    let output = self
+                        .compile_encoding_with_preprocessed_artifacts(
+                            compiler,
+                            initial.clone(),
+                            &selectors,
+                            &labels,
+                            layout,
+                            &output_cache,
+                        )
+                        .map_err(|error| {
+                            construction_error.replace(Some(error));
+                            mxx_dsl::DslError::Schema
+                        })?;
+                    Ok(output.vector)
+                },
+            )
         });
         let vectors = match vectors_result {
             Ok(vectors) => vectors,
-            Err(_) => {
+            Err(error) => {
                 return Err(construction_error.into_inner().unwrap_or(
                     ExponentLutError::OnlinePrfStage {
                         stage: "construct label-major family",
-                        detail: "DSL family construction failed".to_owned(),
+                        detail: error.to_string(),
                     },
                 ));
             }

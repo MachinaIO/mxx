@@ -1579,7 +1579,7 @@ impl TrapdoorFamily {
             with_new_construction_scope(|scope| {
                 let input = schema.placeholders();
                 let explicit_inputs = input.flatten();
-                (body(index, input), explicit_inputs, scope)
+                (body(index, input).normalize_parallel_output(), explicit_inputs, scope)
             })
         });
         let sealed = SubgraphHandle::seal(
@@ -1626,7 +1626,7 @@ impl TrapdoorFamily {
                 let matrix = matrix_schema.placeholders();
                 let mut explicit_inputs = trapdoor.flatten();
                 explicit_inputs.extend(matrix.flatten());
-                let body_value = body(index, trapdoor, matrix);
+                let body_value = body(index, trapdoor, matrix).normalize_parallel_output();
                 (body_value, explicit_inputs, scope)
             })
         });
@@ -2261,7 +2261,7 @@ impl<T: FamilyElement> Family<T> {
         let (index_slot, (body_value, explicit_input, scope)) = with_loop_index(|index| {
             with_new_construction_scope(|scope| {
                 let input = schema.placeholders();
-                let output = body(index, input.clone());
+                let output = body(index, input.clone()).normalize_parallel_output();
                 (output, input.flatten(), scope)
             })
         });
@@ -2359,6 +2359,10 @@ where
 {
     type Families = Family<T>;
 
+    fn normalize_parallel_output(self) -> Self {
+        self.normalize_for_family()
+    }
+
     fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
         let mut element_types = self.schema().wire_types();
         if element_types.len() != 1 {
@@ -2435,7 +2439,7 @@ impl Family<Mat> {
                     })
                     .collect::<Vec<_>>();
                 let explicit_inputs = inputs.iter().map(|input| input.value.clone()).collect();
-                let output = body(index, inputs)?;
+                let output = body(index, inputs)?.normalize_parallel_output();
                 Ok::<_, DslError>((output, explicit_inputs, scope))
             })
         });
@@ -2521,7 +2525,8 @@ impl Family<Mat> {
                     .map(|input| input.value.clone())
                     .chain(broadcast_inputs.iter().map(|input| input.value.clone()))
                     .collect();
-                let output = body(index, zipped_inputs, broadcast_inputs)?;
+                let output =
+                    body(index, zipped_inputs, broadcast_inputs)?.normalize_parallel_output();
                 Ok((output, explicit_inputs, scope))
             })
         });
@@ -2702,7 +2707,7 @@ impl Family<Mat> {
             with_new_construction_scope(|scope| {
                 let left = Mat::source_input("left".to_owned(), left_type, None);
                 let right = Mat::source_input("right".to_owned(), right_type, None);
-                let output = body(index, left.clone(), right.clone());
+                let output = body(index, left.clone(), right.clone()).normalize_parallel_output();
                 (output, vec![left.value, right.value], scope)
             })
         });
@@ -2762,7 +2767,7 @@ impl Family<Mat> {
             with_new_construction_scope(|scope| {
                 let left = Mat::source_input("left".to_owned(), left_type, None);
                 let right = Mat::source_input("right".to_owned(), right_type, None);
-                let output = body(index, left.clone(), right.clone());
+                let output = body(index, left.clone(), right.clone()).normalize_parallel_output();
                 (output, vec![left.value, right.value], scope)
             })
         });
@@ -2827,7 +2832,8 @@ impl Family<Mat> {
                 let first = Mat::source_input("first".to_owned(), first_type, None);
                 let second = Mat::source_input("second".to_owned(), second_type, None);
                 let third = Mat::source_input("third".to_owned(), third_type, None);
-                let output = body(index, first.clone(), second.clone(), third.clone());
+                let output = body(index, first.clone(), second.clone(), third.clone())
+                    .normalize_parallel_output();
                 (output, vec![first.value, second.value, third.value], scope)
             })
         });
@@ -3002,7 +3008,7 @@ impl ParallelRange {
         self,
         body: impl FnOnce(LoopIndex) -> Result<Mat, DslError>,
     ) -> Result<Family<Mat>, DslError> {
-        self.try_map_values(body)
+        self.try_map_values(Vec::<Mat>::new(), |index, _| body(index))
     }
 
     pub fn map_values<R: ParallelOutput>(
@@ -3010,8 +3016,9 @@ impl ParallelRange {
         body: impl FnOnce(LoopIndex) -> R,
     ) -> Result<R::Families, DslError> {
         let count = self.count;
-        let (index_slot, (body_value, scope)) =
-            with_loop_index(|index| with_new_construction_scope(|scope| (body(index), scope)));
+        let (index_slot, (body_value, scope)) = with_loop_index(|index| {
+            with_new_construction_scope(|scope| (body(index).normalize_parallel_output(), scope))
+        });
         let body_outputs = body_value.flatten();
         let sealed = SubgraphHandle::seal(
             "parallel-range-body",
@@ -3039,25 +3046,36 @@ impl ParallelRange {
         body_value.parallel_families(&node, &mut 0, &count, pending)
     }
 
-    pub fn try_map_values<R: ParallelOutput>(
+    /// Builds a structural range with explicit shared inputs. Non-artifact
+    /// families must be supplied through `broadcast` rather than captured.
+    pub fn try_map_values<B: GraphValue, R: ParallelOutput>(
         self,
-        body: impl FnOnce(LoopIndex) -> Result<R, DslError>,
+        broadcast: B,
+        body: impl FnOnce(LoopIndex, B) -> Result<R, DslError>,
     ) -> Result<R::Families, DslError> {
         let count = self.count;
+        let schema = broadcast.schema();
         let (index_slot, body_result) = with_loop_index(|index| {
-            with_new_construction_scope(|scope| body(index).map(|body_value| (body_value, scope)))
+            with_new_construction_scope(|scope| {
+                let inputs = schema.placeholders();
+                let explicit_inputs = inputs.flatten();
+                body(index, inputs).map(|body_value| {
+                    (body_value.normalize_parallel_output(), explicit_inputs, scope)
+                })
+            })
         });
-        let (body_value, scope) = body_result?;
+        let (body_value, explicit_inputs, scope) = body_result?;
         let body_outputs = body_value.flatten();
         let sealed = SubgraphHandle::seal(
             "parallel-range-body",
             scope,
-            Vec::new(),
+            explicit_inputs,
             body_outputs,
             CapturePolicy::BroadcastScalarsAndArtifactFamilies,
         )?;
-        let arguments = sealed.captures.iter().map(|capture| capture.outer.clone()).collect();
-        let modes = (0..sealed.captures.len()).map(|_| LoopInputMode::Broadcast).collect();
+        let mut arguments = broadcast.flatten();
+        arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
+        let modes = (0..arguments.len()).map(|_| LoopInputMode::Broadcast).collect();
         let family_outputs = body_value.parallel_family_types(&count)?;
         let node = NodeHandle::parallel_loop(
             sealed.handle.clone(),
@@ -3071,7 +3089,8 @@ impl ParallelRange {
                 input_modes: modes,
             },
         );
-        let pending = body_value.pending().remap(&sealed.remap);
+        let pending =
+            Pending::merge([broadcast.pending(), body_value.pending().remap(&sealed.remap)]);
         body_value.parallel_families(&node, &mut 0, &count, pending)
     }
 }
@@ -3119,7 +3138,7 @@ where
                 let second = second_schema.placeholders_from(&mut next);
                 let mut explicit_inputs = first.flatten();
                 explicit_inputs.extend(second.flatten());
-                let output = body(index, (first, second))?;
+                let output = body(index, (first, second))?.normalize_parallel_output();
                 Ok::<_, DslError>((output, explicit_inputs, scope))
             })
         });
@@ -3175,7 +3194,7 @@ where
                 let mut explicit_inputs = first.flatten();
                 explicit_inputs.extend(second.flatten());
                 explicit_inputs.extend(third.flatten());
-                let output = body(index, (first, second, third))?;
+                let output = body(index, (first, second, third))?.normalize_parallel_output();
                 Ok::<_, DslError>((output, explicit_inputs, scope))
             })
         });
@@ -3238,7 +3257,8 @@ where
                 explicit_inputs.extend(second.flatten());
                 explicit_inputs.extend(third.flatten());
                 explicit_inputs.extend(fourth.flatten());
-                let output = body(index, (first, second, third, fourth))?;
+                let output =
+                    body(index, (first, second, third, fourth))?.normalize_parallel_output();
                 Ok::<_, DslError>((output, explicit_inputs, scope))
             })
         });
@@ -3376,7 +3396,7 @@ where
             explicit_inputs.extend(d.flatten());
             explicit_inputs.extend(e.flatten());
             explicit_inputs.extend(f.flatten());
-            let output = body(index, (a, b, c), (d, e, f));
+            let output = body(index, (a, b, c), (d, e, f)).normalize_parallel_output();
             Ok::<_, DslError>((output, explicit_inputs, scope))
         })
     });
@@ -4017,6 +4037,17 @@ pub trait GraphValue: Clone {
 pub trait ParallelOutput: GraphValue {
     type Families;
 
+    /// Normalizes scalar leaves to their family element schema while the body
+    /// construction scope is active, before its outputs are sealed. In
+    /// particular, constant integers and booleans become ordinary typed family
+    /// members, just as they do in `Family::pack`.
+    fn normalize_parallel_output(self) -> Self
+    where
+        Self: Sized,
+    {
+        self
+    }
+
     fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError>;
 
     fn parallel_families(
@@ -4073,6 +4104,10 @@ impl ParallelOutput for Trapdoor {
 impl<A: ParallelOutput, B: ParallelOutput> ParallelOutput for (A, B) {
     type Families = (A::Families, B::Families);
 
+    fn normalize_parallel_output(self) -> Self {
+        (self.0.normalize_parallel_output(), self.1.normalize_parallel_output())
+    }
+
     fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
         let mut types = self.0.parallel_family_types(count)?;
         types.extend(self.1.parallel_family_types(count)?);
@@ -4094,6 +4129,14 @@ impl<A: ParallelOutput, B: ParallelOutput> ParallelOutput for (A, B) {
 
 impl<A: ParallelOutput, B: ParallelOutput, C: ParallelOutput> ParallelOutput for (A, B, C) {
     type Families = (A::Families, B::Families, C::Families);
+
+    fn normalize_parallel_output(self) -> Self {
+        (
+            self.0.normalize_parallel_output(),
+            self.1.normalize_parallel_output(),
+            self.2.normalize_parallel_output(),
+        )
+    }
 
     fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
         let mut types = self.0.parallel_family_types(count)?;
@@ -4118,6 +4161,10 @@ impl<A: ParallelOutput, B: ParallelOutput, C: ParallelOutput> ParallelOutput for
 
 impl<T: ParallelOutput> ParallelOutput for Vec<T> {
     type Families = Vec<T::Families>;
+
+    fn normalize_parallel_output(self) -> Self {
+        self.into_iter().map(ParallelOutput::normalize_parallel_output).collect()
+    }
 
     fn parallel_family_types(&self, count: &IntExpr) -> Result<Vec<WireType>, DslError> {
         self.iter().try_fold(Vec::new(), |mut types, value| {
@@ -5338,6 +5385,73 @@ mod tests {
                 .flat_map(|scope| scope.nodes())
                 .any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
         );
+    }
+
+    #[test]
+    fn range_explicit_broadcast_preserves_nonartifact_family_inputs() {
+        let ring = Ring::new(97, 4);
+        let family = ring.input_family("label-major-input", 6, (1, 2));
+        let output = Parallel::range(2)
+            .try_map_values(family.clone(), |label, values| {
+                Ok(values.get(label.as_int().mul(Int::constant(3))))
+            })
+            .unwrap();
+        assert_eq!(output.count(), &IntExpr::constant(2));
+        let graph = DslContext::new("explicit-family-broadcast")
+            .output("labels", output)
+            .unwrap()
+            .build()
+            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+        assert!(
+            Parallel::range(2)
+                .try_map_values(Vec::<Mat>::new(), |label, _| {
+                    Ok(family.get(label.as_int().mul(Int::constant(3))))
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parallel_outputs_normalize_constant_scalar_leaves_before_sealing() {
+        let indices = Parallel::range(3).map_values(|index| index.as_int()).unwrap();
+        let (integers, booleans, nested) = Parallel::range(3)
+            .try_map_values(Vec::<Mat>::new(), |index, _| {
+                Ok((
+                    Int::constant(7),
+                    Bool::constant(true),
+                    (index.as_int(), vec![Bool::constant(false), Bool::constant(true)]),
+                ))
+            })
+            .unwrap();
+        let mapped = integers.clone().parallel_map_values(|_, _| Bool::constant(false)).unwrap();
+        let zipped = (integers.clone(), indices.clone())
+            .parallel_zip_tuple_result(|index, _| Ok((index.as_int(), Bool::constant(true))))
+            .unwrap();
+        assert_eq!(indices.count(), &IntExpr::constant(3));
+        assert_eq!(booleans.count(), &IntExpr::constant(3));
+        let built = DslContext::new("parallel-constant-leaves")
+            .output("indices", indices)
+            .unwrap()
+            .output("integers", integers)
+            .unwrap()
+            .output("booleans", booleans)
+            .unwrap()
+            .output("nested-index", nested.0)
+            .unwrap()
+            .output("nested-false", nested.1[0].clone())
+            .unwrap()
+            .output("nested-true", nested.1[1].clone())
+            .unwrap()
+            .output("mapped", mapped)
+            .unwrap()
+            .output("zipped-index", zipped.0)
+            .unwrap()
+            .output("zipped-bool", zipped.1)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

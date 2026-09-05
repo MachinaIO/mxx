@@ -17,11 +17,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeMeasurement {
     pub work_seconds: f64,
+    /// Dependency latency: one fleet wave for independently column-separable operations.
     pub latency_seconds: f64,
+    /// Sum of all production fleet wave latencies for the full logical operation.
+    pub cumulative_wave_seconds: f64,
+    /// Number of independent fleet waves needed for the full logical operation.
+    pub independent_wave_count: usize,
+    /// Hypothetical workspace when all independent waves execute concurrently.
     pub workspace_bytes: u64,
+}
+
+impl Default for NodeMeasurement {
+    fn default() -> Self {
+        Self {
+            work_seconds: 0.0,
+            latency_seconds: 0.0,
+            cumulative_wave_seconds: 0.0,
+            independent_wave_count: 1,
+            workspace_bytes: 0,
+        }
+    }
 }
 
 pub struct MeasurementNode<'a> {
@@ -90,10 +108,6 @@ pub trait MeasurementBackend {
     fn output_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         self.persistent_storage_bytes_for_node(kind, wire_type)
     }
-    /// Number of production chunks/waves represented by one measured node.
-    fn chunk_count_for_node(&self, _node: &MeasurementNode<'_>) -> usize {
-        1
-    }
     fn persistent_alias_argument(&self, _kind: &NodeKind, _output_port: usize) -> Option<usize> {
         None
     }
@@ -113,7 +127,7 @@ pub struct CostReport {
     pub preimage_sampling_work_seconds: f64,
     /// Earliest completion when all dependency-ready nodes can run concurrently.
     pub critical_path_seconds: f64,
-    /// Maximum simultaneous node parallelism in that unlimited-resource schedule.
+    /// Maximum simultaneous node/fleet-wave parallelism in that unlimited-resource schedule.
     pub maximum_parallelism: usize,
     pub persistent_bytes_over_time: Vec<u64>,
     pub workspace_high_water_bytes: u64,
@@ -124,6 +138,8 @@ pub struct CostReport {
     pub resident_vram_bytes: u64,
     pub expanded_workspace_bytes: u64,
     pub output_bytes: u128,
+    /// Sum of primitive wave counts in this scope, counting each structural node once.
+    /// Nested scope invocation counts are reported separately in `per_subgraph`.
     pub chunk_count: usize,
     pub peak_memory_bytes: u64,
     pub per_subgraph: BTreeMap<String, SubgraphCost>,
@@ -509,7 +525,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             ) = self.node_cost(&node, bindings)?;
             report.total_work_seconds += measurement.work_seconds;
             let total_time =
-                self.total_time_for_node(&node, bindings, measurement.latency_seconds)?;
+                self.total_time_for_node(&node, bindings, measurement.cumulative_wave_seconds)?;
             report.total_time_seconds += total_time;
             report.preimage_sampling_work_seconds += preimage_sampling_work;
             for (role, role_cost) in nested_roles {
@@ -534,7 +550,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             report.expanded_workspace_bytes =
                 report.expanded_workspace_bytes.max(measurement.workspace_bytes);
             report.chunk_count =
-                report.chunk_count.saturating_add(self.backend.chunk_count_for_node(&node));
+                report.chunk_count.saturating_add(measurement.independent_wave_count);
             for wire_type in &node.concrete_output_types {
                 report.output_bytes = report
                     .output_bytes
@@ -675,6 +691,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
                         latency_seconds: one.latency_seconds,
+                        cumulative_wave_seconds: one.cumulative_wave_seconds * count as f64,
+                        independent_wave_count: 1,
                         workspace_bytes: one.workspace_bytes.saturating_mul(count_u64),
                     },
                     preimage_work * count as f64,
@@ -726,6 +744,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
                         latency_seconds: one.latency_seconds * count as f64,
+                        cumulative_wave_seconds: one.cumulative_wave_seconds * count as f64,
+                        independent_wave_count: 1,
                         workspace_bytes: one.workspace_bytes,
                     },
                     preimage_work * count as f64,
@@ -747,7 +767,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         measurement.latency_seconds > 0.0 ||
                             measurement.work_seconds > 0.0 ||
                             measurement.workspace_bytes > 0,
-                    );
+                    )
+                    .saturating_mul(measurement.independent_wave_count);
                     (measurement, preimage_work, 0, parallelism, BTreeMap::new())
                 })
                 .map_err(|error| EstimateError::Backend(error.to_string())),
@@ -851,6 +872,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             NodeMeasurement {
                 work_seconds: report.total_work_seconds,
                 latency_seconds: report.critical_path_seconds,
+                cumulative_wave_seconds: report.total_time_seconds,
+                independent_wave_count: 1,
                 workspace_bytes: report.workspace_high_water_bytes,
             },
             report.preimage_sampling_work_seconds,
@@ -1261,7 +1284,13 @@ mod tests {
             _node: &MeasurementNode<'_>,
             _bindings: &ParamEnv,
         ) -> Result<NodeMeasurement, Self::Error> {
-            Ok(NodeMeasurement { work_seconds: 1.0, latency_seconds: 1.0, workspace_bytes: 4 })
+            Ok(NodeMeasurement {
+                work_seconds: 1.0,
+                latency_seconds: 1.0,
+                cumulative_wave_seconds: 1.0,
+                independent_wave_count: 1,
+                workspace_bytes: 4,
+            })
         }
 
         fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
@@ -1281,7 +1310,13 @@ mod tests {
             _bindings: &ParamEnv,
         ) -> Result<NodeMeasurement, Self::Error> {
             Ok(if matches!(node.kind, NodeKind::IntBinary(_)) {
-                NodeMeasurement { work_seconds: 2.0, latency_seconds: 2.0, workspace_bytes: 4 }
+                NodeMeasurement {
+                    work_seconds: 2.0,
+                    latency_seconds: 2.0,
+                    cumulative_wave_seconds: 2.0,
+                    independent_wave_count: 1,
+                    workspace_bytes: 4,
+                }
             } else {
                 NodeMeasurement::default()
             })
@@ -1375,6 +1410,8 @@ mod tests {
                     NodeMeasurement {
                         work_seconds: 2.0,
                         latency_seconds: 2.0,
+                        cumulative_wave_seconds: 2.0,
+                        independent_wave_count: 1,
                         workspace_bytes: 10,
                     },
                 ),
@@ -1383,12 +1420,20 @@ mod tests {
                     NodeMeasurement {
                         work_seconds: 3.0,
                         latency_seconds: 3.0,
+                        cumulative_wave_seconds: 3.0,
+                        independent_wave_count: 1,
                         workspace_bytes: 20,
                     },
                 ),
                 (
                     NodeId(2),
-                    NodeMeasurement { work_seconds: 1.0, latency_seconds: 1.0, workspace_bytes: 5 },
+                    NodeMeasurement {
+                        work_seconds: 1.0,
+                        latency_seconds: 1.0,
+                        cumulative_wave_seconds: 1.0,
+                        independent_wave_count: 1,
+                        workspace_bytes: 5,
+                    },
                 ),
             ]),
         };
@@ -1671,6 +1716,62 @@ mod tests {
         let report = estimate(&validated, &mut UnitBackend).expect("estimate");
         assert!(report.critical_path_seconds >= 3.0);
         assert_eq!(report.maximum_parallelism, 2);
+    }
+
+    #[test]
+    fn independent_waves_preserve_nested_totals_roles_and_sequential_dependencies() {
+        struct WaveBackend;
+        impl MeasurementBackend for WaveBackend {
+            type Error = Infallible;
+            fn measure(
+                &mut self,
+                _graph: &str,
+                node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                Ok(if matches!(node.kind, NodeKind::MatrixNegate) {
+                    NodeMeasurement {
+                        work_seconds: 14.0,
+                        latency_seconds: 3.0,
+                        cumulative_wave_seconds: 21.0,
+                        independent_wave_count: 7,
+                        workspace_bytes: 70,
+                    }
+                } else {
+                    NodeMeasurement::default()
+                })
+            }
+            fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+                0
+            }
+        }
+        let initial = Ring::new(17, 65536).input("packed", (1, 126_933_919_557_746_796_usize));
+        let total = Sequential::range(3)
+            .scan(initial.clone(), initial, |_, total, _| {
+                let lanes = Parallel::range(2).try_map_values(total, |_, value| {
+                    mxx_ir_core::graph::with_benchmark_role(
+                        BenchmarkRole::PublicPrfAccumulation,
+                        || Ok(-value),
+                    )
+                })?;
+                Ok(lanes.get_static(0))
+            })
+            .unwrap();
+        let built = DslContext::new("nested-independent-waves")
+            .output("total", total)
+            .unwrap()
+            .build()
+            .unwrap();
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).unwrap();
+        let report = estimate(&validated, &mut WaveBackend).unwrap();
+        assert_eq!(report.critical_path_seconds, 9.0);
+        assert_eq!(report.total_work_seconds, 84.0);
+        assert_eq!(report.total_time_seconds, 126.0);
+        assert_eq!(report.maximum_parallelism, 14);
+        assert_eq!(report.workspace_high_water_bytes, 140);
+        let role = &report.benchmark_roles[&BenchmarkRole::PublicPrfAccumulation];
+        assert_eq!(role.work_seconds, 84.0);
+        assert_eq!(role.total_time_seconds, 126.0);
     }
 
     #[test]

@@ -1,0 +1,882 @@
+namespace
+{
+    constexpr uint32_t kTransformThreads = 256;
+    constexpr size_t kMaxGridY = 65535;
+    constexpr size_t kMaxGridZ = 65535;
+
+    __device__ __forceinline__ uint64_t sub_mod_u64(uint64_t a, uint64_t b, uint64_t mod)
+    {
+        if (a >= b)
+        {
+            return a - b;
+        }
+        return mod - (b - a);
+    }
+
+    __device__ __forceinline__ uint64_t mul_mod_shoup_u64(
+        uint64_t value,
+        uint64_t multiplier,
+        uint64_t multiplier_shoup,
+        uint64_t modulus)
+    {
+        if (modulus > (UINT64_MAX >> 1U))
+        {
+            return mul_mod_u64(value, multiplier, modulus);
+        }
+        const uint64_t quotient = __umul64hi(value, multiplier_shoup);
+        uint64_t reduced = value * multiplier - quotient * modulus;
+        if (reduced >= modulus) reduced -= modulus;
+        return reduced;
+    }
+
+    __global__ void ntt_twist_all_limbs_kernel(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
+        size_t limb_count,
+        uint32_t n,
+        size_t poly_offset)
+    {
+        const uint32_t coeff_idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (coeff_idx >= n)
+        {
+            return;
+        }
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
+        const uint64_t modulus = moduli[limb_idx];
+        const size_t twiddle_idx = limb_idx * static_cast<size_t>(n) + coeff_idx;
+        const uint64_t tw = twiddles[twiddle_idx];
+        const uint64_t src = matrix_load_limb_u64(base, poly_idx, coeff_idx, stride_bytes, coeff_bytes);
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            coeff_idx,
+            stride_bytes,
+            coeff_bytes,
+            mul_mod_shoup_u64(src, tw, twiddle_shoup[twiddle_idx], modulus));
+    }
+
+    __global__ void ntt_scale_all_limbs_kernel(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        const uint64_t *moduli,
+        const uint64_t *n_inv,
+        const uint64_t *n_inv_shoup,
+        size_t limb_count,
+        uint32_t n,
+        size_t poly_offset)
+    {
+        const uint32_t coeff_idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (coeff_idx >= n)
+        {
+            return;
+        }
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
+        const uint64_t factor = n_inv[limb_idx];
+        const uint64_t modulus = moduli[limb_idx];
+        const uint64_t src = matrix_load_limb_u64(base, poly_idx, coeff_idx, stride_bytes, coeff_bytes);
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            coeff_idx,
+            stride_bytes,
+            coeff_bytes,
+            mul_mod_shoup_u64(
+                src,
+                factor,
+                n_inv_shoup[limb_idx],
+                modulus));
+    }
+
+    __global__ void ntt_bit_reverse_all_limbs_kernel(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        size_t limb_count,
+        uint32_t n,
+        uint32_t log_n,
+        size_t poly_offset)
+    {
+        const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= n)
+        {
+            return;
+        }
+        const uint32_t rev = __brev(idx) >> (32 - log_n);
+        if (idx >= rev)
+        {
+            return;
+        }
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
+        const uint64_t tmp = matrix_load_limb_u64(base, poly_idx, idx, stride_bytes, coeff_bytes);
+        const uint64_t rev_val =
+            matrix_load_limb_u64(base, poly_idx, rev, stride_bytes, coeff_bytes);
+        matrix_store_limb_u64(base, poly_idx, idx, stride_bytes, coeff_bytes, rev_val);
+        matrix_store_limb_u64(base, poly_idx, rev, stride_bytes, coeff_bytes, tmp);
+    }
+
+    __global__ void ntt_stage_all_limbs_kernel(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
+        size_t limb_count,
+        uint32_t n,
+        uint32_t len,
+        size_t poly_offset)
+    {
+        const uint32_t bfly_idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const uint32_t butterflies = n >> 1;
+        if (bfly_idx >= butterflies)
+        {
+            return;
+        }
+        const size_t limb_idx = static_cast<size_t>(blockIdx.z);
+        if (limb_idx >= limb_count)
+        {
+            return;
+        }
+        const uint32_t half = len >> 1;
+        const uint32_t group = bfly_idx / half;
+        const uint32_t j = bfly_idx - group * half;
+        const uint32_t i = group * len + j;
+        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        uint8_t *const base = limb_bases[limb_idx];
+        const size_t stride_bytes = limb_stride_bytes[limb_idx];
+        const uint8_t coeff_bytes = limb_coeff_bytes[limb_idx];
+        const uint64_t modulus = moduli[limb_idx];
+        const uint32_t twiddle_exponent = 2U * (n / len) * j;
+        const size_t twiddle_idx =
+            limb_idx * static_cast<size_t>(n) + twiddle_exponent;
+        const uint64_t w = twiddles[twiddle_idx];
+        const uint64_t u = matrix_load_limb_u64(base, poly_idx, i, stride_bytes, coeff_bytes);
+        const uint64_t upper =
+            matrix_load_limb_u64(base, poly_idx, i + half, stride_bytes, coeff_bytes);
+        const uint64_t v =
+            mul_mod_shoup_u64(upper, w, twiddle_shoup[twiddle_idx], modulus);
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            i,
+            stride_bytes,
+            coeff_bytes,
+            add_mod_u64(u, v, modulus));
+        matrix_store_limb_u64(
+            base,
+            poly_idx,
+            i + half,
+            stride_bytes,
+            coeff_bytes,
+            sub_mod_u64(u, v, modulus));
+    }
+
+    bool is_power_of_two_u32(uint32_t v)
+    {
+        return v != 0 && (v & (v - 1)) == 0;
+    }
+
+    int launch_twist_for_all_limbs(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
+        size_t limb_count,
+        uint32_t n,
+        size_t poly_count,
+        cudaStream_t stream)
+    {
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
+            !twiddles || !twiddle_shoup || !moduli)
+        {
+            return set_error("null metadata in launch_twist_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_twist_for_all_limbs");
+        }
+        const uint32_t blocks_x = (n + kTransformThreads - 1) / kTransformThreads;
+        for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+        {
+            const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_twist_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_stride_bytes,
+                limb_coeff_bytes,
+                twiddles,
+                twiddle_shoup,
+                moduli,
+                limb_count,
+                n,
+                offset);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+        }
+        return 0;
+    }
+
+    int launch_scale_for_all_limbs(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        const uint64_t *moduli,
+        const uint64_t *n_inv,
+        const uint64_t *n_inv_shoup,
+        size_t limb_count,
+        uint32_t n,
+        size_t poly_count,
+        cudaStream_t stream)
+    {
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
+            !moduli || !n_inv || !n_inv_shoup)
+        {
+            return set_error("null metadata in launch_scale_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_scale_for_all_limbs");
+        }
+        const uint32_t blocks_x = (n + kTransformThreads - 1) / kTransformThreads;
+        for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+        {
+            const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_scale_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_stride_bytes,
+                limb_coeff_bytes,
+                moduli,
+                n_inv,
+                n_inv_shoup,
+                limb_count,
+                n,
+                offset);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+        }
+        return 0;
+    }
+
+    int launch_bit_reverse_for_all_limbs(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        size_t limb_count,
+        uint32_t n,
+        uint32_t log_n,
+        size_t poly_count,
+        cudaStream_t stream)
+    {
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes)
+        {
+            return set_error("null metadata in launch_bit_reverse_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_bit_reverse_for_all_limbs");
+        }
+        const uint32_t blocks_x = (n + kTransformThreads - 1) / kTransformThreads;
+        for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+        {
+            const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_bit_reverse_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_stride_bytes,
+                limb_coeff_bytes,
+                limb_count,
+                n,
+                log_n,
+                offset);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+        }
+        return 0;
+    }
+
+    int launch_stage_for_all_limbs(
+        uint8_t *const *limb_bases,
+        const size_t *limb_stride_bytes,
+        const uint8_t *limb_coeff_bytes,
+        const uint64_t *twiddles,
+        const uint64_t *twiddle_shoup,
+        const uint64_t *moduli,
+        size_t limb_count,
+        uint32_t n,
+        uint32_t len,
+        size_t poly_count,
+        cudaStream_t stream)
+    {
+        if (!limb_bases || !limb_stride_bytes || !limb_coeff_bytes ||
+            !twiddles || !twiddle_shoup || !moduli)
+        {
+            return set_error("null metadata in launch_stage_for_all_limbs");
+        }
+        if (limb_count == 0 || poly_count == 0)
+        {
+            return 0;
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in launch_stage_for_all_limbs");
+        }
+        const uint32_t butterflies = n >> 1;
+        const uint32_t blocks_x = (butterflies + kTransformThreads - 1) / kTransformThreads;
+        for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+        {
+            const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+            const dim3 grid{
+                blocks_x,
+                static_cast<uint32_t>(chunk),
+                static_cast<uint32_t>(limb_count)};
+            ntt_stage_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
+                limb_bases,
+                limb_stride_bytes,
+                limb_coeff_bytes,
+                twiddles,
+                twiddle_shoup,
+                moduli,
+                limb_count,
+                n,
+                len,
+                offset);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                return set_error(err);
+            }
+        }
+        return 0;
+    }
+
+    template <bool Forward>
+    int run_matrix_transform_u64(GpuMatrix *mat)
+    {
+        if (!mat || !mat->ctx)
+        {
+            return set_error("invalid matrix in run_matrix_transform_u64");
+        }
+        if (mat->level < 0)
+        {
+            return set_error("invalid level in run_matrix_transform_u64");
+        }
+        if (mat->ctx->N <= 0)
+        {
+            return set_error("invalid ring dimension in run_matrix_transform_u64");
+        }
+
+        const uint32_t n = static_cast<uint32_t>(mat->ctx->N);
+        uint32_t log_n = 0;
+        uint32_t tmp_n = n;
+        while ((tmp_n & 1U) == 0U && tmp_n > 1U)
+        {
+            ++log_n;
+            tmp_n >>= 1U;
+        }
+        if (!is_power_of_two_u32(n) || tmp_n != 1U || log_n == 0)
+        {
+            return set_error("invalid ring size/logN in run_matrix_transform_u64");
+        }
+
+        auto &limb_map = mat->ctx->limb_gpu_ids;
+        auto &limb_prime_ids = mat->ctx->limb_prime_ids;
+        auto &moduli = mat->ctx->moduli;
+        const size_t limb_count = static_cast<size_t>(mat->level + 1);
+        if (limb_map.size() < limb_count)
+        {
+            return set_error("unexpected limb mapping size in run_matrix_transform_u64");
+        }
+        if (limb_prime_ids.size() < limb_count)
+        {
+            return set_error("unexpected limb metadata size in run_matrix_transform_u64");
+        }
+        if (limb_count > kMaxGridZ)
+        {
+            return set_error("too many limbs in run_matrix_transform_u64");
+        }
+
+        const size_t poly_count = matrix_poly_count(mat);
+        if (poly_count == 0)
+        {
+            mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+            return 0;
+        }
+
+        std::vector<dim3> active_limb_ids(limb_count);
+        std::vector<uint8_t *> limb_bases(limb_count, nullptr);
+        std::vector<size_t> limb_stride_bytes(limb_count, 0);
+        std::vector<uint8_t> limb_coeff_bytes(limb_count, 0);
+
+        int dispatch_device = -1;
+        size_t dispatch_slot = std::numeric_limits<size_t>::max();
+        cudaStream_t dispatch_stream = nullptr;
+        int status = 0;
+
+        for (int limb = 0; limb <= mat->level; ++limb)
+        {
+            const size_t limb_idx = static_cast<size_t>(limb);
+            const dim3 limb_id = limb_map[limb_idx];
+            active_limb_ids[limb_idx] = limb_id;
+            if (limb_id.x >= mat->shared_limb_buffers.size())
+            {
+                return set_error("invalid shared limb partition in run_matrix_transform_u64");
+            }
+
+            int limb_device = -1;
+            status = matrix_limb_device(mat, limb_id, &limb_device);
+            if (status != 0)
+            {
+                return status;
+            }
+            if (limb == 0)
+            {
+                dispatch_device = limb_device;
+                dispatch_slot = static_cast<size_t>(limb_id.x);
+                status = matrix_limb_stream(mat, limb_id, &dispatch_stream);
+                if (status != 0)
+                {
+                    return status;
+                }
+                if (!dispatch_stream)
+                {
+                    return set_error("null dispatch stream in run_matrix_transform_u64");
+                }
+            }
+            else if (limb_device != dispatch_device)
+            {
+                return set_error("single-device mode requires all limbs on one device in run_matrix_transform_u64");
+            }
+
+            const int primeid = limb_prime_ids[limb_idx];
+            if (primeid < 0 ||
+                static_cast<size_t>(primeid) >= moduli.size() ||
+                limb_id.x >= mat->ctx->gpu_ids.size())
+            {
+                return set_error("invalid prime/device index in run_matrix_transform_u64");
+            }
+
+            size_t stride_bytes = 0;
+            uint8_t coeff_bytes = 0;
+            if (!matrix_limb_metadata_by_id(mat, limb_id, &stride_bytes, &coeff_bytes))
+            {
+                return set_error("invalid limb metadata in run_matrix_transform_u64");
+            }
+            if (coeff_bytes == 0)
+            {
+                return set_error("invalid coeff byte-width in run_matrix_transform_u64");
+            }
+            if (stride_bytes < static_cast<size_t>(n) * static_cast<size_t>(coeff_bytes))
+            {
+                return set_error("invalid bytes_per_poly in run_matrix_transform_u64");
+            }
+            limb_stride_bytes[limb_idx] = stride_bytes;
+            limb_coeff_bytes[limb_idx] = coeff_bytes;
+
+            uint8_t *base = matrix_limb_ptr_by_id(mat, 0, limb_id);
+            if (!base)
+            {
+                return set_error("null matrix limb pointer in run_matrix_transform_u64");
+            }
+            limb_bases[limb_idx] = base;
+        }
+
+        if (dispatch_slot >= mat->ctx->ntt_device_constants.size())
+        {
+            return set_error("missing per-device NTT constants in run_matrix_transform_u64");
+        }
+        const GpuNttDeviceConstants &device_constants = mat->ctx->ntt_device_constants[dispatch_slot];
+        if (device_constants.device != dispatch_device)
+        {
+            return set_error("NTT constants device mismatch in run_matrix_transform_u64");
+        }
+        if (device_constants.limb_count < limb_count)
+        {
+            return set_error("insufficient NTT limb constants in run_matrix_transform_u64");
+        }
+        if (device_constants.ring_dimension != n)
+        {
+            return set_error("NTT twiddle constants mismatch in run_matrix_transform_u64");
+        }
+        if (!device_constants.twiddle_forward ||
+            !device_constants.twiddle_inverse ||
+            !device_constants.twiddle_shoup_forward ||
+            !device_constants.twiddle_shoup_inverse ||
+            !device_constants.moduli || !device_constants.n_inv ||
+            !device_constants.n_inv_shoup)
+        {
+            return set_error("null per-device NTT constants in run_matrix_transform_u64");
+        }
+
+        for (const dim3 &limb_id : active_limb_ids)
+        {
+            status = matrix_wait_limb_stream(mat, limb_id, dispatch_device, dispatch_stream);
+            if (status != 0)
+            {
+                return status;
+            }
+        }
+
+        const size_t ptr_bytes = limb_count * sizeof(uint8_t *);
+        const size_t stride_bytes = limb_count * sizeof(size_t);
+        const size_t coeff_bytes_bytes = limb_count * sizeof(uint8_t);
+        uint8_t **limb_bases_device = nullptr;
+        size_t *limb_stride_bytes_device = nullptr;
+        uint8_t *limb_coeff_bytes_device = nullptr;
+        std::vector<void *> pinned_metadata;
+        pinned_metadata.reserve(3);
+        auto allocate_pinned_metadata = [&](const void *source, size_t bytes, void **out) {
+            if (!source || bytes == 0 || !out)
+            {
+                return cudaErrorInvalidValue;
+            }
+            *out = nullptr;
+            cudaError_t allocation_status = cudaHostAlloc(out, bytes, cudaHostAllocPortable);
+            if (allocation_status == cudaSuccess)
+            {
+                std::memcpy(*out, source, bytes);
+                pinned_metadata.push_back(*out);
+            }
+            return allocation_status;
+        };
+        const uint64_t *twiddles =
+            Forward ? device_constants.twiddle_forward : device_constants.twiddle_inverse;
+        const uint64_t *twiddle_shoup = Forward ?
+            device_constants.twiddle_shoup_forward :
+            device_constants.twiddle_shoup_inverse;
+        auto cleanup = [&]()
+        {
+            if (dispatch_device >= 0)
+            {
+                cudaSetDevice(dispatch_device);
+            }
+            if (limb_bases_device)
+            {
+                cudaFreeAsync(limb_bases_device, dispatch_stream);
+                limb_bases_device = nullptr;
+            }
+            if (limb_stride_bytes_device)
+            {
+                cudaFreeAsync(limb_stride_bytes_device, dispatch_stream);
+                limb_stride_bytes_device = nullptr;
+            }
+            if (limb_coeff_bytes_device)
+            {
+                cudaFreeAsync(limb_coeff_bytes_device, dispatch_stream);
+                limb_coeff_bytes_device = nullptr;
+            }
+            if (!pinned_metadata.empty())
+            {
+                (void)gpu_defer_pinned_frees(
+                    mat->ctx,
+                    dispatch_device,
+                    dispatch_stream,
+                    pinned_metadata.data(),
+                    pinned_metadata.size());
+                pinned_metadata.clear();
+            }
+        };
+
+        cudaError_t err = cudaSetDevice(dispatch_device);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_bases_device), ptr_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_stride_bytes_device), stride_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMallocAsync(reinterpret_cast<void **>(&limb_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
+        void *pinned_limb_bases = nullptr;
+        void *pinned_limb_strides = nullptr;
+        void *pinned_limb_widths = nullptr;
+        err = allocate_pinned_metadata(limb_bases.data(), ptr_bytes, &pinned_limb_bases);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                limb_stride_bytes.data(), stride_bytes, &pinned_limb_strides);
+        if (err == cudaSuccess)
+            err = allocate_pinned_metadata(
+                limb_coeff_bytes.data(), coeff_bytes_bytes, &pinned_limb_widths);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
+        err = cudaMemcpyAsync(
+            limb_bases_device,
+            pinned_limb_bases,
+            ptr_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            limb_stride_bytes_device,
+            pinned_limb_strides,
+            stride_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+        err = cudaMemcpyAsync(
+            limb_coeff_bytes_device,
+            pinned_limb_widths,
+            coeff_bytes_bytes,
+            cudaMemcpyHostToDevice,
+            dispatch_stream);
+        if (err != cudaSuccess)
+        {
+            cleanup();
+            return set_error(err);
+        }
+
+        if constexpr (Forward)
+        {
+            status = launch_twist_for_all_limbs(
+                limb_bases_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
+                twiddles,
+                twiddle_shoup,
+                device_constants.moduli,
+                limb_count,
+                n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            status = launch_bit_reverse_for_all_limbs(
+                limb_bases_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
+                limb_count,
+                n,
+                log_n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            for (uint32_t len = 2; len <= n; len <<= 1)
+            {
+                status = launch_stage_for_all_limbs(
+                    limb_bases_device,
+                    limb_stride_bytes_device,
+                    limb_coeff_bytes_device,
+                    twiddles,
+                    twiddle_shoup,
+                    device_constants.moduli,
+                    limb_count,
+                    n,
+                    len,
+                    poly_count,
+                    dispatch_stream);
+                if (status != 0)
+                {
+                    cleanup();
+                    return status;
+                }
+            }
+            // OpenFHE exposes the evaluation vector in bit-reversed order.
+            status = launch_bit_reverse_for_all_limbs(
+                limb_bases_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
+                limb_count,
+                n,
+                log_n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+        }
+        else
+        {
+            // Input already uses OpenFHE's bit-reversed evaluation order,
+            // which is exactly the ordering consumed by these DIT stages.
+            for (uint32_t len = 2; len <= n; len <<= 1)
+            {
+                status = launch_stage_for_all_limbs(
+                    limb_bases_device,
+                    limb_stride_bytes_device,
+                    limb_coeff_bytes_device,
+                    twiddles,
+                    twiddle_shoup,
+                    device_constants.moduli,
+                    limb_count,
+                    n,
+                    len,
+                    poly_count,
+                    dispatch_stream);
+                if (status != 0)
+                {
+                    cleanup();
+                    return status;
+                }
+            }
+            status = launch_scale_for_all_limbs(
+                limb_bases_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
+                device_constants.moduli,
+                device_constants.n_inv,
+                device_constants.n_inv_shoup,
+                limb_count,
+                n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+            status = launch_twist_for_all_limbs(
+                limb_bases_device,
+                limb_stride_bytes_device,
+                limb_coeff_bytes_device,
+                twiddles,
+                twiddle_shoup,
+                device_constants.moduli,
+                limb_count,
+                n,
+                poly_count,
+                dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+        }
+
+        for (const dim3 &limb_id : active_limb_ids)
+        {
+            status = matrix_record_limb_write(mat, limb_id, dispatch_stream);
+            if (status != 0)
+            {
+                cleanup();
+                return status;
+            }
+        }
+
+        mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+        cleanup();
+        return 0;
+    }
+}
+
+int gpu_matrix_ntt_all(GpuMatrix *mat)
+{
+    if (!mat || !mat->ctx)
+    {
+        return set_error("invalid gpu_matrix_ntt_all arguments");
+    }
+    if (mat->format == GPU_POLY_FORMAT_EVAL)
+    {
+        return 0;
+    }
+    return run_matrix_transform_u64<true>(mat);
+}
+
+int gpu_matrix_intt_all(GpuMatrix *mat)
+{
+    if (!mat || !mat->ctx)
+    {
+        return set_error("invalid gpu_matrix_intt_all arguments");
+    }
+    if (mat->format == GPU_POLY_FORMAT_COEFF)
+    {
+        return 0;
+    }
+    return run_matrix_transform_u64<false>(mat);
+}

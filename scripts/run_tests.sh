@@ -39,11 +39,11 @@ fi
 
 if [[ $run_rust -eq 1 ]]; then
   cargo +nightly fmt --all
-  cargo test -r --features gpu --no-run
+  cargo test -r --workspace --lib --features gpu --no-run
 
   rust_test_log="$(mktemp)"
   if RUST_TEST_NOCAPTURE="${RUST_TEST_NOCAPTURE:-1}" \
-    cargo test -r --lib >"$rust_test_log" 2>&1; then
+    cargo test -r --workspace --lib >"$rust_test_log" 2>&1; then
     cat "$rust_test_log"
   else
     status=$?
@@ -52,7 +52,7 @@ if [[ $run_rust -eq 1 ]]; then
       echo "[run_tests] Retrying release lib tests with RUST_TEST_THREADS=1 after SIGSEGV"
       RUST_TEST_NOCAPTURE="${RUST_TEST_NOCAPTURE:-1}" \
         RUST_TEST_THREADS=1 \
-        cargo test -r --lib
+        cargo test -r --workspace --lib
     else
       rm -f "$rust_test_log"
       exit "$status"

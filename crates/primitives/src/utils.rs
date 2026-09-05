@@ -1,0 +1,253 @@
+use crate::poly::{Poly, PolyParams};
+use bigdecimal::BigDecimal;
+use num_bigint::{BigInt, BigUint};
+use num_traits::{One, Zero};
+use rand::Rng;
+use std::sync::Arc;
+
+/// ideal thread chunk size for parallel
+pub fn chunk_size_for(original: usize) -> usize {
+    match original {
+        0..=2048 => 128,
+        2049..=4096 => 256,
+        4097..=8192 => 512,
+        _ => 1024,
+    }
+}
+
+pub fn block_size() -> usize {
+    crate::env::block_size()
+}
+
+#[macro_export]
+macro_rules! parallel_iter {
+    ($i: expr) => {{ rayon::iter::IntoParallelIterator::into_par_iter($i) }};
+}
+
+/// Implements $tr for all combinations of T and &T by delegating to the &T/&T implementation.
+#[macro_export]
+macro_rules! impl_binop_with_refs {
+    ($T:ty => $tr:ident::$f:ident $($t:tt)*) => {
+        impl $tr<$T> for $T {
+            type Output = $T;
+
+            #[inline]
+            fn $f(self, rhs: $T) -> Self::Output {
+                <&$T as $tr<&$T>>::$f(&self, &rhs)
+            }
+        }
+
+        impl $tr<&$T> for $T {
+            type Output = $T;
+
+            #[inline]
+            fn $f(self, rhs: &$T) -> Self::Output {
+                <&$T as $tr<&$T>>::$f(&self, rhs)
+            }
+        }
+
+        impl $tr<$T> for &$T {
+            type Output = $T;
+
+            #[inline]
+            fn $f(self, rhs: $T) -> Self::Output {
+                <&$T as $tr<&$T>>::$f(self, &rhs)
+            }
+        }
+
+        impl $tr<&$T> for &$T {
+            type Output = $T;
+
+            #[inline]
+            fn $f $($t)*
+        }
+    };
+}
+
+/// Calculate modular inverse using the extended Euclidean algorithm for `u64` values.
+/// Returns `Some(x)` such that `(a * x) % m == 1`, or `None` if no inverse exists.
+pub fn mod_inverse(a: u64, m: u64) -> Option<u64> {
+    if m == 0 {
+        return None;
+    }
+
+    let mut r0: i128 = m as i128;
+    let mut r1: i128 = (a % m) as i128;
+    let mut t0: i128 = 0;
+    let mut t1: i128 = 1;
+
+    while r1 != 0 {
+        let q = r0 / r1;
+
+        let r_next = r0 - q * r1;
+        r0 = r1;
+        r1 = r_next;
+
+        let t_next = t0 - q * t1;
+        t0 = t1;
+        t1 = t_next;
+    }
+
+    if r0 != 1 {
+        return None;
+    }
+
+    let mut result = t0 % m as i128;
+    if result < 0 {
+        result += m as i128;
+    }
+    Some(result as u64)
+}
+
+/// Calculate modular inverse using the extended Euclidean algorithm for `BigUint` values.
+/// Returns `Some(x)` such that `(a * x) % m == 1`, or `None` if no inverse exists.
+pub fn mod_inverse_biguints(a: &BigUint, m: &BigUint) -> Option<BigUint> {
+    if m.is_zero() {
+        return None;
+    }
+
+    let m_big = BigInt::from(m.clone());
+    let mut r0 = m_big.clone();
+    let mut r1 = BigInt::from(a % m);
+    let mut t0 = BigInt::zero();
+    let mut t1 = BigInt::one();
+
+    while !r1.is_zero() {
+        let q = &r0 / &r1;
+
+        let r_next = &r0 - &q * &r1;
+        r0 = r1;
+        r1 = r_next;
+
+        let t_next = &t0 - &q * &t1;
+        t0 = t1;
+        t1 = t_next;
+    }
+
+    if r0 != BigInt::one() {
+        return None;
+    }
+
+    let mut result = t0 % &m_big;
+    if result < BigInt::zero() {
+        result += &m_big;
+    }
+    result.to_biguint()
+}
+
+/// Calculates the modular inverse of `a` modulo the CRT-composed modulus `q`.
+/// Each CRT modulus `q_i` is used to compute `a^{-1} mod q_i`, then results are recombined.
+pub fn mod_inverse_mod_q<P: Poly>(
+    a: u64,
+    params: &P::Params,
+    reconst_coeffs: &[BigUint],
+) -> Option<BigUint> {
+    let (moduli, _, _) = params.to_crt();
+    if moduli.is_empty() {
+        return None;
+    }
+    let modulus: Arc<BigUint> = params.modulus().into();
+    let mut acc = BigUint::ZERO;
+    for (idx, &qi) in moduli.iter().enumerate() {
+        let inv_i = mod_inverse(a, qi)?;
+        let term = (BigUint::from(inv_i) * &reconst_coeffs[idx]) % modulus.as_ref();
+        acc += term;
+        acc %= modulus.as_ref();
+    }
+    Some(acc)
+}
+
+pub fn gen_biguint_for_modulus<R: Rng>(rng: &mut R, modulus: &BigUint) -> BigUint {
+    if modulus.is_zero() {
+        return BigUint::ZERO;
+    }
+    let max_bits = modulus.bits() as usize;
+    let max_bytes = max_bits.div_ceil(8);
+    if max_bytes == 0 {
+        return BigUint::ZERO;
+    }
+    let mut bytes = vec![0u8; max_bytes];
+    rng.fill_bytes(&mut bytes);
+    BigUint::from_bytes_be(&bytes) % modulus
+}
+
+pub fn round_div(a: u64, b: u64) -> u64 {
+    assert!(b != 0, "divisor must be non-zero");
+    let a128 = a as u128;
+    let b128 = b as u128;
+    let half = b128 / 2;
+    let rounded = (a128 + half) / b128;
+    rounded as u64
+}
+
+pub fn pow_biguint_usize(base: &BigUint, exponent: usize) -> BigUint {
+    let exponent =
+        u32::try_from(exponent).expect("exponent must fit in u32 for BigUint::pow in nested_rns");
+    base.pow(exponent)
+}
+
+pub fn ceil_biguint_nth_root(value: &BigUint, n: usize) -> BigUint {
+    assert!(n > 0, "n must be at least 1");
+    if *value <= BigUint::one() {
+        return value.clone();
+    }
+
+    let mut low = BigUint::one();
+    let mut high = BigUint::from(2u64);
+    while pow_biguint_usize(&high, n) < *value {
+        high <<= 1u32;
+    }
+
+    while low < high {
+        let mid = (&low + &high) >> 1u32;
+        if pow_biguint_usize(&mid, n) < *value {
+            low = mid + BigUint::one();
+        } else {
+            high = mid;
+        }
+    }
+
+    low
+}
+
+pub fn bigdecimal_bits_ceil(x: &BigDecimal) -> u64 {
+    let (coeff, exp) = x.as_bigint_and_exponent();
+    let exp_abs_u32: u32 =
+        exp.unsigned_abs().try_into().expect("BigDecimal exponent must fit in u32");
+    let pow10 = BigInt::from(10u8).pow(exp_abs_u32);
+    let ceil_int = if exp >= 0 {
+        let numer = coeff + (&pow10 - BigInt::from(1u8));
+        numer / &pow10
+    } else {
+        coeff * &pow10
+    };
+    ceil_int.to_biguint().expect("norm should be non-negative").bits()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mod_inverse_biguints_returns_inverse_for_coprime_inputs() {
+        let modulus = BigUint::from(1_000_000_007u64);
+        let value = BigUint::from(123_456_789u64);
+        let inverse = mod_inverse_biguints(&value, &modulus).expect("inverse must exist");
+
+        assert_eq!((&value * &inverse) % &modulus, BigUint::one());
+    }
+
+    #[test]
+    fn test_mod_inverse_biguints_reduces_large_input_before_inversion() {
+        let modulus = BigUint::from(97u64);
+        let value = &modulus * BigUint::from(123_456u64) + BigUint::from(5u64);
+        let inverse = mod_inverse_biguints(&value, &modulus).expect("inverse must exist");
+
+        assert_eq!((value * &inverse) % &modulus, BigUint::one());
+    }
+
+    #[test]
+    fn test_mod_inverse_biguints_returns_none_for_non_coprime_inputs() {
+        assert_eq!(mod_inverse_biguints(&BigUint::from(12u64), &BigUint::from(18u64)), None);
+    }
+}

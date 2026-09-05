@@ -1,0 +1,33 @@
+[package]
+name = "mxx-bench-estimator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cost, latency, liveness, and peak-memory estimator for mxx graph IR"
+
+[features]
+default = []
+gpu = [
+    "dep:mxx-primitives",
+    "dep:num-bigint",
+    "dep:rayon",
+    "dep:tracing",
+    "mxx-primitives/gpu",
+    "mxx-runtime/gpu",
+]
+
+[dependencies]
+mxx-ir-core.workspace = true
+mxx-primitives = { workspace = true, optional = true }
+mxx-runtime.workspace = true
+num-bigint = { workspace = true, optional = true }
+num-traits.workspace = true
+rayon = { workspace = true, optional = true }
+serde.workspace = true
+thiserror.workspace = true
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+mxx-dsl.workspace = true
+num-bigint.workspace = true
+serial_test.workspace = true

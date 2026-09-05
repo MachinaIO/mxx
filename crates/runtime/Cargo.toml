@@ -1,0 +1,31 @@
+[package]
+name = "mxx-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Execution backends, transcripts, and in-memory artifacts for mxx IR"
+
+[features]
+default = []
+gpu = ["mxx-primitives/gpu"]
+
+[dependencies]
+bincode.workspace = true
+mxx-ir-core.workspace = true
+mxx-primitives.workspace = true
+keccak-asm.workspace = true
+libc.workspace = true
+num-bigint.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+mxx-dsl.workspace = true
+mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
+serial_test.workspace = true

@@ -1,0 +1,521 @@
+use num_bigint::BigUint;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::{borrow::Cow, fmt::Display};
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct GateId(pub(crate) usize);
+
+impl GateId {
+    /// Returns the stable numeric identifier assigned by `PolyCircuit`.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl Display for GateId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolyGateKind {
+    Input,
+    Add,
+    Sub,
+    Mul,
+    SmallScalarMul,
+    LargeScalarMul,
+    SlotTransfer,
+    SlotReduce,
+    PubLut,
+    SubCircuitOutput,
+    SummedSubCircuitOutput,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateParamSource<T> {
+    Const(T),
+    Param(usize),
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubCircuitParamKind {
+    SmallScalarMul,
+    LargeScalarMul,
+    SlotTransfer,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlotTransferSpec {
+    Explicit(Vec<(u32, Option<u32>)>),
+    Rotation {
+        diagonal: u32,
+        num_slots: u32,
+    },
+    Repeated {
+        src_slot: u32,
+        num_slots: u32,
+        prefix_len: u32,
+        prefix_scalar: Option<u32>,
+    },
+    RepeatedLanes {
+        src_block: u32,
+        num_blocks: u32,
+        lanes: u32,
+        prefix_blocks: u32,
+        prefix_scalar: Option<u32>,
+    },
+    /// Identity source mapping with one scalar mask repeated for every coefficient block.
+    IdentityRepeatedLanes {
+        num_blocks: u32,
+        lane_scalars: Vec<Option<u32>>,
+    },
+    /// Weighted reduction of each repeated lane block into its anchor lane.
+    AnchorReduce {
+        num_blocks: u32,
+        lane_scalars: Vec<BigUint>,
+    },
+}
+
+impl SlotTransferSpec {
+    pub fn explicit(values: Vec<(u32, Option<u32>)>) -> Self {
+        Self::Explicit(values)
+    }
+
+    pub fn rotation(diagonal: usize, num_slots: usize) -> Self {
+        Self::Rotation {
+            diagonal: u32::try_from(diagonal).expect("rotation diagonal must fit in u32"),
+            num_slots: u32::try_from(num_slots).expect("rotation slot count must fit in u32"),
+        }
+    }
+
+    pub fn repeated(
+        src_slot: usize,
+        num_slots: usize,
+        prefix_len: usize,
+        prefix_scalar: Option<u32>,
+    ) -> Self {
+        Self::Repeated {
+            src_slot: u32::try_from(src_slot).expect("repeated source slot must fit in u32"),
+            num_slots: u32::try_from(num_slots).expect("repeated slot count must fit in u32"),
+            prefix_len: u32::try_from(prefix_len).expect("repeated prefix length must fit in u32"),
+            prefix_scalar,
+        }
+    }
+
+    pub fn repeated_lanes(
+        src_block: usize,
+        num_blocks: usize,
+        lanes: usize,
+        prefix_blocks: usize,
+        prefix_scalar: Option<u32>,
+    ) -> Self {
+        assert!(lanes > 0, "repeated-lanes lane count must be positive");
+        assert!(src_block < num_blocks, "repeated-lanes source block must exist");
+        assert!(prefix_blocks <= num_blocks, "repeated-lanes prefix exceeds block count");
+        Self::RepeatedLanes {
+            src_block: u32::try_from(src_block)
+                .expect("repeated-lanes source block must fit in u32"),
+            num_blocks: u32::try_from(num_blocks)
+                .expect("repeated-lanes block count must fit in u32"),
+            lanes: u32::try_from(lanes).expect("repeated-lanes lane count must fit in u32"),
+            prefix_blocks: u32::try_from(prefix_blocks)
+                .expect("repeated-lanes prefix block count must fit in u32"),
+            prefix_scalar,
+        }
+    }
+
+    pub fn identity_repeated_lanes(num_blocks: usize, lane_scalars: Vec<Option<u32>>) -> Self {
+        assert!(num_blocks > 0, "identity repeated-lanes block count must be positive");
+        assert!(!lane_scalars.is_empty(), "identity repeated-lanes mask must be nonempty");
+        let total_slots = num_blocks
+            .checked_mul(lane_scalars.len())
+            .expect("identity repeated-lanes slot count overflow");
+        assert!(
+            u32::try_from(total_slots).is_ok(),
+            "identity repeated-lanes slot count must fit in u32"
+        );
+        Self::IdentityRepeatedLanes {
+            num_blocks: u32::try_from(num_blocks)
+                .expect("identity repeated-lanes block count must fit in u32"),
+            lane_scalars,
+        }
+    }
+
+    pub fn anchor_reduce(num_blocks: usize, lane_scalars: Vec<BigUint>) -> Self {
+        assert!(num_blocks > 0, "anchor-reduce block count must be positive");
+        assert!(!lane_scalars.is_empty(), "anchor-reduce lane scalars must be nonempty");
+        let total_slots =
+            num_blocks.checked_mul(lane_scalars.len()).expect("anchor-reduce slot count overflow");
+        assert!(u32::try_from(total_slots).is_ok(), "anchor-reduce slot count must fit in u32");
+        Self::AnchorReduce {
+            num_blocks: u32::try_from(num_blocks).expect("anchor-reduce block count must fit u32"),
+            lane_scalars,
+        }
+    }
+
+    pub fn materialize(&self) -> Vec<(u32, Option<u32>)> {
+        match self {
+            Self::Explicit(values) => values.clone(),
+            Self::Rotation { diagonal, num_slots } => {
+                let diagonal = usize::try_from(*diagonal)
+                    .expect("rotation diagonal must fit in usize on this platform");
+                let num_slots = usize::try_from(*num_slots)
+                    .expect("rotation slot count must fit in usize on this platform");
+                if num_slots >= 1024 {
+                    (0..num_slots)
+                        .into_par_iter()
+                        .map(|dst_slot| {
+                            let src_slot =
+                                (dst_slot + num_slots - (diagonal % num_slots)) % num_slots;
+                            (
+                                u32::try_from(src_slot)
+                                    .expect("rotation source slot index must fit in u32"),
+                                None,
+                            )
+                        })
+                        .collect()
+                } else {
+                    (0..num_slots)
+                        .map(|dst_slot| {
+                            let src_slot =
+                                (dst_slot + num_slots - (diagonal % num_slots)) % num_slots;
+                            (
+                                u32::try_from(src_slot)
+                                    .expect("rotation source slot index must fit in u32"),
+                                None,
+                            )
+                        })
+                        .collect()
+                }
+            }
+            Self::Repeated { src_slot, num_slots, prefix_len, prefix_scalar } => {
+                let num_slots = usize::try_from(*num_slots)
+                    .expect("repeated slot count must fit in usize on this platform");
+                let prefix_len = usize::try_from(*prefix_len)
+                    .expect("repeated prefix length must fit in usize on this platform");
+                if num_slots >= 1024 {
+                    (0..num_slots)
+                        .into_par_iter()
+                        .map(|dst_slot| {
+                            let scalar = if dst_slot < prefix_len { *prefix_scalar } else { None };
+                            (*src_slot, scalar)
+                        })
+                        .collect()
+                } else {
+                    (0..num_slots)
+                        .map(|dst_slot| {
+                            let scalar = if dst_slot < prefix_len { *prefix_scalar } else { None };
+                            (*src_slot, scalar)
+                        })
+                        .collect()
+                }
+            }
+            Self::RepeatedLanes { src_block, num_blocks, lanes, prefix_blocks, prefix_scalar } => {
+                let num_blocks = usize::try_from(*num_blocks)
+                    .expect("repeated-lanes block count must fit in usize");
+                let lanes =
+                    usize::try_from(*lanes).expect("repeated-lanes lane count must fit in usize");
+                let src_block = usize::try_from(*src_block)
+                    .expect("repeated-lanes source block must fit in usize");
+                let prefix_blocks = usize::try_from(*prefix_blocks)
+                    .expect("repeated-lanes prefix block count must fit in usize");
+                let num_slots =
+                    num_blocks.checked_mul(lanes).expect("repeated-lanes slot count overflow");
+                let build = |dst_slot: usize| {
+                    let dst_block = dst_slot / lanes;
+                    let lane = dst_slot % lanes;
+                    let src_slot = src_block
+                        .checked_mul(lanes)
+                        .and_then(|base| base.checked_add(lane))
+                        .expect("repeated-lanes source slot overflow");
+                    (
+                        u32::try_from(src_slot)
+                            .expect("repeated-lanes source slot must fit in u32"),
+                        if dst_block < prefix_blocks { *prefix_scalar } else { None },
+                    )
+                };
+                if num_slots >= 1024 {
+                    (0..num_slots).into_par_iter().map(build).collect()
+                } else {
+                    (0..num_slots).map(build).collect()
+                }
+            }
+            Self::IdentityRepeatedLanes { num_blocks, lane_scalars } => {
+                let num_blocks = usize::try_from(*num_blocks)
+                    .expect("identity repeated-lanes block count must fit in usize");
+                let num_slots = num_blocks
+                    .checked_mul(lane_scalars.len())
+                    .expect("identity repeated-lanes slot count overflow");
+                let build = |slot: usize| {
+                    (
+                        u32::try_from(slot)
+                            .expect("identity repeated-lanes source slot must fit in u32"),
+                        lane_scalars[slot % lane_scalars.len()],
+                    )
+                };
+                if num_slots >= 1024 {
+                    (0..num_slots).into_par_iter().map(build).collect()
+                } else {
+                    (0..num_slots).map(build).collect()
+                }
+            }
+            Self::AnchorReduce { .. } => {
+                panic!("anchor reduction cannot be materialized as a slot-transfer mapping")
+            }
+        }
+    }
+
+    pub fn as_explicit_slice(&self) -> Option<&[(u32, Option<u32>)]> {
+        match self {
+            Self::Explicit(values) => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn max_scalar_bound(&self) -> u32 {
+        match self {
+            Self::Explicit(values) => {
+                values.iter().map(|(_, scalar)| scalar.unwrap_or(1)).max().unwrap_or(1)
+            }
+            Self::Rotation { .. } => 1,
+            Self::Repeated { prefix_scalar, .. } | Self::RepeatedLanes { prefix_scalar, .. } => {
+                prefix_scalar.map_or(1, |scalar| scalar.max(1))
+            }
+            Self::IdentityRepeatedLanes { lane_scalars, .. } => {
+                lane_scalars.iter().map(|scalar| scalar.unwrap_or(1)).max().unwrap_or(1)
+            }
+            Self::AnchorReduce { lane_scalars, .. } => {
+                if lane_scalars.iter().any(|scalar| u32::try_from(scalar).is_err()) {
+                    u32::MAX
+                } else {
+                    lane_scalars
+                        .iter()
+                        .map(|scalar| u32::try_from(scalar).expect("checked above"))
+                        .max()
+                        .unwrap_or(1)
+                        .max(1)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubCircuitParamValue {
+    SmallScalarMul(Vec<u32>),
+    LargeScalarMul(Vec<BigUint>),
+    SlotTransfer(SlotTransferSpec),
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubCircuitParamSpec {
+    SmallScalarMul { max_scalar: u32 },
+    LargeScalarMul { max_scalar: BigUint },
+    SlotTransfer { max_scalar: u32 },
+}
+
+impl SubCircuitParamSpec {
+    pub fn kind(&self) -> SubCircuitParamKind {
+        match self {
+            Self::SmallScalarMul { .. } => SubCircuitParamKind::SmallScalarMul,
+            Self::LargeScalarMul { .. } => SubCircuitParamKind::LargeScalarMul,
+            Self::SlotTransfer { .. } => SubCircuitParamKind::SlotTransfer,
+        }
+    }
+
+    pub fn simulator_binding(&self) -> SubCircuitParamValue {
+        match self {
+            Self::SmallScalarMul { max_scalar } => {
+                SubCircuitParamValue::SmallScalarMul(vec![*max_scalar])
+            }
+            Self::LargeScalarMul { max_scalar } => {
+                SubCircuitParamValue::LargeScalarMul(vec![max_scalar.clone()])
+            }
+            Self::SlotTransfer { max_scalar } => SubCircuitParamValue::SlotTransfer(
+                SlotTransferSpec::explicit(vec![(0, Some(*max_scalar))]),
+            ),
+        }
+    }
+
+    pub fn validate_binding(&self, binding: &SubCircuitParamValue, param_id: usize) {
+        match (self, binding) {
+            (Self::SmallScalarMul { max_scalar }, SubCircuitParamValue::SmallScalarMul(values)) => {
+                if let Some(actual_max) = values.iter().copied().max() {
+                    assert!(
+                        actual_max <= *max_scalar,
+                        "sub-circuit SmallScalarMul binding {param_id} exceeds declared max: actual={actual_max}, max={max_scalar}"
+                    );
+                }
+            }
+            (Self::LargeScalarMul { max_scalar }, SubCircuitParamValue::LargeScalarMul(values)) => {
+                if let Some(actual_max) = values.iter().max() {
+                    assert!(
+                        actual_max <= max_scalar,
+                        "sub-circuit LargeScalarMul binding {param_id} exceeds declared max: actual={actual_max}, max={max_scalar}"
+                    );
+                }
+            }
+            (Self::SlotTransfer { max_scalar }, SubCircuitParamValue::SlotTransfer(value)) => {
+                let actual_max = value.max_scalar_bound();
+                assert!(
+                    actual_max <= *max_scalar,
+                    "sub-circuit SlotTransfer binding {param_id} exceeds declared max: actual={actual_max}, max={max_scalar}"
+                );
+            }
+            (expected, actual) => panic!(
+                "sub-circuit parameter kind mismatch for param {param_id}: expected {:?}, got {:?}",
+                expected.kind(),
+                actual.kind()
+            ),
+        }
+    }
+}
+
+impl SubCircuitParamValue {
+    pub fn kind(&self) -> SubCircuitParamKind {
+        match self {
+            Self::SmallScalarMul(_) => SubCircuitParamKind::SmallScalarMul,
+            Self::LargeScalarMul(_) => SubCircuitParamKind::LargeScalarMul,
+            Self::SlotTransfer(_) => SubCircuitParamKind::SlotTransfer,
+        }
+    }
+}
+
+impl GateParamSource<Vec<u32>> {
+    pub fn resolve_small_scalar<'a>(&'a self, bindings: &'a [SubCircuitParamValue]) -> &'a [u32] {
+        match self {
+            Self::Const(value) => value.as_slice(),
+            Self::Param(param_id) => match bindings.get(*param_id) {
+                Some(SubCircuitParamValue::SmallScalarMul(value)) => value.as_slice(),
+                Some(other) => panic!(
+                    "sub-circuit parameter kind mismatch for SmallScalarMul: expected {:?}, got {:?}",
+                    SubCircuitParamKind::SmallScalarMul,
+                    other.kind()
+                ),
+                None => panic!("missing sub-circuit parameter binding {param_id}"),
+            },
+        }
+    }
+}
+
+impl GateParamSource<Vec<BigUint>> {
+    pub fn resolve_large_scalar<'a>(
+        &'a self,
+        bindings: &'a [SubCircuitParamValue],
+    ) -> &'a [BigUint] {
+        match self {
+            Self::Const(value) => value.as_slice(),
+            Self::Param(param_id) => match bindings.get(*param_id) {
+                Some(SubCircuitParamValue::LargeScalarMul(value)) => value.as_slice(),
+                Some(other) => panic!(
+                    "sub-circuit parameter kind mismatch for LargeScalarMul: expected {:?}, got {:?}",
+                    SubCircuitParamKind::LargeScalarMul,
+                    other.kind()
+                ),
+                None => panic!("missing sub-circuit parameter binding {param_id}"),
+            },
+        }
+    }
+}
+
+impl GateParamSource<SlotTransferSpec> {
+    pub fn resolve_slot_transfer<'a>(
+        &'a self,
+        bindings: &'a [SubCircuitParamValue],
+    ) -> Cow<'a, [(u32, Option<u32>)]> {
+        match self {
+            Self::Const(value) => value
+                .as_explicit_slice()
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(value.materialize())),
+            Self::Param(param_id) => match bindings.get(*param_id) {
+                Some(SubCircuitParamValue::SlotTransfer(value)) => value
+                    .as_explicit_slice()
+                    .map(Cow::Borrowed)
+                    .unwrap_or_else(|| Cow::Owned(value.materialize())),
+                Some(other) => panic!(
+                    "sub-circuit parameter kind mismatch for SlotTransfer: expected {:?}, got {:?}",
+                    SubCircuitParamKind::SlotTransfer,
+                    other.kind()
+                ),
+                None => panic!("missing sub-circuit parameter binding {param_id}"),
+            },
+        }
+    }
+}
+
+impl GateParamSource<usize> {
+    pub fn resolve_public_lookup(&self, _bindings: &[SubCircuitParamValue]) -> usize {
+        match self {
+            Self::Const(lut_id) => *lut_id,
+            Self::Param(param_id) => {
+                panic!("parameterized public lookup id {param_id} is not supported")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolyGate {
+    pub gate_id: GateId,
+    pub gate_type: PolyGateType,
+    pub input_gates: Vec<GateId>,
+}
+
+impl PolyGate {
+    pub fn new(gate_id: GateId, gate_type: PolyGateType, input_gates: Vec<GateId>) -> Self {
+        Self { gate_id, gate_type, input_gates }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum PolyGateType {
+    Input,
+    Add,
+    Sub,
+    Mul,
+    SmallScalarMul { scalar: GateParamSource<Vec<u32>> },
+    LargeScalarMul { scalar: GateParamSource<Vec<BigUint>> },
+    SlotTransfer { src_slots: GateParamSource<SlotTransferSpec> },
+    SlotReduce { num_slots: usize, input_count: usize },
+    PubLut { lut_id: GateParamSource<usize> },
+    SubCircuitOutput { call_id: usize, output_idx: usize, num_inputs: usize },
+    SummedSubCircuitOutput { summed_call_id: usize, output_idx: usize, num_inputs: usize },
+}
+
+impl PolyGateType {
+    pub fn num_input(&self) -> usize {
+        match self {
+            PolyGateType::Input => 0,
+            PolyGateType::SmallScalarMul { .. } |
+            PolyGateType::LargeScalarMul { .. } |
+            PolyGateType::SlotTransfer { .. } |
+            PolyGateType::PubLut { .. } => 1,
+            PolyGateType::SlotReduce { input_count, .. } => *input_count,
+            PolyGateType::SubCircuitOutput { num_inputs, .. } |
+            PolyGateType::SummedSubCircuitOutput { num_inputs, .. } => *num_inputs,
+            PolyGateType::Add | PolyGateType::Sub | PolyGateType::Mul => 2,
+        }
+    }
+
+    pub fn kind(&self) -> PolyGateKind {
+        match self {
+            PolyGateType::Input => PolyGateKind::Input,
+            PolyGateType::Add => PolyGateKind::Add,
+            PolyGateType::Sub => PolyGateKind::Sub,
+            PolyGateType::Mul => PolyGateKind::Mul,
+            PolyGateType::SmallScalarMul { .. } => PolyGateKind::SmallScalarMul,
+            PolyGateType::LargeScalarMul { .. } => PolyGateKind::LargeScalarMul,
+            PolyGateType::SlotTransfer { .. } => PolyGateKind::SlotTransfer,
+            PolyGateType::SlotReduce { .. } => PolyGateKind::SlotReduce,
+            PolyGateType::PubLut { .. } => PolyGateKind::PubLut,
+            PolyGateType::SubCircuitOutput { .. } => PolyGateKind::SubCircuitOutput,
+            PolyGateType::SummedSubCircuitOutput { .. } => PolyGateKind::SummedSubCircuitOutput,
+        }
+    }
+}

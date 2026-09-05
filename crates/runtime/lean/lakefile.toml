@@ -1,0 +1,20 @@
+name = "MxxRuntime"
+version = "0.1.0"
+defaultTargets = ["MxxRuntime"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "MxxPrimitives"
+path = "../../primitives/lean"
+
+[[lean_lib]]
+name = "MxxRuntime"
+roots = [
+  "MxxRuntime",
+  "RuntimeHash",
+  "RuntimeMatrixOps",
+  "RuntimePrimitives",
+]

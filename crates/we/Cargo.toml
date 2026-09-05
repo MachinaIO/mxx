@@ -1,0 +1,33 @@
+[package]
+name = "mxx-we"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Witness encryption constructions for mxx"
+
+[features]
+default = []
+gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu", "mxx-runtime/gpu"]
+
+[dependencies]
+mxx-primitives.workspace = true
+mxx-gadgets.workspace = true
+mxx-bgg.workspace = true
+mxx-dsl.workspace = true
+mxx-ir-core.workspace = true
+mxx-runtime.workspace = true
+mxx-bench-estimator.workspace = true
+num-bigint.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+keccak-asm.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
+serial_test.workspace = true
+tracing-subscriber.workspace = true

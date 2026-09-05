@@ -1,43 +1,60 @@
-[package]
-name = "mxx"
+[workspace]
+resolver = "3"
+members = [
+    "crates/ir-core",
+    "crates/dsl",
+    "crates/runtime",
+    "crates/bench-estimator",
+    "crates/bgg",
+    "crates/primitives",
+    "crates/gadgets",
+    "crates/func-enc",
+    "crates/we",
+    "crates/io",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-[features]
-default = []
-disk = ["libc", "memmap2"]
-gpu = []
-
-[dependencies]
-tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "sync"] }
-dashmap = "6.1.0"
-serde_json = "1.0"
-libc = { version = "0.2", optional = true }
-memmap2 = { version = "0.9.5", optional = true }
-openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git" }
-num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
-num-traits = "0.2.19"
-bigdecimal = { version = "0.4" }
-thiserror = "1"
-rayon = { version = "1.5" }
-itertools = "0.14.0"
-serde = { version = "1.0", features = ["derive"] }
-rand = { version = "0.9.0", features = ["std_rng"] }
+[workspace.dependencies]
+mxx-primitives = { path = "crates/primitives" }
+mxx-gadgets = { path = "crates/gadgets" }
+mxx-func-enc = { path = "crates/func-enc" }
+mxx-we = { path = "crates/we" }
+mxx-io = { path = "crates/io" }
+mxx-ir-core = { path = "crates/ir-core" }
+mxx-dsl = { path = "crates/dsl" }
+mxx-runtime = { path = "crates/runtime" }
+mxx-bench-estimator = { path = "crates/bench-estimator" }
+mxx-bgg = { path = "crates/bgg" }
+bigdecimal = "0.4"
 bincode = "2.0.1"
-tracing = "0.1"
-memory-stats = "1.2.0"
-digest = "0.10"
 bitvec = "1"
-keccak-asm = { version = "0.1.4" }
-tempfile = { version = "3.19.1" }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-serial_test = { version = "3.5.0", default-features = false }
-
-[build-dependencies]
 cc = "1"
+dashmap = "6.1.0"
+digest = "0.10"
+itertools = "0.14.0"
+keccak-asm = "0.1.4"
+libc = "0.2"
+memory-stats = "1.2.0"
+num-bigint = { version = "0.4.6", features = ["serde", "rand"] }
+num-integer = "0.1"
+num-traits = "0.2.19"
+openfhe = { git = "https://github.com/MachinaIO/openfhe-rs.git" }
+rand = { version = "0.9.0", features = ["std_rng"] }
+rayon = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+smallvec = "1.15"
+serial_test = { version = "3.5.0", default-features = false }
+tempfile = "3.19.1"
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.dev]
 debug = "line-tables-only"
@@ -57,19 +74,3 @@ codegen-units = 16
 inherits = "release"
 debug = "full"
 strip = "none"
-
-[[bench]]
-name = "bench_matrix_mul_cpu"
-harness = false
-
-[[bench]]
-name = "bench_matrix_mul_gpu"
-harness = false
-
-[[bench]]
-name = "bench_preimage_cpu"
-harness = false
-
-[[bench]]
-name = "bench_preimage_gpu"
-harness = false

@@ -1,0 +1,55 @@
+[package]
+name = "mxx-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Polynomial, matrix, sampling, and GPU primitives for mxx"
+
+[features]
+default = []
+gpu = []
+# Internal feature enabled by workspace dev-dependencies to preserve test-only Drop synchronization.
+test-gpu-sync = []
+
+[dependencies]
+bigdecimal.workspace = true
+bincode.workspace = true
+bitvec.workspace = true
+digest.workspace = true
+itertools.workspace = true
+keccak-asm.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+openfhe.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+
+[[bench]]
+name = "bench_matrix_mul_cpu"
+harness = false
+
+[[bench]]
+name = "bench_matrix_mul_gpu"
+harness = false
+
+[[bench]]
+name = "bench_small_rhs_gpu"
+harness = false
+
+[[bench]]
+name = "bench_preimage_cpu"
+harness = false
+
+[[bench]]
+name = "bench_preimage_gpu"
+harness = false

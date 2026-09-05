@@ -3,6 +3,14 @@
 ## Repository Purpose
 This repository provides implementations for lattice-cryptography operations (polynomial and matrix operations, preimage samplings, BGG+ encodings, and more), written in Rust and CUDA.
 
+## Workspace Architecture
+- The authoritative crate map and dependency rules are documented in `docs/architecture.md`.
+- The workspace has no root facade crate. The authoritative crate list is the
+  workspace member list in `Cargo.toml`.
+- Keep dependencies layered as documented in `docs/architecture.md`;
+  application crates never depend on one another.
+- The reusable gadget layer is `crates/gadgets/`; its circuit-specific gadget module is `circuit_gadgets`.
+
 ## Global Requirements
 - All documentation in this repository, along with git commit messages and PRs, must be written in English.
 - When documenting file paths, use only paths relative to the repository top directory. Do not write absolute paths in documentation.

@@ -1,5 +1,7 @@
 /target
+/lean/.lake/
 /test_data
+/crates/*/test_data
 /logs
 /archive
 /ignores

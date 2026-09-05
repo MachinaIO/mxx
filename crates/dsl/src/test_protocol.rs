@@ -159,6 +159,124 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_generic_threshold_protocol_export() {
+        use mxx_ir_core::{
+            ParamEnv,
+            artifact::export_validated_manifest,
+            lean::{
+                claim::{ClaimBackend, ClaimSemantics},
+                protocol::export_claim,
+            },
+            validate,
+        };
+        use std::{collections::BTreeMap, fs, path::Path};
+
+        let declaration = protocol();
+        let bindings = ParamEnv {
+            integers: BTreeMap::from([("cutoff".into(), 3.into())]),
+            ..ParamEnv::default()
+        };
+        let production = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
+        let producer = validate(&declaration.stages()[0].graph, &bindings).unwrap();
+        let manifest = export_validated_manifest(production.clone(), &producer).unwrap();
+        let manifests = BTreeMap::from([(production, manifest)]);
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_ir_fixtures/threshold_protocol");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("ThresholdFixture.lean"),
+            "import MxxRuntime\nnamespace ThresholdFixture\ndef zeroCenter (_ : Nat) (_ : Bool) : Nat := 0\ndef decoderRadius (q : Nat) : Nat := q / 4\nend ThresholdFixture\n",
+        ).unwrap();
+        // The residual graph is already ciphertext minus the encoded message. Subtracting a
+        // Boolean message center again would change the proposition; its center must be zero.
+        let semantics = ClaimSemantics {
+            imports: &["ThresholdFixture"],
+            hash_model_type: "MxxRuntime.HashModel",
+            centered_lift: "Mxx.Primitives.centeredLift",
+            message_center: "ThresholdFixture.zeroCenter",
+            decoder_radius: "ThresholdFixture.decoderRadius",
+        };
+        export_claim(
+            &declaration,
+            &bindings,
+            &ClaimBackend {
+                module_name: "ThresholdFixture",
+                context_name: "ThresholdFixture.backend",
+                layouts: &[],
+            },
+            &semantics,
+            &manifests,
+            &directory,
+        )
+        .expect("generic export accepts the validated threshold decoder");
+
+        let source = fs::read_to_string(directory.join("Claim.lean")).unwrap();
+        let (premises, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
+        assert!(premises.contains("Stage_encrypt.generatedRoot"));
+        assert!(premises.contains("Stage_decrypt.generatedRoot"));
+        assert!(premises.contains("Ideal.generatedRoot"));
+        assert_eq!(premises.matches("(external.input_0)").count(), 2);
+        assert!(!premises.contains(".natAbs <"));
+        assert!(premises.contains("ThresholdFixture.zeroCenter 256"));
+        assert!(!source.contains("MxxWe"));
+        assert!(conclusion.contains("Runs hashModel external execution →"));
+        assert!(
+            conclusion.contains(
+                "(observedResidual execution).natAbs < ThresholdFixture.decoderRadius 256"
+            )
+        );
+        assert!(conclusion.contains("execution.«stage_1».2.1 = execution.«ideal»"));
+        let decoder = fs::read_to_string(directory.join("Stage_decrypt.lean")).unwrap();
+        assert!(decoder.contains("MxxRuntime.thresholdDecode 2 1 0"));
+        assert!(decoder.contains("decide (w_1_0_decoded ≠ 0)"));
+    }
+
+    #[test]
+    fn test_threshold_export_preserves_each_port_and_symbolic_modulus() {
+        use mxx_ir_core::{
+            ParamEnv,
+            lean::{ExportOptions, export},
+        };
+        use std::{collections::BTreeMap, fs, path::Path};
+        let ring = Ring::new(256, 2);
+        let input = ring.input("ciphertext", (1, 1));
+        let modulus = IntExpr::Var("plaintext_modulus".into());
+        let integers = input.clone().threshold_decode_ints(modulus.clone(), 2);
+        let booleans = input.threshold_decode_bools(modulus, 2);
+        let mut context = DslContext::new("threshold-ports").int_parameter("plaintext_modulus");
+        for (index, value) in integers.into_iter().enumerate() {
+            context = context.int_output(format!("integer_{index}"), value).unwrap();
+        }
+        for (index, value) in booleans.into_iter().enumerate() {
+            context = context.bool_output(format!("boolean_{index}"), value).unwrap();
+        }
+        let graph = context.build().unwrap();
+        let bindings = ParamEnv {
+            integers: BTreeMap::from([("plaintext_modulus".into(), 3.into())]),
+            ..ParamEnv::default()
+        };
+        let validated = graph.validate(&bindings).unwrap();
+        let artifact = export(
+            &validated,
+            &ExportOptions {
+                namespace: "ThresholdPorts".into(),
+                module_name: "ThresholdPorts".into(),
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(artifact.source.matches("MxxRuntime.thresholdDecode").count(), 4);
+        assert_eq!(artifact.source.matches("decide (").count(), 2);
+        assert_eq!(artifact.source.matches("params.«plaintext_modulus» 2 0").count(), 2);
+        assert_eq!(artifact.source.matches("params.«plaintext_modulus» 2 1").count(), 2);
+        assert!(artifact.root.outputs["integer_0"].lean_type == "Int");
+        assert!(artifact.root.outputs["boolean_1"].lean_type == "Bool");
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_ir_fixtures/threshold_ports");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("ThresholdPorts.lean"), artifact.source).unwrap();
+    }
+
+    #[test]
     fn toy_protocol_is_a_closed_bundle_with_a_decoded_endpoint() {
         let protocol = protocol();
         assert_eq!(protocol.bundle.endpoint_specs, vec![EndpointSpecId::ToyThresholdDecode]);

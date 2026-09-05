@@ -69,6 +69,44 @@ noncomputable def extractCoefficient {q n : Nat} (position : Int)
   ∃ index : Fin n, (index.val : Int) = position ∧
     output = ((input 0 0).coeff index).val
 
+/-- Decode one of the first `length` canonical coefficients using the runtime's nearest-integer
+rounding, followed by reduction modulo the plaintext modulus. Boolean ports separately test whether
+this integer is nonzero. Positive divisors make integer division agree with the backend formula. -/
+noncomputable def thresholdDecode {q n : Nat} (plaintextModulus length position : Int)
+    (input : ExactMatrix q n 1 1) (output : Int) : Prop :=
+  0 < q ∧ 0 < plaintextModulus ∧ 0 ≤ length ∧ length ≤ (n : Int) ∧
+  ∃ index : Fin n, (index.val : Int) = position ∧ position < length ∧
+    output = ((plaintextModulus * (((input 0 0).coeff index).val : Int) + (q : Int) / 2) /
+      (q : Int)) % plaintextModulus
+
+-- Boundary regressions exercise the relation itself, including the half-step tie and wraparound.
+example (input : ExactMatrix 256 1 1 1) (h : ((input 0 0).coeff 0).val = 63) (out : Int) :
+    thresholdDecode 2 1 0 input out ↔ out = 0 := by
+  simp only [thresholdDecode, Fin.exists_fin_one, Fin.val_zero, h]
+  norm_num
+
+example (input : ExactMatrix 256 1 1 1) (h : ((input 0 0).coeff 0).val = 64) (out : Int) :
+    thresholdDecode 2 1 0 input out ↔ out = 1 := by
+  simp only [thresholdDecode, Fin.exists_fin_one, Fin.val_zero, h]
+  norm_num
+
+example (input : ExactMatrix 256 1 1 1) (h : ((input 0 0).coeff 0).val = 191) (out : Int) :
+    thresholdDecode 2 1 0 input out ↔ out = 1 := by
+  simp only [thresholdDecode, Fin.exists_fin_one, Fin.val_zero, h]
+  norm_num
+
+example (input : ExactMatrix 256 1 1 1) (h : ((input 0 0).coeff 0).val = 192) (out : Int) :
+    thresholdDecode 2 1 0 input out ↔ out = 0 := by
+  simp only [thresholdDecode, Fin.exists_fin_one, Fin.val_zero, h]
+  norm_num
+
+-- For plaintext modulus three, integer two must also decode to Boolean true.
+example (input : ExactMatrix 256 1 1 1) (h : ((input 0 0).coeff 0).val = 171) (out : Int)
+    (hrun : thresholdDecode 3 1 0 input out) : decide (out ≠ 0) = true := by
+  simp only [thresholdDecode, Fin.exists_fin_one, Fin.val_zero, h] at hrun
+  norm_num at hrun
+  simp [hrun]
+
 /-- A literal coefficient list in increasing degree order, reduced in the exact residue ring.
 The exporter validates the scalar shape and the list length against the ring dimension. -/
 noncomputable def matrixPolynomial {q n : Nat} (coefficients : List Int) :

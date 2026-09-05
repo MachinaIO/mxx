@@ -41,7 +41,11 @@ pub struct ClaimSemantics<'a> {
     pub imports: &'a [&'a str],
     pub hash_model_type: &'a str,
     pub centered_lift: &'a str,
+    /// Lean function `Nat → Bool → Nat` giving the center subtracted from the designated
+    /// residual output. Use zero when the graph has already subtracted the encoded message.
     pub message_center: &'a str,
+    /// Lean function `Nat → Nat` giving the strict error radius for the declared decoder.
+    /// This is part of the conclusion to prove, not an assumed bound on executions.
     pub decoder_radius: &'a str,
 }
 

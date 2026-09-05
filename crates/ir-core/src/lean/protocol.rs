@@ -257,8 +257,7 @@ pub fn assemble_claim(
         .ok_or("missing actual endpoint")?;
     let target = &bundle.operational_decoder_targets[0];
     if target.decoder_stage != endpoint.workflow_output.stage ||
-        target.decoder_node != actual.wire.node ||
-        !matches!(target.kind, crate::protocol::OperationalDecoderKind::BooleanInterval)
+        target.decoder_node != actual.wire.node
     {
         return Err("operational decoder does not identify the actual endpoint".into());
     }

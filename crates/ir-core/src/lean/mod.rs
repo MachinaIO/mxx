@@ -1297,11 +1297,32 @@ impl<'a> Emitter<'a> {
                     output(0)
                 ));
             }
+            NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+                append_expression_guards(plaintext_modulus, env, relations);
+                append_expression_guards(length, env, relations);
+                let count = scope.node(node_id).expect("decoder node").output_types().len();
+                relations.push(format!("{} = {count}", env.expr(length)));
+                for port in 0..count {
+                    let name = output(port as u32);
+                    let decoded =
+                        if *output_bool { format!("{name}_decoded") } else { name.clone() };
+                    self.bind_existential(&decoded, "Int");
+                    relations.push(format!(
+                        "{} {} {} {port} {} {decoded}",
+                        self.options.primitives.threshold_decode,
+                        env.expr(plaintext_modulus),
+                        env.expr(length),
+                        arg(0)?,
+                    ));
+                    if *output_bool {
+                        self.let_output(&name, &format!("decide ({decoded} ≠ 0)"));
+                    }
+                }
+            }
             NodeKind::IntToReal |
             NodeKind::RealBinary(_) |
             NodeKind::RealSqrt |
             NodeKind::LiftIntegerToConstantPolynomial { .. } |
-            NodeKind::ThresholdDecode { .. } |
             NodeKind::CrtRecompose { .. } |
             NodeKind::PackPolynomialCoefficients { .. } |
             NodeKind::Tensor => {

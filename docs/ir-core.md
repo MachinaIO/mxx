@@ -33,6 +33,15 @@ and derives their connections and endpoints from the declaration, then invokes
 applications retain their bound calculations and Lean proofs. Structural families
 remain symbolic rather than being expanded into one graph or claim per element.
 
+The Boolean claim exporter supports both `BooleanInterval` and `ThresholdDecode` endpoints
+validated by the protocol. `ClaimSemantics` supplies the message center and strict decoder
+radius; it does not assume the endpoint is a WE decoder. If the designated residual graph
+already computes `ciphertext - encoded_message`, supply a zero center so the message is not
+subtracted twice. If it instead exposes the decoder input, supply that encoding's center.
+In both cases the generated conclusion requires the residual bound and equality with the ideal
+Boolean output; exporting the statement does not prove either property. The current renderer
+requires a scalar-polynomial residual, not a family-valued residual.
+
 Tensor product, concatenation, selection, transpose, slice, reshape,
 constant-coefficient extraction, and CRT recomposition are ordinary executable
 core nodes. Generic modulus-down and modulus-up operations are not exposed

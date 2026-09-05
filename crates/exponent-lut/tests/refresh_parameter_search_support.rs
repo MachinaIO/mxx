@@ -85,6 +85,7 @@ fn test_refresh_parameter_search() {
                     candidate.crt_depth,
                     candidate.crt_bits,
                     candidate.base_bits,
+                    None,
                 );
                 lattice_security_bits(n, dcrt.modulus().as_ref(), config.error_sigma)
             },

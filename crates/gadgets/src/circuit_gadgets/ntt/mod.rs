@@ -635,8 +635,8 @@ mod compact_tests {
     ) -> (DCRTPolyParams, DCRTPolyParams) {
         assert!(ambient_offset + native_depth <= ambient_depth);
         for crt_bits in 17..=30 {
-            let native = DCRTPolyParams::new(4, native_depth, crt_bits, 6);
-            let ambient = DCRTPolyParams::new(8, ambient_depth, crt_bits, 6);
+            let native = DCRTPolyParams::new(4, native_depth, crt_bits, 6, None);
+            let ambient = DCRTPolyParams::new(8, ambient_depth, crt_bits, 6, None);
             let native_moduli = native.to_crt().0;
             let ambient_moduli = ambient.to_crt().0;
             if native_moduli == ambient_moduli[ambient_offset..ambient_offset + native_depth] {
@@ -650,7 +650,7 @@ mod compact_tests {
 
     #[test]
     fn forward_and_inverse_match_openfhe_at_ambient_dimension() {
-        let params = DCRTPolyParams::new(8, 2, 17, 6);
+        let params = DCRTPolyParams::new(8, 2, 17, 6, None);
         let window = CrtWindow::full(params.to_crt().2);
         let coefficients = (0u64..8).map(|value| BigUint::from(value + 3)).collect::<Vec<_>>();
         let openfhe_forward = DCRTPoly::from_biguints(&params, &coefficients).eval_slots();
@@ -663,7 +663,7 @@ mod compact_tests {
 
     #[test]
     fn compact_subdimension_round_trip_uses_no_inactive_lanes() {
-        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let params = DCRTPolyParams::new(8, 3, 17, 6, None);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
         let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
         let transformed = run_transform(&params, &coefficients, window, false);
@@ -679,7 +679,7 @@ mod compact_tests {
 
     #[test]
     fn compact_subdimension_forward_matches_openfhe_table_butterflies() {
-        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let params = DCRTPolyParams::new(8, 3, 17, 6, None);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
         let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
         let q_i = params.to_crt().0[window.offset];
@@ -694,7 +694,7 @@ mod compact_tests {
 
     #[test]
     fn compact_subdimension_inverse_matches_openfhe_table_butterflies() {
-        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let params = DCRTPolyParams::new(8, 3, 17, 6, None);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
         let coefficients = (0u64..4).map(|value| BigUint::from(value + 5)).collect::<Vec<_>>();
         let q_i = params.to_crt().0[window.offset];
@@ -790,7 +790,7 @@ mod compact_tests {
 
     #[test]
     fn compact_offset_window_identity_transform_reconstructs() {
-        let params = DCRTPolyParams::new(8, 3, 17, 6);
+        let params = DCRTPolyParams::new(8, 3, 17, 6, None);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
         let values = vec![BigUint::from(5u8)];
         assert_eq!(run_transform(&params, &values, window, false), values);
@@ -798,7 +798,7 @@ mod compact_tests {
 
     #[test]
     fn compact_ntt_uses_slot_transfers_without_top_level_multiplication() {
-        let params = DCRTPolyParams::new(8, 2, 17, 6);
+        let params = DCRTPolyParams::new(8, 2, 17, 6, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
@@ -827,7 +827,7 @@ mod compact_tests {
 
     #[test]
     fn compact_single_tower_round_trip_reconstructs_modulo_q() {
-        let params = DCRTPolyParams::new(2, 1, 24, 6);
+        let params = DCRTPolyParams::new(2, 1, 24, 6, None);
         let window = CrtWindow::full(params.to_crt().2);
         let coefficients =
             (0u64..2).map(|value| BigUint::from(value * value + 7)).collect::<Vec<_>>();
@@ -843,7 +843,7 @@ mod compact_tests {
     #[test]
     #[should_panic(expected = "num_slots must be a power of two")]
     fn forward_rejects_non_power_of_two_slot_count() {
-        let params = DCRTPolyParams::new(8, 1, 17, 6);
+        let params = DCRTPolyParams::new(8, 1, 17, 6, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
@@ -1019,7 +1019,7 @@ mod mod_switch_tests {
     #[test]
     #[serial_test::serial]
     fn test_ntt_inverse_mod_up_forward_round_trip_keeps_coeff_error_within_mod_up_bound() {
-        let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
         let source_level_offset = 2usize;
@@ -1093,7 +1093,7 @@ mod mod_switch_tests {
     #[test]
     #[serial_test::serial]
     fn test_ntt_inverse_mod_down_forward_round_trip_keeps_coeff_error_within_mod_down_bound() {
-        let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(4, 6, 18, BASE_BITS, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = test_context(&mut circuit, &params);
         let source_active_levels = 4usize;

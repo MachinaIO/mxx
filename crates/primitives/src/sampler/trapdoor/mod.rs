@@ -18,7 +18,7 @@ use crate::{
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
-use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
+use openfhe::ffi::FormatMatrixCoefficient;
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
 use std::{
@@ -295,9 +295,6 @@ fn sample_p1_for_pert_mat(
     padded_ncol: usize,
 ) -> DCRTPolyMatrix {
     ensure_openfhe_warmup(params);
-    let n = params.ring_dimension();
-    let depth = params.crt_depth();
-    let k_res = params.crt_bits();
     debug!("{}", "sample_p1_for_pert_square_mat parameters computed");
     let mut a_mat = a_mat.to_cpp_matrix_ptr();
     FormatMatrixCoefficient(a_mat.inner.as_mut().unwrap());
@@ -311,19 +308,17 @@ fn sample_p1_for_pert_mat(
     drop(tp2);
     let cpp_matrix = {
         let _lock = SAMPLE_P1_FOR_PERT_MAT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        SampleP1ForPertMat(
+        crate::poly::dcrt::native::ffi::exact_basis_p1(
             &a_mat.inner,
             &b_mat.inner,
             &d_mat.inner,
             &tp2_cpp.inner,
-            n,
-            depth,
-            k_res,
             padded_ncol,
             c,
             s,
             dgg_stddev,
         )
+        .expect("exact CRT perturbation sampling failed")
     };
     debug!("{}", "SampleP1ForPertSquareMat called");
     drop(a_mat);

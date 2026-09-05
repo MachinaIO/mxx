@@ -936,7 +936,7 @@ impl ExponentLutPublicKeyCompiler {
         balanced_sum_family(aligned)
     }
 
-    fn build_lut_cache(
+    pub(crate) fn build_lut_cache(
         &self,
         input: &Mat,
         table: &LutTable,

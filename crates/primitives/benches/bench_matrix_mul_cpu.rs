@@ -7,7 +7,7 @@ use tracing::info;
 
 fn bench_cpu_matrix_mul() {
     let _ = tracing_subscriber::fmt::try_init();
-    let params = DCRTPolyParams::new(16384, 15, 24, 12);
+    let params = DCRTPolyParams::new(16384, 15, 24, 12, None);
     let uniform_sampler = DCRTPolyUniformSampler::new();
     let left = uniform_sampler.sample_uniform(&params, 1, 30, DistType::FinRingDist);
     let right = uniform_sampler.sample_uniform(&params, 30, 120, DistType::FinRingDist);

@@ -79,6 +79,7 @@ struct AcceptedAverageEvidence {
     setup_identity: String,
     layout_id: String,
     program_id: String,
+    switch_moduli: Vec<String>,
     mask_digit_count: usize,
     fresh_error_digit_count: usize,
     hard_authority_accepted: bool,
@@ -402,6 +403,11 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         accepted.candidate,
         mask_digits,
         fresh_error_digits,
+        &evidence
+            .switch_moduli
+            .iter()
+            .map(|p| p.parse().expect("selected switching modulus"))
+            .collect::<Vec<_>>(),
     )
     .expect("build accepted Exponent-LUT graphs without simulation");
     info!(
@@ -532,8 +538,9 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         accepted.candidate.crt_depth,
         accepted.candidate.crt_bits,
         accepted.candidate.base_bits,
+        None,
     );
-    let (moduli, _, crt_depth) = parameters.to_crt();
+    let (moduli, _, _) = parameters.to_crt();
     let device_ids = detected_gpu_device_ids();
     assert!(!device_ids.is_empty(), "Exponent-LUT benchmark estimate requires a CUDA GPU");
     let gpu_parameters =
@@ -544,7 +551,15 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     let backends = device_ids
         .iter()
         .copied()
-        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
+        .map(|device_id| {
+            (
+                gpu_backend_on(
+                    bundle.ring_parameters(gpu_parameters.clone()).expect("refresh rings"),
+                    [device_id],
+                ),
+                device_id,
+            )
+        })
         .collect();
     let mut backend = GpuNodeMeasurementBackend::new(
         backends,
@@ -553,7 +568,6 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
             measured_iterations,
             ..MeasurementHarnessConfig::default()
         },
-        crt_depth,
     );
     info!(
         gpu_count = device_ids.len(),

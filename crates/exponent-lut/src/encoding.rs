@@ -849,53 +849,12 @@ impl ExponentLutEncodingCompiler {
     }
 
     #[cfg(all(test, feature = "gpu"))]
-    fn test_lut_cache(
-        &self,
-        input: &BggEncodingWire,
-        helpers: &[LutHelper],
-    ) -> Result<ProgramLutCache, ExponentLutError> {
-        let columns = input
-            .vector
-            .matrix_type()
-            .columns
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_usize())
-            .ok_or(ExponentLutError::InvalidLut)?;
-        let digits = self
-            .digit_count
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_usize())
-            .filter(|digits| *digits != 0 && columns % digits == 0)
-            .ok_or(ExponentLutError::InvalidLut)?;
-        let public_input = self.ring.zero((columns / digits, columns));
-        let mut switch = Vec::with_capacity(helpers.len());
-        let mut branch = Vec::with_capacity(helpers.len());
-        for helper in helpers {
-            let switch_decomposition = helper
-                .switch()
-                .gsw_ciphertext()
-                .clone()
-                .decompose(self.gadget_base.clone(), self.digit_count.clone());
-            let switched = switch_decomposition
-                .clone()
-                .mul_small_rhs(public_input.clone().ring_automorphism(helper.sigma()));
-            switch.push(switch_decomposition);
-            branch.push(switched.decompose(self.gadget_base.clone(), self.digit_count.clone()));
-        }
-        Ok(ProgramLutCache {
-            switch: Family::pack(switch).map_err(|_| ExponentLutError::InvalidLut)?,
-            branch: Family::pack(branch).map_err(|_| ExponentLutError::InvalidLut)?,
-        })
-    }
-
-    #[cfg(all(test, feature = "gpu"))]
     fn test_single_input_lut(
         &self,
         input: &BggEncodingWire,
         values: &[usize],
         helpers: &[LutHelper],
+        cache: &ProgramLutCache,
     ) -> Result<BggEncodingWire, ExponentLutError> {
         let ring_dimension = input
             .vector
@@ -910,8 +869,7 @@ impl ExponentLutEncodingCompiler {
             self.exponent_layout.effective_modulus(ring_dimension),
             values.to_vec(),
         )?;
-        let cache = self.test_lut_cache(input, helpers)?;
-        self.single_input_lut_table_with_cache(input, &table, helpers, Some(&cache))
+        self.single_input_lut_table_with_cache(input, &table, helpers, Some(cache))
     }
 
     #[cfg(all(test, feature = "gpu"))]
@@ -921,6 +879,7 @@ impl ExponentLutEncodingCompiler {
         rhs: &ExponentRhsPackage,
         table: &LutTable,
         helpers: &[LutHelper],
+        cache: &ProgramLutCache,
     ) -> Result<BggEncodingWire, ExponentLutError> {
         let fused = BggEncodingWire {
             vector: rhs
@@ -930,8 +889,7 @@ impl ExponentLutEncodingCompiler {
                 .mul_small_rhs(lhs.vector.clone()),
             plaintext: None,
         };
-        let cache = self.test_lut_cache(&fused, helpers)?;
-        self.single_input_lut_table_with_cache(&fused, table, helpers, Some(&cache))
+        self.single_input_lut_table_with_cache(&fused, table, helpers, Some(cache))
     }
 
     fn single_input_lut_table_with_cache(
@@ -1808,7 +1766,7 @@ mod tests {
 
     #[test]
     fn odd_width_segmented_reduction_matches_scalar_addition() {
-        let parameters = DCRTPolyParams::new(4, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(4, 1, 20, 4, None);
         let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 4);
         let mut context = DslContext::new("odd-width-segmented-reduction");
         for width in [1usize, 3, 5] {
@@ -2094,7 +2052,7 @@ mod tests {
 
     #[test]
     fn public_lut_lowering_propagates_native_plaintext() {
-        let parameters = DCRTPolyParams::new(4, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(4, 1, 20, 4, None);
         let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 4);
         let compiler = ExponentLutEncodingCompiler::with_layout(
             BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() },
@@ -2150,7 +2108,7 @@ mod tests {
         for (ring_dimension, stride_log2) in
             [(8usize, 0u32), (8, 1), (8, 2), (16, 0), (16, 1), (16, 2)]
         {
-            let parameters = DCRTPolyParams::new(ring_dimension as u32, 1, 20, 4);
+            let parameters = DCRTPolyParams::new(ring_dimension as u32, 1, 20, 4, None);
             let modulus = BigInt::from(parameters.modulus().as_ref().clone());
             let ring = Ring::new(modulus, ring_dimension);
             let width = ring_dimension >> stride_log2;
@@ -2934,14 +2892,14 @@ mod tests {
         }
 
         impl Fixture {
-            fn new() -> Self {
+            fn new(width_log2: u32) -> Self {
                 let ring_dimension = parameter(RING_DIMENSION_ENV, 4);
                 let crt_bits = parameter(CRT_BITS_ENV, 17);
                 let base_bits = parameter(BASE_BITS_ENV, 9);
                 assert!(ring_dimension.is_power_of_two() && ring_dimension >= 2);
                 assert!(base_bits > 0 && base_bits < 63 && crt_bits > base_bits);
                 let parameters =
-                    DCRTPolyParams::new(ring_dimension, 1, crt_bits as usize, base_bits);
+                    DCRTPolyParams::new(ring_dimension, 1, crt_bits as usize, base_bits, None);
                 assert_eq!(parameters.modulus_digits(), 2, "GPU fixture requires digit_count=2");
                 let (moduli, _, crt_depth) = parameters.to_crt();
                 assert_eq!(crt_depth, 1);
@@ -2967,21 +2925,21 @@ mod tests {
                     ring: ring.clone(),
                     sampler: ExponentLutEncodingSampler {
                         layout: layout.clone(),
-                        exponent_layout: crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 },
+                        exponent_layout: crate::layout::ExpLayout { stride_log2: 0, width_log2 },
                         gaussian_sigma: None,
                         gaussian_max_coefficient_bound: None,
                     },
                     public_sampler: ExponentLutPublicKeySampler {
                         layout,
-                        exponent_layout: crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 },
+                        exponent_layout: crate::layout::ExpLayout { stride_log2: 0, width_log2 },
                     },
                     compiler: ExponentLutEncodingCompiler::with_layout(
                         bgg.clone(),
-                        crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 },
+                        crate::layout::ExpLayout { stride_log2: 0, width_log2 },
                     ),
                     public_compiler: ExponentLutPublicKeyCompiler::with_layout(
                         bgg,
-                        crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 },
+                        crate::layout::ExpLayout { stride_log2: 0, width_log2 },
                     ),
                     mask_secret: ring.input("exponent-lut-gpu-mask-secret", (1, 2)),
                     payload_secret: ring.input("exponent-lut-gpu-payload-secret", (1, 2)),
@@ -3174,10 +3132,23 @@ mod tests {
         #[test]
         #[serial(dcrt_runtime)]
         fn test_gpu_native_unary_exhaustive_inputs_distinct_secrets() {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new(1);
             let table = unary_table();
             let (helpers, public_helpers) = fixture.helpers(&table, b"unary-helpers".as_slice());
             let public_input = fixture.public_input(b"unary-input".as_slice());
+            let cache = fixture
+                .public_compiler
+                .build_lut_cache(
+                    &public_input.matrix,
+                    &LutTable::unary(
+                        table.len(),
+                        fixture.parameters.ring_dimension() as usize,
+                        table.clone(),
+                    )
+                    .unwrap(),
+                    &public_helpers,
+                )
+                .unwrap();
             let mut relations = Vec::new();
             for exponent in 0..table.len() {
                 let encoded = fixture
@@ -3186,6 +3157,7 @@ mod tests {
                         &fixture.input(b"unary-input".as_slice(), exponent),
                         &table,
                         &helpers,
+                        &cache,
                     )
                     .unwrap();
                 let expected_public = fixture
@@ -3204,7 +3176,7 @@ mod tests {
         #[test]
         #[serial(dcrt_runtime)]
         fn test_gpu_native_binary_all_u_plus_bv_pairs() {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new(2);
             let table = LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap();
             let (helpers, public_helpers) =
                 fixture.helpers(table.values(), b"binary-helpers".as_slice());
@@ -3214,6 +3186,18 @@ mod tests {
                 for rhs_exponent in 0..2 {
                     let rhs = fixture
                         .rhs(format!("binary-rhs-{rhs_exponent}").into_bytes(), 2 * rhs_exponent);
+                    let fused_public = rhs
+                        .gsw_ciphertext()
+                        .clone()
+                        .decompose(
+                            fixture.compiler.gadget_base.clone(),
+                            fixture.compiler.digit_count.clone(),
+                        )
+                        .mul_small_rhs(public_lhs.matrix.clone());
+                    let cache = fixture
+                        .public_compiler
+                        .build_lut_cache(&fused_public, &table, &public_helpers)
+                        .unwrap();
                     let encoded = fixture
                         .compiler
                         .test_two_input_lut(
@@ -3221,6 +3205,7 @@ mod tests {
                             &rhs,
                             &table,
                             &helpers,
+                            &cache,
                         )
                         .unwrap();
                     let expected_public = fixture
@@ -3248,7 +3233,7 @@ mod tests {
         #[test]
         #[serial(dcrt_runtime)]
         fn test_gpu_native_two_stage_lut_chain() {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new(1);
             let first_table = vec![0, 1];
             let second_table = unary_table();
             let private_bank = fixture
@@ -3288,17 +3273,43 @@ mod tests {
             );
             let input = fixture.input(b"chain-input".as_slice(), 1);
             let public_input = fixture.public_input(b"chain-input".as_slice());
+            let first_cache = fixture
+                .public_compiler
+                .build_lut_cache(
+                    &public_input.matrix,
+                    &LutTable::unary(
+                        2,
+                        fixture.parameters.ring_dimension() as usize,
+                        first_table.clone(),
+                    )
+                    .unwrap(),
+                    &first_public_helpers,
+                )
+                .unwrap();
             let first = fixture
                 .compiler
-                .test_single_input_lut(&input, &first_table, &first_helpers)
+                .test_single_input_lut(&input, &first_table, &first_helpers, &first_cache)
                 .unwrap();
             let first_public = fixture
                 .public_compiler
                 .single_input_lut(&public_input.matrix, &first_table, &first_public_helpers)
                 .unwrap();
+            let second_cache = fixture
+                .public_compiler
+                .build_lut_cache(
+                    &first_public,
+                    &LutTable::unary(
+                        2,
+                        fixture.parameters.ring_dimension() as usize,
+                        second_table.clone(),
+                    )
+                    .unwrap(),
+                    &second_public_helpers,
+                )
+                .unwrap();
             let second = fixture
                 .compiler
-                .test_single_input_lut(&first, &second_table, &second_helpers)
+                .test_single_input_lut(&first, &second_table, &second_helpers, &second_cache)
                 .unwrap();
             let second_public = fixture
                 .public_compiler
@@ -3317,7 +3328,7 @@ mod tests {
         #[test]
         #[serial(dcrt_runtime)]
         fn test_gpu_native_generic_exponent_lut_program() {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new(1);
             let table = LutTable::unary(2, 2, unary_table()).unwrap();
             let mut builder = ExponentLutProgramBuilder::new();
             builder
@@ -3342,26 +3353,43 @@ mod tests {
             let public_set = LutPublicHelperSet::new(&table, public_helpers).unwrap();
             let encoded = fixture.input(b"program-input".as_slice(), 1);
             let public_input = fixture.public_input(b"program-input".as_slice());
+            let ranges = crate::program::ProgramFamilyBindings::new();
+            let public_inputs = BTreeMap::from([(input_id, public_input)]);
+            let public_sets = BTreeMap::from([(lut_id, public_set)]);
+            let preprocessing = fixture
+                .public_compiler
+                .compile_program_with_preprocessing(
+                    &program,
+                    &public_inputs,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &ranges,
+                    &public_sets,
+                )
+                .unwrap();
             let actual = fixture
                 .compiler
-                .compile_program(
+                .compile_program_with_ranges_and_cache(
                     &program,
                     &BTreeMap::from([(input_id, encoded)]),
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                     &BTreeMap::new(),
+                    &ranges,
                     &BTreeMap::from([(lut_id, private_set)]),
+                    &preprocessing.cache,
                 )
                 .unwrap();
             let expected = fixture
                 .public_compiler
                 .compile_program(
                     &program,
-                    &BTreeMap::from([(input_id, public_input)]),
+                    &public_inputs,
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                     &BTreeMap::new(),
-                    &BTreeMap::from([(lut_id, public_set)]),
+                    &public_sets,
                 )
                 .unwrap();
             fixture.execute(

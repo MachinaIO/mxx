@@ -364,7 +364,6 @@ impl PendingMeasurement {
 pub struct GpuNodeMeasurementBackend {
     workers: Vec<GpuMeasurementWorker>,
     harness: MeasurementHarnessConfig,
-    crt_depth: usize,
     /// Setup-time snapshot. Measurement and calibration must not reread process environment.
     vram_percent: u32,
     calibration_registry: GpuCalibrationRegistry,
@@ -375,11 +374,7 @@ pub struct GpuNodeMeasurementBackend {
 
 impl GpuNodeMeasurementBackend {
     /// Creates a representative GPU measurement backend for validated IR nodes.
-    pub fn new(
-        backends: Vec<(GpuDcrtBackend, i32)>,
-        harness: MeasurementHarnessConfig,
-        crt_depth: usize,
-    ) -> Self {
+    pub fn new(backends: Vec<(GpuDcrtBackend, i32)>, harness: MeasurementHarnessConfig) -> Self {
         assert!(!backends.is_empty(), "GPU measurement requires at least one backend");
         let vram_percent = backends[0].0.vram_percent();
         assert!(
@@ -390,19 +385,17 @@ impl GpuNodeMeasurementBackend {
             .into_iter()
             .map(|(backend, device_id)| GpuMeasurementWorker { backend, device_id })
             .collect();
-        Self::from_workers(workers, harness, crt_depth, vram_percent)
+        Self::from_workers(workers, harness, vram_percent)
     }
 
     fn from_workers(
         workers: Vec<GpuMeasurementWorker>,
         harness: MeasurementHarnessConfig,
-        crt_depth: usize,
         vram_percent: u32,
     ) -> Self {
         Self {
             workers,
             harness,
-            crt_depth,
             vram_percent,
             calibration_registry: GpuCalibrationRegistry::new(),
             measurements: HashMap::new(),
@@ -1448,6 +1441,8 @@ impl GpuNodeMeasurementBackend {
             }
             NodeKind::MatrixScale { .. } |
             NodeKind::RingAutomorphism { .. } |
+            NodeKind::ModulusSwitch { .. } |
+            NodeKind::ModulusReduce { .. } |
             NodeKind::MatrixNegate => {
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) |
@@ -2373,6 +2368,22 @@ impl GpuNodeMeasurementBackend {
                     .map_err(backend_error)
                     .map(|outputs| outputs.into_iter().map(GpuMeasurementOutput::matrix).collect())
             }
+            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+                let destination = output_matrix_type()?;
+                matrix_outputs(
+                    (0..batch_size)
+                        .map(|_| {
+                            let source = matrix(0)?;
+                            if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
+                                backend.modulus_switch(source, &destination)
+                            } else {
+                                backend.reduce_modulus(source, &destination)
+                            }
+                            .map_err(backend_error)
+                        })
+                        .collect(),
+                )
+            }
             NodeKind::RingAutomorphism { index } => {
                 let index = evaluate_usize(index)?;
                 backend
@@ -2712,7 +2723,8 @@ impl GpuNodeMeasurementBackend {
                 }
                 Ok(Vec::new())
             }
-            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => {
+                let destination = output_matrix_type()?;
                 let levels = prepared
                     .arguments
                     .iter()
@@ -2746,6 +2758,7 @@ impl GpuNodeMeasurementBackend {
                                     &levels,
                                     &plaintext_moduli,
                                     &reconstruction_coefficients,
+                                    &destination,
                                 )
                                 .map_err(backend_error)
                         })
@@ -2857,12 +2870,18 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
         match wire_type {
-            ConcreteWireType::Matrix(matrix) => matrix_bytes(matrix, self.crt_depth),
+            ConcreteWireType::Matrix(matrix) | ConcreteWireType::Trapdoor { matrix, .. } => {
+                // Missing ring metadata cannot be represented as a cheap zero-byte
+                // buffer. Actual execution will report the registry error.
+                self.workers
+                    .first()
+                    .and_then(|worker| worker.backend.ring_crt_depth(matrix).ok())
+                    .map_or(u64::MAX, |depth| matrix_bytes(matrix, depth))
+            }
             ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
             ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
                 compact_matrix_bytes(matrix, max_coefficient_bound)
             }
-            ConcreteWireType::Trapdoor { matrix, .. } => matrix_bytes(matrix, self.crt_depth),
             ConcreteWireType::IndexedFamily { element, count } => self
                 .persistent_bytes(element)
                 .saturating_mul(u64::try_from(*count).unwrap_or(u64::MAX)),
@@ -3004,7 +3023,6 @@ mod tests {
         let backend = GpuNodeMeasurementBackend::from_workers(
             Vec::new(),
             crate::harness::MeasurementHarnessConfig::default(),
-            1,
             37,
         );
 
@@ -3102,8 +3120,8 @@ mod tests {
         assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Concat {
             axis: mxx_ir_core::node::ConcatAxis::Diagonal,
         }));
-        assert!(!GpuNodeMeasurementBackend::column_separable(&NodeKind::ConstantMatrix {
-            matrix_type,
+        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::ConstantMatrix {
+            matrix_type: MatrixType { rows: 1.into(), columns: 1.into(), ..matrix_type },
             value: ConstantMatrix::Rotation { exponent: IntExpr::constant(1) },
         }));
     }

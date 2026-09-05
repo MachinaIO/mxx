@@ -11,10 +11,11 @@ use crate::{
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GpuP1CovarianceCacheOpaque,
                 GpuRngSeed, GpuSmallMatrixAllocationReportRaw, GpuSmallMatrixOpaque,
                 PinnedHostBuffer, check_status, gpu_event_set_destroy, gpu_event_set_wait,
-                gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_binary_batch, gpu_matrix_copy,
-                gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
-                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
-                gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
+                gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_binary_batch,
+                gpu_matrix_convert_modulus, gpu_matrix_copy, gpu_matrix_copy_block,
+                gpu_matrix_copy_peer, gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
+                gpu_matrix_crt_recompose, gpu_matrix_decompose_base,
+                gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
                 gpu_matrix_fill_gadget_columns, gpu_matrix_fill_identity_columns,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_unit_row_columns,
@@ -1002,6 +1003,57 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    fn convert_modulus(&self, destination: &GpuDCRTPolyParams, round_scale: bool) -> Self {
+        assert_eq!(
+            self.params.ring_dimension(),
+            destination.ring_dimension(),
+            "modulus conversion ring dimension mismatch"
+        );
+        let source_modulus = self.params.modulus_for_level(self.level);
+        let destination_modulus = destination.modulus();
+        assert_eq!(
+            &source_modulus % destination_modulus.as_ref(),
+            BigUint::from(0u8),
+            "destination modulus must divide source modulus"
+        );
+        let divisor = &source_modulus / destination_modulus.as_ref();
+        let division_inverses = destination
+            .moduli()
+            .iter()
+            .map(|modulus| {
+                if round_scale {
+                    crate::utils::mod_inverse((&divisor % modulus).to_u64().unwrap(), *modulus)
+                        .expect("switch divisor must be invertible in every retained tower")
+                } else {
+                    1
+                }
+            })
+            .collect::<Vec<_>>();
+        let coefficients = round_scale.then(|| self.clone().into_coeff_domain());
+        let source = coefficients.as_ref().unwrap_or(self);
+        let mut output = Self::new_empty_with_state(
+            destination,
+            self.nrow,
+            self.ncol,
+            destination.crt_depth() - 1,
+            source.is_ntt,
+        );
+        let status = unsafe {
+            gpu_matrix_convert_modulus(
+                output.raw,
+                source.raw,
+                i32::from(round_scale),
+                division_inverses.as_ptr(),
+                division_inverses.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_convert_modulus");
+        if round_scale {
+            output.ntt_all_in_place();
+        }
+        output
+    }
+
     /// Waits for writes to this matrix without synchronizing unrelated device work.
     pub fn wait_until_ready(&self) {
         let status = unsafe { gpu_matrix_wait(self.raw) };
@@ -1503,10 +1555,11 @@ impl GpuDCRTPolyMatrix {
         levels: &[Self],
         plaintext_moduli: &[u64],
         reconstruction_residues: &[u64],
+        destination: &GpuDCRTPolyParams,
     ) -> Self {
         let first = levels.first().expect("CRT recomposition requires at least one level");
         assert_eq!(levels.len(), plaintext_moduli.len(), "CRT level count mismatch");
-        let limb_count = first.level + 1;
+        let limb_count = destination.crt_depth();
         assert_eq!(
             reconstruction_residues.len(),
             levels.len() * limb_count,
@@ -1514,17 +1567,16 @@ impl GpuDCRTPolyMatrix {
         );
         assert!(
             levels.iter().all(|level| {
-                level.params == first.params &&
+                level.params.ring_dimension() == destination.ring_dimension() &&
                     level.nrow == 1 &&
-                    level.ncol == first.ncol &&
-                    level.level == first.level
+                    level.ncol == first.ncol
             }),
-            "CRT levels must have matching parameters and 1 x n shape"
+            "CRT levels must have matching ring dimensions and 1 x m shape"
         );
         let coefficient_levels =
             levels.iter().cloned().map(Self::into_coeff_domain).collect::<Vec<_>>();
         let mut output =
-            Self::new_empty_with_state(&first.params, 1, first.ncol, first.level, false);
+            Self::new_empty_with_state(destination, 1, first.ncol, limb_count - 1, false);
         let raw_levels = coefficient_levels
             .iter()
             .map(|level| level.raw as *const GpuMatrixOpaque)
@@ -2187,6 +2239,7 @@ impl GpuDCRTPolyMatrix {
             self.params.crt_depth(),
             self.params.crt_bits(),
             self.params.base_bits(),
+            Some(self.params.moduli().to_vec()),
         )
     }
 
@@ -3400,26 +3453,12 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         )
     }
 
-    fn modulus_switch(
-        &self,
-        new_modulus: &<<Self::P as Poly>::Params as PolyParams>::Modulus,
-    ) -> Self {
-        let polys = parallel_iter!(0..self.nrow)
-            .map(|i| {
-                parallel_iter!(0..self.ncol)
-                    .map(|j| {
-                        let coeffs = self.entry(i, j);
-                        let switched_coeffs = coeffs
-                            .coeffs()
-                            .into_iter()
-                            .map(|c| c.modulus_switch(new_modulus.clone()))
-                            .collect::<Vec<_>>();
-                        GpuDCRTPoly::from_coeffs(&self.params, &switched_coeffs)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        Self::from_poly_vec(&self.params, polys)
+    fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self {
+        self.convert_modulus(destination, true)
+    }
+
+    fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self {
+        self.convert_modulus(destination, false)
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
@@ -3852,7 +3891,7 @@ mod tests {
     use std::sync::Arc;
 
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 17, 1)
+        DCRTPolyParams::new(128, 2, 17, 1, None)
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
@@ -3945,7 +3984,7 @@ mod tests {
     #[sequential]
     fn test_gpu_compact_batch_is_byte_identical_to_scalar_serialization() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 5, 17, 8);
+        let cpu_params = DCRTPolyParams::new(32, 5, 17, 8, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let modulus = gpu_params.modulus();
         let mut matrices =
@@ -4011,7 +4050,7 @@ mod tests {
             .map(|value| value.parse::<u32>().expect("ring dimension"))
             .unwrap_or(32);
         assert!(ring_dimension >= 4 && ring_dimension.is_power_of_two());
-        let cpu_params = DCRTPolyParams::new(ring_dimension, 3, 17, 8);
+        let cpu_params = DCRTPolyParams::new(ring_dimension, 3, 17, 8, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut rand::rng());
         let eval = Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &cpu));
@@ -4043,7 +4082,7 @@ mod tests {
     #[sequential]
     fn test_gpu_matrix_operation_batches_match_scalar_operations() {
         gpu_device_sync();
-        let gpu_params = gpu_params_from_cpu(&DCRTPolyParams::new(32, 3, 17, 8));
+        let gpu_params = gpu_params_from_cpu(&DCRTPolyParams::new(32, 3, 17, 8, None));
         let constant_matrix = |rows: usize, columns: usize, value: usize| {
             GpuDCRTPolyMatrix::from_poly_vec(
                 &gpu_params,
@@ -4203,7 +4242,7 @@ mod tests {
             expected_scaled
         );
 
-        let second_params = gpu_params_from_cpu(&DCRTPolyParams::new(32, 3, 17, 8));
+        let second_params = gpu_params_from_cpu(&DCRTPolyParams::new(32, 3, 17, 8, None));
         let mixed_contexts = vec![
             constant_matrix(1, 2, 41),
             GpuDCRTPolyMatrix::from_poly_vec_row(
@@ -4223,7 +4262,7 @@ mod tests {
     #[sequential]
     fn test_gpu_thin_row_matrix_multiply_matches_cpu() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 2, 28, 8);
+        let cpu_params = DCRTPolyParams::new(32, 2, 28, 8, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let mut random = rng();
         let left_cpu = random_cpu_matrix(&cpu_params, 1, 80, &mut random);
@@ -4242,7 +4281,7 @@ mod tests {
     #[sequential]
     fn test_gpu_thin_row_matrix_multiply_batch_matches_cpu_with_inner_tail() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 2, 28, 8);
+        let cpu_params = DCRTPolyParams::new(32, 2, 28, 8, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let mut random = rng();
         let mut expected = Vec::new();
@@ -4272,7 +4311,7 @@ mod tests {
     fn test_gpu_direct_context_copy_preserves_source_lifetime_dependency() {
         gpu_device_sync();
         let devices = detected_gpu_device_ids();
-        let cpu_params = DCRTPolyParams::new(32, 3, 17, 8);
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 8, None);
         let (moduli, _, _) = cpu_params.to_crt();
         let staging_source_params = GpuDCRTPolyParams::new_with_gpu(
             cpu_params.ring_dimension(),
@@ -4280,6 +4319,7 @@ mod tests {
             cpu_params.base_bits(),
             vec![devices[0]],
             Some(1),
+            None,
         );
         let staging_destination_params = GpuDCRTPolyParams::new_with_gpu(
             cpu_params.ring_dimension(),
@@ -4287,6 +4327,7 @@ mod tests {
             cpu_params.base_bits(),
             vec![devices[0]],
             Some(1),
+            None,
         );
         let second_staging_destination_params = GpuDCRTPolyParams::new_with_gpu(
             cpu_params.ring_dimension(),
@@ -4294,6 +4335,7 @@ mod tests {
             cpu_params.base_bits(),
             vec![devices[0]],
             Some(1),
+            None,
         );
         let staging_source = GpuDCRTPolyMatrix::from_poly_vec_row(
             &staging_source_params,
@@ -4320,6 +4362,7 @@ mod tests {
             cpu_params.base_bits(),
             vec![devices[0]],
             Some(1),
+            None,
         );
         let destination_params = GpuDCRTPolyParams::new_with_gpu(
             cpu_params.ring_dimension(),
@@ -4327,6 +4370,7 @@ mod tests {
             cpu_params.base_bits(),
             vec![devices[1]],
             Some(1),
+            None,
         );
         let values = vec![
             vec![
@@ -4362,7 +4406,7 @@ mod tests {
     #[test]
     #[sequential]
     fn test_gpu_ntt_matches_openfhe_evaluation_order() {
-        let cpu_params = DCRTPolyParams::new(8, 2, 16, 8);
+        let cpu_params = DCRTPolyParams::new(8, 2, 16, 8, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let coefficients = (0..cpu_params.ring_dimension())
             .map(|index| BigUint::from(index * index + 3 * index + 7))
@@ -4495,6 +4539,7 @@ mod tests {
             params.base_bits(),
             vec![src_device],
             Some(1),
+            None,
         );
         let dst_params = GpuDCRTPolyParams::new_with_gpu(
             params.ring_dimension(),
@@ -4502,6 +4547,7 @@ mod tests {
             params.base_bits(),
             vec![dst_device],
             Some(1),
+            None,
         );
 
         let near_modulus = src_params.modulus().as_ref() - BigUint::from(7u32);
@@ -4566,7 +4612,7 @@ mod tests {
     #[sequential]
     fn test_gpu_range_constant_columns_match_full_global_layout() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2, None);
         let params = gpu_params_from_cpu(&cpu_params);
 
         let identity = GpuDCRTPolyMatrix::identity(&params, 5, None);
@@ -4676,7 +4722,7 @@ mod tests {
     #[sequential]
     fn test_gpu_small_matrix_decompose_modes_remain_distinct_one_limb() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 1, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 1, 17, 2, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let negative_three = cpu_params.modulus().as_ref() - BigUint::from(3u32);
         let cpu_source = DCRTPolyMatrix::from_poly_vec_row(
@@ -4711,7 +4757,7 @@ mod tests {
     #[sequential]
     fn test_gpu_small_matrix_canonical_signed_multicolumn_boundaries() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 1, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 1, 17, 2, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let bound = BigUint::from(255u32);
         let width = 1usize;
@@ -4916,7 +4962,7 @@ mod tests {
     #[sequential]
     fn test_gpu_small_rhs_cuda_report_matches_planner_at_exact_budget() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let lhs = GpuDCRTPolyMatrix::from_poly_vec_row(
             &params,
@@ -4945,7 +4991,7 @@ mod tests {
     #[sequential]
     fn test_gpu_small_rhs_workspace_expands_exactly_one_runtime_shard() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let dimension = 4usize;
         let lhs = GpuDCRTPolyMatrix::from_poly_vec_row(
@@ -4979,7 +5025,7 @@ mod tests {
     #[sequential]
     fn test_gpu_preimage_hard_cutoff_pack_accepts_rejects_and_reuses_destination() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 1, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 1, 17, 2, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let accepted_source = GpuDCRTPolyMatrix::from_poly_vec_row(
             &gpu_params,
@@ -5047,7 +5093,7 @@ mod tests {
     #[sequential]
     fn test_gpu_preimage_hard_cutoff_rejects_when_anchor_residue_alone_would_accept() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 2, 17, 2, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let first_modulus = gpu_params.moduli()[0];
         assert_eq!(first_modulus % gpu_params.moduli()[0], 0);
@@ -5111,7 +5157,7 @@ mod tests {
     #[sequential]
     fn test_gpu_small_rhs_multiply_matches_full_dcrt_with_all_tile_tails() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let mut random = rng();
         let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
@@ -5152,7 +5198,7 @@ mod tests {
         assert!(ring_dimension >= 2 && ring_dimension.is_power_of_two());
 
         for crt_bits in [28usize, 50] {
-            let cpu_params = DCRTPolyParams::new(ring_dimension, 2, crt_bits, 8);
+            let cpu_params = DCRTPolyParams::new(ring_dimension, 2, crt_bits, 8, None);
             let gpu_params = gpu_params_from_cpu(&cpu_params);
             let mut random = rng();
             let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
@@ -5197,8 +5243,8 @@ mod tests {
             .map(|value| value.parse::<u32>().expect("invalid test GPU NTT ring dimension"))
             .unwrap_or(256);
         assert!(ring_dimension >= 2 && ring_dimension.is_power_of_two());
-        let (narrow_moduli, _, _) = DCRTPolyParams::new(ring_dimension, 1, 28, 8).to_crt();
-        let (wide_moduli, _, _) = DCRTPolyParams::new(ring_dimension, 1, 50, 8).to_crt();
+        let (narrow_moduli, _, _) = DCRTPolyParams::new(ring_dimension, 1, 28, 8, None).to_crt();
+        let (wide_moduli, _, _) = DCRTPolyParams::new(ring_dimension, 1, 50, 8, None).to_crt();
         let params =
             GpuDCRTPolyParams::new(ring_dimension, vec![narrow_moduli[0], wide_moduli[0]], 8);
         assert!(params.moduli()[0] <= u32::MAX as u64);
@@ -5231,7 +5277,7 @@ mod tests {
         gpu_device_sync();
         for ring_dimension in [32u32, 64] {
             for crt_bits in [28usize, 50] {
-                let cpu_params = DCRTPolyParams::new(ring_dimension, 2, crt_bits, 8);
+                let cpu_params = DCRTPolyParams::new(ring_dimension, 2, crt_bits, 8, None);
                 let gpu_params = gpu_params_from_cpu(&cpu_params);
                 for lhs_rows in [1usize, 2] {
                     let mut random = rng();
@@ -5266,7 +5312,7 @@ mod tests {
     #[sequential]
     fn test_gpu_small_rhs_column_shards_reconstruct_full_result() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(64, 2, 28, 8);
+        let cpu_params = DCRTPolyParams::new(64, 2, 28, 8, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let mut random = rng();
         let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
@@ -5296,7 +5342,7 @@ mod tests {
     #[sequential]
     fn test_gpu_small_rhs_zero_copy_column_view_matches_compact_slice() {
         gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2);
+        let cpu_params = DCRTPolyParams::new(32, 3, 17, 2, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let mut random = rng();
         let lhs_cpu = random_cpu_matrix(&cpu_params, 2, 3, &mut random);
@@ -5409,7 +5455,7 @@ mod tests {
     #[sequential]
     fn test_gpu_matrix_decompose_matches_cpu_balanced_digits() {
         gpu_device_sync();
-        let params = DCRTPolyParams::new(128, 2, 17, 3);
+        let params = DCRTPolyParams::new(128, 2, 17, 3, None);
         let gpu_params = gpu_params_from_cpu(&params);
         let gpu_matrix = GpuDCRTPolyMatrix::from_poly_vec(
             &gpu_params,
@@ -5424,7 +5470,7 @@ mod tests {
     #[sequential]
     fn test_gpu_matrix_decompose_balanced_odd_for_centered_inputs() {
         gpu_device_sync();
-        let params = DCRTPolyParams::new(128, 2, 17, 3);
+        let params = DCRTPolyParams::new(128, 2, 17, 3, None);
         let gpu_params = gpu_params_from_cpu(&params);
         let modulus = gpu_params.modulus();
         let x = GpuDCRTPolyMatrix::from_poly_vec(
@@ -5446,7 +5492,7 @@ mod tests {
     #[sequential]
     fn test_gpu_matrix_decompose_balanced_round_to_even_tie_digits() {
         gpu_device_sync();
-        let params = DCRTPolyParams::new(128, 2, 17, 3);
+        let params = DCRTPolyParams::new(128, 2, 17, 3, None);
         let gpu_params = gpu_params_from_cpu(&params);
         let (moduli, _, _) = params.to_crt();
         let digits_per_tower = params.crt_bits().div_ceil(params.base_bits() as usize);
@@ -5564,7 +5610,7 @@ mod tests {
     #[sequential]
     fn test_gpu_matrix_small_decomposed_identity_chunk_digit_bound() {
         gpu_device_sync();
-        let params = DCRTPolyParams::new(128, 2, 16, 4);
+        let params = DCRTPolyParams::new(128, 2, 16, 4, None);
         let gpu_params = gpu_params_from_cpu(&params);
         let size = 4usize;
         let chunk_count = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
@@ -5606,7 +5652,7 @@ mod tests {
     #[sequential]
     fn test_gpu_matrix_small_decomposed_identity_chunk_from_scalar_relation() {
         gpu_device_sync();
-        let params = DCRTPolyParams::new(128, 2, 16, 4);
+        let params = DCRTPolyParams::new(128, 2, 16, 4, None);
         let gpu_params = gpu_params_from_cpu(&params);
         let size = 4usize;
         let chunk_count = gpu_params.crt_bits().div_ceil(gpu_params.base_bits() as usize);
@@ -5696,7 +5742,7 @@ mod tests {
     #[sequential]
     fn test_gpu_matrix_gauss_samp_gq_arb_base_relation() {
         gpu_device_sync();
-        let params = DCRTPolyParams::new(128, 2, 16, 8);
+        let params = DCRTPolyParams::new(128, 2, 16, 8, None);
         let gpu_params = gpu_params_from_cpu(&params);
 
         let value_a = 5usize;
@@ -5982,53 +6028,167 @@ mod tests {
     #[test]
     #[sequential]
     fn test_gpu_matrix_modulus_switch() {
-        gpu_device_sync();
-        let params = gpu_test_params();
-        let gpu_params = gpu_params_from_cpu(&params);
+        let (dimension, depth, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(dimension, depth, bits, base_bits, None);
+        let source = gpu_params_from_cpu(&params);
+        let mut random = rng();
+        for indices in [vec![0, 2], vec![3], (0..depth).collect()] {
+            let destination = GpuDCRTPolyParams::new_with_gpu(
+                source.ring_dimension(),
+                indices.iter().map(|i| source.moduli()[*i]).collect(),
+                source.base_bits(),
+                source.gpu_ids().to_vec(),
+                Some(1),
+                Some(&source),
+            );
+            let q = source.modulus();
+            let p = destination.modulus();
+            let divisor = q.as_ref() / p.as_ref();
+            let half = &divisor / 2u32;
+            let boundary = &divisor * 3u32 + &half;
+            let cases = [
+                BigUint::zero(),
+                BigUint::from(1u32),
+                half.clone(),
+                &half + 1u32,
+                boundary.clone(),
+                &boundary + 1u32,
+                q.as_ref() / 2u32,
+                q.as_ref() / 2u32 + 1u32,
+                q.as_ref() - 1u32,
+            ];
+            for (rows, columns) in [(1, 1), (1, 5), (3, 2)] {
+                let coefficients = (0..rows * columns)
+                    .map(|entry| {
+                        (0..source.ring_dimension() as usize)
+                            .map(|i| {
+                                let value = if i < cases.len() {
+                                    cases[(i + entry) % cases.len()].clone()
+                                } else {
+                                    BigUint::from(random.random::<u128>()) % q.as_ref()
+                                };
+                                FinRingElem::new(value, q.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let matrix = GpuDCRTPolyMatrix::from_poly_vec(
+                    &source,
+                    coefficients
+                        .chunks(columns)
+                        .map(|row| {
+                            row.iter().map(|c| GpuDCRTPoly::from_coeffs(&source, c)).collect()
+                        })
+                        .collect(),
+                );
+                let switched = matrix.modulus_switch(&destination);
+                let reduced = matrix.reduce_modulus(&destination);
+                assert_eq!(switched.params.modulus(), p);
+                assert!(switched.is_ntt);
+                assert_eq!(reduced.is_ntt, matrix.is_ntt);
+                for row in 0..rows {
+                    for column in 0..columns {
+                        let input = &coefficients[row * columns + column];
+                        let expected = input
+                            .iter()
+                            .map(|coefficient| coefficient.modulus_switch(p.clone()))
+                            .collect::<Vec<_>>();
+                        assert_eq!(switched.entry(row, column).coeffs(), expected);
+                        let expected_reduction = input
+                            .iter()
+                            .map(|coefficient| {
+                                FinRingElem::new(coefficient.value.clone(), p.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(reduced.entry(row, column).coeffs(), expected_reduction);
+                    }
+                }
+            }
+        }
+    }
 
-        let value00 =
-            FinRingElem::new(1023782870921908217643761278891282178u128, gpu_params.modulus());
-        let value01 =
-            FinRingElem::new(8179012198875468938912873783289218738u128, gpu_params.modulus());
-        let value10 =
-            FinRingElem::new(2034903202902173762872163465127672178u128, gpu_params.modulus());
-        let value11 =
-            FinRingElem::new(1990091289902891278121564387120912660u128, gpu_params.modulus());
-
-        let matrix_vec = vec![
-            vec![
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &value00),
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &value01),
-            ],
-            vec![
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &value10),
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &value11),
-            ],
-        ];
-
-        let matrix = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, matrix_vec);
-        let new_modulus = Arc::new(BigUint::from(2u32));
-        let switched = matrix.modulus_switch(&new_modulus);
-
-        assert_eq!(switched.params.modulus(), gpu_params.modulus());
-
-        let new_value00 = value00.modulus_switch(new_modulus.clone());
-        let new_value01 = value01.modulus_switch(new_modulus.clone());
-        let new_value10 = value10.modulus_switch(new_modulus.clone());
-        let new_value11 = value11.modulus_switch(new_modulus.clone());
-
-        let expected_vec = vec![
-            vec![
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &new_value00),
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &new_value01),
-            ],
-            vec![
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &new_value10),
-                GpuDCRTPoly::from_elem_to_constant(&gpu_params, &new_value11),
-            ],
-        ];
-
-        let expected = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, expected_vec);
-        assert_eq!(switched, expected);
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_crt_recompose_mixed_moduli() {
+        let (dimension, depth, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let cpu = DCRTPolyParams::new(dimension, depth, bits, base_bits, None);
+        let destination = gpu_params_from_cpu(&cpu);
+        let q = destination.modulus();
+        let reconstruction = destination.reconst_coeffs();
+        let reconstruction_residues = reconstruction
+            .iter()
+            .flat_map(|coefficient| {
+                destination
+                    .moduli()
+                    .iter()
+                    .map(move |prime| (coefficient % prime).to_u64().unwrap())
+            })
+            .collect::<Vec<_>>();
+        let mut random = rng();
+        for columns in [1, 5] {
+            let mut expected = vec![vec![BigUint::zero(); dimension as usize]; columns];
+            let levels = (0..depth)
+                .map(|slot| {
+                    // Unequal source tower counts, including a non-prefix subset.
+                    let indices = if slot == 0 {
+                        vec![slot]
+                    } else if slot == 1 {
+                        vec![0, slot, depth - 1]
+                    } else {
+                        vec![0, slot]
+                    };
+                    let modulus = indices
+                        .iter()
+                        .map(|index| BigUint::from(destination.moduli()[*index]))
+                        .product::<BigUint>();
+                    let source = destination.select_modulus(&modulus).unwrap();
+                    let plaintext = Arc::new(BigUint::from(destination.moduli()[slot]));
+                    let spacing = &modulus / plaintext.as_ref();
+                    let boundary = &spacing * 2u32 + &spacing / 2u32;
+                    let values = [
+                        BigUint::zero(),
+                        &modulus - 1u32,
+                        &modulus / 2u32,
+                        boundary.clone(),
+                        boundary + 1u32,
+                    ];
+                    let row = (0..columns)
+                        .map(|column| {
+                            let coefficients = (0..dimension as usize)
+                                .map(|index| {
+                                    let value = if index < values.len() {
+                                        values[index].clone()
+                                    } else {
+                                        BigUint::from(random.random::<u128>()) % &modulus
+                                    };
+                                    let input = FinRingElem::new(value, source.modulus());
+                                    let rounded = input.modulus_switch(plaintext.clone());
+                                    expected[column][index] +=
+                                        rounded.value * &reconstruction[slot];
+                                    input
+                                })
+                                .collect::<Vec<_>>();
+                            GpuDCRTPoly::from_coeffs(&source, &coefficients)
+                        })
+                        .collect();
+                    GpuDCRTPolyMatrix::from_poly_vec_row(&source, row)
+                })
+                .collect::<Vec<_>>();
+            let actual = GpuDCRTPolyMatrix::crt_recompose_levels(
+                &levels,
+                destination.moduli(),
+                &reconstruction_residues,
+                &destination,
+            );
+            assert_eq!(actual.params.modulus(), q);
+            assert!(actual.is_ntt);
+            for (column, coefficients) in expected.into_iter().enumerate() {
+                let expected = coefficients
+                    .into_iter()
+                    .map(|coefficient| FinRingElem::new(coefficient, q.clone()))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual.entry(0, column).coeffs(), expected);
+            }
+        }
     }
 }

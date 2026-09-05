@@ -8,12 +8,12 @@
 //! is important: setup may hold secrets and trapdoors, but the public program and
 //! graph declarations must not contain private support or selector choices.
 //!
-//! Setup material is organized per CRT slot `t`. With `mu_t=q/q_t`, the
-//! producer constructs `A_{sum,t} = A_t + A_{m,t} + A_{e,t}`, then the preimage
-//! target `T_t = A_{sum,t} - mu_t A'` and a matrix `K_t` satisfying `B K_t=T_t`.
-//! The public matrix `B`, targets, and typed preimages `K_t` are fixed by
-//! preprocessing. Online evaluation samples one fresh anchor error and forms
-//! one shared `b=sB+e_b`, then uses `d_t=bK_t` for every slot. Neither the
+//! Setup material is organized per CRT slot `t`. The producer switches the
+//! complete `A_{sum,t} = A_t + A_{m,t} + A_{e,t}` to the selected ring `R_P`,
+//! then targets `T_t = MS(A_{sum,t}) - (P_t/q_t) reduce(A')` with `B_P K_t=T_t`.
+//! Each distinct `P` has one preprocessing-fixed public matrix and trapdoor.
+//! Online evaluation forms one fresh `b_P=reduce(s) B_P+e_P` per group and
+//! uses `d_t=b_P K_t` for that group's slots. Neither the
 //! online secret `s` nor `b` crosses the artifact boundary.
 
 use crate::{
@@ -132,7 +132,7 @@ pub struct RefreshSetupParameters {
     pub coefficient_count: usize,
     /// Number of base-`p` digits represented by each mask PRF label. This is
     /// independent of `layout.digit_count`, which is the gadget digit count.
-    pub mask_base_p_digit_count: usize,
+    pub mask_base_p_digit_counts: Vec<usize>,
     /// Number of base-`p` digits represented by each fresh-error PRF label.
     pub fresh_error_base_p_digit_count: usize,
     /// Statistical security parameter used for the joint mask transcript.
@@ -143,6 +143,8 @@ pub struct RefreshSetupParameters {
     pub layout: BggSamplerLayout,
     /// CRT modulus and reconstruction data for the refresh equations.
     pub refresh: RefreshCompiler,
+    /// Exact selected CRT-subset destination modulus for each refresh slot.
+    pub switch_moduli: Vec<BigUint>,
     /// Gaussian width used when sampling the decoder trapdoor.
     pub decoder_sigma: mxx_ir_core::RealExpr,
     /// Gaussian width used by every setup helper and the shared anchor error.
@@ -154,6 +156,25 @@ pub struct RefreshSetupParameters {
     pub decoder_preimage_bound: TrapdoorPreimageCutoffPolicy,
     /// Human-readable setup name used by callers when selecting a production.
     pub name: String,
+}
+
+/// Public security-analysis inputs, not a security estimate or joint-view proof.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RefreshAnchorSecurityInputs {
+    pub modulus: BigUint,
+    pub complementary_modulus: BigUint,
+    pub slots: Vec<usize>,
+    pub ring_dimension: usize,
+    pub random_secret_polynomials: usize,
+    pub secret_distribution: String,
+    pub fixed_augmented_coordinate: i32,
+    pub error_sigma: mxx_ir_core::RealExpr,
+    pub error_coefficient_cutoff: mxx_ir_core::IntExpr,
+    pub anchor_columns: usize,
+    pub execution_budget: usize,
+    pub ring_samples: usize,
+    pub estimated_security_bits: Option<u64>,
+    pub status: String,
 }
 
 /// Setup-produced decomposition plans for the refresh routes.
@@ -168,7 +189,7 @@ pub struct RefreshNoiseGainDecompositions {
     /// One compact decomposition for each CRT slot's `G^-1(kappa_t G)` action.
     pub state_scaling: Vec<NoiseDecompositionPlan>,
     /// One compact decomposition for every P-adic mask digit `P^c`.
-    pub mask: Vec<NoiseDecompositionPlan>,
+    pub mask: Vec<Vec<NoiseDecompositionPlan>>,
     /// Number of ring-coefficient positions represented by each mask plan.
     /// The compact search path stores one plan per P-adic digit and uses this
     /// multiplicity instead of materializing `coefficient_count` copies.
@@ -196,7 +217,8 @@ impl RefreshNoiseGainDecompositions {
         slot_count: usize,
     ) -> Result<RefreshRouteNoiseGains, RefreshSetupError> {
         if self.state_scaling.len() != slot_count ||
-            self.mask.is_empty() ||
+            self.mask.len() != slot_count ||
+            self.mask.iter().any(|plans| plans.is_empty()) ||
             self.fresh.len() != slot_count ||
             self.mask_multiplicity == 0 ||
             (!self.fresh_multiplicity.is_empty() &&
@@ -229,7 +251,11 @@ impl RefreshNoiseGainDecompositions {
         };
         Ok(RefreshRouteNoiseGains {
             state_scaling: self.state_scaling.iter().map(derive).collect::<Result<Vec<_>, _>>()?,
-            mask: derive_sum(&self.mask, self.mask_multiplicity)?,
+            mask: self
+                .mask
+                .iter()
+                .map(|plans| derive_sum(plans, self.mask_multiplicity))
+                .collect::<Result<Vec<_>, _>>()?,
             fresh: self
                 .fresh
                 .iter()
@@ -306,7 +332,7 @@ impl std::fmt::Debug for RefreshSetupParameters {
             .field("base_p", &self.base_p)
             .field("component_count", &self.component_count)
             .field("coefficient_count", &self.coefficient_count)
-            .field("mask_base_p_digit_count", &self.mask_base_p_digit_count)
+            .field("mask_base_p_digit_count", &self.mask_base_p_digit_counts)
             .field("fresh_error_base_p_digit_count", &self.fresh_error_base_p_digit_count)
             .field("mask_statistical_security_bits", &self.mask_statistical_security_bits)
             .field("lut_width", &self.lut_width)
@@ -339,17 +365,27 @@ impl RefreshSetupParameters {
         name: impl Into<String>,
     ) -> Self {
         let encoding_error_bound = encoding_error_bound_or_zero(&encoding_error_sigma);
+        let switch_moduli = vec![
+            refresh
+                .full_modulus
+                .evaluate(&ParamEnv::default())
+                .ok()
+                .and_then(|value| value.to_biguint())
+                .unwrap_or_default();
+            refresh.crt_plaintext_moduli.len()
+        ];
         Self {
             refresh_id,
             base_p,
             component_count,
             coefficient_count,
-            mask_base_p_digit_count,
+            mask_base_p_digit_counts: vec![mask_base_p_digit_count; switch_moduli.len()],
             fresh_error_base_p_digit_count,
             mask_statistical_security_bits,
             lut_width,
             layout,
             refresh,
+            switch_moduli,
             decoder_sigma,
             encoding_error_sigma,
             encoding_error_bound,
@@ -448,7 +484,7 @@ impl RefreshSetupParameters {
             crt_slot_count: plaintext_moduli.len(),
             component_columns,
             coefficient_count: self.coefficient_count,
-            mask_digit_count: self.mask_base_p_digit_count,
+            mask_digit_counts: self.mask_base_p_digit_counts.clone(),
             fresh_digit_count: self.fresh_error_base_p_digit_count,
         };
         // The joint mask/fresh event count belongs only to the average tail
@@ -459,8 +495,9 @@ impl RefreshSetupParameters {
             .map_err(|_| RefreshSetupError::InvalidParameters("refresh topology overflows"))?;
         let mut refresh = RefreshNoiseParameters::new(
             plaintext_moduli,
+            self.switch_moduli.clone(),
             self.base_p.into(),
-            self.mask_base_p_digit_count,
+            self.mask_base_p_digit_counts.clone(),
             self.fresh_error_base_p_digit_count,
         )
         .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh noise parameters"))?;
@@ -532,17 +569,28 @@ impl RefreshSetupParameters {
             .ok_or(RefreshSetupError::InvalidParameters(
                 "encoding error bound must be non-negative",
             ))?;
-        let expected_mask_route_count = Some(self.coefficient_count)
-            .and_then(|value| value.checked_mul(self.mask_base_p_digit_count))
-            .ok_or(RefreshSetupError::InvalidParameters("mask route count overflow"))?;
+        let expected_mask_route_counts = self
+            .mask_base_p_digit_counts
+            .iter()
+            .map(|digits| {
+                self.coefficient_count
+                    .checked_mul(*digits)
+                    .ok_or(RefreshSetupError::InvalidParameters("mask route count overflow"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let expected_fresh_route_count = Some(self.coefficient_count)
             .and_then(|value| value.checked_mul(self.fresh_error_base_p_digit_count))
             .ok_or(RefreshSetupError::InvalidParameters("fresh route count overflow"))?;
-        let actual_mask_route_count = route_decompositions
+        let actual_mask_route_counts = route_decompositions
             .mask
-            .len()
-            .checked_mul(route_decompositions.mask_multiplicity)
-            .ok_or(RefreshSetupError::InvalidParameters("mask route count overflow"))?;
+            .iter()
+            .map(|plans| {
+                plans
+                    .len()
+                    .checked_mul(route_decompositions.mask_multiplicity)
+                    .ok_or(RefreshSetupError::InvalidParameters("mask route count overflow"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let actual_fresh_route_counts = route_decompositions
             .fresh
             .iter()
@@ -560,7 +608,8 @@ impl RefreshSetupParameters {
                     .ok_or(RefreshSetupError::InvalidParameters("fresh route count overflow"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if actual_mask_route_count != expected_mask_route_count ||
+        if actual_mask_route_counts.len() != self.switch_moduli.len() ||
+            actual_mask_route_counts != expected_mask_route_counts ||
             route_decompositions.fresh.len() != self.refresh.crt_plaintext_moduli.len() ||
             actual_fresh_route_counts.iter().any(|count| *count != expected_fresh_route_count)
         {
@@ -570,17 +619,21 @@ impl RefreshSetupParameters {
         }
         let route_gains =
             route_decompositions.derive_route_gains(self.refresh.crt_plaintext_moduli.len())?;
-        let centered_digit_variance = centered_base_p_digit_variance(&self.base_p.into())
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid centered digit variance"))?;
-        let mask_digit_variances = vec![
-            centered_digit_variance.scaled(&route_gains.mask.l2_squared);
-            self.refresh.crt_plaintext_moduli.len()
-        ];
-        let fresh_digit_variances = route_gains
-            .fresh
+        // These are nominal payload variances, not decomposition-transported
+        // operational errors. Independent base-p digits form a uniform interval.
+        let support_variance = |digits: usize| {
+            let digits = u32::try_from(digits)
+                .map_err(|_| RefreshSetupError::InvalidParameters("digit count overflow"))?;
+            centered_base_p_digit_variance(&BigUint::from(self.base_p).pow(digits))
+                .map_err(|_| RefreshSetupError::InvalidParameters("invalid payload variance"))
+        };
+        let mask_digit_variances = self
+            .mask_base_p_digit_counts
             .iter()
-            .map(|gain| centered_digit_variance.scaled(&gain.l2_squared))
-            .collect();
+            .map(|digits| support_variance(*digits))
+            .collect::<Result<Vec<_>, _>>()?;
+        let fresh_digit_variances =
+            vec![support_variance(self.fresh_error_base_p_digit_count)?; self.switch_moduli.len()];
         let refresh = self
             .refresh_noise_parameters()?
             .with_route_gains(route_gains)
@@ -618,7 +671,7 @@ impl RefreshSetupParameters {
         config: &AverageCaseConfig,
     ) -> Result<ExponentLutAverageNoiseReport, RefreshSetupError> {
         let mut candidate = self.clone();
-        candidate.mask_base_p_digit_count = candidate_mask_base_p_digit_count;
+        candidate.mask_base_p_digit_counts.fill(candidate_mask_base_p_digit_count);
         // The mask digit count changes the route topology.  Rebuild both the
         // compact route plans and the gain plan from the candidate instead of
         // reusing plans generated for the previous digit count.
@@ -659,7 +712,8 @@ impl RefreshSetupParameters {
             !self.lut_width.is_power_of_two() ||
             self.lut_width > n ||
             n % self.lut_width != 0 ||
-            self.mask_base_p_digit_count == 0 ||
+            self.mask_base_p_digit_counts.len() != self.switch_moduli.len() ||
+            self.mask_base_p_digit_counts.iter().any(|count| *count == 0) ||
             self.fresh_error_base_p_digit_count == 0 ||
             self.mask_statistical_security_bits == 0 ||
             self.layout.digit_count == 0 ||
@@ -718,21 +772,151 @@ impl RefreshSetupParameters {
                     "decoder cutoff requires a concrete finite sigma",
                 )
             })?;
-        let selected = self
-            .decoder_preimage_bound
-            .resolve(
-                ring_dimension,
-                self.layout.secret_dimension,
-                self.layout.digit_count,
-                gadget_base,
-                decoder_sigma,
-            )
-            .map_err(|_| {
-                RefreshSetupError::InvalidParameters(
-                    "invalid decoder trapdoor preimage cutoff policy",
-                )
-            })?;
+        let selected = (0..self.switch_moduli.len())
+            .map(|slot| {
+                self.decoder_preimage_bound
+                    .resolve(
+                        ring_dimension,
+                        self.layout.secret_dimension,
+                        self.decoder_digit_count(slot)?,
+                        gadget_base,
+                        decoder_sigma,
+                    )
+                    .map_err(|_| {
+                        RefreshSetupError::InvalidParameters(
+                            "invalid decoder trapdoor preimage cutoff policy",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, RefreshSetupError>>()?
+            .into_iter()
+            .max()
+            .ok_or(RefreshSetupError::InvalidParameters("empty decoder moduli"))?;
         Ok(IntExpr::constant(BigInt::from_biguint(num_bigint::Sign::Plus, selected)))
+    }
+
+    /// Gadget digits for the exact retained CRT basis of one low-modulus anchor.
+    /// Tower order is inherited from the source; arbitrary subsets are supported.
+    pub fn decoder_digit_count(&self, slot: usize) -> Result<usize, RefreshSetupError> {
+        let selected = self
+            .switch_moduli
+            .get(slot)
+            .filter(|modulus| **modulus > BigUint::one())
+            .ok_or(RefreshSetupError::InvalidParameters("missing switching modulus"))?;
+        let towers = &self.refresh.crt_plaintext_moduli;
+        let base = self
+            .layout
+            .gadget_base
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .and_then(|value| value.to_u64())
+            .filter(|base| *base >= 2 && base.is_power_of_two())
+            .ok_or(RefreshSetupError::InvalidParameters("invalid decoder gadget base"))?;
+        let base_bits = base.trailing_zeros() as usize;
+        let mut product = BigUint::one();
+        let mut count = 0usize;
+        let mut maximum_bits = 0usize;
+        for tower in towers {
+            let modulus = tower
+                .evaluate(&ParamEnv::default())
+                .ok()
+                .and_then(|value| value.to_biguint())
+                .filter(|value| *value > BigUint::one())
+                .ok_or(RefreshSetupError::InvalidParameters("invalid decoder CRT tower"))?;
+            if selected % &modulus == BigUint::zero() {
+                maximum_bits = maximum_bits.max(modulus.bits() as usize);
+                product *= modulus;
+                count = count
+                    .checked_add(1)
+                    .ok_or(RefreshSetupError::InvalidParameters("decoder digit count overflow"))?;
+            }
+        }
+        if &product != selected {
+            return Err(RefreshSetupError::InvalidParameters(
+                "switching modulus is not a CRT subset",
+            ));
+        }
+        count
+            .checked_mul(maximum_bits.div_ceil(base_bits))
+            .ok_or(RefreshSetupError::InvalidParameters("decoder digit count overflow"))
+    }
+
+    /// Describe every new marginal and complementary view without borrowing
+    /// security bits from the original high-q BGG distribution. The declared
+    /// budget counts fresh anchor samples across executions of this setup.
+    pub fn anchor_security_inputs(
+        &self,
+        execution_budget: usize,
+    ) -> Result<Vec<RefreshAnchorSecurityInputs>, RefreshSetupError> {
+        self.validate_dimensions()?;
+        if execution_budget == 0 {
+            return Err(RefreshSetupError::InvalidParameters("zero security execution budget"));
+        }
+        let q = self
+            .refresh
+            .full_modulus
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .and_then(|value| value.to_biguint())
+            .ok_or(RefreshSetupError::InvalidParameters("invalid security modulus"))?;
+        self.anchor_groups().into_iter().map(|(modulus, slots)| {
+            let digits = self.decoder_digit_count(slots[0])?;
+            let columns = digits.checked_add(2)
+                .and_then(|value| value.checked_mul(self.layout.secret_dimension))
+                .ok_or(RefreshSetupError::InvalidParameters("anchor sample count overflow"))?;
+            let samples = columns.checked_mul(execution_budget)
+                .ok_or(RefreshSetupError::InvalidParameters("anchor sample budget overflow"))?;
+            Ok(RefreshAnchorSecurityInputs {
+                complementary_modulus: &q / &modulus,
+                modulus,
+                slots,
+                ring_dimension: self.coefficient_count,
+                random_secret_polynomials: self.layout.secret_dimension - 1,
+                secret_distribution: "one coefficientwise uniform ternary polynomial, shared across all moduli".into(),
+                fixed_augmented_coordinate: 1,
+                error_sigma: self.encoding_error_sigma.clone(),
+                error_coefficient_cutoff: self.encoding_error_bound.clone(),
+                anchor_columns: columns,
+                execution_budget,
+                ring_samples: samples,
+                estimated_security_bits: None,
+                status: "not estimated: low-P marginal with fixed coordinate, complementary J-view with correlated operational errors, and their joint view with high-q encodings/targets/preimages require analysis; noise acceptance is not security acceptance".into(),
+            })
+        }).collect()
+    }
+
+    /// Deterministic public anchor groups, ordered by their exact modulus.
+    fn anchor_groups(&self) -> Vec<(BigUint, Vec<usize>)> {
+        let mut groups = BTreeMap::<BigUint, Vec<usize>>::new();
+        for (slot, modulus) in self.switch_moduli.iter().enumerate() {
+            groups.entry(modulus.clone()).or_default().push(slot);
+        }
+        groups.into_iter().collect()
+    }
+
+    fn switch_ring(&self, slot: usize) -> Result<mxx_dsl::Ring, RefreshSetupError> {
+        let modulus = self.switch_moduli.get(slot).ok_or(RefreshSetupError::InvalidManifest)?;
+        Ok(mxx_dsl::Ring::new(
+            IntExpr::constant(BigInt::from(modulus.clone())),
+            self.layout.ring_dimension.clone(),
+        ))
+    }
+
+    fn mask_lifts(&self) -> Result<Vec<Mat>, RefreshSetupError> {
+        let q = self
+            .refresh
+            .full_modulus
+            .evaluate(&ParamEnv::default())
+            .map_err(|_| RefreshSetupError::InvalidManifest)?;
+        Ok(self
+            .switch_moduli
+            .iter()
+            .map(|modulus| {
+                self.layout
+                    .ring()
+                    .polynomial([IntExpr::constant(&q / BigInt::from(modulus.clone()))])
+            })
+            .collect())
     }
 
     fn validate(&self) -> Result<(), RefreshSetupError> {
@@ -774,7 +958,7 @@ impl RefreshPrfInputs {
             parameters.refresh_id,
             parameters.prf_component_count(),
             parameters.coefficient_count,
-            parameters.mask_base_p_digit_count,
+            parameters.mask_base_p_digit_counts.clone(),
             parameters.fresh_error_base_p_digit_count,
         )?;
         let labels = crate::noise_refresh::refresh::RefreshPrfLabelIndex::new(
@@ -782,7 +966,7 @@ impl RefreshPrfInputs {
             parameters.refresh.crt_plaintext_moduli.len(),
             parameters.prf_component_count(),
             parameters.coefficient_count,
-            parameters.mask_base_p_digit_count,
+            parameters.mask_base_p_digit_counts.clone(),
             parameters.fresh_error_base_p_digit_count,
         )?;
         let family = RefreshPrfFamilyMaterial::from_native_encoding_batch_outputs(
@@ -825,7 +1009,7 @@ impl RefreshPrfInputs {
             parameters.refresh_id,
             parameters.prf_component_count(),
             parameters.coefficient_count,
-            parameters.mask_base_p_digit_count,
+            parameters.mask_base_p_digit_counts.clone(),
             parameters.fresh_error_base_p_digit_count,
         )?;
         if self.masks.len() != parameters.refresh.crt_plaintext_moduli.len() {
@@ -858,13 +1042,14 @@ impl RefreshPrfInputs {
         &self,
         base_p: usize,
         route_preimages: Family<mxx_dsl::Preimage>,
+        lifts: Vec<Mat>,
     ) -> Result<Vec<BggEncodingWire>, RefreshSetupError> {
         let family = self
             .masks
             .first()
             .and_then(RefreshMaskMaterial::family_material)
             .ok_or(RefreshSetupError::InvalidParameters("missing native mask family"))?;
-        aggregate_refresh_masks(base_p, family, self.masks.len(), route_preimages)
+        aggregate_refresh_masks(base_p, family, self.masks.len(), route_preimages, lifts)
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid native mask family"))
     }
 }
@@ -1035,8 +1220,9 @@ pub struct RefreshPreprocessingArtifactNames {
     pub state_public_matrix: String,
     /// Public random matrix used in the target equation.
     pub a_prime: String,
-    /// Public trapdoor matrix `B`.
-    pub public_matrix_b: String,
+    /// One public trapdoor matrix `B_P` per distinct switching modulus,
+    /// in ascending modulus order.
+    pub public_matrix_b: Vec<String>,
     /// Exact public refresh target matrix for each CRT slot.
     pub refresh_targets: Vec<String>,
     /// Per-slot sampled preimage matrices.
@@ -1057,7 +1243,7 @@ pub(crate) struct RefreshPreprocessingWires {
     pub(crate) fresh_route_rhs_decompositions: Family<mxx_dsl::Preimage>,
     pub(crate) state: BggPublicKeyWire,
     pub(crate) a_prime: Mat,
-    pub(crate) public_b: Mat,
+    pub(crate) public_b: Vec<Mat>,
     pub(crate) refresh_targets: Vec<Mat>,
     pub(crate) scaled_fresh: Vec<Mat>,
     pub(crate) masks: Vec<Mat>,
@@ -1095,6 +1281,8 @@ pub struct RefreshPreprocessingDeclaration {
     pub names: RefreshPreprocessingArtifactNames,
     /// Number of CRT slots.
     pub slot_count: usize,
+    /// Exact per-slot destination rings; equal moduli share one public anchor.
+    pub switch_moduli: Vec<BigUint>,
     /// Number of secret components.
     pub component_count: usize,
     /// Number of public-key columns covered by each PRF group (`2 * ell_beta`).
@@ -1102,7 +1290,7 @@ pub struct RefreshPreprocessingDeclaration {
     /// Number of coefficients per slot.
     pub coefficient_count: usize,
     /// Number of base-`p` digits represented by each mask PRF label.
-    pub mask_base_p_digit_count: usize,
+    pub mask_base_p_digit_counts: Vec<usize>,
     /// Number of base-`p` digits represented by the shared fresh-error label group.
     pub fresh_error_base_p_digit_count: usize,
     /// Statistical security parameter used for the joint mask transcript.
@@ -1144,7 +1332,7 @@ pub struct ImportedRefreshSetup {
     pub(crate) state: BggPublicKeyWire,
     pub(crate) setup_secret_t: Mat,
     pub(crate) a_prime: Mat,
-    pub(crate) public_b: Mat,
+    pub(crate) public_b: Vec<Mat>,
     pub(crate) refresh_targets: Vec<Mat>,
     pub(crate) readout_artifacts: NativePrfReadoutFamilyArtifacts,
     pub(crate) program_cache: ProgramCacheBatchBindings,
@@ -1396,14 +1584,6 @@ fn compact_readout_plan_schema(
         .trace_plan(ring_dimension)
         .map_err(|_| RefreshSetupError::InvalidManifest)?
         .helper_count();
-    let decoder_rows = parameters
-        .component_count
-        .checked_mul(
-            digit_count
-                .checked_add(2)
-                .ok_or(RefreshSetupError::InvalidParameters("decoder shape overflow"))?,
-        )
-        .ok_or(RefreshSetupError::InvalidParameters("decoder shape overflow"))?;
     let decoder_bound = parameters
         .resolve_decoder_preimage_bound()?
         .evaluate(&ParamEnv::default())
@@ -1422,13 +1602,20 @@ fn compact_readout_plan_schema(
             })
             .collect(),
         decoder: (0..parameters.refresh.crt_plaintext_moduli.len())
-            .map(|_| CompactPreimageSchema {
-                rows: decoder_rows,
-                columns: parameters.layout.public_key_columns(),
-                ring_dimension,
-                max_coefficient_bound: decoder_bound.clone(),
+            .map(|slot| {
+                let decoder_rows = parameters
+                    .decoder_digit_count(slot)?
+                    .checked_add(2)
+                    .and_then(|digits| parameters.component_count.checked_mul(digits))
+                    .ok_or(RefreshSetupError::InvalidParameters("decoder shape overflow"))?;
+                Ok(CompactPreimageSchema {
+                    rows: decoder_rows,
+                    columns: parameters.layout.public_key_columns(),
+                    ring_dimension,
+                    max_coefficient_bound: decoder_bound.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, RefreshSetupError>>()?,
     })
 }
 
@@ -1770,19 +1957,14 @@ fn compact_noise_snapshot_plans(
         .map_err(|_| RefreshSetupError::InvalidParameters("invalid PRF route plan"))
         .and_then(bind_crt)
     };
-    let mask = (0..p.mask_base_p_digit_count)
-        .map(|c| {
-            let value = BigUint::from(p.base_p).pow(c as u32);
-            route_plan(value.into(), 0)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let (mask, _) = compact_mask_routes(p)?;
     let fresh = scales
         .iter()
         .map(|scale| {
             (0..p.fresh_error_base_p_digit_count)
                 .map(|c| {
                     let value = scale * BigUint::from(p.base_p).pow(c as u32);
-                    route_plan(value.into(), 0)
+                    route_plan(-BigInt::from(value), 0)
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
@@ -1810,7 +1992,7 @@ fn compact_noise_snapshot_plans(
 /// by the parameter-search context.
 fn compact_mask_routes(
     parameters: &RefreshSetupParameters,
-) -> Result<(Vec<NoiseDecompositionPlan>, usize), RefreshSetupError> {
+) -> Result<(Vec<Vec<NoiseDecompositionPlan>>, usize), RefreshSetupError> {
     let p = parameters;
     let ring_dimension = p
         .layout
@@ -1865,8 +2047,29 @@ fn compact_mask_routes(
         .map_err(|_| RefreshSetupError::InvalidParameters("invalid PRF route plan"))
         .and_then(bind_crt)
     };
-    let mask = (0..p.mask_base_p_digit_count)
-        .map(|c| route_plan(BigUint::from(p.base_p).pow(c as u32).into()))
+    let full_modulus: BigUint = crt_moduli.iter().product();
+    if p.switch_moduli.len() != crt_moduli.len() ||
+        p.switch_moduli
+            .iter()
+            .any(|modulus| modulus.is_zero() || &full_modulus % modulus != BigUint::zero())
+    {
+        return Err(RefreshSetupError::InvalidParameters("invalid switching moduli"));
+    }
+    let mask = p
+        .switch_moduli
+        .iter()
+        .zip(&p.mask_base_p_digit_counts)
+        .map(|(modulus, digits)| {
+            let lift = &full_modulus / modulus;
+            (0..*digits)
+                .map(|c| {
+                    let c = u32::try_from(c).map_err(|_| {
+                        RefreshSetupError::InvalidParameters("mask digit count overflow")
+                    })?;
+                    route_plan(-BigInt::from(&lift * BigUint::from(p.base_p).pow(c)))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((mask, p.coefficient_count))
 }
@@ -1956,14 +2159,14 @@ fn compact_noise_snapshot_routes(
         .map_err(|_| RefreshSetupError::InvalidParameters("invalid PRF route plan"))
         .and_then(&bind_crt)
     };
-    let mask = (0..p.mask_base_p_digit_count)
-        .map(|c| route_plan(BigUint::from(p.base_p).pow(c as u32).into(), 0))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (mask, _) = compact_mask_routes(p)?;
     let fresh = scales
         .iter()
         .map(|scale| {
             (0..p.fresh_error_base_p_digit_count)
-                .map(|c| route_plan((scale * BigUint::from(p.base_p).pow(c as u32)).into(), 0))
+                .map(|c| {
+                    route_plan(-BigInt::from(scale * BigUint::from(p.base_p).pow(c as u32)), 0)
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2046,7 +2249,7 @@ impl RefreshPreprocessingProducer {
                 Ok::<_, RefreshSetupError>((readout_artifacts, public_readout_output))
             })?;
         // `A'` is the public random matrix used in every slot target
-        // `T_t = A_{sum,t} - mu_t A'`; its domain tag binds it to this refresh.
+        // `T_t = MS(A_{sum,t}) - Delta_t reduce(A')`; its tag binds this refresh.
         let a_prime = ring.hash_matrix(
             request.hash_key.clone(),
             HashTag::from(
@@ -2054,19 +2257,6 @@ impl RefreshPreprocessingProducer {
             ),
             (p.layout.secret_dimension, p.layout.public_key_columns()),
         );
-        let trapdoor_digits = p.layout.digit_count;
-        let trapdoor = ring.sample_trapdoor(
-            p.layout.secret_dimension,
-            p.decoder_sigma.clone(),
-            p.layout.gadget_base.clone(),
-            trapdoor_digits,
-            decoder_preimage_bound.clone(),
-        );
-        let public_b = trapdoor.public_matrix();
-        let b_columns = p
-            .component_count
-            .checked_mul(p.layout.digit_count + 2)
-            .ok_or(RefreshSetupError::InvalidManifest)?;
         let mut scales = Vec::new();
         for slot in 0..p.refresh.crt_plaintext_moduli.len() {
             // `scale = mu_t = q/q_t` is the scalar represented by the
@@ -2090,8 +2280,9 @@ impl RefreshPreprocessingProducer {
             .checked_mul(p.coefficient_count)
             .and_then(|value| value.checked_mul(p.fresh_error_base_p_digit_count))
             .ok_or(RefreshSetupError::InvalidManifest)?;
-        let mask_route_count = refresh_route_family_count(p, p.mask_base_p_digit_count)?;
-        let fresh_route_count = refresh_route_family_count(p, p.fresh_error_base_p_digit_count)?;
+        let mask_route_count = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
+        let fresh_digits = vec![p.fresh_error_base_p_digit_count; p.switch_moduli.len()];
+        let fresh_route_count = refresh_route_family_count(p, &fresh_digits)?;
         // The route constructor uses only the matrix type. Selecting one
         // symbolic member does not enumerate or share its value.
         let public_key_for_routes = public_readout_output.get_static(0);
@@ -2101,9 +2292,14 @@ impl RefreshPreprocessingProducer {
             p.base_p,
             p.prf_component_count(),
             p.coefficient_count,
-            p.mask_base_p_digit_count,
+            &p.mask_base_p_digit_counts,
             mask_route_count,
-            None,
+            Some(route_scale_family(
+                p.mask_lifts()?,
+                p.prf_component_count(),
+                p.coefficient_count,
+                &p.mask_base_p_digit_counts,
+            )?),
             decomposition_base.clone(),
             IntExpr::constant(decomposition_digit_count),
         )?;
@@ -2116,7 +2312,7 @@ impl RefreshPreprocessingProducer {
             p.base_p,
             p.prf_component_count(),
             p.coefficient_count,
-            p.fresh_error_base_p_digit_count,
+            &fresh_digits,
             fresh_route_count,
             Some(repeated_scales),
             decomposition_base.clone(),
@@ -2141,12 +2337,12 @@ impl RefreshPreprocessingProducer {
             p.refresh.crt_plaintext_moduli.len(),
             p.prf_component_count(),
             p.coefficient_count,
-            p.mask_base_p_digit_count,
+            &p.mask_base_p_digit_counts,
             p.fresh_error_base_p_digit_count,
             scales.clone(),
+            p.mask_lifts()?,
         )?;
         let mask_public_family = Family::pack(public_masks.clone())?;
-        let scale_family = Family::pack(scales.clone())?;
         let scaled_fresh_public_family = Family::pack(public_fresh.clone())?;
         let state_public = request.state.clone();
         let state_scaling_family = Family::pack(state_scaling.clone())?;
@@ -2154,29 +2350,18 @@ impl RefreshPreprocessingProducer {
             state_scaling_family.parallel_map_values(|_, decomposition| {
                 decomposition.mul_small_rhs(state_public.matrix.clone())
             })?;
-        // Build every slot target in one structural loop, then sample all
-        // preimages in a second structural loop. Each family element computes
-        // `T_t = A_t + A_{m,t} + A_{e,t} - mu_t A'`; the slot index is structural,
-        // never plaintext. This path contains only public matrices from the
-        // state and PRF/readout projections.
-        let target_family = Family::<Mat>::parallel_zip_many_values(
-            vec![mask_public_family, scale_family, scaled_fresh_public_family, scaled_state_family],
+        // Sum all high-q public terms before the single coefficient switch.
+        let sum_family = Family::<Mat>::parallel_zip_many_values(
+            vec![mask_public_family, scaled_fresh_public_family, scaled_state_family],
             |_, mut items| {
                 let scaled_state = items.pop().expect("scaled state family");
                 let fresh_public = items.pop().expect("scaled fresh family");
-                let scale = items.pop().expect("scale family");
                 let mask_public = items.pop().expect("mask family");
-                scaled_state + mask_public + fresh_public - scale * a_prime.clone()
+                scaled_state + mask_public + fresh_public
             },
         )?;
-        // Sample one preimage K_t per target; the trapdoor is captured once
-        // and broadcast, so the resulting relation is `B K_t = T_t`.
-        let refresh_targets =
-            (0..public_masks.len()).map(|slot| target_family.get_static(slot)).collect();
-        let preimage_family = target_family.parallel_map_values(|_, target| {
-            trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns()))
-        })?;
-        let ks = (0..public_masks.len()).map(|slot| preimage_family.get_static(slot)).collect();
+        let (public_b, refresh_targets, ks) =
+            sample_refresh_decoders(p, sum_family, &a_prime, &decoder_preimage_bound)?;
         let ring_dimension = p
             .layout
             .ring_dimension
@@ -2299,8 +2484,11 @@ impl RefreshPreprocessingProducer {
         let setup_public_key_count = refresh_prf_output_count(p)?
             .checked_mul(active_count)
             .ok_or(RefreshSetupError::InvalidManifest)?;
-        let mask_route_count = refresh_route_family_count(p, p.mask_base_p_digit_count)?;
-        let fresh_route_count = refresh_route_family_count(p, p.fresh_error_base_p_digit_count)?;
+        let mask_route_count = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
+        let fresh_route_count = refresh_route_family_count(
+            p,
+            &vec![p.fresh_error_base_p_digit_count; p.switch_moduli.len()],
+        )?;
         if concrete_preimage_family_count(&w.setup_public_key_rhs)? != setup_public_key_count ||
             concrete_preimage_family_count(&w.mask_route_rhs_decompositions)? != mask_route_count ||
             concrete_preimage_family_count(&w.fresh_route_rhs_decompositions)? !=
@@ -2356,7 +2544,6 @@ impl RefreshPreprocessingProducer {
         }
         let ring = p.layout.ring();
         let cols = p.layout.public_key_columns();
-        let b_columns = p.component_count * (p.layout.digit_count + 2);
         let setup_key_schema = ring.matrix_type((p.component_count * p.layout.digit_count, cols));
         if w.setup_public_key_rhs.element_type() != &setup_key_schema {
             return Err(RefreshSetupError::InvalidManifest);
@@ -2371,17 +2558,33 @@ impl RefreshPreprocessingProducer {
                 &ring.matrix_type((p.component_count, cols)),
             ) ||
             !same_matrix_type(
-                w.public_b.matrix_type(),
-                &ring.matrix_type((p.component_count, b_columns)),
-            ) ||
-            !same_matrix_type(
                 w.a_prime.matrix_type(),
                 &ring.matrix_type((p.component_count, cols)),
             )
         {
             return Err(RefreshSetupError::InvalidManifest);
         }
+        let groups = p.anchor_groups();
+        if w.public_b.len() != groups.len() {
+            return Err(RefreshSetupError::InvalidManifest);
+        }
+        let mut anchors_by_slot = BTreeMap::new();
+        for (group, (_, slots)) in groups.iter().enumerate() {
+            let low_ring = p.switch_ring(slots[0])?;
+            let b_columns = p.component_count * (p.decoder_digit_count(slots[0])? + 2);
+            if !same_matrix_type(
+                w.public_b[group].matrix_type(),
+                &low_ring.matrix_type((p.component_count, b_columns)),
+            ) {
+                return Err(RefreshSetupError::InvalidManifest);
+            }
+            for slot in slots {
+                anchors_by_slot.insert(*slot, w.public_b[group].clone());
+            }
+        }
         for (slot, (mask, k)) in w.masks.iter().zip(w.preimages.iter()).enumerate() {
+            let low_ring = p.switch_ring(slot)?;
+            let b_columns = p.component_count * (p.decoder_digit_count(slot)? + 2);
             if !same_matrix_type(mask.matrix_type(), &ring.matrix_type((p.component_count, cols))) ||
                 !same_matrix_type(
                     w.scaled_fresh[slot].matrix_type(),
@@ -2389,9 +2592,9 @@ impl RefreshPreprocessingProducer {
                 ) ||
                 !same_matrix_type(
                     w.refresh_targets[slot].matrix_type(),
-                    &ring.matrix_type((p.component_count, cols)),
+                    &low_ring.matrix_type((p.component_count, cols)),
                 ) ||
-                !same_matrix_type(k.matrix_type(), &ring.matrix_type((b_columns, cols)))
+                !same_matrix_type(k.matrix_type(), &low_ring.matrix_type((b_columns, cols)))
             {
                 return Err(RefreshSetupError::InvalidManifest);
             }
@@ -2409,10 +2612,16 @@ impl RefreshPreprocessingProducer {
                     &scale,
                 )
                 .matrix;
-            let target = scaled_state + w.masks[slot].clone() + w.scaled_fresh[slot].clone() -
-                scale * w.a_prime.clone();
+            let modulus = IntExpr::constant(BigInt::from(p.switch_moduli[slot].clone()));
+            let delta = low_ring.polynomial([IntExpr::Div(
+                Box::new(modulus.clone()),
+                Box::new(p.refresh.crt_plaintext_moduli[slot].clone()),
+            )]);
+            let target = (scaled_state + w.masks[slot].clone() + w.scaled_fresh[slot].clone())
+                .modulus_switch(modulus.clone()) -
+                delta * w.a_prime.clone().reduce_modulus(modulus);
             if !same_matrix_type(
-                k.clone().mul_small_rhs(w.public_b.clone()).matrix_type(),
+                k.clone().mul_small_rhs(anchors_by_slot[&slot].clone()).matrix_type(),
                 target.matrix_type(),
             ) {
                 return Err(RefreshSetupError::InvalidManifest);
@@ -2430,17 +2639,91 @@ impl RefreshPreprocessingProducer {
     }
 }
 
-/// Builds the one shared online decoder anchor `b=sB+e_b` used by every CRT slot.
-fn shared_decoder_base(
-    ring: &mxx_dsl::Ring,
+/// Samples the preprocessing-fixed low-P targets and decoder families.
+fn sample_refresh_decoders(
+    p: &RefreshSetupParameters,
+    sum_family: Family<Mat>,
+    a_prime: &Mat,
+    decoder_preimage_bound: &IntExpr,
+) -> Result<(Vec<Mat>, Vec<Mat>, Vec<mxx_dsl::Preimage>), RefreshSetupError> {
+    let mut public_b = Vec::new();
+    let mut targets_by_slot = BTreeMap::new();
+    let mut preimages_by_slot = BTreeMap::new();
+    for (modulus, slots) in p.anchor_groups() {
+        let low_ring = p.switch_ring(slots[0])?;
+        let modulus = IntExpr::constant(BigInt::from(modulus));
+        let digits = p.decoder_digit_count(slots[0])?;
+        let b_columns =
+            p.component_count.checked_mul(digits + 2).ok_or(RefreshSetupError::InvalidManifest)?;
+        let trapdoor = low_ring.sample_trapdoor(
+            p.component_count,
+            p.decoder_sigma.clone(),
+            p.layout.gadget_base.clone(),
+            digits,
+            decoder_preimage_bound.clone(),
+        );
+        public_b.push(trapdoor.public_matrix());
+        let low_a_prime = a_prime.clone().reduce_modulus(modulus.clone());
+        let group_sums =
+            Family::pack(slots.iter().map(|slot| sum_family.get_static(*slot)).collect())?;
+        let deltas = Family::pack(
+            slots
+                .iter()
+                .map(|slot| {
+                    low_ring.polynomial([IntExpr::Div(
+                        Box::new(modulus.clone()),
+                        Box::new(p.refresh.crt_plaintext_moduli[*slot].clone()),
+                    )])
+                })
+                .collect(),
+        )?;
+        let targets = (group_sums, deltas).parallel_zip_tuple(|_, (sum, delta)| {
+            sum.modulus_switch(modulus.clone()) - delta * low_a_prime.clone()
+        })?;
+        let preimages = targets.clone().parallel_map_values(|_, target| {
+            trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns()))
+        })?;
+        for (local, slot) in slots.into_iter().enumerate() {
+            targets_by_slot.insert(slot, targets.get_static(local));
+            preimages_by_slot.insert(slot, preimages.get_static(local));
+        }
+    }
+    let refresh_targets = targets_by_slot.into_values().collect();
+    let ks = preimages_by_slot.into_values().collect();
+    Ok((public_b, refresh_targets, ks))
+}
+
+/// Samples one online anchor per exact P group and restores original slot order.
+fn shared_decoder_bases(
+    parameters: &RefreshSetupParameters,
     secret: Mat,
-    public_b: Mat,
-    encoding_error_sigma: mxx_ir_core::RealExpr,
-    encoding_error_bound: mxx_ir_core::IntExpr,
-) -> BggEncodingWire {
-    let b_columns = public_b.matrix_type().columns.clone();
-    let anchor_error = ring.gaussian((1, b_columns), encoding_error_sigma, encoding_error_bound);
-    BggEncodingWire { vector: secret * public_b.clone() + anchor_error, plaintext: None }
+    public_b: &[Mat],
+) -> Result<(Vec<Mat>, Vec<BggEncodingWire>), RefreshSetupError> {
+    let groups = parameters.anchor_groups();
+    if public_b.len() != groups.len() {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    let mut public_by_slot = BTreeMap::new();
+    let mut bases_by_slot = BTreeMap::new();
+    for ((modulus, slots), public) in groups.into_iter().zip(public_b) {
+        let ring = parameters.switch_ring(slots[0])?;
+        let reduced_secret =
+            secret.clone().reduce_modulus(IntExpr::constant(BigInt::from(modulus)));
+        let anchor_error = ring.gaussian(
+            (1, public.matrix_type().columns.clone()),
+            parameters.encoding_error_sigma.clone(),
+            parameters.encoding_error_bound.clone(),
+        );
+        let base = BggEncodingWire {
+            vector: reduced_secret * public.clone() + anchor_error,
+            plaintext: None,
+        };
+        for slot in slots {
+            public_by_slot.insert(slot, public.clone());
+            bases_by_slot.insert(slot, base.clone());
+        }
+    }
+    Ok((public_by_slot.into_values().collect(), bases_by_slot.into_values().collect()))
 }
 
 /// Public-key-only counterpart of the refresh PRF routing performed online on
@@ -2456,22 +2739,25 @@ fn aggregate_public_refresh_prf(
     slot_count: usize,
     component_count: usize,
     coefficient_count: usize,
-    mask_digit_count: usize,
+    mask_digit_counts: &[usize],
     fresh_digit_count: usize,
     scales: Vec<Mat>,
+    mask_lifts: Vec<Mat>,
 ) -> Result<(Vec<Mat>, Vec<Mat>), RefreshSetupError> {
-    let mask_group = component_count
-        .checked_mul(coefficient_count)
-        .and_then(|value| value.checked_mul(mask_digit_count))
-        .ok_or(RefreshSetupError::InvalidManifest)?;
+    let coordinates =
+        component_count.checked_mul(coefficient_count).ok_or(RefreshSetupError::InvalidManifest)?;
+    let mask_total = mask_digit_counts.iter().try_fold(0usize, |total, digits| {
+        coordinates
+            .checked_mul(*digits)
+            .and_then(|count| total.checked_add(count))
+            .ok_or(RefreshSetupError::InvalidManifest)
+    })?;
     let fresh_group = component_count
         .checked_mul(coefficient_count)
         .and_then(|value| value.checked_mul(fresh_digit_count))
         .ok_or(RefreshSetupError::InvalidManifest)?;
-    let mask_total =
-        slot_count.checked_mul(mask_group).ok_or(RefreshSetupError::InvalidManifest)?;
     let total = mask_total.checked_add(fresh_group).ok_or(RefreshSetupError::InvalidManifest)?;
-    if slot_count == 0 || scales.len() != slot_count {
+    if slot_count == 0 || scales.len() != slot_count || mask_digit_counts.len() != slot_count {
         return Err(RefreshSetupError::InvalidManifest);
     }
 
@@ -2487,10 +2773,27 @@ fn aggregate_public_refresh_prf(
         mask_outputs,
         component_count,
         coefficient_count,
-        mask_digit_count,
-        None,
+        mask_digit_counts,
+        Some(route_scale_family(
+            mask_lifts,
+            component_count,
+            coefficient_count,
+            mask_digit_counts,
+        )?),
     )?;
-    let masks = reduce_public_family_segments(routed_masks, slot_count, mask_group)?;
+    let mut start = 0usize;
+    let masks = mask_digit_counts
+        .iter()
+        .map(|digits| {
+            let count =
+                coordinates.checked_mul(*digits).ok_or(RefreshSetupError::InvalidManifest)?;
+            let indices = Parallel::range(count)
+                .map_values(|index| Int::constant(start).add(index.as_int()))?;
+            let slice = routed_masks.clone().parallel_gather(indices)?;
+            start = start.checked_add(count).ok_or(RefreshSetupError::InvalidManifest)?;
+            Ok(reduce_public_family_segments(slice, 1, count)?.get_static(0))
+        })
+        .collect::<Result<Vec<_>, RefreshSetupError>>()?;
 
     let fresh_indices = Parallel::range(fresh_group)
         .map_values(|index| Int::constant(mask_total).add(index.as_int()))?;
@@ -2512,28 +2815,18 @@ fn aggregate_public_refresh_prf(
         repeated_fresh,
         component_count,
         coefficient_count,
-        fresh_digit_count,
+        &vec![fresh_digit_count; slot_count],
         Some(repeated_scales),
     )?;
     let fresh = reduce_public_family_segments(routed_fresh, slot_count, fresh_group)?;
-    if !family_count_is(&masks, slot_count)? || !family_count_is(&fresh, slot_count)? {
+    if !family_count_is(&fresh, slot_count)? {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    Ok((
-        (0..slot_count).map(|slot| masks.get_static(slot)).collect(),
-        (0..slot_count).map(|slot| fresh.get_static(slot)).collect(),
-    ))
+    Ok((masks, (0..slot_count).map(|slot| fresh.get_static(slot)).collect()))
 }
 
 fn refresh_prf_output_count(p: &RefreshSetupParameters) -> Result<usize, RefreshSetupError> {
-    let mask = p
-        .refresh
-        .crt_plaintext_moduli
-        .len()
-        .checked_mul(p.prf_component_count())
-        .and_then(|value| value.checked_mul(p.coefficient_count))
-        .and_then(|value| value.checked_mul(p.mask_base_p_digit_count))
-        .ok_or(RefreshSetupError::InvalidManifest)?;
+    let mask = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
     let fresh = p
         .prf_component_count()
         .checked_mul(p.coefficient_count)
@@ -2544,14 +2837,17 @@ fn refresh_prf_output_count(p: &RefreshSetupParameters) -> Result<usize, Refresh
 
 fn refresh_route_family_count(
     p: &RefreshSetupParameters,
-    digit_count: usize,
+    digit_counts: &[usize],
 ) -> Result<usize, RefreshSetupError> {
-    p.refresh
-        .crt_plaintext_moduli
-        .len()
+    if digit_counts.len() != p.refresh.crt_plaintext_moduli.len() {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    let digits = digit_counts.iter().try_fold(0usize, |sum, count| {
+        sum.checked_add(*count).ok_or(RefreshSetupError::InvalidManifest)
+    })?;
+    digits
         .checked_mul(p.prf_component_count())
         .and_then(|value| value.checked_mul(p.coefficient_count))
-        .and_then(|value| value.checked_mul(digit_count))
         .ok_or(RefreshSetupError::InvalidManifest)
 }
 
@@ -2566,16 +2862,55 @@ fn concrete_preimage_family_count(
         .ok_or(RefreshSetupError::InvalidManifest)
 }
 
+fn route_scale_family(
+    scales: Vec<Mat>,
+    component_count: usize,
+    coefficient_count: usize,
+    digit_counts: &[usize],
+) -> Result<Family<Mat>, RefreshSetupError> {
+    if scales.len() != digit_counts.len() {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    let count = digit_counts.iter().try_fold(0usize, |total, digits| {
+        component_count
+            .checked_mul(coefficient_count)
+            .and_then(|count| count.checked_mul(*digits))
+            .and_then(|count| total.checked_add(count))
+            .ok_or(RefreshSetupError::InvalidManifest)
+    })?;
+    let indices = Parallel::range(count).try_map_values(Vec::<Mat>::new(), |index, _| {
+        let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
+            index.expression(),
+            component_count,
+            coefficient_count,
+            digit_counts,
+        )
+        .map_err(|_| mxx_dsl::DslError::Schema)?;
+        Ok(Int::evaluate(slot))
+    })?;
+    Ok(Family::pack(scales)?.parallel_gather(indices)?)
+}
+
 fn route_public_prf_family(
     compiler: &ExponentLutPublicKeyCompiler,
     base_p: usize,
     public_keys: Family<Mat>,
     component_count: usize,
     coefficient_count: usize,
-    digit_count: usize,
+    digit_counts: &[usize],
     scales: Option<Family<Mat>>,
 ) -> Result<Family<Mat>, RefreshSetupError> {
     let has_scales = scales.is_some();
+    let total_digits = digit_counts.iter().try_fold(0usize, |sum, digits| {
+        sum.checked_add(*digits).ok_or(RefreshSetupError::InvalidManifest)
+    })?;
+    let expected_count = component_count
+        .checked_mul(coefficient_count)
+        .and_then(|coordinates| coordinates.checked_mul(total_digits))
+        .ok_or(RefreshSetupError::InvalidManifest)?;
+    if !family_count_is(&public_keys, expected_count)? {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
     let mut families = vec![public_keys];
     if let Some(scales) = scales {
         families.push(scales);
@@ -2583,54 +2918,13 @@ fn route_public_prf_family(
     Family::<Mat>::try_parallel_zip_many_values(families, |index, mut inputs| {
         let scale = has_scales.then(|| inputs.pop().expect("scale family"));
         let public_key = inputs.pop().ok_or(mxx_dsl::DslError::Schema)?;
-        let flat = index.expression();
-        let group_size = component_count
-            .checked_mul(coefficient_count)
-            .and_then(|value| value.checked_mul(digit_count))
-            .ok_or(mxx_dsl::DslError::Schema)?;
-        let group_quotient = mxx_ir_core::IntExpr::FloorDiv(
-            Box::new(flat.clone()),
-            Box::new(mxx_ir_core::IntExpr::constant(group_size)),
-        );
-        let within_group = mxx_ir_core::IntExpr::Sub(
-            Box::new(flat),
-            Box::new(mxx_ir_core::IntExpr::Mul(
-                Box::new(group_quotient),
-                Box::new(mxx_ir_core::IntExpr::constant(group_size)),
-            )),
+        let (_, digit, coefficient, component) = crate::noise_refresh::refresh::route_coordinates(
+            index.expression(),
+            component_count,
+            coefficient_count,
+            digit_counts,
         )
-        .canonicalize();
-        let digit_quotient = mxx_ir_core::IntExpr::FloorDiv(
-            Box::new(within_group.clone()),
-            Box::new(mxx_ir_core::IntExpr::constant(digit_count)),
-        );
-        let digit = mxx_ir_core::IntExpr::Sub(
-            Box::new(within_group.clone()),
-            Box::new(mxx_ir_core::IntExpr::Mul(
-                Box::new(digit_quotient.clone()),
-                Box::new(mxx_ir_core::IntExpr::constant(digit_count)),
-            )),
-        )
-        .canonicalize();
-        let coefficient_quotient = mxx_ir_core::IntExpr::FloorDiv(
-            Box::new(digit_quotient.clone()),
-            Box::new(mxx_ir_core::IntExpr::constant(coefficient_count)),
-        );
-        let coefficient = mxx_ir_core::IntExpr::Sub(
-            Box::new(digit_quotient),
-            Box::new(mxx_ir_core::IntExpr::Mul(
-                Box::new(coefficient_quotient),
-                Box::new(mxx_ir_core::IntExpr::constant(coefficient_count)),
-            )),
-        )
-        .canonicalize();
-        let component = mxx_ir_core::IntExpr::FloorDiv(
-            Box::new(within_group),
-            Box::new(mxx_ir_core::IntExpr::constant(
-                coefficient_count.checked_mul(digit_count).ok_or(mxx_dsl::DslError::Schema)?,
-            )),
-        )
-        .canonicalize();
+        .map_err(|_| mxx_dsl::DslError::Schema)?;
         let public_type = public_key.matrix_type();
         let ring =
             mxx_dsl::Ring::new(public_type.modulus.clone(), public_type.ring_dimension.clone());
@@ -2644,7 +2938,7 @@ fn route_public_prf_family(
             (1, 1),
             mxx_ir_core::node::ConstantMatrix::Rotation { exponent: coefficient },
         );
-        let route = scalar *
+        let route = -scalar *
             ring.constant(
                 (public_type.rows.clone(), 1),
                 mxx_ir_core::node::ConstantMatrix::UnitColumn {
@@ -2718,7 +3012,7 @@ impl RefreshPreprocessingDeclaration {
             self.component_count == 0 ||
             self.prf_component_count == 0 ||
             self.coefficient_count == 0 ||
-            self.mask_base_p_digit_count == 0 ||
+            self.mask_base_p_digit_counts.iter().any(|count| *count == 0) ||
             self.fresh_error_base_p_digit_count == 0 ||
             self.mask_statistical_security_bits == 0 ||
             self.gadget_digit_count == 0 ||
@@ -2726,6 +3020,7 @@ impl RefreshPreprocessingDeclaration {
                 Some(self.prf_component_count) ||
             self.encoding_error_bound == 0.into() ||
             self.slot_scales.len() != self.slot_count ||
+            self.switch_moduli.len() != self.slot_count ||
             self.names.preimages.len() != self.slot_count ||
             self.names.state_scaling.len() != self.slot_count ||
             self.names.setup_public_key_rhs.is_empty()
@@ -2822,7 +3117,8 @@ impl ImportedRefreshSetup {
             declaration.component_count != parameters.component_count ||
             declaration.prf_component_count != parameters.prf_component_count() ||
             declaration.coefficient_count != parameters.coefficient_count ||
-            declaration.mask_base_p_digit_count != parameters.mask_base_p_digit_count ||
+            declaration.mask_base_p_digit_counts != parameters.mask_base_p_digit_counts ||
+            declaration.switch_moduli != parameters.switch_moduli ||
             declaration.fresh_error_base_p_digit_count !=
                 parameters.fresh_error_base_p_digit_count ||
             declaration.mask_statistical_security_bits !=
@@ -2847,7 +3143,6 @@ impl ImportedRefreshSetup {
         let production_id = manifest.production_id.clone();
         let n = &declaration.names;
         let cols = parameters.layout.public_key_columns();
-        let b_columns = parameters.component_count * (parameters.layout.digit_count + 2);
         // The manifest has already checked every concrete type. Preserve the
         // parameter-derived symbolic shape in the consumer graph; no producer
         // graph or live producer wire crosses this artifact boundary.
@@ -2879,29 +3174,43 @@ impl ImportedRefreshSetup {
             ArtifactConfidentiality::Public,
             &parameters.layout.ring().matrix_type((parameters.component_count, cols)),
         )?;
-        let public_b = imported(
-            &n.public_matrix_b,
-            ArtifactConfidentiality::Public,
-            &parameters.layout.ring().matrix_type((parameters.component_count, b_columns)),
-        )?;
+        let public_b = parameters
+            .anchor_groups()
+            .iter()
+            .enumerate()
+            .map(|(group, (_, slots))| {
+                let b_columns =
+                    parameters.component_count * (parameters.decoder_digit_count(slots[0])? + 2);
+                imported(
+                    &n.public_matrix_b[group],
+                    ArtifactConfidentiality::Public,
+                    &parameters
+                        .switch_ring(slots[0])?
+                        .matrix_type((parameters.component_count, b_columns)),
+                )
+            })
+            .collect::<Result<Vec<_>, RefreshSetupError>>()?;
         let refresh_targets = n
             .refresh_targets
             .iter()
-            .map(|name| {
+            .enumerate()
+            .map(|(slot, name)| {
                 imported(
                     name,
                     ArtifactConfidentiality::Public,
-                    &parameters.layout.ring().matrix_type((parameters.component_count, cols)),
+                    &parameters.switch_ring(slot)?.matrix_type((parameters.component_count, cols)),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let state = BggPublicKeyWire { matrix: state_public_matrix, reveal_plaintext: false };
         let mut ks = Vec::new();
-        for x in &n.preimages {
+        for (slot, x) in n.preimages.iter().enumerate() {
             // Keep K typed as a preimage across the artifact boundary. The
             // consumer therefore applies the bounded witness through `mul_small_rhs`
             // instead of materializing it as an untyped matrix.
-            let matrix = parameters.layout.ring().matrix_type((b_columns, cols));
+            let b_columns =
+                parameters.component_count * (parameters.decoder_digit_count(slot)? + 2);
+            let matrix = parameters.switch_ring(slot)?.matrix_type((b_columns, cols));
             let ring = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
             ks.push(ring.preimage_artifact_input(
                 production_id.clone(),
@@ -3170,16 +3479,11 @@ impl RefreshCompiler {
         ) {
             return Err(RefreshSetupError::IdentityMismatch);
         }
-        // The decoder anchor is online material because it depends on the
-        // fresh evaluator secret `s`. Sample its one fresh error here, once,
-        // and share the resulting wire across every CRT slot.
-        let decoder_base = shared_decoder_base(
-            &setup.parameters.layout.ring(),
-            online_secret_s,
-            setup.public_b.clone(),
-            setup.parameters.encoding_error_sigma.clone(),
-            setup.parameters.encoding_error_bound.clone(),
-        );
+        // Sample one fresh error per distinct public B_P in this execution.
+        // All anchors reduce the same integer secret; switching or independently
+        // resampling the secret would change the defining decoder equation.
+        let (public_b_by_slot, decoder_bases_by_slot) =
+            shared_decoder_bases(&setup.parameters, online_secret_s, &setup.public_b)?;
         let online = RefreshPrfInputs::from_native_encoding_batch_outputs(
             &setup.parameters,
             program,
@@ -3189,6 +3493,7 @@ impl RefreshCompiler {
         let masks = online.aggregate_masks(
             setup.parameters.base_p,
             setup.mask_route_rhs_decompositions.clone(),
+            setup.parameters.mask_lifts()?,
         )?;
         let scales = (0..setup.parameters.refresh.crt_plaintext_moduli.len())
             .map(|slot| {
@@ -3206,12 +3511,12 @@ impl RefreshCompiler {
             state,
             setup.state.clone(),
             setup.a_prime.clone(),
-            setup.public_b.clone(),
+            public_b_by_slot,
             setup.refresh_targets.clone(),
             scaled_fresh,
             masks,
             setup.state_scaling.clone(),
-            decoder_base,
+            decoder_bases_by_slot,
             setup.preimages.clone(),
         )?)
     }
@@ -3242,7 +3547,7 @@ fn canonical_names(
         fresh_route_rhs_decompositions: n("fresh-route-k-rhs", 0),
         state_public_matrix: n("state-public", 0),
         a_prime: n("a-prime", 0),
-        public_matrix_b: n("public-b", 0),
+        public_matrix_b: (0..p.anchor_groups().len()).map(|group| n("public-b", group)).collect(),
         refresh_targets: (0..s).map(|i| n("refresh-target", i)).collect(),
         preimages: (0..s).map(|i| n("preimage", i)).collect(),
         readout: RefreshReadoutArtifactNames {
@@ -3479,10 +3784,11 @@ fn make_declaration(
         prf_output_wire: contract.output_wire(),
         names: n,
         slot_count: p.refresh.crt_plaintext_moduli.len(),
+        switch_moduli: p.switch_moduli.clone(),
         component_count: p.component_count,
         prf_component_count: p.prf_component_count(),
         coefficient_count: p.coefficient_count,
-        mask_base_p_digit_count: p.mask_base_p_digit_count,
+        mask_base_p_digit_counts: p.mask_base_p_digit_counts.clone(),
         fresh_error_base_p_digit_count: p.fresh_error_base_p_digit_count,
         mask_statistical_security_bits: p.mask_statistical_security_bits,
         gadget_digit_count: p.layout.digit_count,
@@ -3538,8 +3844,10 @@ fn add_setup_outputs(
             wires.fresh_route_rhs_decompositions.clone(),
         )?
         .public_output(names.state_public_matrix.clone(), wires.state.matrix.clone())?
-        .public_output(names.a_prime.clone(), wires.a_prime.clone())?
-        .public_output(names.public_matrix_b.clone(), wires.public_b.clone())?;
+        .public_output(names.a_prime.clone(), wires.a_prime.clone())?;
+    for (name, public_b) in names.public_matrix_b.iter().zip(&wires.public_b) {
+        context = context.public_output(name.clone(), public_b.clone())?;
+    }
     for (slot, target) in wires.refresh_targets.iter().enumerate() {
         context = context.public_output(names.refresh_targets[slot].clone(), target.clone())?;
     }
@@ -3626,7 +3934,8 @@ fn identity_digest(
         component_count: usize,
         prf_component_count: usize,
         coefficient_count: usize,
-        mask_base_p_digit_count: usize,
+        mask_base_p_digit_counts: &'a [usize],
+        switch_moduli: &'a [BigUint],
         fresh_error_base_p_digit_count: usize,
         mask_statistical_security_bits: usize,
         gadget_digit_count: usize,
@@ -3653,7 +3962,8 @@ fn identity_digest(
         component_count: p.component_count,
         prf_component_count: p.prf_component_count(),
         coefficient_count: p.coefficient_count,
-        mask_base_p_digit_count: p.mask_base_p_digit_count,
+        mask_base_p_digit_counts: &p.mask_base_p_digit_counts,
+        switch_moduli: &p.switch_moduli,
         fresh_error_base_p_digit_count: p.fresh_error_base_p_digit_count,
         mask_statistical_security_bits: p.mask_statistical_security_bits,
         gadget_digit_count: p.layout.digit_count,
@@ -3782,28 +4092,20 @@ fn validate_manifest(
     let slots = p.refresh.crt_plaintext_moduli.len();
     let helper_count = p.lut_width.saturating_sub(1);
     let output_count = refresh_prf_output_count(p)?;
-    let mask_route_count = refresh_route_family_count(p, p.mask_base_p_digit_count)?;
-    let fresh_route_count = refresh_route_family_count(p, p.fresh_error_base_p_digit_count)?;
+    let mask_route_count = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
+    let fresh_route_count =
+        refresh_route_family_count(p, &vec![p.fresh_error_base_p_digit_count; slots])?;
     let cols = p.layout.public_key_columns();
-    let b_columns = p
-        .component_count
-        .checked_mul(p.layout.digit_count + 2)
-        .ok_or(RefreshSetupError::InvalidManifest)?;
     let check =
         |name: &str, confidentiality: ArtifactConfidentiality, rows: usize, columns: usize| {
             check_type(name, confidentiality, matrix_type(rows, columns))
         };
-    let check_preimage = |name: &str, rows: usize, columns: usize| {
+    let check_preimage = |name: &str, ring_modulus: BigInt, rows: usize, columns: usize| {
         check_type(
             name,
             ArtifactConfidentiality::Private,
             ArtifactType::Preimage {
-                matrix: ConcreteMatrixType {
-                    modulus: modulus.clone(),
-                    ring_dimension,
-                    rows,
-                    columns,
-                },
+                matrix: ConcreteMatrixType { modulus: ring_modulus, ring_dimension, rows, columns },
                 max_coefficient_bound: decoder_preimage_bound.clone(),
             },
         )
@@ -3820,6 +4122,7 @@ fn validate_manifest(
         .ok_or(RefreshSetupError::InvalidManifest)?;
     let expected_artifact_count =
         expected_setup_artifact_count(slots, helper_count, program_cache_artifact_count)
+            .and_then(|count| count.checked_add(p.anchor_groups().len().checked_sub(1)?))
             .ok_or(RefreshSetupError::InvalidManifest)?;
     if m.artifacts.len() != expected_artifact_count {
         return Err(RefreshSetupError::InvalidManifest);
@@ -3843,15 +4146,41 @@ fn validate_manifest(
         output_count.checked_mul(active_count).ok_or(RefreshSetupError::InvalidManifest)?;
     check(&n.state_public_matrix, ArtifactConfidentiality::Public, p.component_count, cols)?;
     check(&n.a_prime, ArtifactConfidentiality::Public, p.component_count, cols)?;
-    check(&n.public_matrix_b, ArtifactConfidentiality::Public, p.component_count, b_columns)?;
+    let groups = p.anchor_groups();
+    if n.public_matrix_b.len() != groups.len() {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    for (group, (group_modulus, slots)) in groups.iter().enumerate() {
+        let b_columns = p.component_count * (p.decoder_digit_count(slots[0])? + 2);
+        check_type(
+            &n.public_matrix_b[group],
+            ArtifactConfidentiality::Public,
+            ArtifactType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(group_modulus.clone()),
+                ring_dimension,
+                rows: p.component_count,
+                columns: b_columns,
+            }),
+        )?;
+    }
     if n.refresh_targets.len() != slots {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    for name in &n.refresh_targets {
-        check(name, ArtifactConfidentiality::Public, p.component_count, cols)?;
+    for (slot, name) in n.refresh_targets.iter().enumerate() {
+        check_type(
+            name,
+            ArtifactConfidentiality::Public,
+            ArtifactType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(p.switch_moduli[slot].clone()),
+                ring_dimension,
+                rows: p.component_count,
+                columns: cols,
+            }),
+        )?;
     }
-    for preimage in &n.preimages {
-        check_preimage(preimage, b_columns, cols)?;
+    for (slot, preimage) in n.preimages.iter().enumerate() {
+        let b_columns = p.component_count * (p.decoder_digit_count(slot)? + 2);
+        check_preimage(preimage, BigInt::from(p.switch_moduli[slot].clone()), b_columns, cols)?;
     }
     let gadget_base = p
         .layout
@@ -4453,20 +4782,27 @@ impl RefreshParameterSimulationRequest {
     pub fn mask_route_gain_for_digit_count(
         setup: &RefreshSetupParameters,
         mask_digit_count: usize,
-    ) -> Result<crate::noise::RightActionNoiseGain, RefreshSetupError> {
+    ) -> Result<Vec<crate::noise::RightActionNoiseGain>, RefreshSetupError> {
         let mut candidate = setup.clone();
-        candidate.mask_base_p_digit_count = mask_digit_count;
+        candidate.mask_base_p_digit_counts.fill(mask_digit_count);
         let (plans, multiplicity) = compact_mask_routes(&candidate)?;
-        let gains =
-            crate::noise_refresh::simulation::NoiseGainPlanBuilder::derive_route_gains(&plans)
-                .map_err(|_| RefreshSetupError::InvalidParameters("invalid mask route plan"))?;
-        let mut aggregate =
-            crate::noise::RightActionNoiseGain { l1: 0u8.into(), l2_squared: 0u8.into() };
-        for gain in gains {
-            aggregate.l1 += gain.l1 * multiplicity;
-            aggregate.l2_squared += gain.l2_squared * multiplicity;
-        }
-        Ok(aggregate)
+        plans
+            .iter()
+            .map(|plans| {
+                let gains =
+                    crate::noise_refresh::simulation::NoiseGainPlanBuilder::derive_route_gains(
+                        plans,
+                    )
+                    .map_err(|_| RefreshSetupError::InvalidParameters("invalid mask route plan"))?;
+                let mut aggregate =
+                    crate::noise::RightActionNoiseGain { l1: 0u8.into(), l2_squared: 0u8.into() };
+                for gain in gains {
+                    aggregate.l1 += gain.l1 * multiplicity;
+                    aggregate.l2_squared += gain.l2_squared * multiplicity;
+                }
+                Ok(aggregate)
+            })
+            .collect()
     }
 
     /// Builds a compact snapshot with a previously derived invariant plan.
@@ -4527,13 +4863,26 @@ impl RefreshParameterSimulationRequest {
             ));
         }
         let (mask, mask_multiplicity) = compact_mask_routes(&setup)?;
+        let decoder_schema = compact_readout_plan_schema(&setup, &program)?;
+        let base = setup
+            .layout
+            .gadget_base
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .and_then(|value| value.to_biguint())
+            .ok_or(RefreshSetupError::InvalidParameters("invalid gadget base"))?;
+        let decoder = decoder_schema
+            .decoder
+            .iter()
+            .map(|schema| bounded_plan_from_schema(&base, schema))
+            .collect::<Result<Vec<_>, _>>()?;
         let routes = RefreshNoiseGainDecompositions {
             state_scaling: invariant_routes.state_scaling.clone(),
             mask,
             mask_multiplicity,
             fresh: invariant_routes.fresh.clone(),
             fresh_multiplicity: invariant_routes.fresh_multiplicity.clone(),
-            decoder: invariant_routes.decoder.clone(),
+            decoder,
         };
         let family_active_counts = active_cells.bucket_active_widths().collect::<Vec<_>>();
         setup.build_noise_snapshot_with_family_active_counts(
@@ -4933,7 +5282,7 @@ impl RefreshParameterSimulationRequest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::noise_refresh::pbc::{PbcParameters, PbcRootSeed, generate_key_layout};
     use mxx_ir_core::node::NodeKind;
@@ -4941,7 +5290,7 @@ mod tests {
 
     fn parameters(gadget_base: i32, secret_dimension: usize) -> RefreshSetupParameters {
         let layout = BggSamplerLayout {
-            modulus: 6.into(),
+            modulus: 15.into(),
             ring_dimension: 4.into(),
             secret_dimension,
             digit_count: 2,
@@ -4958,8 +5307,8 @@ mod tests {
             4,
             layout,
             RefreshCompiler {
-                full_modulus: 6.into(),
-                crt_plaintext_moduli: vec![2.into(), 3.into()],
+                full_modulus: 15.into(),
+                crt_plaintext_moduli: vec![3.into(), 5.into()],
                 reconstruction_coefficients: vec![1.into(), 1.into()],
             },
             1.into(),
@@ -5048,7 +5397,7 @@ mod tests {
     #[test]
     fn base_p_digit_counts_are_independent_of_gadget_digit_count() {
         let setup = parameters(4, 2);
-        assert_eq!(setup.mask_base_p_digit_count, 1);
+        assert_eq!(setup.mask_base_p_digit_counts, vec![1; 2]);
         assert_eq!(setup.fresh_error_base_p_digit_count, 1);
         assert_eq!(setup.prf_component_count(), 4);
         assert_eq!(setup.layout.digit_count, 2);
@@ -5086,12 +5435,12 @@ mod tests {
         let output_count = refresh_prf_output_count(&setup).expect("output count");
         assert_eq!(output_count, 48);
         assert_eq!(
-            refresh_route_family_count(&setup, setup.mask_base_p_digit_count)
+            refresh_route_family_count(&setup, &setup.mask_base_p_digit_counts)
                 .expect("mask route count"),
             32
         );
         assert_eq!(
-            refresh_route_family_count(&setup, setup.fresh_error_base_p_digit_count)
+            refresh_route_family_count(&setup, &vec![setup.fresh_error_base_p_digit_count; 2])
                 .expect("fresh route count"),
             32
         );
@@ -5108,7 +5457,8 @@ mod tests {
         let mut overflowing = parameters(4, 2);
         overflowing.coefficient_count = usize::MAX;
         assert!(
-            refresh_route_family_count(&overflowing, overflowing.mask_base_p_digit_count).is_err()
+            refresh_route_family_count(&overflowing, &overflowing.mask_base_p_digit_counts)
+                .is_err()
         );
     }
 
@@ -5188,6 +5538,122 @@ mod tests {
             1,
         )
         .expect("explicit cutoff above official is accepted");
+    }
+
+    #[test]
+    fn switched_refresh_snapshot_tracks_exact_rounding_and_unscaled_decoder() {
+        let mut setup = parameters(4, 2);
+        setup.layout.modulus = 105.into();
+        setup.layout.digit_count = 6;
+        setup.refresh.full_modulus = 105.into();
+        setup.refresh.crt_plaintext_moduli = vec![3.into(), 5.into(), 7.into()];
+        setup.refresh.reconstruction_coefficients = vec![1.into(); 3];
+        setup.switch_moduli = vec![15u8.into(), 15u8.into(), 21u8.into()];
+        setup.mask_base_p_digit_counts = vec![2; 3];
+        let profile =
+            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 }, 1)
+                .unwrap();
+        let generated = generate_key_layout(
+            &PbcParameters::paper_evaluation(10, 4),
+            PbcRootSeed(rand::random()),
+            &[0, 1, 2, 3],
+        )
+        .unwrap();
+        let active = PbcActiveCellIndex::build(&generated.public_layout).unwrap();
+        let mut snapshot =
+            RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout(
+                setup.clone(),
+                profile,
+                &generated.public_layout,
+                &active,
+            )
+            .unwrap();
+        let candidate = snapshot.simulate().unwrap();
+        assert!(!candidate.refresh.accepted);
+        eprintln!(
+            "small switched-refresh candidate (q=105,n=4,P=[15,15,21],d_m=[2,2,2]): {}",
+            serde_json::to_string(&candidate.refresh).unwrap()
+        );
+        // Real compact routes must depend on the selected J, and low-P decoder
+        // rows retain the original number of target columns.
+        assert_eq!(setup.decoder_digit_count(0).unwrap(), 4);
+        let switched_plans = compact_mask_routes(&setup).unwrap().0;
+        let mut unswitched_setup = setup.clone();
+        unswitched_setup.switch_moduli.fill(105u8.into());
+        assert_ne!(switched_plans, compact_mask_routes(&unswitched_setup).unwrap().0);
+        let mut ragged_setup = setup.clone();
+        ragged_setup.mask_base_p_digit_counts = vec![1, 3, 2];
+        let ragged_snapshot =
+            RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout(
+                ragged_setup,
+                profile,
+                &generated.public_layout,
+                &active,
+            )
+            .unwrap();
+        assert_eq!(ragged_snapshot.refresh.mask_digit_counts, vec![1, 3, 2]);
+        assert_ne!(
+            ragged_snapshot.refresh.route_gains.as_ref().unwrap().mask[0],
+            ragged_snapshot.refresh.route_gains.as_ref().unwrap().mask[1]
+        );
+
+        // Isolate the transfer equation after exercising the real setup path.
+        snapshot.initial_state_bound = 1u8.into();
+        snapshot.helper_error_cutoff = 1u8.into();
+        snapshot.initial_state_doubled_variance = AverageVariance::zero();
+        snapshot.helper_doubled_variance = AverageVariance::new(4u8.into(), 1u8.into()).unwrap();
+        let unit = RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() };
+        snapshot.refresh.route_gains = Some(RefreshRouteNoiseGains {
+            state_scaling: vec![unit.clone(); 3],
+            mask: vec![unit.clone(); 3],
+            fresh: vec![unit; 3],
+            decoder: vec![RightActionNoiseGain { l1: 5u8.into(), l2_squared: 25u8.into() }; 3],
+        });
+        let mut pre = snapshot.evaluate_pre_refresh().unwrap();
+        pre.readout_bound = 0u8.into();
+        pre.readout_variance = AverageVariance::zero();
+        let report = snapshot.simulate_worst_from_pre_refresh(pre.clone()).unwrap();
+        let slot = &report.refresh.slots[1];
+        // n=4, J=7: ceil(1/7 + 18/7) + 5 = 8, while separate
+        // ceilings would incorrectly produce 9. Decoder noise stays 5.
+        assert_eq!(slot.pre_switch_bound, 1u8.into());
+        assert_eq!(slot.lift, 7u8.into());
+        assert_eq!(slot.spacing, 3u8.into());
+        assert_eq!(slot.decoder_bound, 5u8.into());
+        assert_eq!(slot.residual_bound, 8u8.into());
+        assert_eq!(slot.mask_bound, 2u8.into());
+        assert_eq!(slot.rounding_lhs, 20u8.into());
+        assert!(!report.refresh.accepted);
+
+        let config = AverageCaseConfig { allow_average_acceptance: true, ..Default::default() };
+        let average = snapshot.simulate_average_with_pre_refresh(&config, pre.clone()).unwrap();
+        assert_eq!(
+            average.refresh.slots[1].variance,
+            AverageVariance::new(100u8.into(), 1u8.into()).unwrap()
+        );
+        let expected = average.refresh.slots[1].f_avg.clone();
+        snapshot
+            .refresh
+            .mask_digit_variances
+            .fill(AverageVariance::new(BigUint::one() << 100usize, 1u8.into()).unwrap());
+        let average = snapshot.simulate_average_with_pre_refresh(&config, pre.clone()).unwrap();
+        assert_eq!(average.refresh.slots[1].f_avg, expected);
+
+        snapshot.refresh.switch_moduli.fill(105u8.into());
+        let comparison = snapshot.simulate_worst_from_pre_refresh(pre.clone()).unwrap();
+        assert_eq!(comparison.refresh.slots[1].rounding_numerator, 0u8.into());
+        assert_eq!(comparison.refresh.slots[1].residual_bound, 6u8.into());
+        snapshot.refresh.mask_digit_counts = vec![1, 2, 3];
+        snapshot.refresh.transcript_topology.as_mut().unwrap().mask_digit_counts = vec![1, 2, 3];
+        let ragged = snapshot.simulate_worst_from_pre_refresh(pre.clone()).unwrap();
+        assert_eq!(
+            ragged.refresh.slots.iter().map(|slot| slot.mask_modulus.clone()).collect::<Vec<_>>(),
+            vec![2u8.into(), 4u8.into(), 8u8.into()]
+        );
+        for invalid in [0u8, 10, 25, 7] {
+            snapshot.refresh.switch_moduli[1] = invalid.into();
+            assert!(snapshot.simulate_worst_from_pre_refresh(pre.clone()).is_err());
+        }
     }
 
     #[test]
@@ -5280,7 +5746,7 @@ mod tests {
         // the invariant gate/readout routes from the first setup.
         for mask_digits in [1usize, 2usize] {
             let mut setup_for_digits = parameters(4, 2);
-            setup_for_digits.mask_base_p_digit_count = mask_digits;
+            setup_for_digits.mask_base_p_digit_counts.fill(mask_digits);
             let expected_plaintext =
                 setup_for_digits.layout.ring().polynomial([BigInt::from(0_u8).into()]);
             let full_request = RefreshParameterSimulationRequest::new(
@@ -5366,15 +5832,15 @@ mod tests {
     fn refresh_noise_parameters_bind_full_q_topology_and_digit_variances() {
         let setup = parameters(4, 2);
         let refresh = setup.refresh_noise_parameters().expect("complete refresh noise schema");
-        assert_eq!(refresh.global_modulus, Some(BigUint::from(6u8)));
-        assert_eq!(refresh.plaintext_moduli, vec![BigUint::from(2u8), BigUint::from(3u8)]);
+        assert_eq!(refresh.global_modulus, Some(BigUint::from(15u8)));
+        assert_eq!(refresh.plaintext_moduli, vec![BigUint::from(3u8), BigUint::from(5u8)]);
         assert_eq!(
             refresh.transcript_topology,
             Some(RefreshTranscriptTopology {
                 crt_slot_count: 2,
                 component_columns: 4,
                 coefficient_count: 4,
-                mask_digit_count: 1,
+                mask_digit_counts: vec![1; 2],
                 fresh_digit_count: 1,
             })
         );
@@ -5403,7 +5869,7 @@ mod tests {
                 .expect("concrete balanced decomposition");
         let decompositions = RefreshNoiseGainDecompositions {
             state_scaling: vec![plan.clone(), plan.clone()],
-            mask: vec![plan.clone()],
+            mask: vec![vec![plan.clone()]; 2],
             mask_multiplicity: 1,
             fresh: vec![vec![plan.clone()], vec![plan.clone()]],
             fresh_multiplicity: vec![1, 1],
@@ -5475,7 +5941,7 @@ mod tests {
         let decoder = vec![route(1.into(), 0), route(1.into(), 0)];
         let decompositions = RefreshNoiseGainDecompositions {
             state_scaling,
-            mask,
+            mask: vec![mask; 2],
             mask_multiplicity: 1,
             fresh_multiplicity: vec![1, 1],
             fresh,
@@ -5493,7 +5959,8 @@ mod tests {
                 },
             )
         };
-        assert_eq!(gains.mask, sum(&decompositions.mask));
+        assert_eq!(gains.mask[0], sum(&decompositions.mask[0]));
+        assert_eq!(gains.mask[1], sum(&decompositions.mask[1]));
         assert_eq!(gains.fresh[0], sum(&decompositions.fresh[0]));
         assert_eq!(gains.fresh[1], sum(&decompositions.fresh[1]));
         assert_ne!(gains.fresh[0], gains.fresh[1]);
@@ -5509,7 +5976,7 @@ mod tests {
         // compare against the corresponding explicit route sum.
         let compact = RefreshNoiseGainDecompositions {
             state_scaling: decompositions.state_scaling.clone(),
-            mask: vec![route(1.into(), 0), route(2.into(), 0), route(4.into(), 0)],
+            mask: vec![vec![route(1.into(), 0), route(2.into(), 0), route(4.into(), 0)]; 2],
             mask_multiplicity: 3,
             fresh: vec![
                 vec![route(7.into(), 0), route(14.into(), 0), route(28.into(), 0)],
@@ -5696,7 +6163,7 @@ mod tests {
         };
         let make_routes = |plan: &NoiseDecompositionPlan| RefreshNoiseGainDecompositions {
             state_scaling: vec![plan.clone(), plan.clone()],
-            mask: vec![plan.clone()],
+            mask: vec![vec![plan.clone()]; 2],
             mask_multiplicity: setup.coefficient_count,
             fresh: vec![vec![plan.clone()], vec![plan.clone()]],
             fresh_multiplicity: vec![setup.coefficient_count; 2],
@@ -5720,9 +6187,9 @@ mod tests {
             .expect("second snapshot");
         let first_routes = first.refresh.route_gains.as_ref().unwrap();
         let second_routes = second.refresh.route_gains.as_ref().unwrap();
-        assert_ne!(first_routes.mask.l2_squared, second_routes.mask.l2_squared);
-        assert_ne!(first.refresh.mask_digit_variances[0], second.refresh.mask_digit_variances[0]);
-        assert_ne!(first.refresh.fresh_digit_variances[0], second.refresh.fresh_digit_variances[0]);
+        assert_ne!(first_routes.mask[0].l2_squared, second_routes.mask[0].l2_squared);
+        assert_eq!(first.refresh.mask_digit_variances[0], second.refresh.mask_digit_variances[0]);
+        assert_eq!(first.refresh.fresh_digit_variances[0], second.refresh.fresh_digit_variances[0]);
     }
 
     #[test]
@@ -5750,7 +6217,7 @@ mod tests {
         };
         let baseline = identity(&setup);
         let mut changed_mask = setup.clone();
-        changed_mask.mask_base_p_digit_count = 2;
+        changed_mask.mask_base_p_digit_counts.fill(2);
         assert_ne!(baseline, identity(&changed_mask));
         let mut changed_fresh = setup.clone();
         changed_fresh.fresh_error_base_p_digit_count = 2;
@@ -5766,13 +6233,8 @@ mod tests {
         let ring = setup.layout.ring();
         let secret = ring.zero((1, 2));
         let public_b = ring.zero((2, 8));
-        let base = shared_decoder_base(
-            &ring,
-            secret,
-            public_b,
-            setup.encoding_error_sigma.clone(),
-            setup.encoding_error_bound.clone(),
-        );
+        let (_, bases) = shared_decoder_bases(&setup, secret, &[public_b]).unwrap();
+        let base = bases[0].clone();
         assert_eq!(base.vector.matrix_type().rows, 1.into());
         assert_eq!(base.vector.matrix_type().columns, 8.into());
 
@@ -5792,6 +6254,551 @@ mod tests {
         assert_eq!(gaussian_nodes, 1);
         assert_eq!(context.graph.outputs().len(), 1);
         assert!(context.graph.outputs().contains_key("decoder-result"));
+    }
+
+    #[derive(Default)]
+    pub(crate) struct NumericRefreshBounds {
+        bounds: BTreeMap<String, BigUint>,
+        paired: Vec<(BigUint, BigUint)>,
+    }
+
+    pub(crate) fn assert_numeric_refresh_outputs(
+        outputs: BTreeMap<String, (BigUint, Vec<BigUint>)>,
+        bounds: &NumericRefreshBounds,
+    ) {
+        let centered = outputs
+            .into_iter()
+            .map(|(name, (modulus, coefficients))| {
+                let half = &modulus / 2u8;
+                let coefficients = coefficients
+                    .into_iter()
+                    .map(|value| {
+                        if value > half {
+                            BigInt::from(value) - BigInt::from(modulus.clone())
+                        } else {
+                            BigInt::from(value)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let bound = bounds.bounds.get(&name).cloned().unwrap_or_default();
+                assert!(
+                    coefficients.iter().all(|value| value.magnitude() <= &bound),
+                    "{name}: observed centered operational error exceeds {bound}"
+                );
+                (name, coefficients)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (slot, (lift, rounding_numerator)) in bounds.paired.iter().enumerate() {
+            let paired = &centered[&format!("paired-error-{slot}")];
+            let pre_switch = &centered[&format!("pre-switch-error-{slot}")];
+            assert_eq!(paired.len(), pre_switch.len());
+            for (paired, pre_switch) in paired.iter().zip(pre_switch) {
+                let exact_rounding = paired * BigInt::from(lift.clone()) - pre_switch;
+                assert!(
+                    exact_rounding.magnitude() * 2u8 <= *rounding_numerator,
+                    "slot {slot}: exact paired rounding exceeded (J-1)(n+2)/(2J)"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn switched_decoder_numeric_fixture() -> (
+        mxx_ir_core::ValidatedGraph,
+        Vec<mxx_primitives::poly::dcrt::params::DCRTPolyParams>,
+        NumericRefreshBounds,
+    ) {
+        use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
+        let parameter = |name, default| {
+            std::env::var(name).ok().map(|value| value.parse::<u32>().unwrap()).unwrap_or(default)
+        };
+        let n = parameter("MXX_PRIMITIVE_TEST_RING_DIMENSION", 32);
+        let depth = parameter("MXX_PRIMITIVE_TEST_CRT_DEPTH", 3) as usize;
+        let bits = parameter("MXX_PRIMITIVE_TEST_CRT_BITS", 40) as usize;
+        let base_bits = parameter("MXX_PRIMITIVE_TEST_BASE_BITS", 4);
+        assert!(depth >= 3, "mixed-P round trip requires at least three towers");
+        let parameters = DCRTPolyParams::new(n, depth, bits, base_bits, None);
+        let q = parameters.modulus().as_ref().clone();
+        let (primes, _, _) = parameters.to_crt();
+        let ring = mxx_dsl::Ring::new(BigInt::from(q.clone()), n as usize);
+        let mut setup = parameters_for_numeric_refresh(&parameters);
+        setup.switch_moduli = (0..depth)
+            .map(|slot| &q / BigUint::from(primes[if slot + 1 == depth { 0 } else { depth - 1 }]))
+            .collect();
+        setup.mask_base_p_digit_counts = (0..depth).map(|slot| 1 + slot % 2).collect();
+        let columns = setup.layout.public_key_columns();
+        let secret = Mat::concat(
+            mxx_dsl::ConcatAxis::Columns,
+            vec![ring.polynomial([(-1).into()]), ring.polynomial([1.into()])],
+        );
+        let gadget = ring.gadget(2, setup.layout.gadget_base.clone(), setup.layout.digit_count);
+        let payload_secret = Mat::concat(
+            mxx_dsl::ConcatAxis::Columns,
+            vec![ring.polynomial([1.into()]), ring.polynomial([1.into()])],
+        );
+        let public_a = ring.uniform_residue((2, columns));
+        let a_prime = ring.uniform_residue((2, columns));
+        let message = ring.polynomial([1.into(), (-1).into()]);
+        // Nonzero coefficient-bounded input error and post-readout helper
+        // residual. This fixture tests refresh, not the full PRF evaluator.
+        let input_error = Mat::concat(
+            mxx_dsl::ConcatAxis::Columns,
+            vec![ring.polynomial((0..n).map(|_| 1.into())); columns],
+        );
+        let state = BggEncodingWire {
+            vector: secret.clone() * public_a.clone() -
+                message.clone() * (payload_secret.clone() * gadget.clone()) +
+                input_error.clone(),
+            plaintext: None,
+        };
+        let fresh = Mat::concat(
+            mxx_dsl::ConcatAxis::Columns,
+            vec![ring.polynomial((0..n).map(|_| 1.into())); columns],
+        );
+        let mut scalings = Vec::new();
+        let mut sums = Vec::new();
+        let mut masks = Vec::new();
+        let mut scaled_fresh = Vec::new();
+        let mut mask_residuals = Vec::new();
+        let mut pre_switch_errors = Vec::new();
+        let mut bounds = NumericRefreshBounds::default();
+        let inverse_two = (&q + BigUint::one()) / 2u8;
+        for slot in 0..depth {
+            let kappa = ring.polynomial([setup.refresh.scale_expression(slot).unwrap()]);
+            let scaling = (kappa.clone() * gadget.clone())
+                .decompose(setup.layout.gadget_base.clone(), setup.layout.digit_count);
+            sums.push(scaling.clone().mul_small_rhs(public_a.clone()));
+            pre_switch_errors
+                .push(scaling.clone().mul_small_rhs(input_error.clone()) + input_error.clone());
+            scalings.push(scaling);
+            scaled_fresh.push(BggEncodingWire { vector: kappa * fresh.clone(), plaintext: None });
+            let digits = setup.mask_base_p_digit_counts[slot];
+            let support = 4usize.pow(digits as u32);
+            // Enumerate native digit combinations, including endpoints and interior
+            // values. The production public normalization must yield v-M/2.
+            let raw = Mat::concat(
+                mxx_dsl::ConcatAxis::Columns,
+                (0..columns)
+                    .map(|column| {
+                        ring.polynomial((0..n as usize).map(|coefficient| {
+                            let mut value = (column * n as usize + coefficient) % support;
+                            let mut weight = BigInt::one();
+                            let mut encoded = BigInt::zero();
+                            for _ in 0..digits {
+                                let native_digit = BigInt::from(value % 4) - 1;
+                                encoded +=
+                                    &weight * (native_digit - BigInt::from(inverse_two.clone()));
+                                weight *= 4;
+                                value /= 4;
+                            }
+                            IntExpr::constant(encoded)
+                        }))
+                    })
+                    .collect(),
+            );
+            let offset = crate::noise_refresh::refresh::public_half_offset_vector(
+                &ring, 4, digits, columns, true,
+            )
+            .unwrap();
+            let lift =
+                ring.polynomial([IntExpr::constant(BigInt::from(&q / &setup.switch_moduli[slot]))]);
+            let normalized = raw + offset;
+            let expected_mask = Mat::concat(
+                mxx_dsl::ConcatAxis::Columns,
+                (0..columns)
+                    .map(|column| {
+                        ring.polynomial((0..n as usize).map(|coefficient| {
+                            IntExpr::constant(
+                                BigInt::from((column * n as usize + coefficient) % support) -
+                                    BigInt::from(support / 2),
+                            )
+                        }))
+                    })
+                    .collect(),
+            );
+            mask_residuals.push(normalized.clone() - expected_mask);
+            masks.push(BggEncodingWire {
+                vector: lift * normalized + input_error.clone(),
+                plaintext: None,
+            });
+        }
+        let cutoff = setup.resolve_decoder_preimage_bound().unwrap();
+        let decoder_cutoff = cutoff.evaluate(&ParamEnv::default()).unwrap().to_biguint().unwrap();
+        let anchor_cutoff = setup
+            .encoding_error_bound
+            .evaluate(&ParamEnv::default())
+            .unwrap()
+            .to_biguint()
+            .unwrap();
+        // Generic balanced-decomposition bound for the actual D(kappa G)
+        // action, plus one post-readout residual. Constants make this safely
+        // conservative even though the generic convolution factor is retained.
+        let pre_switch_bound =
+            BigUint::from(n) * columns * BigUint::from(1u64 << (base_bits - 1)) + 1u8;
+        for slot in 0..depth {
+            let lift = &q / &setup.switch_moduli[slot];
+            let denominator = &lift * 2u8;
+            let rounding_numerator = (&lift - BigUint::one()) * (n + 2);
+            let decoder_error = &decoder_cutoff *
+                &anchor_cutoff *
+                n *
+                (2 * (setup.decoder_digit_count(slot).unwrap() + 2));
+            let mask_bound =
+                BigUint::from(4usize.pow(setup.mask_base_p_digit_counts[slot] as u32) / 2);
+            let spacing = &setup.switch_moduli[slot] / BigUint::from(primes[slot]);
+            let final_bound = crate::noise_refresh::simulation::switched_error_bound(
+                &pre_switch_bound,
+                &lift,
+                n as usize,
+                &decoder_error,
+            )
+            .unwrap();
+            let paired_bound =
+                (&pre_switch_bound * 2u8 + &rounding_numerator + &denominator - 1u8) / &denominator;
+            assert!(
+                (mask_bound + &final_bound) * 2u8 < spacing,
+                "test parameters must satisfy the strict switched mask-plus-residual margin"
+            );
+            bounds.bounds.insert(format!("pre-switch-error-{slot}"), pre_switch_bound.clone());
+            bounds.bounds.insert(format!("paired-error-{slot}"), paired_bound);
+            bounds.bounds.insert(format!("decoder-error-{slot}"), decoder_error);
+            bounds.bounds.insert(format!("final-error-{slot}"), final_bound);
+            bounds.bounds.insert(format!("anchor-error-{slot}"), anchor_cutoff.clone());
+            bounds.paired.push((lift, rounding_numerator));
+        }
+        let (public_b, targets, preimages) =
+            sample_refresh_decoders(&setup, Family::pack(sums).unwrap(), &a_prime, &cutoff)
+                .unwrap();
+        let (slot_public, bases) = shared_decoder_bases(&setup, secret.clone(), &public_b).unwrap();
+        let anchor_errors = (0..depth)
+            .map(|slot| {
+                bases[slot].vector.clone() -
+                    secret.clone().reduce_modulus(BigInt::from(setup.switch_moduli[slot].clone())) *
+                        slot_public[slot].clone()
+            })
+            .collect::<Vec<_>>();
+        let diagnostic_state = state.vector.clone();
+        let diagnostic_masks = masks.clone();
+        let diagnostic_fresh = scaled_fresh.clone();
+        let diagnostic_scalings = scalings.clone();
+        let diagnostic_bases = bases.clone();
+        let compiler = ExponentLutEncodingCompiler::with_layout(
+            mxx_bgg::BggPublicKeyCompiler {
+                ring: ring.clone(),
+                base: setup.layout.gadget_base.clone(),
+                digit_count: setup.layout.digit_count.into(),
+            },
+            crate::layout::ExpLayout { stride_log2: 1, width_log2: n.ilog2() - 1 },
+        );
+        let bound = setup
+            .refresh
+            .bind_imported_wires(
+                &compiler,
+                state,
+                BggPublicKeyWire { matrix: public_a, reveal_plaintext: false },
+                a_prime.clone(),
+                slot_public.clone(),
+                targets.clone(),
+                scaled_fresh,
+                masks,
+                scalings,
+                bases,
+                preimages.clone(),
+            )
+            .unwrap();
+        let refreshed = setup.refresh.refresh(&compiler, &bound).unwrap().into_encoding().vector;
+        let expected = secret * a_prime - message * (payload_secret * gadget) + fresh;
+        let mut context = DslContext::new("numeric-switched-decoder")
+            .output("refresh-residual", refreshed - expected.clone())
+            .unwrap();
+        for slot in 0..depth {
+            let modulus = IntExpr::constant(BigInt::from(setup.switch_moduli[slot].clone()));
+            let low = setup.switch_ring(slot).unwrap();
+            let delta = low.polynomial([IntExpr::constant(BigInt::from(
+                &setup.switch_moduli[slot] / primes[slot],
+            ))]);
+            let support = 4usize.pow(setup.mask_base_p_digit_counts[slot] as u32);
+            let nominal_mask = Mat::concat(
+                mxx_dsl::ConcatAxis::Columns,
+                (0..columns)
+                    .map(|column| {
+                        low.polynomial((0..n as usize).map(|coefficient| {
+                            IntExpr::constant(
+                                BigInt::from((column * n as usize + coefficient) % support) -
+                                    BigInt::from(support / 2),
+                            )
+                        }))
+                    })
+                    .collect(),
+            );
+            let combined =
+                diagnostic_scalings[slot].clone().mul_small_rhs(diagnostic_state.clone()) +
+                    diagnostic_masks[slot].vector.clone() +
+                    diagnostic_fresh[slot].vector.clone();
+            let decoder_error = preimages[slot].clone().mul_small_rhs(anchor_errors[slot].clone());
+            let final_error = combined.modulus_switch(modulus.clone()) -
+                preimages[slot].clone().mul_small_rhs(diagnostic_bases[slot].vector.clone()) -
+                delta * expected.clone().reduce_modulus(modulus) -
+                nominal_mask;
+            context = context
+                .output(format!("pre-switch-error-{slot}"), pre_switch_errors[slot].clone())
+                .unwrap()
+                .output(format!("paired-error-{slot}"), final_error.clone() + decoder_error.clone())
+                .unwrap()
+                .output(format!("decoder-error-{slot}"), decoder_error)
+                .unwrap()
+                .output(format!("final-error-{slot}"), final_error)
+                .unwrap()
+                .output(format!("anchor-error-{slot}"), anchor_errors[slot].clone())
+                .unwrap();
+            context = context
+                .output(format!("mask-normalization-residual-{slot}"), mask_residuals[slot].clone())
+                .unwrap();
+            context = context
+                .output(
+                    format!("preimage-residual-{slot}"),
+                    preimages[slot].clone().mul_small_rhs(slot_public[slot].clone()) -
+                        targets[slot].clone(),
+                )
+                .unwrap();
+        }
+        let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+        let mut concrete = vec![parameters.clone()];
+        for p in setup.switch_moduli.iter().collect::<std::collections::BTreeSet<_>>() {
+            concrete.push(parameters.select_modulus(p).unwrap());
+        }
+        (graph, concrete, bounds)
+    }
+
+    #[test]
+    #[cfg_attr(feature = "gpu", serial_test::serial(dcrt_runtime))]
+    fn switched_decoder_numeric_round_trip_with_shared_fresh_error() {
+        use mxx_primitives::{
+            matrix::PolyMatrix,
+            poly::{Poly, PolyParams},
+        };
+        use mxx_runtime::{
+            MemoryArtifactStore, RuntimeValue, backend::poly::cpu_backend, transcript::SamplingMode,
+        };
+        let (graph, concrete, bounds) = switched_decoder_numeric_fixture();
+        let mut backend = cpu_backend(concrete);
+        // Two fresh execution draws of the same validated graph, with no
+        // replay/cached anchor. Structural tests separately bind draw sites.
+        for _execution in 0..2 {
+            let result = mxx_runtime::execute(
+                &graph,
+                &mut backend,
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+            )
+            .unwrap();
+            let mut observations = BTreeMap::new();
+            for (name, output) in result.outputs {
+                let RuntimeValue::Matrix(matrix) = output else {
+                    panic!("matrix output expected");
+                };
+                let mut coefficients = Vec::new();
+                for row in 0..matrix.row_size() {
+                    for column in 0..matrix.col_size() {
+                        coefficients.extend(matrix.entry(row, column).coeffs_biguints());
+                    }
+                }
+                observations
+                    .insert(name, (matrix.params().modulus().as_ref().clone(), coefficients));
+            }
+            assert_numeric_refresh_outputs(observations, &bounds);
+        }
+    }
+
+    fn parameters_for_numeric_refresh(
+        parameters: &mxx_primitives::poly::dcrt::params::DCRTPolyParams,
+    ) -> RefreshSetupParameters {
+        use mxx_primitives::poly::PolyParams;
+        let (primes, _, _) = parameters.to_crt();
+        let q = BigInt::from(parameters.modulus().as_ref().clone());
+        RefreshSetupParameters::new(
+            rand::random(),
+            4,
+            2,
+            parameters.ring_dimension() as usize,
+            1,
+            1,
+            32,
+            4,
+            BggSamplerLayout {
+                modulus: q.clone().into(),
+                ring_dimension: (parameters.ring_dimension() as usize).into(),
+                secret_dimension: 2,
+                digit_count: parameters.modulus_digits(),
+                gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
+            },
+            RefreshCompiler {
+                full_modulus: q.into(),
+                crt_plaintext_moduli: primes.into_iter().map(IntExpr::constant).collect(),
+                reconstruction_coefficients: parameters
+                    .reconst_coeffs()
+                    .into_iter()
+                    .map(|value| IntExpr::constant(BigInt::from(value)))
+                    .collect(),
+            },
+            1.into(),
+            1.into(),
+            "numeric-switched-decoder",
+        )
+    }
+
+    #[test]
+    fn switched_preprocessing_artifacts_use_only_selected_decoder_rings() {
+        use mxx_primitives::poly::PolyParams;
+        let (_, rings, _) = switched_decoder_numeric_fixture();
+        let source = &rings[0];
+        let mut setup = parameters_for_numeric_refresh(source);
+        let primes = source.to_crt().0;
+        let q = source.modulus().as_ref().clone();
+        setup.switch_moduli = (0..primes.len())
+            .map(|slot| {
+                &q / BigUint::from(
+                    primes[if slot + 1 == primes.len() { 0 } else { primes.len() - 1 }],
+                )
+            })
+            .collect();
+        let profile = SparseLwrPrfProfile::new(
+            crate::layout::ExpLayout {
+                stride_log2: 1,
+                width_log2: source.ring_dimension().ilog2() - 1,
+            },
+            2,
+        )
+        .unwrap();
+        setup.lut_width = profile.layout.width();
+        let expected = setup.layout.ring().polynomial([1.into()]);
+        let generated = generate_key_layout(
+            &PbcParameters::paper_evaluation(10, 4),
+            PbcRootSeed(rand::random()),
+            &[0, 1, 2, 3],
+        )
+        .unwrap();
+        let bundle = RefreshParameterSimulationRequest::new(
+            setup.clone(),
+            profile,
+            generated,
+            rand::random(),
+            setup.decoder_sigma.clone(),
+            expected,
+            1,
+        )
+        .unwrap()
+        .build_benchmark()
+        .unwrap();
+        assert_eq!(bundle.ring_parameters(source.clone()).unwrap().len(), 3);
+        let nodes = bundle
+            .benchmark_preprocessing_graph()
+            .graph
+            .scopes()
+            .values()
+            .flat_map(|scope| scope.nodes())
+            .collect::<Vec<_>>();
+        let trapdoors = nodes
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::TrapdoorSample { matrix_type, .. } => {
+                    Some(matrix_type.modulus.evaluate(&ParamEnv::default()).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(trapdoors.len(), 2);
+        assert!(trapdoors.iter().all(|p| *p != BigInt::from(q.clone())));
+        assert_eq!(
+            trapdoors.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            setup.switch_moduli.iter().cloned().map(BigInt::from).collect()
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::ModulusSwitch { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn online_anchor_groups_reduce_one_secret_and_sample_once_per_ring() {
+        let mut setup = parameters(4, 2);
+        setup.layout.modulus = 105.into();
+        setup.refresh.full_modulus = 105.into();
+        setup.refresh.crt_plaintext_moduli = vec![7.into(), 3.into(), 5.into()];
+        setup.refresh.reconstruction_coefficients = vec![1.into(); 3];
+        setup.switch_moduli = vec![21u8.into(), 15u8.into(), 15u8.into()];
+        setup.mask_base_p_digit_counts = vec![1, 3, 2];
+        let security = setup.anchor_security_inputs(3).unwrap();
+        assert_eq!(security.len(), 2);
+        assert_eq!(security[0].modulus, 15u8.into());
+        assert_eq!(security[0].complementary_modulus, 7u8.into());
+        assert_eq!(security[0].slots, vec![1, 2]);
+        assert_eq!(security[1].modulus, 21u8.into());
+        assert_eq!(security[1].complementary_modulus, 5u8.into());
+        for group in security {
+            assert_eq!(group.ring_dimension, 4);
+            assert_eq!(group.random_secret_polynomials, 1);
+            assert_eq!(group.fixed_augmented_coordinate, 1);
+            assert_eq!(group.ring_samples, 3 * group.anchor_columns);
+            assert_eq!(group.error_sigma, setup.encoding_error_sigma);
+            assert_eq!(group.error_coefficient_cutoff, setup.encoding_error_bound);
+            assert_eq!(group.estimated_security_bits, None);
+            assert!(group.status.contains("noise acceptance is not security acceptance"));
+        }
+        assert!(setup.anchor_security_inputs(0).is_err());
+        let ring = setup.layout.ring();
+        let secret = ring.input("shared-small-secret", (1, 2));
+        let public = setup
+            .anchor_groups()
+            .iter()
+            .map(|(p, _)| {
+                mxx_dsl::Ring::new(IntExpr::constant(BigInt::from(p.clone())), 4)
+                    .input(format!("B-{p}"), (2, 8))
+            })
+            .collect::<Vec<_>>();
+        let (anchors, bases) = shared_decoder_bases(&setup, secret.clone(), &public).unwrap();
+        assert_eq!(anchors[1].value_handle(), anchors[2].value_handle());
+        assert_ne!(anchors[0].value_handle(), anchors[1].value_handle());
+        assert_eq!(bases[1].vector.value_handle(), bases[2].vector.value_handle());
+        assert_ne!(bases[0].vector.value_handle(), bases[1].vector.value_handle());
+        let (_, second) = shared_decoder_bases(&setup, secret, &public).unwrap();
+        assert_ne!(bases[0].vector.value_handle(), second[0].vector.value_handle());
+        let mut context = DslContext::new("grouped-online-anchors");
+        for (slot, base) in bases.into_iter().enumerate() {
+            let low = setup.switch_ring(slot).unwrap();
+            context = context
+                .output(
+                    format!("decoder-result-{slot}"),
+                    base.vector * low.input(format!("consumer-{slot}"), (8, 1)),
+                )
+                .unwrap();
+        }
+        let graph = context.build().unwrap();
+        graph.validate(&Default::default()).unwrap();
+        let nodes =
+            graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::ModulusReduce { .. }))
+                .count(),
+            2
+        );
+        assert!(!nodes.iter().any(|node| matches!(
+            node.kind(),
+            NodeKind::ModulusSwitch { .. } | NodeKind::UniformIntervalSample { .. }
+        )));
+        assert!(graph.graph.outputs().keys().all(|name| name.starts_with("decoder-result-")));
     }
 
     #[test]
@@ -5899,6 +6906,35 @@ pub struct RefreshParameterSimulationBundle {
 }
 
 impl RefreshParameterSimulationBundle {
+    /// Registers the source ring and every distinct selected decoder ring.
+    /// Selection preserves the concrete CRT basis and, on GPUs, execution owner.
+    pub fn ring_parameters<P: mxx_primitives::poly::PolyParams>(
+        &self,
+        source: P,
+    ) -> Result<Vec<P>, RefreshSetupError> {
+        let source_modulus: std::sync::Arc<BigUint> = source.modulus().into();
+        if self.noise_snapshot.refresh.global_modulus.as_ref() != Some(source_modulus.as_ref()) {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
+        let mut rings = vec![source.clone()];
+        let selected = self
+            .noise_snapshot
+            .refresh
+            .switch_moduli
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for modulus in selected {
+            if modulus != source_modulus.as_ref() {
+                rings.push(source.select_modulus(modulus).ok_or(
+                    RefreshSetupError::InvalidParameters(
+                        "selected ring is not a source CRT subset",
+                    ),
+                )?);
+            }
+        }
+        Ok(rings)
+    }
+
     /// Returns the graph entrypoint used when assembling request-level facts.
     pub fn entrypoint(&self) -> &'static str {
         "verification"

@@ -800,7 +800,9 @@ impl ResolverProgress {
 /// the match intentionally has no wildcard.
 fn classify_node_kind(kind: &NodeKind) -> NodeKindClass {
     match kind {
-        NodeKind::RingAutomorphism { .. } => NodeKindClass::TypedUnsupported,
+        NodeKind::RingAutomorphism { .. } |
+        NodeKind::ModulusSwitch { .. } |
+        NodeKind::ModulusReduce { .. } => NodeKindClass::TypedUnsupported,
         NodeKind::Input { .. } |
         NodeKind::ConstantInt(_) |
         NodeKind::EvaluateInt(_) |
@@ -5988,6 +5990,14 @@ impl<'a> ProductionAdapter<'a> {
             }),
         };
         let result = match kind {
+            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+                // The application-specific refresh simulator owns these bounds;
+                // no generic noise transfer has been established here.
+                return Err(ProductionAdapterError::UnsupportedNode {
+                    kind: format!("{kind:?}"),
+                    wire: wire.clone(),
+                });
+            }
             NodeKind::RingAutomorphism { .. } => {
                 // Exponent-LUT evaluates this operation in its own noise interpreter.
                 // The generic checker has no typed automorphism operator yet.
@@ -6582,7 +6592,7 @@ impl<'a> ProductionAdapter<'a> {
                     true,
                 )?)
             }
-            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => expr(
+            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => expr(
                 self,
                 ValueOperator::Matrix(MatrixOperation::CrtRecompose {
                     plaintext_moduli: plaintext_moduli

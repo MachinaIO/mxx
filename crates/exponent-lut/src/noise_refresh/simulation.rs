@@ -224,11 +224,12 @@ pub struct TraceNoiseGains {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RefreshNoiseParameters {
     pub slot_count: usize,
-    /// The full ciphertext modulus q. It is used only to derive the per-slot
-    /// threshold kappa_t=q/q_t, never as an error gain.
+    /// Full ciphertext modulus q, used to derive exact J and kappa ratios.
     pub global_modulus: Option<BigUint>,
     pub plaintext_moduli: Vec<BigUint>,
-    pub mask_digit_count: usize,
+    /// Destination modulus P_t for each slot, in the same order as q_t.
+    pub switch_moduli: Vec<BigUint>,
+    pub mask_digit_counts: Vec<usize>,
     pub fresh_digit_count: usize,
     pub base_p: BigUint,
     pub transcript_topology: Option<RefreshTranscriptTopology>,
@@ -252,7 +253,7 @@ pub struct RefreshTranscriptTopology {
     /// Ring coefficient/rotation labels (`N`).
     pub coefficient_count: usize,
     /// Number of independent P-adic mask labels per slot.
-    pub mask_digit_count: usize,
+    pub mask_digit_counts: Vec<usize>,
     /// Number of independent P-adic fresh labels in the shared group.
     pub fresh_digit_count: usize,
 }
@@ -263,16 +264,18 @@ impl RefreshTranscriptTopology {
             self.component_columns == 0 ||
             self.component_columns % 2 != 0 ||
             self.coefficient_count == 0 ||
-            self.mask_digit_count == 0 ||
+            self.mask_digit_counts.len() != self.crt_slot_count ||
+            self.mask_digit_counts.iter().any(|count| *count == 0) ||
             self.fresh_digit_count == 0
         {
             return Err(NoiseSimulationError::InvalidRefresh("invalid transcript topology"));
         }
-        let mask_events = self
-            .crt_slot_count
+        let mask_digits = self.mask_digit_counts.iter().try_fold(0usize, |sum, count| {
+            sum.checked_add(*count).ok_or(NoiseSimulationError::IntegerConversion)
+        })?;
+        let mask_events = mask_digits
             .checked_mul(self.component_columns)
             .and_then(|value| value.checked_mul(self.coefficient_count))
-            .and_then(|value| value.checked_mul(self.mask_digit_count))
             .ok_or(NoiseSimulationError::IntegerConversion)?;
         let fresh_events = self
             .component_columns
@@ -304,7 +307,7 @@ pub struct RefreshRouteNoiseGains {
     /// Per-slot gain for the state action `G^-1(kappa_t G)`.
     pub state_scaling: Vec<RightActionNoiseGain>,
     /// Sum of L1 and squared-L2 gains over all mask P-adic digit/coordinate routes.
-    pub mask: RightActionNoiseGain,
+    pub mask: Vec<RightActionNoiseGain>,
     /// Per-slot sums over all fresh P-adic digit/coordinate routes.
     pub fresh: Vec<RightActionNoiseGain>,
     /// Per-slot gain for the directly applied decoder preimage.
@@ -340,7 +343,9 @@ impl RefreshNoiseParameters {
             self.plaintext_moduli.iter().any(|modulus| modulus <= &BigUint::one()) ||
             self.base_p < BigUint::from(2u8) ||
             !is_power_of_two(&self.base_p) ||
-            self.mask_digit_count == 0 ||
+            self.mask_digit_counts.len() != self.slot_count ||
+            self.mask_digit_counts.iter().any(|count| *count == 0) ||
+            self.switch_moduli.len() != self.slot_count ||
             self.fresh_digit_count == 0
         {
             return Err(NoiseSimulationError::InvalidRefresh("invalid refresh schema"));
@@ -351,10 +356,20 @@ impl RefreshNoiseParameters {
             {
                 return Err(NoiseSimulationError::InvalidRefresh("invalid global modulus"));
             }
+            for (modulus, destination) in self.plaintext_moduli.iter().zip(&self.switch_moduli) {
+                if destination <= &BigUint::one() ||
+                    destination % 2u8 == BigUint::zero() ||
+                    global % destination != BigUint::zero() ||
+                    destination % modulus != BigUint::zero() ||
+                    (global / destination) % 2u8 == BigUint::zero()
+                {
+                    return Err(NoiseSimulationError::InvalidRefresh("invalid switching modulus"));
+                }
+            }
         }
         if let Some(topology) = &self.transcript_topology {
             if topology.crt_slot_count != self.slot_count ||
-                topology.mask_digit_count != self.mask_digit_count ||
+                topology.mask_digit_counts != self.mask_digit_counts ||
                 topology.fresh_digit_count != self.fresh_digit_count
             {
                 return Err(NoiseSimulationError::InvalidRefresh(
@@ -367,14 +382,15 @@ impl RefreshNoiseParameters {
 
     pub fn new(
         plaintext_moduli: Vec<BigUint>,
+        switch_moduli: Vec<BigUint>,
         base_p: BigUint,
-        mask_digit_count: usize,
+        mask_digit_counts: Vec<usize>,
         fresh_digit_count: usize,
     ) -> Result<Self, NoiseSimulationError> {
         if plaintext_moduli.is_empty() ||
             plaintext_moduli.iter().any(|modulus| modulus <= &BigUint::one()) ||
             base_p < BigUint::from(2u8) ||
-            mask_digit_count == 0 ||
+            mask_digit_counts.iter().any(|count| *count == 0) ||
             fresh_digit_count == 0
         {
             return Err(NoiseSimulationError::InvalidRefresh("empty refresh noise parameters"));
@@ -383,9 +399,10 @@ impl RefreshNoiseParameters {
             slot_count: plaintext_moduli.len(),
             global_modulus: None,
             plaintext_moduli,
+            switch_moduli,
             base_p,
             transcript_topology: None,
-            mask_digit_count,
+            mask_digit_counts,
             fresh_digit_count,
             route_gains: None,
             smudging: None,
@@ -401,12 +418,13 @@ impl RefreshNoiseParameters {
         gains: RefreshRouteNoiseGains,
     ) -> Result<Self, NoiseSimulationError> {
         if gains.state_scaling.len() != self.slot_count ||
+            gains.mask.len() != self.slot_count ||
             gains.fresh.len() != self.slot_count ||
             gains.decoder.len() != self.slot_count ||
             gains
                 .state_scaling
                 .iter()
-                .chain(std::iter::once(&gains.mask))
+                .chain(gains.mask.iter())
                 .any(|gain| gain.l1.is_zero() || gain.l2_squared.is_zero()) ||
             gains
                 .fresh
@@ -445,7 +463,7 @@ impl RefreshNoiseParameters {
         if topology.crt_slot_count != self.slot_count {
             return Err(NoiseSimulationError::InvalidRefresh("transcript slot mismatch"));
         }
-        if topology.mask_digit_count != self.mask_digit_count ||
+        if topology.mask_digit_counts != self.mask_digit_counts ||
             topology.fresh_digit_count != self.fresh_digit_count
         {
             return Err(NoiseSimulationError::InvalidRefresh("transcript digit mismatch"));
@@ -511,6 +529,18 @@ pub struct RefreshSlotNoiseReport {
     pub bound: BigUint,
     pub margin: BigInt,
     pub kappa: BigUint,
+    pub switch_modulus: BigUint,
+    pub lift: BigUint,
+    pub spacing: BigUint,
+    pub mask_modulus: BigUint,
+    pub mask_bound: BigUint,
+    pub pre_switch_bound: BigUint,
+    /// Exact numerator over 2J for the deterministic paired-rounding bound.
+    pub rounding_numerator: BigUint,
+    pub rounding_denominator: BigUint,
+    pub decoder_bound: BigUint,
+    pub residual_bound: BigUint,
+    pub smudging_margin: BigInt,
     pub rounding_lhs: BigUint,
     pub rounding_margin: BigInt,
     pub fresh_error_accepted: bool,
@@ -536,11 +566,16 @@ pub struct AverageRefreshSlotNoiseReport {
     pub variance: AverageVariance,
     pub f_avg: BigUint,
     pub kappa: BigUint,
+    pub switch_modulus: BigUint,
+    pub lift: BigUint,
     pub spacing: BigUint,
+    pub rounding_numerator: BigUint,
+    pub rounding_denominator: BigUint,
     pub deterministic_mask_bound: BigUint,
     pub rounding_lhs: BigUint,
     pub rounding_margin: BigInt,
     pub rounding_deficit: BigUint,
+    pub smudging_margin: BigInt,
     pub fresh_error_accepted: bool,
     pub variance_breakdown: AverageVarianceBreakdown,
 }
@@ -826,6 +861,9 @@ impl ExponentLutNoiseSnapshot {
             .transcript_topology
             .as_ref()
             .ok_or(NoiseSimulationError::InvalidRefresh("transcript topology is required"))?;
+        if topology.coefficient_count != ring_dimension {
+            return Err(NoiseSimulationError::InvalidRefresh("transcript ring dimension mismatch"));
+        }
         let expected_coordinates = topology.mask_smudging_coordinates()?;
         if refresh
             .smudging
@@ -960,43 +998,69 @@ impl ExponentLutNoiseSnapshot {
             .route_gains
             .as_ref()
             .ok_or(NoiseSimulationError::InvalidRefresh("route gains are required"))?;
-        let mask_modulus = self.refresh.base_p.pow(self.refresh.mask_digit_count as u32);
-        // `P^d_m - 1` is the doubled centered mask bound `2*B_mask`.
-        // Consequently the strict native condition `B_m + 2*F < kappa`
-        // is equivalently `B_mask + F < q/(2*q_t)`.
-        let mask_bound = &mask_modulus - 1u8;
-        let fresh_modulus = self.refresh.base_p.pow(self.refresh.fresh_digit_count as u32);
+        self.refresh.validate()?;
+        let fresh_digits = u32::try_from(self.refresh.fresh_digit_count)
+            .map_err(|_| NoiseSimulationError::IntegerConversion)?;
+        let fresh_modulus = self.refresh.base_p.pow(fresh_digits);
+        // The unchanged fresh digit construction has this conservative support.
         let fresh_bound = &fresh_modulus - 1u8;
-        let mask_coverage_accepted = mask_modulus >= self.native_modulus;
+        let mut mask_coverage_accepted = true;
         let mut rounding_accepted = true;
         let mut fresh_error_accepted = true;
-        let domain_accepted = mask_coverage_accepted;
         let mut mask_smudging_accepted = true;
-        let mut max_route_bound = BigUint::zero();
+        let global_modulus = self
+            .refresh
+            .global_modulus
+            .as_ref()
+            .ok_or(NoiseSimulationError::InvalidRefresh("global modulus is required"))?;
+        let topology = self
+            .refresh
+            .transcript_topology
+            .as_ref()
+            .ok_or(NoiseSimulationError::InvalidRefresh("transcript topology is required"))?;
+        let smudging = self
+            .refresh
+            .smudging
+            .as_ref()
+            .ok_or(NoiseSimulationError::InvalidRefresh("smudging parameters are required"))?;
+        let smudging_shift =
+            smudging.lambda_mask.checked_add(1).ok_or(NoiseSimulationError::IntegerConversion)?;
+        let smudging_factor =
+            (BigUint::one() << smudging_shift) * BigUint::from(smudging.transcript_coordinates);
         let slots = self
             .refresh
             .plaintext_moduli
             .iter()
             .enumerate()
             .map(|(slot, modulus)| {
-                let route_bound = &routes.state_scaling[slot].l1 * &self.initial_state_bound +
-                    (&routes.mask.l1 + &routes.fresh[slot].l1) * output_bound +
-                    &routes.decoder[slot].l1 * &self.helper_error_cutoff;
+                let digits = u32::try_from(self.refresh.mask_digit_counts[slot])
+                    .map_err(|_| NoiseSimulationError::IntegerConversion)?;
+                let mask_modulus = self.refresh.base_p.pow(digits);
+                let mask_bound = &mask_modulus / 2u8;
+                mask_coverage_accepted &= mask_modulus >= self.native_modulus;
+                let pre_switch_bound = &routes.state_scaling[slot].l1 * &self.initial_state_bound +
+                    (&routes.mask[slot].l1 + &routes.fresh[slot].l1) * output_bound;
+                let decoder_bound = &routes.decoder[slot].l1 * &self.helper_error_cutoff;
+                let destination = &self.refresh.switch_moduli[slot];
+                let lift = global_modulus / destination;
+                let spacing = destination / modulus;
+                let rounding_numerator =
+                    (&lift - 1u8) * (BigUint::from(topology.coefficient_count) + 2u8);
+                let rounding_denominator = &lift * 2u8;
+                let route_bound = switched_error_bound(
+                    &pre_switch_bound,
+                    &lift,
+                    topology.coefficient_count,
+                    &decoder_bound,
+                )?;
                 let total_bound = &mask_bound + &route_bound;
-                if route_bound > max_route_bound {
-                    max_route_bound = route_bound.clone();
-                }
-                let global_modulus =
-                    self.refresh.global_modulus.as_ref().ok_or(
-                        NoiseSimulationError::InvalidRefresh("global modulus is required"),
-                    )?;
                 let kappa = global_modulus / modulus;
-                if kappa.is_zero() {
-                    return Err(NoiseSimulationError::InvalidRefresh("invalid CRT modulus ratio"));
-                }
-                let rounding_lhs = &mask_bound + &route_bound * 2u8;
+                let rounding_lhs = &total_bound * 2u8;
                 let rounding_margin =
-                    BigInt::from(kappa.clone()) - BigInt::from(rounding_lhs.clone());
+                    BigInt::from(spacing.clone()) - BigInt::from(rounding_lhs.clone());
+                let smudging_margin = BigInt::from(mask_modulus.clone()) -
+                    BigInt::from(&smudging_factor * &route_bound);
+                mask_smudging_accepted &= smudging_margin.sign() != num_bigint::Sign::Minus;
                 let fresh_ok = fresh_error_below_every_prime_factor(&fresh_bound, modulus)?;
                 rounding_accepted &= rounding_margin.sign() == num_bigint::Sign::Plus;
                 fresh_error_accepted &= fresh_ok;
@@ -1005,23 +1069,24 @@ impl ExponentLutNoiseSnapshot {
                     bound: total_bound.clone(),
                     margin: rounding_margin.clone(),
                     kappa,
+                    switch_modulus: destination.clone(),
+                    lift,
+                    spacing,
+                    mask_modulus,
+                    mask_bound,
+                    pre_switch_bound,
+                    rounding_numerator,
+                    rounding_denominator,
+                    decoder_bound,
+                    residual_bound: route_bound,
+                    smudging_margin,
                     rounding_lhs,
                     rounding_margin,
                     fresh_error_accepted: fresh_ok,
                 })
             })
             .collect::<Result<Vec<_>, NoiseSimulationError>>()?;
-        let smudging = self
-            .refresh
-            .smudging
-            .as_ref()
-            .ok_or(NoiseSimulationError::InvalidRefresh("smudging parameters are required"))?;
-        let smudging_shift =
-            smudging.lambda_mask.checked_add(1).ok_or(NoiseSimulationError::IntegerConversion)?;
-        let smudging_requirement = (BigUint::one() << smudging_shift) *
-            BigUint::from(smudging.transcript_coordinates) *
-            max_route_bound;
-        mask_smudging_accepted &= mask_modulus >= smudging_requirement;
+        let domain_accepted = mask_coverage_accepted;
         let accepted =
             rounding_accepted && fresh_error_accepted && domain_accepted && mask_smudging_accepted;
         Ok(RefreshNoiseReport {
@@ -1142,14 +1207,11 @@ impl ExponentLutNoiseSnapshot {
             .route_gains
             .as_ref()
             .ok_or(NoiseSimulationError::InvalidRefresh("route gains are required"))?;
-        let mask_modulus = self.refresh.base_p.pow(self.refresh.mask_digit_count as u32);
-        // `P^d_m - 1` is the doubled centered mask bound `2*B_mask`.
-        // Thus `B_m + 2*F < kappa` is the same strict condition as
-        // `B_mask + F < q/(2*q_t)` after dividing by two.
-        let mask_bound = &mask_modulus - 1u8;
-        let fresh_modulus = self.refresh.base_p.pow(self.refresh.fresh_digit_count as u32);
+        let fresh_digits = u32::try_from(self.refresh.fresh_digit_count)
+            .map_err(|_| NoiseSimulationError::IntegerConversion)?;
+        let fresh_modulus = self.refresh.base_p.pow(fresh_digits);
         let fresh_bound = &fresh_modulus - 1u8;
-        let mask_coverage_accepted = mask_modulus >= self.native_modulus;
+        let mask_coverage_accepted = hard_refresh.mask_coverage_accepted;
         let topology = self
             .refresh
             .transcript_topology
@@ -1161,13 +1223,21 @@ impl ExponentLutNoiseSnapshot {
             // Mask and fresh PRF labels are distinct iid routed outputs;
             // their variances add rather than forming a coherent combined
             // state action.
+            let lift = &hard_refresh.slots[slot].lift;
+            let switched = |variance: AverageVariance| {
+                AverageVariance::new(variance.numerator, variance.denominator * lift * lift)
+                    .map_err(NoiseSimulationError::from)
+            };
             let breakdown = AverageVarianceBreakdown {
-                readout_mask: output_variance.scaled(&routes.mask.l2_squared),
-                readout_fresh: output_variance.scaled(&routes.fresh[slot].l2_squared),
+                readout_mask: switched(output_variance.scaled(&routes.mask[slot].l2_squared))?,
+                readout_fresh: switched(output_variance.scaled(&routes.fresh[slot].l2_squared))?,
                 decoder: self.helper_doubled_variance.scaled(&routes.decoder[slot].l2_squared),
-                state: self
-                    .initial_state_doubled_variance
-                    .scaled(&routes.state_scaling[slot].l2_squared),
+                state: switched(
+                    self.initial_state_doubled_variance
+                        .scaled(&routes.state_scaling[slot].l2_squared),
+                )?,
+                // Nominal payload distribution is reported separately; it is
+                // not an operational error and is not added to the tail.
                 mask_digit: self.refresh.mask_digit_variances[slot].clone(),
                 fresh_digit: self.refresh.fresh_digit_variances[slot].clone(),
             };
@@ -1175,9 +1245,7 @@ impl ExponentLutNoiseSnapshot {
                 .readout_mask
                 .add(&breakdown.readout_fresh)
                 .add(&breakdown.decoder)
-                .add(&breakdown.state)
-                .add(&breakdown.mask_digit)
-                .add(&breakdown.fresh_digit);
+                .add(&breakdown.state);
             Ok::<(AverageVariance, AverageVarianceBreakdown), NoiseSimulationError>((
                 variance, breakdown,
             ))
@@ -1187,14 +1255,26 @@ impl ExponentLutNoiseSnapshot {
         let mut domain_accepted = mask_coverage_accepted;
         let mut mask_smudging_accepted = true;
         let mut max_f_avg = BigUint::zero();
+        let smudging = self
+            .refresh
+            .smudging
+            .as_ref()
+            .ok_or(NoiseSimulationError::InvalidRefresh("smudging parameters are required"))?;
+        let smudging_shift =
+            smudging.lambda_mask.checked_add(1).ok_or(NoiseSimulationError::IntegerConversion)?;
+        let smudging_factor =
+            (BigUint::one() << smudging_shift) * BigUint::from(smudging.transcript_coordinates);
         let slots = self
             .refresh
             .plaintext_moduli
             .iter()
             .enumerate()
             .map(|(slot, modulus)| {
+                let exact = &hard_refresh.slots[slot];
+                let mask_bound = &exact.mask_bound;
                 let (variance, variance_breakdown) = route_variance(slot)?;
-                let f_avg = average_favg(&z_squared, &variance, config.tail_correction_bits)?;
+                let f_avg = average_favg(&z_squared, &variance, config.tail_correction_bits)? +
+                    ceil_div(&exact.rounding_numerator, &exact.rounding_denominator)?;
                 if f_avg > max_f_avg {
                     max_f_avg = f_avg.clone();
                 }
@@ -1206,10 +1286,13 @@ impl ExponentLutNoiseSnapshot {
                 if kappa.is_zero() {
                     return Err(NoiseSimulationError::InvalidRefresh("invalid CRT modulus ratio"));
                 }
-                let rounding_lhs = &mask_bound + &f_avg * 2u8;
+                let rounding_lhs = (mask_bound + &f_avg) * 2u8;
                 let rounding_margin =
-                    BigInt::from(kappa.clone()) - BigInt::from(rounding_lhs.clone());
+                    BigInt::from(exact.spacing.clone()) - BigInt::from(rounding_lhs.clone());
                 let rounding = rounding_margin.sign() == num_bigint::Sign::Plus;
+                let smudging_margin = BigInt::from(exact.mask_modulus.clone()) -
+                    BigInt::from(&smudging_factor * &f_avg);
+                mask_smudging_accepted &= smudging_margin.sign() != num_bigint::Sign::Minus;
                 let fresh = fresh_error_below_every_prime_factor(&fresh_bound, modulus)?;
                 let domain = true;
                 rounding_accepted &= rounding;
@@ -1225,27 +1308,21 @@ impl ExponentLutNoiseSnapshot {
                     variance,
                     f_avg,
                     kappa: kappa.clone(),
-                    spacing: kappa,
+                    switch_modulus: exact.switch_modulus.clone(),
+                    lift: exact.lift.clone(),
+                    spacing: exact.spacing.clone(),
+                    rounding_numerator: exact.rounding_numerator.clone(),
+                    rounding_denominator: exact.rounding_denominator.clone(),
                     deterministic_mask_bound: mask_bound.clone(),
                     rounding_lhs,
                     rounding_margin,
                     rounding_deficit,
+                    smudging_margin,
                     fresh_error_accepted: fresh,
                     variance_breakdown,
                 })
             })
             .collect::<Result<Vec<_>, NoiseSimulationError>>()?;
-        let smudging = self
-            .refresh
-            .smudging
-            .as_ref()
-            .ok_or(NoiseSimulationError::InvalidRefresh("smudging parameters are required"))?;
-        let smudging_shift =
-            smudging.lambda_mask.checked_add(1).ok_or(NoiseSimulationError::IntegerConversion)?;
-        let smudging_requirement = (BigUint::one() << smudging_shift) *
-            BigUint::from(smudging.transcript_coordinates) *
-            max_f_avg.clone();
-        mask_smudging_accepted &= mask_modulus >= smudging_requirement;
         let correctness_accepted =
             rounding_accepted && fresh_error_accepted && domain_accepted && mask_smudging_accepted;
         // The selected correctness authority is average-case.  The worst-case
@@ -1310,6 +1387,20 @@ fn integer_sqrt_floor(value: &BigUint) -> BigUint {
         }
     }
     low
+}
+
+/// Exact hard operational budget shared by reports and numeric diagnostics.
+pub(crate) fn switched_error_bound(
+    pre_switch: &BigUint,
+    lift: &BigUint,
+    ring_dimension: usize,
+    decoder: &BigUint,
+) -> Result<BigUint, NoiseSimulationError> {
+    if lift.is_zero() {
+        return Err(NoiseSimulationError::InvalidRefresh("zero switching lift"));
+    }
+    let rounding = (lift - 1u8) * (BigUint::from(ring_dimension) + 2u8);
+    Ok(ceil_div(&(pre_switch * 2u8 + rounding), &(lift * 2u8))? + decoder)
 }
 
 fn ceil_div(numerator: &BigUint, denominator: &BigUint) -> Result<BigUint, NoiseSimulationError> {
@@ -1806,15 +1897,16 @@ mod tests {
     fn refresh_route_and_smudging_artifacts_are_required() {
         let refresh = RefreshNoiseParameters::new(
             vec![BigUint::from(257u16), BigUint::from(263u16)],
+            vec![BigUint::from(257u16) * 263u16; 2],
             BigUint::from(16u8),
-            2,
+            vec![2; 2],
             2,
         )
         .unwrap();
         let unit = RightActionNoiseGain { l1: BigUint::one(), l2_squared: BigUint::one() };
         let routes = RefreshRouteNoiseGains {
             state_scaling: vec![unit.clone(), unit.clone()],
-            mask: unit.clone(),
+            mask: vec![unit.clone(); 2],
             fresh: vec![unit.clone(), unit.clone()],
             decoder: vec![unit.clone(), unit.clone()],
         };
@@ -1826,7 +1918,13 @@ mod tests {
                         RightActionNoiseGain { l1: BigUint::zero(), l2_squared: BigUint::one() },
                         RightActionNoiseGain { l1: BigUint::zero(), l2_squared: BigUint::one() }
                     ],
-                    mask: RightActionNoiseGain { l1: BigUint::one(), l2_squared: BigUint::one() },
+                    mask: vec![
+                        RightActionNoiseGain {
+                            l1: BigUint::one(),
+                            l2_squared: BigUint::one()
+                        };
+                        2
+                    ],
                     fresh: Vec::new(),
                     decoder: Vec::new(),
                 })
@@ -1915,8 +2013,9 @@ mod tests {
     fn refresh_artifacts_require_per_slot_variance() {
         let refresh = RefreshNoiseParameters::new(
             vec![BigUint::from(3u8), BigUint::from(5u8)],
+            vec![BigUint::from(15u8); 2],
             BigUint::from(16u8),
-            2,
+            vec![2; 2],
             2,
         )
         .unwrap();
@@ -2293,7 +2392,7 @@ mod tests {
             crt_slot_count: 2,
             component_columns: 4,
             coefficient_count: 3,
-            mask_digit_count: 1,
+            mask_digit_counts: vec![1; 2],
             fresh_digit_count: 1,
         };
         let config = AverageCaseConfig {

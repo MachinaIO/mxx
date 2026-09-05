@@ -2,6 +2,20 @@ use std::{env, path::PathBuf};
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=native");
+    println!("cargo::rerun-if-changed=src/poly/dcrt/native.rs");
+    cxx_build::bridge("src/poly/dcrt/native.rs")
+        .file("native/ExactBasis.cc")
+        .include("native")
+        .include("/usr/local/include")
+        .include("/usr/local/include/openfhe")
+        .include("/usr/local/include/openfhe/core")
+        .include("/usr/local/include/openfhe/pke")
+        .include("/usr/local/include/openfhe/binfhe")
+        .include("/usr/local/include/openfhe/third-party/include")
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-fopenmp")
+        .compile("mxx_exact_basis");
 
     // Native library metadata must propagate through the mxx-primitives rlib to
     // binaries owned by dependent workspace crates.

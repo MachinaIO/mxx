@@ -48,6 +48,19 @@ pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
+    // Small unit-test defaults; overrides permit the same production path to
+    // exercise larger coefficient vectors and CRT bases without source edits.
+    let dimension = positive_usize("MXX_PRIMITIVE_TEST_RING_DIMENSION", 32).unwrap();
+    let depth = positive_usize("MXX_PRIMITIVE_TEST_CRT_DEPTH", 4).unwrap();
+    let bits = positive_usize("MXX_PRIMITIVE_TEST_CRT_BITS", 30).unwrap();
+    let base_bits = positive_usize("MXX_PRIMITIVE_TEST_BASE_BITS", 2).unwrap();
+    assert!(dimension >= 16 && dimension.is_power_of_two());
+    assert!(depth >= 4);
+    (u32::try_from(dimension).unwrap(), depth, bits, u32::try_from(base_bits).unwrap())
+}
+
+#[cfg(test)]
 mod tests {
     use super::{gpu_vram_percent, positive_usize};
 

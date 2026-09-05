@@ -11,6 +11,7 @@ fn reviewed_estimator_bits(universe: usize, q_l: usize) -> u64 {
 
 fn mock_prepared(candidate: Candidate) -> PreparedCandidate {
     PreparedCandidate {
+        anchor_security_inputs: Vec::new(),
         candidate,
         ring_dimension: 1 << candidate.log_ring_dimension,
         bucket_width: 3,
@@ -768,6 +769,7 @@ fn accepted_phase_two_profile_persists_native_q_and_rejects_out_of_grid_tamperin
             layout_id: "aa".repeat(32),
             program_id: "bb".repeat(32),
             checker_accepted: true,
+            switched_security_status: "low-P marginal estimates not supplied; cross-modulus joint-view security unresolved".into(),
             sparse_lwr_q_l: profile.q_l,
             sparse_lwr_p: profile.p,
             sparse_lwr_tier: profile.tier,
@@ -860,6 +862,9 @@ fn result_serialization_is_redacted() {
         layout_id: "aa".repeat(32),
         program_id: "bb".repeat(32),
         checker_accepted: true,
+        switched_security_status:
+            "low-P marginal estimates not supplied; cross-modulus joint-view security unresolved"
+                .into(),
         sparse_lwr_q_l: 8,
         sparse_lwr_p: 2,
         sparse_lwr_tier: SparseLwrSecurityTier::Primary100,
@@ -901,6 +906,9 @@ fn persisted_report_declares_minimality_scope_and_evaluated_phase_one_rows() {
         layout_id: "aa".repeat(32),
         program_id: "bb".repeat(32),
         checker_accepted: true,
+        switched_security_status:
+            "low-P marginal estimates not supplied; cross-modulus joint-view security unresolved"
+                .into(),
         sparse_lwr_q_l: sparse_profile.q_l,
         sparse_lwr_p: sparse_profile.p,
         sparse_lwr_tier: sparse_profile.tier,
@@ -963,7 +971,7 @@ fn sparse_lwr_estimator_arguments_use_exact_reviewed_model() {
 
 #[test]
 fn reconstruction_coefficients_come_from_the_dcrt_parameters() {
-    let dcrt = DCRTPolyParams::new(32, 2, 28, 27);
+    let dcrt = DCRTPolyParams::new(32, 2, 28, 27, None);
     let coefficients = exact_reconstruction_coefficients(&dcrt);
     assert_eq!(coefficients.len(), 2);
     assert!(dcrt.reconst_coeffs().iter().any(|value| value != &BigUint::from(1_u8)));
@@ -995,14 +1003,347 @@ fn fresh_digit_selection_checks_prime_factors_of_composite_towers() {
 }
 
 #[test]
+fn coarse_switch_ring_candidates_preserve_slots_and_evaluate_real_noise() {
+    assert_eq!(
+        candidate_switch_moduli(&[3, 5, 7], 2).unwrap(),
+        vec![15u8.into(), 15u8.into(), 35u8.into()]
+    );
+    assert_eq!(candidate_switch_moduli(&[3, 5, 7], 3).unwrap(), vec![105u8.into(); 3]);
+    assert!(candidate_switch_moduli(&[3, 5, 7], 0).is_err());
+    assert!(
+        mask_digit_search_bounds(
+            &4u8.into(),
+            &4u8.into(),
+            &[3, 5, 7],
+            &candidate_switch_moduli(&[3, 5, 7], 1).unwrap()
+        )
+        .is_err()
+    );
+    let mut config = SearchConfig::reviewed();
+    config.sparse_lwr_universe = 10;
+    config.sparse_lwr_weight = 4;
+    config.sparse_lwr_modulus = 32;
+    config.sparse_lwr_output_modulus = 4;
+    let candidate = Candidate { crt_depth: 3, log_ring_dimension: 5, crt_bits: 40, base_bits: 4 };
+    match prepare_candidate(&config, candidate) {
+        Ok(mut prepared) => {
+            assert!(check_refresh_bundle(&config, candidate, &mut prepared).unwrap());
+            let snapshot = prepared.noise_snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.refresh.switch_moduli.len(), 3);
+            eprintln!(
+                "coarse switched candidate accepted by configured noise authority: P={:?}, report={}",
+                snapshot.refresh.switch_moduli,
+                serde_json::to_string(prepared.production_report.as_ref().unwrap()).unwrap()
+            );
+        }
+        Err(CandidatePreparationError::Infeasible(reason)) => {
+            assert!(reason.contains("coarse switched-ring scan rejected"));
+            assert!((1..=3).all(|retained| reason.contains(&format!("retained={retained}:"))));
+            eprintln!("coarse switched candidate concrete rejection: {reason}");
+        }
+        Err(error) => panic!("unexpected candidate construction failure: {error:?}"),
+    }
+}
+
+#[test]
+fn profile_b_switched_refresh_named_average_authority_component_search() {
+    // Pure public-layout/noise interpretation: no backend, artifact sampling,
+    // external estimator, integration execution, or benchmark is invoked.
+    let mut config = SearchConfig::reviewed();
+    config.noise_model = NoiseSearchModel::AverageCase;
+    config.crt_depths = 27..=27;
+    config.log_ring_dimensions = 16..=16;
+    config.sparse_lwr_universe = 8192;
+    config.sparse_lwr_weight = 18;
+    config.sparse_lwr_modulus = 4096;
+    config.sparse_lwr_output_modulus = 32;
+    let candidate =
+        Candidate { crt_depth: 27, log_ring_dimension: 16, crt_bits: 50, base_bits: 25 };
+    eprintln!(
+        "Profile B: n=65536, depth=27, crt_bits=50, base_bits=25, Q=4096, p=32, v=8192, h=18; security target=100; authority={:?}; coarse contiguous retained-width groups and uniform mask digits; security acceptance is NOT inferred from noise acceptance",
+        average_case_config(&config).unwrap()
+    );
+    match prepare_candidate(&config, candidate) {
+        Ok(mut prepared) => {
+            assert!(check_refresh_bundle(&config, candidate, &mut prepared).unwrap());
+            let report = prepared.production_report.as_ref().unwrap();
+            assert!(report.average_case.as_ref().unwrap().accepted);
+            assert_eq!(report.anchor_security_inputs.len(), 6);
+            assert!(report.anchor_security_inputs.iter().all(
+                |group| group.modulus.bits() == 250 &&
+                    group.ring_dimension == 65536 &&
+                    group.anchor_columns == 24 &&
+                    group.execution_budget == 1 &&
+                    group.estimated_security_bits.is_none()
+            ));
+            assert_eq!(prepared.mask_base_p_digit_count, 38);
+            eprintln!("PROFILE_B_NOISE_ACCEPTED {}", serde_json::to_string(report).unwrap());
+        }
+        Err(CandidatePreparationError::Infeasible(reason)) => {
+            panic!("previously accepted Profile B noise candidate regressed: {reason}");
+        }
+        Err(error) => panic!("Profile B component construction failed: {error:?}"),
+    }
+}
+
+#[test]
+#[ignore = "explicit full retained-width parameter search; no backend execution"]
+fn profile_b_minimum_mask_retained_width_search() {
+    let mut config = SearchConfig::reviewed();
+    config.noise_model = NoiseSearchModel::AverageCase;
+    config.crt_depths = 27..=27;
+    config.log_ring_dimensions = 16..=16;
+    config.sparse_lwr_universe = 8192;
+    config.sparse_lwr_weight = 18;
+    config.sparse_lwr_modulus = 4096;
+    config.sparse_lwr_output_modulus = 32;
+    let candidate =
+        Candidate { crt_depth: 27, log_ring_dimension: 16, crt_bits: 50, base_bits: 25 };
+    let mut context = build_candidate_context(&config, candidate).unwrap();
+    let started = std::time::Instant::now();
+    let run =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/profile_b_minimum_mask_search")
+        .join(run.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    eprintln!("SEARCH_DIRECTORY {}", directory.display());
+    let mut rows = Vec::new();
+    let mut selected: Option<(usize, usize)> = None;
+    for retained in 1..=candidate.crt_depth {
+        eprintln!(
+            "SEARCH_WIDTH_START retained={retained} elapsed={:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+        context.switch_moduli = candidate_switch_moduli(&context.crt_moduli, retained).unwrap();
+        match prepare_candidate_from_ring_context(&config, &context, None, false) {
+            Ok(mut prepared) => {
+                assert!(check_refresh_bundle(&config, candidate, &mut prepared).unwrap());
+                let report = prepared.production_report.as_ref().unwrap();
+                let average = report.average_case.as_ref().unwrap();
+                let snapshot = prepared.noise_snapshot.as_ref().unwrap();
+                let mask_digits = prepared.mask_base_p_digit_count;
+                let score = (candidate.crt_depth * mask_digits, retained);
+                if selected.is_none_or(|best| score < best) {
+                    selected = Some(score);
+                }
+                let row = serde_json::json!({
+                    "retained": retained, "accepted": true,
+                    "mask_digits": mask_digits, "sum_mask_digits": score.0,
+                    "fresh_digits": prepared.fresh_error_base_p_digit_count,
+                    "label_count": prepared.prf_label_count,
+                    "q": snapshot.refresh.global_modulus.as_ref().unwrap().to_string(),
+                    "q_t": snapshot.refresh.plaintext_moduli.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "P_t": snapshot.refresh.switch_moduli.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "M": snapshot.refresh.base_p.pow(mask_digits as u32).to_string(),
+                    "max_F_avg": average.refresh.max_f_avg.to_string(),
+                    "minimum_rounding_margin": average.refresh.slots.iter().map(|slot| &slot.rounding_margin).min().unwrap().to_string(),
+                    "minimum_smudging_margin": average.refresh.slots.iter().map(|slot| &slot.smudging_margin).min().unwrap().to_string(),
+                    "joint_event_count": average.refresh.joint_event_count.to_string(),
+                    "z_squared": format!("{}/{}", average.refresh.z_squared.numerator, average.refresh.z_squared.denominator),
+                    "anchor_group_count": report.anchor_security_inputs.len(),
+                    "decoder_columns": report.anchor_security_inputs.iter().map(|group| group.anchor_columns).collect::<Vec<_>>(),
+                    "official_preimage_bound": prepared.official_preimage_bound.to_string(),
+                    "selected_preimage_bound": prepared.selected_preimage_bound.to_string(),
+                    "fresh_margins": report.fresh_error_margins,
+                    "slots": average.refresh.slots.iter().map(|slot| serde_json::json!({
+                        "slot": slot.slot, "P": slot.switch_modulus.to_string(), "J": slot.lift.to_string(),
+                        "Delta": slot.spacing.to_string(), "F_avg": slot.f_avg.to_string(),
+                        "B_m": slot.deterministic_mask_bound.to_string(),
+                        "rounding_margin": slot.rounding_margin.to_string(),
+                        "smudging_margin": slot.smudging_margin.to_string(),
+                    })).collect::<Vec<_>>(),
+                });
+                fs::write(
+                    directory.join(format!("retained-{retained}-full-report.json")),
+                    serde_json::to_vec_pretty(report).unwrap(),
+                )
+                .unwrap();
+                eprintln!(
+                    "SEARCH_WIDTH_ACCEPT retained={retained} dm={mask_digits} labels={} elapsed={:.3}s",
+                    prepared.prf_label_count,
+                    started.elapsed().as_secs_f64()
+                );
+                rows.push(row);
+            }
+            Err(CandidatePreparationError::Infeasible(reason)) => {
+                eprintln!(
+                    "SEARCH_WIDTH_REJECT retained={retained} reason={reason} elapsed={:.3}s",
+                    started.elapsed().as_secs_f64()
+                );
+                rows.push(
+                    serde_json::json!({"retained": retained, "accepted": false, "reason": reason}),
+                );
+            }
+            Err(error) => panic!("unexpected search error at retained={retained}: {error:?}"),
+        }
+        fs::write(directory.join("widths.json"), serde_json::to_vec_pretty(&rows).unwrap())
+            .unwrap();
+    }
+    let (sum_digits, retained) = selected.expect("no accepted candidate in the declared grid");
+    let summary = serde_json::json!({
+        "scope": "minimum sum of mask digits in all retained widths 1..27, contiguous groups, uniform digits; not exhaustive subsets or ragged optimum",
+        "baseline": {"n":65536,"crt_depth":27,"crt_bits":50,"base_bits":25,"Q":4096,"p":32,"v":8192,"h":18,"encoding_sigma":4.0,"decoder_sigma":4.578},
+        "noise_authority":"AverageCase TFHE-style heuristic with conservative Add",
+        "failure_exponent":100,"mask_statistical_security_bits":100,"tail_correction_bits":0,
+        "selected_retained":retained,"sum_mask_digits":sum_digits,
+        "joint_security":"unresolved; noise acceptance is not a whole-construction security claim",
+        "elapsed_seconds":started.elapsed().as_secs_f64(), "candidates":rows,
+    });
+    fs::write(directory.join("search.json"), serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+    eprintln!(
+        "SEARCH_COMPLETE retained={retained} sum_mask_digits={sum_digits} report={}",
+        directory.join("search.json").display()
+    );
+}
+
+#[test]
+#[ignore = "export an already accepted Profile B candidate; no simulation or backend execution"]
+fn export_profile_b_modswitch_benchmark_inputs() {
+    let mut config = SearchConfig::from_env().unwrap();
+    assert_eq!(config.noise_model, NoiseSearchModel::AverageCase);
+    assert_eq!(
+        (
+            config.sparse_lwr_modulus,
+            config.sparse_lwr_output_modulus,
+            config.sparse_lwr_universe,
+            config.sparse_lwr_weight
+        ),
+        (4096, 32, 8192, 18)
+    );
+    assert_eq!((config.security_bits, config.mask_statistical_security_bits), (100, 100));
+    config.bgg_security_envelope = Some("reviewed_monotone_envelope".into());
+    let candidate =
+        Candidate { crt_depth: 27, log_ring_dimension: 16, crt_bits: 50, base_bits: 25 };
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/profile_b_minimum_mask_search/1788588283213876339");
+    let saved: ProductionNoiseReport =
+        serde_json::from_slice(&fs::read(directory.join("retained-5-full-report.json")).unwrap())
+            .unwrap();
+    let average = saved.average_case.as_ref().expect("saved average authority");
+    assert!(average.accepted && average.hard_authority_accepted && average.correctness_accepted);
+    let selected: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("search.json")).unwrap()).unwrap();
+    assert_eq!(selected["selected_retained"].as_u64(), Some(5));
+    let row = selected["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["retained"].as_u64() == Some(5))
+        .unwrap();
+    let mask_digits = row["mask_digits"].as_u64().unwrap() as usize;
+    let fresh_digits = row["fresh_digits"].as_u64().unwrap() as usize;
+    let moduli = row["P_t"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().parse::<BigUint>().unwrap())
+        .collect::<Vec<_>>();
+    let mut context = build_candidate_context(&config, candidate).unwrap();
+    context.switch_moduli = moduli.clone();
+    let setup = setup_for_candidate_context(&config, &context, mask_digits, fresh_digits).unwrap();
+    // Reconstruct actual public identities and route metadata, without
+    // evaluate_pre_refresh/simulate/check_refresh_bundle or an estimator.
+    let snapshot = RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout(
+        setup,
+        context.profile,
+        &context.generated_layout.public_layout,
+        &context.active_cells,
+    )
+    .unwrap();
+    assert_eq!(snapshot.setup_identity(), &average.snapshot_identity);
+    assert_eq!(snapshot.refresh.switch_moduli, moduli);
+    let mut prepared =
+        prepare_candidate_with_fixed_digits(&config, candidate, mask_digits, fresh_digits, &moduli)
+            .unwrap();
+    assert_eq!(prepared.bundle.as_ref().unwrap().public_identity(), &average.snapshot_identity);
+    assert_eq!(prepared.anchor_security_inputs, saved.anchor_security_inputs);
+    assert_eq!(prepared.prf_label_count as u64, row["label_count"].as_u64().unwrap());
+    prepared.noise_snapshot = Some(snapshot);
+    let phase1 = select_sparse_lwr_profile(&config, |nu, h, q, p| {
+        let tuple = config
+            .sparse_lwr_phase1_grid
+            .iter()
+            .find(|tuple| (tuple.nu, tuple.h, tuple.q_l, tuple.p) == (nu, h, q, p))
+            .ok_or("tuple is not declared")?;
+        sparse_lwr_parameter_support::pinned_estimator_security_bits(tuple)?
+            .ok_or_else(|| "missing pinned sparse-LWR evidence".into())
+    })
+    .unwrap();
+    let bgg = reviewed_bgg_security_bits(&config, candidate).unwrap();
+    let result = SearchResult {
+        candidate,
+        achieved_security_bits: bgg.min(phase1.sparse_lwr_security_bits),
+        switched_security_status: "selected low-P marginal evidence is external; cross-modulus joint-view security unresolved".into(),
+        bgg_rlwe_security_bits: bgg,
+        sparse_lwr_security_bits: phase1.sparse_lwr_security_bits,
+        raw_key_entropy_bits: phase1.raw_key_entropy_bits,
+        sparse_lwr_universe: phase1.universe,
+        sparse_lwr_weight: phase1.weight,
+        official_preimage_bound: prepared.official_preimage_bound.to_string(),
+        ring_dimension: prepared.ring_dimension,
+        bucket_width: prepared.bucket_width,
+        pbc_attempts_used: prepared.pbc_attempts_used,
+        layout_id: hex(prepared.layout_id),
+        program_id: hex(prepared.program_id),
+        checker_accepted: average.accepted,
+        sparse_lwr_q_l: phase1.q_l,
+        sparse_lwr_p: phase1.p,
+        sparse_lwr_tier: phase1.tier,
+        estimator_commit: phase1.estimator_commit.clone(),
+        estimator_cost_model: phase1.estimator_cost_model.clone(),
+        estimator_shape_model: phase1.estimator_shape_model.clone(),
+        average_evidence: final_average_evidence(&config, &prepared, average).unwrap(),
+        production_report: Some(saved.clone()),
+        bgg_security_authority: bgg_security_authority(&config).into(),
+        bgg_security_evidence_source: bgg_security_evidence_source(&config).into(),
+    };
+    let mut checkpoint = Phase1Checkpoint::from_selection(&config, &phase1).unwrap();
+    checkpoint.accepted_phase2 =
+        Some(AcceptedPhase2Profile { tuple: phase1.tuple.clone(), candidate });
+    checkpoint.validate(&config).unwrap();
+    let checkpoint_path = std::env::var(PHASE1_CHECKPOINT_ENV).expect("output checkpoint path");
+    let report_path =
+        std::env::var("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT").expect("output report path");
+    let report = search_report(&config, &phase1, result);
+    for (path, value) in [
+        (checkpoint_path, serde_json::to_value(&checkpoint).unwrap()),
+        (report_path, serde_json::to_value(&report).unwrap()),
+    ] {
+        let output = fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        serde_json::to_writer_pretty(output, &value).unwrap();
+        eprintln!("EXPORTED {path}");
+    }
+    eprintln!(
+        "EXPORT_COMPLETE layout={} program={} setup={} dm={mask_digits} de={fresh_digits} labels={} simulation=false lattice_estimator=false backend_execution=false",
+        hex(prepared.layout_id),
+        hex(prepared.program_id),
+        hex(average.snapshot_identity),
+        prepared.prf_label_count
+    );
+}
+
+#[test]
 fn mask_digit_search_starts_at_domain_coverage_and_stops_at_safe_bound() {
     assert_eq!(
-        mask_digit_search_bounds(&BigUint::from(2u8), &BigUint::from(8u8), &[100, 200]),
+        mask_digit_search_bounds(
+            &BigUint::from(2u8),
+            &BigUint::from(8u8),
+            &[100, 200],
+            &[20000u32.into(), 20000u32.into()]
+        ),
         Ok((3, 6))
     );
     assert_eq!(
-        mask_digit_search_bounds(&BigUint::from(32u8), &BigUint::from(32u8), &[32, 37]),
-        Ok((1, 1))
+        mask_digit_search_bounds(
+            &BigUint::from(32u8),
+            &BigUint::from(32u8),
+            &[32, 37],
+            &[1184u32.into(), 1184u32.into()]
+        ),
+        Err(CandidatePreparationError::Infeasible(
+            "strict deterministic mask boundary is below the domain minimum".into()
+        ))
     );
 }
 
@@ -1015,7 +1356,7 @@ fn emits_large_profile_sparse_prf_stage_diagnostics() {
     config.crt_bits = 32;
     config.base_bits = 1;
     let ring_dimension = 1usize << 16;
-    let dcrt = DCRTPolyParams::new(ring_dimension as u32, 62, 32, 1);
+    let dcrt = DCRTPolyParams::new(ring_dimension as u32, 62, 32, 1, None);
     let q_bits = dcrt.modulus().bits();
     info!(q_bits, ring_dimension, "large exact-noise diagnostic profile");
     let result = prepare_candidate(
@@ -1038,10 +1379,11 @@ fn diag_free_prepare_and_check_bundle_smoke() {
                 .expect("compact noise checker must complete");
             assert!(checked, "reviewed fixed candidate must pass canonical compact acceptance");
         }
-        Err(CandidatePreparationError::Infeasible(reason)) => assert_eq!(
-            reason,
-            "no mask digit count passed the complete production report in d_m=3..=231"
-        ),
+        Err(CandidatePreparationError::Infeasible(reason)) => {
+            assert!(reason.starts_with("coarse switched-ring scan rejected: retained=1:"));
+            assert!(reason.contains("no mask digit count passed the complete production report"));
+            assert!((1..=30).all(|retained| reason.contains(&format!("retained={retained}:"))));
+        }
         Err(CandidatePreparationError::Fatal(reason)) => {
             panic!("compact preparation failed fatally: {reason}")
         }

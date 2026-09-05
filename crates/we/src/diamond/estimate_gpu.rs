@@ -171,7 +171,7 @@ impl DiamondGpuMeasurementBackend {
                 *self.device_ids.get(self.backend.active_placement()).ok_or_else(|| {
                     DiamondGpuMeasurementError::Expression("invalid GPU placement".to_owned())
                 })?;
-            let params = self.parameters.params_for_device(device_id);
+            let params = self.parameters.params_for_device(device_id, None);
             let bound = max_coefficient_bound.to_biguint().ok_or_else(|| {
                 DiamondGpuMeasurementError::Expression(
                     "compact matrix coefficient bound is not nonnegative".to_owned(),

@@ -7,6 +7,7 @@
 
 #ifdef __cplusplus
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <vector>
 #endif
@@ -28,12 +29,14 @@ int gpu_context_create(
     size_t gpu_ids_len,
     size_t stream_pool_size,
     uint32_t vram_percent,
+    const GpuContext *related_context,
     GpuContext **out_ctx);
 
 void gpu_context_destroy(GpuContext *ctx);
 int gpu_context_fence_releases(const GpuContext *ctx);
 int gpu_context_get_N(const GpuContext *ctx, int *out_N);
 int gpu_context_get_vram_budget_bytes(const GpuContext *ctx, size_t *out_bytes);
+uint64_t gpu_context_execution_identity(const GpuContext *ctx);
 int gpu_default_mempool_get_usage(
     int device,
     size_t *out_used_current_bytes,
@@ -103,6 +106,22 @@ struct GpuNttDeviceConstants
 
 struct PinnedHostReclaimer;
 
+// Related rings share execution resources explicitly, while all CRT and NTT
+// metadata below remain ring-specific. Independent executions stay isolated.
+struct GpuExecutionOwner
+{
+    uint64_t identity = 0;
+    std::vector<int> gpu_ids;
+    size_t vram_budget_bytes = 0;
+    uint32_t vram_percent = 0;
+    bool registered = false;
+    std::vector<std::vector<cudaStream_t>> compute_streams_by_partition;
+    std::vector<cudaStream_t> release_streams_by_partition;
+    PinnedHostReclaimer *pinned_host_reclaimer = nullptr;
+    std::atomic<size_t> next_compute_stream{0};
+    ~GpuExecutionOwner();
+};
+
 struct GpuContext
 {
     std::vector<uint64_t> moduli;
@@ -123,11 +142,7 @@ struct GpuContext
     std::vector<uint8_t> limb_coeff_bytes;
     std::vector<size_t> decomp_counts_by_partition;
     std::mutex transform_mutex;
-    std::vector<std::vector<cudaStream_t>> compute_streams_by_partition;
-    std::vector<cudaStream_t> release_streams_by_partition;
-    std::vector<cudaEvent_t> release_fence_events_by_partition;
-    PinnedHostReclaimer *pinned_host_reclaimer = nullptr;
-    std::atomic<size_t> next_compute_stream{0};
+    std::shared_ptr<GpuExecutionOwner> execution;
 };
 
 struct GpuEventSet

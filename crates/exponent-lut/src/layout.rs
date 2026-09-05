@@ -197,7 +197,7 @@ mod tests {
         };
         use std::collections::BTreeMap;
 
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = parameters.modulus().as_ref().clone();
         let ring = Ring::new(
             BigInt::from_biguint(num_bigint::Sign::Plus, modulus),

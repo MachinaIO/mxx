@@ -317,7 +317,7 @@ mod tests {
     use serial_test::serial as sequential;
 
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 16, 8)
+        DCRTPolyParams::new(128, 2, 16, 8, None)
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {

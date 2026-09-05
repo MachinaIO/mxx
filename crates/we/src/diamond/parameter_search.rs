@@ -191,6 +191,7 @@ impl DiamondParameterSearch {
                 crt_depth,
                 self.crt_modulus_bits,
                 self.gadget_base_bits,
+                None,
             );
             let started = Instant::now();
             debug!(
@@ -235,6 +236,7 @@ impl DiamondParameterSearch {
             crt_depth,
             self.crt_modulus_bits,
             self.gadget_base_bits,
+            None,
         );
         let modulus: Arc<BigUint> = parameters.modulus();
         let error_sigma = RealExpr::from_f64_exact(self.error_sigma)
@@ -455,7 +457,7 @@ mod tests {
 
     fn smallest_checker_candidate() -> (DCRTPolyParams, DiamondWeCompiler) {
         let search = small_search();
-        let parameters = DCRTPolyParams::new(32, 2, 60, 2);
+        let parameters = DCRTPolyParams::new(32, 2, 60, 2, None);
         let error_sigma = RealExpr::from_f64_exact(search.error_sigma).unwrap();
         let trapdoor_sigma = RealExpr::from_f64_exact(search.trapdoor_sigma).unwrap();
         let compiler = DiamondWeCompiler::new(

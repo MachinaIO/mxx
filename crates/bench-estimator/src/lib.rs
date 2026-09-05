@@ -1134,7 +1134,7 @@ fn node_cost_inputs_depend_on(
         NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => [plaintext_modulus, length]
             .into_iter()
             .any(|expression| int_expr_depends_on(expression, slots, dependent_variables)),
-        NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+        NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => {
             plaintext_moduli
                 .iter()
                 .chain(reconstruction_coefficients)

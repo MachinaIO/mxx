@@ -3,6 +3,7 @@
 mod constant;
 mod gadget;
 mod hash;
+mod identifiers;
 mod loop_binding;
 mod loops;
 mod matrix_ops;

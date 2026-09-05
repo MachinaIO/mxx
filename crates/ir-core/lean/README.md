@@ -14,12 +14,18 @@ layout fixture is written to `test_data/lean_runtime_fixture/Generated.lean`. Ge
 validate and export real frozen graphs; they do not themselves invoke the Lean kernel.
 
 The IR fixtures cover constants, hashes, samplers, gadgets, small/wide preimages, matrix
-operations, lexical loop bindings, and empty/nonempty structural loops. Their proof text can
-be checked separately from `crates/runtime/lean`, after building the IR and runtime packages:
+operations, quoted keyword identifiers, lexical loop bindings, and empty/nonempty structural
+loops. Their proof text can be checked separately from the repository root, after building the
+IR and runtime packages:
 
 ```sh
-LEAN_PATH=../../ir-core/lean/.lake/build/lib/lean lake env lean ../../../test_data/lean_ir_fixtures/sampler/Generated.lean
+LEAN_PATH=crates/ir-core/lean/.lake/build/lib/lean \
+  lake +leanprover/lean4:v4.28.0 -d crates/runtime/lean env lean \
+  test_data/lean_ir_fixtures/sampler/Generated.lean
 ```
+
+The explicit toolchain matches `crates/runtime/lean/lean-toolchain`: Lake's `-d` selects the
+package without changing the repository-root working directory or Elan's initial toolchain choice.
 
 The fixtures prove consequences of generated execution relations, not sampler termination or
 distribution. The runtime fixture additionally supplies the concrete CRT gadget layout.

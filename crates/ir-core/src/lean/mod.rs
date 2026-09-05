@@ -219,6 +219,8 @@ pub enum ExportError {
     MissingChildScope { scope: FrozenGraphScopeId, node: NodeId },
     #[error("invalid graph parameter name {0:?}")]
     InvalidIdentifier(String),
+    #[error("distinct graph scopes map to the same Lean declaration {0:?}")]
+    ScopeNameCollision(String),
     #[error("loop-index binder {0} is unavailable at its use site")]
     MissingLoopIndex(u32),
 }
@@ -239,7 +241,7 @@ impl LexicalEnv {
         match expr {
             IntExpr::Const(value) => value.to_string(),
             IntExpr::Var(name) => {
-                self.vars.get(name).cloned().unwrap_or_else(|| format!("params.{name}"))
+                self.vars.get(name).cloned().unwrap_or_else(|| format!("params.«{name}»"))
             }
             IntExpr::LoopIndex(slot) => {
                 if let Some(name) = self.loop_index_nats.get(slot) {
@@ -265,7 +267,7 @@ impl LexicalEnv {
         match expr {
             RealExpr::Rational(r) => format!("({}/{})", r.numerator(), r.denominator()),
             RealExpr::Var(name) => {
-                self.vars.get(name).cloned().unwrap_or_else(|| format!("params.{name}"))
+                self.vars.get(name).cloned().unwrap_or_else(|| format!("params.«{name}»"))
             }
             RealExpr::FromInt(value) => self.expr(value),
             RealExpr::Add(a, b) => format!("({} + {})", self.real_expr(a), self.real_expr(b)),
@@ -397,6 +399,12 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit(mut self) -> Result<LeanArtifact, ExportError> {
+        let mut scope_names = BTreeSet::new();
+        for name in self.scopes.values() {
+            if !scope_names.insert(name) {
+                return Err(ExportError::ScopeNameCollision(name.clone()));
+            }
+        }
         let mut root_env = self.validated.bindings.clone();
         root_env.loop_indices.clear();
         self.collect_layout_environments(&FrozenGraphScopeId::Root, root_env);
@@ -572,6 +580,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_params(&mut self) -> Result<(), ExportError> {
+        // Quote every field and its uses, so Lean keywords remain ordinary IR parameter names.
+        // The identifier validation excludes delimiters that could terminate the quoted name.
         self.source.push_str("structure Params where\n");
         for parameter in self.graph.parameters() {
             valid_identifier(&parameter.name)?;
@@ -579,7 +589,7 @@ impl<'a> Emitter<'a> {
                 crate::graph::CompileParameterKind::Integer => "Int",
                 crate::graph::CompileParameterKind::Real => "Rat",
             };
-            self.source.push_str(&format!("  {} : {}\n", parameter.name, ty));
+            self.source.push_str(&format!("  «{}» : {}\n", parameter.name, ty));
         }
         for name in self
             .params
@@ -587,7 +597,7 @@ impl<'a> Emitter<'a> {
             .filter(|name| !self.graph.parameters().iter().any(|p| &p.name == *name))
         {
             valid_identifier(name)?;
-            self.source.push_str(&format!("  {} : Int\n", name));
+            self.source.push_str(&format!("  «{}» : Int\n", name));
         }
         if self.params.is_empty() {
             self.source.push_str("  unit : Unit\n");
@@ -655,7 +665,11 @@ impl<'a> Emitter<'a> {
             self.source.push_str("  let _backend := backend\n");
         }
         let mut env = LexicalEnv {
-            vars: self.params.iter().map(|name| (name.clone(), format!("params.{name}"))).collect(),
+            vars: self
+                .params
+                .iter()
+                .map(|name| (name.clone(), format!("params.«{name}»")))
+                .collect(),
             loop_indices: scope_loop_slots(self.graph, scope_id)
                 .into_iter()
                 .map(|slot| (slot, format!("(Int.ofNat i_{slot})")))
@@ -1995,7 +2009,7 @@ fn params_update(env: &LexicalEnv, bindings: &[(String, IntExpr)]) -> String {
     }
     let updates = bindings
         .iter()
-        .map(|(name, value)| format!("{} := {}", name, env.expr(value)))
+        .map(|(name, value)| format!("«{}» := {}", name, env.expr(value)))
         .collect::<Vec<_>>();
     format!("{{ params with {} }}", updates.join(", "))
 }
@@ -2427,8 +2441,8 @@ mod tests {
         assert_eq!(artifact.source.matches("def scope_bound ").count(), 1);
         assert_eq!(artifact.root.parameters["k"].lean_type, "Int");
         assert_eq!(artifact.root.parameters["k"].root_value, None);
-        assert!(artifact.source.contains("scope_bound { params with k := 1 } ()"));
-        assert!(artifact.source.contains("scope_bound { params with k := 2 } ()"));
+        assert!(artifact.source.contains("scope_bound { params with «k» := 1 } ()"));
+        assert!(artifact.source.contains("scope_bound { params with «k» := 2 } ()"));
     }
 
     #[test]
@@ -2509,7 +2523,7 @@ mod tests {
                 assert!(
                     artifact
                         .source
-                        .contains("scope_lexical_gadget backend { params with b := 16 }")
+                        .contains("scope_lexical_gadget backend { params with «b» := 16 }")
                 );
             }
         }
@@ -2539,11 +2553,41 @@ mod tests {
         bindings.integers.insert("den".into(), BigInt::from(3));
         let validated = crate::validate(&graph, &bindings).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
-        assert!(artifact.source.contains("MxxIR.exactDiv -6 params.den"));
+        assert!(artifact.source.contains("MxxIR.exactDiv -6 params.«den»"));
         assert!(
-            artifact.source.contains("params.den ≠ 0") &&
-                artifact.source.contains("-6 % params.den = 0")
+            artifact.source.contains("params.«den» ≠ 0") &&
+                artifact.source.contains("-6 % params.«den» = 0")
         );
+    }
+
+    #[test]
+    fn export_rejects_colliding_sanitized_subgraph_names() {
+        let outputs = ["a-b", "a_b"]
+            .into_iter()
+            .map(|name| {
+                let child = with_new_construction_scope(|scope| {
+                    let value = NodeHandle::new(
+                        NodeKind::ConstantInt(BigInt::from(7)),
+                        vec![],
+                        vec![WireType::ConstantInt],
+                    )
+                    .output(0)
+                    .unwrap();
+                    SubgraphHandle::new(name, scope, vec![], vec![value]).unwrap()
+                });
+                let value =
+                    NodeHandle::subgraph_call(child, vec![], vec![], vec![]).output(0).unwrap();
+                (name.to_owned(), GraphOutput { value, confidentiality: None })
+            })
+            .collect();
+        let (graph, _) =
+            Graph::freeze("scope-collision", vec![], outputs, vec![], vec![], BTreeMap::new())
+                .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        assert!(matches!(
+            export(&validated, &ExportOptions::default()),
+            Err(ExportError::ScopeNameCollision(name)) if name == "scope_a_b"
+        ));
     }
 
     #[test]

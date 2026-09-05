@@ -321,7 +321,7 @@ pub fn assemble_claim(
             .iter()
             .map(|(name, field)| {
                 let value = field.root_value.clone().unwrap_or_else(|| "(0 : Int)".into());
-                format!("{name} := {value}")
+                format!("«{name}» := {value}")
             })
             .collect::<Vec<_>>()
             .join(", ");

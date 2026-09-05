@@ -1,0 +1,13 @@
+name = "mxx-ir-core"
+defaultTargets = ["MxxIR"]
+
+[[lean_lib]]
+name = "MxxIR"
+roots = [
+  "IRExpr",
+  "IRIterRuns",
+  "IRRegression",
+  "IRRel",
+  "IRScopeSpec",
+  "MxxIR",
+]

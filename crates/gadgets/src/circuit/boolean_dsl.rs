@@ -387,8 +387,10 @@ pub fn boolean_circuit_validity_predicate(
     mxx_dsl::PurePredicateSpec::new(
         context
             .bool_output("valid", bool_all([params_valid, records_valid, output_valid]))?
-            .build()?,
+            .build()?
+            .graph,
     )
+    .map_err(Into::into)
 }
 
 /// Builds a sampler-free ideal evaluator for the symbolic circuit family.
@@ -463,8 +465,9 @@ pub fn boolean_circuit_satisfaction_predicate(
     let output = select_boolean_output(&circuit, &final_layer);
     let inputs_valid = reduce_bool_family(input_validity, params.max_layer_width)?;
     mxx_dsl::PurePredicateSpec::new(
-        context.bool_output("satisfied", bool_and(inputs_valid, output))?.build()?,
+        context.bool_output("satisfied", bool_and(inputs_valid, output))?.build()?.graph,
     )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

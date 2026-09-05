@@ -49,7 +49,7 @@ fn and_circuit() -> BooleanCircuitData {
     }
 }
 
-/// Exercises the real selection, Rust operational checker, GPU cost model, and GPU runtime path.
+/// Exercises parameter selection with generated Lean certificates, the GPU cost model, and runtime.
 ///
 /// The small defaults are intentionally only a smoke configuration. All search, measurement, and
 /// execution settings are environment-overridable for a larger benchmark invocation.

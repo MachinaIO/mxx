@@ -7,7 +7,7 @@ family-valued preimage relations, finite selection, and fixed-count sequential l
 operational-noise checker.
 
 For those subjects, this document supersedes the Switch-centric rules in
-`docs/correctness/egg-free-operational-noise-normal-form-spec.ja.md`, including its selector
+`docs/correctness/egg-free-operational-noise-normal-form-spec.md`, including its selector
 terminology, Switch scope-minimization rules, family section, `Select`/`FamilyGet` transfer rows,
 Stage 4, and the corresponding Switch acceptance gates. The older document remains authoritative
 for matrix `PolynomialNF`, exact factor ordering, central scalars, numeric bounds, final Large

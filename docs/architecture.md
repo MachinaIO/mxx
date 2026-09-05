@@ -9,10 +9,9 @@ on the crate that owns an abstraction.
 mxx-runtime              -> mxx-ir-core, mxx-primitives
 mxx-bench-estimator      -> mxx-ir-core, mxx-runtime
 mxx-dsl                  -> mxx-ir-core
-mxx-correctness          -> mxx-ir-core, mxx-dsl
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core
-mxx-we                   -> mxx-bgg, mxx-correctness, mxx-gadgets, mxx-runtime
+mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
 mxx-func-enc/io          -> lower layers when their application modules are enabled
 ```
 
@@ -34,26 +33,32 @@ preserving both the preimage equation and the authoritative cutoff.
 
 Owns the canonical executable graph, compile expressions, artifact metadata, parameter/type/shape
 validation, execution ordering, and liveness. `derive_param_constraints` is the shared source of
-decidable compile-parameter conditions consumed by concrete validation and operational checking. Sampler
+decidable compile-parameter conditions consumed by concrete validation. Sampler
 nodes serialize required integer coefficient cutoffs. Subgraph and parallel-loop bodies are
 structural and stored once.
+
+`protocol` owns protocol declarations, input contracts, frozen graph annotations, sampler-free
+ideal/predicate specifications, and structural validation of linked workflows. These are core
+graph data and checks, independent of the DSL used to construct a graph. There is no separate
+correctness crate and no generic symbolic noise simulator.
+
+The Lean exporter owns primitive execution-relation generation and application-independent linked
+claim assembly. It receives explicit graph connections and endpoint semantics, not a WE protocol
+implementation, and does not infer noise bounds or expand structural families into individual lanes.
+`lean::protocol` converts a protocol declaration into exported roots and a linked claim;
+`lean::claim` renders the final proposition. Applications supply backend bindings and decoder
+semantics, while their mathematical bounds and proofs remain application-owned.
 
 ### `mxx-dsl`
 
 Creates immutable core nodes immediately. It has no symbolic reinterpretation layer.
-`IdealSpec` and `PurePredicateSpec` accept only sampler-free graphs for correctness declarations.
+The constructed graphs feed core-owned `IdealSpec` and `PurePredicateSpec` validation.
 Indexed `Family` operations create structural parallel loops.
 
 ### `mxx-runtime`
 
 Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
 transcripts, sessions, artifacts, and bounded parallel waves.
-
-### `mxx-correctness`
-
-The library validates linked workflow declarations and evaluates their operational noise bounds
-with the Rust checker. Protocol declarations remain crate-owned; there is no central protocol
-registry or parameter-check executable.
 
 ### `mxx-gadgets` and `mxx-bgg`
 
@@ -67,8 +72,27 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and
 previous-layer indices as public runtime families. Encryption and decryption consume the same
 circuit assignment; witness bits are decryption-only inputs. Parameter search uses deterministic
-worst-case bounds and accepts a candidate only after the generic Rust operational checker accepts
-the frozen workflow and concrete parameter environment.
+worst-case bounds and accepts a candidate only after Lean checks the generated theorem for the
+same frozen workflow, backend layout, and concrete parameter environment. The selected candidate
+retains its checked artifact; numerical rejection and checker failures remain distinct.
 
 `mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
-remain disabled. Diamond iO must migrate to the Rust operational checker before it is enabled.
+remain disabled. They need application-owned correctness implementations before being enabled.
+
+Tall's old-simulator-dependent parameter search and noisy verification modes are explicitly
+unavailable pending a Tall-specific correctness implementation. The independent noiseless runtime
+round-trip remains available; it is not a substitute for a proved noisy bound.
+
+## Generated Lean artifacts
+
+Each crate keeps its handwritten Lean modules directly under `lean/`, without a nested package-name
+directory. Shared modules have crate-qualified filenames such as `PrimitivesBounds.lean` and
+`RuntimeMatrixOps.lean`, avoiding collisions when several packages share one Lean search path.
+Lake libraries list their module roots explicitly. The `MxxPrimitives.lean`, `MxxRuntime.lean`,
+`MxxIR.lean`, `MxxGadgets.lean`, and `MxxBgg.lean` entry modules collect reusable imports; mathematical
+namespaces and theorem names are independent of this file layout.
+
+Diamond parameter search generates and checks Lean artifacts through the production library API;
+the GPU integration test uses that same search. No separate example executable is required.
+Crates do not contain example targets: reusable extraction fixtures live in ordinary unit-test
+modules, and generated files belong under ignored `test_data` or temporary artifact directories.

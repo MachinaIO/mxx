@@ -1,13 +1,16 @@
 //! Witness-encryption protocols expressed as validated declarative graphs.
 
 pub mod diamond;
+pub mod lean;
 
-use mxx_correctness::{
-    ComparatorSpec, ProtocolDecl, ProtocolInputDestination, ProtocolInputId, StageId,
-    StageInputName,
-};
 use mxx_gadgets::circuit::{BooleanCircuitData, BooleanCircuitShape};
-use mxx_ir_core::node::NodeKind;
+use mxx_ir_core::{
+    node::NodeKind,
+    protocol::{
+        ComparatorSpec, ProtocolDecl, ProtocolInputDestination, ProtocolInputId, StageId,
+        StageInputName,
+    },
+};
 use std::collections::BTreeSet;
 use thiserror::Error;
 

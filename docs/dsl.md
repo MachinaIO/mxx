@@ -38,8 +38,9 @@ preprocessing without expanding a parameterized count. Persist the public half w
 `public_family_output` and the private half with `private_trapdoor_family_output`; import the pair
 with `trapdoor_family_artifact_input`.
 
-Correctness declarations use `IdealSpec::new` and `PurePredicateSpec::new`. These wrappers reject
-sampling nodes and retain a deterministic graph consumed by `mxx-correctness::ProtocolDecl`.
+Correctness declarations use core-owned `IdealSpec::new` and `PurePredicateSpec::new`. These wrappers
+reject sampling nodes and retain a deterministic graph consumed by
+`mxx_ir_core::protocol::ProtocolDecl`; construction remains in the DSL.
 There is no virtual matrix, assumption, symbolic overlay, or second expression DAG.
 
 See `docs/runtime.md` for execution and `docs/correctness/operational-protocol-inventory.md` for checking semantics.

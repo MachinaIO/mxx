@@ -5,14 +5,6 @@ use mxx_bgg::{
     BggPublicKeyFamily, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
     DynamicBooleanBggError, evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
 };
-use mxx_correctness::{
-    ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec,
-    EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId, InputContract,
-    InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
-    OutputRef, ParameterDecl, ParameterKind, ProtocolDecl, ProtocolInputBinding,
-    ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId,
-    StageInputName, Workflow,
-};
 use mxx_dsl::{
     Bool, BuiltGraph, DslContext, DslError, Int, Mat, Parallel, PurePredicateSpec, SemanticAnchor,
     Sequential, parallel_zip_bundle_result,
@@ -29,6 +21,14 @@ use mxx_ir_core::{
     IntExpr, ParamEnv,
     artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
     node::{ConcatAxis, IndexRange},
+    protocol::{
+        ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
+        ComparatorSpec, EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId,
+        InputContract, InputContractEntry, InputValueContract, OperationalDecoderKind,
+        OperationalDecoderTarget, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
+        ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
+        ProtocolStage, StageId, StageInputName, Workflow,
+    },
 };
 use thiserror::Error;
 
@@ -132,7 +132,8 @@ fn diamond_parameter_validity_predicate(
         .map(Bool::to_int)
         .fold(Int::constant(1), Int::mul)
         .equal(Int::constant(1));
-    PurePredicateSpec::new(context.bool_output("valid-parameters", valid)?.build()?)
+    PurePredicateSpec::new(context.bool_output("valid-parameters", valid)?.build()?.graph)
+        .map_err(Into::into)
 }
 
 fn padded_witness_public_key_indices(
@@ -805,8 +806,10 @@ impl DiamondWeProtocolFamily {
         let ideal = mxx_dsl::IdealSpec::new(
             ideal_context
                 .bool_output(IDEAL_MESSAGE_OUTPUT, ideal_ring.bool_input(MESSAGE_INPUT))?
-                .build()?,
-        )?;
+                .build()?
+                .graph,
+        )
+        .map_err(DslError::from)?;
         let circuit_names = [
             "circuit-active-gate-count",
             "circuit-gate-kind",

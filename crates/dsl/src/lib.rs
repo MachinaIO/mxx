@@ -4,8 +4,7 @@
 
 use mxx_ir_core::{
     CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, Graph, GraphOutput,
-    IntExpr, NodeHandle, ParamEnv, RealExpr, ScopedWireRef, SealMap, SealedSubgraph,
-    SubgraphHandle, ValueHandle,
+    IntExpr, NodeHandle, ParamEnv, RealExpr, SealMap, SealedSubgraph, SubgraphHandle, ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
     graph::with_new_construction_scope,
     node::{
@@ -22,7 +21,20 @@ use std::{
 };
 use thiserror::Error;
 
-pub use mxx_ir_core::{Rational, artifact::ArtifactConfidentiality as Confidentiality};
+pub use mxx_ir_core::{
+    Rational,
+    artifact::ArtifactConfidentiality as Confidentiality,
+    protocol::{
+        FrozenDerivationAttachment, FrozenDerivationAttachments, FrozenSemanticAnchors, IdealSpec,
+        PurePredicateSpec,
+    },
+};
+#[cfg(test)]
+mod bundle_tests;
+#[cfg(test)]
+mod protocol_tests;
+#[cfg(test)]
+mod test_protocol;
 
 thread_local! {
     /// Lexical loop depth while closure bodies are constructed. Using the depth as the binder
@@ -68,10 +80,8 @@ pub enum DslError {
     FamilyCountMismatch,
     #[error(transparent)]
     StructuralValidation(#[from] mxx_ir_core::ValidationError),
-    #[error("ideal and predicate specifications must be sampler-free")]
-    NonPureSpecification,
-    #[error("a pure predicate must have exactly one boolean output")]
-    PredicateOutput,
+    #[error(transparent)]
+    Specification(#[from] mxx_ir_core::protocol::SpecificationError),
     #[error("semantic anchor could not be resolved in the frozen graph: {0}")]
     SemanticAnchorResolution(String),
 }
@@ -3351,66 +3361,12 @@ impl LoopIndex {
     }
 }
 
-/// Semantic wire sets retained by the DSL and resolved exactly once when the graph is frozen.
-///
-/// Labels are proof-facing names, not executable nodes. A label may name more than one wire so
-/// callers can identify a typed tuple or family interface without reconstructing it by searching
-/// the frozen graph.
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct FrozenSemanticAnchors {
-    entries: BTreeMap<String, Vec<ScopedWireRef>>,
-}
-
-/// A frozen, owner-crate rule reference retained alongside an executable graph.
-///
-/// This is generator infrastructure: it identifies the exact wires to which an owning crate's
-/// checked operational rule applies.  It contains neither a claimed equation nor a numeric bound.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize)]
-#[doc(hidden)]
-pub struct FrozenDerivationAttachment {
-    pub namespace: String,
-    pub rule: String,
-    pub roles: Vec<(String, ScopedWireRef)>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[doc(hidden)]
-pub struct FrozenDerivationAttachments {
-    entries: Vec<FrozenDerivationAttachment>,
-}
-
-impl FrozenDerivationAttachments {
-    #[doc(hidden)]
-    pub fn iter(&self) -> impl Iterator<Item = &FrozenDerivationAttachment> {
-        self.entries.iter()
-    }
-
-    #[doc(hidden)]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct DerivationAttachment {
     namespace: String,
     rule: String,
     roles: Vec<(String, ValueHandle)>,
-}
-
-impl FrozenSemanticAnchors {
-    pub fn get(&self, name: &str) -> Option<&[ScopedWireRef]> {
-        self.entries.get(name).map(Vec::as_slice)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &[ScopedWireRef])> {
-        self.entries.iter().map(|(name, wires)| (name.as_str(), wires.as_slice()))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 #[derive(Clone, Default)]
@@ -3805,8 +3761,8 @@ impl DslContext {
         Ok((
             BuiltGraph {
                 graph,
-                anchors: FrozenSemanticAnchors { entries: anchors },
-                derivation_attachments: FrozenDerivationAttachments { entries: attachments },
+                anchors: FrozenSemanticAnchors::new(anchors),
+                derivation_attachments: FrozenDerivationAttachments::new(attachments),
             },
             freeze_map,
         ))
@@ -3818,62 +3774,6 @@ pub struct BuiltGraph {
     pub anchors: FrozenSemanticAnchors,
     #[doc(hidden)]
     pub derivation_attachments: FrozenDerivationAttachments,
-}
-
-#[derive(Clone)]
-pub struct IdealSpec {
-    pub graph: Graph,
-}
-
-#[derive(Clone)]
-pub struct PurePredicateSpec {
-    pub graph: Graph,
-}
-
-fn require_sampler_free(graph: &Graph) -> Result<(), DslError> {
-    let contains_sampler = graph.scopes().values().any(|scope| {
-        scope.nodes().iter().any(|node| {
-            matches!(
-                node.kind(),
-                NodeKind::UniformResidueSample { .. } |
-                    NodeKind::UniformIntervalSample { .. } |
-                    NodeKind::GaussianSample { .. } |
-                    NodeKind::HashSample { .. } |
-                    NodeKind::TrapdoorSample { .. } |
-                    NodeKind::PreimageSample { .. }
-            )
-        })
-    });
-    if contains_sampler {
-        return Err(DslError::NonPureSpecification);
-    }
-    Ok(())
-}
-
-impl IdealSpec {
-    pub fn new(graph: BuiltGraph) -> Result<Self, DslError> {
-        require_sampler_free(&graph.graph)?;
-        Ok(Self { graph: graph.graph })
-    }
-}
-
-impl PurePredicateSpec {
-    pub fn new(graph: BuiltGraph) -> Result<Self, DslError> {
-        require_sampler_free(&graph.graph)?;
-        if graph.graph.outputs().len() != 1 {
-            return Err(DslError::PredicateOutput);
-        }
-        let output = graph.graph.outputs().values().next().expect("one predicate output").value;
-        let output_type = graph
-            .graph
-            .root_scope()
-            .node(output.node)
-            .and_then(|node| node.output_types().get(output.port.0 as usize));
-        if output_type != Some(&WireType::Bool) && output_type != Some(&WireType::ConstantBool) {
-            return Err(DslError::PredicateOutput);
-        }
-        Ok(Self { graph: graph.graph })
-    }
 }
 
 impl BuiltGraph {
@@ -3898,7 +3798,6 @@ pub enum ValidationBuildError {
     #[error(transparent)]
     Core(#[from] mxx_ir_core::ValidationError),
 }
-
 pub trait GraphValue: Clone {
     type Schema: GraphValueSchema<Value = Self>;
     fn flatten(&self) -> Vec<ValueHandle>;
@@ -5207,7 +5106,10 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert!(matches!(IdealSpec::new(sampled), Err(DslError::NonPureSpecification)));
+        assert!(matches!(
+            IdealSpec::new(sampled.graph),
+            Err(mxx_ir_core::protocol::SpecificationError::NonPureSpecification)
+        ));
     }
 
     #[test]

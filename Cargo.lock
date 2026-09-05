@@ -480,28 +480,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mxx-correctness"
-version = "0.1.0"
-dependencies = [
- "libc",
- "mxx-bgg",
- "mxx-dsl",
- "mxx-gadgets",
- "mxx-ir-core",
- "mxx-primitives",
- "num-bigint",
- "num-traits",
- "rayon",
- "serde",
- "serde_json",
- "smallvec",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "mxx-dsl"
 version = "0.1.0"
 dependencies = [
@@ -542,7 +520,6 @@ dependencies = [
  "keccak-asm",
  "mxx-bench-estimator",
  "mxx-bgg",
- "mxx-correctness",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",
@@ -629,7 +606,6 @@ dependencies = [
  "keccak-asm",
  "mxx-bench-estimator",
  "mxx-bgg",
- "mxx-correctness",
  "mxx-dsl",
  "mxx-gadgets",
  "mxx-ir-core",

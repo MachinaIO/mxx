@@ -43,7 +43,7 @@ theorem generated_decrypt_injector_context
   have hpacking : ∀ i : Fin inputCount, Stage_decrypt.parallel_generatedRoot_6 backend params i.val
       w5 (w6 i) := by tauto
   have hbatch : 0 ≤ params.diamond_batch_bits := by
-    rcases hpacking 0 with ⟨_, _, hbatch, _, _⟩
+    rcases hpacking 0 with ⟨_, hbatch, _, _⟩
     exact hbatch
   have hpacked := generated_packed_raw_witness backend params inputs.2.1 w3 w5 w6
     hraw hindices hprefix hpacking

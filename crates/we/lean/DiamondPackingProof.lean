@@ -41,7 +41,7 @@ theorem generated_packed_bits
         ∃ position : Fin witnessSlots,
           (position.val : Int) = (layer : Int) * params.diamond_batch_bits + (bit : Int) ∧
           output / (2 ^ bit) % 2 = raw position := by
-  rcases hrun with ⟨finalAcc, finalPower, _, hscan, hout⟩
+  rcases hrun with ⟨⟨finalAcc, finalPower⟩, _, hscan, hout⟩
   let Invariant := fun (width : Nat) (state : Int × Int × Unit) ↦
     state.2.1 = 2 ^ width ∧ (0 ≤ state.1 ∧ state.1 < 2 ^ width) ∧
       ∀ bit, bit < width → ∃ position : Fin witnessSlots,
@@ -126,7 +126,7 @@ theorem generated_packed_raw_witness
   obtain ⟨position, hposition, hvalue⟩ := generated_witness_prefix backend params prefixPosition
     raw _ _ (hindices prefixPosition) (hprefix prefixPosition)
   have hbatch : 0 ≤ params.diamond_batch_bits := by
-    rcases hpacking i with ⟨_, _, hnonneg, _, _⟩
+    rcases hpacking i with ⟨_, hnonneg, _, _⟩
     exact hnonneg
   have haddress : position.val = i.val * params.diamond_batch_bits.toNat + bit := by
     rw [← hposition] at hprefixPosition

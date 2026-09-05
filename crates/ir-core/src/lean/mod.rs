@@ -407,7 +407,7 @@ struct Emitter<'a> {
     current_anonymous_lets: BTreeSet<String>,
     current_uses_hash_model: bool,
     current_witnesses: Vec<(String, String)>,
-    current_root: bool,
+    current_record: bool,
     current_value_expressions: BTreeMap<String, String>,
     scope_proofs: BTreeMap<FrozenGraphScopeId, ScopeProofShape>,
 }
@@ -457,7 +457,7 @@ impl<'a> Emitter<'a> {
             current_anonymous_lets: BTreeSet::new(),
             current_uses_hash_model: false,
             current_witnesses: Vec::new(),
-            current_root: false,
+            current_record: false,
             current_value_expressions: BTreeMap::new(),
             scope_proofs: BTreeMap::new(),
             requires_hash_model: graph.scopes().values().any(|scope| {
@@ -684,8 +684,11 @@ impl<'a> Emitter<'a> {
         self.indent = 1;
         self.current_witnesses.clear();
         self.current_value_expressions.clear();
-        self.current_root = matches!(scope_id, FrozenGraphScopeId::Root);
         let scope = self.graph.scope(scope_id).expect("scope key came from graph");
+        self.current_record = matches!(scope_id, FrozenGraphScopeId::Root) ||
+            scope.nodes().iter().any(|node| {
+                matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_))
+            });
         let validated = self.validated.scopes.get(scope_id).expect("validated scope");
         let inputs = scope_input_wires(scope);
         if !matches!(scope_id, FrozenGraphScopeId::Root) {
@@ -791,11 +794,11 @@ impl<'a> Emitter<'a> {
         self.scope_proofs.insert(
             scope_id.clone(),
             ScopeProofShape {
-                witness_record: self.current_root.then(|| {
+                witness_record: self.current_record.then(|| {
                     format!("{}.{}.Witness", self.options.namespace, self.scopes[scope_id])
                 }),
                 body_relation: self
-                    .current_root
+                    .current_record
                     .then(|| format!("{}.{}.body", self.options.namespace, self.scopes[scope_id])),
                 value_expressions: self.current_value_expressions.clone(),
                 witnesses: self.current_witnesses.clone(),
@@ -847,7 +850,7 @@ impl<'a> Emitter<'a> {
         );
         // Large records need projections and recursors, not size or constructor
         // injectivity theorems; generating the latter dominates Lean elaboration.
-        let record = if self.current_root {
+        let record = if self.current_record {
             let fields = self
                 .current_witnesses
                 .iter()
@@ -860,7 +863,7 @@ impl<'a> Emitter<'a> {
         } else {
             String::new()
         };
-        if self.current_root {
+        if self.current_record {
             let name = &self.scopes[scope_id];
             let body_header =
                 final_header.replacen(&format!("def {name} "), &format!("abbrev {name}.body "), 1);
@@ -872,12 +875,23 @@ impl<'a> Emitter<'a> {
             );
             self.source
                 .insert_str(declaration_start, &(record + &constraint_definition + &body_header));
-            let wrapper_header = final_header
+            let mut wrapper_header = final_header
                 .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)");
             let backend = if self.requires_backend { "backend " } else { "" };
             let hash = if self.requires_hash_model { "hashModel " } else { "" };
             let input = if inputs.is_empty() { "()" } else { "inputs" };
-            self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {input} outputs witness\n\n"));
+            let loop_names = scope_loop_slots(self.graph, scope_id)
+                .into_iter()
+                .map(|slot| format!("i_{slot}"))
+                .collect::<Vec<_>>();
+            if !loop_binders.is_empty() {
+                let named_binders =
+                    loop_names.iter().map(|name| format!(" ({name} : Nat)")).collect::<String>();
+                wrapper_header = wrapper_header.replacen(&loop_binders, &named_binders, 1);
+            }
+            let loop_arguments =
+                loop_names.iter().map(|name| format!("{name} ")).collect::<String>();
+            self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness\n\n"));
         } else {
             self.source.insert_str(declaration_start, &(constraint_definition + &final_header));
         }
@@ -1893,11 +1907,11 @@ impl<'a> Emitter<'a> {
     fn bind_existential(&mut self, name: &str, ty: &str) {
         self.current_value_expressions.insert(
             name.to_owned(),
-            if self.current_root { format!("witness.{name}") } else { name.to_owned() },
+            if self.current_record { format!("witness.{name}") } else { name.to_owned() },
         );
         self.current_scope_values.push((name.to_owned(), ty.to_owned()));
         self.current_witnesses.push((name.to_owned(), ty.to_owned()));
-        if self.current_root {
+        if self.current_record {
             self.source.push_str(&format!("  let {name} := witness.{name}\n"));
         } else {
             self.source.push_str(&format!("{}∃ ({} : {}),\n", "  ".repeat(self.indent), name, ty));

@@ -46,8 +46,10 @@ theorem generated_selector_witness
     (hrun : Stage_encrypt.parallel_generatedRoot_72 backend hashModel params slot
       (secret, publicMatrix, ()) target) :
     Nonempty (InjectorSelectorWitness backend hashModel params slot secret publicMatrix target) := by
-  rcases hrun with ⟨regular, initialZero, initial, selector, error,
-    _, hregular, hzero, _, _, _, hselect, _, _, _, _, hscan, herror, htarget⟩
+  obtain ⟨scopeWitness, facts⟩ := hrun
+  rcases scopeWitness with ⟨regular, initialZero, initial, selector, error⟩
+  dsimp only [Stage_encrypt.parallel_generatedRoot_72.body] at facts
+  rcases facts with ⟨_, hregular, hzero, _, _, _, hselect, _, _, _, _, hscan, herror, htarget⟩
   exact ⟨{
     regular := regular
     zeroState := initialZero

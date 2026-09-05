@@ -37,8 +37,10 @@ theorem generated_target_shared_secret
       gaussianSample params.diamond_error_sigma params.diamond_error_max_coefficient_bound error ∧
       target = selector * publicMatrix + error := by
   dsimp only [Stage_encrypt.parallel_generatedRoot_72] at hrun
-  rcases hrun with ⟨regular, initialZero, initial, selector, error,
-    _, hregular, hzero, _, _, _, hselect, _, _, _, _, hscan, herror, htarget⟩
+  obtain ⟨scopeWitness, facts⟩ := hrun
+  rcases scopeWitness with ⟨regular, initialZero, initial, selector, error⟩
+  dsimp only [Stage_encrypt.parallel_generatedRoot_72.body] at facts
+  rcases facts with ⟨_, hregular, hzero, _, _, _, hselect, _, _, _, _, hscan, herror, htarget⟩
   have hr : regular 0 0 = secret 0 0 ∧ regular 1 0 = 0 := by
     constructor
     · simpa [concatDiagonal] using hregular 0 0

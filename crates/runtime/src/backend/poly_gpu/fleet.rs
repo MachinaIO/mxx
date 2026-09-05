@@ -508,6 +508,11 @@ impl GpuDcrtBackend {
         self.vram_percent
     }
 
+    /// Concrete resident CRT tower count for an exactly registered ring.
+    pub fn ring_crt_depth(&self, matrix: &ConcreteMatrixType) -> Result<usize, PolyBackendError> {
+        Ok(self.devices[0].1.parameters(matrix)?.crt_depth())
+    }
+
     /// Builds a local representative of a regular gadget's global column range.
     ///
     /// This is used by the estimator's single-device worker. Validation is
@@ -995,49 +1000,6 @@ impl GpuDcrtBackend {
         Ok(replica)
     }
 
-    fn same_layout(left: &GpuFleetMatrix, right: &GpuFleetMatrix) -> bool {
-        left.size() == right.size() &&
-            left.shards.len() == right.shards.len() &&
-            left.shards.iter().zip(&right.shards).all(|(left, right)| {
-                left.device_id == right.device_id &&
-                    left.global_column_start == right.global_column_start &&
-                    left.value.col_size() == right.value.col_size()
-            })
-    }
-
-    fn matrix_has_current_layout(&self, value: &GpuFleetMatrix) -> bool {
-        let ranges = self.column_ranges(value.columns);
-        ranges.len() == value.shards.len() &&
-            ranges.iter().zip(&value.shards).all(|((device, start, end), shard)| {
-                self.devices[*device].0 == shard.device_id &&
-                    *start == shard.global_column_start &&
-                    end - start == shard.value.col_size()
-            })
-    }
-
-    fn repartition_matrix(
-        &mut self,
-        value: &GpuFleetMatrix,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        let ranges = self.column_ranges(value.columns);
-        let mut shards = Vec::with_capacity(ranges.len());
-        for wave in ranges.chunks(self.devices.len()) {
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(Self::matrix_piece_on_device(backend, value, start, end).map(|value| {
-                        GpuColumnShard { device_id: *device_id, global_column_start: start, value }
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            shards.extend(launched);
-        }
-        Ok(GpuFleetMatrix::new(value.rows, value.columns, shards))
-    }
-
     fn gather_matrix(
         &mut self,
         value: &GpuFleetMatrix,
@@ -1346,8 +1308,8 @@ mod tests {
     ) -> Option<[i32; 2]> {
         for (index, &left_device) in detected.iter().enumerate() {
             for &right_device in &detected[index + 1..] {
-                let left_params = parameters.params_for_device(left_device);
-                let right_params = parameters.params_for_device(right_device);
+                let left_params = parameters.params_for_device(left_device, None);
+                let right_params = parameters.params_for_device(right_device, None);
                 let left = GpuDCRTPolyMatrix::zero(&left_params, 1, 1);
                 if left.copy_to_params_direct(&right_params).is_none() {
                     continue;
@@ -1956,6 +1918,7 @@ impl Backend for GpuDcrtBackend {
             Identity,
             UnitRow(usize),
             Gadget(bool),
+            SingleColumn,
         }
         let range_constant = match value {
             ConstantMatrix::Zero => Some(RangeConstant::Zero),
@@ -1972,6 +1935,14 @@ impl Backend for GpuDcrtBackend {
                 let base = base.evaluate(env).map_err(|_| PolyBackendError::InvalidInteger)?;
                 self.validate_gadget_layout(ty, &base, ty.columns / ty.rows, *small)?;
                 Some(RangeConstant::Gadget(*small))
+            }
+            _ if ty.columns == 1 &&
+                (self.pending_pilot.is_some() ||
+                    self.active_operation.is_some_and(|operation| {
+                        self.operation_widths.contains_key(&operation)
+                    })) =>
+            {
+                Some(RangeConstant::SingleColumn)
             }
             _ => None,
         };
@@ -1991,7 +1962,8 @@ impl Backend for GpuDcrtBackend {
                         let (_, start, end) =
                             *wave.iter().find(|(owner, _, _)| *owner == device)?;
                         let local_ty = ConcreteMatrixType { columns: end - start, ..ty.clone() };
-                        Some(backend.parameters(&local_ty).map(|params| {
+                        Some((|| {
+                            let params = backend.parameters(&local_ty)?;
                             let value = match range_constant {
                                 RangeConstant::Zero => {
                                     GpuDCRTPolyMatrix::zero(params, ty.rows, end - start)
@@ -2018,13 +1990,16 @@ impl Backend for GpuDcrtBackend {
                                     start,
                                     end - start,
                                 ),
+                                RangeConstant::SingleColumn => {
+                                    backend.constant_matrix(&local_ty, value, env)?
+                                }
                             };
-                            GpuColumnShard {
+                            Ok::<_, PolyBackendError>(GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
                                 value,
-                            }
-                        }))
+                            })
+                        })())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 self.commit_column_wave(&mut shards, launched, &mut next_column)?;
@@ -2297,6 +2272,22 @@ impl Backend for GpuDcrtBackend {
         index: usize,
     ) -> Result<Self::Matrix, Self::Error> {
         self.unary_columns(value, |backend, value| backend.ring_automorphism(value, index))
+    }
+
+    fn modulus_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.modulus_switch(input, destination))
+    }
+
+    fn reduce_modulus(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.reduce_modulus(input, destination))
     }
 
     fn preimage_target(
@@ -3146,23 +3137,13 @@ impl Backend for GpuDcrtBackend {
         levels: &[Self::Matrix],
         plaintext_moduli: &[BigInt],
         reconstruction_coefficients: &[BigInt],
+        destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         self.restart_runtime_pilot_after_matrix_inputs(&levels.iter().collect::<Vec<_>>())?;
-        if levels.iter().any(|level| !self.matrix_has_current_layout(level)) {
-            let normalized = levels
-                .iter()
-                .map(|level| {
-                    if self.matrix_has_current_layout(level) {
-                        Ok(level.clone())
-                    } else {
-                        self.repartition_matrix(level)
-                    }
-                })
-                .collect::<Result<Vec<_>, PolyBackendError>>()?;
-            return self.crt_recompose(&normalized, plaintext_moduli, reconstruction_coefficients);
-        }
         let first = levels.first().ok_or(PolyBackendError::InvalidInteger)?;
-        if levels.iter().any(|level| !Self::same_layout(first, level)) {
+        // Each calibrated wave stages its exact columns independently from
+        // every input's existing shards; pilot widths do not exist yet here.
+        if levels.iter().any(|level| level.size() != first.size()) {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         let mut shards = Vec::new();
@@ -3187,6 +3168,7 @@ impl Backend for GpuDcrtBackend {
                                     &local,
                                     plaintext_moduli,
                                     reconstruction_coefficients,
+                                    destination,
                                 )
                             })
                             .map(|value| GpuColumnShard {

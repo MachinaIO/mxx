@@ -315,6 +315,17 @@ pub trait Backend {
         index: usize,
     ) -> Result<Self::Matrix, Self::Error>;
 
+    fn modulus_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+    fn reduce_modulus(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, usize)>,
@@ -497,6 +508,7 @@ pub trait Backend {
         levels: &[Self::Matrix],
         plaintext_moduli: &[BigInt],
         reconstruction_coefficients: &[BigInt],
+        destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
 
     fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8>;

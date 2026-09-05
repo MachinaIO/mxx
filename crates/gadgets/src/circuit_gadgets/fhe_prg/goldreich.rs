@@ -1521,7 +1521,7 @@ mod graph_tests {
 
     #[test]
     fn encrypted_predicate_circuit_matches_plaintext_evaluation_at_runtime() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let graph = GoldreichGraph::from_edges(
             5,
             vec![GoldreichEdge::new([0, 1, 2], [3, 4]), GoldreichEdge::new([0, 2, 4], [1, 3])],
@@ -1556,7 +1556,7 @@ mod graph_tests {
     fn ring_gsw_predicate_executes_through_ir_and_decrypts_to_plaintext() {
         const RING_DIMENSION: u32 = 2;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let parameters = DCRTPolyParams::new(RING_DIMENSION, 1, 10, 5);
+        let parameters = DCRTPolyParams::new(RING_DIMENSION, 1, 10, 5, None);
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
             &parameters,

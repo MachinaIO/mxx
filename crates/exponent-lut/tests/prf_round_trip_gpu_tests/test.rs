@@ -159,7 +159,7 @@ impl PrfTestParameters {
 
     fn build(&self) -> (DCRTPolyParams, RefreshSetupParameters, SparseLwrPrfProfile) {
         let Self { log_n, depth, crt_bits, base_bits, q_native, p, security, .. } = *self;
-        let params = DCRTPolyParams::new(1 << log_n, depth, crt_bits, base_bits);
+        let params = DCRTPolyParams::new(1 << log_n, depth, crt_bits, base_bits, None);
         let n = params.ring_dimension() as usize;
         let modulus = BigInt::from(params.modulus().as_ref().clone());
         let width_log2 = q_native.trailing_zeros() as usize - 1;
@@ -816,7 +816,6 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
                     .unwrap_or(2),
                 ..Default::default()
             },
-            depth,
         );
         let stages = [("preprocess", &preprocessing), ("online", &estimate_online)];
         for (_, graph) in stages {

@@ -11,4 +11,7 @@ pub mod prf;
 pub mod readout;
 pub mod refresh;
 pub mod setup;
+#[cfg(all(test, feature = "gpu"))]
+#[path = "../../tests/unit/noise_refresh_gpu.rs"]
+mod setup_gpu;
 pub mod simulation;

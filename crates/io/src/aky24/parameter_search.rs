@@ -131,7 +131,7 @@ impl Aky24IoParameterSearch {
             let ring_dimension = 1u32
                 .checked_shl(log_ring_dimension as u32)
                 .ok_or(Aky24IoParameterSearchError::InvalidRange)?;
-            let parameters = DCRTPolyParams::new(ring_dimension, depth, self.crt_modulus_bits, 1);
+            let parameters = DCRTPolyParams::new(ring_dimension, depth, self.crt_modulus_bits, 1, None);
             let achieved = error_sigmas.iter().try_fold(u64::MAX, |minimum, error_sigma| {
                 estimate_security(&parameters, secret_sigma, *error_sigma)
                     .map(|estimate| minimum.min(estimate))
@@ -160,7 +160,7 @@ impl Aky24IoParameterSearch {
             .ok_or(Aky24IoParameterSearchError::InvalidRange)?;
         // AKY24's attribute encoding is binary, so the DCRT gadget base is
         // fixed to two rather than exposed as an independent search knob.
-        let parameters = DCRTPolyParams::new(ring_dimension, depth, self.crt_modulus_bits, 1);
+        let parameters = DCRTPolyParams::new(ring_dimension, depth, self.crt_modulus_bits, 1, None);
         let modulus: Arc<BigUint> = parameters.modulus();
         let mut config = self.template.clone();
         config.modulus = BigInt::from(modulus.as_ref().clone());

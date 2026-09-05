@@ -59,6 +59,14 @@ pub enum NodeKind {
     RingAutomorphism {
         index: IntExpr,
     },
+    /// Coefficientwise exact nearest scaling into a divisor ring.
+    ModulusSwitch {
+        modulus: IntExpr,
+    },
+    /// Ordinary coefficient-ring reduction, preserving small integer values.
+    ModulusReduce {
+        modulus: IntExpr,
+    },
     Transpose,
     Slice {
         rows: Option<IndexRange>,
@@ -130,6 +138,7 @@ pub enum NodeKind {
         output_bool: bool,
     },
     CrtRecompose {
+        modulus: IntExpr,
         plaintext_moduli: Vec<IntExpr>,
         reconstruction_coefficients: Vec<IntExpr>,
     },

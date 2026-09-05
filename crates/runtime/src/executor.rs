@@ -1863,6 +1863,18 @@ where
                     self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
             }
+            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let output = if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
+                    self.backend.modulus_switch(&input, &ty)
+                } else {
+                    self.backend.reduce_modulus(&input, &ty)
+                }
+                .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
             NodeKind::RingAutomorphism { index } => {
                 let input = self.matrix(values, node.args[0])?;
                 let index = self.eval_usize(node.id, index, env)?;
@@ -1912,7 +1924,7 @@ where
                     self.put(values, node.id, port as u32, value);
                 }
             }
-            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => {
                 let levels = node
                     .args
                     .iter()
@@ -1930,9 +1942,16 @@ where
                         value.evaluate(env).map_err(|error| self.expression_error(node.id, error))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let destination =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let output = self
                     .backend
-                    .crt_recompose(&levels, &plaintext_moduli, &reconstruction_coefficients)
+                    .crt_recompose(
+                        &levels,
+                        &plaintext_moduli,
+                        &reconstruction_coefficients,
+                        &destination,
+                    )
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -4281,6 +4300,22 @@ mod tests {
             unused_probe_operation!(value, index)
         }
 
+        fn modulus_switch(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+
+        fn reduce_modulus(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+
         fn preimage_target(
             &mut self,
             value: Arc<Self::Matrix>,
@@ -4405,8 +4440,14 @@ mod tests {
             levels: &[Self::Matrix],
             plaintext_moduli: &[BigInt],
             reconstruction_coefficients: &[BigInt],
+            destination: &ConcreteMatrixType,
         ) -> Result<Self::Matrix, Self::Error> {
-            unused_probe_operation!(levels, plaintext_moduli, reconstruction_coefficients)
+            unused_probe_operation!(
+                levels,
+                plaintext_moduli,
+                reconstruction_coefficients,
+                destination
+            )
         }
 
         fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
@@ -4630,7 +4671,7 @@ mod tests {
 
     #[test]
     fn canonical_polynomial_coefficient_bits_roundtrip_on_cpu() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = parameters.modulus();
         let coefficient_bits = parameters.modulus_bits();
         let ring_dimension = parameters.ring_dimension() as usize;
@@ -4672,7 +4713,7 @@ mod tests {
 
     #[test]
     fn integer_lift_writes_only_the_constant_polynomial_coefficient() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let context = DslContext::new("integer-lift-constant-polynomial");
@@ -4867,7 +4908,7 @@ mod tests {
 
     #[test]
     fn decomposed_hash_executes_as_a_generic_small_rhs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u8) << parameters.base_bits();
@@ -4900,7 +4941,7 @@ mod tests {
 
     #[test]
     fn generic_small_rhs_input_and_artifact_keep_the_compact_runtime_kind() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let lhs = ring.input("lhs", (1, 1));
@@ -5010,7 +5051,7 @@ mod tests {
     #[test]
     #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn trapdoor_families_sample_preimages_and_persist_each_member() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u64 << parameters.base_bits());
@@ -5277,7 +5318,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_preserves_preimage_small_owner_and_relation() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u8) << parameters.base_bits();
@@ -5343,7 +5384,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::from([(
                 "increments".to_owned(),
                 RuntimeValue::IndexedFamily(vec![
@@ -5372,7 +5413,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -5398,7 +5439,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -5428,7 +5469,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
             BTreeMap::from([(
                 "bits".to_owned(),
                 RuntimeValue::IndexedFamily(
@@ -5615,7 +5656,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_and_trace_preserve_sampled_execution_exactly() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sample = ring.gaussian((1, 1), 3, 19);
@@ -5657,7 +5698,7 @@ mod tests {
 
     #[test]
     fn resumable_session_reuses_draws_and_rejects_changed_inputs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sampled = DslContext::new("runtime-resumable-sample")
@@ -5784,7 +5825,7 @@ mod tests {
         .expect("freeze")
         .0;
         let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let result = execute(
             &validated,
             &mut cpu_backend([parameters]),
@@ -5833,7 +5874,7 @@ mod tests {
         assert!(matches!(
             execute(
                 &validated,
-                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4)]),
+                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
                 BTreeMap::new(),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
@@ -5844,7 +5885,7 @@ mod tests {
 
     #[test]
     fn dynamic_family_access_selects_the_runtime_index_and_rejects_out_of_range() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let family = Family::pack(vec![ring.polynomial([10.into()]), ring.polynomial([20.into()])])

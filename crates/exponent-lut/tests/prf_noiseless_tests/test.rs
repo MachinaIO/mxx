@@ -39,7 +39,7 @@ fn test_lwr_prf_noiseless_round_trip() {
     assert!(depth >= 2, "exercise at least two CRT limbs");
     assert!(q_native.is_power_of_two() && q_native >= 4 && q_native <= 2 * n);
     assert!(p.is_power_of_two() && p >= 4 && p <= q_native);
-    let params = DCRTPolyParams::new(n as u32, depth, env("CRT_BITS", 20), base_bits);
+    let params = DCRTPolyParams::new(n as u32, depth, env("CRT_BITS", 20), base_bits, None);
     let modulus = BigInt::from(params.modulus().as_ref().clone());
     let layout = BggSamplerLayout {
         modulus: modulus.clone().into(),

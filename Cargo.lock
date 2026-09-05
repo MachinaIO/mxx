@@ -610,6 +610,8 @@ dependencies = [
  "bincode",
  "bitvec",
  "cc",
+ "cxx",
+ "cxx-build",
  "digest",
  "itertools",
  "keccak-asm",

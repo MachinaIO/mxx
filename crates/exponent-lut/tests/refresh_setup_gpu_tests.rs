@@ -93,6 +93,7 @@ fn test_gpu_noise_refresh_round_trip() {
         candidate.crt_depth,
         candidate.crt_bits,
         candidate.base_bits,
+        None,
     );
     let n = params.ring_dimension() as usize;
     println!(
@@ -130,7 +131,7 @@ fn test_gpu_noise_refresh_round_trip() {
         candidate.crt_depth,
         columns,
         n,
-        mask_digits,
+        vec![mask_digits; candidate.crt_depth],
         fresh_digits,
     )
     .unwrap();
@@ -338,7 +339,8 @@ fn gpu_artifact_backed_refresh_replays_across_wave_settings() {
     );
     let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU required for artifact-backed smoke test");
-    let mut backend = gpu_backend_on([gpu_parameters], devices);
+    let mut backend =
+        gpu_backend_on(bundle.ring_parameters(gpu_parameters).expect("refresh rings"), devices);
     let mut inputs = bundle.selector_runtime_inputs(&mut backend).expect("selector inputs");
     inputs.insert(
         "refresh-parameter-search-hash-key".to_owned(),

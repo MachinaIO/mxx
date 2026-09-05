@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn online_runtime_matches_explicit_threshold_decode_oracle() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let q = parameters.modulus().as_ref().clone();
         let digit_count = parameters.modulus_digits();
         let compiler = MaskedHighBitDecoderCompiler {

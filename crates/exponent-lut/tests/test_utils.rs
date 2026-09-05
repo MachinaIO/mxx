@@ -521,6 +521,7 @@ pub fn check_refresh_bundle(
             "native AverageCase noise report"
         );
         prepared.production_report = Some(ProductionNoiseReport {
+            anchor_security_inputs: prepared.anchor_security_inputs.clone(),
             worst_case: None,
             average_case: Some(average.clone()),
             fresh_error_margins: fresh_error_margins(config, _candidate, prepared)?,
@@ -549,6 +550,7 @@ pub fn check_refresh_bundle(
     let accepted = report.refresh.accepted;
     log_worst_case_noise_report(_candidate, &report);
     prepared.production_report = Some(ProductionNoiseReport {
+        anchor_security_inputs: prepared.anchor_security_inputs.clone(),
         worst_case: Some(report),
         average_case: None,
         fresh_error_margins: fresh_error_margins(config, _candidate, prepared)?,
@@ -658,6 +660,7 @@ fn fresh_error_margins(
         candidate.crt_depth,
         candidate.crt_bits,
         candidate.base_bits,
+        None,
     );
     let bound = BigUint::from(config.sparse_lwr_output_modulus)
         .pow(prepared.fresh_error_base_p_digit_count as u32) -
@@ -1061,6 +1064,8 @@ pub struct Candidate {
 
 /// The public, non-secret facts retained for one prepared candidate.
 pub struct PreparedCandidate {
+    pub anchor_security_inputs:
+        Vec<mxx_exponent_lut::noise_refresh::setup::RefreshAnchorSecurityInputs>,
     pub candidate: Candidate,
     pub ring_dimension: usize,
     pub bucket_width: usize,
@@ -1099,8 +1104,12 @@ pub struct PreparedCandidate {
 /// Complete setup-owned evidence for one candidate.  The nested program
 /// report retains every gate/family member bit transition; the refresh report
 /// retains the exact per-slot rounding and fresh-error margins.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 pub struct ProductionNoiseReport {
+    /// Marginal inputs and explicitly unresolved joint-view security. Noise
+    /// acceptance and existing high-q estimates do not discharge this status.
+    pub anchor_security_inputs:
+        Vec<mxx_exponent_lut::noise_refresh::setup::RefreshAnchorSecurityInputs>,
     pub worst_case: Option<ExponentLutNoiseReport>,
     pub average_case: Option<ExponentLutAverageNoiseReport>,
     /// Exact smallest-prime-factor minus `(P^d_e-1)` margin for every CRT slot.
@@ -1111,7 +1120,10 @@ pub struct ProductionNoiseReport {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SearchResult {
     pub candidate: Candidate,
+    /// Minimum of the original high-q BGG and sparse-LWR marginal estimates;
+    /// not the security of the switched construction or its joint view.
     pub achieved_security_bits: u64,
+    pub switched_security_status: String,
     pub bgg_rlwe_security_bits: u64,
     pub sparse_lwr_security_bits: u64,
     pub raw_key_entropy_bits: f64,
@@ -1123,6 +1135,7 @@ pub struct SearchResult {
     pub pbc_attempts_used: u32,
     pub layout_id: String,
     pub program_id: String,
+    /// Acceptance by the selected application noise authority only.
     pub checker_accepted: bool,
     pub sparse_lwr_q_l: usize,
     pub sparse_lwr_p: usize,
@@ -1141,6 +1154,7 @@ pub struct AverageAcceptanceEvidence {
     pub setup_identity: String,
     pub layout_id: String,
     pub program_id: String,
+    pub switch_moduli: Vec<String>,
     pub mask_digit_count: usize,
     pub fresh_error_digit_count: usize,
     pub event_budget_log2: u32,
@@ -1935,6 +1949,15 @@ fn final_average_evidence(
         setup_identity: hex(report.snapshot_identity),
         layout_id: hex(prepared.layout_id),
         program_id: hex(prepared.program_id),
+        switch_moduli: prepared
+            .noise_snapshot
+            .as_ref()
+            .ok_or("missing selected switching rings")?
+            .refresh
+            .switch_moduli
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         mask_digit_count: prepared.mask_base_p_digit_count,
         fresh_error_digit_count: prepared.fresh_error_base_p_digit_count,
         event_budget_log2,
@@ -2085,6 +2108,7 @@ where
             layout_id: hex(prepared.layout_id),
             program_id: hex(prepared.program_id),
             checker_accepted: true,
+            switched_security_status: "low-P marginal estimates not supplied; cross-modulus joint-view security unresolved".into(),
             sparse_lwr_q_l: sparse_profile.q_l,
             sparse_lwr_p: sparse_profile.p,
             sparse_lwr_tier: sparse_profile.tier,
@@ -2147,12 +2171,13 @@ pub(crate) fn reviewed_bgg_security_bits(
     if candidate.crt_depth == 0 || candidate.crt_depth > 27 {
         return Err(format!("{REVIEWED_BGG_ENVELOPE_SOURCE} covers CRT depth 1..=27 only"));
     }
-    let q27 = DCRTPolyParams::new(1 << 16, 27, 50, 25).modulus();
+    let q27 = DCRTPolyParams::new(1 << 16, 27, 50, 25, None).modulus();
     let candidate_q = DCRTPolyParams::new(
         1 << candidate.log_ring_dimension,
         candidate.crt_depth,
         candidate.crt_bits,
         candidate.base_bits,
+        None,
     )
     .modulus();
     if candidate_q.as_ref() > q27.as_ref() {
@@ -2186,7 +2211,7 @@ pub fn prepare_candidate(
     config: &SearchConfig,
     candidate: Candidate,
 ) -> Result<PreparedCandidate, CandidatePreparationError> {
-    prepare_candidate_with_digits_inner(config, candidate, None, false)
+    prepare_candidate_with_digits_inner(config, candidate, None, false, None)
 }
 
 pub fn prepare_candidate_with_fixed_digits(
@@ -2194,6 +2219,7 @@ pub fn prepare_candidate_with_fixed_digits(
     candidate: Candidate,
     mask_digits: usize,
     fresh_error_digits: usize,
+    switch_moduli: &[BigUint],
 ) -> Result<PreparedCandidate, CandidatePreparationError> {
     if mask_digits == 0 || fresh_error_digits == 0 {
         return Err("fixed d_m and d_e must be positive".to_owned().into());
@@ -2203,6 +2229,7 @@ pub fn prepare_candidate_with_fixed_digits(
         candidate,
         Some((mask_digits, fresh_error_digits)),
         true,
+        Some(switch_moduli),
     )
 }
 
@@ -2212,6 +2239,7 @@ struct CandidatePreparationContext {
     layout: mxx_exponent_lut::ExpLayout,
     profile: SparseLwrPrfProfile,
     crt_moduli: Vec<u64>,
+    switch_moduli: Vec<BigUint>,
     sampler_layout: BggSamplerLayout,
     refresh: RefreshCompiler,
     generated_layout: PbcGeneratedKeyLayout,
@@ -2240,6 +2268,7 @@ fn build_candidate_context(
         candidate.crt_depth,
         candidate.crt_bits,
         candidate.base_bits,
+        None,
     );
     let (crt_moduli, _, _) = dcrt.to_crt();
     let modulus = BigInt::from_biguint(num_bigint::Sign::Plus, dcrt.modulus().as_ref().clone());
@@ -2286,6 +2315,7 @@ fn build_candidate_context(
         ring_dimension,
         layout,
         profile,
+        switch_moduli: vec![dcrt.modulus().as_ref().clone(); crt_moduli.len()],
         crt_moduli,
         sampler_layout,
         refresh,
@@ -2308,7 +2338,7 @@ fn setup_for_candidate_context(
         .map_err(|error| CandidatePreparationError::Fatal(format!("decoder sigma: {error}")))?;
     let sigma_encoding = RealExpr::from_f64_exact(config.error_sigma)
         .map_err(|error| CandidatePreparationError::Fatal(format!("encoding sigma: {error}")))?;
-    Ok(RefreshSetupParameters::new(
+    let mut setup = RefreshSetupParameters::new(
         [0x52; 32],
         context.base_p,
         config.secret_dimension,
@@ -2323,7 +2353,9 @@ fn setup_for_candidate_context(
         sigma_encoding,
         "refresh-parameter-search",
     )
-    .with_decoder_preimage_bound(config.decoder_preimage_bound.clone()))
+    .with_decoder_preimage_bound(config.decoder_preimage_bound.clone());
+    setup.switch_moduli = context.switch_moduli.clone();
+    Ok(setup)
 }
 
 /// Builds the actual verification program with fresh test-owned PBC randomness.
@@ -2372,8 +2404,63 @@ fn prepare_candidate_with_digits_inner(
     candidate: Candidate,
     fixed_digits: Option<(usize, usize)>,
     build_full_bundle: bool,
+    selected_switch_moduli: Option<&[BigUint]>,
 ) -> Result<PreparedCandidate, CandidatePreparationError> {
-    let context = build_candidate_context(config, candidate)?;
+    let mut context = build_candidate_context(config, candidate)?;
+    if let Some(selected) = selected_switch_moduli {
+        context.switch_moduli = selected.to_vec();
+        return prepare_candidate_from_ring_context(
+            config,
+            &context,
+            fixed_digits,
+            build_full_bundle,
+        );
+    }
+    let mut rejections = Vec::new();
+    // Deterministic coarse search: increasing retained width, shared contiguous
+    // groups, and an overlapping full-width final group. Full q is evaluated
+    // last as an ordinary candidate, not as an evaluator fallback.
+    for retained in 1..=context.crt_moduli.len() {
+        context.switch_moduli = candidate_switch_moduli(&context.crt_moduli, retained)?;
+        match prepare_candidate_from_ring_context(config, &context, fixed_digits, build_full_bundle)
+        {
+            Ok(prepared) => return Ok(prepared),
+            Err(CandidatePreparationError::Infeasible(reason)) => {
+                rejections.push(format!("retained={retained}: {reason}"))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(CandidatePreparationError::Infeasible(format!(
+        "coarse switched-ring scan rejected: {}",
+        rejections.join("; ")
+    )))
+}
+
+fn candidate_switch_moduli(
+    crt_moduli: &[u64],
+    retained: usize,
+) -> Result<Vec<BigUint>, CandidatePreparationError> {
+    if retained == 0 || retained > crt_moduli.len() {
+        return Err(CandidatePreparationError::Fatal("invalid retained CRT width".into()));
+    }
+    Ok((0..crt_moduli.len())
+        .map(|slot| {
+            let start = ((slot / retained) * retained).min(crt_moduli.len() - retained);
+            crt_moduli[start..start + retained]
+                .iter()
+                .fold(BigUint::one(), |product, prime| product * *prime)
+        })
+        .collect())
+}
+
+fn prepare_candidate_from_ring_context(
+    config: &SearchConfig,
+    context: &CandidatePreparationContext,
+    fixed_digits: Option<(usize, usize)>,
+    build_full_bundle: bool,
+) -> Result<PreparedCandidate, CandidatePreparationError> {
+    let candidate = context.candidate;
     match fixed_digits {
         Some((mask_digits, fresh_error_digits)) => prepare_candidate_from_context(
             config,
@@ -2387,8 +2474,12 @@ fn prepare_candidate_with_digits_inner(
         ),
         None => {
             let base_p_big = BigUint::from(context.base_p);
-            let (first_digits, last_digits) =
-                mask_digit_search_bounds(&base_p_big, &context.q_l, &context.crt_moduli)?;
+            let (first_digits, last_digits) = mask_digit_search_bounds(
+                &base_p_big,
+                &context.q_l,
+                &context.crt_moduli,
+                &context.switch_moduli,
+            )?;
             let invariant_setup = setup_for_candidate_context(
                 config,
                 &context,
@@ -2421,6 +2512,36 @@ fn prepare_candidate_with_digits_inner(
                     CandidatePreparationError::Fatal("compact scan snapshot missing".to_owned())
                 })?
                 .clone();
+            if config.noise_model == NoiseSearchModel::WorstCase {
+                // State and shared-fresh routes do not depend on mask digit
+                // count. Even dropping all mask-route, rounding and decoder
+                // errors cannot repair 2 H >= kappa, since
+                // (H/J)/Delta = H/kappa for every selected P.
+                let routes = scan_base.refresh.route_gains.as_ref().ok_or_else(|| {
+                    CandidatePreparationError::Fatal("missing route gains".into())
+                })?;
+                let readout = &pre_refresh
+                    .as_ref()
+                    .ok_or_else(|| {
+                        CandidatePreparationError::Fatal("missing pre-refresh report".into())
+                    })?
+                    .readout_bound;
+                let q = scan_base.refresh.global_modulus.as_ref().ok_or_else(|| {
+                    CandidatePreparationError::Fatal("missing global modulus".into())
+                })?;
+                for slot in 0..scan_base.refresh.slot_count {
+                    let unavoidable = &routes.state_scaling[slot].l1 *
+                        &scan_base.initial_state_bound +
+                        &routes.fresh[slot].l1 * readout;
+                    let kappa = q / &scan_base.refresh.plaintext_moduli[slot];
+                    if &unavoidable * 2u8 >= kappa {
+                        return Err(CandidatePreparationError::Infeasible(format!(
+                            "no mask digit count passed the complete production report in d_m={first_digits}..={last_digits}: exact necessary bound rejects slot {slot}, 2*H_unavoidable={} >= kappa={kappa}",
+                            &unavoidable * 2u8
+                        )));
+                    }
+                }
+            }
             let mask_gains = (first_digits..=last_digits)
                 .map(|mask_digits| {
                     RefreshParameterSimulationRequest::mask_route_gain_for_digit_count(
@@ -2500,30 +2621,24 @@ fn prepare_candidate_with_digits_inner(
 pub(crate) fn snapshot_with_mask_gain(
     base: &ExponentLutNoiseSnapshot,
     mask_digits: usize,
-    mask_gain: &RightActionNoiseGain,
+    mask_gain: &[RightActionNoiseGain],
 ) -> Result<ExponentLutNoiseSnapshot, String> {
     let mut snapshot = base.clone();
     let mut refresh = snapshot.refresh.clone();
-    refresh.mask_digit_count = mask_digits;
+    if mask_gain.len() != refresh.slot_count {
+        return Err("compact scan mask gain slot count differs".to_owned());
+    }
+    refresh.mask_digit_counts.fill(mask_digits);
     let topology = refresh
         .transcript_topology
         .as_mut()
         .ok_or_else(|| "compact snapshot transcript topology is missing".to_owned())?;
-    topology.mask_digit_count = mask_digits;
-    let mask_events = topology
+    topology.mask_digit_counts.fill(mask_digits);
+    let transcript_coordinates = topology
         .crt_slot_count
         .checked_mul(topology.component_columns)
         .and_then(|value| value.checked_mul(topology.coefficient_count))
-        .and_then(|value| value.checked_mul(mask_digits))
-        .ok_or_else(|| "compact scan mask event count overflows".to_owned())?;
-    let fresh_events = topology
-        .component_columns
-        .checked_mul(topology.coefficient_count)
-        .and_then(|value| value.checked_mul(topology.fresh_digit_count))
-        .ok_or_else(|| "compact scan fresh event count overflows".to_owned())?;
-    let transcript_coordinates = mask_events
-        .checked_add(fresh_events)
-        .ok_or_else(|| "compact scan event count overflows".to_owned())?;
+        .ok_or_else(|| "compact scan mask coordinate count overflows".to_owned())?;
     refresh
         .smudging
         .as_mut()
@@ -2533,11 +2648,11 @@ pub(crate) fn snapshot_with_mask_gain(
         .route_gains
         .clone()
         .ok_or_else(|| "compact snapshot route gains are missing".to_owned())?;
-    route_gains.mask = mask_gain.clone();
+    route_gains.mask = mask_gain.to_vec();
     refresh.route_gains = Some(route_gains);
-    let digit_variance = centered_base_p_digit_variance(&refresh.base_p.clone().into())
-        .map_err(|error| error.to_string())?
-        .scaled(&mask_gain.l2_squared);
+    let mask_digits = u32::try_from(mask_digits).map_err(|_| "mask digit count overflows")?;
+    let digit_variance = centered_base_p_digit_variance(&refresh.base_p.pow(mask_digits))
+        .map_err(|error| error.to_string())?;
     refresh.mask_digit_variances = vec![digit_variance; refresh.slot_count];
     snapshot.refresh = refresh;
     Ok(snapshot)
@@ -2600,6 +2715,9 @@ fn prepare_candidate_from_context(
         })?,
     )
     .map_err(CandidatePreparationError::Fatal)?;
+    let anchor_security_inputs = setup
+        .anchor_security_inputs(1)
+        .map_err(|error| CandidatePreparationError::Fatal(error.to_string()))?;
     let prf_component_count = setup.prf_component_count();
     let prf_label_count = setup
         .refresh
@@ -2696,6 +2814,7 @@ fn prepare_candidate_from_context(
         })
     });
     Ok(PreparedCandidate {
+        anchor_security_inputs,
         candidate,
         ring_dimension,
         bucket_width,
@@ -2748,16 +2867,21 @@ fn minimum_mask_base_p_digit_count(q_l: usize, base_p: usize) -> Result<usize, S
 
 /// Returns the finite `d_m` interval that may satisfy the strict deterministic
 /// CRT precondition.  The lower endpoint is exactly `ceil_log_P(Q_L)`; the
-/// upper endpoint is the last digit before `B_m >= min kappa`.  The exact
-/// report checks `B_m + 2F < kappa`; this weaker monotone stopping condition
+/// upper endpoint is the last digit before `2 floor(M/2) >= min Delta`. The exact
+/// report checks `2(B_m + F) < Delta`; this weaker monotone stopping condition
 /// cannot skip a valid candidate and leaves the final decision to production
 /// report evaluation.
 fn mask_digit_search_bounds(
     base_p: &BigUint,
     q_l: &BigUint,
     crt_moduli: &[u64],
+    switch_moduli: &[BigUint],
 ) -> Result<(usize, usize), CandidatePreparationError> {
-    if base_p < &BigUint::from(2u8) || q_l.is_zero() || crt_moduli.is_empty() {
+    if base_p < &BigUint::from(2u8) ||
+        q_l.is_zero() ||
+        crt_moduli.is_empty() ||
+        switch_moduli.len() != crt_moduli.len()
+    {
         return Err(CandidatePreparationError::Fatal(
             "invalid mask digit-search boundary inputs".to_owned(),
         ));
@@ -2770,10 +2894,15 @@ fn mask_digit_search_bounds(
         })?,
     )?;
     let moduli = crt_moduli.iter().copied().map(BigUint::from).collect::<Vec<_>>();
-    let full_modulus = moduli.iter().fold(BigUint::one(), |product, modulus| product * modulus);
+    if moduli.iter().zip(switch_moduli).any(|(qt, p)| p.is_zero() || p % qt != BigUint::zero()) {
+        return Err(CandidatePreparationError::Fatal(
+            "selected ring does not contain its CRT slot".into(),
+        ));
+    }
     let min_spacing = moduli
         .iter()
-        .map(|modulus| &full_modulus / modulus)
+        .zip(switch_moduli)
+        .map(|(modulus, selected)| selected / modulus)
         .min()
         .ok_or_else(|| CandidatePreparationError::Fatal("missing CRT spacing".to_owned()))?;
     let mut last = first;
@@ -2781,7 +2910,7 @@ fn mask_digit_search_bounds(
         let exponent = u32::try_from(last).map_err(|_| {
             CandidatePreparationError::Fatal("mask digit count overflow".to_owned())
         })?;
-        let bound = base_p.pow(exponent) - BigUint::one();
+        let bound = (base_p.pow(exponent) / 2u8) * 2u8;
         if bound >= min_spacing {
             if last == first {
                 return Err(CandidatePreparationError::Infeasible(
@@ -2968,7 +3097,7 @@ pub fn hex(bytes: [u8; 32]) -> String {
 
 /// Small real-graph fixture shared by runtime smoke tests.
 pub fn tiny_native_refresh_bundle() -> (DCRTPolyParams, RefreshParameterSimulationBundle, usize) {
-    let poly_parameters = DCRTPolyParams::new(32, 2, 10, 10);
+    let poly_parameters = DCRTPolyParams::new(32, 2, 10, 10, None);
     let modulus = poly_parameters.modulus().as_ref().clone();
     let (crt_moduli, _, _) = poly_parameters.to_crt();
     let ring = mxx_dsl::Ring::new(

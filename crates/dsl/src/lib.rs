@@ -1039,6 +1039,23 @@ impl Mat {
         Self::from_node(NodeKind::RingAutomorphism { index: index.into() }, vec![self], ty)
     }
 
+    /// Rounds each coefficient after scaling by destination/source modulus.
+    /// The destination must be an odd divisor of the source modulus.
+    #[track_caller]
+    pub fn modulus_switch(self, modulus: impl Into<IntExpr>) -> Self {
+        let modulus = modulus.into();
+        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
+        Self::from_node(NodeKind::ModulusSwitch { modulus }, vec![self], ty)
+    }
+
+    /// Reduces coefficients into a divisor ring without scaling their values.
+    #[track_caller]
+    pub fn reduce_modulus(self, modulus: impl Into<IntExpr>) -> Self {
+        let modulus = modulus.into();
+        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
+        Self::from_node(NodeKind::ModulusReduce { modulus }, vec![self], ty)
+    }
+
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }
@@ -1259,10 +1276,12 @@ impl Mat {
         values: Vec<Mat>,
         plaintext_moduli: Vec<IntExpr>,
         reconstruction_coefficients: Vec<IntExpr>,
+        modulus: IntExpr,
     ) -> Mat {
-        let ty = values.first().expect("CRT recomposition requires inputs").matrix_type.clone();
+        let mut ty = values.first().expect("CRT recomposition requires inputs").matrix_type.clone();
+        ty.modulus = modulus.clone();
         Mat::from_node(
-            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients },
+            NodeKind::CrtRecompose { modulus, plaintext_moduli, reconstruction_coefficients },
             values,
             ty,
         )

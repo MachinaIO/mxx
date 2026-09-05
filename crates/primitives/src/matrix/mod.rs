@@ -569,10 +569,9 @@ pub trait PolyMatrix:
             .expect("small_decomposed_identity_chunk_from_scalar row offset overflow");
         full.slice(row_start, row_start + size, 0, size)
     }
-    fn modulus_switch(
-        &self,
-        new_modulus: &<<Self::P as Poly>::Params as PolyParams>::Modulus,
-    ) -> Self;
+    fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self;
+    /// Ordinary ring reduction into an exact destination CRT basis, without scaling.
+    fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),

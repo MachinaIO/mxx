@@ -728,7 +728,7 @@ mod tests {
     const SIGMA: f64 = 4.578;
 
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 16, 8)
+        DCRTPolyParams::new(128, 2, 16, 8, None)
     }
 
     fn sample_pert_square_mat_gpu_native(
@@ -770,7 +770,7 @@ mod tests {
     fn test_gpu_preimage_perturbation_keeps_single_column_tail() {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _) = trapdoor_sampler.trapdoor(&params, size);
@@ -1236,7 +1236,7 @@ mod tests {
     #[test]
     #[sequential]
     fn test_gpu_preimage_sampler_parameters_follow_instance_sigma() {
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let base = 1u32 << params.base_bits();
         let default_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
@@ -1313,7 +1313,7 @@ mod tests {
     ) {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, sigma);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
@@ -1370,7 +1370,7 @@ mod tests {
     fn test_gpu_p_hat_coefficients_below_compute_preimage_sigma() {
         gpu_device_sync();
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
@@ -1434,7 +1434,7 @@ mod tests {
         }
 
         let size = 2usize;
-        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17);
+        let cpu_params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
         let base_params = gpu_params_from_cpu(&cpu_params);
         let trapdoor_sampler = GpuDCRTPolyTrapdoorSampler::new(&base_params, SIGMA);
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
@@ -1460,7 +1460,7 @@ mod tests {
             let dst_device = device_ids[(idx + 1) % device_ids.len()];
             assert_ne!(src_device, dst_device, "src and dst devices must differ");
 
-            let src_params = base_params.params_for_device(src_device);
+            let src_params = base_params.params_for_device(src_device, None);
             let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&src_params, size);
             let target =
                 uniform_sampler.sample_uniform(&src_params, size, size, DistType::FinRingDist);
@@ -1493,7 +1493,7 @@ mod tests {
         }
 
         for case in cases {
-            let dst_params = base_params.params_for_device(case.dst_device);
+            let dst_params = base_params.params_for_device(case.dst_device, None);
             let public_matrix =
                 GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &case.public_matrix_bytes);
             let target = GpuDCRTPolyMatrix::from_compact_bytes(&dst_params, &case.target_bytes);

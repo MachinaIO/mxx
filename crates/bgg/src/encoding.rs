@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn runtime_multiplication_matches_the_bgg_encoding_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
         let ring = Ring::new(
@@ -607,7 +607,7 @@ mod tests {
     }
     #[test]
     fn payload_secret_none_reuses_the_mask_secret() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let layout = concrete_layout(&parameters, 2);
         let ring = layout.ring();
         let public_keys = BggPublicKeySampler { layout: layout.clone() }.sample(
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn runtime_public_keys_and_encodings_match_the_bgg_sampling_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let layout = concrete_layout(&parameters, 2);
         let key = [23u8; 32];
         let tag = b"bgg-ir-sampler";

@@ -657,8 +657,8 @@ mod compact_layout_tests {
 
     fn matching_native_and_ambient_params() -> (DCRTPolyParams, DCRTPolyParams, CrtWindow) {
         for crt_bits in 17..=30 {
-            let native = DCRTPolyParams::new(4, 1, crt_bits, 6);
-            let ambient = DCRTPolyParams::new(8, 3, crt_bits, 6);
+            let native = DCRTPolyParams::new(4, 1, crt_bits, 6, None);
+            let ambient = DCRTPolyParams::new(8, 3, crt_bits, 6, None);
             for offset in 0..3 {
                 if native.to_crt().0 == ambient.to_crt().0[offset..offset + 1] {
                     return (native, ambient, CrtWindow::new(offset, 1, 3));
@@ -938,7 +938,7 @@ mod tests {
         max_unreduced_muls: usize,
         scale: u64,
     ) -> (DCRTPolyParams, Arc<NestedRnsRingGswContext<DCRTPoly>>) {
-        let params = DCRTPolyParams::new(RING_DIMENSION, ACTIVE_LEVELS, CRT_BITS, BASE_BITS);
+        let params = DCRTPolyParams::new(RING_DIMENSION, ACTIVE_LEVELS, CRT_BITS, BASE_BITS, None);
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &params,
@@ -1301,7 +1301,7 @@ mod tests {
     fn chained_multiplication_builds_the_complete_ir_graph() {
         let ring_dimension = 2u32;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let params = DCRTPolyParams::new(ring_dimension, ACTIVE_LEVELS, CRT_BITS, BASE_BITS);
+        let params = DCRTPolyParams::new(ring_dimension, ACTIVE_LEVELS, CRT_BITS, BASE_BITS, None);
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
             &params,
@@ -1349,7 +1349,7 @@ mod tests {
     fn multiplication_context_supports_a_final_column_batch_narrower_than_the_batch_size() {
         let active_levels = 15usize;
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let params = DCRTPolyParams::new(2, active_levels, 18, BASE_BITS);
+        let params = DCRTPolyParams::new(2, active_levels, 18, BASE_BITS, None);
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
             &params,

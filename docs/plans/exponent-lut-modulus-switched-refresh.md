@@ -1,6 +1,8 @@
 # Modulus-switched Exponent-LUT refresh: design and implementation plan
 
-Status: design proposal; no implementation or new parameter acceptance is claimed.
+Status: implemented with unit validation and Profile B noise acceptance under
+the explicitly selected average-case authority. This is not joint-view
+security acceptance or a production benchmark; see the checkpoint in §8.
 This document specifies the complete refresh transition and its implementation
 plan without requiring the preceding conversation. It supersedes the refresh
 routing, decoder, and refresh-threshold portions of
@@ -80,7 +82,25 @@ c_{e,t}&=sA_{e,t}+\kappa_t e'+e_{e,t}.
 \]
 
 All three equations are over `R_q`. State scaling uses
-`G^{-1}(kappa_t G)`, with its actual decomposition gain. Define
+`G^{-1}(kappa_t G)`, with its actual decomposition gain. Apply this scaling
+exactly once to the normal input state `c` to obtain `u_t`; `u_t` already
+contains the message scale `kappa_t=q/q_t`. Switching scales by `P_t/q`,
+so `kappa_t` becomes `Delta_t=P_t/q_t` without any additional multiplier.
+Explicitly, `(P_t/q)(q/q_t) z=(P_t/q_t) z`; here `P_t` is the switching
+modulus, distinct from the PRF output modulus `p_PRF`.
+For a generic message value `z` (distinct from the nominal mask `m_t`), the
+nominal payload mapping is:
+
+| Payload | Before switching in `R_q` | After switching in `R_(P_t)` |
+| --- | --- | --- |
+| Message (`z=-X^w tG` here) | `kappa_t z` | `Delta_t z` |
+| Shared fresh error | `kappa_t e'` | `Delta_t e'` |
+| Nominal mask | `J_t m_t` | `m_t` |
+
+These are exact translation terms in the combined switch, not separate
+switches of the summands. `J_t=q/P_t` only lifts the nominal mask from its
+desired post-switch scale. Do not additionally multiply either the already
+scaled message or the fresh-error payload by `J_t`. Define
 
 \[
 v_t=u_t+c_{m,t}+c_{e,t},\quad
@@ -311,8 +331,9 @@ provenance ledger, or adversarial simulator protocol is required.
 
 ## 6. Current implementation and concrete changes
 
-The following symbols exist in the current checkout; described changes are
-proposed, not already implemented.
+The following table records the baseline-to-implementation migration. The
+baseline limitations described in this section motivated the changes;
+current implementation and validation evidence is summarized in §8.
 
 | Location / existing symbol | Required change |
 | --- | --- |
@@ -357,13 +378,26 @@ existing API. Reuse existing `Mat` and ring types rather than introducing a
 second encoding representation. Validate source/destination moduli, ring
 dimension, columns, and coefficient/evaluation format at that boundary.
 
-The GPU implementation must keep rounding on device, batch coefficient and
-tower work, use exact integer/CRT arithmetic, and restore the expected
-evaluation format. Dropping CRT limbs alone is reduction, not scaled
-rounding. Floating-point approximate switching is insufficient for this
-contract. Include both the public-matrix preprocessing switch and online
-vector switch in planning and costs; avoid host coefficient reconstruction
-in the production GPU path.
+The GPU implementation must execute the entire coefficientwise `MS_t` on
+device for both the preprocessing public matrix `A_sum,t` and the online
+vector `v_t`: GPU INTT from the source evaluation format, exact coefficient
+integer/CRT nearest switching, then GPU NTT into the target evaluation
+format. No coefficient round trip through the host, host reconstruction,
+or CPU fallback is permitted in either production GPU switch. Rounding in
+the NTT domain is not coefficientwise switching. Dropping CRT limbs alone
+is reduction, not scaled rounding; floating-point approximations must not
+decide rounding boundaries.
+The final nearest decoding from `R_(P_t)` to `R_(q_t)` must likewise stay
+on the GPU, with coefficientwise exact integer rounding and no host
+coefficient round trip.
+
+Batch and parallelize coefficient, column, and tower work on the GPU; avoid
+per-coefficient or per-column host launch loops. Use VRAM-calibrated waves
+through the existing symmetric multi-GPU production/estimator planner,
+including transform and switching scratch space. Preserve its capacity-based
+distribution and whole-matrix limb placement; add no fixed wave caps or
+unnecessary synchronization. Include both switches and their source INTT
+and target NTT transforms in planning and measured costs.
 
 For an exact GPU implementation, let `r` be the centered reconstruction of
 `x mod J_t` from the discarded CRT towers. Then
@@ -432,9 +466,18 @@ the guard or arbitrarily serializing all work is not a solution.
    errors term-by-term with the selected simulation bounds. Check the
    generated artifact graph has no old combined decoder. Use trusted
    primitives/round trips for expected values, not a duplicate evaluator.
+   Compare selected GPU output coefficients against an exact CPU reference
+   obeying the same nearest-switch contract, including negative values and
+   both sides of rounding boundaries. Cover both public-matrix and online
+   vector shapes, selected CRT subsets, and wave boundaries. Keep reference
+   computation and diagnostic readback outside the measured production path;
+   verify that neither GPU switch copies coefficients through the host.
 6. **Validate production performance.** After correctness acceptance and
    explicit authorization for integration tests, run complete refresh tests
    and GPU benchmark waves through production functions and store/load paths.
+   Account for both preprocessing and online coefficientwise switches and
+   their GPU INTT/NTT transforms; check measured paths for host coefficient
+   copies and unnecessary synchronization.
    Follow `GPU.md` and `BUILDER.md`; no integration or GPU test was run while
    writing this design.
 
@@ -475,3 +518,122 @@ review of the remaining joint-view security obligations, and honest
 validation/performance reporting. Until those steps are completed this
 document establishes an implementable algebraic proposal, not a validated
 secure deployment or a benchmark result.
+
+## 8. Implementation and validation checkpoint (2026-09-05)
+
+The switched simulator, ragged mask indexing, exact destination-typed CPU/GPU
+switch and reduction operations, mixed-modulus CRT, shared GPU execution
+ownership, grouped low-modulus preprocessing/artifacts and online anchors,
+and production planner/estimator dispatch are implemented. Native GPU
+switching and final CRT decoding use exact coefficient arithmetic between
+device INTT/NTT transforms. No coefficient-host fallback was introduced.
+
+The non-ignored component unit
+`profile_b_switched_refresh_named_average_authority_component_search` in
+`crates/exponent-lut/tests/parameter_search_unit.rs` reproduces the exact
+comparison profile in §7 without executing a backend, artifacts, integration
+test, external security estimator, or benchmark:
+
+```sh
+cargo test --release -p mxx-exponent-lut --test parameter_search_unit \
+  profile_b_switched_refresh_named_average_authority_component_search -- --nocapture
+```
+
+Its coarse increasing-retained-width, contiguous-group, uniform-digit search
+selects five retained 50-bit towers per slot, six distinct 250-bit anchor
+moduli across 27 slots, and `d_m=38` (`M=2^190`, `B_m=2^189`). This is not an
+exhaustive subset/ragged optimization. The named correctness authority is
+`AverageCase`, with `failure_exponent=100`, `tail_correction_bits=0`, the
+accepted TFHE-style variance heuristic and conservative correlated `Add`.
+Hard domain/fresh-support checks remain separate from that heuristic.
+The complete emitted report records exact moduli, route/decoder terms,
+joint tail counts and per-slot margins. The initial accepted run had
+`max F_avg=850377501249489267`, 200-bit spacings, minimum strict rounding
+margin `1605368404408516041782639623211186277883973868608376545242395`, and
+minimum smudging margin
+`1157264469336541567343474824793365005706215453443007447040`.
+Noise acceptance does not imply that the original high-q security estimates
+cover these new views.
+
+`RefreshSetupParameters::anchor_security_inputs(execution_budget)` reports
+each exact `P`, complementary `J`, slot group, ring dimension, one random
+ternary secret polynomial and the fixed augmented coordinate `1`, actual
+anchor error sigma/cutoff, anchor columns and sample budget. Production
+noise reports retain these inputs with an explicitly unestimated security
+status. A caller must obtain matching external evidence rather than inherit
+high-q security bits. The remaining joint-view obligation in §5, including
+the correlated complementary projection, is unresolved.
+
+A separate marginal calculation was run for each of the following selected
+`P` values with `n=65536`, ternary unknown secret, sigma `4`, and
+`m=1572864=24*n` scalar equations for one execution. Subtracting the known
+augmented public row leaves one unknown ternary ring polynomial. The
+authority is the bundled lattice estimator's **rough scalar-LWE surrogate**,
+not a proof about correlated ring samples or the joint view. All six runs
+returned uSVP `log2(ROP)=1202.164` (floor `1202`); the other rough result,
+`dual_hybrid`, was infinite.
+
+```text
+1809251283755169804643792595030325745566728194278478234920304281948304834561
+1809251207930325016022886889611584165212105705678103291926203402066066800641
+1809251120731756287638325423094560278549504412161526380292198786363058421761
+1809251018157598974248277523328659399802009492139169810353294299171281174529
+1809250902945974011043096294392820043706360432234152287429651025113362333697
+1809250879987899561990856885660925020771157995355245904313539848666809630721
+```
+
+Reproduction uses `lattice-estimator-cli` commit
+`2d2980ddf7fba0d1fee407999fbb9adf26bf3368`, bundled estimator commit
+`e35f45b7976a90a79c3c6625a45bbc344c1abc67`, and Sage. From that CLI checkout
+with its root on `PYTHONPATH`, run the following with `sage -python`, setting
+`P` successively to each integer above:
+
+```python
+from lattice_cli.core import LWE, LWEParameters, Ternary, DiscreteGaussian
+from sage.all import RealField, floor
+r = LWE.estimate.rough(LWEParameters(65536, P, Ternary,
+                                    DiscreteGaussian(4.0), 1572864))
+logs = {k: RealField(128)(v["rop"]).log(2) for k, v in r.items()}
+print(logs)
+print(int(floor(min(logs.values()))))
+```
+
+The CLI wrapper's float conversion overflows for these large work factors
+and prints the sentinel `4294967295`; that value is not a security estimate
+and was not used. These external marginal results are deliberately not
+hardcoded into production parameters or promoted to joint security evidence.
+
+Targeted unit evidence includes exact CPU-reference/GPU switching boundaries
+and selected bases, low-P sampler equations, mixed-P CRT, actual producer
+artifact typing, shared-anchor grouping and numerical original-q refresh
+relations. Final numerical diagnostics inject nonzero state and post-readout
+helper residuals, check every centered coefficient of `h`, paired rounding,
+anchor error, unscaled `e_P K`, and final operational error against the hard
+bounds, and retain exact mask/preimage/final-relation checks. Both CPU and GPU
+drivers execute the same graph twice with fresh sampling; each driver passed
+five consecutive targeted runs.
+
+Final validation after these additions passed:
+
+- Exponent-LUT GPU library: `175/175`, three consecutive runs.
+- Exponent-LUT CPU-configured library: `170/170`.
+- Parameter component units: `46` passed, one diagnostic-only unit ignored;
+  the exact Profile B acceptance and the ordinary large rejection smoke both
+  ran. An exact necessary-bound prune reduced that unchanged worst-case
+  smoke from a prior 180-second timeout to a 1.35-second passing run.
+- Runtime library: `74` passed, one ignored; estimator library: `47/47`;
+  IR library: `45/45`.
+- CPU/GPU workspace library compilation, GPU workspace all-target check,
+  nightly formatting and whitespace checks passed. Pre-existing
+  `mxx-correctness` dead-code warnings remain; these builds are not claimed
+  warning-free.
+
+Earlier native validation included CPU primitive `86/86`, GPU primitive
+`172/172` in three runs, and 900 targeted reclaimer/lifetime repetitions.
+An earlier stalled primitive run was terminated with explicit authorization;
+the corrected constructor initialization removes a concrete race, but the
+cause of that original stall was not proven.
+
+Compile/unit evidence is not integration, production artifact store/load,
+measured performance or secure-deployment acceptance. No integration test
+or benchmark is authorized by this checkpoint, and none was run for it.

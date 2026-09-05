@@ -1,5 +1,5 @@
-import MxxIR.Rel
-import MxxIR.IterRuns
+import IRRel
+import IRIterRuns
 
 namespace MxxIR
 

@@ -2,17 +2,16 @@
 
 `mxx` is a Rust and CUDA workspace for lattice-cryptography research. It contains
 polynomial and matrix primitives, bounded samplers, an executable graph IR and DSL, reusable BGG+
-and circuit gadgets, runtime backends, and a Rust operational-noise checker.
+and circuit gadgets, runtime backends, and application-specific Lean correctness proofs.
 
 ## Workspace layout
 
 | Crate | Responsibility |
 | --- | --- |
 | `mxx-primitives` | Polynomial/matrix operations, CPU/GPU kernels, and concrete samplers. |
-| `mxx-ir-core` | Serializable executable DAG, parameter/type validation, and artifact manifests. |
+| `mxx-ir-core` | Executable DAG, protocol declarations, structural validation, artifact manifests, and Lean claim generation. |
 | `mxx-dsl` | Typed graph construction and sampler-free ideal/predicate builders. |
 | `mxx-runtime` | CPU/GPU graph execution, transcripts, sessions, and in-memory artifacts. |
-| `mxx-correctness` | Common correctness declarations and the Rust operational checker. |
 | `mxx-bench-estimator` | Validated-graph cost and memory composition. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |

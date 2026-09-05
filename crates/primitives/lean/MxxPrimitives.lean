@@ -1,8 +1,8 @@
-import MxxPrimitives.Negacyclic
-import MxxPrimitives.Reduction
-import MxxPrimitives.Matrix
-import MxxPrimitives.Bounds
-import MxxPrimitives.Preimage
-import MxxPrimitives.Radix
-import MxxPrimitives.CrtRadix
-import MxxPrimitives.Sampling
+import PrimitivesNegacyclic
+import PrimitivesReduction
+import PrimitivesMatrix
+import PrimitivesBounds
+import PrimitivesPreimage
+import PrimitivesRadix
+import PrimitivesCrtRadix
+import PrimitivesSampling

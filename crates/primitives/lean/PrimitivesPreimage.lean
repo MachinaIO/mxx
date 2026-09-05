@@ -1,4 +1,4 @@
-import MxxPrimitives.Bounds
+import PrimitivesBounds
 
 namespace Mxx.Primitives
 

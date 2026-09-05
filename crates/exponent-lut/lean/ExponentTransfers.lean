@@ -1,5 +1,5 @@
 import ExponentBounds
-import MxxBgg.Multiplication
+import BggMultiplication
 
 namespace MxxExponentLut
 

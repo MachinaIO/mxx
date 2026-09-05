@@ -1,5 +1,5 @@
-import MxxPrimitives.Radix
-import MxxPrimitives.CrtRadix
+import PrimitivesRadix
+import PrimitivesCrtRadix
 
 namespace Mxx.Primitives.CrtDecomposition
 

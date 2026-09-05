@@ -386,17 +386,25 @@ pub(super) fn root_decomposition_proofs(
 
         if matches!(node.kind(), NodeKind::ParallelLoop(_)) {
             let child_id = FrozenGraphScopeId::ParallelBody {
-                parent: Box::new(FrozenGraphScopeId::Root), owner: value.wire.node,
+                parent: Box::new(FrozenGraphScopeId::Root),
+                owner: value.wire.node,
             };
             let Some(child) = graph.source.scopes().get(&child_id) else { continue };
             if child.nodes().len() != 2 || child.inputs().len() != 1 || child.outputs().len() != 1 {
                 continue;
             }
             let child_output = child.node(child.outputs()[0].node).unwrap();
-            if !matches!(child_output.kind(), NodeKind::GadgetDecompose { .. }) { continue; }
-            let ConcreteWireType::IndexedFamily { element, count: lanes } = &value.wire_type else { continue };
+            if !matches!(child_output.kind(), NodeKind::GadgetDecompose { .. }) {
+                continue;
+            }
+            let ConcreteWireType::IndexedFamily { element, count: lanes } = &value.wire_type else {
+                continue
+            };
             let Some(matrix) = element.matrix_type() else { continue };
-            let Some(target) = graph.scopes[&child_id].wire_types[&child.inputs()[0]].matrix_type() else { continue };
+            let Some(target) = graph.scopes[&child_id].wire_types[&child.inputs()[0]].matrix_type()
+            else {
+                continue
+            };
             let position = shape.node_constraints[&value.wire.node].clone().last().unwrap();
             let q = &matrix.modulus;
             let n = matrix.ring_dimension;

@@ -1,4 +1,4 @@
-import MxxPrimitives.Preimage
+import PrimitivesPreimage
 
 namespace Mxx.Gadgets
 

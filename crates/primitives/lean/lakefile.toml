@@ -13,3 +13,15 @@ rev = "v4.28.0"
 
 [[lean_lib]]
 name = "MxxPrimitives"
+roots = [
+  "MxxPrimitives",
+  "PrimitivesBounds",
+  "PrimitivesCrtDecomposition",
+  "PrimitivesCrtRadix",
+  "PrimitivesMatrix",
+  "PrimitivesNegacyclic",
+  "PrimitivesPreimage",
+  "PrimitivesRadix",
+  "PrimitivesReduction",
+  "PrimitivesSampling",
+]

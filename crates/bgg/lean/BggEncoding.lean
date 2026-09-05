@@ -1,5 +1,5 @@
-import MxxPrimitives.Bounds
-import MxxPrimitives.Matrix
+import PrimitivesBounds
+import PrimitivesMatrix
 
 namespace Mxx.Bgg
 

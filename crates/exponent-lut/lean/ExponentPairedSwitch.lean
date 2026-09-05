@@ -1,5 +1,5 @@
 import ExponentRefreshBounds
-import MxxRuntime.ModulusSwitch
+import RuntimeModulusSwitch
 
 namespace MxxExponentLut
 open Mxx.Primitives

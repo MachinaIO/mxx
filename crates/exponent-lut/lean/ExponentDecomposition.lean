@@ -1,5 +1,5 @@
 import ExponentBounds
-import MxxRuntime.Primitives
+import RuntimePrimitives
 
 namespace MxxExponentLut
 open Mxx.Primitives MxxRuntime

@@ -12,6 +12,7 @@ pub mod graph;
 pub mod inventory;
 pub mod lean;
 pub mod node;
+pub mod protocol;
 mod serde_support;
 pub mod types;
 pub mod validate;

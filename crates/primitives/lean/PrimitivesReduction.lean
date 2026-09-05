@@ -1,4 +1,4 @@
-import MxxPrimitives.Negacyclic
+import PrimitivesNegacyclic
 import Mathlib.Data.Matrix.Basic
 
 namespace Mxx.Primitives

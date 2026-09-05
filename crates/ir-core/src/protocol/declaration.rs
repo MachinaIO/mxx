@@ -1,6 +1,7 @@
-use crate::{BundleValidationError, ClosedProtocolBundle};
-use mxx_dsl::{FrozenDerivationAttachments, FrozenSemanticAnchors};
-use mxx_ir_core::{CompileParameter, FrozenGraphScopeId, Graph, NodeId, Port, WireType};
+use super::{
+    BundleValidationError, ClosedProtocolBundle, FrozenDerivationAttachments, FrozenSemanticAnchors,
+};
+use crate::{CompileParameter, FrozenGraphScopeId, Graph, NodeId, Port, WireType};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -168,9 +169,9 @@ impl ProtocolDecl {
             .map(|parameter| {
                 let kind = match parameter.kind {
                     ParameterKind::Dimension | ParameterKind::Integer => {
-                        mxx_ir_core::CompileParameterKind::Integer
+                        crate::CompileParameterKind::Integer
                     }
-                    ParameterKind::Rational => mxx_ir_core::CompileParameterKind::Real,
+                    ParameterKind::Rational => crate::CompileParameterKind::Real,
                 };
                 (parameter.name.as_str(), kind)
             })
@@ -203,14 +204,14 @@ impl ProtocolDecl {
 
     fn stage_inputs(
         stage: &ProtocolStage,
-    ) -> BTreeMap<String, (&WireType, Option<&mxx_ir_core::node::ArtifactInput>)> {
+    ) -> BTreeMap<String, (&WireType, Option<&crate::node::ArtifactInput>)> {
         stage
             .graph
             .root_scope()
             .nodes()
             .iter()
             .filter_map(|node| match node.kind() {
-                mxx_ir_core::node::NodeKind::Input { name, artifact, .. } => {
+                crate::node::NodeKind::Input { name, artifact, .. } => {
                     Some((name.clone(), (&node.output_types()[0], artifact.as_ref())))
                 }
                 _ => None,
@@ -307,31 +308,5 @@ impl ProtocolDecl {
             return Err(ProtocolError::UnreachableStage);
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn valid_protocol() -> ProtocolDecl {
-        crate::test_protocol::protocol()
-    }
-
-    #[test]
-    fn artifact_binding_totality_errors_are_distinct() {
-        let mut missing = valid_protocol();
-        missing.bundle.workflow.stages[1].bindings.clear();
-        assert_eq!(missing.validate(), Err(ProtocolError::MissingArtifactBinding));
-
-        let mut duplicate = valid_protocol();
-        let repeated = duplicate.bundle.workflow.stages[1].bindings[0].clone();
-        duplicate.bundle.workflow.stages[1].bindings.push(repeated);
-        assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateArtifactBinding));
-
-        let mut producer = valid_protocol();
-        producer.bundle.workflow.stages[1].bindings[0].producer_stage =
-            StageId("absent".to_owned());
-        assert_eq!(producer.validate(), Err(ProtocolError::MissingProducerStage));
     }
 }

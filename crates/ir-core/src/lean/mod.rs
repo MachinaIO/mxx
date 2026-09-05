@@ -7,6 +7,7 @@
 pub mod claim;
 #[cfg(test)]
 mod fixtures;
+pub mod protocol;
 
 use crate::{
     expr::{IntExpr, RealExpr},
@@ -1601,24 +1602,23 @@ impl<'a> Emitter<'a> {
             NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
                 append_expression_guards(plaintext_modulus, env, relations);
                 append_expression_guards(length, env, relations);
-                let count = self.validated.scopes[scope_id]
-                    .wire_types
-                    .keys()
-                    .filter(|wire| wire.node == node_id)
-                    .count();
-                relations.push(format!("1 < ({})", env.expr(plaintext_modulus)));
+                let count = scope.node(node_id).expect("decoder node").output_types().len();
                 relations.push(format!("({}) = {count}", env.expr(length)));
                 for port in 0..count {
-                    let term = format!(
-                        "{} ({}) {port} {}",
+                    let name = output(port as u32);
+                    let decoded =
+                        if *output_bool { format!("{name}_decoded") } else { name.clone() };
+                    self.bind_existential(&decoded, "Int");
+                    relations.push(format!(
+                        "{} ({}) ({}) {port} {} {decoded}",
                         self.options.primitives.threshold_decode,
                         env.expr(plaintext_modulus),
-                        arg(0)?
-                    );
-                    self.let_output(
-                        &output(port as u32),
-                        &if *output_bool { format!("decide (({term}) ≠ 0)") } else { term },
-                    );
+                        env.expr(length),
+                        arg(0)?,
+                    ));
+                    if *output_bool {
+                        self.let_output(&name, &format!("decide ({decoded} ≠ 0)"));
+                    }
                 }
             }
             NodeKind::IntToReal | NodeKind::RealBinary(_) | NodeKind::RealSqrt => {

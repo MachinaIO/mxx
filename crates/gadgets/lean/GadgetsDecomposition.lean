@@ -1,5 +1,5 @@
-import MxxGadgets.GadgetMatrix
-import MxxPrimitives.CrtDecomposition
+import GadgetsGadgetMatrix
+import PrimitivesCrtDecomposition
 
 namespace Mxx.Gadgets
 open Mxx.Primitives

@@ -1,4 +1,4 @@
-import MxxPrimitives.Reduction
+import PrimitivesReduction
 import Mathlib.Data.Matrix.Basic
 
 namespace Mxx.Primitives

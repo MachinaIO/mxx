@@ -1,4 +1,4 @@
-import MxxRuntime.MatrixOps
+import RuntimeMatrixOps
 
 namespace MxxRuntime
 

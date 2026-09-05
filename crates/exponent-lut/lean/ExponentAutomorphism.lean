@@ -1,5 +1,5 @@
 import ExponentBounds
-import MxxRuntime.MatrixOps
+import RuntimeMatrixOps
 import Mathlib.Data.Nat.ModEq
 
 namespace MxxExponentLut

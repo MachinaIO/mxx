@@ -1,5 +1,5 @@
 import ExponentTransfers
-import MxxRuntime.MatrixOps
+import RuntimeMatrixOps
 
 namespace MxxExponentLut
 

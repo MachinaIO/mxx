@@ -40,8 +40,8 @@ pub fn export_claim(
     let mut graphs = declaration
         .stages()
         .iter()
-        .map(|stage| (format!("Stage_{}", stage.id.0), &stage.graph))
-        .collect::<Vec<_>>();
+        .map(|stage| Ok((stage_module_name(&stage.id)?, &stage.graph)))
+        .collect::<Result<Vec<_>, String>>()?;
     graphs.extend(
         declaration
             .bundle
@@ -87,6 +87,18 @@ pub fn export_claim(
     let claim = crate::lean::assemble_claim(protocol, &roots, bindings, backend)?;
     fs::write(directory.join("Claim.lean"), claim)?;
     Ok(())
+}
+
+fn stage_module_name(stage: &StageId) -> Result<String, String> {
+    if stage.0.is_empty() ||
+        !stage.0.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(format!(
+            "invalid Lean export stage ID {:?}: expected nonempty ASCII letters, digits, or underscores",
+            stage.0
+        ));
+    }
+    Ok(format!("Stage_{}", stage.0))
 }
 
 fn input_contract(value: &InputValueContract) -> Result<InputContract, String> {
@@ -290,6 +302,48 @@ mod tests {
     use super::*;
     use mxx_correctness::{InputContractEntry, ProtocolInputBinding, ProtocolInputId};
     use mxx_ir_core::IntExpr;
+
+    #[test]
+    fn test_stage_module_name_accepts_ascii_suffixes() {
+        for name in ["encrypt", "decoder_stage", "Stage42", "123", "match", "_"] {
+            assert_eq!(stage_module_name(&StageId(name.into())).unwrap(), format!("Stage_{name}"));
+        }
+    }
+
+    #[test]
+    fn test_export_claim_rejects_stage_ids_before_writing_files() {
+        let mut protocol = crate::diamond::DiamondWeProtocolFamily::new(b"stage-id-test".to_vec())
+            .protocol_decl()
+            .unwrap();
+        // The first stage can export, so validating names only during emission would leave a file.
+        protocol.protocol.bundle.workflow.stages[0].graph =
+            mxx_dsl::DslContext::new("stage-id-test")
+                .bool_output("value", mxx_dsl::Bool::constant(true))
+                .unwrap()
+                .build()
+                .unwrap()
+                .graph;
+        let backend =
+            mxx_runtime::lean::render_backend_context(&[], "Backend", "TestBackend").unwrap();
+        for name in
+            ["", "decoder-stage", "decoder.stage", "decoder/stage", "decoder\\stage", "復号"]
+        {
+            protocol.protocol.bundle.workflow.stages[1].id = StageId(name.into());
+            let directory = tempfile::tempdir().unwrap();
+            let error = export_claim(
+                &protocol,
+                &ParamEnv::default(),
+                &backend,
+                &BTreeMap::new(),
+                directory.path(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("invalid Lean export stage ID"), "{name:?}: {error}");
+            assert!(error.contains("nonempty ASCII letters, digits, or underscores"), "{error}");
+            assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
+        }
+    }
 
     #[test]
     fn input_contract_mapping_uses_exact_ids_and_coverage() {

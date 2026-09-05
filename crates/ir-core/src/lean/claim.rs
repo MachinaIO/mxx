@@ -278,7 +278,7 @@ pub fn assemble_claim(
         if producer.wire_type != consumer.wire_type || producer.lean_type != consumer.lean_type {
             return Err("artifact value type mismatch".into());
         }
-        let value = project(producer, &format!("execution.{}", entries[link.producer.root].1));
+        let value = project(producer, &format!("execution.«{}»", entries[link.producer.root].1));
         if inputs[link.consumer.root][consumer.tuple_index].replace(value).is_some() {
             return Err("duplicate artifact/external binding".into());
         }
@@ -297,7 +297,12 @@ pub fn assemble_claim(
         source.push_str(&format!("  {field} : {ty}\n"));
     }
     source.push_str(&format!(
-        "\ndef ValidExternals (external : ExternalInputs) : Prop :=\n  {}\n",
+        "\ndef ValidExternals ({} : ExternalInputs) : Prop :=\n  {}\n",
+        if contract_conditions.iter().any(|condition| condition.contains("external.")) {
+            "external"
+        } else {
+            "_"
+        },
         if contract_conditions.is_empty() {
             "True".into()
         } else {
@@ -306,7 +311,7 @@ pub fn assemble_claim(
     ));
     source.push_str("\nstructure Execution where\n");
     for (artifact, field) in &entries {
-        source.push_str(&format!("  {field} : {}\n", artifact.root.output_type));
+        source.push_str(&format!("  «{field}» : {}\n", artifact.root.output_type));
     }
     let mut conditions = vec!["ValidExternals external".into()];
     for (position, (artifact, field)) in entries.iter().enumerate() {
@@ -335,7 +340,7 @@ pub fn assemble_claim(
             root.parameter_type
         ));
         conditions.push(format!(
-            "{}{} {}_params ({}) execution.{}",
+            "{}{} {}_params ({}) execution.«{}»",
             root.relation,
             context,
             field,
@@ -350,10 +355,15 @@ pub fn assemble_claim(
         }
         conditions.push(format!(
             "{} = true",
-            project(value, &format!("execution.{}", entries[requirement.root].1))
+            project(value, &format!("execution.«{}»", entries[requirement.root].1))
         ));
     }
-    source.push_str(&format!("\ndef Runs (hashModel : {}) (external : ExternalInputs)\n    (execution : Execution) : Prop :=\n  {}\n", semantics.hash_model_type, conditions.join(" ∧\n  ")));
+    let hash_binder = if entries.iter().any(|(artifact, _)| artifact.root.requires_hash_model) {
+        "hashModel"
+    } else {
+        "_"
+    };
+    source.push_str(&format!("\ndef Runs ({hash_binder} : {}) (external : ExternalInputs)\n    (execution : Execution) : Prop :=\n  {}\n", semantics.hash_model_type, conditions.join(" ∧\n  ")));
     let actual = output(claim, &claim.actual)?;
     let ideal = output(claim, &claim.ideal)?;
     if actual.wire_type != ConcreteWireType::Bool ||
@@ -371,10 +381,10 @@ pub fn assemble_claim(
         return Err("residual must be a scalar polynomial".into());
     }
     let q = &matrix.modulus;
-    let ideal_value = project(ideal, &format!("execution.{}", entries[claim.ideal.root].1));
-    let actual_value = project(actual, &format!("execution.{}", entries[claim.actual.root].1));
+    let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
+    let actual_value = project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
     let residual_value =
-        project(residual, &format!("execution.{}", entries[claim.residual.root].1));
+        project(residual, &format!("execution.«{}»", entries[claim.residual.root].1));
     let centered_lift = semantics.centered_lift;
     let message_center = semantics.message_center;
     let decoder_radius = semantics.decoder_radius;
@@ -480,8 +490,53 @@ mod tests {
         let (runs, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
         assert!(!runs.contains(".natAbs <"));
         assert!(conclusion.contains("(observedResidual execution).natAbs <"));
-        assert!(conclusion.contains("execution.producer"));
-        assert!(conclusion.contains("execution.ideal"));
+        assert!(conclusion.contains("execution.«producer»"));
+        assert!(conclusion.contains("execution.«ideal»"));
+    }
+
+    #[test]
+    fn linked_claim_quotes_execution_fields_in_declarations_links_and_conclusions() {
+        let (graph, artifact) = exported_graph();
+        let mut claim = linked(&graph, &artifact);
+        claim.roots[0].field = "match".into();
+        claim.roots[1].field = "namespace".into();
+        claim.externals[0].destinations.pop();
+        claim.links.push(Link {
+            producer: claim.actual.clone(),
+            consumer: Port { root: 1, name: "bit".into() },
+        });
+        claim.requirements.push(claim.actual.clone());
+        let source = assemble_claim(
+            &claim,
+            &ParamEnv::default(),
+            &ClaimBackend {
+                module_name: "MxxRuntime",
+                context_name: "unusedBackend",
+                layouts: &[],
+            },
+            &ClaimSemantics {
+                imports: &["Decoder"],
+                hash_model_type: "MxxRuntime.HashModel",
+                centered_lift: "Mxx.Primitives.centeredLift",
+                message_center: "MxxWe.messageCenter",
+                decoder_radius: "MxxWe.decoderRadius",
+            },
+        )
+        .unwrap();
+        assert!(source.contains("  «match» :"));
+        assert!(source.contains("  «namespace» :"));
+        assert!(source.contains("namespace_params (execution.«match».1) execution.«namespace»"));
+        assert!(source.contains("execution.«match».1 = true"));
+        assert!(source.contains("execution.«match».1 = execution.«namespace».1"));
+        assert!(source.contains("execution.«match».2.1"));
+        assert!(!source.contains("execution.match"));
+        assert!(!source.contains("execution.namespace"));
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_ir_fixtures/claim_identifiers");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(format!("{}.lean", artifact.module_name)), &artifact.source)
+            .unwrap();
+        std::fs::write(directory.join("Claim.lean"), source).unwrap();
     }
 
     #[test]

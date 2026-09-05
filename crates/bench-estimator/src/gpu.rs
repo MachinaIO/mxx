@@ -22,6 +22,7 @@ use mxx_primitives::{
     },
     poly::dcrt::gpu::{
         gpu_default_mempool_reset_high_water, gpu_default_mempool_usage, gpu_device_memory_usage,
+        gpu_memory_info,
     },
 };
 use mxx_runtime::{
@@ -83,10 +84,18 @@ fn require_exclusive_measurement_context(
 }
 
 fn begin_gpu_memory_measurement(
-    device_id: i32,
+    worker: &mut GpuMeasurementWorker,
 ) -> Result<GpuMemoryMeasurementBaseline, GpuMeasurementError> {
+    let device_id = worker.device_id;
     let memory = gpu_device_memory_usage(device_id).map_err(GpuMeasurementError)?;
     require_exclusive_measurement_context(device_id, memory.live_contexts)?;
+    // Matrix readiness precedes owner destruction, which queues frees on separate release
+    // streams. Match the runtime calibration boundary before sampling the allocator baseline.
+    // This fences release events only, outside the measured operation.
+    worker
+        .backend
+        .fence_released_memory()
+        .map_err(|error| GpuMeasurementError(error.to_string()))?;
     gpu_default_mempool_reset_high_water(device_id).map_err(GpuMeasurementError)?;
     let pool_used_current =
         gpu_default_mempool_usage(device_id).map_err(GpuMeasurementError)?.used_current;
@@ -1021,8 +1030,16 @@ impl GpuNodeMeasurementBackend {
             .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
         let device_memories = self
             .workers
-            .iter()
-            .map(|worker| Self::device_memory(worker.device_id))
+            .par_iter_mut()
+            .map(|worker| {
+                // The pilot has been dropped; make its queued frees reusable before admitting
+                // a full fleet wave against the pool's effective available memory.
+                worker
+                    .backend
+                    .fence_released_memory()
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                Self::device_memory(worker.device_id)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let gpu0_memory = device_memories[0].0;
@@ -1037,6 +1054,26 @@ impl GpuNodeMeasurementBackend {
         let assigned_columns =
             gpu_capped_waterfill_columns(widths, self.workers.len(), total_columns)
                 .map_err(|error| GpuMeasurementError(error.to_string()))?;
+
+        for (index, worker) in self.workers.iter().enumerate() {
+            let physical = gpu_memory_info(worker.device_id).map_err(GpuMeasurementError)?;
+            let pool = gpu_default_mempool_usage(worker.device_id).map_err(GpuMeasurementError)?;
+            let memory = device_memories[index].0;
+            let calibration =
+                if index == 0 { profile.gpu0 } else { profile.nonzero.unwrap_or(profile.gpu0) };
+            info!(
+                scope = ?request.scope, node = request.id.0, device_id = worker.device_id,
+                physical_total_bytes = physical.total, physical_free_bytes = physical.free,
+                pool_used_bytes = pool.used_current, pool_reserved_bytes = pool.reserved_current,
+                effective_resident_bytes = memory.resident_bytes,
+                budget_bytes = u128::from(memory.total_bytes) * u128::from(vram_percent) / 100,
+                pilot_columns = calibration.pilot_columns(),
+                pilot_peak_bytes = calibration.pilot_peak_bytes(),
+                bytes_per_column = calibration.bytes_per_column(),
+                assigned_columns = assigned_columns[index],
+                "GPU fleet calibration memory snapshot"
+            );
+        }
 
         info!(
             scope = ?request.scope,
@@ -1929,13 +1966,13 @@ impl GpuNodeMeasurementBackend {
             let _ = Self::run_fleet_iteration(workers, scope, id, bindings, &prepared)?;
         }
         let baselines = workers
-            .par_iter()
+            .par_iter_mut()
             .zip(prepared.par_iter())
             .map(|(worker, prepared)| {
                 if prepared.is_none() {
                     return Ok(None);
                 }
-                begin_gpu_memory_measurement(worker.device_id).map(Some)
+                begin_gpu_memory_measurement(worker).map(Some)
             })
             .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
 
@@ -1997,7 +2034,7 @@ impl GpuNodeMeasurementBackend {
         };
         let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)?;
         prepared.finish();
-        let baseline = begin_gpu_memory_measurement(worker.device_id)?;
+        let baseline = begin_gpu_memory_measurement(worker)?;
         let probe = GpuMemoryProbe { device_id: worker.device_id };
         let mut operation_error = None;
         let measured = measure_batch_operation(harness, &probe, 1, |representative_batch| {
@@ -2066,7 +2103,7 @@ impl GpuNodeMeasurementBackend {
             Some((&representative.fixed_arguments, true)),
         )?;
         fixed.finish();
-        let baseline = begin_gpu_memory_measurement(worker.device_id)?;
+        let baseline = begin_gpu_memory_measurement(worker)?;
         let scaled = Self::prepare(
             &mut worker.backend,
             &node,

@@ -329,9 +329,10 @@ Finding and independently verifying one candidate is the initial requirement.
 The final Diamond acceptance path has one authority: its generated Lean theorem and proved bound.
 Remove its dependency on generic symbolic operational-noise acceptance once the new path passes.
 
-The declaration layer remains in `mxx-correctness`; its generic symbolic noise engine and
-graph-to-checker conversion API have been removed. Generic Lean claim assembly belongs to
-`mxx-ir-core`, with an application adapter supplying protocol connections and decoder semantics.
+The declaration layer and generic Lean claim assembly belong to `mxx-ir-core`; the separate
+correctness crate, generic symbolic noise engine, and graph-to-checker conversion API have been
+removed. An application adapter supplies runtime backend bindings and decoder semantics, while
+core derives the connections from the protocol declaration.
 Tall's old-simulator-dependent modes are explicitly unavailable until it has an application-owned
 correctness implementation. Do not retain a fallback that silently accepts a candidate when
 Lean fails, or substitute runtime-only measurements for the retired noise-bound acceptance.

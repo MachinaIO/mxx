@@ -7,6 +7,7 @@
 pub mod claim;
 #[cfg(test)]
 mod fixtures;
+pub mod protocol;
 
 use crate::{
     expr::{IntExpr, RealExpr},

@@ -1,17 +1,17 @@
 //! Small two-stage reference protocol used to test the shared correctness machinery.
 
-use crate::{
-    ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding, ComparatorSpec,
-    EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId, InputContract,
-    InputContractEntry, InputValueContract, OperationalDecoderKind, OperationalDecoderTarget,
-    OutputRef, ParameterDecl, ParameterKind, ProtocolDecl, ProtocolInputBinding,
-    ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId,
-    StageInputName, Workflow,
-};
-use mxx_dsl::{DslContext, IdealSpec, Ring, SemanticAnchor};
+use crate::{DslContext, IdealSpec, Ring, SemanticAnchor};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+    protocol::{
+        ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
+        ComparatorSpec, EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId,
+        InputContract, InputContractEntry, InputValueContract, OperationalDecoderKind,
+        OperationalDecoderTarget, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
+        ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
+        ProtocolStage, StageId, StageInputName, Workflow,
+    },
 };
 
 pub const DECODED_ENDPOINT: &str = "decoded-endpoint";
@@ -63,7 +63,8 @@ pub fn protocol() -> ProtocolDecl {
             .bool_output("result", ring.bool_input("message"))
             .expect("unique output")
             .build()
-            .expect("toy ideal graph"),
+            .expect("toy ideal graph")
+            .graph,
     )
     .expect("sampler-free ideal");
 
@@ -178,7 +179,7 @@ mod tests {
         endpoints[0].actual_input = "unrelated".to_owned();
         assert_eq!(
             protocol.bundle.validate(),
-            Err(crate::BundleValidationError::MissingComparatorConnection)
+            Err(mxx_ir_core::protocol::BundleValidationError::MissingComparatorConnection)
         );
     }
 
@@ -193,7 +194,7 @@ mod tests {
         *plaintext_modulus = IntExpr::constant(3);
         assert_eq!(
             protocol.bundle.validate(),
-            Err(crate::BundleValidationError::InvalidOperationalDecoderTarget)
+            Err(mxx_ir_core::protocol::BundleValidationError::InvalidOperationalDecoderTarget)
         );
     }
 }

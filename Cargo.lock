@@ -480,17 +480,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mxx-correctness"
-version = "0.1.0"
-dependencies = [
- "mxx-dsl",
- "mxx-ir-core",
- "num-bigint",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "mxx-dsl"
 version = "0.1.0"
 dependencies = [
@@ -617,7 +606,6 @@ dependencies = [
  "keccak-asm",
  "mxx-bench-estimator",
  "mxx-bgg",
- "mxx-correctness",
  "mxx-dsl",
  "mxx-gadgets",
  "mxx-ir-core",

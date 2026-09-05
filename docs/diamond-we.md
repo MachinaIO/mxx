@@ -48,10 +48,13 @@ same external inputs and exported artifacts. For bounded successful executions w
 accepting inputs, it proves the actual residual is below the exact decoder threshold and the
 operational decoder returns the ideal message, for both Boolean messages.
 
-`crates/we/src/lean.rs::export_claim` adapts the declaration and calls the IR exporter.
+`crates/we/src/lean.rs::export_claim` supplies WE decoder semantics and runtime backend bindings.
+`crates/ir-core/src/lean/protocol.rs::export_claim` exports the declaration's graphs and converts
+their protocol connections into a linked claim.
 `crates/ir-core/src/lean/claim.rs::assemble_claim` owns application-independent graph linking,
 input predicates, and final Boolean threshold claim rendering. The WE adapter supplies the
-decoder's Lean helper names and endpoint identities; the generic renderer contains no WE
+decoder's Lean helper names; endpoint identities come from the core protocol declaration.
+The generic renderer contains no WE
 protocol or noise-inference rules. Application-specific bounds, proof sources, and certificate
 verification remain under `crates/we/src/lean` and `crates/we/lean`.
 
@@ -69,8 +72,8 @@ The fixed audit entry point is `crates/we/lean/Certificate.lean`, containing
 
 The parameter search called by `test_gpu_diamond_we.rs` already generates and checks these
 artifacts; no example executable or separate emission command is needed. Extractor fixtures are
-ordinary unit tests. `mxx-correctness` now supplies declarations and structural validation only;
-the former generic symbolic noise simulator has been removed.
+ordinary unit tests. `mxx-ir-core::protocol` supplies declarations and structural validation;
+the separate correctness crate and former generic symbolic noise simulator have been removed.
 
 `DiamondWeProtocolFamily::protocol_decl` returns a validated `WitnessEncryptionProtocolDecl`. The
 declaration is built directly from symbolic circuit and cryptographic parameters; it does not own a

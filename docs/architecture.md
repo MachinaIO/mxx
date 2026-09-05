@@ -9,10 +9,9 @@ on the crate that owns an abstraction.
 mxx-runtime              -> mxx-ir-core, mxx-primitives
 mxx-bench-estimator      -> mxx-ir-core, mxx-runtime
 mxx-dsl                  -> mxx-ir-core
-mxx-correctness          -> mxx-ir-core, mxx-dsl
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core
-mxx-we                   -> mxx-bgg, mxx-correctness, mxx-gadgets, mxx-runtime
+mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
 mxx-func-enc/io          -> lower layers when their application modules are enabled
 ```
 
@@ -38,27 +37,28 @@ decidable compile-parameter conditions consumed by concrete validation. Sampler
 nodes serialize required integer coefficient cutoffs. Subgraph and parallel-loop bodies are
 structural and stored once.
 
+`protocol` owns protocol declarations, input contracts, frozen graph annotations, sampler-free
+ideal/predicate specifications, and structural validation of linked workflows. These are core
+graph data and checks, independent of the DSL used to construct a graph. There is no separate
+correctness crate and no generic symbolic noise simulator.
+
 The Lean exporter owns primitive execution-relation generation and application-independent linked
 claim assembly. It receives explicit graph connections and endpoint semantics, not a WE protocol
 implementation, and does not infer noise bounds or expand structural families into individual lanes.
+`lean::protocol` converts a protocol declaration into exported roots and a linked claim;
+`lean::claim` renders the final proposition. Applications supply backend bindings and decoder
+semantics, while their mathematical bounds and proofs remain application-owned.
 
 ### `mxx-dsl`
 
 Creates immutable core nodes immediately. It has no symbolic reinterpretation layer.
-`IdealSpec` and `PurePredicateSpec` accept only sampler-free graphs for correctness declarations.
+The constructed graphs feed core-owned `IdealSpec` and `PurePredicateSpec` validation.
 Indexed `Family` operations create structural parallel loops.
 
 ### `mxx-runtime`
 
 Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
 transcripts, sessions, artifacts, and bounded parallel waves.
-
-### `mxx-correctness`
-
-The library owns protocol declarations, input contracts, and structural validation of linked
-workflows. It does not simulate noise. The former application-agnostic operational-noise engine
-and its graph-to-checker conversion API have been removed. Applications own their mathematical
-bounds and Lean proofs; `mxx-ir-core` owns mechanical Lean extraction and generic claim assembly.
 
 ### `mxx-gadgets` and `mxx-bgg`
 

@@ -20,6 +20,19 @@ Correctness declarations and deterministic hard-bound proofs are separate from
 execution. The core stores executable semantics, artifact metadata, and the
 authoritative integer cutoffs on sampler nodes.
 
+`protocol` owns the declarations connecting multiple executable graphs: stages,
+artifact links, external-input contracts, ideal specifications, requirements,
+and decoder endpoints. `IdealSpec::new(Graph)` and `PurePredicateSpec::new(Graph)`
+check sampler-free graphs without depending on the DSL. The DSL still owns
+construction and returns a `BuiltGraph`; pass its `graph` field to these constructors.
+
+`lean::protocol::export_claim` accepts a `ProtocolDecl`, concrete parameter and
+manifest bindings, a `ClaimBackend`, and `ClaimSemantics`. It exports the graphs
+and derives their connections and endpoints from the declaration, then invokes
+`lean::claim` to render the final statement. Neither layer infers noise bounds;
+applications retain their bound calculations and Lean proofs. Structural families
+remain symbolic rather than being expanded into one graph or claim per element.
+
 Tensor product, concatenation, selection, transpose, slice, reshape,
 constant-coefficient extraction, and CRT recomposition are ordinary executable
 core nodes. Generic modulus-down and modulus-up operations are not exposed

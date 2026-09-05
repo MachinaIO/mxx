@@ -1,4 +1,4 @@
-import MxxWe.Bounds
+import Bounds
 import DiamondProofParameters
 
 namespace DiamondGeneratedProof

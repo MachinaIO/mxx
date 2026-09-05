@@ -1,8 +1,7 @@
 //! Emit a concrete Lean regular-gadget layout from the DCRT parameters used by setup.
 
+use crate::lean::{export_dcrt_layouts, render_backend_context};
 use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
-use mxx_runtime::lean::{export_dcrt_layouts, render_backend_context};
-use std::{env, fs, process};
 
 fn render_fixture() -> String {
     let parameters = DCRTPolyParams::new(2, 1, 10, 5);
@@ -134,10 +133,10 @@ end GeneratedConcreteRegular
     )
 }
 
-fn main() {
-    let Some(output) = env::args().nth(1) else {
-        eprintln!("usage: emit_lean_regular_fixture OUTPUT.lean");
-        process::exit(2);
-    };
-    fs::write(output, render_fixture()).expect("write Lean fixture");
+#[test]
+fn export_concrete_regular_fixture() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/lean_runtime_fixture");
+    std::fs::create_dir_all(&directory).expect("create fixture directory");
+    std::fs::write(directory.join("Generated.lean"), render_fixture()).expect("write Lean fixture");
 }

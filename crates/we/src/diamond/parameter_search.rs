@@ -77,6 +77,9 @@ pub enum DiamondParameterSearchError {
 }
 
 impl DiamondParameterSearch {
+    /// Select parameters by exporting each candidate's actual IR and checking its Lean proof.
+    /// The selected certificate retains the generated sources and kernel-checked theorem;
+    /// callers, including the GPU workflow, do not need a separate emission step.
     pub fn search(&self) -> Result<DiamondSelectedParameters, DiamondParameterSearchError> {
         self.search_with_security_estimator(lattice_security_bits)
     }
@@ -401,9 +404,25 @@ mod tests {
     #[ignore = "requires prepared Lean package dependencies; security estimator is a test double"]
     fn selected_candidate_retains_a_kernel_checked_certificate() {
         let selected = proof_search().search_with_security_estimator(|_, _| Ok(1)).unwrap();
+        for source in ["Backend.lean", "Claim.lean", "NumericCertificate.lean", "Certificate.lean"]
+        {
+            assert!(selected.certificate.directory().join(source).is_file(), "missing {source}");
+        }
         assert!(selected.certificate.directory().join("Certificate.olean").is_file());
+        assert_eq!(
+            std::fs::read_to_string(selected.certificate.directory().join("Certificate.lean"))
+                .unwrap(),
+            include_str!("../../lean/Certificate.lean")
+        );
         assert!(selected.certificate.numeric_bound() < selected.certificate.radius());
         assert_eq!(selected.compiler.config.modulus, BigInt::from(selected.modulus.clone()));
+        let reuse_error = crate::lean::diamond::export_diamond_certificate(
+            &selected.parameters,
+            &selected.compiler,
+            selected.certificate.directory(),
+        )
+        .unwrap_err();
+        assert!(reuse_error.to_string().contains("empty output directory"));
         println!(
             "test-double security estimate; verified correctness artifact={}",
             selected.certificate.directory().display()

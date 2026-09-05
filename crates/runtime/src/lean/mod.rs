@@ -5,6 +5,9 @@
 
 mod layout;
 
+#[cfg(test)]
+mod fixtures;
+
 pub use layout::{
     LayoutError, LeanBackendArtifact, LeanGadgetMode, LeanRingLayout, export_dcrt_layouts,
     render_backend_context,

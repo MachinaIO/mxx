@@ -1,15 +1,15 @@
 //! Exercise exact-division binding guards under both logical loop binders.
-use mxx_ir_core::{
+use crate::{
     Graph, GraphOutput, IntExpr, NodeHandle, ParamEnv, WireType,
     graph::{SubgraphHandle, with_new_construction_scope},
     lean::{ExportOptions, export},
     node::{NodeKind, ParallelLoop, SequentialLoop},
     validate,
 };
-use std::{collections::BTreeMap, env, fs};
+use std::collections::BTreeMap;
 
-fn main() {
-    let path = env::args().nth(1).expect("output Lean path");
+#[test]
+fn export_loop_binding_fixture() {
     let body = with_new_construction_scope(|scope| {
         let value = NodeHandle::new(
             NodeKind::EvaluateInt(IntExpr::Var("k".into())),
@@ -52,7 +52,7 @@ fn main() {
         .output(0)
         .unwrap();
         let next = NodeHandle::new(
-            NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add),
+            NodeKind::IntBinary(crate::node::IntBinaryOp::Add),
             vec![current.clone(), value],
             vec![WireType::Int],
         )
@@ -92,5 +92,5 @@ fn main() {
     let artifact = export(&validated, &ExportOptions::default()).unwrap();
     assert!(artifact.source.contains("∀ i : Fin 3, 1 ≠ 0"));
     assert!(artifact.source.contains("(current next : Int) => 1 ≠ 0"));
-    fs::write(path, artifact.source).unwrap();
+    super::write_fixture("loop_binding", artifact.source);
 }

@@ -796,7 +796,7 @@ exhaustion require monotonicity for that searched family or an exhaustive policy
 | `crates/runtime/lean/MxxRuntime` | Concrete primitive relations and fixed hash interpretation interface |
 | `crates/gadgets/lean/MxxGadgets` | Gadget reconstruction, preimage consumption, input-injector algebra |
 | `crates/bgg/lean/MxxBgg` | Full BGG+ invariant, compatible-secret multiplication and gate lemmas |
-| `crates/we/lean/MxxWe` | Generated Diamond program, application scope proofs, bound, decoder, final theorem |
+| `crates/we/lean` | Generated Diamond program, application scope proofs, bound, decoder, final theorem |
 | `crates/we/src/diamond/correctness` | Application bound calculator, candidate invocation, artifact receipt |
 
 The relational combinators are polymorphic in ordinary Lean input/output types, so `ir-core` need

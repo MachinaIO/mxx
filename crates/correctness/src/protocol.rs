@@ -96,8 +96,8 @@ pub type ParamDecls = Vec<ParameterDecl>;
 
 /// The single canonical Rust protocol declaration.
 ///
-/// Rust stores compile-parameter declarations and the closed protocol bundle. The operational
-/// checker computes coefficient bounds and validates decoder targets from this frozen data.
+/// Rust stores compile parameters and the closed protocol bundle, and validates their wiring.
+/// Noise bounds and correctness proofs belong to the application, not this declaration layer.
 #[derive(Clone)]
 pub struct ProtocolDecl {
     pub params: ParamDecls,
@@ -315,7 +315,7 @@ mod tests {
     use super::*;
 
     fn valid_protocol() -> ProtocolDecl {
-        crate::toy_example::protocol()
+        crate::test_protocol::protocol()
     }
 
     #[test]

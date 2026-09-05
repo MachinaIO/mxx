@@ -1,7 +1,7 @@
 import Stage_encrypt
 import DiamondProofParameters
 import Backend
-import MxxWe.Decoder
+import Decoder
 
 open Mxx.Primitives MxxRuntime
 

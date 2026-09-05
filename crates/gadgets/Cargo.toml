@@ -33,7 +33,6 @@ keccak-asm.workspace = true
 [dev-dependencies]
 mxx-bgg.workspace = true
 mxx-bench-estimator.workspace = true
-mxx-correctness.workspace = true
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 mxx-runtime.workspace = true
 serial_test.workspace = true

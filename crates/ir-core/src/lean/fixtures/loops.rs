@@ -1,7 +1,7 @@
-//! Emit nested parallel scopes and an identity loop, including an empty outer family.
+//! Generate nested parallel scopes and an identity loop, including an empty outer family.
 //! The inner count must be positive for its real static gather; an empty outer family
 //! omits the impossible root gather. No primitive relation is overridden.
-use mxx_ir_core::{
+use crate::{
     Graph, GraphOutput, IntExpr, NodeHandle, ParamEnv,
     graph::{CompileParameter, SubgraphHandle, with_new_construction_scope},
     lean::{ExportOptions, export},
@@ -9,15 +9,9 @@ use mxx_ir_core::{
     types::WireType,
     validate,
 };
-use std::{collections::BTreeMap, env, fs, time::Instant};
+use std::collections::BTreeMap;
 
-fn main() {
-    let started = Instant::now();
-    let mut args = env::args().skip(1);
-    let output = args.next().expect("output Lean path");
-    let n: usize = args.next().expect("outer N").parse().expect("N is usize");
-    let l: usize = args.next().expect("sequential L").parse().expect("L is usize");
-    let m: usize = args.next().map(|s| s.parse().expect("inner M is usize")).unwrap_or(n.max(1));
+fn render(n: usize, l: usize, m: usize) -> String {
     assert!(m > 0, "inner M must be positive for the inner static gather");
     let inner_type = WireType::IndexedFamily { element: Box::new(WireType::Int), count: m.into() };
     let body = with_new_construction_scope(|outer_scope| {
@@ -32,7 +26,7 @@ fn main() {
                 .unwrap()
             });
             let value = NodeHandle::new(
-                NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add),
+                NodeKind::IntBinary(crate::node::IntBinaryOp::Add),
                 indices.to_vec(),
                 vec![WireType::Int],
             )
@@ -193,12 +187,12 @@ theorem generated_loop_preserves_initial {{initial : Int}} {{outputs : {output_t
         }
     );
     let source = format!("{}\n{}", artifact.source, proof);
-    println!(
-        "N={n} M={m} L={l} source_bytes={} relation_declarations={} static_node_visits={} proof_declarations=2 generation_us={}",
-        source.len(),
-        artifact.source.lines().filter(|s| s.starts_with("def ")).count(),
-        artifact.static_node_visits,
-        started.elapsed().as_micros()
-    );
-    fs::write(output, source).unwrap();
+    source
+}
+
+#[test]
+fn export_nested_loop_fixtures() {
+    for (name, n, l, m) in [("loop", 2, 3, 2), ("empty_loop", 0, 0, 1)] {
+        super::write_fixture(name, render(n, l, m));
+    }
 }

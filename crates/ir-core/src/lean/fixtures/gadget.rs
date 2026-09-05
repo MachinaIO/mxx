@@ -1,6 +1,6 @@
-//! Emit and check the generic deterministic gadget-decomposition relation.
+//! Generate and check the generic deterministic gadget-decomposition relation.
 
-use mxx_ir_core::{
+use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv, WireType,
     graph::CompileParameter,
     lean::{BackendLayout, ExportOptions, export},
@@ -8,10 +8,10 @@ use mxx_ir_core::{
     types::MatrixType,
     validate,
 };
-use std::{collections::BTreeMap, env, fs};
+use std::collections::BTreeMap;
 
-fn main() {
-    let output = env::args().nth(1).expect("output Lean path");
+#[test]
+fn export_gadget_fixture() {
     let matrix = MatrixType {
         modulus: 17.into(),
         ring_dimension: 2.into(),
@@ -77,5 +77,5 @@ theorem generated_gadget_relation
   rw [outputEq]
   exact sampleRuns
 "#;
-    fs::write(output, format!("{}\n{}", artifact.source, proof)).unwrap();
+    super::write_fixture("gadget", format!("{}\n{}", artifact.source, proof));
 }

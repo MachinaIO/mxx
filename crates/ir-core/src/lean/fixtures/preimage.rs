@@ -1,10 +1,10 @@
-//! Emit a real frozen-IR preimage consumer and its kernel-checked Lean equation.
+//! Generate a real frozen-IR preimage consumer and its kernel-checked Lean equation.
 //!
 //! The graph contains the nonzero-target-error path `(L * B + e) * K`, with
 //! `B * K = P + E`. Matrix operators are supplied as ordinary typeclass operations only for this
 //! fixture; the exporter itself remains application agnostic.
 
-use mxx_ir_core::{
+use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv, RealExpr, WireType,
     graph::CompileParameter,
     lean::{BackendLayout, ExportOptions, PrimitiveNames, export},
@@ -12,7 +12,7 @@ use mxx_ir_core::{
     types::MatrixType,
     validate,
 };
-use std::{collections::BTreeMap, env, fs};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy)]
 struct Geometry {
@@ -39,7 +39,7 @@ fn matrix_type(rows: u32, columns: u32) -> MatrixType {
     }
 }
 
-fn input(name: &str, ty: MatrixType) -> mxx_ir_core::graph::ValueHandle {
+fn input(name: &str, ty: MatrixType) -> crate::graph::ValueHandle {
     NodeHandle::new(
         NodeKind::Input {
             name: name.into(),
@@ -53,7 +53,7 @@ fn input(name: &str, ty: MatrixType) -> mxx_ir_core::graph::ValueHandle {
     .unwrap()
 }
 
-fn emit(output: &str, selected: Geometry) {
+fn render(selected: Geometry) -> String {
     let b = input("B", matrix_type(selected.source_rows, selected.inner));
     let trapdoor_matrix = matrix_type(selected.source_rows, selected.inner);
     let trapdoor = NodeHandle::new(
@@ -195,12 +195,12 @@ theorem generated_nonzero_target_consumption
   ac_rfl
 "#,
     );
-    fs::write(output, format!("{}\n{}", artifact.source, proof)).unwrap();
+    format!("{}\n{}", artifact.source, proof)
 }
 
-fn main() {
-    let mut args = env::args().skip(1);
-    let output = args.next().expect("output Lean path");
-    let selected = geometry(&args.next().unwrap_or_else(|| "small".into()));
-    emit(&output, selected);
+#[test]
+fn export_preimage_fixtures() {
+    for name in ["small", "wide"] {
+        super::write_fixture(&format!("preimage_{name}"), render(geometry(name)));
+    }
 }

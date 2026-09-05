@@ -1,39 +1,33 @@
 # Frozen-IR Lean extraction fixtures
 
-Build the generic IR support package from this directory:
+Build this package with `lake build` from `crates/ir-core/lean`.
 
-```text
-lake build
+Fixture generators are ordinary unit tests, not example executables. From the repository root:
+
+```sh
+cargo test -p mxx-ir-core --lib lean::fixtures
+cargo test -p mxx-runtime --lib lean::fixtures
 ```
 
-The generated fixtures import both `MxxIR` and the runtime package.  Generate one from the
-repository root, then check it from `crates/runtime/lean` with the IR package on `LEAN_PATH`:
+IR fixtures are written to `test_data/lean_ir_fixtures/<fixture>/Generated.lean`. The runtime
+layout fixture is written to `test_data/lean_runtime_fixture/Generated.lean`. Generation tests
+validate and export real frozen graphs; they do not themselves invoke the Lean kernel.
 
-```text
-cargo run -p mxx-ir-core --example emit_sampler_fixture -- /tmp/mxx_generated_sampler.lean
-LEAN_PATH=<repository>/crates/ir-core/lean/.lake/build/lib/lean lake env lean /tmp/mxx_generated_sampler.lean
+The IR fixtures cover constants, hashes, samplers, gadgets, small/wide preimages, matrix
+operations, lexical loop bindings, and empty/nonempty structural loops. Their proof text can
+be checked separately from `crates/runtime/lean`, after building the IR and runtime packages:
+
+```sh
+LEAN_PATH=../../ir-core/lean/.lake/build/lib/lean lake env lean ../../../test_data/lean_ir_fixtures/sampler/Generated.lean
 ```
 
-The same commands apply to `emit_gadget_fixture` and to `emit_preimage_fixture`, whose second
-argument selects `small` or `wide`.  The fixtures prove generated relation consequences only;
-they do not establish CRT backend fidelity or sampler termination/distribution.
+The fixtures prove consequences of generated execution relations, not sampler termination or
+distribution. The runtime fixture additionally supplies the concrete CRT gadget layout.
 
-The structural loop fixture accepts explicit parallel and sequential counts.  Its generated
-source keeps nested families under `Fin N` and sequential execution under `MxxIR.IterRuns`:
+Families remain functions on `Fin N`; sequential loops use `MxxIR.IterRuns` with a single shared
+state tuple. Changing closed counts does not enumerate lanes or steps. `MxxIR.IterRuns.invariant`
+provides the reusable initial/step invariant elimination rule.
 
-```text
-cargo run -p mxx-ir-core --example emit_loop_fixture -- /tmp/mxx_generated_loops.lean 16 1024
-LEAN_PATH=<repository>/crates/ir-core/lean/.lake/build/lib/lean lake env lean /tmp/mxx_generated_loops.lean
-```
-
-Changing `N` or `L` changes only closed count expressions; it does not enumerate lanes or steps.
-`MxxIR.IterRuns.invariant` provides the reusable initial/step invariant elimination rule used by
-the fixture proof.
-
-The matrix-operation fixture exercises row, column, and block-diagonal concatenation together
-with a nonzero loop-dependent slice offset:
-
-```text
-cargo run -p mxx-ir-core --example emit_matrix_ops_fixture -- /tmp/mxx_generated_matrix_ops.lean
-LEAN_PATH=<repository>/crates/ir-core/lean/.lake/build/lib/lean lake env lean /tmp/mxx_generated_matrix_ops.lean
-```
+Production Diamond artifacts are generated and checked inside parameter search, not through
+these fixtures. Application proofs remain in their owning crate; the shared exporter and
+linked-claim renderer live in `crates/ir-core/src/lean`.

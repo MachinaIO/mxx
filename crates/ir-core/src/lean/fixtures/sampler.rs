@@ -1,6 +1,6 @@
-//! Emit the sampled-trapdoor path and consume both coupled outputs in Lean.
+//! Generate the sampled-trapdoor path and consume both coupled outputs in Lean.
 
-use mxx_ir_core::{
+use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv, RealExpr, WireType,
     graph::CompileParameter,
     lean::{BackendLayout, ExportOptions, export},
@@ -8,10 +8,10 @@ use mxx_ir_core::{
     types::MatrixType,
     validate,
 };
-use std::{collections::BTreeMap, env, fs};
+use std::collections::BTreeMap;
 
-fn main() {
-    let output = env::args().nth(1).expect("output Lean path");
+#[test]
+fn export_sampler_fixture() {
     let public_type = MatrixType {
         modulus: 17.into(),
         ring_dimension: 2.into(),
@@ -142,5 +142,5 @@ theorem generated_sampled_trapdoor_path
         artifact.source.lines().filter(|line| line.starts_with("def ")).count(),
         artifact.static_node_visits
     );
-    fs::write(output, source).unwrap();
+    super::write_fixture("sampler", source);
 }

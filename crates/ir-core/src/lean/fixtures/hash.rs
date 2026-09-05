@@ -1,15 +1,15 @@
-//! Emit full-tag plain hashing and canonical coefficient extraction from frozen IR.
-use mxx_ir_core::{
+//! Generate full-tag plain hashing and canonical coefficient extraction from frozen IR.
+use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv, WireType,
     lean::{ExportOptions, export},
     node::{HashVariant, NodeKind},
     types::MatrixType,
     validate,
 };
-use std::{collections::BTreeMap, env, fs};
+use std::collections::BTreeMap;
 
-fn main() {
-    let path = env::args().nth(1).expect("output Lean path");
+#[test]
+fn export_hash_fixture() {
     let key_type = WireType::Bytes { length: 32.into() };
     let key = NodeHandle::new(
         NodeKind::Input { name: "key".into(), wire_type: key_type.clone(), artifact: None },
@@ -94,5 +94,5 @@ theorem generated_canonical_coefficient {model : MxxRuntime.HashModel}
   rw [outputEq]
   exact extractRun
 "#;
-    fs::write(path, format!("{}\n{proof}", artifact.source)).unwrap();
+    super::write_fixture("hash", format!("{}\n{proof}", artifact.source));
 }

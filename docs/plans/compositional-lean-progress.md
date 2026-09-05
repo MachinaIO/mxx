@@ -87,7 +87,7 @@ The runtime renderer returns a private-field `LeanBackendArtifact`; the WE
 assembler checks every exported root's layout metadata against that artifact.
 The concrete generator rejects an all-missing context before claim assembly.
 
-`crates/we/examples/emit_compositional.rs` exports all actual frozen roots:
+The production certificate exporter, invoked by Diamond parameter search, exports all actual frozen roots:
 encryption (295 stored nodes), decryption (454), three requirements (79, 371,
 199), and ideal (1). Backend and all six graph modules independently compile.
 The generated `Claim.lean` also compiles and its construction is independently
@@ -108,7 +108,7 @@ small fixture was claimed, and no final noise premise is added by this correctio
 
 The example uses a small structural configuration (`q = 1009`, ring dimension 8,
 gadget base 16). No feasible final noise bound has been established for it.
-The application proof templates in `crates/we/lean/templates` import these actual
+The application proof sources in `crates/we/lean` import these actual
 generated graph modules, rather than defining a second protocol:
 
 - `DiamondGateProof.lean`: independently accepted active product-gate extraction,
@@ -159,7 +159,7 @@ digits 8, inner dimension 20, error cutoff 29, preimage cutoff 85158441689,
 one injector layer and two circuit layers. Its bound
 3332445012031301517286688280911696390047037013499038720 is below radius
 1569275433823053701793832124557973045606030056736041006492.
-The same proof templates now compile at both backend geometries. The candidate's
+The same proof sources now compile at both backend geometries. The candidate's
 complete 44-module chain compiles, and the official emitter produces
 `DiamondCertificate.correctness : GeneratedClaim.CorrectnessClaim` with its
 closed numeric gate fully discharged. Independent regeneration reproduced all
@@ -187,7 +187,7 @@ dependency, and fresh-compilation validation.
 The same application proof now also has independent acceptance at depth four
 and width five, with eight 48-bit CRT towers and two digits per tower. All 45
 modules compile and the closed correctness theorem uses only the three standard
-axioms. The circuit proof templates are byte-identical across these two circuit
+axioms. The circuit proof sources are byte-identical across these two circuit
 sizes; all six generated graphs retain their declaration and line counts.
 
 Actual two-input, one-bit-batch execution also has independent whole-theorem
@@ -208,7 +208,7 @@ and compile without warnings; their scoped independent review is complete.
 ## Final validation checkpoint
 
 - All six Lean packages build without warnings.
-- The current exporter and proof templates freshly generate and compile all 45
+- The current exporter and proof sources freshly generate and compile all 45
   candidate modules without warnings. The closed `DiamondCertificate.correctness`
   declaration uses only `propext`, `Classical.choice`, and `Quot.sound`.
 - Both `cargo test -r --workspace --lib --no-run` and its `--features gpu` variant
@@ -246,12 +246,13 @@ for package in primitives ir-core gadgets bgg runtime we; do
   (cd "crates/$package/lean" && lake build) || exit
 done
 
-artifact_dir=$(mktemp -d)
-cargo run -p mxx-we --example emit_compositional -- "$artifact_dir" candidate check
+cargo test -p mxx-we --lib selected_candidate_retains_a_kernel_checked_certificate -- --ignored --nocapture
 
 cargo test -r --workspace --lib --no-run
 cargo test -r --workspace --lib --features gpu --no-run
 ```
 
-All commands above are verified at this checkpoint. The last two commands compile
+The certificate-retention unit test replaces the former example command; it uses a security
+estimator test double and exercises real Lean generation/checking, not GPU execution or a real
+security estimate. The historical checkpoint used the former example command. The last two commands compile
 unit tests without running them; they are not integration or GPU execution tests.

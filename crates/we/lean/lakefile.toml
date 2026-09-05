@@ -10,5 +10,41 @@ pp.unicode.fun = true
 name = "MxxPrimitives"
 path = "../../primitives/lean"
 
+[[require]]
+name = "MxxRuntime"
+path = "../../runtime/lean"
+
+[[require]]
+name = "mxx-ir-core"
+path = "../../ir-core/lean"
+
+[[require]]
+name = "MxxBgg"
+path = "../../bgg/lean"
+
+[[lean_lib]]
+name = "DiamondCandidate"
+srcDir = "generated"
+roots = [
+  "Backend", "Claim", "DiamondProofParameters", "NumericCertificate",
+  "Stage_encrypt", "Stage_decrypt", "Requirement_0", "Requirement_1", "Requirement_2", "Ideal"
+]
+
 [[lean_lib]]
 name = "MxxWe"
+# Candidate modules belong to DiamondCandidate above; handwritten proofs live here.
+roots = [
+  "Decoder", "Bounds", "Certificate",
+  "DiamondAccumulatedSecretProof", "DiamondBooleanGateProof",
+  "DiamondBoundedLayerProof", "DiamondBoundedLoopProof",
+  "DiamondCircuitInitialProof", "DiamondCircuitLayerProof", "DiamondCircuitPublicProof",
+  "DiamondCircuitRequirementProof", "DiamondClaimCircuitProof",
+  "DiamondClaimCorrectnessProof", "DiamondClaimFinalProof", "DiamondClaimInjectorProof",
+  "DiamondClaimStateProof", "DiamondDecryptInjectorProof", "DiamondEncodingRowProof",
+  "DiamondEncryptedGateProof", "DiamondFinalDecryptionProof", "DiamondFinalEncodingProof",
+  "DiamondFinalPublicProof", "DiamondGateProof", "DiamondIndexProof",
+  "DiamondInitialStateProof", "DiamondInjectorLoopProof", "DiamondInjectorProof",
+  "DiamondInjectorWitness", "DiamondInputContractProof", "DiamondIntegerInvariant",
+  "DiamondLayerProof", "DiamondNumericProof", "DiamondPackingProof", "DiamondSelectorProof",
+  "DiamondSelectorWitness", "DiamondTransitionProof", "DiamondWitnessPreimageProof"
+]

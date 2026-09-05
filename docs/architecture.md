@@ -34,9 +34,13 @@ preserving both the preimage equation and the authoritative cutoff.
 
 Owns the canonical executable graph, compile expressions, artifact metadata, parameter/type/shape
 validation, execution ordering, and liveness. `derive_param_constraints` is the shared source of
-decidable compile-parameter conditions consumed by concrete validation and operational checking. Sampler
+decidable compile-parameter conditions consumed by concrete validation. Sampler
 nodes serialize required integer coefficient cutoffs. Subgraph and parallel-loop bodies are
 structural and stored once.
+
+The Lean exporter owns primitive execution-relation generation and application-independent linked
+claim assembly. It receives explicit graph connections and endpoint semantics, not a WE protocol
+implementation, and does not infer noise bounds or expand structural families into individual lanes.
 
 ### `mxx-dsl`
 
@@ -51,9 +55,10 @@ transcripts, sessions, artifacts, and bounded parallel waves.
 
 ### `mxx-correctness`
 
-The library validates linked workflow declarations and evaluates their operational noise bounds
-with the Rust checker. Protocol declarations remain crate-owned; there is no central protocol
-registry or parameter-check executable.
+The library owns protocol declarations, input contracts, and structural validation of linked
+workflows. It does not simulate noise. The former application-agnostic operational-noise engine
+and its graph-to-checker conversion API have been removed. Applications own their mathematical
+bounds and Lean proofs; `mxx-ir-core` owns mechanical Lean extraction and generic claim assembly.
 
 ### `mxx-gadgets` and `mxx-bgg`
 
@@ -72,4 +77,15 @@ same frozen workflow, backend layout, and concrete parameter environment. The se
 retains its checked artifact; numerical rejection and checker failures remain distinct.
 
 `mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
-remain disabled. Diamond iO must migrate to the Rust operational checker before it is enabled.
+remain disabled. They need application-owned correctness implementations before being enabled.
+
+Tall's old-simulator-dependent parameter search and noisy verification modes are explicitly
+unavailable pending a Tall-specific correctness implementation. The independent noiseless runtime
+round-trip remains available; it is not a substitute for a proved noisy bound.
+
+## Generated Lean artifacts
+
+Diamond parameter search generates and checks Lean artifacts through the production library API;
+the GPU integration test uses that same search. No separate example executable is required.
+Crates do not contain example targets: reusable extraction fixtures live in ordinary unit-test
+modules, and generated files belong under ignored `test_data` or temporary artifact directories.

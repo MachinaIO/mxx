@@ -1,6 +1,7 @@
-//! Emit generic slice and matrix-concatenation relations, including a loop-dependent slice offset.
+//! Generate generic slice and matrix-concatenation relations, including a loop-dependent slice
+//! offset.
 
-use mxx_ir_core::{
+use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv,
     expr::IntExpr,
     graph::{CompileParameter, SubgraphHandle, with_new_construction_scope},
@@ -9,7 +10,7 @@ use mxx_ir_core::{
     types::{MatrixType, WireType},
     validate,
 };
-use std::{collections::BTreeMap, env, fs};
+use std::collections::BTreeMap;
 
 fn matrix(rows: usize, columns: usize) -> MatrixType {
     MatrixType {
@@ -20,8 +21,8 @@ fn matrix(rows: usize, columns: usize) -> MatrixType {
     }
 }
 
-fn main() {
-    let output = env::args().nth(1).expect("output Lean path");
+#[test]
+fn export_matrix_ops_fixture() {
     let one_by_two = matrix(1, 2);
     let two_by_one = matrix(2, 1);
     let one_by_one = matrix(1, 1);
@@ -169,5 +170,5 @@ theorem generated_slice_coefficients
   rcases hslice with ⟨_, _, _, _, _, _, _, _, hcoeff⟩
   simpa using hcoeff ⟨0, by omega⟩ ⟨0, by omega⟩ (by omega) (by omega)
 "#;
-    fs::write(output, format!("{}\n{}", artifact.source, proof)).unwrap();
+    super::write_fixture("matrix_ops", format!("{}\n{}", artifact.source, proof));
 }

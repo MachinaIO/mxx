@@ -3,24 +3,11 @@ name = "mxx-correctness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Perfect-correctness declarations and Rust operational checking for mxx"
+description = "Protocol declarations and workflow connection validation for mxx"
 
 [dependencies]
 mxx-ir-core.workspace = true
 mxx-dsl.workspace = true
-libc.workspace = true
 num-bigint.workspace = true
-num-traits.workspace = true
-rayon.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-smallvec.workspace = true
 thiserror.workspace = true
-tempfile.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
-mxx-bgg.workspace = true
-mxx-gadgets.workspace = true
-mxx-primitives.workspace = true
-tracing-subscriber.workspace = true

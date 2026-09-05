@@ -48,6 +48,30 @@ same external inputs and exported artifacts. For bounded successful executions w
 accepting inputs, it proves the actual residual is below the exact decoder threshold and the
 operational decoder returns the ideal message, for both Boolean messages.
 
+`crates/we/src/lean.rs::export_claim` adapts the declaration and calls the IR exporter.
+`crates/ir-core/src/lean/claim.rs::assemble_claim` owns application-independent graph linking,
+input predicates, and final Boolean threshold claim rendering. The WE adapter supplies the
+decoder's Lean helper names and endpoint identities; the generic renderer contains no WE
+protocol or noise-inference rules. Application-specific bounds, proof sources, and certificate
+verification remain under `crates/we/src/lean` and `crates/we/lean`.
+
+Handwritten Lean sources live together in `crates/we/lean`. The `Diamond*.lean` proofs import
+candidate-generated IR modules; the exporter copies them unchanged into the candidate directory
+and checks them there. For local editing, select that directory with
+`python3 scripts/select_we_lean_candidate.py <candidate-directory>`, then run `lake build` in
+`crates/we/lean`. Lake builds the current handwritten sources through `Certificate` against the
+selected generated snapshot. See `crates/we/lean/README.md` for bootstrap and VS Code setup.
+
+The fixed audit entry point is `crates/we/lean/Certificate.lean`, containing
+`DiamondCertificate.correctness : GeneratedClaim.CorrectnessClaim`. The candidate's generated
+`Claim.lean` supplies the IR-derived statement and execution assumptions; generated
+`NumericCertificate.lean` proves the numeric gate. The final theorem has no numeric premise.
+
+The parameter search called by `test_gpu_diamond_we.rs` already generates and checks these
+artifacts; no example executable or separate emission command is needed. Extractor fixtures are
+ordinary unit tests. `mxx-correctness` now supplies declarations and structural validation only;
+the former generic symbolic noise simulator has been removed.
+
 `DiamondWeProtocolFamily::protocol_decl` returns a validated `WitnessEncryptionProtocolDecl`. The
 declaration is built directly from symbolic circuit and cryptographic parameters; it does not own a
 concrete circuit shape or a parameter-search candidate. Its sole fixed value is the BGG domain tag.

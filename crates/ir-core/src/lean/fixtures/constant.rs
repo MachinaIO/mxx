@@ -1,6 +1,6 @@
-//! Emit literal-matrix semantics and proofs about their actual named root projections.
+//! Generate literal-matrix semantics and proofs about their actual named root projections.
 
-use mxx_ir_core::{
+use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv,
     expr::IntExpr,
     lean::{ExportOptions, export},
@@ -8,10 +8,10 @@ use mxx_ir_core::{
     types::{MatrixType, WireType},
     validate,
 };
-use std::{collections::BTreeMap, env, fs};
+use std::collections::BTreeMap;
 
-fn main() {
-    let path = env::args().nth(1).expect("output Lean path");
+#[test]
+fn export_constant_fixture() {
     let matrix = MatrixType {
         modulus: IntExpr::constant(17),
         ring_dimension: IntExpr::constant(2),
@@ -74,5 +74,5 @@ fn main() {
         "\ntheorem generated_alias {{outputs : {}}} : {} = {} := by rfl\n",
         root.output_type, root.outputs["alias"].projection, root.outputs["polynomial"].projection,
     ));
-    fs::write(path, format!("{}\n{proof}", artifact.source)).unwrap();
+    super::write_fixture("constant", format!("{}\n{proof}", artifact.source));
 }

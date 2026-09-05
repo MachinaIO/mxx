@@ -4,6 +4,10 @@
 //! Diamond roles, or provide semantic fallbacks for an operation it cannot translate.  Primitive
 //! names are supplied by the package owning those primitive relations.
 
+pub mod claim;
+#[cfg(test)]
+mod fixtures;
+
 use crate::{
     expr::{IntExpr, RealExpr},
     graph::{FrozenGraphScopeId, Graph, GraphScope},

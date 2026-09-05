@@ -8,13 +8,12 @@ use crate::{
     ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec, ProtocolStage, StageId,
     StageInputName, Workflow,
 };
-use mxx_dsl::{DerivationAttachmentValue, DslContext, GraphValue, IdealSpec, Ring, SemanticAnchor};
+use mxx_dsl::{DslContext, IdealSpec, Ring, SemanticAnchor};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
 };
 
-pub const PROTOCOL_NAME: &str = "toy-example";
 pub const DECODED_ENDPOINT: &str = "decoded-endpoint";
 pub const RESIDUAL_ANCHOR: &str = "toy.decoder.residual";
 pub fn protocol() -> ProtocolDecl {
@@ -26,22 +25,6 @@ pub fn protocol() -> ProtocolDecl {
     let encoded = selector
         .select(vec![zero.clone(), carrier.clone()])
         .expect("two equally typed encoding branches");
-    let encoded_wire = encoded.flatten().into_iter().next().expect("one encoded matrix wire");
-    let message_wire = message.flatten().into_iter().next().expect("one message wire");
-    let zero_wire = zero.flatten().into_iter().next().expect("one zero wire");
-    let carrier_wire = carrier.flatten().into_iter().next().expect("one carrier wire");
-    let encoded = encoded
-        .derivation_attachment(
-            "mxx-correctness",
-            "protocol-boolean-signal-grouping",
-            vec![
-                ("value".to_owned(), encoded_wire),
-                ("selector".to_owned(), message_wire),
-                ("zero".to_owned(), zero_wire),
-                ("carrier".to_owned(), carrier_wire),
-            ],
-        )
-        .expect("mechanical Toy Boolean-carrier attachment");
     let ciphertext = encoded.clone() +
         ring.gaussian((1, 1), RealExpr::from_integer(1), IntExpr::Var("cutoff".to_owned()));
     let residual = (ciphertext.clone() - encoded)

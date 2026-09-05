@@ -5,8 +5,7 @@ use crate::{
 };
 use mxx_ir_core::{
     artifact::{ProductionId, SpecHash, export_validated_manifest},
-    lean::{ExportOptions, export},
-    validate, validate_with_manifests,
+    validate,
 };
 use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
 use mxx_runtime::lean::{export_dcrt_layouts, render_backend_context};
@@ -115,6 +114,9 @@ pub fn export_diamond_certificate(
         return Err("Diamond compiler and registered DCRT layout disagree".into());
     }
     fs::create_dir_all(directory)?;
+    if fs::read_dir(directory)?.next().transpose()?.is_some() {
+        return Err("Diamond certificate export requires an empty output directory".into());
+    }
     let protocol = compiler.protocol_decl()?;
     let declaration = protocol.protocol();
     let bindings = compiler.circuit_bindings()?;
@@ -166,186 +168,138 @@ pub fn export_diamond_certificate(
             compiler.shape.instance_width,
         ),
     )?;
-    let mut graphs = declaration
-        .stages()
-        .iter()
-        .map(|stage| (format!("Stage_{}", stage.id.0), &stage.graph))
-        .collect::<Vec<_>>();
-    graphs.extend(
-        declaration
-            .bundle
-            .requirements
-            .iter()
-            .enumerate()
-            .map(|(index, requirement)| (format!("Requirement_{index}"), &requirement.graph)),
-    );
-    graphs.push(("Ideal".into(), &declaration.bundle.ideal.graph));
-    let mut generated = BTreeMap::new();
-    for (name, graph) in graphs {
-        let validated = validate_with_manifests(graph, &bindings, &manifests)?;
-        let artifact = export(
-            &validated,
-            &ExportOptions {
-                namespace: name.clone(),
-                module_name: name.clone(),
-                backend_layouts: layouts.iter().map(|layout| layout.exporter_binding()).collect(),
-                ..ExportOptions::default()
-            },
-        )?;
-        fs::write(directory.join(format!("{name}.lean")), &artifact.source)?;
-        generated.insert(name, artifact);
-    }
-    let roots = crate::lean::ExportedRoots {
-        stages: declaration
-            .stages()
-            .iter()
-            .map(|stage| {
-                (
-                    stage.id.clone(),
-                    generated.remove(&format!("Stage_{}", stage.id.0)).expect("exported stage"),
-                )
-            })
-            .collect(),
-        requirements: (0..declaration.bundle.requirements.len())
-            .map(|index| {
-                generated.remove(&format!("Requirement_{index}")).expect("exported requirement")
-            })
-            .collect(),
-        ideal: generated.remove("Ideal").expect("exported ideal"),
-    };
-    let claim = crate::lean::assemble_claim(&protocol, &roots, &bindings, &backend)?;
-    fs::write(directory.join("Claim.lean"), claim)?;
+    crate::lean::export_claim(&protocol, &bindings, &backend, &manifests, directory)?;
     fs::write(
         directory.join("DiamondGateProof.lean"),
-        include_str!("../../lean/templates/DiamondGateProof.lean"),
+        include_str!("../../lean/DiamondGateProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondEncryptedGateProof.lean"),
-        include_str!("../../lean/templates/DiamondEncryptedGateProof.lean"),
+        include_str!("../../lean/DiamondEncryptedGateProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondInjectorProof.lean"),
-        include_str!("../../lean/templates/DiamondInjectorProof.lean"),
+        include_str!("../../lean/DiamondInjectorProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondSelectorProof.lean"),
-        include_str!("../../lean/templates/DiamondSelectorProof.lean"),
+        include_str!("../../lean/DiamondSelectorProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondInitialStateProof.lean"),
-        include_str!("../../lean/templates/DiamondInitialStateProof.lean"),
+        include_str!("../../lean/DiamondInitialStateProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondTransitionProof.lean"),
-        include_str!("../../lean/templates/DiamondTransitionProof.lean"),
+        include_str!("../../lean/DiamondTransitionProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondAccumulatedSecretProof.lean"),
-        include_str!("../../lean/templates/DiamondAccumulatedSecretProof.lean"),
+        include_str!("../../lean/DiamondAccumulatedSecretProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondIndexProof.lean"),
-        include_str!("../../lean/templates/DiamondIndexProof.lean"),
+        include_str!("../../lean/DiamondIndexProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondInjectorWitness.lean"),
-        include_str!("../../lean/templates/DiamondInjectorWitness.lean"),
+        include_str!("../../lean/DiamondInjectorWitness.lean"),
     )?;
     fs::write(
         directory.join("DiamondLayerProof.lean"),
-        include_str!("../../lean/templates/DiamondLayerProof.lean"),
+        include_str!("../../lean/DiamondLayerProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondIntegerInvariant.lean"),
-        include_str!("../../lean/templates/DiamondIntegerInvariant.lean"),
+        include_str!("../../lean/DiamondIntegerInvariant.lean"),
     )?;
     fs::write(
         directory.join("DiamondSelectorWitness.lean"),
-        include_str!("../../lean/templates/DiamondSelectorWitness.lean"),
+        include_str!("../../lean/DiamondSelectorWitness.lean"),
     )?;
     fs::write(
         directory.join("DiamondEncodingRowProof.lean"),
-        include_str!("../../lean/templates/DiamondEncodingRowProof.lean"),
+        include_str!("../../lean/DiamondEncodingRowProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondInputContractProof.lean"),
-        include_str!("../../lean/templates/DiamondInputContractProof.lean"),
+        include_str!("../../lean/DiamondInputContractProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondPackingProof.lean"),
-        include_str!("../../lean/templates/DiamondPackingProof.lean"),
+        include_str!("../../lean/DiamondPackingProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondDecryptInjectorProof.lean"),
-        include_str!("../../lean/templates/DiamondDecryptInjectorProof.lean"),
+        include_str!("../../lean/DiamondDecryptInjectorProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondWitnessPreimageProof.lean"),
-        include_str!("../../lean/templates/DiamondWitnessPreimageProof.lean"),
+        include_str!("../../lean/DiamondWitnessPreimageProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondBoundedLayerProof.lean"),
-        include_str!("../../lean/templates/DiamondBoundedLayerProof.lean"),
+        include_str!("../../lean/DiamondBoundedLayerProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondBoundedLoopProof.lean"),
-        include_str!("../../lean/templates/DiamondBoundedLoopProof.lean"),
+        include_str!("../../lean/DiamondBoundedLoopProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondInjectorLoopProof.lean"),
-        include_str!("../../lean/templates/DiamondInjectorLoopProof.lean"),
+        include_str!("../../lean/DiamondInjectorLoopProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondBooleanGateProof.lean"),
-        include_str!("../../lean/templates/DiamondBooleanGateProof.lean"),
+        include_str!("../../lean/DiamondBooleanGateProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondCircuitLayerProof.lean"),
-        include_str!("../../lean/templates/DiamondCircuitLayerProof.lean"),
+        include_str!("../../lean/DiamondCircuitLayerProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondCircuitRequirementProof.lean"),
-        include_str!("../../lean/templates/DiamondCircuitRequirementProof.lean"),
+        include_str!("../../lean/DiamondCircuitRequirementProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondCircuitInitialProof.lean"),
-        include_str!("../../lean/templates/DiamondCircuitInitialProof.lean"),
+        include_str!("../../lean/DiamondCircuitInitialProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondFinalDecryptionProof.lean"),
-        include_str!("../../lean/templates/DiamondFinalDecryptionProof.lean"),
+        include_str!("../../lean/DiamondFinalDecryptionProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondFinalPublicProof.lean"),
-        include_str!("../../lean/templates/DiamondFinalPublicProof.lean"),
+        include_str!("../../lean/DiamondFinalPublicProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondFinalEncodingProof.lean"),
-        include_str!("../../lean/templates/DiamondFinalEncodingProof.lean"),
+        include_str!("../../lean/DiamondFinalEncodingProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondNumericProof.lean"),
-        include_str!("../../lean/templates/DiamondNumericProof.lean"),
+        include_str!("../../lean/DiamondNumericProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondClaimInjectorProof.lean"),
-        include_str!("../../lean/templates/DiamondClaimInjectorProof.lean"),
+        include_str!("../../lean/DiamondClaimInjectorProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondClaimStateProof.lean"),
-        include_str!("../../lean/templates/DiamondClaimStateProof.lean"),
+        include_str!("../../lean/DiamondClaimStateProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondClaimFinalProof.lean"),
-        include_str!("../../lean/templates/DiamondClaimFinalProof.lean"),
+        include_str!("../../lean/DiamondClaimFinalProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondClaimCircuitProof.lean"),
-        include_str!("../../lean/templates/DiamondClaimCircuitProof.lean"),
+        include_str!("../../lean/DiamondClaimCircuitProof.lean"),
     )?;
     fs::write(
         directory.join("DiamondClaimCorrectnessProof.lean"),
-        include_str!("../../lean/templates/DiamondClaimCorrectnessProof.lean"),
+        include_str!("../../lean/DiamondClaimCorrectnessProof.lean"),
     )?;
     let q = layout.modulus.to_biguint().ok_or("negative modulus")?;
     if q < BigUint::from(4u32) {
@@ -382,7 +336,6 @@ pub fn export_diamond_certificate(
         circuit_layers: compiler.shape.depth.into(),
     };
     let numeric = render_numeric_certificate(&numeric_inputs);
-    fs::write(directory.join("NumericCertificate.lean"), &numeric.source)?;
     let numeric_gate = "DiamondGeneratedProof.cappedDiamondBound (MxxWe.decoderRadius q) n inner ell \
         GeneratedClaim.stage_0_params.diamond_error_max_coefficient_bound.toNat \
         GeneratedClaim.stage_0_params.diamond_preimage_max_coefficient_bound.toNat D \
@@ -399,29 +352,28 @@ pub fn export_diamond_certificate(
         numeric_gate_left = numeric_gate.split(" < ").next().ok_or("numeric gate shape")?,
         bound = numeric.bound,
     );
-    let certificate = if numeric.bound < numeric_inputs.cap {
-        format!(
-            "theorem numeric_gate : {numeric_gate} := {numeric_proof}\n\n\
-             theorem correctness : GeneratedClaim.CorrectnessClaim :=\n\
-               DiamondGeneratedProof.generated_claim_correctness_of_capped_gate numeric_gate\n\n\
-             #print axioms correctness\n"
-        )
+    let numeric_result = if numeric.bound < numeric_inputs.cap {
+        format!("theorem numeric_gate : {numeric_gate} := {numeric_proof}\n")
     } else {
         format!("theorem numeric_rejection : ¬ ({numeric_gate}) := {numeric_proof}\n")
     };
     fs::write(
-        directory.join("Certificate.lean"),
+        directory.join("NumericCertificate.lean"),
         format!(
-            "import DiamondClaimCorrectnessProof\nimport NumericCertificate\n\n\
+            "import Claim\n{}\n\
              open MxxWe DiamondGeneratedProof DiamondProofParameters\n\n\
-             namespace DiamondCertificate\n\n\
+             namespace DiamondNumericCertificate\n\n\
              set_option maxRecDepth 8192\n\n\
-             {certificate}\nend DiamondCertificate\n"
+             {numeric_result}\nend DiamondNumericCertificate\n",
+            numeric.source,
         ),
     )?;
+    if numeric.bound < numeric_inputs.cap {
+        fs::write(directory.join("Certificate.lean"), include_str!("../../lean/Certificate.lean"))?;
+    }
     fs::write(
         directory.join("DiamondCircuitPublicProof.lean"),
-        include_str!("../../lean/templates/DiamondCircuitPublicProof.lean"),
+        include_str!("../../lean/DiamondCircuitPublicProof.lean"),
     )?;
     Ok(ExportedDiamondCertificate {
         directory: directory.to_path_buf(),

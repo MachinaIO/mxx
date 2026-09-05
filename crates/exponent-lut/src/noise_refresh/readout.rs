@@ -26,6 +26,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub(crate) fn helper_sigma_for_flat_index(index: IntExpr, branches: Vec<IntExpr>) -> IntExpr {
+    // Flattening is label-major: every label visits all helper sigmas.
+    // The helper coordinate is a remainder, not an exact integer quotient.
+    IntExpr::Select {
+        selector: Box::new(IntExpr::Rem(
+            Box::new(index),
+            Box::new(IntExpr::constant(branches.len())),
+        )),
+        branches,
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/readout_index_tests/test.rs"]
+mod readout_index_tests;
+
 /// Errors raised while validating or constructing a value readout.
 #[derive(Debug, Eq, PartialEq, Error)]
 pub enum ValueReadoutError {
@@ -523,18 +539,7 @@ impl ValueReadout {
             helper_sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
         let helper_vectors = (flat_transformed, flat_aligned, flat_switches)
             .parallel_zip_tuple(move |index, (transformed, aligned, switch)| {
-                let flat_index = index.expression();
-                let divisor = IntExpr::constant(helper_count);
-                let sigma = IntExpr::Select {
-                    selector: Box::new(IntExpr::Sub(
-                        Box::new(flat_index.clone()),
-                        Box::new(IntExpr::Mul(
-                            Box::new(IntExpr::Div(Box::new(flat_index), Box::new(divisor.clone()))),
-                            Box::new(divisor),
-                        )),
-                    )),
-                    branches: sigma_branches.clone(),
-                };
+                let sigma = helper_sigma_for_flat_index(index.expression(), sigma_branches.clone());
                 aligned + switch.mul_small_rhs(transformed.ring_automorphism(sigma))
             })
             .map_err(|error| {
@@ -686,6 +691,30 @@ impl ValueReadout {
     /// source for symbolic table declarations.
     pub fn canonical_coefficients(&self) -> Option<&[BigInt]> {
         self.canonical_coefficients.as_deref()
+    }
+
+    /// Convolution gains of the declared integer lift of T', separate from
+    /// the decomposition of T'G (not necessarily centered modulo the ring q).
+    /// Native signed-monomial accumulator plaintexts only rotate/sign these
+    /// coefficients, preserving both norms used for the switch helper error.
+    pub(crate) fn target_plaintext_gain(
+        &self,
+        ring_dimension: usize,
+    ) -> Result<crate::noise::RightActionNoiseGain, ValueReadoutError> {
+        self.layout.validate(ring_dimension)?;
+        let width = native_width(&self.layout, ring_dimension)?;
+        let coefficients =
+            self.canonical_coefficients().ok_or(ValueReadoutError::Canonicalization)?;
+        // Reject polynomial declarations requiring coefficient aliasing. The
+        // target reads the first width coefficients, with implicit zero padding.
+        if coefficients.len() > ring_dimension {
+            return Err(ValueReadoutError::InvalidTableLength);
+        }
+        // mono(-k) occupies a distinct coefficient for every native k;
+        // negacyclic wrapping changes its sign, not its magnitude.
+        Ok(crate::noise::RightActionNoiseGain::from_polynomial_coefficients((0..width).map(|k| {
+            coefficients.get(k).cloned().unwrap_or_default() * BigInt::from(2u8) - BigInt::one()
+        })))
     }
 
     /// Returns the immutable table declaration.
@@ -1523,6 +1552,44 @@ mod tests {
         IntExpr,
         node::{ConstantMatrix, NodeKind},
     };
+
+    #[test]
+    fn target_plaintext_gain_tracks_table_and_monomial_coefficients() {
+        // Native readout requires width >= 2. Check the monomial invariant
+        // directly on the same convolution-gain primitive without relaxing it.
+        for sign in [-1, 1] {
+            assert_eq!(
+                crate::noise::RightActionNoiseGain::from_polynomial_coefficients([
+                    BigInt::zero(),
+                    sign.into(),
+                    BigInt::zero()
+                ],),
+                crate::noise::RightActionNoiseGain::unit()
+            );
+        }
+        for stride_log2 in [0, 1, 3] {
+            let readout = ValueReadout::from_canonical_values(
+                ExpLayout { stride_log2, width_log2: 2 },
+                vec![1, 1, 2, 2],
+            )
+            .unwrap();
+            assert_eq!(
+                readout.target_plaintext_gain(4 << stride_log2).unwrap(),
+                crate::noise::RightActionNoiseGain { l1: 8u8.into(), l2_squared: 20u8.into() }
+            );
+        }
+        let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let ring = Ring::new(97, 4);
+        let symbolic = ValueReadout::new(layout, ring.input("table", (1, 1))).unwrap();
+        assert!(symbolic.target_plaintext_gain(4).is_err());
+        let padded = ValueReadout::new(layout, ring.polynomial([1.into()])).unwrap();
+        assert_eq!(
+            padded.target_plaintext_gain(4).unwrap(),
+            crate::noise::RightActionNoiseGain { l1: 4u8.into(), l2_squared: 4u8.into() }
+        );
+        let aliased = ValueReadout::new(layout, ring.polynomial(vec![1.into(); 5])).unwrap();
+        assert!(aliased.target_plaintext_gain(4).is_err());
+    }
 
     fn independent_automorphisms(ring_dimension: usize, layout: ExpLayout) -> Vec<usize> {
         let modulus = 2 * ring_dimension;

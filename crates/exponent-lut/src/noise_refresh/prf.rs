@@ -1398,19 +1398,10 @@ impl SparseLwrPrfProgram {
             helpers.sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
         let public_decompositions = (flat_transformed, flat_switches)
             .parallel_zip_tuple(move |index, (transformed, switch)| {
-                let sigma = IntExpr::Select {
-                    selector: Box::new(IntExpr::Sub(
-                        Box::new(index.expression()),
-                        Box::new(IntExpr::Mul(
-                            Box::new(IntExpr::Div(
-                                Box::new(index.expression()),
-                                Box::new(IntExpr::constant(helper_count)),
-                            )),
-                            Box::new(IntExpr::constant(helper_count)),
-                        )),
-                    )),
-                    branches: sigma_branches.clone(),
-                };
+                let sigma = crate::noise_refresh::readout::helper_sigma_for_flat_index(
+                    index.expression(),
+                    sigma_branches.clone(),
+                );
                 switch
                     .mul_small_rhs(transformed.ring_automorphism(sigma))
                     .decompose(compiler.public_key.base.clone(), digit_count)

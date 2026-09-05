@@ -1,5 +1,29 @@
 include!("test_utils.rs");
 
+#[test]
+#[ignore = "CPU-only inventory for an accepted real round-trip candidate"]
+fn test_round_trip_artifact_inventory() {
+    let config = SearchConfig::from_env().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let result = &report["result"];
+    let candidate = serde_json::from_value(result["candidate"].clone()).unwrap();
+    let evidence = &result["average_evidence"];
+    let (bundle, _, _) = round_trip_bundle(
+        &config,
+        candidate,
+        evidence["mask_digit_count"].as_u64().unwrap() as usize,
+        evidence["fresh_error_digit_count"].as_u64().unwrap() as usize,
+        1,
+    )
+    .unwrap();
+    for manifest in bundle.preprocessing_manifests().values() {
+        println!("artifact_inventory={}", serde_json::to_string(manifest).unwrap());
+    }
+}
+
 fn reviewed_estimator_bits(universe: usize, q_l: usize) -> u64 {
     match (universe, q_l) {
         (16384, 2048) => 100,
@@ -44,7 +68,7 @@ fn mock_sparse_profile(config: &SearchConfig) -> SelectedSparseLwrProfile {
         p: config.sparse_lwr_output_modulus,
         universe: config.sparse_lwr_universe,
         weight: config.sparse_lwr_weight,
-        tier: SparseLwrSecurityTier::Primary100,
+        tier: SparseLwrSecurityTier::Requested,
         error_lower,
         error_upper,
         estimator_commit: config.phase1_estimator_commit.clone(),
@@ -459,6 +483,46 @@ fn mocked_security_and_checker_select_first_minimal_candidate() {
 }
 
 #[test]
+fn requested_one_bit_target_controls_both_phases_and_checkpoint_identity() {
+    let mut config = SearchConfig::reviewed();
+    config.security_bits = 1;
+    config.mask_statistical_security_bits = 1;
+    config.sparse_lwr_universe = 64;
+    config.sparse_lwr_weight = 1;
+    config.sparse_lwr_modulus = 8;
+    config.sparse_lwr_output_modulus = 4;
+    config.sparse_lwr_universe_grid = vec![64];
+    config.sparse_lwr_phase1_grid = vec![SparseLwrParameterTuple {
+        q_l: 8,
+        p: 4,
+        nu: 64,
+        h: 1,
+        estimator_minimum_classical_bits: None,
+        estimator_security_bits: None,
+    }];
+    config.crt_depths = 1..=1;
+    config.log_ring_dimensions = 5..=5;
+    let selected = select_sparse_lwr_profile(&config, |_, _, _, _| Ok(16)).unwrap();
+    assert_eq!(selected.tier, SparseLwrSecurityTier::Requested);
+    let checkpoint = Phase1Checkpoint::from_selection(&config, &selected).unwrap();
+    checkpoint.validate(&config).unwrap();
+    let mut different_target = config.clone();
+    different_target.security_bits = 2;
+    assert!(checkpoint.validate(&different_target).is_err());
+    let result =
+        search_with_hooks(&config, &selected, |c| Ok(mock_prepared(c)), |_| Ok(1), |_| Ok(true))
+            .unwrap();
+    assert_eq!(result.achieved_security_bits, 1);
+    let report = search_report(&config, &selected, result);
+    assert_eq!(report.phase1.security_target_bits, 1);
+    assert_eq!(report.phase2.security_target_bits, 1);
+    assert!(
+        search_with_hooks(&config, &selected, |c| Ok(mock_prepared(c)), |_| Ok(0), |_| Ok(true))
+            .is_err()
+    );
+}
+
+#[test]
 fn phase_one_exhausts_ordered_grid_before_selecting_primary_profile() {
     let mut config = SearchConfig::reviewed();
     config.security_bits = 100;
@@ -471,7 +535,7 @@ fn phase_one_exhausts_ordered_grid_before_selecting_primary_profile() {
     assert_eq!(calls, vec![16384, 16384, 8192]);
     assert_eq!(selected.universe, 16384);
     assert_eq!(selected.q_l, 2048);
-    assert_eq!(selected.tier, SparseLwrSecurityTier::Primary100);
+    assert_eq!(selected.tier, SparseLwrSecurityTier::Requested);
     assert_eq!(selected.sparse_lwr_security_bits, 100);
 }
 
@@ -497,7 +561,7 @@ fn qualified_profiles_preserve_all_primary_rows_for_phase_two_advancement() {
             .collect::<Vec<_>>(),
         [(2048, 16, 16384), (4096, 32, 16384), (4096, 32, 8192)]
     );
-    assert!(profiles.iter().all(|profile| profile.tier == SparseLwrSecurityTier::Primary100));
+    assert!(profiles.iter().all(|profile| profile.tier == SparseLwrSecurityTier::Requested));
 }
 
 #[test]
@@ -673,7 +737,7 @@ fn phase_one_checkpoint_binds_tuple_tier_error_and_estimator_identity() {
     );
     let mut checkpoint: Phase1Checkpoint =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    checkpoint.selected.tier = SparseLwrSecurityTier::Fallback100;
+    checkpoint.selected.tier = SparseLwrSecurityTier::Rejected;
     std::fs::write(&path, serde_json::to_vec_pretty(&checkpoint).unwrap()).unwrap();
     assert!(
         load_or_search_phase1(&config, Some(&path), |universe, _, q_l, _| Ok(
@@ -697,7 +761,7 @@ fn phase_one_checkpoint_binds_tuple_tier_error_and_estimator_identity() {
         .contains("does not match")
     );
     let mut changed = config.clone();
-    changed.phase1_fallback_security_bits = 101;
+    changed.security_bits = 101;
     assert!(
         load_or_search_phase1(&changed, Some(&path), |_, _, _, _| Ok(128))
             .unwrap_err()
@@ -862,7 +926,7 @@ fn result_serialization_is_redacted() {
         checker_accepted: true,
         sparse_lwr_q_l: 8,
         sparse_lwr_p: 2,
-        sparse_lwr_tier: SparseLwrSecurityTier::Primary100,
+        sparse_lwr_tier: SparseLwrSecurityTier::Requested,
         estimator_commit: REVIEWED_ESTIMATOR_COMMIT.to_owned(),
         estimator_cost_model: REVIEWED_ESTIMATOR_COST_MODEL.to_owned(),
         estimator_shape_model: REVIEWED_ESTIMATOR_SHAPE_MODEL.to_owned(),

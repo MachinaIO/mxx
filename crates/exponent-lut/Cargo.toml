@@ -25,6 +25,8 @@ thiserror.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+rayon.workspace = true
+tempfile.workspace = true
 mxx-bench-estimator = { workspace = true, features = ["gpu"] }
 mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 serial_test.workspace = true

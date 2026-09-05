@@ -388,6 +388,8 @@ where
         executed_node_count: 0,
         last_release_fence_node_count: 0,
         has_pending_releases: false,
+        execution_started: Instant::now(),
+        last_progress_report: None,
     };
     let inputs = inputs
         .into_iter()
@@ -440,6 +442,13 @@ where
         }
     }
     executor.fence_pending_releases()?;
+    info!(
+        graph = validated.source.name(),
+        host_returned_node_instances = executor.executed_node_count,
+        elapsed_seconds = executor.execution_started.elapsed().as_secs_f64(),
+        gpu_completion = "not_observed",
+        "runtime graph execution returned after output finalization"
+    );
     let result = ExecutionResult {
         outputs: named_outputs,
         production_id,
@@ -464,6 +473,8 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     executed_node_count: usize,
     last_release_fence_node_count: usize,
     has_pending_releases: bool,
+    execution_started: Instant,
+    last_progress_report: Option<Instant>,
 }
 
 struct PreimageProgress {
@@ -573,6 +584,29 @@ where
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
         for (position, handle) in validated_scope.execution_order.iter().enumerate() {
+            // Counts include structural nodes and each instantiated loop-body
+            // node, not coefficients, kernels, or device-completed work. Scope
+            // totals describe the unexpanded template only. Reporting never
+            // fences GPU work and remains independent of release-fence policy.
+            if tracing::enabled!(tracing::Level::INFO) &&
+                self.last_progress_report
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+            {
+                info!(
+                    graph = self.validated.source.name(),
+                    scope = ?scope_id,
+                    next_scope_template_node = position,
+                    scope_template_nodes = validated_scope.execution_order.len(),
+                    batch_instances = envs.len(),
+                    first_instance_path = ?paths.first(),
+                    last_instance_path = ?paths.last(),
+                    host_returned_node_instances = self.executed_node_count,
+                    elapsed_seconds = self.execution_started.elapsed().as_secs_f64(),
+                    gpu_completion = "not_observed",
+                    "runtime graph dispatch progress"
+                );
+                self.last_progress_report = Some(Instant::now());
+            }
             let node = ExecutableNode {
                 id: NodeId(position as u64),
                 kind: handle.kind(),

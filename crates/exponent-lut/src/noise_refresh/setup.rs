@@ -3987,6 +3987,8 @@ fn validate_manifest(
 /// verification circuit boundary, not a decryption API: the caller supplies
 /// the expected plaintext and decides how to consume the decoded outputs.
 pub struct RefreshVerification {
+    encoding_vector: Mat,
+    anchor: Mat,
     residual: Mat,
     /// The exact scalar matrix passed as the input to each threshold decoder,
     /// in public-key-column order.  Keeping these wires prevents consumers
@@ -4053,7 +4055,10 @@ impl RefreshVerification {
         residual_name: impl Into<String>,
         decoded_prefix: impl Into<String>,
     ) -> Result<DslContext, RefreshSetupError> {
-        let mut context = context.private_output(residual_name, self.residual.clone())?;
+        let mut context = context
+            .private_output("refresh-verification-vector", self.encoding_vector.clone())?
+            .private_output("refresh-verification-anchor", self.anchor.clone())?
+            .private_output(residual_name, self.residual.clone())?;
         // Export each scalar decoder operand under its own canonical name.  A
         // correctness target must bind to one exact column, not to the
         // aggregate residual matrix (which would make a same-shaped column
@@ -4146,8 +4151,9 @@ pub fn build_refresh_verification(
         public_key.matrix_type().ring_dimension.clone(),
     );
     let g = ring.gadget(mask_secret.matrix_type().columns.clone(), gadget_base, gadget_digit_count);
-    let residual = encoding.vector.clone() - mask_secret.clone() * public_key.clone() +
+    let anchor = mask_secret.clone() * public_key.clone() -
         expected_plaintext.clone() * (payload_secret.clone() * g);
+    let residual = encoding.vector.clone() - anchor.clone();
     let plaintext_modulus = plaintext_modulus.into();
     let mut decoder_residuals = Vec::with_capacity(public_key_columns);
     let mut decoded = Vec::with_capacity(decoded_count);
@@ -4161,7 +4167,13 @@ pub fn build_refresh_verification(
             scalar_residual.threshold_decode_bools(plaintext_modulus.clone(), decode_length),
         );
     }
-    Ok(RefreshVerification { residual, decoder_residuals, decoded })
+    Ok(RefreshVerification {
+        encoding_vector: encoding.vector.clone(),
+        anchor,
+        residual,
+        decoder_residuals,
+        decoded,
+    })
 }
 
 /// Exact matrix facts exported for request-level external-input validation.
@@ -4283,6 +4295,9 @@ impl RefreshParameterSimulationRequest {
     /// Creates a request after checking all cross-layer dimensions and the
     /// selected decoder cutoff against the official policy. The sparse support and one-hot
     /// schedule remain private inside the generated PBC layout.
+    /// Verification builds encode `expected_plaintext` as the initial state
+    /// and independently use it in the output relation. Benchmark-only builds
+    /// retain the fixed identity attribute and do not construct this oracle.
     pub fn new(
         setup: RefreshSetupParameters,
         profile: SparseLwrPrfProfile,
@@ -4609,9 +4624,13 @@ impl RefreshParameterSimulationRequest {
         let active_count = crate::noise_refresh::pbc::PbcActiveCellIndex::build(&layout)
             .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?
             .len();
-        let initial_attribute = profile.layout.mono(&ring, &BigInt::zero()).map_err(|_| {
-            RefreshSetupError::InvalidParameters("invalid native initial attribute")
-        })?;
+        let initial_attribute = if benchmark_only {
+            profile.layout.mono(&ring, &BigInt::zero()).map_err(|_| {
+                RefreshSetupError::InvalidParameters("invalid native initial attribute")
+            })?
+        } else {
+            self.expected_plaintext.clone()
+        };
         let online_label_count = refresh_prf_output_count(&setup)?;
         let total_labels = online_label_count
             .checked_mul(active_count)
@@ -4933,6 +4952,14 @@ impl RefreshParameterSimulationRequest {
 }
 
 #[cfg(test)]
+#[path = "../../tests/prf_noiseless_tests/test.rs"]
+mod prf_noiseless_tests;
+
+#[cfg(all(test, feature = "gpu"))]
+#[path = "../../tests/prf_round_trip_gpu_tests/test.rs"]
+mod prf_round_trip_gpu_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::noise_refresh::pbc::{PbcParameters, PbcRootSeed, generate_key_layout};
@@ -5188,6 +5215,64 @@ mod tests {
             1,
         )
         .expect("explicit cutoff above official is accepted");
+    }
+
+    #[test]
+    fn readout_switch_error_adds_target_plaintext_gains_only() {
+        let mut rng = rand::rng();
+        let generated = generate_key_layout(
+            &PbcParameters::custom(4, 1, 2, 3, 1, None),
+            PbcRootSeed(rand::Rng::random(&mut rng)),
+            &[0],
+        )
+        .unwrap();
+        let active = PbcActiveCellIndex::build(&generated.public_layout).unwrap();
+        let profile =
+            SparseLwrPrfProfile::new(crate::ExpLayout { stride_log2: 0, width_log2: 2 }, 2)
+                .unwrap();
+        let mut setup = parameters(4, 2);
+        setup.base_p = 4;
+        let snapshot = RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout(
+            setup,
+            profile,
+            &generated.public_layout,
+            &active,
+        )
+        .unwrap();
+        let actual = snapshot.evaluate_pre_refresh().unwrap();
+        let gains = &snapshot.readout_gains;
+        let target_bound = &gains.target.l1 * &actual.program.output_bound;
+        let output_wire = snapshot.program.outputs().last().unwrap();
+        let target_variance =
+            actual.program.wire_variances[output_wire].scaled(&gains.target.l2_squared);
+        let mut old_trace_bound = &gains.identity_trace.l1 * &target_bound;
+        let mut old_trace_variance = target_variance.clone();
+        for gain in &gains.nonidentity_trace {
+            old_trace_bound += &gain.action.l1 * &target_bound +
+                (BigUint::one() + &gain.helper_action.l1) * &snapshot.helper_error_cutoff;
+            old_trace_variance =
+                old_trace_variance.add(&target_variance.scaled(&gain.action.l2_squared)).add(
+                    &snapshot
+                        .helper_doubled_variance
+                        .scaled(&(BigUint::one() + &gain.helper_action.l2_squared)),
+                );
+        }
+        let branches = BigUint::from(gains.nonidentity_trace.len());
+        // T'=[1,-3,-3,-1]: the former unit factor omitted exactly 7 B_chi
+        // and 19 V_chi per nonidentity branch, before normalization.
+        let worst_delta = &gains.normalization.l1 *
+            &branches *
+            BigUint::from(7u8) *
+            &snapshot.helper_error_cutoff;
+        let variance_delta = snapshot
+            .helper_doubled_variance
+            .scaled(&(&gains.normalization.l2_squared * branches * BigUint::from(19u8)));
+        assert!(!worst_delta.is_zero() && !variance_delta.numerator.is_zero());
+        assert_eq!(actual.readout_bound, &gains.normalization.l1 * old_trace_bound + worst_delta);
+        assert_eq!(
+            actual.readout_variance,
+            old_trace_variance.scaled(&gains.normalization.l2_squared).add(&variance_delta)
+        );
     }
 
     #[test]

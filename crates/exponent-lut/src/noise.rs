@@ -62,6 +62,19 @@ pub struct RightActionNoiseGain {
 }
 
 impl RightActionNoiseGain {
+    /// Convolution gains of distinct coefficients of an integer polynomial lift.
+    pub(crate) fn from_polynomial_coefficients(
+        coefficients: impl IntoIterator<Item = BigInt>,
+    ) -> Self {
+        let mut gain = Self { l1: BigUint::zero(), l2_squared: BigUint::zero() };
+        for coefficient in coefficients {
+            let magnitude = coefficient.magnitude();
+            gain.l1 += magnitude;
+            gain.l2_squared += magnitude * magnitude;
+        }
+        gain
+    }
+
     pub fn unit() -> Self {
         Self { l1: BigUint::one(), l2_squared: BigUint::one() }
     }

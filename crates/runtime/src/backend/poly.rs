@@ -455,22 +455,6 @@ where
         self.preimage_batch_calls
     }
 
-    /// Copies a complete matrix to the active GPU placement without host
-    /// staging. Fleet-internal resharding uses this strict path so an
-    /// unavailable direct or peer transfer is reported instead of silently
-    /// materializing the matrix in CPU memory.
-    #[cfg(feature = "gpu")]
-    pub(super) fn matrix_to_active_placement_peer_only(
-        &self,
-        value: &M,
-    ) -> Result<M, PolyBackendError> {
-        let target = self.parameters_for_matrix(value)?;
-        if value.params() == target {
-            return Ok(value.clone());
-        }
-        value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
-    }
-
     pub(super) fn parameters(
         &self,
         matrix_type: &ConcreteMatrixType,
@@ -600,6 +584,11 @@ where
         if let Some(copied) = value.copy_to_params_direct(target) {
             return Ok(copied);
         }
+        tracing::debug!(
+            rows = value.row_size(),
+            columns = value.col_size(),
+            "Direct matrix placement unavailable; transferring raw RNS through host staging"
+        );
         let bytes = value.to_cpu_staging_bytes();
         Ok(M::from_cpu_staging_bytes(target, &bytes))
     }

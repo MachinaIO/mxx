@@ -947,7 +947,9 @@ impl GpuDcrtBackend {
             }
             let local =
                 shard.value.slice_columns(overlap_start - shard_start, overlap_end - shard_start);
-            pieces.push(backend.matrix_to_active_placement_peer_only(&local)?);
+            // Transfer only the requested overlap. Non-peer fleets use the
+            // backend's raw RNS staging transport, without CPU arithmetic.
+            pieces.push(backend.matrix_to_active_placement(&local)?);
         }
         let mut pieces = pieces.into_iter();
         let first = pieces.next().expect("requested matrix range must be covered");
@@ -965,7 +967,7 @@ impl GpuDcrtBackend {
             .iter()
             .map(|shard| {
                 let local = shard.value.slice(row_start, row_end, 0, shard.value.col_size());
-                backend.matrix_to_active_placement_peer_only(&local)
+                backend.matrix_to_active_placement(&local)
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter();
@@ -1055,8 +1057,16 @@ impl GpuDcrtBackend {
 
     fn scatter_matrix(
         &mut self,
-        value: &GpuDCRTPolyMatrix,
+        value: GpuDCRTPolyMatrix,
     ) -> Result<GpuFleetMatrix, PolyBackendError> {
+        if !self
+            .active_operation
+            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
+        {
+            // Materialization outside a calibrated operation retains its real
+            // owner. Consumers derive their own operation-specific partition.
+            return Ok(GpuFleetMatrix::from_matrix(value));
+        }
         let (rows, columns) = value.size();
         let ranges = self.column_ranges(columns);
         let mut shards = Vec::with_capacity(ranges.len());
@@ -1068,8 +1078,10 @@ impl GpuDcrtBackend {
                 .filter_map(|(device, (device_id, backend))| {
                     let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
                     let local = value.slice_columns(start, end);
-                    Some(backend.matrix_to_active_placement_peer_only(&local).map(|value| {
-                        GpuColumnShard { device_id: *device_id, global_column_start: start, value }
+                    Some(backend.matrix_to_active_placement(&local).map(|value| GpuColumnShard {
+                        device_id: *device_id,
+                        global_column_start: start,
+                        value,
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1299,6 +1311,35 @@ mod tests {
         assert!(backend.column_widths(operation).is_some());
     }
 
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_polynomial_input_without_selected_operation() {
+        let devices = detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 1,
+            columns: 1,
+        };
+        let mut backend = super::super::gpu_backend_on([parameters], devices.clone());
+        let value = ConstantMatrix::Polynomial {
+            coefficients: (0..32)
+                .map(|_| IntExpr::constant(BigInt::from(rand::random::<i16>())))
+                .collect(),
+        };
+        let actual = backend.constant_matrix(&ty, &value, &ParamEnv::default()).unwrap();
+        assert!(backend.active_operation.is_none());
+        assert!(backend.operation_widths.is_empty());
+        assert_eq!(actual.size(), (1, 1));
+        assert_eq!(actual.shards().len(), 1);
+        assert_eq!(actual.shards()[0].device_id, devices[0]);
+        let expected =
+            backend.devices[0].1.constant_matrix(&ty, &value, &ParamEnv::default()).unwrap();
+        assert_eq!(actual.shards()[0].value, expected);
+    }
+
     fn first_bidirectional_peer_pair(
         detected: &[i32],
         parameters: &GpuDCRTPolyParams,
@@ -1318,6 +1359,83 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_unplanned_materialization_preserves_payloads() {
+        let devices = detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 5,
+        };
+        let mut backend = super::super::gpu_backend_on([parameters], devices);
+        let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"load-input").unwrap();
+        let bytes = backend.devices[0].1.matrix_to_bytes(&source);
+        let staged = source.to_cpu_staging_bytes();
+        let small = backend.devices[0].1.gadget_decompose(&source, false).unwrap();
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: ConcreteMatrixType { rows: small.rows(), ..ty.clone() },
+            max_coefficient_bound: BigInt::from(small.max_coefficient_bound().clone()),
+        };
+        let small_bytes = backend.devices[0]
+            .1
+            .small_matrix_to_bytes(&small, &schema, SmallMatrixSemanticKind::Generic)
+            .unwrap();
+        // An operation identity alone is not a derived calibration plan.
+        for operation in [None, Some(rand::random())] {
+            backend.active_operation = operation;
+            assert!(backend.operation_widths.is_empty());
+            for restored in [
+                backend.matrix_from_bytes(&ty, &bytes).unwrap(),
+                backend.matrix_from_cpu_staging_bytes(&ty, &staged).unwrap(),
+                backend.scatter_matrix(source.clone()).unwrap(),
+            ] {
+                assert_eq!(restored.size(), (2, 5));
+                assert_eq!(restored.shards().len(), 1);
+                assert_eq!(restored.shards()[0].value, source);
+            }
+            let restored = backend
+                .small_matrix_from_bytes(&schema, &small_bytes, SmallMatrixSemanticKind::Generic)
+                .unwrap();
+            assert_eq!(restored.shards().len(), 1);
+            assert_eq!(restored.shards()[0].value, small);
+            let invalid = ConcreteMatrixType { columns: 6, ..ty.clone() };
+            assert!(backend.matrix_from_bytes(&invalid, &bytes).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires at least two GPUs; non-peer devices exercise host transport"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_nonpeer_range_transport_preserves_values() {
+        let devices = detected_gpu_device_ids();
+        assert!(devices.len() >= 2);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let mut backend = super::super::gpu_backend_on([parameters.clone()], devices.clone());
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 5,
+        };
+        let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"transport").unwrap();
+        let destination = backend.devices[1].1.parameters(&ty).unwrap();
+        let host_staging_required = source.copy_to_params_direct(destination).is_none();
+        println!("fleet_range_transport host_staging_required={host_staging_required}");
+        let expected = source.slice_columns(1, 4);
+        let expected_bytes = expected.to_cpu_staging_bytes();
+        let source = GpuFleetMatrix::from_matrix(source);
+        let transferred =
+            GpuDcrtBackend::matrix_piece_on_device(&mut backend.devices[1].1, &source, 1, 4)
+                .unwrap();
+        assert_eq!(transferred.size(), (2, 3));
+        assert_eq!(transferred.params().device_ids(), &[devices[1]]);
+        assert_eq!(transferred.to_cpu_staging_bytes(), expected_bytes);
     }
 
     #[test]
@@ -1913,8 +2031,11 @@ impl Backend for GpuDcrtBackend {
             }
             return Ok(GpuFleetMatrix::new(ty.rows, ty.columns, shards));
         }
+        // Non-range constants are already materialized on one device, including
+        // setup inputs created before an operation has selected calibrated widths.
+        // Keep that ownership; consuming operations distribute their needed ranges.
         let full = self.devices[0].1.constant_matrix(ty, value, env)?;
-        self.scatter_matrix(&full)
+        Ok(GpuFleetMatrix::from_matrix(full))
     }
 
     fn add(
@@ -2498,7 +2619,7 @@ impl Backend for GpuDcrtBackend {
             inputs.iter().map(|value| self.gather_matrix(value)).collect::<Result<Vec<_>, _>>()?;
         let refs = gathered.iter().collect::<Vec<_>>();
         let output = self.devices[0].1.concat(&refs, axis)?;
-        self.scatter_matrix(&output)
+        self.scatter_matrix(output)
     }
 
     fn sample_uniform(
@@ -2730,7 +2851,7 @@ impl Backend for GpuDcrtBackend {
         for (_, backend) in self.devices.iter().skip(1) {
             values.push(backend.trapdoor_from_bytes(ty, &bytes)?);
         }
-        let public = self.scatter_matrix(&public)?;
+        let public = self.scatter_matrix(public)?;
         Ok((public, GpuFleetTrapdoor { values }))
     }
 
@@ -3162,6 +3283,12 @@ impl Backend for GpuDcrtBackend {
         if rows != ty.rows || columns != ty.columns {
             return Err(PolyBackendError::InvalidInteger);
         }
+        if !self
+            .active_operation
+            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
+        {
+            return self.devices[0].1.matrix_from_bytes(ty, bytes).map(GpuFleetMatrix::from_matrix);
+        }
         let coefficient_bits = usize::from(max_bits);
         let ring_dimension = ty.ring_dimension;
         let ranges = self.column_ranges(columns);
@@ -3301,6 +3428,15 @@ impl Backend for GpuDcrtBackend {
         bytes: &[u8],
         expected_semantic_kind: SmallMatrixSemanticKind,
     ) -> Result<Self::SmallMatrix, Self::Error> {
+        if !self
+            .active_operation
+            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
+        {
+            return self.devices[0]
+                .1
+                .small_matrix_from_bytes(expected_schema, bytes, expected_semantic_kind)
+                .map(GpuFleetSmallMatrix::from_matrix);
+        }
         let (bound, payload) =
             decode_small_matrix_artifact(expected_schema, bytes, expected_semantic_kind)?;
         let rows = expected_schema.matrix.rows;

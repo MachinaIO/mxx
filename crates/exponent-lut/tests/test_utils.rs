@@ -60,22 +60,11 @@ pub(crate) mod sparse_lwr_parameter_support {
         Ok(layout)
     }
 
-    /// Security tier used by the reviewed Phase-1 tuple grid.  A fallback tier is
-    /// deliberately distinct from the fallback tier, while both are evaluated
-    /// against the reviewed 100-bit target.
+    /// Whether a tuple meets the explicitly requested computational target.
     #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub enum SparseLwrSecurityTier {
-        Primary100,
-        Fallback100,
-    }
-
-    impl SparseLwrSecurityTier {
-        pub const fn target_bits(self) -> u64 {
-            match self {
-                Self::Primary100 => 100,
-                Self::Fallback100 => 100,
-            }
-        }
+        Requested,
+        Rejected,
     }
 
     /// One reviewed Phase-1 point.  The tuple is ordered as `(Q, P, nu, h)`;
@@ -475,7 +464,6 @@ use tracing::info;
 
 const REVIEWED_ESTIMATOR_COST_MODEL: &str = "MATZOV";
 const REVIEWED_ESTIMATOR_SHAPE_MODEL: &str = "gsa";
-const PHASE1_PRIMARY_SECURITY_BITS: u64 = 100;
 pub const NO_CANDIDATE_ERROR: &str =
     "no candidate in the declared finite grid passed security and correctness";
 
@@ -730,7 +718,6 @@ pub struct SearchConfig {
     /// sparse-LWR selection; the scalar fields above are the selected tuple
     /// projected into Phase 2.
     pub sparse_lwr_phase1_grid: Vec<SparseLwrParameterTuple>,
-    pub phase1_fallback_security_bits: u64,
     pub phase1_estimator_commit: String,
     pub phase1_estimator_cost_model: String,
     pub phase1_estimator_shape_model: String,
@@ -774,7 +761,6 @@ impl SearchConfig {
             sparse_lwr_modulus: 2048,
             sparse_lwr_output_modulus: 16,
             sparse_lwr_phase1_grid: reviewed_phase1_tuple_grid(),
-            phase1_fallback_security_bits: 100,
             phase1_estimator_commit: REVIEWED_ESTIMATOR_COMMIT.to_owned(),
             phase1_estimator_cost_model: REVIEWED_ESTIMATOR_COST_MODEL.to_owned(),
             phase1_estimator_shape_model: REVIEWED_ESTIMATOR_SHAPE_MODEL.to_owned(),
@@ -1005,8 +991,8 @@ impl SearchConfig {
         }) {
             return Err("Phase-1 tuple grid must be in reviewed ascending order".to_owned());
         }
-        if self.phase1_fallback_security_bits != 100 {
-            return Err("Phase-1 fallback tier must be exactly 100 bits".to_owned());
+        if self.security_bits == 0 {
+            return Err("security target must be positive".to_owned());
         }
         if self.phase1_estimator_commit.len() != 40 ||
             !self.phase1_estimator_commit.bytes().all(|byte| byte.is_ascii_hexdigit()) ||
@@ -1264,7 +1250,6 @@ pub struct Phase1Declaration {
     pub sparse_secret_model: String,
     pub sparse_error_model: String,
     pub error_intervals: Vec<(usize, usize, i64, i64)>,
-    pub fallback_security_target_bits: u64,
     pub estimator_commit: String,
     pub estimator_cost_model: String,
     pub estimator_shape_model: String,
@@ -1287,7 +1272,7 @@ impl Phase1Declaration {
                 .iter()
                 .map(|tuple| raw_key_entropy_bits(tuple.nu, tuple.h))
                 .collect(),
-            security_target_bits: PHASE1_PRIMARY_SECURITY_BITS,
+            security_target_bits: config.security_bits,
             sparse_secret_model: "SparseBinary".to_owned(),
             sparse_error_model: "Uniform".to_owned(),
             error_intervals: config
@@ -1298,7 +1283,6 @@ impl Phase1Declaration {
                     Ok((tuple.q_l, tuple.p, lower, upper))
                 })
                 .collect::<Result<Vec<_>, String>>()?,
-            fallback_security_target_bits: config.phase1_fallback_security_bits,
             estimator_commit: config.phase1_estimator_commit.clone(),
             estimator_cost_model: config.phase1_estimator_cost_model.clone(),
             estimator_shape_model: config.phase1_estimator_shape_model.clone(),
@@ -1401,10 +1385,10 @@ impl Phase1Checkpoint {
         for (index, row) in self.evaluated.iter().enumerate() {
             let tuple = &config.sparse_lwr_phase1_grid[index];
             let (error_lower, error_upper) = sparse_lwr_error_bounds(tuple.q_l, tuple.p)?;
-            let expected_tier = if row.minimum_security_bits >= PHASE1_PRIMARY_SECURITY_BITS {
-                SparseLwrSecurityTier::Primary100
+            let expected_tier = if row.minimum_security_bits >= config.security_bits {
+                SparseLwrSecurityTier::Requested
             } else {
-                SparseLwrSecurityTier::Fallback100
+                SparseLwrSecurityTier::Rejected
             };
             if row.q_l != tuple.q_l ||
                 row.p != tuple.p ||
@@ -1418,13 +1402,7 @@ impl Phase1Checkpoint {
                 row.sparse_lwr_security_bits != row.estimator_security_bits ||
                 (row.raw_key_entropy_bits - raw_key_entropy_bits(row.universe, row.weight)).abs() >
                     1e-9 ||
-                row.qualified !=
-                    (row.minimum_security_bits >=
-                        if row.tier == SparseLwrSecurityTier::Primary100 {
-                            PHASE1_PRIMARY_SECURITY_BITS
-                        } else {
-                            config.phase1_fallback_security_bits
-                        }) ||
+                row.qualified != (row.minimum_security_bits >= config.security_bits) ||
                 row.minimum_security_bits != row.sparse_lwr_security_bits
             {
                 return Err("Phase-1 checkpoint contains an inconsistent evaluated row".to_owned());
@@ -1441,9 +1419,7 @@ impl Phase1Checkpoint {
             })
             .ok_or_else(|| "Phase-1 checkpoint selected tuple is not evaluated".to_owned())?;
         let selected_row = &self.evaluated[selected_index];
-        let earlier_primary = self.evaluated[..selected_index]
-            .iter()
-            .any(|row| row.qualified && row.tier == SparseLwrSecurityTier::Primary100);
+        let earlier_primary = self.evaluated[..selected_index].iter().any(|row| row.qualified);
         if !selected_row.qualified ||
             earlier_primary ||
             self.selected.tuple != config.sparse_lwr_phase1_grid[selected_index] ||
@@ -1635,7 +1611,7 @@ pub fn search_report(
             support_weight: sparse_profile.weight,
             q_l: sparse_profile.q_l,
             output_modulus: sparse_profile.p,
-            security_target_bits: PHASE1_PRIMARY_SECURITY_BITS,
+            security_target_bits: config.security_bits,
             evaluated: sparse_profile.evaluations.clone(),
             selected_universe: sparse_profile.universe,
             selected_q_l: sparse_profile.q_l,
@@ -1655,17 +1631,8 @@ pub fn search_report(
             log_ring_dimension_min: *config.log_ring_dimensions.start(),
             log_ring_dimension_max: *config.log_ring_dimensions.end(),
             order: "crt_depth_ascending_then_log_ring_dimension_ascending_then_base_bits_descending_then_crt_bits_descending; profile_tuple_q_l_p_nu_h_ascending",
-            security_target_bits: if sparse_profile.tier == SparseLwrSecurityTier::Fallback100 {
-                config.phase1_fallback_security_bits
-            } else {
-                config.security_bits
-            },
-            overall_target_policy: if sparse_profile.tier == SparseLwrSecurityTier::Fallback100 {
-                "fallback100"
-            } else {
-                "primary100"
-            }
-            .to_owned(),
+            security_target_bits: config.security_bits,
+            overall_target_policy: "requested_target".to_owned(),
             crt_base_bits_grid: config.crt_base_bits_grid.clone(),
             noise_model: config.noise_model,
         },
@@ -1714,7 +1681,6 @@ where
     }
     let mut evaluations = Vec::new();
     let mut primary_selection = None;
-    let mut fallback_selection = None;
     for tuple in &config.sparse_lwr_phase1_grid {
         let universe = tuple.nu;
         let weight = tuple.h;
@@ -1736,12 +1702,12 @@ where
             ));
         }
         let exact_minimum = tuple.estimator_minimum_classical_bits.unwrap_or(sparse_bits as f64);
-        let tier = if exact_minimum >= PHASE1_PRIMARY_SECURITY_BITS as f64 {
-            SparseLwrSecurityTier::Primary100
+        let tier = if exact_minimum >= config.security_bits as f64 {
+            SparseLwrSecurityTier::Requested
         } else {
-            SparseLwrSecurityTier::Fallback100
+            SparseLwrSecurityTier::Rejected
         };
-        let qualified = exact_minimum >= tier.target_bits() as f64;
+        let qualified = exact_minimum >= config.security_bits as f64;
         let (error_lower, error_upper) = sparse_lwr_error_bounds(q_l, p)?;
         evaluations.push(SparseLwrEvaluation {
             q_l,
@@ -1769,19 +1735,14 @@ where
             tier = ?tier,
             "evaluated sparse-LWR Phase-1 profile"
         );
-        if qualified && tier == SparseLwrSecurityTier::Primary100 && primary_selection.is_none() {
+        if qualified && primary_selection.is_none() {
             primary_selection = Some((tuple.clone(), sparse_bits));
-        } else if qualified &&
-            tier == SparseLwrSecurityTier::Fallback100 &&
-            fallback_selection.is_none()
-        {
-            fallback_selection = Some((tuple.clone(), sparse_bits));
         }
     }
-    let (tuple, sparse_bits) = primary_selection.or(fallback_selection).ok_or_else(|| {
+    let (tuple, sparse_bits) = primary_selection.ok_or_else(|| {
         format!(
-            "no sparse-LWR profile in the declared tuple grid passed the {}-bit primary or {}-bit fallback floor",
-            PHASE1_PRIMARY_SECURITY_BITS, config.phase1_fallback_security_bits
+            "no sparse-LWR profile in the declared tuple grid passed the requested {}-bit floor",
+            config.security_bits
         )
     })?;
     let (error_lower, error_upper) = sparse_lwr_error_bounds(tuple.q_l, tuple.p)?;
@@ -1792,13 +1753,7 @@ where
         p: tuple.p,
         universe: tuple.nu,
         weight: tuple.h,
-        tier: if tuple.estimator_minimum_classical_bits.unwrap_or(sparse_bits as f64) >=
-            PHASE1_PRIMARY_SECURITY_BITS as f64
-        {
-            SparseLwrSecurityTier::Primary100
-        } else {
-            SparseLwrSecurityTier::Fallback100
-        },
+        tier: SparseLwrSecurityTier::Requested,
         error_lower,
         error_upper,
         estimator_commit: config.phase1_estimator_commit.clone(),
@@ -2056,11 +2011,7 @@ where
             "selected sparse-LWR profile does not match the frozen search configuration".to_owned()
         );
     }
-    let overall_security_target = if sparse_profile.tier == SparseLwrSecurityTier::Fallback100 {
-        config.phase1_fallback_security_bits
-    } else {
-        config.security_bits
-    };
+    let overall_security_target = config.security_bits;
     for candidate in candidates(config) {
         info!(
             crt_depth = candidate.crt_depth,
@@ -2373,6 +2324,47 @@ fn setup_for_candidate_context(
         "refresh-parameter-search",
     )
     .with_decoder_preimage_bound(config.decoder_preimage_bound.clone()))
+}
+
+/// Builds the actual verification program with fresh test-owned PBC randomness.
+/// Search fixtures remain deterministic; runtime correctness never reuses their seeds.
+pub fn round_trip_bundle(
+    config: &SearchConfig,
+    candidate: Candidate,
+    mask_digits: usize,
+    fresh_digits: usize,
+    plaintext_exponent: usize,
+) -> Result<(RefreshParameterSimulationBundle, PbcGeneratedKeyLayout, SparseLwrPrfProfile), String>
+{
+    let mut context = build_candidate_context(config, candidate).map_err(|e| e.to_string())?;
+    let mut rng = rand::rng();
+    let support = sample(&mut rng, config.sparse_lwr_universe, config.sparse_lwr_weight).into_vec();
+    let root_seed = rand::Rng::random(&mut rng);
+    context.generated_layout = generate_key_layout(
+        &PbcParameters::paper_evaluation(config.sparse_lwr_universe, config.sparse_lwr_weight),
+        PbcRootSeed(root_seed),
+        &support,
+    )
+    .map_err(|e| e.to_string())?;
+    let setup = setup_for_candidate_context(config, &context, mask_digits, fresh_digits)
+        .map_err(|e| e.to_string())?;
+    let plaintext = setup.layout.ring().constant(
+        (1, 1),
+        mxx_ir_core::node::ConstantMatrix::Rotation { exponent: plaintext_exponent.into() },
+    );
+    let bundle = RefreshParameterSimulationRequest::new(
+        setup,
+        context.profile,
+        context.generated_layout.clone(),
+        rand::Rng::random(&mut rng),
+        RealExpr::from_f64_exact(config.decoder_sigma).map_err(|e| e.to_string())?,
+        plaintext,
+        1,
+    )
+    .map_err(|e| e.to_string())?
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok((bundle, context.generated_layout, context.profile))
 }
 
 fn prepare_candidate_with_digits_inner(
@@ -2836,7 +2828,7 @@ fn fresh_error_base_p_digit_count(
 /// final bundle check.  Keeping this projection centralized prevents a
 /// selector from silently evaluating a different event/failure budget than
 /// the accepted graph.
-fn average_case_config(config: &SearchConfig) -> Result<AverageCaseConfig, String> {
+pub fn average_case_config(config: &SearchConfig) -> Result<AverageCaseConfig, String> {
     Ok(AverageCaseConfig {
         failure_exponent: u32::try_from(config.security_bits)
             .map_err(|_| "AverageCase security target does not fit u32".to_owned())?,

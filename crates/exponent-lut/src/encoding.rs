@@ -334,7 +334,6 @@ impl ExponentLutEncodingSampler {
         let mut helper_root = helper_tag.into();
         helper_root.push("exponent-lut-lut-v1");
         let sampler = self.clone();
-        let table_values = table.values().to_vec();
         let helper_count = helper_sigmas.len();
         let (switch_ciphertexts, public_masks, online_mask_vectors) = Parallel::range(helper_count)
             .map_values(move |index| {
@@ -376,13 +375,10 @@ impl ExponentLutEncodingSampler {
                 .into_iter()
                 .nth(1)
                 .expect("validated structural online mask");
-                let coefficient = lut_coefficient(
-                    &sampler.layout.ring(),
-                    &lut_layout,
-                    sigma.clone(),
-                    &table_values,
-                )
-                .expect("validated structural LUT coefficient");
+                // ValueReadout already multiplies the input by T'. Its trace
+                // must sum unweighted automorphism branches, so this helper
+                // changes the payload secret from sigma(t) to t with value 1.
+                // Ordinary LUT helpers separately retain their LUT coefficients.
                 let mut switch_tag = helper_root.clone();
                 switch_tag.push("switch");
                 switch_tag.push(IntExpr::Add(
@@ -393,7 +389,7 @@ impl ExponentLutEncodingSampler {
                     .sample_fixed_rhs(
                         setup_secret.clone().ring_automorphism(sigma),
                         setup_secret.clone(),
-                        coefficient,
+                        sampler.layout.ring().identity(1),
                         hash_key.clone(),
                         switch_tag,
                     )
@@ -2839,12 +2835,11 @@ mod tests {
             .unwrap();
         let nodes =
             graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
-        // The canonical coefficient expression has O(width) scalar monomial
-        // terms, but the width helper matrices themselves occur only once in
-        // the Parallel body rather than O(width) times on the host.
+        // The unweighted helper matrices occur only once in the Parallel
+        // body rather than O(width) times on the host.
         assert!(
             nodes.len() < 8 * 1024,
-            "helper graph grew beyond one coefficient expression: {} nodes",
+            "helper graph grew beyond one structural family: {} nodes",
             nodes.len()
         );
         assert_eq!(

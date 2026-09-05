@@ -773,6 +773,7 @@ pub struct ExponentLutNoiseSnapshot {
     pub refresh: RefreshNoiseParameters,
     pub gain_plan: NoiseGainPlan,
     pub family_active_counts: Vec<usize>,
+    target_plaintext_gain: RightActionNoiseGain,
     native_modulus: BigUint,
     identity: [u8; 32],
 }
@@ -804,6 +805,10 @@ impl ExponentLutNoiseSnapshot {
             .ring_dimension()
             .map_err(|_| NoiseSimulationError::InvalidDecomposition)?;
         layout.validate(ring_dimension).map_err(|_| NoiseSimulationError::InvalidDecomposition)?;
+        let target_plaintext_gain = program
+            .readout
+            .target_plaintext_gain(ring_dimension)
+            .map_err(|_| NoiseSimulationError::InvalidDecomposition)?;
         let native_modulus = BigUint::from(layout.effective_modulus(ring_dimension));
         if refresh.route_gains.is_none() {
             return Err(NoiseSimulationError::InvalidRefresh("route gains are required"));
@@ -862,6 +867,7 @@ impl ExponentLutNoiseSnapshot {
             refresh,
             gain_plan,
             family_active_counts,
+            target_plaintext_gain,
             native_modulus,
             identity,
         })
@@ -900,7 +906,11 @@ impl ExponentLutNoiseSnapshot {
         let mut trace_bound = &self.readout_gains.identity_trace.l1 * &target_bound;
         for gain in &self.readout_gains.nonidentity_trace {
             trace_bound += &gain.action.l1 * &target_bound;
-            trace_bound += &(BigUint::one() + &gain.helper_action.l1) * &self.helper_error_cutoff;
+            // The switch error is multiplied by sigma(mu*T'), where the
+            // native accumulator mu is a signed monomial. The online mask
+            // error separately acts through its cached public decomposition.
+            trace_bound += &(&self.target_plaintext_gain.l1 + &gain.helper_action.l1) *
+                &self.helper_error_cutoff;
         }
         let readout_bound = &self.readout_gains.normalization.l1 * trace_bound;
         let output_wire =
@@ -914,11 +924,9 @@ impl ExponentLutNoiseSnapshot {
         let mut trace_variance = target_variance.clone();
         for gain in &self.readout_gains.nonidentity_trace {
             trace_variance = trace_variance.add(&target_variance.scaled(&gain.action.l2_squared));
-            trace_variance = trace_variance.add(
-                &self
-                    .helper_doubled_variance
-                    .scaled(&(BigUint::one() + &gain.helper_action.l2_squared)),
-            );
+            trace_variance = trace_variance.add(&self.helper_doubled_variance.scaled(
+                &(&self.target_plaintext_gain.l2_squared + &gain.helper_action.l2_squared),
+            ));
         }
         let readout_variance = trace_variance.scaled(&self.readout_gains.normalization.l2_squared);
         Ok(PreRefreshNoiseEvaluation { program, readout_bound, readout_variance })

@@ -1,6 +1,7 @@
 //! Witness-encryption protocols expressed as validated declarative graphs.
 
 pub mod diamond;
+pub mod lean;
 
 use mxx_correctness::{
     ComparatorSpec, ProtocolDecl, ProtocolInputDestination, ProtocolInputId, StageId,

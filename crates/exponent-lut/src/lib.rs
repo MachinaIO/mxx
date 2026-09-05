@@ -16,6 +16,7 @@
 
 pub mod encoding;
 pub mod layout;
+pub mod lean;
 pub mod noise;
 pub mod noise_refresh;
 pub mod program;

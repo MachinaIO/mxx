@@ -6695,7 +6695,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn parameters_for_numeric_refresh(
+    pub(crate) fn parameters_for_numeric_refresh(
         parameters: &mxx_primitives::poly::dcrt::params::DCRTPolyParams,
     ) -> RefreshSetupParameters {
         use mxx_primitives::poly::PolyParams;
@@ -6977,8 +6977,8 @@ fn same_matrix_type(
 /// the embedded Exponent-LUT snapshot remains the operational-noise authority.
 pub struct RefreshParameterSimulationBundle {
     selector_graph: BuiltGraph,
-    preprocessing_graph: Option<BuiltGraph>,
-    verification_graph: Option<BuiltGraph>,
+    pub(crate) preprocessing_graph: Option<BuiltGraph>,
+    pub(crate) verification_graph: Option<BuiltGraph>,
     benchmark_preprocessing_graph: BuiltGraph,
     benchmark_online_graph: BuiltGraph,
     preprocessing_manifests: std::collections::BTreeMap<ProductionId, Manifest>,
@@ -6987,7 +6987,7 @@ pub struct RefreshParameterSimulationBundle {
     selector_runtime_binding: PbcSelectorRuntimeBinding,
     metadata: std::collections::BTreeMap<String, RefreshSimulationMatrixInputMetadata>,
     targets: Vec<RefreshSimulationDecoderTarget>,
-    noise_snapshot: ExponentLutNoiseSnapshot,
+    pub(crate) noise_snapshot: ExponentLutNoiseSnapshot,
 }
 
 impl RefreshParameterSimulationBundle {

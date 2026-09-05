@@ -1,4 +1,4 @@
-//! Closed protocol bundle consumed by the structural correctness analyzer.
+//! Closed protocol bundle for workflow validation and application-owned correctness proofs.
 //!
 //! A bundle names every logical input once and connects it to every executable
 //! root that consumes it. It does not carry derived facts or caller-provided
@@ -78,7 +78,7 @@ pub struct TrapdoorContractMismatch {
     pub actual: TrapdoorContractValue,
 }
 
-/// A closed endpoint registry key used by the Rust operational checker.
+/// A closed endpoint registry key used by protocol declarations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum EndpointSpecId {
     ToyThresholdDecode,
@@ -87,9 +87,8 @@ pub enum EndpointSpecId {
 
 /// A symbolic upper bound explicitly assumed by an external-input contract.
 ///
-/// This is protocol data, not a Rust-derived analyzer result. The Rust
-/// operational checker converts it to its internal bound expression, checks
-/// the input obligation, and evaluates it.
+/// This is protocol data, not a derived analyzer result. A proof consumer must explicitly
+/// support the contract before using it as an assumption; structural validation is not proof.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value")]
 pub enum DeclaredBoundExpr {
@@ -119,8 +118,8 @@ pub enum InputValueContract {
         /// If present, every canonical coefficient of the external matrix is strictly below this
         /// bound. This is an input contract, not a bound derived by Rust.
         canonical_coefficient_exclusive_upper_bound: Option<IntExpr>,
-        /// Whether every polynomial entry is constant. This is input metadata used by the
-        /// operational bound rules, not a property inferred by Rust.
+        /// Whether every polynomial entry is constant. This is declared input metadata,
+        /// not a property inferred by Rust.
         is_constant_polynomial: bool,
     },
     MatrixBounded {
@@ -129,8 +128,7 @@ pub enum InputValueContract {
         max_centered_coefficient: DeclaredBoundExpr,
     },
     /// An explicit declaration that this matrix is not assigned a small finite
-    /// coefficient bound. This is distinct from an omitted bound contract,
-    /// which the operational checker rejects.
+    /// coefficient bound. This is distinct from an omitted input contract.
     MatrixLarge {
         matrix_type: MatrixType,
     },
@@ -242,8 +240,7 @@ pub enum OperationalDecoderKind {
     BooleanInterval,
 }
 
-/// Names the residual and executable decoder whose acceptance margin is checked
-/// by the Rust operational checker.
+/// Names the residual and executable decoder whose acceptance margin an application proves.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationalDecoderTarget {
     pub target_id: String,
@@ -356,10 +353,10 @@ pub enum BundleValidationError {
 }
 
 impl ClosedProtocolBundle {
-    /// Performs construction-time hygiene before operational checking.
+    /// Performs construction-time validation of the closed workflow.
     ///
-    /// These checks are not operational-checker evidence. The checker validates
-    /// theorem-relevant conditions from the frozen bundle independently.
+    /// These checks do not prove correctness. The generated claim and application proof must
+    /// establish the theorem-relevant properties of the frozen bundle independently.
     pub fn new(bundle: Self) -> Result<Self, BundleValidationError> {
         bundle.validate()?;
         Ok(bundle)

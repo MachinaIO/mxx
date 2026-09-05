@@ -10,6 +10,7 @@ pub mod encoding;
 pub mod expr;
 pub mod graph;
 pub mod inventory;
+pub mod lean;
 pub mod node;
 mod serde_support;
 pub mod types;

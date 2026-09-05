@@ -161,6 +161,7 @@ pub enum ConstantValue {
     Bool(bool),
     Int(BigInt),
     Real(String),
+    #[cfg(test)]
     Bytes(Box<[u8]>),
 }
 
@@ -177,6 +178,7 @@ impl TypedConstant {
         Self { value_type: ResolvedValueType::Real, value: ConstantValue::Real(value.into()) }
     }
 
+    #[cfg(test)]
     pub fn bytes(value: impl Into<Box<[u8]>>) -> Self {
         Self { value_type: ResolvedValueType::Bytes, value: ConstantValue::Bytes(value.into()) }
     }
@@ -198,6 +200,7 @@ pub struct SampleDescriptor {
     pub decomposition: Option<String>,
 }
 
+#[cfg(test)]
 impl SampleDescriptor {
     pub fn new(definition: impl Into<String>, output_type: ResolvedValueType) -> Self {
         Self {
@@ -262,11 +265,13 @@ pub struct SemanticFamilySourceIdentity {
 
 /// Stable identity of a registered pure index function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg(test)]
 pub struct IndexFunctionDefinitionId(pub u64);
 
 /// A registered index-function signature.  Evaluation is intentionally not a
 /// Stage 1 concern; the signature is enough to validate arity and output type.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg(test)]
 pub struct IndexFunctionDefinition {
     pub id: IndexFunctionDefinitionId,
     pub arity: usize,
@@ -274,26 +279,27 @@ pub struct IndexFunctionDefinition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg(test)]
 pub struct IndexEvaluatorId {
     arena: ArenaToken,
     definition: IndexFunctionDefinitionId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub enum BuiltinIndexEvaluator {
     Add,
-    Subtract,
-    Modulo,
-    Divide,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub struct IndexEvaluationInput {
     pub value: i64,
     pub value_type: ResolvedValueType,
     pub trusted_range: TrustedIndexRange,
 }
 
+#[cfg(test)]
 type IndexEvaluator =
     dyn Fn(&[i64], &[u64]) -> Result<i64, String> + Send + Sync + std::panic::RefUnwindSafe;
 
@@ -360,6 +366,7 @@ pub enum ScalarOperation {
     Multiply,
     Divide,
     Remainder,
+    #[cfg(test)]
     Negate,
     Equal,
     Less,
@@ -371,12 +378,19 @@ pub enum ScalarOperation {
     RealMultiply,
     RealDivide,
     RealSqrt,
-    ThresholdDecode { plaintext_modulus: BigUint, length: u64, output_bool: bool },
-    Bit { position: u32 },
-    Slice { start: u64, end_exclusive: u64 },
-    Hash { tag: String, dynamic_tags: Box<[u64]> },
-    ExtractCoefficient { row: u64, column: u64 },
-    LiftConstantPolynomial { output: ResolvedMatrixType, coefficient_bits: u32 },
+    ThresholdDecode {
+        plaintext_modulus: BigUint,
+        length: u64,
+        output_bool: bool,
+    },
+    Bit {
+        position: u32,
+    },
+    #[cfg(test)]
+    LiftConstantPolynomial {
+        output: ResolvedMatrixType,
+        coefficient_bits: u32,
+    },
 }
 
 /// Matrix operators retain complete shape, ring, layout, and decomposition
@@ -404,6 +418,7 @@ pub enum MatrixOperation {
         output: ResolvedMatrixType,
         layout: MatrixLayout,
     },
+    #[cfg(test)]
     View {
         output: ResolvedMatrixType,
         layout: MatrixLayout,
@@ -452,6 +467,7 @@ pub enum SamplerOperation {
         sigma: String,
         max_coefficient_bound: BigInt,
     },
+    #[cfg(test)]
     Hash {
         output: ResolvedMatrixType,
         variant: HashVariant,
@@ -476,10 +492,10 @@ pub enum SamplerOperation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg(test)]
 pub enum HashVariant {
     Plain,
     Decomposed,
-    SmallDecomposed,
 }
 
 /// Stable definition of the deterministic polynomial hash used by Graph IR.
@@ -540,6 +556,7 @@ pub enum ValueOperator {
     },
     Constant(TypedConstant),
     Source(SemanticSourceIdentity),
+    #[cfg(test)]
     Sample {
         event: SampleEventId,
         descriptor: SampleDescriptor,
@@ -552,6 +569,7 @@ pub enum ValueOperator {
     OpaqueFamilyElement {
         source: SemanticFamilySourceIdentity,
     },
+    #[cfg(test)]
     IndexMap {
         definition: IndexFunctionDefinitionId,
         parameters: Box<[u64]>,
@@ -635,33 +653,32 @@ pub enum ArenaError {
         actual: ResolvedValueType,
     },
     IncompatibleMatrixTypes,
+    #[cfg(test)]
     UnknownIndexFunction(IndexFunctionDefinitionId),
+    #[cfg(test)]
     MissingIndexEvaluator(IndexFunctionDefinitionId),
+    #[cfg(test)]
     ForeignIndexEvaluator {
         expected: ArenaToken,
         actual: ArenaToken,
     },
+    #[cfg(test)]
     IndexEvaluatorPanicked(IndexFunctionDefinitionId),
+    #[cfg(test)]
     IndexEvaluatorImplementation {
         definition: IndexFunctionDefinitionId,
         message: String,
     },
+    #[cfg(test)]
     IndexValueOutOfRange {
         value: i64,
         minimum: u64,
         maximum_exclusive: u64,
     },
+    #[cfg(test)]
     IndexArity {
         expected: usize,
         actual: usize,
-    },
-    ArgumentTypeRequired {
-        position: u32,
-    },
-    ConflictingArgumentType {
-        position: u32,
-        first: ResolvedValueType,
-        second: ResolvedValueType,
     },
     /// A value-fact transfer failed after the expression itself was constructed. Keep the
     /// expression and fact-store reason visible; collapsing this into a matrix-shape error
@@ -681,7 +698,6 @@ pub enum ArenaError {
     FreeArgumentEscapes {
         position: u32,
     },
-    InvalidClosedExpression,
     ProgramArenaExhausted,
     ExpressionArenaExhausted,
     ExpressionAllocationFailed,
@@ -695,6 +711,7 @@ impl fmt::Display for ArenaError {
 
 impl std::error::Error for ArenaError {}
 
+#[cfg(test)]
 fn validate_index_value(value: i64, range: TrustedIndexRange) -> Result<(), ArenaError> {
     let in_range = u64::try_from(value)
         .ok()
@@ -722,7 +739,9 @@ pub struct ExprArena {
     program_call_reductions: Vec<Option<ExprId>>,
     program_call_reduction_count: usize,
     interner: HashMap<Arc<ExprNode>, u32>,
+    #[cfg(test)]
     index_definitions: BTreeMap<IndexFunctionDefinitionId, IndexFunctionDefinition>,
+    #[cfg(test)]
     index_evaluators: BTreeMap<IndexFunctionDefinitionId, Arc<IndexEvaluator>>,
     program_signatures: BTreeMap<ValueProgramId, ProgramSignature>,
     scoped_derivations: BTreeMap<ValueProgramId, HashSet<u32>>,
@@ -746,7 +765,9 @@ impl ExprArena {
             program_call_reductions: Vec::new(),
             program_call_reduction_count: 0,
             interner: HashMap::new(),
+            #[cfg(test)]
             index_definitions: BTreeMap::new(),
+            #[cfg(test)]
             index_evaluators: BTreeMap::new(),
             program_signatures: BTreeMap::new(),
             scoped_derivations: BTreeMap::new(),
@@ -763,6 +784,7 @@ impl ExprArena {
         self.nodes.len()
     }
 
+    #[cfg(test)]
     pub fn register_index_definition(
         &mut self,
         definition: IndexFunctionDefinition,
@@ -777,6 +799,7 @@ impl ExprArena {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn register_index_evaluator<F>(
         &mut self,
         definition: IndexFunctionDefinitionId,
@@ -796,6 +819,7 @@ impl ExprArena {
         Ok(IndexEvaluatorId { arena: self.token, definition })
     }
 
+    #[cfg(test)]
     pub fn register_builtin_index_evaluator(
         &mut self,
         definition: IndexFunctionDefinitionId,
@@ -808,14 +832,12 @@ impl ExprArena {
                     .map_err(|_| "parameter does not fit i64".to_owned())?;
             match builtin {
                 BuiltinIndexEvaluator::Add => input.checked_add(parameter),
-                BuiltinIndexEvaluator::Subtract => input.checked_sub(parameter),
-                BuiltinIndexEvaluator::Modulo => input.checked_rem(parameter),
-                BuiltinIndexEvaluator::Divide => input.checked_div(parameter),
             }
             .ok_or_else(|| "invalid or overflowing index arithmetic".to_owned())
         })
     }
 
+    #[cfg(test)]
     pub fn index_evaluator_id(
         &self,
         definition: IndexFunctionDefinitionId,
@@ -826,6 +848,7 @@ impl ExprArena {
             .ok_or(ArenaError::UnknownIndexFunction(definition))
     }
 
+    #[cfg(test)]
     pub fn evaluate_index_map(
         &self,
         evaluator: IndexEvaluatorId,
@@ -1030,6 +1053,7 @@ impl ExprArena {
         self.intern_slice(descriptor, inputs)
     }
 
+    #[cfg(test)]
     pub(crate) fn intern_matrix_transform(
         &mut self,
         operation: MatrixOperation,
@@ -1038,6 +1062,7 @@ impl ExprArena {
         self.intern_transform(ValueOperator::Matrix(operation), inputs)
     }
 
+    #[cfg(test)]
     pub(crate) fn intern_scalar_transform(
         &mut self,
         operation: ScalarOperation,
@@ -1046,14 +1071,7 @@ impl ExprArena {
         self.intern_transform(ValueOperator::Scalar(operation), inputs)
     }
 
-    pub(crate) fn intern_value_transform(
-        &mut self,
-        operation: ValueTransformOperation,
-        inputs: &[ExprId],
-    ) -> Result<ExprId, ArenaError> {
-        self.intern_transform(ValueOperator::Transform(operation), inputs)
-    }
-
+    #[cfg(test)]
     pub(crate) fn intern_extract_coefficient(
         &mut self,
         input: ExprId,
@@ -1292,6 +1310,7 @@ impl ExprArena {
         Ok(free)
     }
 
+    #[cfg(test)]
     pub fn reachable_node_count(&self, root: ExprId) -> Result<usize, ArenaError> {
         self.check_id(root)?;
         let mut seen = BTreeSet::new();
@@ -1342,13 +1361,14 @@ impl ExprArena {
             }
             ValueOperator::Constant(constant) => {
                 arity(0)?;
-                let valid = matches!(
-                    (&constant.value_type, &constant.value),
+                let valid = match (&constant.value_type, &constant.value) {
                     (ResolvedValueType::Bool, ConstantValue::Bool(_)) |
-                        (ResolvedValueType::Int, ConstantValue::Int(_)) |
-                        (ResolvedValueType::Real, ConstantValue::Real(_)) |
-                        (ResolvedValueType::Bytes, ConstantValue::Bytes(_))
-                );
+                    (ResolvedValueType::Int, ConstantValue::Int(_)) |
+                    (ResolvedValueType::Real, ConstantValue::Real(_)) => true,
+                    #[cfg(test)]
+                    (ResolvedValueType::Bytes, ConstantValue::Bytes(_)) => true,
+                    _ => false,
+                };
                 if valid {
                     Ok(constant.value_type.clone())
                 } else {
@@ -1359,6 +1379,7 @@ impl ExprArena {
                 arity(0)?;
                 Ok(source.value_type.clone())
             }
+            #[cfg(test)]
             ValueOperator::Sample { event: _, descriptor } => {
                 arity(0)?;
                 Ok(descriptor.output_type.clone())
@@ -1396,6 +1417,7 @@ impl ExprArena {
                 same(0, &ResolvedValueType::Int, &types[0])?;
                 Ok(source.element_type.clone())
             }
+            #[cfg(test)]
             ValueOperator::IndexMap { definition, parameters: _ } => {
                 let definition = self
                     .index_definitions
@@ -1505,6 +1527,7 @@ impl ExprArena {
                 }
                 output
             }
+            #[cfg(test)]
             SamplerOperation::Hash { output, base, digit_count, .. } => {
                 if base.is_some_and(|base| base < 2) || digit_count.is_some_and(|count| count == 0)
                 {
@@ -1632,6 +1655,7 @@ impl ExprArena {
                 }
                 Ok(ResolvedValueType::Int)
             }
+            #[cfg(test)]
             ScalarOperation::Negate => {
                 arity(1)?;
                 if !matches!(types[0], ResolvedValueType::Int | ResolvedValueType::Real) {
@@ -1644,7 +1668,7 @@ impl ExprArena {
                 }
                 Ok(types[0].clone())
             }
-            ScalarOperation::Bit { .. } | ScalarOperation::Slice { .. } => {
+            ScalarOperation::Bit { .. } => {
                 arity(1)?;
                 if types[0] != ResolvedValueType::Int {
                     return Err(ArenaError::TypeMismatch {
@@ -1653,14 +1677,6 @@ impl ExprArena {
                         expected: ResolvedValueType::Int,
                         actual: types[0].clone(),
                     });
-                }
-                if let ScalarOperation::Slice { start, end_exclusive } = operation {
-                    if start > end_exclusive {
-                        return Err(ArenaError::InvalidRange {
-                            minimum: *start,
-                            maximum_exclusive: *end_exclusive,
-                        });
-                    }
                 }
                 Ok(ResolvedValueType::Int)
             }
@@ -1735,42 +1751,7 @@ impl ExprArena {
                 }
                 Ok(if *output_bool { ResolvedValueType::Bool } else { ResolvedValueType::Int })
             }
-            ScalarOperation::Hash { .. } => {
-                if types.iter().any(|value_type| {
-                    !matches!(value_type, ResolvedValueType::Int | ResolvedValueType::Bytes)
-                }) {
-                    return Err(ArenaError::TypeMismatch {
-                        operator,
-                        position: 0,
-                        expected: ResolvedValueType::Int,
-                        actual: types.first().cloned().unwrap_or(ResolvedValueType::Bool),
-                    });
-                }
-                Ok(ResolvedValueType::Int)
-            }
-            ScalarOperation::ExtractCoefficient { .. } => {
-                arity(1)?;
-                let Some(ResolvedValueType::Matrix(matrix)) = types.first() else {
-                    return Err(ArenaError::TypeMismatch {
-                        operator,
-                        position: 0,
-                        expected: ResolvedValueType::Matrix(ResolvedMatrixType::new(
-                            BigUint::from(1_u8),
-                            1,
-                            1,
-                            1,
-                        )?),
-                        actual: types.first().cloned().unwrap_or(ResolvedValueType::Bool),
-                    });
-                };
-                let ScalarOperation::ExtractCoefficient { row, column } = operation else {
-                    unreachable!()
-                };
-                if *row as usize >= matrix.rows || *column as usize >= matrix.columns {
-                    return Err(ArenaError::ProgramOutputMismatch);
-                }
-                Ok(ResolvedValueType::Int)
-            }
+            #[cfg(test)]
             ScalarOperation::LiftConstantPolynomial { output, coefficient_bits } => {
                 arity(1)?;
                 if *coefficient_bits == 0 {
@@ -1992,6 +1973,7 @@ impl ExprArena {
                 layout.validate_for(&output)?;
                 Ok(ResolvedValueType::Matrix(output))
             }
+            #[cfg(test)]
             MatrixOperation::View { output, layout } => {
                 arity(1)?;
                 if !output.same_ring(matrices[0]) {

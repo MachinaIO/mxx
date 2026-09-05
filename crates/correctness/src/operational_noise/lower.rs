@@ -1077,15 +1077,6 @@ impl<'a> ProductionAdapter<'a> {
         (None, projector.stats)
     }
 
-    fn call_family_with_wire(
-        &mut self,
-        family: FamilyValueId,
-        index: ExprId,
-        wire: PlannedWire,
-    ) -> Result<ExprId, ProductionAdapterError> {
-        self.call_family_with_wire_reason(family, index, wire, BetaReason::Other)
-    }
-
     fn call_family_with_wire_reason(
         &mut self,
         family: FamilyValueId,
@@ -2557,17 +2548,18 @@ impl<'a> ProductionAdapter<'a> {
                             .expressions()
                             .node(input)
                             .map_err(|_| "invalid gadget input authority".to_owned())?;
-                        if !matches!(
-                            input_node.operator,
+                        if !match input_node.operator {
+                            #[cfg(test)]
+                            ValueOperator::Sample { .. } => true,
                             ValueOperator::Constant(_) |
-                                ValueOperator::Source(_) |
-                                ValueOperator::Sample { .. } |
-                                ValueOperator::Sampler { .. } |
-                                ValueOperator::DeterministicHash(_) |
-                                ValueOperator::OpaqueFamilyElement { .. } |
-                                ValueOperator::ExplicitElement { .. } |
-                                ValueOperator::Trapdoor(_)
-                        ) {
+                            ValueOperator::Source(_) |
+                            ValueOperator::Sampler { .. } |
+                            ValueOperator::DeterministicHash(_) |
+                            ValueOperator::OpaqueFamilyElement { .. } |
+                            ValueOperator::ExplicitElement { .. } |
+                            ValueOperator::Trapdoor(_) => true,
+                            _ => false,
+                        } {
                             return Err(
                                 "gadget decomposition input is not a concrete leaf".to_owned()
                             );
@@ -2741,14 +2733,17 @@ impl<'a> ProductionAdapter<'a> {
                                         self.job.expressions().node(scalar).ok().is_some_and(
                                             |node| {
                                                 (node.inputs.is_empty() &&
-                                                    matches!(
-                                                        node.operator,
+                                                    match node.operator {
+                                                        #[cfg(test)]
+                                                        ValueOperator::Sample { .. } => true,
                                                         ValueOperator::Constant(_) |
-                                                            ValueOperator::Sampler { .. } |
-                                                            ValueOperator::Source(_) |
-                                                            ValueOperator::Sample { .. } |
-                                                            ValueOperator::ExplicitElement { .. }
-                                                    )) ||
+                                                        ValueOperator::Sampler { .. } |
+                                                        ValueOperator::Source(_) |
+                                                        ValueOperator::ExplicitElement {
+                                                            ..
+                                                        } => true,
+                                                        _ => false,
+                                                    }) ||
                                                     matches!(
                                                         node.operator,
                                                         ValueOperator::ProgramCall { .. }
@@ -2933,17 +2928,18 @@ impl<'a> ProductionAdapter<'a> {
                             return Err("generated argument type or position mismatch".to_owned());
                         }
                     }
-                    let basic_body_operator = matches!(
-                        node.operator,
+                    let basic_body_operator = match node.operator {
+                        #[cfg(test)]
+                        ValueOperator::Sample { .. } => true,
                         ValueOperator::Argument { .. } |
-                            ValueOperator::Constant(_) |
-                            ValueOperator::Source(_) |
-                            ValueOperator::Sample { .. } |
-                            ValueOperator::Sampler { .. } |
-                            ValueOperator::OpaqueFamilyElement { .. } |
-                            ValueOperator::ExplicitElement { .. } |
-                            ValueOperator::Trapdoor(_)
-                    );
+                        ValueOperator::Constant(_) |
+                        ValueOperator::Source(_) |
+                        ValueOperator::Sampler { .. } |
+                        ValueOperator::OpaqueFamilyElement { .. } |
+                        ValueOperator::ExplicitElement { .. } |
+                        ValueOperator::Trapdoor(_) => true,
+                        _ => false,
+                    };
                     // DeterministicHash remains an exact atom.  It is admitted here only as
                     // the single direct child of an authorized fixed Slice; its key/tag inputs
                     // continue through this same owner/binder traversal below.
@@ -3040,14 +3036,15 @@ impl<'a> ProductionAdapter<'a> {
                     };
                     if !scalar_program_call &&
                         (!node.inputs.is_empty() ||
-                            !matches!(
-                                node.operator,
+                            !match node.operator {
+                                #[cfg(test)]
+                                ValueOperator::Sample { .. } => true,
                                 ValueOperator::Constant(_) |
-                                    ValueOperator::Sampler { .. } |
-                                    ValueOperator::Source(_) |
-                                    ValueOperator::Sample { .. } |
-                                    ValueOperator::ExplicitElement { .. }
-                            ))
+                                ValueOperator::Sampler { .. } |
+                                ValueOperator::Source(_) |
+                                ValueOperator::ExplicitElement { .. } => true,
+                                _ => false,
+                            })
                     {
                         return Err("scalar compact factor is not a concrete leaf".to_owned());
                     }
@@ -4119,14 +4116,15 @@ impl<'a> ProductionAdapter<'a> {
         if !node.inputs.is_empty() {
             return (false, "inputs");
         }
-        if !matches!(
-            node.operator,
+        if !match node.operator {
+            #[cfg(test)]
+            ValueOperator::Sample { .. } => true,
             ValueOperator::Constant(_) |
-                ValueOperator::Sampler { .. } |
-                ValueOperator::Source(_) |
-                ValueOperator::Sample { .. } |
-                ValueOperator::ExplicitElement { .. }
-        ) {
+            ValueOperator::Sampler { .. } |
+            ValueOperator::Source(_) |
+            ValueOperator::ExplicitElement { .. } => true,
+            _ => false,
+        } {
             return (false, "not concrete leaf");
         }
         if !self.job.expressions().is_closed(expression).unwrap_or(false) {
@@ -4808,9 +4806,9 @@ impl<'a> ProductionAdapter<'a> {
                     }),
                 };
             let public_event = match &self.job.expressions().node(public_root)?.operator {
-                ValueOperator::Sampler { event, .. } | ValueOperator::Sample { event, .. } => {
-                    *event
-                }
+                ValueOperator::Sampler { event, .. } => *event,
+                #[cfg(test)]
+                ValueOperator::Sample { event, .. } => *event,
                 _ => {
                     return Err(ProductionAdapterError::Structural {
                         wire: candidate.wire,
@@ -7710,20 +7708,11 @@ fn decomposition_contract(
             kind: if *small { "small-gadget-decompose" } else { "gadget-decompose" }.to_owned(),
             parameters: Box::new([*base, u64::from(*digit_count)]),
         }),
+        #[cfg(test)]
         ValueOperator::Sampler {
             operation:
                 SamplerOperation::Hash {
                     variant: super::arena::HashVariant::Decomposed,
-                    base: Some(base),
-                    digit_count: Some(digit_count),
-                    ..
-                },
-            ..
-        } |
-        ValueOperator::Sampler {
-            operation:
-                SamplerOperation::Hash {
-                    variant: super::arena::HashVariant::SmallDecomposed,
                     base: Some(base),
                     digit_count: Some(digit_count),
                     ..
@@ -7752,10 +7741,12 @@ fn compact_binding_operator_shape(operator: &ValueOperator) -> &'static str {
         ValueOperator::Argument { .. } => "Argument",
         ValueOperator::Constant(_) => "Constant",
         ValueOperator::Source(_) => "Source",
+        #[cfg(test)]
         ValueOperator::Sample { .. } => "Sample",
         ValueOperator::Sampler { .. } => "Sampler",
         ValueOperator::DeterministicHash(_) => "DeterministicHash",
         ValueOperator::OpaqueFamilyElement { .. } => "OpaqueFamilyElement",
+        #[cfg(test)]
         ValueOperator::IndexMap { .. } => "IndexMap",
         ValueOperator::ExplicitElement { .. } => "ExplicitElement",
         ValueOperator::ProgramCall { .. } => "ProgramCall",
@@ -7777,6 +7768,7 @@ fn compact_matrix_operator_shape(operator: &ValueOperator) -> &'static str {
         ValueOperator::Matrix(MatrixOperation::Transpose) => "Matrix::Transpose",
         ValueOperator::Matrix(MatrixOperation::Slice { .. }) => "Matrix::Slice",
         ValueOperator::Matrix(MatrixOperation::IndexedSlice { .. }) => "Matrix::IndexedSlice",
+        #[cfg(test)]
         ValueOperator::Matrix(MatrixOperation::View { .. }) => "Matrix::View",
         ValueOperator::Matrix(MatrixOperation::Concat { .. }) => "Matrix::Concat",
         ValueOperator::Matrix(MatrixOperation::Tensor { .. }) => "Matrix::Tensor",
@@ -7799,6 +7791,7 @@ fn compact_concrete_operator_shape(operator: &ValueOperator) -> &'static str {
             ScalarOperation::Multiply => "Scalar::Multiply",
             ScalarOperation::Divide => "Scalar::Divide",
             ScalarOperation::Remainder => "Scalar::Remainder",
+            #[cfg(test)]
             ScalarOperation::Negate => "Scalar::Negate",
             ScalarOperation::Equal => "Scalar::Equal",
             ScalarOperation::Less => "Scalar::Less",
@@ -7812,9 +7805,7 @@ fn compact_concrete_operator_shape(operator: &ValueOperator) -> &'static str {
             ScalarOperation::RealSqrt => "Scalar::RealSqrt",
             ScalarOperation::ThresholdDecode { .. } => "Scalar::ThresholdDecode",
             ScalarOperation::Bit { .. } => "Scalar::Bit",
-            ScalarOperation::Slice { .. } => "Scalar::Slice",
-            ScalarOperation::Hash { .. } => "Scalar::Hash",
-            ScalarOperation::ExtractCoefficient { .. } => "Scalar::ExtractCoefficient",
+            #[cfg(test)]
             ScalarOperation::LiftConstantPolynomial { .. } => "Scalar::LiftConstantPolynomial",
         },
         ValueOperator::Matrix(_) => compact_matrix_operator_shape(operator),

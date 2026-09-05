@@ -4,11 +4,13 @@
 //! terms contain only compact monomial IDs.  In particular, this module has no factor identity,
 //! symbolic-factor, relation-protection, or provenance authority of its own.
 
+#[cfg(test)]
+use super::arena::HashVariant;
 use super::{
     arena::{
-        ExprArena, ExprId, ExprNode, HashVariant, MatrixLayout, MatrixOperation,
-        ResolvedMatrixType, ResolvedValueType, SamplerOperation, ScalarOperation, ScopeProof,
-        ScopedExprId, TypedConstant, ValueOperator, ValueTransformOperation,
+        ExprArena, ExprId, ExprNode, MatrixLayout, MatrixOperation, ResolvedMatrixType,
+        ResolvedValueType, SamplerOperation, ScalarOperation, ScopeProof, ScopedExprId,
+        TypedConstant, ValueOperator, ValueTransformOperation,
     },
     bound::{
         BoundClass, MatrixBound as CanonicalMatrixBound, MatrixProductFacts,
@@ -413,7 +415,6 @@ struct CompactValue {
     semantic: Option<ScopedExprId>,
     exact_nf: Option<Arc<PolynomialNF>>,
     coefficient_bound: NumericContract<CoefficientBound>,
-    resolved_type: ResolvedValueType,
     hold: Option<ExprId>,
 }
 
@@ -468,6 +469,7 @@ pub(crate) struct CompactScalarProgramCallPlan {
 }
 
 impl CompactShellPlan {
+    #[cfg(test)]
     pub(crate) fn insert_gadget(
         &mut self,
         shell: ExprId,
@@ -506,6 +508,7 @@ impl CompactShellPlan {
         self.gadget_shells.values().map(|entry| entry.occurrences).sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_scalar(
         &mut self,
         expression: ExprId,
@@ -543,6 +546,7 @@ impl CompactShellPlan {
             self.scalar_program_calls.values().map(|entry| entry.occurrences).sum::<u64>()
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_scalar_program_call(
         &mut self,
         consumer: ExprId,
@@ -581,12 +585,11 @@ impl CompactShellPlan {
 }
 
 impl CompactValue {
-    fn from_analyzed(value: AnalyzedValue, resolved_type: ResolvedValueType) -> Self {
+    fn from_analyzed(value: AnalyzedValue) -> Self {
         Self {
             semantic: Some(value.semantic),
             exact_nf: value.exact_nf,
             coefficient_bound: value.coefficient_bound,
-            resolved_type,
             hold: None,
         }
     }
@@ -2042,7 +2045,6 @@ impl<'a> Normalizer<'a> {
                                 semantic: Some(semantic),
                                 exact_nf: exact,
                                 coefficient_bound,
-                                resolved_type,
                                 hold,
                             });
                             continue;
@@ -2113,7 +2115,6 @@ impl<'a> Normalizer<'a> {
                                 semantic: Some(semantic),
                                 exact_nf: exact,
                                 coefficient_bound,
-                                resolved_type: value_type,
                                 hold,
                             });
                         }
@@ -2457,6 +2458,7 @@ impl<'a> Normalizer<'a> {
                     for hold in child_holds {
                         self.release_compact_scalar_hold(hold)?;
                     }
+                    self.expressions.value_type(expression)?;
                     values.push(CompactValue {
                         // This value is an eliminable virtual algebra result.  It deliberately
                         // carries no semantic expression; the original root identity is restored
@@ -2464,7 +2466,6 @@ impl<'a> Normalizer<'a> {
                         semantic: None,
                         exact_nf: exact.map(Arc::new),
                         coefficient_bound: bound,
-                        resolved_type: self.expressions.value_type(expression)?.clone(),
                         hold: None,
                     });
                 }
@@ -2512,13 +2513,12 @@ impl<'a> Normalizer<'a> {
                         })?],
                     )?;
                     self.insert_gadget_hold(input, input_nf, Some(expression));
-                    let resolved_type = self.expressions.value_type(expression)?.clone();
+                    self.expressions.value_type(expression)?;
                     let exact_nf = Some(Arc::new(self.atom_nf(&proof, semantic)?));
                     values.push(CompactValue {
                         semantic: Some(semantic),
                         exact_nf,
                         coefficient_bound: bound,
-                        resolved_type,
                         hold: None,
                     });
                 }
@@ -2583,7 +2583,7 @@ impl<'a> Normalizer<'a> {
                         &resolved_type,
                         &value.coefficient_bound,
                     );
-                    let mut compact_value = CompactValue::from_analyzed(value, resolved_type);
+                    let mut compact_value = CompactValue::from_analyzed(value);
                     compact_value.hold = hold;
                     for child_hold in child_holds {
                         self.release_compact_scalar_hold(child_hold)?;
@@ -2640,7 +2640,7 @@ impl<'a> Normalizer<'a> {
                         &resolved_type,
                         &value.coefficient_bound,
                     );
-                    let mut compact_value = CompactValue::from_analyzed(value, resolved_type);
+                    let mut compact_value = CompactValue::from_analyzed(value);
                     compact_value.hold = hold;
                     for child_hold in child_holds {
                         self.release_compact_scalar_hold(child_hold)?;
@@ -2924,6 +2924,7 @@ impl<'a> Normalizer<'a> {
                 operation,
                 children,
             )?),
+            #[cfg(test)]
             ValueOperator::Scalar(ScalarOperation::LiftConstantPolynomial { .. }) => Some(
                 node.inputs
                     .first()
@@ -2940,7 +2941,6 @@ impl<'a> Normalizer<'a> {
                 ..
             }) |
             ValueOperator::Source(_) |
-            ValueOperator::Sample { .. } |
             ValueOperator::Sampler { .. } |
             ValueOperator::DeterministicHash(_) |
             ValueOperator::OpaqueFamilyElement { .. } |
@@ -2989,6 +2989,7 @@ impl<'a> Normalizer<'a> {
                 }
             }
             MatrixOperation::IndexedSlice { .. } => {}
+            #[cfg(test)]
             MatrixOperation::View { output, layout } => {
                 if let ResolvedValueType::Matrix(input) =
                     self.expressions.value_type(node.inputs[0])?
@@ -3159,6 +3160,7 @@ impl<'a> Normalizer<'a> {
                 }
                 Ok(self.atom_nf(scope_proof, semantic)?)
             }
+            #[cfg(test)]
             MatrixOperation::View { output, layout } => {
                 let input_type = self.expressions.value_type(node.inputs[0])?;
                 if let ResolvedValueType::Matrix(input_type) = input_type {
@@ -3419,6 +3421,7 @@ impl<'a> Normalizer<'a> {
                 ..
             }) => Ok(Some((None, BigInt::from(0_u8), value.clone()))),
             ValueOperator::Scalar(operation) => match operation {
+                #[cfg(test)]
                 ScalarOperation::Negate if node.inputs.len() == 1 => {
                     let Some((argument, a, b)) =
                         self.range_reduced_affine_form(node.inputs[0], range)?
@@ -5584,6 +5587,7 @@ impl<'a> Normalizer<'a> {
         }
         let ValueOperator::Scalar(operation) = &node.operator else { return None };
         match operation {
+            #[cfg(test)]
             ScalarOperation::Negate if node.inputs.len() == 1 => {
                 let (coefficient, offset) =
                     self.scoped_affine_form(node.inputs[0], argument_position)?;
@@ -5840,7 +5844,9 @@ impl<'a> Normalizer<'a> {
             }
             ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
-            ValueOperator::Source(_) | ValueOperator::Sample { .. } => NumericContract::Missing,
+            ValueOperator::Source(_) => NumericContract::Missing,
+            #[cfg(test)]
+            ValueOperator::Sample { .. } => NumericContract::Missing,
             ValueOperator::ProgramCall { .. } => self
                 .program_call_matrix_facts(expression)
                 .map(|facts| facts.coefficient_bound.clone())
@@ -5866,14 +5872,17 @@ impl<'a> Normalizer<'a> {
             MatrixOperation::Negate |
             MatrixOperation::Transpose |
             MatrixOperation::Slice { .. } |
-            MatrixOperation::IndexedSlice { .. } |
-            MatrixOperation::View { .. } => {
+            MatrixOperation::IndexedSlice { .. } => {
                 let bound = bounds.first().cloned().unwrap_or(NumericContract::Missing);
                 if bound.is_missing() && matches!(operation, MatrixOperation::Slice { .. }) {
                     self.factor_bound(node.inputs[0])
                 } else {
                     Ok(bound)
                 }
+            }
+            #[cfg(test)]
+            MatrixOperation::View { .. } => {
+                Ok(bounds.first().cloned().unwrap_or(NumericContract::Missing))
             }
             MatrixOperation::Scale => product_bounds(bounds),
             MatrixOperation::Multiply => self.matrix_product_bound(node, bounds),
@@ -6009,7 +6018,9 @@ impl<'a> Normalizer<'a> {
             }
             ValueOperator::Sampler { operation, .. } => sampler_bound(operation),
             ValueOperator::DeterministicHash(_) => NumericContract::Known(CoefficientBound::Large),
-            ValueOperator::Source(_) | ValueOperator::Sample { .. } => NumericContract::Missing,
+            ValueOperator::Source(_) => NumericContract::Missing,
+            #[cfg(test)]
+            ValueOperator::Sample { .. } => NumericContract::Missing,
             ValueOperator::Argument { .. } | ValueOperator::ProgramCall { .. } => {
                 NumericContract::Missing
             }
@@ -6030,20 +6041,27 @@ impl<'a> Normalizer<'a> {
     }
 
     fn integer_constant(&self, expression: ExprId) -> Option<BigInt> {
-        let mut current = expression;
-        let mut negate = false;
-        loop {
-            let node = self.expressions.node(current).ok()?;
-            match &node.operator {
-                ValueOperator::Constant(super::arena::TypedConstant {
-                    value: super::arena::ConstantValue::Int(value),
-                    ..
-                }) => return Some(if negate { -value.clone() } else { value.clone() }),
-                ValueOperator::Scalar(ScalarOperation::Negate) if node.inputs.len() == 1 => {
-                    negate = !negate;
-                    current = node.inputs[0];
+        #[cfg(not(test))]
+        {
+            self.direct_integer_constant(expression)
+        }
+        #[cfg(test)]
+        {
+            let mut current = expression;
+            let mut negate = false;
+            loop {
+                let node = self.expressions.node(current).ok()?;
+                match &node.operator {
+                    ValueOperator::Constant(super::arena::TypedConstant {
+                        value: super::arena::ConstantValue::Int(value),
+                        ..
+                    }) => return Some(if negate { -value.clone() } else { value.clone() }),
+                    ValueOperator::Scalar(ScalarOperation::Negate) if node.inputs.len() == 1 => {
+                        negate = !negate;
+                        current = node.inputs[0];
+                    }
+                    _ => return None,
                 }
-                _ => return None,
             }
         }
     }
@@ -6196,21 +6214,18 @@ fn sampler_bound(operation: &SamplerOperation) -> NumericContract<CoefficientBou
         // `preimage_max_coefficient_bound` is metadata for preimages sampled against this
         // trapdoor later, never a bound on `B` itself.
         SamplerOperation::Trapdoor { .. } => NumericContract::Known(CoefficientBound::Large),
+        #[cfg(test)]
         SamplerOperation::Hash { variant, base, .. } => match variant {
             // Plain hashes are intentionally explicit large residuals.  A finite value is
             // accepted only when the caller supplied an authoritative fact, which is handled
             // before this fallback by `factor_bound`.
             HashVariant::Plain => NumericContract::Known(CoefficientBound::Large),
-            HashVariant::Decomposed | HashVariant::SmallDecomposed => {
+            HashVariant::Decomposed => {
                 let Some(base) = base else { return NumericContract::Missing };
                 if *base < 2 {
                     return NumericContract::Missing;
                 }
-                let bound = if matches!(variant, HashVariant::SmallDecomposed) {
-                    base.saturating_sub(1)
-                } else {
-                    (*base / 2).max(1)
-                };
+                let bound = (*base / 2).max(1);
                 NumericContract::Known(CoefficientBound::finite(BigUint::from(bound)))
             }
         },
@@ -6239,13 +6254,11 @@ fn scalar_bound(
             add_bounds(bounds).unwrap_or(NumericContract::Missing)
         }
         ScalarOperation::Multiply => product_bounds(bounds).unwrap_or(NumericContract::Missing),
-        ScalarOperation::Negate |
-        ScalarOperation::BoolToInt |
-        ScalarOperation::IntToReal |
-        ScalarOperation::ExtractCoefficient { .. } => {
+        ScalarOperation::BoolToInt | ScalarOperation::IntToReal => {
             bounds.first().cloned().unwrap_or(NumericContract::Missing)
         }
-        ScalarOperation::LiftConstantPolynomial { .. } => {
+        #[cfg(test)]
+        ScalarOperation::Negate | ScalarOperation::LiftConstantPolynomial { .. } => {
             bounds.first().cloned().unwrap_or(NumericContract::Missing)
         }
         _ => NumericContract::Missing,

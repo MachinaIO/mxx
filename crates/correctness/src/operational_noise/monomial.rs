@@ -492,6 +492,7 @@ impl MonomialArena {
     /// Relation fixed-point matching uses this for RHS-derived subwords which are not necessarily
     /// reachable from the original root proof. The lookup validates the non-forgeable scoped
     /// handles' program and expression-arena tokens, but never creates a descriptor or scoped ID.
+    #[cfg(test)]
     pub(crate) fn find_interned(
         &self,
         scope: ValueProgramId,

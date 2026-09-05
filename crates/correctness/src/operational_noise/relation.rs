@@ -117,6 +117,7 @@ impl GadgetRecompositionRegistry {
     /// Check the complete typed algebraic contract. The caller separately proves that the first
     /// ordered factor is a `MatrixConstantKind::Gadget` and the next factor is the matching
     /// `GadgetDecompose` transform; this registry deliberately does not perform shape search.
+    #[cfg(test)]
     pub(crate) fn allows(
         &self,
         base: u64,
@@ -437,6 +438,7 @@ impl NormalizationCache {
             runtime: BTreeMap::new(),
         }
     }
+    #[cfg(test)]
     pub fn intern(&mut self, rhs: PolynomialNF) -> Result<CanonicalRhsId, RelationRegistryError> {
         self.intern_arc(Arc::new(rhs))
     }
@@ -465,6 +467,7 @@ impl NormalizationCache {
         self.rhs_interner.entry(hash).or_default().push(slot);
         Ok(CanonicalRhsId { arena: self.token, slot })
     }
+    #[cfg(test)]
     pub fn get(&self, id: CanonicalRhsId) -> Result<&PolynomialNF, RelationRegistryError> {
         if id.arena != self.token {
             return Err(RelationRegistryError::ForeignCanonicalRhs);
@@ -496,12 +499,15 @@ impl NormalizationCache {
     ) {
         self.runtime.insert(key, value);
     }
+    #[cfg(test)]
     pub fn runtime_entry_count(&self) -> usize {
         self.runtime.len()
     }
+    #[cfg(test)]
     pub fn canonical_rhs_count(&self) -> usize {
         self.rhs.len()
     }
+    #[cfg(test)]
     pub fn canonical_state_fingerprint(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.rhs.hash(&mut hasher);
@@ -624,6 +630,7 @@ impl RelationRegistry {
             Err(RelationRegistryError::NotFrozen)
         }
     }
+    #[cfg(test)]
     pub(crate) fn has_universal_relations(&self) -> Result<bool, RelationRegistryError> {
         if !self.frozen {
             return Err(RelationRegistryError::NotFrozen);

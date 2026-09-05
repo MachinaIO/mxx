@@ -42,9 +42,11 @@ separate projection used by the final decoder.
 
 ## Correctness and parameters
 
-The Rust operational checker is the active acceptance path for the constructed closed protocol
-and registered-rule analysis. There is currently no end-to-end correctness theorem; the checker
-uses explicit hard bounds and the executable parameter checker instead.
+The active acceptance path is a generated Lean correctness theorem for the actual frozen protocol
+graphs. It links encryption, decryption, all requirement graphs, and the ideal message through the
+same external inputs and exported artifacts. For bounded successful executions with valid,
+accepting inputs, it proves the actual residual is below the exact decoder threshold and the
+operational decoder returns the ideal message, for both Boolean messages.
 
 `DiamondWeProtocolFamily::protocol_decl` returns a validated `WitnessEncryptionProtocolDecl`. The
 declaration is built directly from symbolic circuit and cryptographic parameters; it does not own a
@@ -63,12 +65,14 @@ declared cutoff. CPU preimage sampling rejects a whole candidate, preserving the
 
 `DiamondParameterSearch` fixes the circuit shape and searches ring dimension and modulus depth. It
 uses the ordinary untruncated Gaussian only for lattice-security estimation. Correctness uses a
-worst-case recurrence with full ring and inner-dimension factors, then invokes the Rust
-checker before accepting a candidate. The checker receives all 15 symbolic protocol parameters,
-including the four circuit-family dimensions and both sampler sigmas. Rational sigmas are passed as
-exact numerator/denominator pairs. Candidate acceptance therefore evaluates the generated
-parameter-validity predicate and the Diamond parameter relations, rather than only the derived
-hard-bound arithmetic.
+worst-case recurrence with full ring and inner-dimension factors, then invokes Lean on freshly
+generated source modules before accepting a candidate. A compact capped binary computation is
+checked in the Lean kernel and discharges the strict numeric gate of the full theorem. All protocol
+parameters, including circuit dimensions and exact sampler sigmas, come from the same compiler and
+backend setup. The selected result retains the verified artifact directory. Conservative numeric
+rejection is separate from export, unsupported-semantics, compiler, and timeout errors; there is no
+fallback to the older operational checker. Search is a candidate-finding heuristic, not a claim of
+CRT-depth minimality or exhaustive failure.
 
 Certified GPU Diamond execution is not exposed. The GPU Gaussian and preimage paths must enforce
 the same bounded support, including whole-candidate preimage rejection, before a GPU integration

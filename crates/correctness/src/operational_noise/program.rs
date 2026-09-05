@@ -234,17 +234,6 @@ impl ProgramArena {
         self.diagnostic_counters.set(counters);
     }
 
-    pub(crate) fn beta_reason_counters(
-        &self,
-    ) -> ([u64; BETA_REASON_COUNT], [u64; BETA_REASON_COUNT], [u64; BETA_REASON_COUNT]) {
-        let counters = self.diagnostic_counters.get();
-        (
-            counters.beta_reason_misses,
-            counters.beta_reason_visits,
-            counters.beta_reason_expr_allocations,
-        )
-    }
-
     fn record_beta_miss(&self, reason: BetaReason) {
         self.update_diagnostic_counters(|counters| {
             counters.beta_reason_misses[reason.index()] =
@@ -445,6 +434,7 @@ impl ProgramArena {
             ) if node.inputs.len() == 2 => Ok(self
                 .is_closed_affine_integer(expressions, node.inputs[0])? &&
                 self.is_closed_affine_integer(expressions, node.inputs[1])?),
+            #[cfg(test)]
             ValueOperator::Scalar(super::arena::ScalarOperation::Negate)
                 if node.inputs.len() == 1 =>
             {
@@ -1007,6 +997,7 @@ impl ProgramArena {
     /// Access a family at one exact typed index.  The trusted range is mandatory; equal ranges
     /// do not correlate independent expressions, and containment is checked against this exact
     /// family domain.
+    #[cfg(test)]
     pub fn call_family(
         &self,
         expressions: &mut ExprArena,
@@ -1023,6 +1014,7 @@ impl ProgramArena {
         self.call_family_in_range(expressions, family, index, index_range)
     }
 
+    #[cfg(test)]
     pub(crate) fn call_family_in_range(
         &self,
         expressions: &mut ExprArena,
@@ -1080,6 +1072,7 @@ impl ProgramArena {
     /// body containing this call may be finalized as another generated family; callers must fully
     /// materialize it only before semantic exposure to relation validation, family analysis, or
     /// normalization.
+    #[cfg(test)]
     pub(crate) fn call_family_in_range_deferred_generated(
         &self,
         expressions: &mut ExprArena,
@@ -1126,22 +1119,6 @@ impl ProgramArena {
             counters.family_calls = counters.family_calls.saturating_add(1);
         });
         Ok(call)
-    }
-
-    fn reduce_validated_family_call(
-        &self,
-        expressions: &mut ExprArena,
-        family: FamilyValueId,
-        index: ExprId,
-        call: ExprId,
-    ) -> Result<ExprId, ArenaError> {
-        self.reduce_validated_family_call_with_reason(
-            expressions,
-            family,
-            index,
-            call,
-            BetaReason::Other,
-        )
     }
 
     fn reduce_validated_family_call_with_reason(
@@ -1218,6 +1195,7 @@ impl ProgramArena {
     /// Fully expand reducible generated-family calls in one not-yet-finalized composition body.
     /// Opaque/nonreducible callees remain folded, while their input expressions are still fully
     /// materialized before the opaque call is rebuilt.
+    #[cfg(test)]
     pub(crate) fn materialize_reducible_generated_calls(
         &self,
         expressions: &mut ExprArena,
@@ -1391,19 +1369,6 @@ impl ProgramArena {
     /// Beta-reduce one validated program application and transitively materialize every
     /// reducible generated-family call exposed by the result. Nonreducible callees remain opaque,
     /// while their already-evaluated input expressions are still rebuilt and checked.
-    pub(crate) fn beta_reduce_materialized(
-        &self,
-        expressions: &mut ExprArena,
-        program: ValueProgramId,
-        arguments: &[ExprId],
-    ) -> Result<ExprId, ArenaError> {
-        self.beta_reduce_materialized_with_reason(
-            expressions,
-            program,
-            arguments,
-            BetaReason::Other,
-        )
-    }
 
     pub(crate) fn beta_reduce_materialized_with_reason(
         &self,
@@ -1430,6 +1395,7 @@ impl ProgramArena {
     }
 
     /// Compose two equal-domain families by constructing one ordinary operator body.
+    #[cfg(test)]
     pub fn pointwise_binary(
         &mut self,
         expressions: &mut ExprArena,
@@ -1449,26 +1415,10 @@ impl ProgramArena {
         self.generated_family_from_body(expressions, domain, body)
     }
 
-    pub fn pointwise_unary(
-        &mut self,
-        expressions: &mut ExprArena,
-        family: FamilyValueId,
-        operation: ValueOperator,
-    ) -> Result<FamilyValueId, ArenaError> {
-        let domain = self.family_domain(family)?;
-        let argument = expressions.intern_argument(0, ResolvedValueType::Int)?;
-        let range = TrustedIndexRange {
-            minimum: domain.minimum,
-            maximum_exclusive: domain.maximum_exclusive,
-        };
-        let value = self.call_family_in_range(expressions, family, argument, range)?;
-        let body = expressions.intern_slice(operation, &[value])?;
-        self.generated_family_from_body(expressions, domain, body)
-    }
-
     /// `reindex(F, h)` derives the exact mapped-index range through the job fact authority.
     /// `h` is an explicit unary program, rather than a raw binder-open expression whose free
     /// argument could be captured accidentally.
+    #[cfg(test)]
     pub fn reindex(
         &mut self,
         expressions: &mut ExprArena,
@@ -1494,6 +1444,7 @@ impl ProgramArena {
     /// The result domain is exactly the direct family's domain.  `map_program` must be an
     /// existing unary integer program with that exact input domain, and its root's finalized
     /// range authorizes the single offset-family call.  Neither domain is enumerated.
+    #[cfg(test)]
     pub fn zip_offset(
         &mut self,
         expressions: &mut ExprArena,
@@ -1526,6 +1477,7 @@ impl ProgramArena {
         self.generated_family_from_body(expressions, direct_domain, body)
     }
 
+    #[cfg(test)]
     fn instantiate_index_map(
         &self,
         expressions: &mut ExprArena,
@@ -1561,6 +1513,7 @@ impl ProgramArena {
     /// differ: the map's trusted input range is the result domain, while its trusted output range
     /// must be contained in the source domain. The generated body contains exactly one mapped
     /// source-family call; no selector or domain enumeration is performed.
+    #[cfg(test)]
     pub fn gather(
         &mut self,
         expressions: &mut ExprArena,
@@ -1585,6 +1538,7 @@ impl ProgramArena {
 
     /// Zip many equal-domain families with one ordinary n-ary operator.  The operation receives
     /// only same-index program calls; no selector product or family-domain enumeration occurs.
+    #[cfg(test)]
     pub fn zip(
         &mut self,
         expressions: &mut ExprArena,
@@ -1751,6 +1705,7 @@ impl ProgramArena {
 
     /// Iterative beta reduction for a finalized generated program.  No recursive Rust call stack
     /// or domain traversal is used; repeated subexpressions are memoized by expression slot.
+    #[cfg(test)]
     pub fn beta_reduce(
         &self,
         expressions: &mut ExprArena,
@@ -1830,22 +1785,6 @@ impl ProgramArena {
         Ok(reduced)
     }
 
-    fn beta_reduce_family_call(
-        &self,
-        expressions: &mut ExprArena,
-        family: FamilyValueId,
-        index: ExprId,
-        opaque_call: ExprId,
-    ) -> Result<ExprId, ArenaError> {
-        self.beta_reduce_family_call_with_reason(
-            expressions,
-            family,
-            index,
-            opaque_call,
-            BetaReason::Other,
-        )
-    }
-
     fn beta_reduce_family_call_with_reason(
         &self,
         expressions: &mut ExprArena,
@@ -1876,6 +1815,7 @@ impl ProgramArena {
         Err(ArenaError::UnknownProgram(family.program()))
     }
 
+    #[cfg(test)]
     fn same_domain(
         &self,
         left: FamilyValueId,
@@ -1915,6 +1855,7 @@ impl ProgramArena {
     }
 
     /// The producer-owned export descriptor. Unexported generated/sampler families return None.
+    #[cfg(test)]
     pub fn family_artifact(
         &self,
         family: FamilyValueId,

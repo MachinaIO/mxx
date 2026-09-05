@@ -11,8 +11,8 @@ use super::{
         ArenaError, ArtifactIdentity, ClosedExprId, ExprArena, FamilyDomain, ProgramSignature,
         ResolvedMatrixType, ResolvedValueType, ScopedExprId, TrustedIndexRange,
     },
-    facts::{FactStore, IndexFacts, MatrixFacts, ScalarFacts, TrapdoorFacts, ValueFacts},
-    monomial::{MonomialArena, MonomialError, MonomialId, TermMap},
+    facts::{FactStore, MatrixFacts, TrapdoorFacts, ValueFacts},
+    monomial::{MonomialArena, MonomialError, TermMap},
     normal_form::{
         AnalyzedValue, BoundedSummary, CompactShellPlan, NormalizationCounters, NormalizeError,
         Normalizer,
@@ -29,6 +29,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use tracing::info;
+
+#[cfg(test)]
+use super::{facts::ScalarFacts, monomial::MonomialId};
 
 static NEXT_CANDIDATE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -94,6 +97,7 @@ pub struct CandidateResourceCounters {
 
 /// Finalization result for one candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub struct CandidateReport {
     pub token: CandidateToken,
     pub resources: CandidateResourceCounters,
@@ -124,6 +128,7 @@ impl ArtifactAliasTable {
         self.entries.clear();
     }
 
+    #[cfg(test)]
     fn finish(&mut self, token: CandidateToken) -> Result<usize, JobError> {
         self.require_active(token)?;
         let count = self.entries.len();
@@ -136,10 +141,12 @@ impl ArtifactAliasTable {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    #[cfg(test)]
     fn require_active(&self, token: CandidateToken) -> Result<(), JobError> {
         match self.active {
             Some(active) if active == token => Ok(()),
@@ -152,6 +159,7 @@ impl ArtifactAliasTable {
 
     /// Register a producer family under an exact semantic binding.  The family must belong to
     /// `programs`; its domain and element type must exactly match the binding descriptor.
+    #[cfg(test)]
     pub fn register(
         &mut self,
         token: CandidateToken,
@@ -185,6 +193,7 @@ impl ArtifactAliasTable {
     }
 
     /// Resolve an alias without constructing a consumer identity.
+    #[cfg(test)]
     pub fn resolve(
         &self,
         token: CandidateToken,
@@ -213,6 +222,7 @@ impl ArtifactAliasTable {
     }
 }
 
+#[cfg(test)]
 fn validate_binding(
     programs: &ProgramArena,
     binding: &ArtifactBindingIdentity,
@@ -250,6 +260,7 @@ fn validate_binding(
     Ok(())
 }
 
+#[cfg(test)]
 fn map_family_error(error: ArenaError, producer: FamilyValueId) -> JobError {
     match error {
         ArenaError::ForeignProgram { .. } | ArenaError::InvalidSlot { .. } => {
@@ -328,6 +339,7 @@ fn matrix_operation_name(operation: &super::arena::MatrixOperation) -> String {
                 format_layout(layout)
             )
         }
+        #[cfg(test)]
         super::arena::MatrixOperation::View { output, layout } => {
             format!("view(output={},{} )", format_matrix_type(output), format_layout(layout))
         }
@@ -376,11 +388,11 @@ fn format_groups(groups: &[(super::arena::ExprId, usize)]) -> String {
         .join(",")
 }
 
+#[cfg(test)]
 fn hash_variant_name(variant: super::arena::HashVariant) -> &'static str {
     match variant {
         super::arena::HashVariant::Plain => "plain",
         super::arena::HashVariant::Decomposed => "decomposed",
-        super::arena::HashVariant::SmallDecomposed => "small-decomposed",
     }
 }
 
@@ -400,6 +412,7 @@ impl MonomialStores {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn arena_count(&self) -> usize {
         self.arenas.len()
     }
@@ -481,6 +494,7 @@ impl CheckerJob {
         &self.programs
     }
 
+    #[cfg(test)]
     pub fn programs_mut(&mut self) -> &mut ProgramArena {
         &mut self.programs
     }
@@ -524,6 +538,7 @@ impl CheckerJob {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn insert_scalar_facts(
         &mut self,
         token: CandidateToken,
@@ -551,15 +566,6 @@ impl CheckerJob {
         self.insert_value_facts(token, expression, ValueFacts::Trapdoor(facts))
     }
 
-    pub fn insert_index_facts(
-        &mut self,
-        token: CandidateToken,
-        expression: super::arena::ExprId,
-        facts: IndexFacts,
-    ) -> Result<(), JobError> {
-        self.insert_value_facts(token, expression, ValueFacts::Index(facts))
-    }
-
     fn insert_value_facts(
         &mut self,
         token: CandidateToken,
@@ -576,10 +582,12 @@ impl CheckerJob {
         self.facts.insert(&self.expressions, expression, facts).map_err(JobError::Facts)
     }
 
+    #[cfg(test)]
     pub fn monomials(&self) -> &MonomialStores {
         &self.monomials
     }
 
+    #[cfg(test)]
     pub fn relations(&self) -> &RelationRegistry {
         &self.relations
     }
@@ -606,10 +614,6 @@ impl CheckerJob {
         }
         self.compact_shell_plan = Some(plan);
         Ok(())
-    }
-
-    pub fn normalization(&self) -> &NormalizationCache {
-        &self.normalization
     }
 
     /// Describe at most a bounded prefix of exact terms for diagnostics. The returned data is
@@ -662,11 +666,13 @@ impl CheckerJob {
             &self.expressions.node(factor.expression()).map_err(JobError::Arena)?.operator;
         let (class, operation) = match operator {
             super::arena::ValueOperator::Source(_) => ("public", "source"),
+            #[cfg(test)]
             super::arena::ValueOperator::Sample { .. } => ("sample", "sample"),
             super::arena::ValueOperator::Sampler { operation, .. } => {
                 let operation = match operation {
                     super::arena::SamplerOperation::Preimage { .. } => "preimage",
                     super::arena::SamplerOperation::Trapdoor { .. } => "trapdoor",
+                    #[cfg(test)]
                     super::arena::SamplerOperation::Hash { .. } => "hash",
                     super::arena::SamplerOperation::Gaussian { .. } => "gaussian",
                     super::arena::SamplerOperation::UniformResidue { .. } => "uniform-residue",
@@ -692,6 +698,7 @@ impl CheckerJob {
             super::arena::ValueOperator::Argument { .. } => ("binder", "argument"),
             super::arena::ValueOperator::Constant(_) => ("constant", "literal"),
             super::arena::ValueOperator::ProgramCall { .. } => ("program", "call"),
+            #[cfg(test)]
             super::arena::ValueOperator::IndexMap { .. } => ("index", "map"),
             super::arena::ValueOperator::OpaqueFamilyElement { .. } => ("family", "opaque-element"),
             super::arena::ValueOperator::ExplicitElement { .. } => ("family", "explicit-element"),
@@ -749,6 +756,7 @@ impl CheckerJob {
                 }
             }
             super::arena::ValueOperator::Sampler { operation, .. } => match operation {
+                #[cfg(test)]
                 super::arena::SamplerOperation::Hash { variant, base, digit_count, .. } => format!(
                     "hash(variant={},base={},digits={})",
                     hash_variant_name(*variant),
@@ -821,11 +829,13 @@ impl CheckerJob {
                 format!("arg{position}")
             }
             super::arena::ValueOperator::Trapdoor(_) => "trapdoor-transform".to_owned(),
+            #[cfg(test)]
             super::arena::ValueOperator::IndexMap { .. } => "index-map".to_owned(),
             super::arena::ValueOperator::ExplicitElement { .. } => "explicit-element".to_owned(),
             super::arena::ValueOperator::ExtractCoefficient { .. } => {
                 "extract-coefficient".to_owned()
             }
+            #[cfg(test)]
             super::arena::ValueOperator::Sample { .. } => "sample".to_owned(),
         };
         Ok(detail)
@@ -996,6 +1006,7 @@ impl CheckerJob {
         Ok(expression)
     }
 
+    #[cfg(test)]
     pub(crate) fn materialize_reducible_generated_calls(
         &mut self,
         root: super::arena::ExprId,
@@ -1150,7 +1161,8 @@ impl CheckerJob {
                 super::arena::ValueOperator::Source(source) => {
                     source.sample_event.map(|event| (event, source.output_role.as_str()))
                 }
-                super::arena::ValueOperator::Sample { event, .. } |
+                #[cfg(test)]
+                super::arena::ValueOperator::Sample { event, .. } => Some((*event, "value")),
                 super::arena::ValueOperator::Sampler { event, .. } => Some((*event, "value")),
                 _ => None,
             };
@@ -1452,6 +1464,7 @@ impl CheckerJob {
                             "uniform-interval"
                         }
                         super::arena::SamplerOperation::Gaussian { .. } => "gaussian",
+                        #[cfg(test)]
                         super::arena::SamplerOperation::Hash { .. } => "hash",
                         super::arena::SamplerOperation::Trapdoor { .. } => "trapdoor",
                         super::arena::SamplerOperation::Preimage { .. } => "preimage",
@@ -1461,6 +1474,7 @@ impl CheckerJob {
                 super::arena::ValueOperator::DeterministicHash(_) => {
                     "deterministic-hash".to_owned()
                 }
+                #[cfg(test)]
                 super::arena::ValueOperator::Sample { .. } => "sample".to_owned(),
                 super::arena::ValueOperator::OpaqueFamilyElement { .. } => {
                     "opaque-family-element".to_owned()
@@ -1471,6 +1485,7 @@ impl CheckerJob {
                 super::arena::ValueOperator::Trapdoor(_) => "trapdoor".to_owned(),
                 super::arena::ValueOperator::Argument { .. } => "argument".to_owned(),
                 super::arena::ValueOperator::Constant(_) => "constant".to_owned(),
+                #[cfg(test)]
                 super::arena::ValueOperator::IndexMap { .. } => "index-map".to_owned(),
                 super::arena::ValueOperator::ExtractCoefficient { .. } => {
                     "extract-coefficient".to_owned()
@@ -1720,16 +1735,9 @@ impl CheckerJob {
     }
 
     /// Return the scope-local monomial arena, creating it after the scope has been finalized.
-    pub fn ensure_monomials(
-        &mut self,
-        scope: super::arena::ValueProgramId,
-    ) -> Result<&mut MonomialArena, JobError> {
-        let (expressions, programs, monomials) =
-            (&self.expressions, &self.programs, &mut self.monomials);
-        monomials.ensure(expressions, programs, scope).map_err(JobError::Monomial)
-    }
 
     /// Intern one monomial through the job-owned scope store.
+    #[cfg(test)]
     pub fn intern_monomial(
         &mut self,
         scope: super::arena::ValueProgramId,
@@ -1744,6 +1752,7 @@ impl CheckerJob {
             .map_err(JobError::Monomial)
     }
 
+    #[cfg(test)]
     pub fn artifact_aliases(&self) -> &ArtifactAliasTable {
         &self.aliases
     }
@@ -1762,6 +1771,7 @@ impl CheckerJob {
         Ok(token)
     }
 
+    #[cfg(test)]
     pub fn register_artifact_alias(
         &mut self,
         token: CandidateToken,
@@ -1775,6 +1785,7 @@ impl CheckerJob {
         self.aliases.register(token, &self.programs, binding, producer)
     }
 
+    #[cfg(test)]
     pub fn resolve_artifact_alias(
         &self,
         token: CandidateToken,
@@ -1784,6 +1795,7 @@ impl CheckerJob {
         self.aliases.resolve(token, &self.programs, binding)
     }
 
+    #[cfg(test)]
     pub fn finalize_candidate(
         &mut self,
         token: CandidateToken,
@@ -1876,29 +1888,39 @@ pub enum JobError {
         expected: CandidateToken,
         actual: CandidateToken,
     },
+    #[cfg(test)]
     ForeignOrInvalidProducer {
         producer: FamilyValueId,
     },
+    #[cfg(test)]
     UnexportedProducer {
         producer: FamilyValueId,
     },
+    #[cfg(test)]
     MissingArtifactAlias {
         binding: ArtifactBindingIdentity,
     },
+    #[cfg(test)]
     ConflictingArtifactAlias {
         binding: ArtifactBindingIdentity,
     },
+    #[cfg(test)]
     MissingArtifactDefinition,
+    #[cfg(test)]
     MissingArtifactDomain,
+    #[cfg(test)]
     MissingArtifactLayout,
+    #[cfg(test)]
     ArtifactDomainMismatch {
         expected: FamilyDomain,
         actual: FamilyDomain,
     },
+    #[cfg(test)]
     ArtifactTypeMismatch {
         expected: ResolvedValueType,
         actual: ResolvedValueType,
     },
+    #[cfg(test)]
     ArtifactBindingMismatch {
         expected: ArtifactBindingIdentity,
         actual: ArtifactBindingIdentity,

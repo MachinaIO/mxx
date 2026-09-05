@@ -30,13 +30,6 @@ impl<T> NumericContract<T> {
             Self::Known(value) => Some(value),
         }
     }
-
-    pub fn map<U>(&self, map: impl FnOnce(&T) -> U) -> NumericContract<U> {
-        match self {
-            Self::Missing => NumericContract::Missing,
-            Self::Known(value) => NumericContract::Known(map(value)),
-        }
-    }
 }
 
 /// A finite coefficient bound remains a value-level expression summary.  It
@@ -77,10 +70,6 @@ impl CoefficientBound {
             Self::Finite(BoundExpression::new(value))
         }
     }
-
-    pub fn is_large(&self) -> bool {
-        matches!(self, Self::Large)
-    }
 }
 
 /// Bounds for polynomial support after typed validation.
@@ -120,11 +109,13 @@ impl MatrixMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg(test)]
 pub struct ScalarFacts {
     pub value_type: ResolvedValueType,
     pub coefficient_bound: NumericContract<CoefficientBound>,
 }
 
+#[cfg(test)]
 impl ScalarFacts {
     pub fn new(value_type: ResolvedValueType) -> Result<Self, FactError> {
         if !matches!(
@@ -168,6 +159,7 @@ pub struct TrapdoorFacts {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[cfg(test)]
 pub struct IndexFacts {
     pub range: Option<TrustedIndexRange>,
 }
@@ -176,31 +168,38 @@ pub struct IndexFacts {
 /// as a substitute for the expression ID.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ValueFacts {
+    #[cfg(test)]
     Scalar(ScalarFacts),
     Matrix(MatrixFacts),
     Trapdoor(TrapdoorFacts),
+    #[cfg(test)]
     Index(IndexFacts),
 }
 
 impl ValueFacts {
     pub fn value_type(&self) -> ResolvedValueType {
         match self {
+            #[cfg(test)]
             Self::Scalar(facts) => facts.value_type.clone(),
             Self::Matrix(facts) => ResolvedValueType::Matrix(facts.matrix_type.clone()),
             Self::Trapdoor(_) => ResolvedValueType::Trapdoor,
+            #[cfg(test)]
             Self::Index(_) => ResolvedValueType::Int,
         }
     }
 
     fn coefficient_bound(&self) -> Option<&NumericContract<CoefficientBound>> {
         match self {
+            #[cfg(test)]
             Self::Scalar(facts) => Some(&facts.coefficient_bound),
             Self::Matrix(facts) => Some(&facts.coefficient_bound),
             Self::Trapdoor(facts) => Some(&facts.coefficient_bound),
+            #[cfg(test)]
             Self::Index(_) => None,
         }
     }
 
+    #[cfg(test)]
     fn coefficient_bound_mut(&mut self) -> Option<&mut NumericContract<CoefficientBound>> {
         match self {
             Self::Scalar(facts) => Some(&mut facts.coefficient_bound),
@@ -213,24 +212,64 @@ impl ValueFacts {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FactError {
-    ForeignExpression { expected: ArenaToken, actual: ArenaToken },
-    InvalidExpression { id: ExprId },
-    InvalidFactVariant { id: ExprId, value_type: ResolvedValueType },
-    BinderOpenExpression { id: ExprId },
-    TrapdoorAuthorityMismatch { id: ExprId },
-    FactTypeMismatch { id: ExprId, expected: ResolvedValueType, actual: ResolvedValueType },
-    RangeRequiresInteger { id: ExprId, actual: ResolvedValueType },
-    ConflictingFacts { id: ExprId, first: String, second: String },
-    MissingFacts { id: ExprId },
+    ForeignExpression {
+        expected: ArenaToken,
+        actual: ArenaToken,
+    },
+    InvalidExpression {
+        id: ExprId,
+    },
+    #[cfg(test)]
+    InvalidFactVariant {
+        id: ExprId,
+        value_type: ResolvedValueType,
+    },
+    BinderOpenExpression {
+        id: ExprId,
+    },
+    TrapdoorAuthorityMismatch {
+        id: ExprId,
+    },
+    FactTypeMismatch {
+        id: ExprId,
+        expected: ResolvedValueType,
+        actual: ResolvedValueType,
+    },
+    RangeRequiresInteger {
+        id: ExprId,
+        actual: ResolvedValueType,
+    },
+    ConflictingFacts {
+        id: ExprId,
+        first: String,
+        second: String,
+    },
+    MissingFacts {
+        id: ExprId,
+    },
+    #[cfg(test)]
     WrongFactType,
-    InvalidPolynomialFacts { support_upper: usize, ring_dimension: usize },
-    InvalidRange { minimum: u64, maximum_exclusive: u64 },
-    ConflictingRange { id: ExprId, first: TrustedIndexRange, second: TrustedIndexRange },
-    LateRangeDeclaration { id: ExprId },
-    RangeAlreadyFinalized,
-    IndexRangeRequired { id: ExprId },
+    InvalidPolynomialFacts {
+        support_upper: usize,
+        ring_dimension: usize,
+    },
+    InvalidRange {
+        minimum: u64,
+        maximum_exclusive: u64,
+    },
+    ConflictingRange {
+        id: ExprId,
+        first: TrustedIndexRange,
+        second: TrustedIndexRange,
+    },
+    LateRangeDeclaration {
+        id: ExprId,
+    },
+    IndexRangeRequired {
+        id: ExprId,
+    },
+    #[cfg(test)]
     MissingTransferInput,
-    UnsupportedTransfer,
 }
 
 impl fmt::Display for FactError {
@@ -299,6 +338,7 @@ impl FactStore {
         id: ExprId,
         facts: &ValueFacts,
     ) -> Result<(), FactError> {
+        #[cfg(test)]
         if let ValueFacts::Scalar(scalar) = facts {
             if !matches!(
                 &scalar.value_type,
@@ -408,6 +448,7 @@ impl FactStore {
     /// Declare a range for a binder-open expression under one finalized program scope. Raw
     /// expression IDs are intentionally insufficient authority because interning can reuse the
     /// same `Argument(0)` in independent programs with different domains.
+    #[cfg(test)]
     pub fn declare_scoped_trusted_index_range(
         &mut self,
         expressions: &ExprArena,
@@ -469,6 +510,7 @@ impl FactStore {
     /// Replace only a missing coefficient contract.  Conflicting known facts
     /// are rejected, making repeated insertion deterministic and preserving
     /// exact identity independently of numeric summaries.
+    #[cfg(test)]
     pub fn set_coefficient_bound(
         &mut self,
         id: ExprId,
@@ -506,6 +548,7 @@ impl FactStore {
     /// A transfer cannot produce a known result when any required input
     /// contract is missing.  This is the central Stage 1 guard against the
     /// unsound `Missing -> Large` conversion.
+    #[cfg(test)]
     pub fn transfer_bound(
         inputs: &[NumericContract<CoefficientBound>],
         result_if_known: CoefficientBound,
@@ -516,12 +559,9 @@ impl FactStore {
             NumericContract::Known(result_if_known)
         }
     }
-
-    pub fn unsupported_transfer() -> NumericContract<CoefficientBound> {
-        NumericContract::Missing
-    }
 }
 
+#[cfg(test)]
 fn merge_numeric_contract<T: Clone + Eq + fmt::Debug>(
     current: &mut NumericContract<T>,
     incoming: NumericContract<T>,

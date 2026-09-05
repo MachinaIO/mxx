@@ -216,9 +216,11 @@ impl ProtocolPlan {
     pub(crate) fn output_mappings(&self) -> &BTreeSet<OutputMapping> {
         &self.output_mappings
     }
+    #[cfg(test)]
     pub(crate) fn selector_dependencies(&self) -> &BTreeSet<PlannedWire> {
         &self.selector_dependencies
     }
+    #[cfg(test)]
     pub(crate) fn effects(&self) -> &BTreeSet<PlannedWire> {
         &self.effects
     }

@@ -1357,14 +1357,7 @@ impl<'a> Emitter<'a> {
                     &[sigma, bound],
                 );
             }
-            NodeKind::HashSample {
-                variant,
-                tag_prefix,
-                tag_expressions,
-                tag_decimal_expressions,
-                tag_u64_le_expressions,
-                ..
-            } => {
+            NodeKind::HashSample { variant, tag_prefix, tag_components, .. } => {
                 if *variant != crate::node::HashVariant::Plain {
                     return self.unsupported(
                         scope_id,
@@ -1375,30 +1368,36 @@ impl<'a> Emitter<'a> {
                 }
                 let key = arg(0)?;
                 self.current_uses_hash_model = true;
-                for expression in tag_expressions
+                let components = tag_components
                     .iter()
-                    .chain(tag_decimal_expressions)
-                    .chain(tag_u64_le_expressions)
-                {
-                    append_expression_guards(expression, env, relations);
-                }
-                let expressions = |values: &[IntExpr]| {
-                    format!(
-                        "[{}]",
-                        values
-                            .iter()
-                            .map(|value| format!("({})", env.expr(value)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                };
+                    .map(|component| {
+                        use crate::node::HashTagComponent;
+                        match component {
+                            HashTagComponent::Bytes(bytes) => format!(
+                                ".bytes [{}]",
+                                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
+                            ),
+                            HashTagComponent::Integer(expression) |
+                            HashTagComponent::Decimal(expression) |
+                            HashTagComponent::U64Le(expression) => {
+                                append_expression_guards(expression, env, relations);
+                                let constructor = match component {
+                                    HashTagComponent::Integer(_) => "integer",
+                                    HashTagComponent::Decimal(_) => "decimal",
+                                    _ => "u64Le",
+                                };
+                                format!(".{constructor} ({})", env.expr(expression))
+                            }
+                            HashTagComponent::Operand(index) => {
+                                format!(".integer {}", wire_name(args[*index]))
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let prefix = format!(
                     "[{}]",
                     tag_prefix.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
-                );
-                let operands = format!(
-                    "[{}]",
-                    args.iter().skip(1).map(|wire| wire_name(*wire)).collect::<Vec<_>>().join(", ")
                 );
                 self.sample_one(
                     scope,
@@ -1406,15 +1405,7 @@ impl<'a> Emitter<'a> {
                     existentials,
                     relations,
                     &self.options.primitives.hash_sample,
-                    &[
-                        "hashModel".into(),
-                        prefix,
-                        expressions(tag_expressions),
-                        expressions(tag_decimal_expressions),
-                        expressions(tag_u64_le_expressions),
-                        operands,
-                        key,
-                    ],
+                    &["hashModel".into(), prefix, format!("[{components}]"), key],
                 );
             }
             NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
@@ -2884,9 +2875,7 @@ mod tests {
                 matrix_type: matrix.clone(),
                 variant: crate::node::HashVariant::Plain,
                 tag_prefix: vec![],
-                tag_expressions: vec![],
-                tag_decimal_expressions: vec![],
-                tag_u64_le_expressions: vec![],
+                tag_components: Vec::new(),
                 base: None,
                 digit_count: None,
             },

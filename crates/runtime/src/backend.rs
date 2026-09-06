@@ -525,6 +525,9 @@ pub trait Backend {
     fn matrices_to_bytes(&self, values: &[&Self::Matrix]) -> Vec<Vec<u8>> {
         values.iter().map(|value| self.matrix_to_bytes(value)).collect()
     }
+    /// Decodes an intact payload from this backend's matching matrix codec and type.
+    /// Malformed bytes or mismatched metadata violate the caller contract; implementations
+    /// may panic. The result reports supported backend failures, not arbitrary corruption.
     fn matrix_from_bytes(
         &self,
         ty: &ConcreteMatrixType,
@@ -550,6 +553,10 @@ pub trait Backend {
     ) -> Result<Self::Trapdoor, Self::Error>;
 }
 
+/// A caller-supplied value must match its validated concrete wire type in full, including
+/// shape, ring/CRT parameters, representation, and sampler metadata. Trapdoor public and
+/// secret material must belong together. This obligation applies recursively to families;
+/// execution's value-kind checks do not certify it or inspect resident matrix contents.
 pub enum RuntimeValue<B: Backend> {
     Int(BigInt),
     Real(f64),

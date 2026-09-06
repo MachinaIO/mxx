@@ -329,6 +329,7 @@ mod tests {
                 for block in 0..layout.public_parameter_block_count() {
                     let block_index = block * layout.gadget_rows() + digit_row;
                     let mut tag = b"wee25_w_block_".to_vec();
+                    tag.push(3); // Typed u64 little-endian hash component.
                     tag.extend_from_slice(&block_index.to_le_bytes());
                     let w = hash_sampler.sample_hash(
                         &parameters,

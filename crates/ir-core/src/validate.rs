@@ -821,14 +821,7 @@ fn validate_node(
             vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
         }
         NodeKind::HashSample {
-            matrix_type,
-            variant,
-            tag_expressions,
-            tag_decimal_expressions,
-            tag_u64_le_expressions,
-            base,
-            digit_count,
-            ..
+            matrix_type, variant, tag_components, base, digit_count, ..
         } => {
             if argument(scope, values, node, 0)? != &(ConcreteWireType::Bytes { length: 32 }) {
                 return node_error(scope, node.id, "hash sampling requires a 32-byte key");
@@ -836,12 +829,26 @@ fn validate_node(
             for index in 1..node.args.len() {
                 require_scalar(scope, values, node, index, is_integer, "integer")?;
             }
-            for expression in tag_expressions.iter().chain(tag_decimal_expressions) {
-                expression.evaluate(env)?;
-            }
-            for expression in tag_u64_le_expressions {
-                if expression.evaluate(env)?.to_u64().is_none() {
-                    return node_error(scope, node.id, "little-endian hash tag must fit in u64");
+            for component in tag_components {
+                use crate::node::HashTagComponent;
+                match component {
+                    HashTagComponent::Bytes(_) => {}
+                    HashTagComponent::Integer(expression) |
+                    HashTagComponent::Decimal(expression) => {
+                        expression.evaluate(env)?;
+                    }
+                    HashTagComponent::U64Le(expression) => {
+                        if expression.evaluate(env)?.to_u64().is_none() {
+                            return node_error(
+                                scope,
+                                node.id,
+                                "little-endian hash tag must fit in u64",
+                            );
+                        }
+                    }
+                    HashTagComponent::Operand(index) => {
+                        require_scalar(scope, values, node, *index, is_integer, "integer")?;
+                    }
                 }
             }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
@@ -1937,9 +1944,7 @@ mod tests {
                 matrix_type: matrix_type.clone(),
                 variant,
                 tag_prefix: Vec::new(),
-                tag_expressions: Vec::new(),
-                tag_decimal_expressions: Vec::new(),
-                tag_u64_le_expressions: Vec::new(),
+                tag_components: Vec::new(),
                 base,
                 digit_count,
             },

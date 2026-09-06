@@ -227,6 +227,9 @@ impl ExecutionError {
     }
 }
 
+/// Executes trusted inputs prepared for the exact validated graph and parameter bindings.
+/// All declared non-artifact inputs must be supplied, and every value must satisfy the
+/// full metadata and payload contract documented on [`RuntimeValue`].
 pub fn execute<B, S>(
     validated: &ValidatedGraph,
     backend: &mut B,
@@ -264,6 +267,9 @@ where
         .map(|(result, _)| result)
 }
 
+/// Starts or resumes a session over a complete, immutable input map satisfying [`execute`]'s
+/// contract. An invalid invocation may leave a durable descriptor; correcting inputs requires
+/// a new nonce (and a new stable alias if used), not a resume with the original identity.
 pub fn execute_in_session<B, S>(
     validated: &ValidatedGraph,
     backend: &mut B,
@@ -285,6 +291,7 @@ where
     )
 }
 
+/// Configured session execution with the same input and nonce contract as [`execute_in_session`].
 pub fn execute_in_session_with_config<B, S>(
     validated: &ValidatedGraph,
     backend: &mut B,
@@ -1632,44 +1639,54 @@ where
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
             NodeKind::HashSample {
-                variant,
-                tag_prefix,
-                tag_expressions,
-                tag_decimal_expressions,
-                tag_u64_le_expressions,
-                base,
-                digit_count,
-                ..
+                variant, tag_prefix, tag_components, base, digit_count, ..
             } => {
                 let key = self.bytes(values, node.args[0])?;
                 let key: [u8; 32] =
                     key.try_into().map_err(|_| ExecutionError::ValueKind(node.args[0]))?;
                 let mut tag = tag_prefix.clone();
-                for expression in tag_expressions {
-                    let value = expression
-                        .evaluate(env)
-                        .map_err(|error| self.expression_error(node.id, error))?;
-                    append_tag_integer(&mut tag, &value);
-                }
-                for expression in tag_decimal_expressions {
-                    let value = expression
-                        .evaluate(env)
-                        .map_err(|error| self.expression_error(node.id, error))?;
-                    tag.extend_from_slice(value.to_string().as_bytes());
-                }
-                for expression in tag_u64_le_expressions {
-                    let value = expression
-                        .evaluate(env)
-                        .map_err(|error| self.expression_error(node.id, error))?
-                        .to_u64()
-                        .ok_or_else(|| ExecutionError::Expression {
-                            node: node.id,
-                            message: "little-endian hash tag component must fit in u64".to_owned(),
-                        })?;
-                    tag.extend_from_slice(&value.to_le_bytes());
-                }
-                for wire in node.args.iter().skip(1) {
-                    append_tag_integer(&mut tag, &self.int(values, *wire)?);
+                for component in tag_components {
+                    use mxx_ir_core::node::HashTagComponent;
+                    match component {
+                        HashTagComponent::Bytes(bytes) => {
+                            tag.push(0);
+                            tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                            tag.extend_from_slice(bytes);
+                        }
+                        HashTagComponent::Integer(expression) => {
+                            let value = expression
+                                .evaluate(env)
+                                .map_err(|error| self.expression_error(node.id, error))?;
+                            tag.push(1);
+                            append_tag_integer(&mut tag, &value);
+                        }
+                        HashTagComponent::Decimal(expression) => {
+                            let value = expression
+                                .evaluate(env)
+                                .map_err(|error| self.expression_error(node.id, error))?;
+                            let decimal = value.to_string();
+                            tag.push(2);
+                            tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                            tag.extend_from_slice(decimal.as_bytes());
+                        }
+                        HashTagComponent::U64Le(expression) => {
+                            let value = expression
+                                .evaluate(env)
+                                .map_err(|error| self.expression_error(node.id, error))?
+                                .to_u64()
+                                .ok_or_else(|| ExecutionError::Expression {
+                                    node: node.id,
+                                    message: "little-endian hash tag component must fit in u64"
+                                        .to_owned(),
+                                })?;
+                            tag.push(3);
+                            tag.extend_from_slice(&value.to_le_bytes());
+                        }
+                        HashTagComponent::Operand(index) => {
+                            tag.push(1);
+                            append_tag_integer(&mut tag, &self.int(values, node.args[*index])?);
+                        }
+                    }
                 }
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
@@ -4863,6 +4880,177 @@ mod tests {
         };
         assert_eq!(matrices(gathered), matrices(expected));
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn zero_integer_hash_tags_match_the_lean_encoding() {
+        use mxx_ir_core::node::{HashTagComponent, HashVariant};
+        use mxx_primitives::sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler};
+
+        // num-bigint 0.4 represents zero with one magnitude byte, not an empty magnitude.
+        assert_eq!(BigInt::from(0).to_bytes_be(), (Sign::NoSign, vec![0]));
+        let mut encoded = Vec::new();
+        append_tag_integer(&mut encoded, &BigInt::from(0));
+        assert_eq!(encoded, vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+
+        let parameters = DCRTPolyParams::default();
+        let matrix_type = mxx_ir_core::types::MatrixType {
+            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()).into(),
+            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            rows: 1.into(),
+            columns: 1.into(),
+        };
+        let key_type = WireType::Bytes { length: 32.into() };
+        let key = NodeHandle::new(
+            NodeKind::Input { name: "key".into(), wire_type: key_type.clone(), artifact: None },
+            vec![],
+            vec![key_type],
+        )
+        .output(0)
+        .unwrap();
+        let operand = NodeHandle::new(
+            NodeKind::Input { name: "zero".into(), wire_type: WireType::Int, artifact: None },
+            vec![],
+            vec![WireType::Int],
+        )
+        .output(0)
+        .unwrap();
+        let outputs = [
+            ("static", HashTagComponent::Integer(0.into())),
+            ("dynamic", HashTagComponent::Operand(1)),
+        ]
+        .into_iter()
+        .map(|(name, component)| {
+            let value = NodeHandle::new(
+                NodeKind::HashSample {
+                    matrix_type: matrix_type.clone(),
+                    variant: HashVariant::Plain,
+                    tag_prefix: b"zero-tag:".to_vec(),
+                    tag_components: vec![component],
+                    base: None,
+                    digit_count: None,
+                },
+                vec![key.clone(), operand.clone()],
+                vec![WireType::Matrix(matrix_type.clone())],
+            )
+            .output(0)
+            .unwrap();
+            (name.to_owned(), GraphOutput { value, confidentiality: None })
+        })
+        .collect();
+        let graph =
+            Graph::freeze("zero-tag", vec![], outputs, vec![], vec![], BTreeMap::new()).unwrap().0;
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([
+                ("key".to_owned(), RuntimeValue::Bytes(vec![0x57; 32])),
+                ("zero".to_owned(), RuntimeValue::Int(0.into())),
+            ]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        // Same literal bytes as the Lean completeHashTag zero regression: integer marker,
+        // nonnegative sign, big-endian length one, and one zero magnitude byte.
+        let mut tag = b"zero-tag:".to_vec();
+        tag.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+        let expected = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+            &parameters,
+            [0x57; 32],
+            tag,
+            1,
+            1,
+            DistType::FinRingDist,
+        );
+        assert_eq!(matrix_output(&result, "static"), &expected);
+        assert_eq!(matrix_output(&result, "dynamic"), &expected);
+    }
+
+    #[test]
+    fn hash_tag_framing_separates_decimal_tuples_and_component_order() {
+        use mxx_ir_core::node::{HashTagComponent as Part, HashVariant};
+        let parameters = DCRTPolyParams::default();
+        let matrix_type = mxx_ir_core::types::MatrixType {
+            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()).into(),
+            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            rows: 1.into(),
+            columns: 1.into(),
+        };
+        let key_type = WireType::Bytes { length: 32.into() };
+        let key = NodeHandle::new(
+            NodeKind::Input { name: "key".into(), wire_type: key_type.clone(), artifact: None },
+            vec![],
+            vec![key_type],
+        )
+        .output(0)
+        .unwrap();
+        let operand =
+            NodeHandle::new(NodeKind::ConstantInt(2.into()), vec![], vec![WireType::ConstantInt])
+                .output(0)
+                .unwrap();
+        let cases = [
+            vec![Part::Decimal(1.into()), Part::Decimal(23.into())],
+            vec![Part::Decimal(12.into()), Part::Decimal(3.into())],
+            vec![Part::Bytes(b"label".to_vec()), Part::U64Le(1.into())],
+            vec![Part::U64Le(1.into()), Part::Bytes(b"label".to_vec())],
+            vec![Part::Bytes(b"a\0b".to_vec())],
+            vec![Part::Bytes(b"a".to_vec()), Part::Bytes(b"b".to_vec())],
+            vec![Part::Integer(1.into()), Part::Operand(1)],
+            vec![Part::Operand(1), Part::Integer(1.into())],
+        ];
+        let outputs = cases
+            .into_iter()
+            .enumerate()
+            .map(|(index, tag_components)| {
+                let sample = NodeHandle::new(
+                    NodeKind::HashSample {
+                        matrix_type: matrix_type.clone(),
+                        variant: HashVariant::Plain,
+                        tag_prefix: b"framing-test:".to_vec(),
+                        tag_components,
+                        base: None,
+                        digit_count: None,
+                    },
+                    vec![key.clone(), operand.clone()],
+                    vec![WireType::Matrix(matrix_type.clone())],
+                )
+                .output(0)
+                .unwrap();
+                (index.to_string(), GraphOutput { value: sample, confidentiality: None })
+            })
+            .collect();
+        let graph = Graph::freeze("hash-framing", vec![], outputs, vec![], vec![], BTreeMap::new())
+            .unwrap()
+            .0;
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(vec![0x57; 32]))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        // Literal protocol bytes exercise the executor against the existing primitive sampler.
+        use mxx_primitives::sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler};
+        let mut expected_tag = b"framing-test:".to_vec();
+        expected_tag.extend_from_slice(&[
+            2, 0, 0, 0, 0, 0, 0, 0, 1, b'1', 2, 0, 0, 0, 0, 0, 0, 0, 2, b'2', b'3',
+        ]);
+        let expected = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+            &parameters,
+            [0x57; 32],
+            expected_tag,
+            1,
+            1,
+            DistType::FinRingDist,
+        );
+        assert_eq!(matrix_output(&result, "0"), &expected);
+        for (left, right) in [("0", "1"), ("2", "3"), ("4", "5"), ("6", "7")] {
+            assert_ne!(matrix_output(&result, left), matrix_output(&result, right));
+        }
     }
 
     #[test]

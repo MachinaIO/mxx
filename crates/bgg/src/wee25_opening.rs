@@ -532,6 +532,7 @@ mod tests {
             for digit_row in 0..compiler.gadget_rows() {
                 let block_index = column * compiler.gadget_rows() + digit_row;
                 let mut tag = b"wee25_w_block_".to_vec();
+                tag.push(3); // Typed u64 little-endian hash component.
                 tag.extend_from_slice(&block_index.to_le_bytes());
                 let w = sampler.sample_hash(
                     parameters,

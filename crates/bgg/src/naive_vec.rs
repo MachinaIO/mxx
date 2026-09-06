@@ -909,6 +909,7 @@ mod tests {
             for slot in 0..2 {
                 let mut slot_tag = tag.to_vec();
                 slot_tag.extend_from_slice(&(output as u64).to_le_bytes());
+                slot_tag.push(3); // Only the slot is a typed hash component.
                 slot_tag.extend_from_slice(&(slot as u64).to_le_bytes());
                 let packed_count = if output == 0 { 1 } else { 2 };
                 let packed = hash_sampler.sample_hash(

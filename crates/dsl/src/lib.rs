@@ -8,8 +8,8 @@ use mxx_ir_core::{
     artifact::{ArtifactConfidentiality, ProductionId},
     graph::with_new_construction_scope,
     node::{
-        ArtifactInput, ConstantMatrix, HashVariant, IndexRange, MatrixBinaryOp, NodeKind,
-        ParallelLoop, SampleRange, SequentialLoop,
+        ArtifactInput, ConstantMatrix, HashTagComponent, HashVariant, IndexRange, MatrixBinaryOp,
+        NodeKind, ParallelLoop, SampleRange, SequentialLoop,
     },
     types::{MatrixType, WireType},
 };
@@ -732,9 +732,7 @@ impl Ring {
                 matrix_type: matrix_type.clone(),
                 variant,
                 tag_prefix: tag.prefix,
-                tag_expressions: tag.binary,
-                tag_decimal_expressions: tag.decimal,
-                tag_u64_le_expressions: tag.u64_le,
+                tag_components: tag.components,
                 base: Some(base),
                 digit_count,
             },
@@ -769,9 +767,7 @@ impl Ring {
                 matrix_type: ty.clone(),
                 variant,
                 tag_prefix: tag.prefix,
-                tag_expressions: tag.binary,
-                tag_decimal_expressions: tag.decimal,
-                tag_u64_le_expressions: tag.u64_le,
+                tag_components: tag.components,
                 base,
                 digit_count,
             },
@@ -866,12 +862,14 @@ impl Ring {
     }
 }
 
+/// A fixed caller-chosen namespace prefix followed by ordered, typed components.
+/// Keep the raw prefix fixed within a sampling domain; use `push` for variable data.
+/// Component framing changes sampled values relative to older grouped tags, so persisted
+/// hash-derived artifacts must be rebuilt when adopting this encoding.
 #[derive(Clone, Default)]
 pub struct HashTag {
     prefix: Vec<u8>,
-    binary: Vec<IntExpr>,
-    decimal: Vec<IntExpr>,
-    u64_le: Vec<IntExpr>,
+    components: Vec<HashTagComponent>,
     dynamic: Vec<ValueHandle>,
     pending: Pending,
 }
@@ -887,7 +885,9 @@ impl HashTag {
 
     pub fn push_decimal(&mut self, index: impl Into<Int>) -> Result<(), DslError> {
         let index = index.into();
-        self.decimal.push(index.compile_expression().ok_or(DslError::CompileTimeIndex)?);
+        self.components.push(HashTagComponent::Decimal(
+            index.compile_expression().ok_or(DslError::CompileTimeIndex)?,
+        ));
         self.pending = Pending::merge([std::mem::take(&mut self.pending), index.pending]);
         Ok(())
     }
@@ -911,8 +911,7 @@ pub trait HashTagPart {
 
 impl HashTagPart for &str {
     fn append_to(self, tag: &mut HashTag) {
-        tag.prefix.extend_from_slice(self.as_bytes());
-        tag.prefix.push(0);
+        tag.components.push(HashTagComponent::Bytes(self.as_bytes().to_vec()));
     }
 }
 
@@ -924,7 +923,7 @@ impl HashTagPart for String {
 
 impl HashTagPart for IntExpr {
     fn append_to(self, tag: &mut HashTag) {
-        tag.u64_le.push(self);
+        tag.components.push(HashTagComponent::U64Le(self));
     }
 }
 
@@ -934,9 +933,12 @@ impl HashTagPart for Int {
             NodeKind::EvaluateInt(expression @ IntExpr::LoopIndex(_))
                 if self.compile_expression().is_some() =>
             {
-                tag.u64_le.push(expression.clone())
+                tag.components.push(HashTagComponent::U64Le(expression.clone()));
             }
-            _ => tag.dynamic.push(self.value),
+            _ => {
+                tag.components.push(HashTagComponent::Operand(tag.dynamic.len() + 1));
+                tag.dynamic.push(self.value);
+            }
         }
         tag.pending = Pending::merge([std::mem::take(&mut tag.pending), self.pending]);
     }
@@ -2154,6 +2156,41 @@ mod tests {
         );
         assert!(all_nodes.clone().any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic)));
         assert!(all_nodes.any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))));
+    }
+
+    #[test]
+    fn hash_tag_components_preserve_mixed_insertion_order() {
+        let ring = Ring::new(17, 8);
+        let mut tag = HashTag::from(b"ordered-tag:".as_slice());
+        tag.push("before");
+        tag.push(IntExpr::constant(3));
+        tag.push("middle");
+        tag.push_decimal(23).unwrap();
+        tag.push(Int::constant(7));
+        tag.push("after");
+        let sample = ring.hash_matrix(ring.bytes_input("key", 32), tag, (1, 1));
+        let built =
+            DslContext::new("ordered-tags").output("sample", sample).unwrap().build().unwrap();
+        let hash = built
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
+            .unwrap();
+        let NodeKind::HashSample { tag_components, .. } = hash.kind() else { unreachable!() };
+        assert_eq!(
+            tag_components,
+            &vec![
+                HashTagComponent::Bytes(b"before".to_vec()),
+                HashTagComponent::U64Le(3.into()),
+                HashTagComponent::Bytes(b"middle".to_vec()),
+                HashTagComponent::Decimal(23.into()),
+                HashTagComponent::Operand(1),
+                HashTagComponent::Bytes(b"after".to_vec()),
+            ]
+        );
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]

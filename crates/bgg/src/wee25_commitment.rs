@@ -251,6 +251,7 @@ mod tests {
             for digit_row in 0..compiler.gadget_rows() {
                 let index = column * compiler.gadget_rows() + digit_row;
                 let mut tag = HASH_TAG_PREFIX.to_vec();
+                tag.push(3); // Typed u64 little-endian hash component.
                 tag.extend_from_slice(&index.to_le_bytes());
                 let w = sampler.sample_hash(
                     parameters,

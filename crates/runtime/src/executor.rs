@@ -4884,6 +4884,92 @@ mod tests {
     }
 
     #[test]
+    fn zero_integer_hash_tags_match_the_lean_encoding() {
+        use mxx_ir_core::node::{HashTagComponent, HashVariant};
+        use mxx_primitives::sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler};
+
+        // num-bigint 0.4 represents zero with one magnitude byte, not an empty magnitude.
+        assert_eq!(BigInt::from(0).to_bytes_be(), (Sign::NoSign, vec![0]));
+        let mut encoded = Vec::new();
+        append_tag_integer(&mut encoded, &BigInt::from(0));
+        assert_eq!(encoded, vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+
+        let parameters = DCRTPolyParams::default();
+        let matrix_type = mxx_ir_core::types::MatrixType {
+            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()).into(),
+            ring_dimension: (parameters.ring_dimension() as usize).into(),
+            rows: 1.into(),
+            columns: 1.into(),
+        };
+        let key_type = WireType::Bytes { length: 32.into() };
+        let key = NodeHandle::new(
+            NodeKind::Input { name: "key".into(), wire_type: key_type.clone(), artifact: None },
+            vec![],
+            vec![key_type],
+        )
+        .output(0)
+        .unwrap();
+        let operand = NodeHandle::new(
+            NodeKind::Input { name: "zero".into(), wire_type: WireType::Int, artifact: None },
+            vec![],
+            vec![WireType::Int],
+        )
+        .output(0)
+        .unwrap();
+        let outputs = [
+            ("static", HashTagComponent::Integer(0.into())),
+            ("dynamic", HashTagComponent::Operand(1)),
+        ]
+        .into_iter()
+        .map(|(name, component)| {
+            let value = NodeHandle::new(
+                NodeKind::HashSample {
+                    matrix_type: matrix_type.clone(),
+                    variant: HashVariant::Plain,
+                    tag_prefix: b"zero-tag:".to_vec(),
+                    tag_components: vec![component],
+                    base: None,
+                    digit_count: None,
+                },
+                vec![key.clone(), operand.clone()],
+                vec![WireType::Matrix(matrix_type.clone())],
+            )
+            .output(0)
+            .unwrap();
+            (name.to_owned(), GraphOutput { value, confidentiality: None })
+        })
+        .collect();
+        let graph =
+            Graph::freeze("zero-tag", vec![], outputs, vec![], vec![], BTreeMap::new()).unwrap().0;
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        let result = execute(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([
+                ("key".to_owned(), RuntimeValue::Bytes(vec![0x57; 32])),
+                ("zero".to_owned(), RuntimeValue::Int(0.into())),
+            ]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        // Same literal bytes as the Lean completeHashTag zero regression: integer marker,
+        // nonnegative sign, big-endian length one, and one zero magnitude byte.
+        let mut tag = b"zero-tag:".to_vec();
+        tag.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+        let expected = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new().sample_hash(
+            &parameters,
+            [0x57; 32],
+            tag,
+            1,
+            1,
+            DistType::FinRingDist,
+        );
+        assert_eq!(matrix_output(&result, "static"), &expected);
+        assert_eq!(matrix_output(&result, "dynamic"), &expected);
+    }
+
+    #[test]
     fn hash_tag_framing_separates_decimal_tuples_and_component_order() {
         use mxx_ir_core::node::{HashTagComponent as Part, HashVariant};
         let parameters = DCRTPolyParams::default();

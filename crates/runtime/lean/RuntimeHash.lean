@@ -13,6 +13,7 @@ structure HashModel where
 def u64LittleEndian (value : Nat) : Blob :=
   (List.range 8).map (fun index ↦ UInt8.ofNat (value / 256 ^ index))
 
+-- num-bigint 0.4 to_bytes_be returns a one-byte magnitude [0] for zero.
 def signedIntegerTag (value : Int) : Blob :=
   let magnitude := if value.natAbs = 0 then [0] else (Nat.digits 256 value.natAbs).reverse
   [if value < 0 then 1 else 0] ++ (u64LittleEndian magnitude.length).reverse ++

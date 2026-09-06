@@ -75,6 +75,7 @@ fn export_hash_fixture() {
     let proof = r#"
 example : MxxRuntime.signedIntegerTag (-256) = [1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0] := by decide
 example : MxxRuntime.signedIntegerTag 0 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 0] := by decide
+example : MxxRuntime.completeHashTag [] [.integer 0] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0] := by decide
 example : MxxRuntime.u64LittleEndian 258 = [2, 1, 0, 0, 0, 0, 0, 0] := by decide
 example : MxxRuntime.completeHashTag [] [.decimal (-42)] = [2, 0, 0, 0, 0, 0, 0, 0, 3, 45, 52, 50] := by decide
 

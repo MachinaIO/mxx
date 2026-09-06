@@ -1,13 +1,10 @@
 //! BGG+ constructions expressed directly with the declarative graph DSL.
 
-pub mod attribute_encoding;
 pub mod boolean;
 pub mod circuit;
 pub mod encoding;
 pub mod lwe_lookup;
-pub mod masked_decoder;
 pub mod naive_vec;
-pub mod noise_refresh;
 pub mod public_key;
 pub mod slot_operation;
 pub mod tall_encoding;
@@ -19,10 +16,6 @@ pub mod wee25_public_parameters;
 #[cfg(test)]
 mod test_utils;
 
-pub use attribute_encoding::{
-    AttributeEncodingCompiler, AttributeEncodingWire, AttributeEvaluationError,
-    AttributeMatrixEvaluation,
-};
 pub use boolean::{
     BggEncodingFamily, BggPublicKeyFamily, DynamicBooleanBggError,
     evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
@@ -45,18 +38,9 @@ pub use lwe_lookup::{
     bind_lwe_lookup_invocations, bind_naive_lwe_lookup_invocations, collect_lwe_lookup_identities,
     collect_lwe_lookup_identities_with_prefix,
 };
-pub use masked_decoder::{
-    MASKED_DECODER_PREIMAGES, MaskedHighBitDecoderArtifacts, MaskedHighBitDecoderCompiler,
-    MaskedHighBitDecoderError, MaskedHighBitDecoderOutputs, MaskedHighBitDecoderPreprocessingWires,
-};
 pub use naive_vec::{
     NaiveBggEncodingVecSampler, NaiveBggEncodingVecWire, NaiveBggPublicKeyVecSampler,
     NaiveBggPublicKeyVecWire, NaiveBggVecCompiler, NaiveVecCompileError,
-};
-pub use noise_refresh::{
-    NOISE_REFRESH_A_PRIME, NOISE_REFRESH_DECODER_PREIMAGES, NaiveBggNoiseRefreshArtifactWires,
-    NaiveBggNoiseRefreshArtifacts, NaiveBggNoiseRefreshCompiler, NaiveBggNoiseRefreshError,
-    NaiveBggNoiseRefreshPreprocessingWires,
 };
 pub use public_key::{
     BggPublicKeyCompiler, BggPublicKeySampler, BggPublicKeyType, BggPublicKeyWire,

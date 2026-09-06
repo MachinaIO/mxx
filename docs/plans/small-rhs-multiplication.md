@@ -623,12 +623,11 @@ its gate, and records the exact result for the next daily review.
    formulas, error-term modeling, or noise accuracy behavior; no simulator
    redesign is part of this task.
 6. **Application call sites:** migrate every RHS use in
-   `crates/bgg/src/{attribute_encoding,boolean,encoding,masked_decoder,
-   lwe_lookup,naive_vec,noise_refresh,public_key,slot_operation,tall_encoding,
+   `crates/bgg/src/{boolean,encoding,
+   lwe_lookup,naive_vec,public_key,slot_operation,tall_encoding,
    wee25_commitment,wee25_opening,wee25_public_parameters}.rs`,
-   `crates/gadgets/src/input_injector.rs`,
-   `crates/we/src/diamond/{graph,estimate,estimate_gpu}.rs`, and
-   `crates/io/src/{diamond/graph.rs,aky24/prfe.rs}`.  Replace `.as_mat()` at
+   `crates/gadgets/src/input_injector.rs`, and
+   `crates/we/src/diamond/{graph,estimate,estimate_gpu}.rs`.  Replace `.as_mat()` at
    each actual small-RHS consumer with `mul_small_rhs`; preserve ordinary
    matrix operations where the RHS is not bounded.  Update application
    artifact declarations and family imports rather than adding adapters.

@@ -12,11 +12,11 @@ mxx-dsl                  -> mxx-ir-core
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
 mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
-mxx-func-enc/io          -> lower layers when their application modules are enabled
+mxx-func-enc/io          -> interface-only crates with no dependencies
 ```
 
 Application crates never depend on one another. Diamond WE is active in `mxx-we`; functional
-encryption and iO protocol modules remain disabled.
+encryption and iO protocol implementations have been removed during the DSL migration.
 
 ## Responsibilities
 
@@ -76,8 +76,10 @@ worst-case bounds and accepts a candidate only after Lean checks the generated t
 same frozen workflow, backend layout, and concrete parameter environment. The selected candidate
 retains its checked artifact; numerical rejection and checker failures remain distinct.
 
-`mxx-func-enc` and `mxx-io` currently expose compiling interface shells. Their protocol modules
-remain disabled. They need application-owned correctness implementations before being enabled.
+`mxx-func-enc` and `mxx-io` expose only their common interface traits. The disabled AKY24 FE,
+AKY24 iO, and Diamond iO modules and their exclusive BGG helpers have been removed. See the
+README for the `main` branch containing the latest iO implementations. Reusable implementations
+in `mxx-gadgets` remain available.
 
 Tall's old-simulator-dependent parameter search and noisy verification modes are explicitly
 unavailable pending a Tall-specific correctness implementation. The independent noiseless runtime

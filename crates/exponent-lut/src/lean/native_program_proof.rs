@@ -364,7 +364,7 @@ pub(super) fn native_program_proof(
         return Err("incomplete native reduction coverage".into());
     }
     let mut source = String::from(
-        "import ExecutionWitnesses\nimport RootProgramContext\nimport RootPrivate\nimport RootCacheAlignment\nimport RootProgramKeys\nimport RootProgramSetup\nimport RootReduction\nimport ExponentNativeProgram\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedNativeProgramProof\nopen Mxx.Primitives MxxExponentLut GeneratedClaim ExponentGeneratedExecution\nopen scoped BigOperators\n\n",
+        "import ExecutionWitnesses\nimport RootProgramContext\nimport RootPrivate\nimport RootCacheAlignment\nimport RootProgramKeys\nimport RootProgramSetup\nimport RootReduction\nimport ExponentNativeProgram\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedNativeProgramProof\nopen Mxx.Primitives MxxRuntime MxxExponentLut GeneratedClaim ExponentGeneratedExecution\nopen scoped BigOperators\n\n",
     );
     source.push_str(&format!("abbrev nativeBound0 : Nat := {initial_cutoff}\n"));
     let mut previous_key = None;
@@ -516,6 +516,9 @@ pub(super) fn native_program_proof(
         values.insert("bridges", bridges);
         source.push_str(&format!("abbrev nativeBound{} : Nat := {} * (denseRegularGain RefreshBackend.layout{layout_index} {n} 2 * nativeBound{j} + {private_cutoff} + denseRegularGain RefreshBackend.layout{layout_index} {n} 2 * {})\n", j + 1, stage.members, values["public_cutoff"]));
         source.push_str(&render(STAGE, &values)?);
+        if j == 0 {
+            source.push_str(&render(FIRST_STAGE_APPROX, &values)?);
+        }
         previous_key = Some(key.output);
         previous_output = Some(output);
     }
@@ -535,8 +538,24 @@ pub(super) fn native_program_proof(
         source.push_str(&format!("#print axioms ExponentGeneratedNativeProgramProof.stage_{j}\n"));
     }
     source.push_str("#print axioms ExponentGeneratedNativeProgramProof.programOutputApprox\n");
+    source.push_str("#print axioms ExponentGeneratedNativeProgramProof.first_stage_approx\n");
     Ok(source)
 }
+const FIRST_STAGE_APPROX: &str = r#"theorem first_stage_approx
+    {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
+    (runs : Runs hashModel external execution) (lane : Fin @lanes@) :
+    let pw := preprocessingWitness runs
+    let vw := verificationWitness runs
+    let cw := programWitness runs lane
+    ∃ message : ExactPoly @q@ @n@, StridedMonomial @stride@ @width@ message ∧
+      Approx (@output@) (@mask@ * ((@key@) lane) - message • (@payload@ * (@gadget@)))
+        nativeBound1 := by
+  obtain ⟨state, derived, ciphertext, key, message, mask, payload⟩ := stage_0 runs lane
+  refine ⟨state.message, message, ?_⟩
+  have invariant := derived.sound (by decide : 0 < @n@)
+  simpa only [ProgramState.Invariant, ciphertext, key, mask, payload] using invariant
+
+"#;
 const STAGE: &str = r#"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}
     (runs : Runs hashModel external execution) (lane : Fin @lanes@) :
     let pw := preprocessingWitness runs
@@ -576,6 +595,7 @@ const STAGE: &str = r#"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} 
     intro i
     obtain ⟨selected,hlo,hhi,hget,hout⟩ := @cache_fact@ i
     obtain ⟨position,hindex,hselected⟩ := hget
+    dsimp only at hindex
     have indexEquation := @cache_index_fact@ i
     norm_num [@cache_index_relation@] at indexEquation
     have same : position = flat i := by apply Fin.ext; dsimp [flat]; clear * - lane i hindex indexEquation; omega

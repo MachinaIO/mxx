@@ -5,9 +5,9 @@ use mxx_ir_core::{
     FrozenGraphScopeId, IntExpr, ParamEnv, ValidatedGraph,
     lean::{BoundaryValue, LeanArtifact},
     node::{ConcatAxis, LoopInputMode, MatrixBinaryOp, NodeKind},
-    types::{ConcreteWireType, WireRef},
+    types::{ConcreteWireType, NodeId, WireRef},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn boundary_type(values: &BTreeMap<String, BoundaryValue>, count: usize) -> String {
     let mut types = vec![String::new(); count];
@@ -52,6 +52,7 @@ fn index_expression(expr: &IntExpr, slot: u32) -> Result<String, String> {
 pub(super) fn root_online_readout(
     graph: &ValidatedGraph,
     artifact: &LeanArtifact,
+    dependencies: &BTreeSet<NodeId>,
 ) -> Result<String, String> {
     let root = graph.source.root_scope();
     let shape = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
@@ -74,18 +75,24 @@ pub(super) fn root_online_readout(
         artifact.root.parameter_type
     );
     let mut source = format!(
-        "import {}\nimport ExponentInputSlice\nimport ExponentDecomposition\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace ExponentGeneratedOnlineReadout\nopen Mxx.Primitives MxxExponentLut\n\nabbrev RootInput := {}\nabbrev RootOutput := {}\n\n",
+        "import {}\nimport ExponentInputSlice\nimport RuntimeDecomposition\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace ExponentGeneratedOnlineReadout\nopen Mxx.Primitives MxxRuntime MxxExponentLut\n\nabbrev RootInput := {}\nabbrev RootOutput := {}\n\n",
         artifact.module_name,
         boundary_type(&artifact.root.inputs, artifact.root.input_count),
         boundary_type(&artifact.root.outputs, artifact.root.output_count)
     );
     let mut branches = 0;
     let mut masks = 0;
+    let mut emitted = BTreeSet::new();
     for (id, child) in graph.source.scopes() {
         let FrozenGraphScopeId::ParallelBody { parent, owner } = id else {
             continue;
         };
         if !matches!(parent.as_ref(), FrozenGraphScopeId::Root) {
+            continue;
+        }
+        // The consumer records actual graph producers at each proof reference.
+        // Do not emit unrelated route-family facts with deep root projections.
+        if !dependencies.contains(owner) {
             continue;
         }
         let root_node = root.node(*owner).ok_or("missing loop owner")?;
@@ -135,10 +142,12 @@ pub(super) fn root_online_readout(
                 _ => None,
             };
             if let Some(operator) = operator {
+                emitted.insert(*owner);
                 let left = input_value(args[0])?;
                 let right = input_value(args[1])?;
                 source.push_str(&format!("-- Actual family operation node {}.\ntheorem family_operation_{} {binders} :\n    ∀ i : Fin {lanes}, ({output}) i = ({left}) {operator} ({right}) := by\n  intro i\n  exact {family_fact} i\n\n", owner.0, owner.0));
             } else if matches!(node.kind(), NodeKind::FamilyGetDynamic) {
+                emitted.insert(*owner);
                 let family = input_value(args[0])?;
                 let index = input_value(args[1])?;
                 let ConcreteWireType::IndexedFamily { count, .. } = &child_types[&args[0]] else {
@@ -180,6 +189,7 @@ pub(super) fn root_online_readout(
             let output_path = ".2".repeat(proof.constraint_count);
             source.push_str(&format!("theorem raw_branch_{} {binders} :\n    ∀ i : Fin {lanes}, ∃ raw : ExactMatrix {q} {n} {rows} {columns},\n      MxxRuntime.ringAutomorphismRuns ({index}) ({transformed}) raw ∧\n      ({output}) i = ({aligned}) + raw * ({switch}) := by\n  intro i\n  obtain ⟨{witnesses}, childFacts⟩ := {family_fact} i\n  exact ⟨_, {hr}, childFacts{output_path}⟩\n\n", owner.0));
             branches += 1;
+            emitted.insert(*owner);
         }
         // Helper masks are the right block of the actual Gaussian encoding.
         for (port, selected) in child.outputs().iter().enumerate() {
@@ -274,11 +284,13 @@ pub(super) fn root_online_readout(
             let key_projection = ".2".repeat(mask_key_port) + ".1";
             source.push_str(&format!("theorem helper_mask_{} {binders}\n    (gadget : ExactMatrix {q} {n} 2 {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, ∃ error : ErrorMatrix {n} 1 {columns},\n      ({mask}) i = ({secret}) * (({mask_key}) i) -\n        MxxRuntime.ringAutomorphism ({index}).toNat ({secret}) * gadget +\n          reduceMatrix {q} {n} 1 {columns} error ∧ CoeffBound error ({cutoff} : Nat) := by\n  intro i\n  obtain ⟨{witnesses}, childFacts⟩ := {family_fact} i\n  obtain ⟨error, he, hb⟩ := gaussian_error_witness {hgaussian}\n  have bounded := initial_right_block {hpublic} {hmessage} {htensor} {hslice}\n    ⟨error, by rw [he]; rfl, hb⟩\n  have maskOutput := congrArg (fun result => result{mask_projection}) childFacts{output_path}\n  have keyOutput := congrArg (fun result => result{key_projection}) childFacts{output_path}\n  dsimp only at maskOutput keyOutput\n  have autoEquation := ({hauto}).2.2.2\n  have same : {gadget_name} = gadget := gadget_runs_deterministic {hgadget} gadgetRuns\n  obtain ⟨selectedError, selectedEquation, selectedBound⟩ := bounded\n  refine ⟨selectedError, ?_, selectedBound⟩\n  rw [maskOutput, selectedEquation, keyOutput, autoEquation, same]\n  simp [MxxRuntime.matrixMul]\n\n", owner.0));
             masks += 1;
+            emitted.insert(*owner);
         }
     }
-    if branches == 0 || masks == 0 {
+    if branches == 0 || masks == 0 || emitted != *dependencies {
         return Err(format!(
-            "readout execution extraction incomplete: {branches} branches, {masks} masks"
+            "readout execution extraction incomplete: {branches} branches, {masks} masks; missing producers {:?}",
+            dependencies.difference(&emitted).collect::<Vec<_>>()
         ));
     }
     source.push_str("end ExponentGeneratedOnlineReadout\n");

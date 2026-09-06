@@ -1,4 +1,4 @@
-import ExponentDecomposition
+import RuntimeDecomposition
 
 namespace MxxExponentLut
 open Mxx.Primitives MxxRuntime
@@ -105,13 +105,14 @@ theorem regularDecomposeMatrix_sparse_gain {q n rows columns : Nat}
     (layout : RegularLayout q) (hq : 1 < q) (hn : 0 < n)
     {target : ExactMatrix q n rows columns} {row : Fin columns → Fin rows}
     {position : Fin columns → Fin n} {value : Fin columns → Int}
-    (hsparse : SparseTarget target row position value) :
-    ∃ witness : ErrorMatrix n (rows * (layout.crtModuli.length * layout.digitsPerTower)) columns,
+    (hsparse : SparseTarget (regularCorrectedTarget layout target) row position value) :
+    ∃ witness : ErrorMatrix n (rows * layout.digitCount) columns,
       regularDecomposeMatrix layout target =
-        reduceMatrix q n (rows * (layout.crtModuli.length * layout.digitsPerTower)) columns witness ∧
+        reduceMatrix q n (rows * layout.digitCount) columns witness ∧
       ActionGain witness (sparseRegularGain layout value) :=
-  ⟨regularIntegerDigits layout target, regularIntegerDigits_reduce layout hq hn target,
-    regularIntegerDigits_sparse_gain layout hn hsparse⟩
+  ⟨retainedIntegerDigits layout target, retainedIntegerDigits_reduce layout hq hn target,
+    retainedIntegerDigits_action_gain_of_full layout target
+      (regularIntegerDigits_sparse_gain layout hn hsparse)⟩
 
 /-- Direct bridge from an exported regular-decomposition execution to its
 sparse integer action witness and exact maximum-column gain. -/
@@ -122,11 +123,11 @@ theorem gadgetDecomposeRuns_sparse_gain {q n rows columns inner : Nat}
     {decomposition : ExactMatrix q n inner columns} {row : Fin columns → Fin rows}
     {position : Fin columns → Fin n} {value : Fin columns → Int}
     (hrun : gadgetDecomposeRuns backend base digits target decomposition)
-    (hsparse : SparseTarget target row position value) :
+    (hsparse : SparseTarget (regularCorrectedTarget layout target) row position value) :
     ∃ witness : ErrorMatrix n inner columns,
       decomposition = reduceMatrix q n inner columns witness ∧
       ActionGain witness (sparseRegularGain layout value) := by
-  obtain ⟨other, hother, _, _, hwidth, hd⟩ := hrun
+  obtain ⟨other, hother, _, _, hwidth, hd, _⟩ := hrun
   have hl : other = layout := Option.some.inj (hother.symm.trans hlookup)
   subst other
   subst inner

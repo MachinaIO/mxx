@@ -81,6 +81,247 @@ fn selectors(expression: &str) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
+/// Prove the actual gathered scalar table for one route family.
+pub(super) fn route_scalar_proofs(
+    pre: &ValidatedGraph,
+    pa: &LeanArtifact,
+    snapshot: &ExponentLutNoiseSnapshot,
+    gather: WireRef,
+    n: usize,
+    columns: usize,
+    digits: &[usize],
+    fresh: bool,
+    role: &str,
+) -> Result<(String, bool), String> {
+    let root = pre.source.root_scope();
+    let shape = pa.scope_proofs.get(&FrozenGraphScopeId::Root).ok_or("missing PRE proof shape")?;
+    let args = |wire: WireRef| {
+        root.node(wire.node)
+            .and_then(|node| root.arguments(node))
+            .ok_or_else(|| "missing route scalar operands".to_string())
+    };
+    let refresh = &snapshot.refresh;
+    let slots = refresh.slot_count;
+    let q = refresh.global_modulus.as_ref().ok_or("missing route full modulus")?;
+    let record = shape.witness_record.as_ref().ok_or("missing PRE witness")?;
+    let body = shape.body_relation.as_ref().ok_or("missing PRE body")?;
+    let params = &pa.root.parameter_type;
+    let coordinates = columns.checked_mul(n).ok_or("route coordinate overflow")?;
+    let total = digits
+        .iter()
+        .try_fold(0usize, |sum, digit| {
+            coordinates.checked_mul(*digit).and_then(|count| sum.checked_add(count))
+        })
+        .ok_or("route count overflow")?;
+    let mut source = String::new();
+    let gather_scope = pre.source.scopes().get(&child(gather)).ok_or("missing route gather")?;
+    let getter = gather_scope.node(gather_scope.outputs()[0].node).ok_or("missing route getter")?;
+    if !matches!(getter.kind(), NodeKind::FamilyGetDynamic) {
+        return Err("route scales are not gathered".into());
+    }
+    let getter_args = gather_scope.arguments(getter).ok_or("missing route gather operands")?;
+    let gather_args = args(gather)?;
+    let capture = |wire| -> Result<WireRef, String> {
+        let i = gather_scope
+            .inputs()
+            .iter()
+            .position(|input| *input == wire)
+            .ok_or("route gather operand not captured")?;
+        gather_args.get(i).copied().ok_or("route gather capture missing".into())
+    };
+    let pack = capture(getter_args[0])?;
+    let indices = capture(getter_args[1])?;
+    let pack_count = args(pack)?.len();
+    let digit_total: usize = digits.iter().sum();
+    if !matches!(root.node(pack.node).map(|node| node.kind()), Some(NodeKind::FamilyPack { .. })) ||
+        (pack_count != slots && pack_count != digit_total)
+    {
+        return Err(format!(
+            "route scale table is not the actual {slots}-slot pack: node={:?}, operands={}",
+            root.node(pack.node).map(|node| node.kind()),
+            args(pack)?.len(),
+        ));
+    }
+    let index_scope = pre.source.scopes().get(&child(indices)).ok_or("missing route indices")?;
+    let index_node =
+        index_scope.node(index_scope.outputs()[0].node).ok_or("missing route index")?;
+    let digit_table =
+        if matches!(index_node.kind(), NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add)) {
+            if pack_count != digit_total {
+                return Err("corrected route table does not contain every slot digit".into());
+            }
+            let operands =
+                index_scope.arguments(index_node).ok_or("missing route index addends")?;
+            let captures = args(indices)?;
+            let resolve = |wire| -> Result<WireRef, String> {
+                let position = index_scope
+                    .inputs()
+                    .iter()
+                    .position(|input| *input == wire)
+                    .ok_or("route index addend is not a captured family")?;
+                captures.get(position).copied().ok_or("missing route index capture".into())
+            };
+            if operands.len() != 2 {
+                return Err("route index must add offset and digit".into());
+            }
+            let offsets = resolve(operands[0])?;
+            let digit_indices = resolve(operands[1])?;
+            let offset_scope =
+                pre.source.scopes().get(&child(offsets)).ok_or("missing route offsets")?;
+            let getter =
+                offset_scope.node(offset_scope.outputs()[0].node).ok_or("missing offset getter")?;
+            if !matches!(getter.kind(), NodeKind::FamilyGetDynamic) {
+                return Err("route offset is not selected from its actual table".into());
+            }
+            let operands = offset_scope.arguments(getter).ok_or("missing offset operands")?;
+            let captures = args(offsets)?;
+            let resolve = |wire| -> Result<WireRef, String> {
+                let position = offset_scope
+                    .inputs()
+                    .iter()
+                    .position(|input| *input == wire)
+                    .ok_or("route offset operand is not captured")?;
+                captures.get(position).copied().ok_or("missing route offset capture".into())
+            };
+            let offset_pack = resolve(operands[0])?;
+            let slot_indices = resolve(operands[1])?;
+            if !matches!(
+                root.node(offset_pack.node).map(|node| node.kind()),
+                Some(NodeKind::FamilyPack { .. })
+            ) || args(offset_pack)?.len() != slots
+            {
+                return Err("route offset table does not cover every slot".into());
+            }
+            Some((offsets, digit_indices, offset_pack, slot_indices))
+        } else {
+            if pack_count != slots {
+                return Err("slot route table has wrong width".into());
+            }
+            None
+        };
+    let index_shape = pa.scope_proofs.get(&child(indices)).ok_or("missing route index proof")?;
+    if !index_shape.witnesses.is_empty() {
+        return Err("route index body is not pure".into());
+    }
+    let index_value = value(shape, indices)?;
+    let gather_value = value(shape, gather)?;
+    let index_fact = fact(shape, indices)?;
+    let gather_fact = fact(shape, gather)?;
+    let pack_fact = fact(shape, pack)?;
+    let index_unfold = unfold(pa, indices)?;
+    let index_path = ".2".repeat(index_shape.constraint_count);
+    let base_p = &refresh.base_p;
+    if digit_table.is_some() {
+        let entries = args(pack)?
+            .iter()
+            .map(|wire| value(shape, *wire))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        source.push_str(&format!("noncomputable def {role}ScalarEntries : List (ExactMatrix {q} {n} 1 1) := [{entries}]\n\n"));
+    }
+    let mut offset = 0usize;
+    let mut scalar_offset = 0usize;
+    for (slot, digit_count) in digits.iter().copied().enumerate() {
+        let divisor =
+            if !fresh { &refresh.switch_moduli[slot] } else { &refresh.plaintext_moduli[slot] };
+        if *divisor == num_bigint::BigUint::from(0u8) ||
+            q % divisor != num_bigint::BigUint::from(0u8)
+        {
+            return Err("route scale candidate is not an exact quotient".into());
+        }
+        let scale = q / divisor;
+        let actual_scale = if digit_table.is_some() {
+            format!(
+                "{role}ScalarEntries[{scalar_offset} + digit.val]'(by simp [{role}ScalarEntries] <;> omega)"
+            )
+        } else {
+            value(shape, args(pack)?[slot])?
+        };
+        let scalar_index = if digit_table.is_some() {
+            format!("{scalar_offset} + digit.val")
+        } else {
+            slot.to_string()
+        };
+        let scale_expression = if digit_table.is_some() {
+            format!("({scale} : Int) * ({base_p} : Int)^digit.val")
+        } else {
+            scale.to_string()
+        };
+        let scale_proof = if digit_table.is_some() {
+            source.push_str(&format!("theorem {role}_scalar_entries_{slot} : ∀ digit : Fin {digit_count},\n    {actual_scale} = MxxRuntime.liftInteger ({scale_expression}) := by\n  intro digit\n  fin_cases digit <;> dsimp [{role}ScalarEntries] <;> ext row column <;> norm_num [{role}ScalarEntries, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger, MxxIR.exactDiv]\n\n"));
+            format!("    exact {role}_scalar_entries_{slot} digit\n")
+        } else {
+            "    funext row column\n    norm_num [MxxIR.exactDiv, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger]\n".into()
+        };
+        let index_normalize = if !fresh {
+            format!(
+                "    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ {total} by decide)] at he\n"
+            )
+        } else {
+            String::new()
+        };
+        let index_proof = if let Some((offsets, digit_indices, offset_pack, slot_indices)) =
+            digit_table
+        {
+            let slot_shape =
+                pa.scope_proofs.get(&child(slot_indices)).ok_or("missing slot index proof")?;
+            let digit_shape =
+                pa.scope_proofs.get(&child(digit_indices)).ok_or("missing digit index proof")?;
+            if !slot_shape.witnesses.is_empty() || !digit_shape.witnesses.is_empty() {
+                return Err("route coordinate indices must be pure".into());
+            }
+            let slot_unfold = unfold(pa, slot_indices)?;
+            let digit_unfold = unfold(pa, digit_indices)?;
+            let slot_path = ".2".repeat(slot_shape.constraint_count);
+            let digit_path = ".2".repeat(digit_shape.constraint_count);
+            let digit_scope =
+                pre.source.scopes().get(&child(digit_indices)).ok_or("missing digit body")?;
+            let mut digit_selectors = String::new();
+            for (i, selector) in
+                selectors(&value(digit_shape, digit_scope.outputs()[0])?)?.iter().enumerate()
+            {
+                digit_selectors.push_str(&format!("    have slotSelector{i} : {selector} = ({slot} : Int) := by\n      simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ {total} by decide)]\n      dsimp [idx]\n      omega\n    simp only [slotSelector{i}] at he\n"));
+            }
+            format!(
+                "  have slotIndexEq : ({slot_value}) idx = ({slot} : Int) := by\n    have h := {slot_fact} idx\n    dsimp only [{slot_unfold}] at h\n    have he := h{slot_path}\n    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ {total} by decide)] at he\n    dsimp [idx] at he ⊢\n    norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at he\n    omega\n  have digitIndexEq : ({digit_value}) idx = (digit.val : Int) := by\n    have h := {digit_fact} idx\n    dsimp only [{digit_unfold}] at h\n    have he := h{digit_path}\n{digit_selectors}    norm_num [MxxIR.selectInt, List.getElem_cons] at he\n{digit_modulo}    clear * - component coefficient digit idx he\n    dsimp [idx] at he ⊢\n    norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at he\n    omega\n  have offsetEq : ({offset_value}) idx = ({scalar_offset} : Int) := by\n    obtain ⟨selected, hlo, hhi, hget, hout⟩ := {offset_fact} idx\n    have hselected := route_lookup_eq (⟨{slot}, by decide⟩ : Fin {slots}) slotIndexEq hget\n    have hp := route_pack_at {offset_pack_fact} (⟨{slot}, by decide⟩ : Fin {slots})\n    rw [hout, hselected]\n    dsimp only\n    rw [hp]\n    rfl\n  have indexEq : ({index_value}) idx = ({scalar_index} : Int) := by\n    have he := {index_fact} idx\n    change ({index_value}) idx = ({offset_value}) idx + ({digit_value}) idx at he\n    simpa only [offsetEq, digitIndexEq, Nat.cast_add, Nat.cast_ofNat] using he\n",
+                digit_modulo = if digit_count > 1 {
+                    format!(
+                        "    rw [Int.fmod_eq_emod_of_nonneg _ (show (0 : Int) ≤ {digit_count} by decide)] at he\n"
+                    )
+                } else {
+                    String::new()
+                },
+                slot_value = value(shape, slot_indices)?,
+                slot_fact = fact(shape, slot_indices)?,
+                digit_value = value(shape, digit_indices)?,
+                digit_fact = fact(shape, digit_indices)?,
+                offset_value = value(shape, offsets)?,
+                offset_fact = fact(shape, offsets)?,
+                offset_pack_fact = fact(shape, offset_pack)?
+            )
+        } else {
+            format!(
+                "  have indexEq : ({index_value}) idx = ({slot} : Int) := by\n    have h := {index_fact} idx\n    dsimp only [{index_unfold}] at h\n    have he := h{index_path}\n    clear * - component coefficient digit idx he\n{index_normalize}    dsimp [idx] at he ⊢\n    norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at he\n    omega\n"
+            )
+        };
+        let flat = format!(
+            "{offset} + (component.val * {n} + coefficient.val) * {digit_count} + digit.val"
+        );
+        let binders = format!(
+            "(component : Fin {columns}) (coefficient : Fin {n}) (digit : Fin {digit_count})"
+        );
+        let bound = "by clear * - component coefficient digit; omega";
+        let idx = format!("⟨{flat}, {bound}⟩");
+        let scale_proof_body = format!(
+            "{index_proof}  have packEq := route_pack_at {pack_fact} (⟨{scalar_index}, by omega⟩ : Fin {pack_count})\n  have scaleEq : ({gather_value}) idx = MxxRuntime.liftInteger ({scale_expression}) := by\n    obtain ⟨sample, hlo, hhi, hget, hout⟩ := {gather_fact} idx\n    have hselected := route_lookup_eq (⟨{scalar_index}, by omega⟩ : Fin {pack_count}) indexEq hget\n    rw [hout, hselected]\n    dsimp only\n    rw [packEq]\n    change ({actual_scale}) = MxxRuntime.liftInteger ({scale_expression})\n{scale_proof}"
+        );
+        source.push_str(&format!("theorem {role}_route_scale_{slot} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record}) (facts : {body} RefreshBackend.backend hashModel params inputs outputs witness)\n    {binders} :\n    ({gather_value}) {idx} = MxxRuntime.liftInteger ({scale_expression}) := by\n  classical\n  let idx : Fin {total} := {idx}\n{scale_proof_body}  exact scaleEq\n\n"));
+        offset += coordinates * digit_count;
+        scalar_offset += digit_count;
+    }
+    Ok((source, digit_table.is_some()))
+}
+
 pub(super) fn root_refresh_route_targets(
     pre: &ValidatedGraph,
     pa: &LeanArtifact,
@@ -111,7 +352,7 @@ pub(super) fn root_refresh_route_targets(
     let body = shape.body_relation.as_ref().ok_or("missing PRE body")?;
     let params = &pa.root.parameter_type;
     let mut source = format!(
-        "import {}\nimport Backend\nimport ExponentRefreshRouteTargets\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedRefreshRouteTargets\nopen Mxx.Primitives MxxExponentLut\n\nabbrev RootInput := {}\nabbrev RootOutput := {}\n\n",
+        "import {}\nimport Backend\nimport ExponentRefreshRouteTargets\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedRefreshRouteTargets\nopen Mxx.Primitives MxxRuntime MxxExponentLut\n\nabbrev RootInput := {}\nabbrev RootOutput := {}\n\n",
         pa.module_name, pa.root.input_type, pa.root.output_type
     );
     for role in ["mask", "fresh"] {
@@ -182,31 +423,18 @@ pub(super) fn root_refresh_route_targets(
         }
         let gather = scaled_args[gathered[0]];
         let target = scaled_args[1 - gathered[0]];
-        let gather_scope = pre.source.scopes().get(&child(gather)).ok_or("missing route gather")?;
-        let getter =
-            gather_scope.node(gather_scope.outputs()[0].node).ok_or("missing route getter")?;
-        if !matches!(getter.kind(), NodeKind::FamilyGetDynamic) {
-            return Err("route scales are not gathered".into());
-        }
-        let getter_args = gather_scope.arguments(getter).ok_or("missing route gather operands")?;
-        let gather_args = args(gather)?;
-        let capture = |wire| -> Result<WireRef, String> {
-            let i = gather_scope
-                .inputs()
-                .iter()
-                .position(|input| *input == wire)
-                .ok_or("route gather operand not captured")?;
-            gather_args.get(i).copied().ok_or("route gather capture missing".into())
-        };
-        let pack = capture(getter_args[0])?;
-        let indices = capture(getter_args[1])?;
-        if !matches!(
-            root.node(pack.node).map(|node| node.kind()),
-            Some(NodeKind::FamilyPack { .. })
-        ) || args(pack)?.len() != slots
-        {
-            return Err("route scale table is not the actual slot pack".into());
-        }
+        let (scalar_proofs, digit_table) = route_scalar_proofs(
+            pre,
+            pa,
+            snapshot,
+            gather,
+            n,
+            columns,
+            &digits,
+            role == "fresh",
+            role,
+        )?;
+        source.push_str(&scalar_proofs);
         let target_scope =
             pre.source.scopes().get(&child(target)).ok_or("missing route targets")?;
         let target_shape =
@@ -218,11 +446,6 @@ pub(super) fn root_refresh_route_targets(
             return Err("route target is not a pure range body".into());
         }
         let target_selectors = selectors(&value(target_shape, target_scope.outputs()[0])?)?;
-        let index_shape =
-            pa.scope_proofs.get(&child(indices)).ok_or("missing route index proof")?;
-        if !index_shape.witnesses.is_empty() {
-            return Err("route index body is not pure".into());
-        }
         let cache_scope = pre.source.scopes().get(&child(cache)).ok_or("missing cache body")?;
         if cache_scope
             .nodes()
@@ -235,23 +458,18 @@ pub(super) fn root_refresh_route_targets(
         }
         let target_value = value(shape, target)?;
         let scaled_value = value(shape, scaled)?;
-        let index_value = value(shape, indices)?;
         let gather_value = value(shape, gather)?;
         let cache_value = value(shape, cache)?;
         let target_fact = fact(shape, target)?;
-        let index_fact = fact(shape, indices)?;
-        let gather_fact = fact(shape, gather)?;
         let scaled_fact = fact(shape, scaled)?;
         let cache_fact = fact(shape, cache)?;
-        let pack_fact = fact(shape, pack)?;
         let target_unfold = unfold(pa, target)?;
-        let index_unfold = unfold(pa, indices)?;
         let target_path = ".2".repeat(target_shape.constraint_count);
-        let index_path = ".2".repeat(index_shape.constraint_count);
         let output_path = ".2".repeat(shape.constraint_count);
         let output = &endpoint.projection;
         let result = output.replacen("outputs", "result", 1);
         let base_p = &refresh.base_p;
+        let target_base = if digit_table { "1".into() } else { refresh.base_p.to_string() };
         let mut offset = 0usize;
         for (slot, digit_count) in digits.into_iter().enumerate() {
             let divisor = if role == "mask" {
@@ -265,14 +483,6 @@ pub(super) fn root_refresh_route_targets(
                 return Err("route scale candidate is not an exact quotient".into());
             }
             let scale = q / divisor;
-            let actual_scale = value(shape, args(pack)?[slot])?;
-            let index_normalize = if role == "mask" {
-                format!(
-                    "    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ {total} by decide)] at he\n"
-                )
-            } else {
-                String::new()
-            };
             let action = format!("{role}Action_{slot}");
             let theorem = format!("{role}_cache_{slot}");
             let flat = format!(
@@ -284,7 +494,7 @@ pub(super) fn root_refresh_route_targets(
             let bound = "by clear * - component coefficient digit; omega";
             let idx = format!("⟨{flat}, {bound}⟩");
             source.push_str(&format!("noncomputable def {action} {binders} : ErrorMatrix {n} {columns} {columns} :=\n  regularIntegerDigits RefreshBackend.layout{layout_index}\n    (routeTarget (-({scale} : Int) * ({base_p} : Int)^digit.val) coefficient component)\n\n"));
-            source.push_str(&format!("theorem {theorem} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record})\n    (facts : {body} RefreshBackend.backend hashModel params inputs outputs witness)\n    (G : ExactMatrix {q} {n} 2 {columns})\n    (hg : MxxRuntime.gadgetMatrixRuns RefreshBackend.backend {base} {regular_digits} G)\n    {binders} :\n    ({output}) {idx} = reduceMatrix {q} {n} {columns} {columns} ({action} component coefficient digit) ∧\n    G * ({output}) {idx} = routeTarget (-({scale} : Int) * ({base_p} : Int)^digit.val) coefficient component := by\n  classical\n  let idx : Fin {total} := {idx}\n  have targetEq : ({target_value}) idx = routeTarget (-({base_p} : Int)^digit.val) coefficient component := by\n    have h := {target_fact} idx\n    dsimp only [{target_unfold}] at h\n    have equation := h{target_path}\n    refine equation.trans ?_\n"));
+            source.push_str(&format!("theorem {theorem} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record})\n    (facts : {body} RefreshBackend.backend hashModel params inputs outputs witness)\n    (G : ExactMatrix {q} {n} 2 {columns})\n    (hg : MxxRuntime.gadgetMatrixRuns RefreshBackend.backend {base} {regular_digits} G)\n    {binders} :\n    ({output}) {idx} = reduceMatrix {q} {n} {columns} {columns} ({action} component coefficient digit) ∧\n    G * ({output}) {idx} = routeTarget (-({scale} : Int) * ({base_p} : Int)^digit.val) coefficient component := by\n  classical\n  let idx : Fin {total} := {idx}\n  have targetEq : ({target_value}) idx = routeTarget (-({target_base} : Int)^digit.val) coefficient component := by\n    have h := {target_fact} idx\n    dsimp only [{target_unfold}] at h\n    have equation := h{target_path}\n    refine equation.trans ?_\n"));
             for (i, selector) in target_selectors.iter().enumerate() {
                 source.push_str(&format!("    have slotEq{i} : {selector} = ({slot} : Int) := by\n      simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ {total} by decide)]\n      dsimp [idx]\n      omega\n"));
             }
@@ -299,8 +509,8 @@ pub(super) fn root_refresh_route_targets(
             }
             // Definitional equality checks the actual base, selected offset, digit
             // count, row choice and matrix operation order before arithmetic.
-            source.push_str(&format!("    change MxxRuntime.matrixMul\n      (MxxRuntime.matrixMulScalarLeft\n        (MxxRuntime.matrixNeg (MxxRuntime.matrixMulScalarLeft\n          (MxxRuntime.liftInteger (({base_p} : Int) ^ (Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count}).toNat))\n          (MxxRuntime.rotationPolynomial (Int.fmod (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n}))))\n        (MxxRuntime.unitColumn 1))\n      (MxxRuntime.unitRow (Int.fdiv (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n})) = _\n    have hd : Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (digit.val : Int) := by\n      rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n      dsimp [idx]\n      omega\n    have hq : Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (component.val * {n} + coefficient.val : Int) := by\n      rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n      dsimp [idx]\n      omega\n    have hc : Int.fmod (component.val * {n} + coefficient.val : Int) {n} = coefficient.val := by\n      rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n      omega\n    have hm : Int.fdiv (component.val * {n} + coefficient.val : Int) {n} = component.val := by\n      rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n      omega\n    simp only [hd, hq, hc, hm, Int.toNat_natCast]\n    exact route_target_expression _ coefficient component\n"));
-            source.push_str(&format!("  have indexEq : ({index_value}) idx = ({slot} : Int) := by\n    have h := {index_fact} idx\n    dsimp only [{index_unfold}] at h\n    have he := h{index_path}\n    clear * - component coefficient digit idx he\n{index_normalize}    dsimp [idx] at he ⊢\n    norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at he\n    omega\n  have packEq := route_pack_at {pack_fact} (⟨{slot}, by decide⟩ : Fin {slots})\n  have scaleEq : ({gather_value}) idx = MxxRuntime.liftInteger ({scale}) := by\n    obtain ⟨sample, hlo, hhi, hget, hout⟩ := {gather_fact} idx\n    have hselected := route_lookup_eq (⟨{slot}, by decide⟩ : Fin {slots}) indexEq hget\n    rw [hout, hselected]\n    dsimp only\n    rw [packEq]\n    change ({actual_scale}) = MxxRuntime.liftInteger ({scale})\n    funext row column\n    norm_num [MxxIR.exactDiv, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger]\n  have scaledEq := {scaled_fact} idx\n  change ({scaled_value}) idx = MxxRuntime.matrixMulScalarLeft (({gather_value}) idx) (({target_value}) idx) at scaledEq\n  rw [scaleEq, targetEq, route_target_scale] at scaledEq\n  have outputEq := congrArg (fun result : RootOutput => {result}) facts{output_path}\n  change ({output}) = ({cache_value}) at outputEq\n  obtain ⟨decomposition, hd, hout⟩ := {cache_fact} idx\n  change MxxRuntime.gadgetDecomposeRuns RefreshBackend.backend {base} {regular_digits} (({scaled_value}) idx) decomposition at hd\n  rw [scaledEq] at hd\n  have canonical := route_cache_canonical RefreshBackend.layout{layout_index} (by rfl)\n    (by decide) (by decide) (by rfl) hg hd\n  change ({output}) idx = _ ∧ G * ({output}) idx = _\n  rw [outputEq, hout]\n  simpa only [{action}, mul_neg, neg_mul] using canonical\n\n#print axioms {theorem}\n\n",));
+            source.push_str(&format!("    change MxxRuntime.matrixMul\n      (MxxRuntime.matrixMulScalarLeft\n        (MxxRuntime.matrixNeg (MxxRuntime.matrixMulScalarLeft\n          (MxxRuntime.liftInteger (({target_base} : Int) ^ (Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count}).toNat))\n          (MxxRuntime.rotationPolynomial (Int.fmod (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n}))))\n        (MxxRuntime.unitColumn 1))\n      (MxxRuntime.unitRow (Int.fdiv (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n})) = _\n    have hd : Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (digit.val : Int) := by\n      rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n      dsimp [idx]\n      omega\n    have hq : Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (component.val * {n} + coefficient.val : Int) := by\n      rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n      dsimp [idx]\n      omega\n    have hc : Int.fmod (component.val * {n} + coefficient.val : Int) {n} = coefficient.val := by\n      rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n      omega\n    have hm : Int.fdiv (component.val * {n} + coefficient.val : Int) {n} = component.val := by\n      rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n      omega\n    simp only [hd, hq, hc, hm, Int.toNat_natCast]\n    exact route_target_expression _ coefficient component\n"));
+            source.push_str(&format!("  have scaleEq := {role}_route_scale_{slot} witness facts component coefficient digit\n  have scaledEq := {scaled_fact} idx\n  change ({scaled_value}) idx = MxxRuntime.matrixMulScalarLeft (({gather_value}) idx) (({target_value}) idx) at scaledEq\n  rw [scaleEq, targetEq, route_target_scale] at scaledEq\n  have outputEq := congrArg (fun result : RootOutput => {result}) facts{output_path}\n  change ({output}) = ({cache_value}) at outputEq\n  obtain ⟨decomposition, hd, hout⟩ := {cache_fact} idx\n  change MxxRuntime.gadgetDecomposeRuns RefreshBackend.backend {base} {regular_digits} (({scaled_value}) idx) decomposition at hd\n  rw [scaledEq] at hd\n  have canonical := route_cache_canonical RefreshBackend.layout{layout_index} (by rfl)\n    (by decide) (by decide) (by rfl) hg hd\n  change ({output}) idx = _ ∧ G * ({output}) idx = _\n  rw [outputEq, hout]\n  simpa only [{action}, mul_neg, neg_mul, one_pow, mul_one] using canonical\n\n#print axioms {theorem}\n\n",));
             offset += coordinates * digit_count;
         }
     }

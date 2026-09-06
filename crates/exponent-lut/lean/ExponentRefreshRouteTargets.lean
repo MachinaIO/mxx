@@ -55,18 +55,24 @@ theorem route_cache_canonical {q n columns : Nat} {backend : BackendContext}
       (fun row column => regularIntegerDigits layout target
         ⟨row.val, by rw [← width]; exact row.isLt⟩ column) ∧
     G * D = target := by
-  obtain ⟨dl, hdl, _, _, hw, hd⟩ := hd
+  have reconstruction := gadget_runs_reconstruct hq hn hg hd
+  obtain ⟨dl, hdl, _, _, hw, hd, _⟩ := hd
   have he : dl = layout := Option.some.inj (hdl.symm.trans lookup)
   subst dl
-  obtain ⟨gl, hgl, _, _, hwg, hg⟩ := hg
-  have he : gl = layout := Option.some.inj (hgl.symm.trans lookup)
-  subst gl
-  subst columns
-  simp only [castMatrixRows] at hd
-  simp only [castMatrixColumns] at hg
-  subst D
-  subst G
-  exact ⟨regularIntegerDigits_reduce layout hq hn _,
-    regularGadgetMatrix_reconstruct layout _ hq hn⟩
+  have hexact : layout.droppedModuli = 0 := by
+    have hpos := layout.digits_pos
+    have hle := Nat.le_of_lt layout.dropped_lt
+    have hsum := Nat.sub_add_cancel hle
+    simp only [RegularLayout.digitCount, RegularLayout.retainedTowers] at hw
+    rw [width] at hw
+    nlinarith
+  have hD := regularDecomposeMatrix_eq_full layout target hexact
+  rw [hD] at hd
+  cases width
+  have hdFull : D = fullDecomposeMatrix layout target := by
+    rw [castMatrixRows_comp] at hd
+    simpa only [castMatrixRows] using hd
+  refine ⟨?_, reconstruction (by simp only [lookup, Option.map_some, hexact])⟩
+  rw [hdFull, regularIntegerDigits_reduce layout hq hn]
 
 end MxxExponentLut

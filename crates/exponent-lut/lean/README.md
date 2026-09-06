@@ -1,9 +1,19 @@
 # Exponent-LUT Lean certificates
 
-Handwritten, reusable mathematics lives in `crates/exponent-lut/lean/*.lean`.
-The package roots in `crates/exponent-lut/lean/lakefile.toml` cover integer error
-bounds, matrix actions, native program evaluation, readout, modulus switching,
-strict rounding, and CRT recomposition. Build them with the pinned Lean toolchain:
+Generic integer matrix action bounds live in
+`crates/primitives/lean/PrimitivesBounds.lean`, and balanced radix bounds in
+`crates/primitives/lean/PrimitivesCrtRadix.lean`. Registered gadget witnesses and
+execution bridges live in `crates/runtime/lean/RuntimeDecomposition.lean`.
+Retained witnesses select digits of the corrected target; approximate execution
+retains its invocation-local residual premise. Exact reconstruction requires a
+registered layout with zero dropped moduli.
+
+Application mathematics in `crates/exponent-lut/lean/*.lean` covers native program
+evaluation, readout, modulus switching, strict rounding, and CRT recomposition.
+The exact cache specializations carry explicit exact-layout premises; the
+residual-aware cache equation keeps the source-secret multiplication of the
+decomposition residual. Static package compilation alone does not certify an
+approximate application execution. Build with the pinned Lean toolchain:
 
 ```sh
 cd crates/exponent-lut/lean
@@ -44,6 +54,17 @@ axiom audits reject certification. The certificate's allowed axioms are
 
 Only successful checks write `checked-record.json`, containing source and dependency
 hashes, module logs, and elapsed time. Export-only tests do not certify a candidate.
+
+The route exporter proves the actual per-slot/per-digit scalar table and its
+offset/index lookup. Readout helper lemmas are emitted from the graph producers
+required by their consumers; the complete execution graphs remain unchanged.
+
+`ExponentNativeFirstStage` and `ExponentNativeProgramProof` are generated for
+the current candidate, rather than retained as obsolete concrete snapshots in
+this directory. Coverage includes the first-stage derivation and its `Approx`
+soundness corollary, every native program stage, and the actual final program
+output bound. The positive certificate test requires both modules' kernel
+objects and logs in addition to `Certificate.olean` and `checked-record.json`.
 
 `MXX_EXPONENT_LUT_LEAN_TIMEOUT_SECONDS` sets a positive integer wall-clock budget
 for the entire checker invocation, including static builds, generated modules,

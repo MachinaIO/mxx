@@ -7,13 +7,15 @@ use mxx_ir_core::{
     node::{LoopInputMode, MatrixBinaryOp, NodeKind},
     types::{ConcreteWireType, NodeId, Port, WireRef},
 };
+use std::collections::BTreeSet;
 
 pub(super) fn root_readout_stage(
     pregraph: &ValidatedGraph,
     preartifact: &LeanArtifact,
     graph: &ValidatedGraph,
     artifact: &LeanArtifact,
-) -> Result<String, String> {
+) -> Result<(String, BTreeSet<NodeId>), String> {
+    let mut online_dependencies = BTreeSet::new();
     let root = graph.source.root_scope();
     let shape = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
     let types = &graph.scopes[&FrozenGraphScopeId::Root].wire_types;
@@ -150,7 +152,7 @@ pub(super) fn root_readout_stage(
     let original = value(current)?;
     let norm = value(normalization)?;
     let mut source = format!(
-        "import {}\nimport ExponentReadoutStage\nimport RootOnlineReadout\nimport RootReadout\nimport RootReadoutOperands\nimport RootReadoutFunction\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 4000000\n\nnamespace ExponentGeneratedReadoutStage\nopen Mxx.Primitives MxxExponentLut\nopen scoped BigOperators\nabbrev RootInput := {input_type}\nabbrev RootOutput := {output_type}\n\nprivate theorem lookup_eq {{α : Type}} {{count : Nat}} {{family : Fin count → α}} {{index : Int}} {{output : α}} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic family index output) : output = family position := by\n  obtain ⟨actual, ha, hv⟩ := h\n  have same : actual = position := by apply Fin.ext; omega\n  simpa only [same] using hv\n\ntheorem normalized_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\n    ∀ label : Fin {labels}, ({normalized}) label =\n      (({transformed}) label + ∑ helper : Fin {helpers},\n        ({original}) ⟨label.val * {helpers} + helper.val, by omega⟩) * ({norm}) := by\n  intro label\n",
+        "import {}\nimport ExponentReadoutStage\nimport RootOnlineReadout\nimport RootReadout\nimport RootReadoutOperands\nimport RootReadoutFunction\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 4000000\n\nnamespace ExponentGeneratedReadoutStage\nopen Mxx.Primitives MxxRuntime MxxExponentLut\nopen scoped BigOperators\nabbrev RootInput := {input_type}\nabbrev RootOutput := {output_type}\n\nprivate theorem lookup_eq {{α : Type}} {{count : Nat}} {{family : Fin count → α}} {{index : Int}} {{output : α}} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic family index output) : output = family position := by\n  obtain ⟨actual, ha, hv⟩ := h\n  have same : actual = position := by apply Fin.ext; omega\n  simpa only [same] using hv\n\ntheorem normalized_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\n    ∀ label : Fin {labels}, ({normalized}) label =\n      (({transformed}) label + ∑ helper : Fin {helpers},\n        ({original}) ⟨label.val * {helpers} + helper.val, by omega⟩) * ({norm}) := by\n  intro label\n",
         artifact.module_name,
         params = artifact.root.parameter_type
     );
@@ -277,6 +279,7 @@ pub(super) fn root_readout_stage(
         let ir = &artifact.scope_relations[&child_id(index_wire)];
         let ip = fact(index_wire)?;
         let gather_id = wire.node.0;
+        online_dependencies.insert(wire.node);
         proof.push_str(&format!("  have index_{role} : ({index_value}) lane = ({position}.val : Int) := by\n    have h := {ip} lane\n    dsimp only [{ir}, {ir}.constraints_0, lane] at h ⊢\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h\n    omega\n  obtain ⟨pos_{role}, hp_{role}, hv_{role}⟩ := ExponentGeneratedOnlineReadout.family_gather_{gather_id} witness facts lane\n  have same_{role} : pos_{role} = ({position} : Fin {count}) := by apply Fin.ext; omega\n  have gathered_{role} : ({gather_value}) lane = ({source_value}) {position} := by simpa only [same_{role}] using hv_{role}\n"));
         gathered_sources.push(source_value);
     }
@@ -294,6 +297,7 @@ pub(super) fn root_readout_stage(
     let n = matrix.ring_dimension;
     let rows = matrix.rows;
     let columns = matrix.columns;
+    online_dependencies.extend([current.node, aligned_wire.node]);
     source = source.replace("end ExponentGeneratedReadoutStage\n", "");
     source.push_str(&format!("theorem helper_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\n    ∀ label : Fin {labels}, ∀ helper : Fin {helpers}, ∃ raw : ExactMatrix {q} {n} {rows} {columns},\n      MxxRuntime.ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat helper.val) [{indices}])\n        (({transformed}) label) raw ∧\n      ({original}) ⟨label.val * {helpers} + helper.val, by omega⟩ =\n        ({mask_actual}) helper * ({helper_actual}) ⟨label.val * {helpers} + helper.val, by omega⟩ +\n          raw * ({switch_actual}) helper := by\n  intro label helper\n  let lane : Fin {total} := ⟨label.val * {helpers} + helper.val, by omega⟩\n{proof}  obtain ⟨raw, hrun, heq⟩ := ExponentGeneratedOnlineReadout.raw_branch_{raw_id} witness facts lane\n  have hmod : Int.fmod (Int.ofNat lane.val) {helpers} = Int.ofNat helper.val := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by decide)]\n    dsimp only [lane]\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\n    omega\n  refine ⟨raw, ?_, ?_⟩\n  · simpa only [hmod, gathered_target] using hrun\n  · have haligned := ExponentGeneratedOnlineReadout.family_operation_{aligned_id} witness facts lane\n    simpa only [haligned, gathered_mask, gathered_switch] using heq\n\nend ExponentGeneratedReadoutStage\n",
         params = artifact.root.parameter_type, raw_id = current.node.0, aligned_id = aligned_wire.node.0));
@@ -443,6 +447,7 @@ private theorem helper_indices_odd : ∀ i : Fin {helpers},
 /-- Actual linked readout noise, before rewriting the proved trace scalar to
 its antiperiodic table value. Cache links are concrete boundary equalities. -/
 theorem encoding_transfer {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}
+    [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)]
     {{preParams : {pre_params}}} {{preInputs : ExponentGeneratedReadoutOperands.RootInput}}
     {{preOutputs : ExponentGeneratedReadoutOperands.RootOutput}}
     (preWitness : {pre_record})
@@ -527,6 +532,7 @@ theorem encoding_transfer {{backend : MxxRuntime.BackendContext}} {{hashModel : 
 /-- The actual native readout value on the full signed strided-monomial
 input domain. The second half is the evaluator's antiperiodic extension. -/
 theorem native_transfer {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}
+    [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)]
     {{preParams : {pre_params}}} {{preInputs : ExponentGeneratedReadoutOperands.RootInput}}
     {{preOutputs : ExponentGeneratedReadoutOperands.RootOutput}}
     (preWitness : {pre_record})
@@ -602,7 +608,8 @@ theorem native_transfer {{backend : MxxRuntime.BackendContext}} {{hashModel : Mx
 
 end ExponentGeneratedReadoutStage
 "#, params = artifact.root.parameter_type, mask_id = mask_source_wire.node.0, target_id = transformed_wire.node.0));
-    Ok(source)
+    online_dependencies.extend([mask_source_wire.node, transformed_wire.node]);
+    Ok((source, online_dependencies))
 }
 
 /// The native simulator assigns bounded-matrix plans to these four readout
@@ -653,7 +660,7 @@ pub(super) fn pre_readout_operands(
         artifact.root.parameter_type
     );
     let mut source = format!(
-        "import {}\nimport ExponentReadoutStage\nimport RootReadoutAlignment\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace ExponentGeneratedReadoutOperands\nopen Mxx.Primitives MxxExponentLut\nabbrev RootInput := {input_type}\nabbrev RootOutput := {output_type}\n\n",
+        "import {}\nimport ExponentReadoutStage\nimport RootReadoutAlignment\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace ExponentGeneratedReadoutOperands\nopen Mxx.Primitives MxxRuntime MxxExponentLut\nabbrev RootInput := {input_type}\nabbrev RootOutput := {output_type}\n\n",
         artifact.module_name
     );
     let mut found = 0;
@@ -793,7 +800,7 @@ pub(super) fn pre_readout_operands(
                 scope_types[&gadget_wire].matrix_type().ok_or("invalid gadget type")?.rows;
             let rw_output =
                 if lanes.is_some() { format!("  rw [{output_equation}]\n") } else { String::new() };
-            source.push_str(&format!("theorem {role}_reconstruction {binders}\n    (gadget : ExactMatrix {q} {n} {target_rows} {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    {quantifier}gadget * {selected} = (({scalar}) 0 0) • gadget := by\n{proof_start}  have same : ({other}) = gadget := gadget_runs_deterministic {hg} gadgetRuns\n{rw_output}  rw [gadget_runs_reconstruct (by decide) (by decide) gadgetRuns {hd}]\n  rw [same]\n  ext row column\n  simp [{scalar_operation}, mul_comm]\n\n"));
+            source.push_str(&format!("theorem {role}_reconstruction {binders} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)]\n    (gadget : ExactMatrix {q} {n} {target_rows} {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    {quantifier}gadget * {selected} = (({scalar}) 0 0) • gadget := by\n{proof_start}  have same : ({other}) = gadget := gadget_runs_deterministic {hg} gadgetRuns\n{rw_output}  rw [gadget_runs_reconstruct (by decide) (by decide) gadgetRuns {hd} Fact.out]\n  rw [same]\n  ext row column\n  simp [{scalar_operation}, mul_comm]\n\n"));
         }
         found += 1;
     }
@@ -891,7 +898,7 @@ pub(super) fn pre_readout_operands(
     };
     let base = base.evaluate(&ParamEnv::default()).map_err(|_| "nonconstant base")?;
     let digits = digit_count.evaluate(&ParamEnv::default()).map_err(|_| "nonconstant digits")?;
-    source.push_str(&format!("theorem aligned_helpers {binders}\n    (layout : MxxRuntime.RegularLayout {q})\n    (lookup : backend.regularLayout {q} {n} = some layout)\n    (gadget : ExactMatrix {q} {n} 2 {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ label : Fin {labels}, ∀ helper : Fin {helpers},\n      gadget * ({helper_actual}) ⟨label.val * {helpers} + helper.val, by omega⟩ =\n        MxxRuntime.ringAutomorphism (MxxIR.selectInt (Int.ofNat helper.val) [{indices}]).toNat\n          (({public_actual}) label * ({target_actual}) label) * ({switch_actual}) helper := by\n  intro label helper\n  let lane : Fin {total} := ⟨label.val * {helpers} + helper.val, by omega⟩\n  obtain ⟨position, targetPosition, action, hposition, htarget, _, _, heq⟩ :=\n    ExponentGeneratedReadoutAlignment.readout_alignment_0 witness facts layout lookup gadget gadgetRuns lane\n  have hlabel : ({li}) lane = (label.val : Int) := by\n    have h := {lp} lane\n    dsimp only [{lr}, {lr}.constraints_0, lane] at h ⊢\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h\n    omega\n  have hhelper : ({hi}) lane = (helper.val : Int) := by\n    have h := {hp} lane\n    dsimp only [{hr}, {hr}.constraints_0, lane] at h ⊢\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h\n    omega\n  have sameLabel : targetPosition = label := by apply Fin.ext; omega\n  have sameHelper : position = helper := by apply Fin.ext; omega\n  have hmod : Int.fmod (Int.ofNat lane.val) {helpers} = Int.ofNat helper.val := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by decide)]\n    dsimp only [lane]\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\n    omega\n  simpa only [sameLabel, sameHelper, hmod] using heq\n\n"));
+    source.push_str(&format!("theorem aligned_helpers {binders} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)]\n    (layout : MxxRuntime.RegularLayout {q})\n    (lookup : backend.regularLayout {q} {n} = some layout)\n    (gadget : ExactMatrix {q} {n} 2 {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ label : Fin {labels}, ∀ helper : Fin {helpers},\n      gadget * ({helper_actual}) ⟨label.val * {helpers} + helper.val, by omega⟩ =\n        MxxRuntime.ringAutomorphism (MxxIR.selectInt (Int.ofNat helper.val) [{indices}]).toNat\n          (({public_actual}) label * ({target_actual}) label) * ({switch_actual}) helper := by\n  intro label helper\n  let lane : Fin {total} := ⟨label.val * {helpers} + helper.val, by omega⟩\n  obtain ⟨position, targetPosition, action, hposition, htarget, _, _, heq⟩ :=\n    ExponentGeneratedReadoutAlignment.readout_alignment_0 witness facts layout lookup gadget gadgetRuns lane\n  have hlabel : ({li}) lane = (label.val : Int) := by\n    have h := {lp} lane\n    dsimp only [{lr}, {lr}.constraints_0, lane] at h ⊢\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h\n    omega\n  have hhelper : ({hi}) lane = (helper.val : Int) := by\n    have h := {hp} lane\n    dsimp only [{hr}, {hr}.constraints_0, lane] at h ⊢\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h\n    omega\n  have sameLabel : targetPosition = label := by apply Fin.ext; omega\n  have sameHelper : position = helper := by apply Fin.ext; omega\n  have hmod : Int.fmod (Int.ofNat lane.val) {helpers} = Int.ofNat helper.val := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by decide)]\n    dsimp only [lane]\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\n    omega\n  simpa only [sameLabel, sameHelper, hmod] using heq\n\n"));
     source.push_str("end ExponentGeneratedReadoutOperands\n");
     Ok(source)
 }

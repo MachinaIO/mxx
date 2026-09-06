@@ -126,7 +126,7 @@ pub fn export_refresh_graphs(
         &verification,
         &verification_artifact,
     )?;
-    let readout_stage_proofs = root_readout_stage::root_readout_stage(
+    let (readout_stage_proofs, online_dependencies) = root_readout_stage::root_readout_stage(
         &preprocessing,
         &preprocessing_artifact,
         &verification,
@@ -231,8 +231,11 @@ pub fn export_refresh_graphs(
         &bundle.noise_snapshot,
     )?;
     let preprocessing = preprocessing_artifact;
-    let online_readout_proofs =
-        root_online_readout::root_online_readout(&verification, &verification_artifact)?;
+    let online_readout_proofs = root_online_readout::root_online_readout(
+        &verification,
+        &verification_artifact,
+        &online_dependencies,
+    )?;
     let root_input_proofs = root_inputs::root_inputs(&verification, &verification_artifact)?;
     let program_input_proofs =
         root_program_inputs::root_program_inputs(&verification, &verification_artifact)?;
@@ -498,6 +501,9 @@ pub fn export_refresh_graphs(
     sources.insert("RootReadoutOperands".into(), readout_operand_proofs);
     sources.insert("RootProgram".into(), program_proofs);
     sources.insert("ExponentNativeProgramProof".into(), native_program_proofs);
+    // Current-fixture coverage, not an obsolete concrete graph snapshot.
+    sources.insert("ExponentNativeFirstStage".into(),
+        "import ExponentNativeProgramProof\n\nnamespace ExponentGeneratedNativeProof\nabbrev first_stage := @ExponentGeneratedNativeProgramProof.stage_0\nabbrev first_stage_approx := @ExponentGeneratedNativeProgramProof.first_stage_approx\nend ExponentGeneratedNativeProof\n\n#print axioms ExponentGeneratedNativeProof.first_stage\n#print axioms ExponentGeneratedNativeProof.first_stage_approx\n".into());
     fs::write(directory.join("program-proof-bindings.txt"), program_manifest)?;
     sources.insert("RootProgramContext".into(), program_context_proofs);
     sources.insert("RootProgramInputs".into(), program_input_proofs);

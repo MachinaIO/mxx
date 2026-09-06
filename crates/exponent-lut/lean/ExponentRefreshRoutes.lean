@@ -3,7 +3,7 @@ import ExponentSparseDecomposition
 import ExponentTransfers
 
 namespace MxxExponentLut
-open Mxx.Primitives
+open Mxx.Primitives MxxRuntime
 open scoped BigOperators
 
 theorem route_family_error_bound {n rows inner columns bound gain : Nat}

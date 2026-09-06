@@ -372,20 +372,19 @@ pub(super) fn root_refresh_route_public(
         let target =
             scope.arguments(decompositions[0].1).ok_or("missing internal decomposition target")?[0];
         let target_selectors = selectors(&value(raw_shape, target)?)?;
-        let (scale_pack, scale_indices) =
-            gather(pre, inputs[1]).ok_or("public scales not gathered")?;
-        if !matches!(
-            root.node(scale_pack.node).map(|node| node.kind()),
-            Some(NodeKind::FamilyPack { .. })
-        ) || arguments(root, scale_pack)?.len() != slots
-        {
-            return Err("public scale table not actual slot pack".into());
-        }
-        let scale_index_shape =
-            pa.scope_proofs.get(&child(scale_indices)).ok_or("missing public scale index shape")?;
-        if !scale_index_shape.witnesses.is_empty() {
-            return Err("public scale index not pure".into());
-        }
+        let scalar_role = format!("{role}Public");
+        let (scalar_proofs, digit_table) = super::root_refresh_route_targets::route_scalar_proofs(
+            pre,
+            pa,
+            snapshot,
+            inputs[1],
+            n,
+            columns,
+            &digits,
+            role_index == 1,
+            &scalar_role,
+        )?;
+        source.push_str(&scalar_proofs);
         source.push_str(&format!("noncomputable abbrev raw{}Public (witness : {record}) := {}\nnoncomputable abbrev {}PublicInput (witness : {record}) := {}\nabbrev exported{}D (outputs : RootOutput) := {}\n\n", if role_index == 0 { "Mask" } else { "Fresh" }, value(shape, raw)?, role, value(shape, inputs[0])?, if role_index == 0 { "Mask" } else { "Fresh" }, endpoint.projection));
         let mut offset = 0usize;
         for (slot, digit_count) in digits.into_iter().enumerate() {
@@ -399,8 +398,7 @@ pub(super) fn root_refresh_route_public(
             {
                 return Err("public route scale not exact quotient".into());
             }
-            let scale = q / divisor;
-            let base_p = &refresh.base_p;
+            let target_base = if digit_table { "1".into() } else { refresh.base_p.to_string() };
             let flat = format!(
                 "{offset} + (component.val * {n} + coefficient.val) * {digit_count} + digit.val"
             );
@@ -448,14 +446,7 @@ pub(super) fn root_refresh_route_public(
                 source.push_str(&format!("  have publicIndex{stage} : ({index_value}) {position} = (({selected} : Nat) : Int) := by\n    have h := {} {position}\n    dsimp only [{}] at h\n    have he := h{}\n    clear * - component coefficient digit idx he\n{normalize}    dsimp [idx] at he ⊢\n    norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at he ⊢\n    omega\n  have publicGet{stage} : ({}) {position} = ({}) (⟨{selected}, {bound}⟩ : Fin {family_count}) := by\n    obtain ⟨sample, hlo, hhi, hget, hout⟩ := {} {position}\n    exact hout.trans (route_lookup_eq (⟨{selected}, {bound}⟩ : Fin {family_count}) publicIndex{stage} hget)\n", fact(shape, indices)?, unfold(pa, indices)?, ".2".repeat(index_shape.constraint_count), value(shape, *wire)?, value(shape, family)?, fact(shape, *wire)?));
             }
             source.push_str(&format!("  have publicEq : ({public_value}) idx = ({normalized_value}) ⟨{label}, {bound}⟩ := {}\n", if role_index == 0 { "publicGet0" } else { "publicGet0.trans publicGet1" }));
-            let normalize = if role_index == 0 {
-                format!(
-                    "    simp only [Int.fdiv_eq_ediv_of_nonneg _ (show (0 : Int) ≤ {total} by decide)] at he\n"
-                )
-            } else {
-                String::new()
-            };
-            source.push_str(&format!("  have scaleIndex : ({}) idx = ({slot} : Int) := by\n    have h := {} idx\n    dsimp only [{}] at h\n    have he := h{}\n    clear * - component coefficient digit idx he\n{normalize}    dsimp [idx] at he ⊢\n    norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at he\n    omega\n  have packEq := route_pack_at {} (⟨{slot}, by decide⟩ : Fin {slots})\n  have scaleEq : ({scale_value}) idx = MxxRuntime.liftInteger ({scale}) := by\n    obtain ⟨sample, hlo, hhi, hget, hout⟩ := {} idx\n    have selected := route_lookup_eq (⟨{slot}, by decide⟩ : Fin {slots}) scaleIndex hget\n    rw [hout, selected]\n    dsimp only\n    rw [packEq]\n    change ({}) = MxxRuntime.liftInteger ({scale})\n    funext row column\n    norm_num [MxxIR.exactDiv, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger]\n", value(shape, scale_indices)?, fact(shape, scale_indices)?, unfold(pa, scale_indices)?, ".2".repeat(scale_index_shape.constraint_count), fact(shape, scale_pack)?, fact(shape, inputs[1])?, value(shape, arguments(root, scale_pack)?[slot])?));
+            source.push_str(&format!("  have scaleEq := {scalar_role}_route_scale_{slot} witness facts component coefficient digit\n"));
             let decomposition_fact = raw_shape
                 .node_constraints
                 .get(&NodeId(decompositions[0].0 as u64))
@@ -474,7 +465,7 @@ pub(super) fn root_refresh_route_public(
                         .join(", ")
                 ));
             }
-            source.push_str(&format!("  change MxxRuntime.gadgetDecomposeRuns RefreshBackend.backend {base} {regular_digits}\n    (MxxRuntime.matrixMulScalarLeft (({scale_value}) idx)\n      (MxxRuntime.matrixMul\n        (MxxRuntime.matrixMulScalarLeft\n          (MxxRuntime.matrixNeg (MxxRuntime.matrixMulScalarLeft\n            (MxxRuntime.liftInteger (({base_p} : Int) ^ (Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count}).toNat))\n            (MxxRuntime.rotationPolynomial (Int.fmod (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n}))))\n          (MxxRuntime.unitColumn 1))\n        (MxxRuntime.unitRow (Int.fdiv (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n})))) decomposition at hd\n  have hdigit : Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (digit.val : Int) := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n    dsimp [idx]\n    omega\n  have hquot : Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (component.val * {n} + coefficient.val : Int) := by\n    rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n    dsimp [idx]\n    omega\n  have hcoeff : Int.fmod (component.val * {n} + coefficient.val : Int) {n} = coefficient.val := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n    omega\n  have hcomponent : Int.fdiv (component.val * {n} + coefficient.val : Int) {n} = component.val := by\n    rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n    omega\n  simp only [hdigit, hquot, hcoeff, hcomponent, Int.toNat_natCast] at hd\n  rw [scaleEq, route_target_expression _ coefficient component, route_target_scale] at hd\n  have canonical := (route_cache_canonical RefreshBackend.layout{layout_index} (by rfl)\n    (by decide) (by decide) (by rfl) hg hd).1\n  have exported := ({role}_cache_{slot} witness facts G hg component coefficient digit).1\n  have sameD : decomposition = ({output}) idx := by\n    apply canonical.trans\n    simpa only [{role}Action_{slot}, mul_neg, neg_mul] using exported.symm\n  change ({raw_value}) idx = _\n  change ({raw_value}) idx = ({public_value}) idx * decomposition at hout\n  rw [hout, sameD, publicEq]\n\n#print axioms {role}_public_{slot}\n\n"));
+            source.push_str(&format!("  change MxxRuntime.gadgetDecomposeRuns RefreshBackend.backend {base} {regular_digits}\n    (MxxRuntime.matrixMulScalarLeft (({scale_value}) idx)\n      (MxxRuntime.matrixMul\n        (MxxRuntime.matrixMulScalarLeft\n          (MxxRuntime.matrixNeg (MxxRuntime.matrixMulScalarLeft\n            (MxxRuntime.liftInteger (({target_base} : Int) ^ (Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count}).toNat))\n            (MxxRuntime.rotationPolynomial (Int.fmod (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n}))))\n          (MxxRuntime.unitColumn 1))\n        (MxxRuntime.unitRow (Int.fdiv (Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count}) {n})))) decomposition at hd\n  have hdigit : Int.fmod (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (digit.val : Int) := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n    dsimp [idx]\n    omega\n  have hquot : Int.fdiv (Int.ofNat idx.val + -1 * {offset}) {digit_count} = (component.val * {n} + coefficient.val : Int) := by\n    rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n    dsimp [idx]\n    omega\n  have hcoeff : Int.fmod (component.val * {n} + coefficient.val : Int) {n} = coefficient.val := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by norm_num)]\n    omega\n  have hcomponent : Int.fdiv (component.val * {n} + coefficient.val : Int) {n} = component.val := by\n    rw [Int.fdiv_eq_ediv_of_nonneg _ (by norm_num)]\n    omega\n  simp only [hdigit, hquot, hcoeff, hcomponent, Int.toNat_natCast] at hd\n  rw [scaleEq, route_target_expression _ coefficient component, route_target_scale] at hd\n  have canonical := (route_cache_canonical RefreshBackend.layout{layout_index} (by rfl)\n    (by decide) (by decide) (by rfl) hg hd).1\n  have exported := ({role}_cache_{slot} witness facts G hg component coefficient digit).1\n  have sameD : decomposition = ({output}) idx := by\n    apply canonical.trans\n    simpa only [idx, {role}Action_{slot}, mul_neg, neg_mul, one_pow, mul_one] using exported.symm\n  change ({raw_value}) idx = _\n  change ({raw_value}) idx = ({public_value}) idx * decomposition at hout\n  rw [hout, sameD, publicEq]\n\n#print axioms {role}_public_{slot}\n\n"));
             offset += coordinates * digit_count;
         }
     }

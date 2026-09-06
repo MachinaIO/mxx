@@ -35,7 +35,7 @@ pub(super) fn matrix_action_proofs(
     artifact: &LeanArtifact,
 ) -> (String, usize) {
     let mut source = format!(
-        "import {}\nimport ExponentTransfers\n\nnamespace ExponentGeneratedScopes\nopen Mxx.Primitives MxxExponentLut\n\n",
+        "import {}\nimport ExponentTransfers\n\nnamespace ExponentGeneratedScopes\nopen Mxx.Primitives MxxRuntime MxxExponentLut\n\n",
         artifact.module_name,
     );
     let mut count = 0;
@@ -152,7 +152,7 @@ pub(super) fn selector_setup_proofs(
 ) -> (String, usize) {
     use mxx_ir_core::node::{ConcatAxis, ConstantMatrix};
     let mut source = format!(
-        "import {}\nimport ExponentSetup\nimport ExponentSecret\nimport ExponentDecomposition\n\nnamespace ExponentGeneratedSetup\nopen Mxx.Primitives MxxExponentLut\n\n",
+        "import {}\nimport ExponentSetup\nimport ExponentSecret\nimport RuntimeDecomposition\n\nnamespace ExponentGeneratedSetup\nopen Mxx.Primitives MxxRuntime MxxExponentLut\n\n",
         artifact.module_name
     );
     let mut count = 0;
@@ -220,11 +220,11 @@ pub(super) fn selector_setup_proofs(
             artifact.module_name,
         ));
         source.push_str(&format!(
-            "theorem selector_cache_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}.Params}} {{index : Nat}} {{key : ByteArray}}\n    {{payload : ExactMatrix {q} {n} 1 1}} {{secret : ExactMatrix {q} {n} 1 2}}\n    {{ciphertext : ExactMatrix {q} {n} 2 {columns}}}\n    {{decomposition : ExactMatrix {q} {n} {columns} {columns}}}\n    (layout : MxxRuntime.RegularLayout {q})\n    (lookup : backend.regularLayout {q} {n} = some layout)\n    (runs : {relation} backend hashModel params index {inputs} ciphertext)\n    (augmented : secret 0 1 = 1)\n    (decomposed : MxxRuntime.gadgetDecomposeRuns backend {base} {digits} ciphertext decomposition) :\n    ∃ gadget : ExactMatrix {q} {n} 2 {columns}, ∃ error : ErrorMatrix {n} 1 {columns},\n    ∃ action : ErrorMatrix {n} {columns} {columns},\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget ∧\n      decomposition = reduceMatrix {q} {n} {columns} {columns} action ∧\n      ActionGain action (denseRegularGain layout {n} 2) ∧\n      secret * gadget * decomposition = (payload 0 0) • (secret * gadget) + reduceMatrix {q} {n} 1 {columns} error ∧\n      CoeffBound error ({cutoff} : Nat) := by\n  obtain ⟨gadget, error, hg, he, hb⟩ := selector_setup_{count} runs augmented\n  obtain ⟨action, ha, hgain⟩ := gadgetDecomposeRuns_dense_gain layout lookup (by decide) (by decide) decomposed\n  refine ⟨gadget, error, action, hg, ha, hgain, ?_, hb⟩\n  rw [Matrix.mul_assoc, gadget_runs_reconstruct (by decide) (by decide) hg decomposed]\n  exact he\n\n",
+            "theorem selector_cache_{count} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}.Params}} {{index : Nat}} {{key : ByteArray}}\n    {{payload : ExactMatrix {q} {n} 1 1}} {{secret : ExactMatrix {q} {n} 1 2}}\n    {{ciphertext : ExactMatrix {q} {n} 2 {columns}}}\n    {{decomposition : ExactMatrix {q} {n} {columns} {columns}}}\n    (layout : MxxRuntime.RegularLayout {q})\n    (lookup : backend.regularLayout {q} {n} = some layout)\n    (runs : {relation} backend hashModel params index {inputs} ciphertext)\n    (augmented : secret 0 1 = 1)\n    (decomposed : MxxRuntime.gadgetDecomposeRuns backend {base} {digits} ciphertext decomposition) :\n    ∃ gadget : ExactMatrix {q} {n} 2 {columns}, ∃ error : ErrorMatrix {n} 1 {columns},\n    ∃ action : ErrorMatrix {n} {columns} {columns},\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget ∧\n      decomposition = reduceMatrix {q} {n} {columns} {columns} action ∧\n      ActionGain action (denseRegularGain layout {n} 2) ∧\n      secret * gadget * decomposition = (payload 0 0) • (secret * gadget) + reduceMatrix {q} {n} 1 {columns} error ∧\n      CoeffBound error ({cutoff} : Nat) := by\n  obtain ⟨gadget, error, hg, he, hb⟩ := selector_setup_{count} runs augmented\n  obtain ⟨action, ha, hgain⟩ := gadgetDecomposeRuns_dense_gain layout lookup (by decide) (by decide) decomposed\n  refine ⟨gadget, error, action, hg, ha, hgain, ?_, hb⟩\n  rw [Matrix.mul_assoc, gadget_runs_reconstruct (by decide) (by decide) hg decomposed Fact.out]\n  exact he\n\n",
             artifact.module_name,
         ));
         source.push_str(&format!(
-            "theorem selector_private_step_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}.Params}} {{index : Nat}} {{key : ByteArray}}\n    {{payload : ExactMatrix {q} {n} 1 1}} {{secret mask : ExactMatrix {q} {n} 1 2}}\n    {{ciphertext gadget publicKey : ExactMatrix {q} {n} 2 {columns}}}\n    {{decomposition : ExactMatrix {q} {n} {columns} {columns}}}\n    {{input output : ExactMatrix {q} {n} 1 {columns}}}\n    {{inputError : ErrorMatrix {n} 1 {columns}}} {{inputBound : Nat}}\n    {{message : ExactPoly {q} {n}}} {{messageInteger : ErrorPoly {n}}}\n    (layout : MxxRuntime.RegularLayout {q})\n    (lookup : backend.regularLayout {q} {n} = some layout)\n    (runs : {relation} backend hashModel params index {inputs} ciphertext)\n    (augmented : secret 0 1 = 1)\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget)\n    (decomposed : MxxRuntime.gadgetDecomposeRuns backend {base} {digits} ciphertext decomposition)\n    (online : output = input * decomposition)\n    (encoded : input = mask * publicKey - message • (secret * gadget) + reduceMatrix {q} {n} 1 {columns} inputError)\n    (messageLift : message = reducePoly {q} {n} messageInteger)\n    (messageBound : polynomialL1 messageInteger ≤ 1)\n    (inputBounded : CoeffBound inputError inputBound) :\n    Approx output (mask * (publicKey * decomposition) - (message * payload 0 0) • (secret * gadget))\n      (denseRegularGain layout {n} 2 * inputBound + {cutoff}) := by\n  obtain ⟨other, error, action, hg, ha, hgain, hcache, hb⟩ := selector_cache_{count} layout lookup runs augmented decomposed\n  have same : other = gadget := gadget_runs_deterministic hg gadgetRuns\n  subst other\n  rw [ha] at hcache\n  rw [online, ha]\n  exact private_encoding_transfer_sampled (by decide) encoded hcache messageLift messageBound inputBounded hb hgain\n\n",
+            "theorem selector_private_step_{count} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}.Params}} {{index : Nat}} {{key : ByteArray}}\n    {{payload : ExactMatrix {q} {n} 1 1}} {{secret mask : ExactMatrix {q} {n} 1 2}}\n    {{ciphertext gadget publicKey : ExactMatrix {q} {n} 2 {columns}}}\n    {{decomposition : ExactMatrix {q} {n} {columns} {columns}}}\n    {{input output : ExactMatrix {q} {n} 1 {columns}}}\n    {{inputError : ErrorMatrix {n} 1 {columns}}} {{inputBound : Nat}}\n    {{message : ExactPoly {q} {n}}} {{messageInteger : ErrorPoly {n}}}\n    (layout : MxxRuntime.RegularLayout {q})\n    (lookup : backend.regularLayout {q} {n} = some layout)\n    (runs : {relation} backend hashModel params index {inputs} ciphertext)\n    (augmented : secret 0 1 = 1)\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget)\n    (decomposed : MxxRuntime.gadgetDecomposeRuns backend {base} {digits} ciphertext decomposition)\n    (online : output = input * decomposition)\n    (encoded : input = mask * publicKey - message • (secret * gadget) + reduceMatrix {q} {n} 1 {columns} inputError)\n    (messageLift : message = reducePoly {q} {n} messageInteger)\n    (messageBound : polynomialL1 messageInteger ≤ 1)\n    (inputBounded : CoeffBound inputError inputBound) :\n    Approx output (mask * (publicKey * decomposition) - (message * payload 0 0) • (secret * gadget))\n      (denseRegularGain layout {n} 2 * inputBound + {cutoff}) := by\n  obtain ⟨other, error, action, hg, ha, hgain, hcache, hb⟩ := selector_cache_{count} layout lookup runs augmented decomposed\n  have same : other = gadget := gadget_runs_deterministic hg gadgetRuns\n  subst other\n  rw [ha] at hcache\n  rw [online, ha]\n  exact private_encoding_transfer_sampled (by decide) encoded hcache messageLift messageBound inputBounded hb hgain\n\n",
             artifact.module_name,
         ));
 
@@ -296,7 +296,7 @@ pub(super) fn encoding_input_proofs(
 ) -> (String, usize) {
     use mxx_ir_core::node::ConstantMatrix;
     let mut source = format!(
-        "import {}\nimport ExponentSetup\n\nnamespace ExponentGeneratedInputs\nopen Mxx.Primitives MxxExponentLut\n\n",
+        "import {}\nimport ExponentSetup\n\nnamespace ExponentGeneratedInputs\nopen Mxx.Primitives MxxRuntime MxxExponentLut\n\n",
         artifact.module_name
     );
     let mut count = 0;
@@ -380,7 +380,7 @@ pub(super) fn root_decomposition_proofs(
     artifact: &LeanArtifact,
 ) -> (String, usize) {
     let mut source = format!(
-        "import {}\nimport ExponentDecomposition\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace ExponentGeneratedRoot\nopen Mxx.Primitives MxxExponentLut\n\n",
+        "import {}\nimport RuntimeDecomposition\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace ExponentGeneratedRoot\nopen Mxx.Primitives MxxRuntime\n\n",
         artifact.module_name
     );
     let root = &artifact.root;

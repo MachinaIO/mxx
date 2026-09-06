@@ -170,3 +170,60 @@ Exact26 benchmark input SHA-256:
 `c6f68bfd10fe0c7ad264e00e5cd9e3aaaf20f9392682d043f3ba4eb081cd81e4`.
 The source remains an uncommitted archive of the same branch/base metadata;
 no source change, commit or push occurred during this measured run.
+
+## Follow-up: exact26 after the new-IR merge
+
+The September 6 post-merge run passed with the same exact26 parameters.
+Preprocess work was 13.20% lower and online work 11.62% lower than the
+preceding exact26 calibration. These are observed estimate differences,
+not an isolated merge speedup: the host changed from 32 to 48 CPU threads
+and the driver from 580.178.04 to 570.124.06. H200x2, CUDA 12.8.93,
+80% VRAM policy, one warmup and two iterations were unchanged.
+
+| Stage / metric, seconds | Post-merge exact26 | New / prior exact26 |
+|---|---:|---:|
+| Preprocess work | 1847815481929987.3 | 0.868045 |
+| Preprocess cumulative waves | 927048359446110.8 | 0.867767 |
+| Preprocess ideal DAG | 40.309508363000106 | 0.981642 |
+| Online work | 2469682082644464.0 | 0.883774 |
+| Online cumulative waves | 1237903512835308.5 | 0.879789 |
+| Online ideal DAG | 23.976173347000103 | 0.920746 |
+
+These retain the same accounting definitions: work sums primitive work,
+cumulative waves sum bounded-fleet wave latencies, and ideal DAG assumes
+unlimited resources. None is a measured complete-refresh runtime.
+The PRF-only denominator remains 6740770816 native outputs, or
+33703854080 information bits; only accumulation and readout enter its numerator.
+
+| PRF-only accounting, seconds | Public-key PRF | Encoding PRF |
+|---|---:|---:|
+| Work per native output | 266287.4345581882 | 225735.16114984444 |
+| Cumulative waves per native output | 133579.17312581377 | 113103.73389181813 |
+| Work per information bit | 53257.48691163764 | 45147.03222996889 |
+| Cumulative waves per information bit | 26715.834625162755 | 22620.746778363628 |
+
+The full-q small-RHS fleet capacities remain 22 and 46 columns, hence five
+and three waves respectively; all six low-P groups still fit one wave.
+New per-wave workspace fields describe bounded-wave scratch excluding
+resident inputs, not whole-graph memory. Saturated UINT64_MAX graph-memory
+fields remain unusable as numerical capacity evidence.
+
+Local noise/graph export was rerun and passed in 6.67 seconds with
+F=1306070000453953074. Regenerated noise and benchmark-input JSON are
+byte-identical to the preceding exact26 artifacts: no noise formula or
+cutoff changed. The input SHA-256 remains the exact26 hash above.
+All six GPU checks passed; the benchmark passed in 197.42 seconds and
+the wrapper completed in 363 seconds with BENCH_EXIT=0. Pod
+`dcuwrlcag37fhv` was stopped with status EXITED. No round trip or
+complete-refresh execution is claimed.
+
+Measured clean source commit:
+`5ee32bd3942c56b3cddba17e6f5ae4e81c54afdb` on `codex/exponent-lut-encode`.
+Source archive SHA-256:
+`78fe82aea5fd002954f2a5a84cb030a01721d09c5226b87ed75776230abebf38`.
+No source modification or push was performed for this run.
+Raw log, relative to the external main checkout:
+`logs/runpod/2026-09-06/h200-exact26-postmerge-5ee32bd39/dcuwrlcag37fhv-h200x2-5ee32bd39-20260906-exact26-postmerge-estimate.log`.
+Parsed evidence is `test_data/exact_minimum_depth_selected/h200-postmerge-vs-exact26.json`.
+The companion CSV adds 14 checked rows with stage prefix
+`exact26_postmerge_vs_exact26:`; earlier rows are unchanged.

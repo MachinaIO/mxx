@@ -1,4 +1,4 @@
-import ExponentBounds
+import PrimitivesBounds
 import BggMultiplication
 
 namespace MxxExponentLut

@@ -134,6 +134,10 @@ mod tests {
             certify(&bundle, &ParamEnv::default(), &backend, &parent, check_timeout().unwrap())
                 .expect("actual accepted candidate must pass the full certificate checker");
         assert!(checked.check_directory.join("Certificate.olean").is_file());
+        for module in ["ExponentNativeFirstStage", "ExponentNativeProgramProof"] {
+            assert!(checked.check_directory.join(format!("{module}.olean")).is_file());
+            assert!(checked.logs.contains_key(module));
+        }
         let record_path = checked.check_directory.parent().unwrap().join("checked-record.json");
         let record: serde_json::Value =
             serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();

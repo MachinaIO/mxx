@@ -1,4 +1,4 @@
-import ExponentBounds
+import PrimitivesBounds
 import RuntimeMatrixOps
 import Mathlib.Data.Nat.ModEq
 

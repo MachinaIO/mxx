@@ -17,7 +17,7 @@ theorem readout_decomposition_gain {q n rows inner columns : Nat}
       decomposition = reduceMatrix q n inner columns action ∧
       CoeffBound action (base.toNat / 2) ∧
       ActionGain action (inner * n * (base.toNat / 2)) := by
-  obtain ⟨layout, _, hb, _, hw, hd⟩ := hrun
+  obtain ⟨layout, _, hb, _, hw, hd, _⟩ := hrun
   subst inner
   simp only [castMatrixRows] at hd
   rw [hd, hb]
@@ -32,10 +32,10 @@ private theorem cast_integer_entries {q p n rows columns : Nat} (h : q = p)
   rfl
 
 /-- Actual CRT gadget entries are integer constants in the polynomial ring. -/
-theorem regular_gadget_integer_entries {q n rows : Nat} (hq : 1 < q) (layout : RegularLayout q) :
+theorem full_gadget_integer_entries {q n rows : Nat} (hq : 1 < q) (layout : RegularLayout q) :
     ∃ entries : Matrix (Fin rows)
       (Fin (rows * (layout.crtModuli.length * layout.digitsPerTower))) Int,
-      regularGadgetMatrix (n := n) (rows := rows) layout =
+      fullGadgetMatrix (n := n) (rows := rows) layout =
         (fun r c => (entries r c : ExactPoly q n)) := by
   classical
   letI : NeZero layout.ordered.modulusProduct := ⟨by rw [layout.ordered.modulusProduct_eq_q]; change q ≠ 0; omega⟩
@@ -45,7 +45,7 @@ theorem regular_gadget_integer_entries {q n rows : Nat} (hq : 1 < q) (layout : R
       Int.ofNat (CrtDecomposition.regularGadgetWeight layout.ordered
         ((regularIndexEquiv layout rows).symm c).2).val else 0
   refine ⟨entries, ?_⟩
-  unfold regularGadgetMatrix
+  unfold fullGadgetMatrix
   have hbefore : (fun r c => regularGadgetUnflattened (n := n) layout r
         ((regularIndexEquiv layout rows).symm c)) =
       (fun r c => (entries r c : ExactPoly layout.ordered.modulusProduct n)) := by
@@ -60,6 +60,16 @@ theorem regular_gadget_integer_entries {q n rows : Nat} (hq : 1 < q) (layout : R
     · simp
   rw [hbefore]
   exact cast_integer_entries _ entries
+
+theorem regular_gadget_integer_entries {q n rows : Nat} (hq : 1 < q)
+    (layout : RegularLayout q) :
+    ∃ entries : Matrix (Fin rows) (Fin (rows * layout.digitCount)) Int,
+      regularGadgetMatrix (n := n) (rows := rows) layout =
+        (fun r c ↦ (entries r c : ExactPoly q n)) := by
+  obtain ⟨entries, he⟩ := full_gadget_integer_entries (n := n) (rows := rows) hq layout
+  refine ⟨fun r c ↦ entries r (regularColumnIndex layout c), ?_⟩
+  funext r c
+  exact congrFun (congrFun he r) (regularColumnIndex layout c)
 
 /-- Actual gadget construction is fixed by every valid odd automorphism. -/
 theorem readout_gadget_automorphism {q n rows columns : Nat}

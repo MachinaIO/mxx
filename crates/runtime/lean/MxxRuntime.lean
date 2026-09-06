@@ -1,4 +1,5 @@
 import RuntimePrimitives
+import RuntimeDecomposition
 import RuntimeMatrixOps
 import RuntimeModulusSwitch
 import RuntimeHash

@@ -27,7 +27,7 @@ pub(super) fn root_program_setup(
         Ok(format!("facts{}.1", ".2".repeat(position)))
     };
     let mut source = String::from(
-        "import RootPrivate\nimport ExponentSetup\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedProgramSetup\nopen Mxx.Primitives MxxExponentLut\n\n",
+        "import RootPrivate\nimport ExponentSetup\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedProgramSetup\nopen Mxx.Primitives MxxRuntime MxxExponentLut\n\n",
     );
     let mut count = 0;
     for (name, output) in &artifact.root.outputs {
@@ -89,7 +89,7 @@ pub(super) fn root_program_setup(
         let cached = value(output.wire)?;
         let hd = fact(output.wire)?;
         let ht = fact(target_wire)?;
-        source.push_str(&format!("-- Actual cache {name:?}.\ntheorem public_cache_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : ExponentGeneratedPrivateRoot.RootInput}} {{outputs : ExponentGeneratedPrivateRoot.RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (gadget : ExactMatrix {q} {n} 2 {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, gadget * (({cached}) i) = (({left}) i) * (({right}) i) := by\n  intro i\n  obtain ⟨decomposition, hd, hout⟩ := {hd} i\n  have reconstruction := gadget_runs_reconstruct (by decide) (by decide) gadgetRuns hd\n  rw [hout, reconstruction]\n  exact {ht} i\n\n",params=artifact.root.parameter_type));
+        source.push_str(&format!("-- Actual cache {name:?}.\ntheorem public_cache_{count} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : ExponentGeneratedPrivateRoot.RootInput}} {{outputs : ExponentGeneratedPrivateRoot.RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (gadget : ExactMatrix {q} {n} 2 {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, gadget * (({cached}) i) = (({left}) i) * (({right}) i) := by\n  intro i\n  obtain ⟨decomposition, hd, hout⟩ := {hd} i\n  have reconstruction := gadget_runs_reconstruct (by decide) (by decide) gadgetRuns hd Fact.out\n  rw [hout, reconstruction]\n  exact {ht} i\n\n",params=artifact.root.parameter_type));
         count += 1;
     }
     if count == 0 {
@@ -127,7 +127,7 @@ pub(super) fn root_program_setup(
     let q = &matrix.modulus;
     let n = matrix.ring_dimension;
     let columns = matrix.columns;
-    source.push_str(&format!("-- Actual native public-input cache {name:?}.\ntheorem public_inputs_cache {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : ExponentGeneratedPrivateRoot.RootInput}} {{outputs : ExponentGeneratedPrivateRoot.RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (gadget : ExactMatrix {q} {n} 2 {columns}) (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, gadget * (({cached}) i) = ({target}) i := by\n  intro i\n  obtain ⟨decomposition, hd, hout⟩ := {hd} i\n  rw [hout]\n  exact gadget_runs_reconstruct (by decide) (by decide) gadgetRuns hd\n\n",params=artifact.root.parameter_type));
+    source.push_str(&format!("-- Actual native public-input cache {name:?}.\ntheorem public_inputs_cache {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : ExponentGeneratedPrivateRoot.RootInput}} {{outputs : ExponentGeneratedPrivateRoot.RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (gadget : ExactMatrix {q} {n} 2 {columns}) (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, gadget * (({cached}) i) = ({target}) i := by\n  intro i\n  obtain ⟨decomposition, hd, hout⟩ := {hd} i\n  rw [hout]\n  exact gadget_runs_reconstruct (by decide) (by decide) gadgetRuns hd Fact.out\n\n",params=artifact.root.parameter_type));
     source.push_str("end ExponentGeneratedProgramSetup\n");
     Ok(source)
 }

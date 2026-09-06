@@ -28,7 +28,7 @@ theorem refresh_crt_coefficient {q n rows : Nat} (layout : RegularLayout q)
     (c : Fin (rows * (layout.crtModuli.length * layout.digitsPerTower)))
     (tower : Fin layout.crtModuli.length) (k : Fin n) :
     layout.ordered.crtEquiv
-      (((castExactMatrix layout.product_eq (mu • regularGadgetMatrix layout)) r c).coeff k)
+      (((castExactMatrix layout.product_eq (mu • fullGadgetMatrix layout)) r c).coeff k)
       tower =
     if r = ((regularIndexEquiv layout rows).symm c).1 ∧ k = ⟨0, hn⟩ ∧
         tower = ((regularIndexEquiv layout rows).symm c).2.1 then
@@ -39,7 +39,7 @@ theorem refresh_crt_coefficient {q n rows : Nat} (layout : RegularLayout q)
     rw [layout.ordered.modulusProduct_eq_q]; exact hq
   letI : Fact (1 < layout.ordered.modulusProduct) := ⟨hp⟩
   rw [cast_smul]
-  unfold regularGadgetMatrix
+  unfold fullGadgetMatrix
   rw [castExactMatrix_cancel]
   change layout.ordered.crtEquiv
     ((mu • regularGadgetUnflattened layout r ((regularIndexEquiv layout rows).symm c)).coeff k)
@@ -81,7 +81,7 @@ theorem refresh_crt_coefficient {q n rows : Nat} (layout : RegularLayout q)
 factor. The selected CRT tower is bounded by the full scalar CRT profile. -/
 theorem regularIntegerDigits_refresh_gain {q n rows : Nat} (layout : RegularLayout q)
     (hq : 1 < q) (hn : 0 < n) (mu : Int) :
-    ActionGain (regularIntegerDigits layout (mu • regularGadgetMatrix (n := n) (rows := rows) layout))
+    ActionGain (regularIntegerDigits layout (mu • fullGadgetMatrix (n := n) (rows := rows) layout))
       (Finset.univ.sup (fun d : Fin layout.digitsPerTower =>
         sparseColumnGain layout (mu * (layout.base : Int) ^ d.val))) := by
   classical
@@ -89,7 +89,7 @@ theorem regularIntegerDigits_refresh_gain {q n rows : Nat} (layout : RegularLayo
   let index := (regularIndexEquiv layout rows).symm column
   have hb (r : Fin rows) (limb : MxxRuntime.RegularLimb layout) (k : Fin n) :
       ((CrtDecomposition.regularDigitPoly layout.ordered
-        ((castExactMatrix layout.product_eq (mu • regularGadgetMatrix layout)) r column)
+        ((castExactMatrix layout.product_eq (mu • fullGadgetMatrix layout)) r column)
         limb).coeff k).natAbs ≤
       if r = index.1 ∧ k = ⟨0, hn⟩ then
         (balancedDigitAt layout.base
@@ -127,36 +127,43 @@ theorem regularIntegerDigits_refresh_gain {q n rows : Nat} (layout : RegularLayo
         sparseColumnGain layout (mu * (layout.base : Int) ^ d.val))
       (Finset.mem_univ index.2.2)
 
-/-- Exact GadgetScalar gain from both actual registered runtime executions. -/
+/-- Exact GadgetScalar gain requires an exact registered gadget layout. -/
 theorem gadgetRuns_refresh_gain {q n rows columns inner : Nat}
     {backend : BackendContext} (layout : RegularLayout q)
     (hlookup : backend.regularLayout q n = some layout) (hq : 1 < q) (hn : 0 < n)
     {base digits : Int} (mu : Int) {G : ExactMatrix q n rows columns}
     {D : ExactMatrix q n inner columns}
     (hg : gadgetMatrixRuns backend base digits G)
-    (hd : gadgetDecomposeRuns backend base digits (mu • G) D) :
+    (hd : gadgetDecomposeRuns backend base digits (mu • G) D)
+    (hexact : layout.droppedModuli = 0) :
     ∃ action : ErrorMatrix n inner columns,
       D = reduceMatrix q n inner columns action ∧
-      ActionGain action (Finset.univ.sup (fun d : Fin layout.digitsPerTower =>
+      ActionGain action (Finset.univ.sup (fun d : Fin layout.digitsPerTower ↦
         sparseColumnGain layout (mu * (layout.base : Int) ^ d.val))) := by
+  have hcount : layout.digitCount = layout.crtModuli.length * layout.digitsPerTower := by
+    simp [RegularLayout.digitCount, RegularLayout.retainedTowers, hexact]
   obtain ⟨gl, hgl, _, _, hcolumns, hg⟩ := hg
   have he : gl = layout := Option.some.inj (hgl.symm.trans hlookup)
   subst gl
-  subst columns
-  simp only [castMatrixColumns] at hg
-  subst G
-  obtain ⟨dl, hdl, _, _, hinner, hd⟩ := hd
+  rw [hcount] at hcolumns
+  cases hcolumns
+  have hG : G = fullGadgetMatrix layout := by
+    rw [regularGadgetMatrix_eq_full layout hexact] at hg
+    rw [castMatrixColumns_comp] at hg
+    simpa only [castMatrixColumns] using hg
+  rw [hG] at hd
+  obtain ⟨dl, hdl, _, _, hinner, hd, _⟩ := hd
   have he : dl = layout := Option.some.inj (hdl.symm.trans hlookup)
   subst dl
-  subst inner
-  simp only [castMatrixRows] at hd
-  rw [hd]
-  exact ⟨regularIntegerDigits layout (mu • regularGadgetMatrix layout),
+  rw [hcount] at hinner
+  cases hinner
+  rw [regularDecomposeMatrix_eq_full layout _ hexact] at hd
+  have hD : D = fullDecomposeMatrix layout (mu • fullGadgetMatrix layout) := by
+    rw [castMatrixRows_comp] at hd
+    simpa only [castMatrixRows] using hd
+  rw [hD]
+  exact ⟨regularIntegerDigits layout (mu • fullGadgetMatrix layout),
     regularIntegerDigits_reduce layout hq hn _,
     regularIntegerDigits_refresh_gain layout hq hn mu⟩
-
-#print axioms refresh_crt_coefficient
-#print axioms regularIntegerDigits_refresh_gain
-#print axioms gadgetRuns_refresh_gain
 
 end MxxExponentLut

@@ -7,7 +7,7 @@ use crate::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -372,12 +372,14 @@ impl SubgraphHandle {
 
     /// Seals a closure body and makes every permitted foreign value an
     /// explicit input. The returned captures are ordered exactly like the
-    /// appended placeholder inputs.
+    /// appended placeholder inputs. Dependencies named in `preserved_values`
+    /// must remain reachable when indexed reads are lowered to member inputs.
     pub fn seal(
         name: impl Into<String>,
         scope: ConstructionScopeId,
         explicit_inputs: Vec<ValueHandle>,
         outputs: Vec<ValueHandle>,
+        preserved_values: &[ValueHandle],
         captures: CapturePolicy,
     ) -> Result<SealedSubgraph, FreezeError> {
         let name = name.into();
@@ -387,6 +389,10 @@ impl SubgraphHandle {
         let mut sealer = ScopeSealer {
             scope: scope.clone(),
             policy: captures,
+            preserved_values: preserved_values
+                .iter()
+                .map(|value| (value.node.identity(), value.port))
+                .collect(),
             nodes: HashMap::new(),
             captured: Vec::new(),
             capture_inputs: HashMap::new(),
@@ -454,6 +460,7 @@ impl SealMap {
 struct ScopeSealer {
     scope: ConstructionScopeId,
     policy: CapturePolicy,
+    preserved_values: HashSet<(NodeIdentity, Port)>,
     nodes: HashMap<NodeIdentity, NodeHandle>,
     captured: Vec<CapturedValue>,
     capture_inputs: HashMap<(NodeIdentity, Port, Option<usize>), ValueHandle>,
@@ -470,7 +477,8 @@ impl ScopeSealer {
                 if matches!(value.node.kind(), NodeKind::FamilyGetDynamic) &&
                     let [family, index] = value.node.arguments() &&
                     family.construction_scope() != self.scope &&
-                    let Some(offset) = parallel_index_offset(index, slot, &self.scope)
+                    let Some(offset) = parallel_index_offset(index, slot, &self.scope) &&
+                    self.can_elide_index(index)
                 {
                     let mode = if offset == 0 {
                         LoopInputMode::Zip
@@ -513,6 +521,11 @@ impl ScopeSealer {
             node
         };
         node.output(value.port.0).ok_or(FreezeError::InvalidPort { port: value.port.0 })
+    }
+
+    fn can_elide_index(&self, value: &ValueHandle) -> bool {
+        !self.preserved_values.contains(&(value.node.identity(), value.port)) &&
+            value.node.arguments().iter().all(|argument| self.can_elide_index(argument))
     }
 
     fn capture(
@@ -1444,6 +1457,7 @@ mod tests {
             scope,
             Vec::new(),
             vec![direct.clone(), duplicate, offset, dynamic, literal_offset],
+            &[],
             CapturePolicy::Lexical { parallel_index: Some(2) },
         )
         .unwrap();
@@ -1481,6 +1495,7 @@ mod tests {
             scope,
             Vec::new(),
             vec![output],
+            &[],
             CapturePolicy::Lexical { parallel_index: Some(0) },
         )
         .unwrap();
@@ -1520,6 +1535,7 @@ mod tests {
             scope,
             Vec::new(),
             vec![output],
+            &[],
             CapturePolicy::Lexical { parallel_index: Some(0) },
         )
         .unwrap();
@@ -1579,6 +1595,7 @@ mod tests {
                 scope,
                 Vec::new(),
                 vec![escaped.clone()],
+                &[],
                 CapturePolicy::Lexical { parallel_index: None }
             ),
             Err(FreezeError::ForeignScope { .. })
@@ -1589,6 +1606,7 @@ mod tests {
                 current_construction_scope(),
                 Vec::new(),
                 vec![escaped],
+                &[],
                 CapturePolicy::Lexical { parallel_index: None }
             ),
             Err(FreezeError::ForeignScope { .. })
@@ -1625,6 +1643,7 @@ mod tests {
                 scope,
                 Vec::new(),
                 vec![output],
+                &[],
                 CapturePolicy::Lexical { parallel_index: Some(0) }
             ),
             Err(FreezeError::ForeignScope { .. })
@@ -1642,6 +1661,7 @@ mod tests {
                 inner_scope,
                 Vec::new(),
                 vec![member.clone()],
+                &[],
                 CapturePolicy::Lexical { parallel_index: Some(1) },
             )
             .unwrap();
@@ -1668,6 +1688,7 @@ mod tests {
             scope,
             Vec::new(),
             vec![output],
+            &[],
             CapturePolicy::Lexical { parallel_index: Some(0) },
         )
         .unwrap();
@@ -1700,6 +1721,7 @@ mod tests {
             scope,
             Vec::new(),
             vec![value],
+            &[],
             CapturePolicy::Lexical { parallel_index: None },
         )
         .unwrap();

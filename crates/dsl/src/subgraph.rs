@@ -46,6 +46,7 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
             scope,
             inputs.flatten(),
             output.flatten(),
+            &[],
             CapturePolicy::Lexical { parallel_index: None },
         )?;
         Ok(Self {

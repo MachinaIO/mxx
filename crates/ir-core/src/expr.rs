@@ -3,7 +3,7 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use thiserror::Error;
 
 /// Symbolic integer arithmetic evaluated with explicit parameter bindings.
@@ -583,7 +583,9 @@ impl IntExpr {
         }
     }
 
-    /// Returns the normative polynomial normal form over opaque generators.
+    /// Returns the polynomial normal form over opaque generators, retaining evaluation of
+    /// partial operations even when their coefficients cancel. A retained zero product prevents
+    /// normalization and serialization from erasing division or other domain errors.
     pub fn canonicalize(&self) -> Self {
         Polynomial::from_expr(self).into_expr()
     }
@@ -1026,7 +1028,10 @@ enum Generator {
 type Monomial = Vec<Generator>;
 
 #[derive(Clone, Debug, Default)]
-struct Polynomial(BTreeMap<Monomial, BigInt>);
+struct Polynomial {
+    terms: BTreeMap<Monomial, BigInt>,
+    required: BTreeSet<Generator>,
+}
 
 impl Polynomial {
     fn from_expr(expr: &IntExpr) -> Self {
@@ -1058,16 +1063,30 @@ impl Polynomial {
     }
 
     fn constant(value: BigInt) -> Self {
-        if value.is_zero() { Self::default() } else { Self(BTreeMap::from([(Vec::new(), value)])) }
+        if value.is_zero() {
+            Self::default()
+        } else {
+            Self { terms: BTreeMap::from([(Vec::new(), value)]), required: BTreeSet::new() }
+        }
     }
 
     fn generator(generator: Generator) -> Self {
-        Self(BTreeMap::from([(vec![generator], BigInt::one())]))
+        // Variables are polynomial indeterminates with bindings supplied by the caller. Other
+        // generators are partial even with complete bindings, and must still be evaluated if
+        // algebraic cancellation removes their numeric contribution. Select stays opaque so
+        // only its selected branch is evaluated.
+        let required = if matches!(generator, Generator::Var(_) | Generator::LoopIndex(_)) {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([generator.clone()])
+        };
+        Self { terms: BTreeMap::from([(vec![generator], BigInt::one())]), required }
     }
 
     fn add(mut self, rhs: Self) -> Self {
-        for (monomial, coefficient) in rhs.0 {
-            match self.0.entry(monomial) {
+        self.required.extend(rhs.required);
+        for (monomial, coefficient) in rhs.terms {
+            match self.terms.entry(monomial) {
                 Entry::Vacant(entry) => {
                     entry.insert(coefficient);
                 }
@@ -1083,28 +1102,37 @@ impl Polynomial {
     }
 
     fn sub(self, mut rhs: Self) -> Self {
-        for coefficient in rhs.0.values_mut() {
+        for coefficient in rhs.terms.values_mut() {
             *coefficient = -coefficient.clone();
         }
         self.add(rhs)
     }
 
     fn mul(self, rhs: Self) -> Self {
-        let mut output = Self::default();
-        for (lhs_monomial, lhs_coefficient) in self.0 {
-            for (rhs_monomial, rhs_coefficient) in &rhs.0 {
+        let mut required = self.required;
+        required.extend(rhs.required);
+        let mut output = Self { terms: BTreeMap::new(), required };
+        for (lhs_monomial, lhs_coefficient) in self.terms {
+            for (rhs_monomial, rhs_coefficient) in &rhs.terms {
                 let mut monomial = lhs_monomial.clone();
                 monomial.extend(rhs_monomial.iter().cloned());
                 monomial.sort();
                 let coefficient = &lhs_coefficient * rhs_coefficient;
-                output = output.add(Self(BTreeMap::from([(monomial, coefficient)])));
+                output = output.add(Self {
+                    terms: BTreeMap::from([(monomial, coefficient)]),
+                    required: BTreeSet::new(),
+                });
             }
         }
         output
     }
 
-    fn into_expr(self) -> IntExpr {
-        let mut terms = self.0.into_iter().map(|(monomial, coefficient)| {
+    fn into_expr(mut self) -> IntExpr {
+        let retained = self.terms.keys().flatten().cloned().collect::<BTreeSet<_>>();
+        for generator in self.required.difference(&retained) {
+            self.terms.insert(vec![generator.clone()], BigInt::zero());
+        }
+        let mut terms = self.terms.into_iter().map(|(monomial, coefficient)| {
             let mut factors = Vec::new();
             if coefficient != BigInt::one() || monomial.is_empty() {
                 factors.push(IntExpr::Const(coefficient));
@@ -1195,6 +1223,63 @@ mod tests {
             (IntExpr::constant(7) % 0).evaluate(&ParamEnv::default()),
             Err(ExprError::DivisionByZero)
         );
+    }
+
+    #[test]
+    fn test_canonicalization_preserves_partial_operation_errors_after_cancellation() {
+        let denominator = IntExpr::Var("denominator".to_owned());
+        let partials = [
+            IntExpr::constant(1) / 0,
+            IntExpr::constant(1) / 2,
+            IntExpr::constant(1) % 0,
+            IntExpr::constant(1).floor_div(0),
+            IntExpr::constant(1) / &denominator,
+            IntExpr::constant(1) % &denominator,
+            IntExpr::constant(1).floor_div(&denominator),
+            IntExpr::RoundDiv(Box::new(IntExpr::constant(1)), Box::new(denominator.clone())),
+            IntExpr::Log2Ceil(Box::new(denominator.clone())),
+        ];
+        for divisor in [-1, 0, 1, 2] {
+            let env = ParamEnv {
+                integers: BTreeMap::from([("denominator".to_owned(), BigInt::from(divisor))]),
+                ..ParamEnv::default()
+            };
+            for partial in &partials {
+                let raw = [
+                    IntExpr::Sub(Box::new(partial.clone()), Box::new(partial.clone())),
+                    IntExpr::Mul(Box::new(partial.clone()), Box::new(IntExpr::constant(0))),
+                    IntExpr::Mul(Box::new(IntExpr::constant(0)), Box::new(partial.clone())),
+                ];
+                let operators = [partial - partial, partial * 0, IntExpr::constant(0) * partial];
+                for (raw, operator) in raw.into_iter().zip(operators) {
+                    let expected = raw.evaluate(&env);
+                    let canonical = raw.canonicalize();
+                    assert_eq!(canonical.evaluate(&env), expected);
+                    assert_eq!(operator.evaluate(&env), expected);
+                    assert_eq!(canonical.canonicalize(), canonical);
+                    let serialized = serde_json::to_vec(&raw).unwrap();
+                    let decoded: IntExpr = serde_json::from_slice(&serialized).unwrap();
+                    assert_eq!(decoded.evaluate(&env), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_canonicalization_preserves_partial_selector_laziness() {
+        let selection = IntExpr::Select {
+            selector: Box::new(IntExpr::Var("selector".to_owned())),
+            branches: vec![IntExpr::constant(9), IntExpr::constant(1) / 0],
+        };
+        let raw = IntExpr::Sub(Box::new(selection.clone()), Box::new(selection.clone()));
+        let canonical = raw.canonicalize();
+        for selector in [-1, 0, 1, 2] {
+            let env = ParamEnv {
+                integers: BTreeMap::from([("selector".to_owned(), BigInt::from(selector))]),
+                ..ParamEnv::default()
+            };
+            assert_eq!(canonical.evaluate(&env), raw.evaluate(&env));
+        }
     }
 
     #[test]

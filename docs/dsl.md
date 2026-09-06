@@ -63,6 +63,8 @@ let sigma = (&variance + 1) / 2;
 
 `IntExpr` supports `+`, `-`, `*`, `/`, `%`, unary `-`, and `floor_div`. Its `/` retains
 exact compile-time division: a nonzero remainder is an error. `%` retains floor remainder.
+Cancellation and multiplication by zero preserve errors from partial operations, including during
+canonicalization and serialization; for example, `(1 / 0) * 0` remains an error.
 `RealExpr` supports `+`, `-`, `*`, `/`, and unary `-`; integer/rational conversions remain exact.
 No implicit floating-point conversion is introduced.
 

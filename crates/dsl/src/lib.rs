@@ -1455,6 +1455,19 @@ impl Pending {
         merged
     }
 
+    fn referenced_values(&self) -> Vec<ValueHandle> {
+        self.semantic_anchors
+            .values()
+            .flatten()
+            .cloned()
+            .chain(
+                self.derivation_attachments
+                    .iter()
+                    .flat_map(|attachment| attachment.roles.iter().map(|(_, wire)| wire.clone())),
+            )
+            .collect()
+    }
+
     fn remap(&self, map: &SealMap) -> Self {
         let semantic_anchors = self
             .semantic_anchors
@@ -1803,15 +1816,8 @@ impl DslContext {
         let pending = Pending::merge(self.outputs.values().map(|output| output.pending.clone()));
         let root_scope = mxx_ir_core::current_construction_scope();
         let retained_roots = pending
-            .semantic_anchors
-            .values()
-            .flat_map(|wires| wires.iter().cloned())
-            .chain(
-                pending
-                    .derivation_attachments
-                    .iter()
-                    .flat_map(|attachment| attachment.roles.iter().map(|(_, wire)| wire.clone())),
-            )
+            .referenced_values()
+            .into_iter()
             .filter(|wire| wire.construction_scope() == root_scope)
             .collect();
         let outputs = self

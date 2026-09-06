@@ -24,6 +24,7 @@ pub fn parallel<T: GraphValue>(
         scope,
         vec![],
         output.flatten(),
+        &output.pending().referenced_values(),
         CapturePolicy::Lexical { parallel_index: Some(index_slot) },
     )?;
     let pending = output.pending().remap(&sealed.remap);
@@ -72,6 +73,7 @@ pub fn iterate<S: GraphValue>(
         scope,
         inputs,
         output.flatten(),
+        &[],
         CapturePolicy::Lexical { parallel_index: None },
     )?;
     let pending = Pending::merge([initial.pending(), output.pending().remap(&sealed.remap)]);
@@ -190,6 +192,72 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn indexed_reads_preserve_index_anchors_and_derivation_roles() {
+        for attachment in [false, true] {
+            for offset in [0, 1] {
+                let ring = Ring::new(17, 8);
+                let source = ring.input_family("source", 3, (1, 1));
+                let output = parallel(2, |i| {
+                    let index = &i + 0;
+                    let index = if attachment {
+                        let role = index.value_handle().clone();
+                        index.derivation_attachment(
+                            "test",
+                            "index",
+                            vec![("index".into(), role)],
+                        )?
+                    } else {
+                        index.semantic_anchor("index")?
+                    };
+                    // The offset also checks annotations on a dependency of the eliminated index.
+                    let index = if offset == 0 { index } else { index + offset };
+                    Ok((source.at(index), source.at(i)))
+                })
+                .unwrap();
+                let built = DslContext::new("annotated-index")
+                    .output("result", output)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                built.validate(&ParamEnv::default()).unwrap();
+                let annotated = if attachment {
+                    &built.derivation_attachments.iter().next().unwrap().roles[0].1
+                } else {
+                    &built.anchors.get("index").unwrap()[0]
+                };
+                assert!(matches!(
+                    annotated.scope,
+                    mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }
+                ));
+                let scope = built.graph.scope(&annotated.scope).unwrap();
+                assert!(matches!(
+                    scope.node(annotated.wire.node).unwrap().kind(),
+                    NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add)
+                ));
+                assert!(
+                    scope
+                        .nodes()
+                        .iter()
+                        .any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
+                );
+                let spec = built
+                    .graph
+                    .root_scope()
+                    .nodes()
+                    .iter()
+                    .find_map(|node| match node.kind() {
+                        NodeKind::ParallelLoop(spec) => Some(spec),
+                        _ => None,
+                    })
+                    .unwrap();
+                // Unannotated reads still use indexed placement in the very same loop.
+                assert!(spec.input_modes.contains(&mxx_ir_core::node::LoopInputMode::Zip));
+                assert!(spec.input_modes.contains(&mxx_ir_core::node::LoopInputMode::Broadcast));
+            }
+        }
     }
 
     #[test]

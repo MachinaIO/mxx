@@ -70,14 +70,46 @@ Slots occupy two rows of N/2 entries.
 respective evaluation keys at the ciphertext's level. CRT modulus switching
 operates on residues without reconstructing whole ciphertext coefficients.
 
+BGV uses hybrid RNS key switching (ePrint 2021/204, Appendix B.2.3), including
+relinearization, rotations, and row swaps. `BgvParams::new(common, t, None)`
+selects approximately three CRT digits and a disjoint 60-bit auxiliary basis P
+large enough to cover the largest digit. Pass `Some(BgvHybridParams {
+digit_size, auxiliary_primes })` to specify the partition width and P explicitly.
+Evaluation keys are 2-by-ceil((level+1)/digit_size) matrices over Q_level*P;
+use `key_switch_parameters(level)` when importing them. Ciphertexts remain over
+Q_level, and switching preserves their correction factor. Parameter security
+must be assessed at Q*P, including the secret-dependent evaluation keys.
+
+The evaluator normalizes CRT digits, approximately extends them to QP, multiplies
+the evaluation key, and removes P with the BGV correction `(S+t*U)/P`, where
+`U = -S/t mod P`. Dedicated `RnsModUp` and `RnsModDown` nodes execute fused
+CPU/CUDA primitives: inverse-transform each input once, accumulate centered CRT
+terms in coefficient form, and forward-transform each output digit once.
+Normalization factors and division inverses are cached per worker and basis;
+GPU coefficients stay on the device. CUDA computes cofactor weights once per
+conversion using a setup kernel, without a host metadata allocation or upload. The GPU conversion batches all entries, digits, and destination
+limbs in one coefficient kernel, with stream-ordered temporary lifetimes.
+The tracked added noise is
+bounded by `ceil((N*error_cutoff*sum_j(alpha_j*floor(Q_j/2)) +
+(N+1)*k*floor(P/2))/P)`, where alpha_j is the number of primes in digit j and k is
+the number of auxiliary primes. This includes approximate-extension error.
+
+For manual CPU key-switch timing, run
+`FHE_TEST_RING_DIMENSION=1024 cargo test -r -p mxx-fhe --lib test_cpu_key_switch_evaluation_timing -- --ignored --nocapture`.
+The fixture uses production evaluation with pre-generated keys and inputs,
+excludes key generation and graph construction, warms up once, and records
+20 execution-plus-output-materialization samples (`FHE_BENCH_REPEATS` overrides
+the count). Other `FHE_TEST_*` variables control the test parameters.
+
 To execute a graph:
 
 1. Construct a `DslContext`, declare inputs, and use the FHE methods to build
    encryption, evaluation, and decryption nodes. Mark secrets and decoded values
    as private outputs.
 2. Build and validate the graph with a `ParamEnv`. Register the exact ordered
-   ciphertext CRT bases with the runtime backend, including single-prime rings
-   used by modulus switching and `batching_parameters()` for BGV.
+   ciphertext CRT bases with the runtime backend. For BGV,
+   `runtime_parameters()` supplies all ciphertext, hybrid, single-prime, and
+   plaintext rings in their exact tower order.
 3. Call runtime `execute` with inputs, a backend, a `MemoryArtifactStore`, and a
    sampling mode. Materialize lazy family outputs before inspecting their values.
 

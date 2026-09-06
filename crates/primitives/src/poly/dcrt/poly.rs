@@ -68,6 +68,30 @@ impl DCRTPoly {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn rns_convert(
+        &self,
+        params: &DCRTPolyParams,
+        digit_size: usize,
+        normalize: bool,
+        plaintext_modulus: u64,
+    ) -> Result<Vec<Self>, String> {
+        let result = super::native::ffi::exact_basis_rns(
+            &self.ptr_poly,
+            &params.to_crt().0,
+            digit_size,
+            normalize,
+            plaintext_modulus,
+        )
+        .map_err(|error| error.to_string())?;
+        (0..ffi::GetMatrixRows(&result))
+            .map(|row| {
+                super::native::ffi::exact_basis_matrix_entry(&result, row, 0)
+                    .map(Self::new)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
     pub fn modulus_switch(&self, params: &DCRTPolyParams) -> Self {
         let new_modulus = params.modulus();
         let coeffs = self.coeffs();

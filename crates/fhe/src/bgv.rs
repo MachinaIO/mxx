@@ -1,4 +1,4 @@
-//! BGV graph builders with exact CRT gadget switching and modulus reduction.
+//! BGV graph builders with RNS hybrid key switching and modulus reduction.
 use crate::{
     FheCommonParams, FheError, FheScheme,
     utils::{self, check_family, check_matrix},
@@ -21,10 +21,20 @@ use mxx_primitives::{
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 
+/// RNS partition width and auxiliary basis for Appendix B.2.3 of ePrint 2021/204.
+/// Security must be assessed at the extended modulus Q*P, not just Q.
+#[derive(Clone, Debug)]
+pub struct BgvHybridParams {
+    pub digit_size: usize,
+    pub auxiliary_primes: Vec<u64>,
+}
+
 #[derive(Clone)]
 pub struct BgvParams {
     pub common: FheCommonParams,
     pub plaintext_modulus: u64,
+    hybrid: BgvHybridParams,
+    extended: DCRTPolyParams,
 }
 
 /// Descending coefficients in -s: (a,b), or (a1*a2,a1*b2+b1*a2,b1*b2).
@@ -98,7 +108,13 @@ pub(crate) fn row(matrix: &Mat, index: usize) -> Mat {
 }
 
 impl BgvParams {
-    pub fn new(common: FheCommonParams, plaintext_modulus: u64) -> Result<Self, FheError> {
+    /// None selects approximately three CRT digits and enough 60-bit special
+    /// primes for P >= the largest digit modulus. This is not security selection.
+    pub fn new(
+        common: FheCommonParams,
+        plaintext_modulus: u64,
+        hybrid: Option<BgvHybridParams>,
+    ) -> Result<Self, FheError> {
         common.validate()?;
         if plaintext_modulus < 2 ||
             common
@@ -112,7 +128,56 @@ impl BgvParams {
                 "plaintext modulus must be at least two and coprime to every CRT prime",
             ));
         }
-        let params = Self { common, plaintext_modulus };
+        let primes = common.ring.to_crt().0;
+        let hybrid = hybrid.unwrap_or_else(|| {
+            let digit_size = primes.len().div_ceil(3);
+            let largest = primes
+                .chunks(digit_size)
+                .map(|group| group.iter().map(|&p| BigUint::from(p)).product::<BigUint>())
+                .max()
+                .unwrap();
+            let order = 2 * u64::from(common.ring.ring_dimension());
+            let mut candidate = ((1u64 << 60) - 2) / order * order + 1;
+            let mut product = BigUint::from(1u8);
+            let mut auxiliary_primes = Vec::new();
+            while product < largest {
+                if !primes.contains(&candidate) &&
+                    plaintext_modulus % candidate != 0 &&
+                    is_prime(candidate)
+                {
+                    auxiliary_primes.push(candidate);
+                    product *= candidate;
+                }
+                candidate -= order;
+            }
+            BgvHybridParams { digit_size, auxiliary_primes }
+        });
+        if hybrid.digit_size == 0 ||
+            hybrid.digit_size > primes.len() ||
+            hybrid.auxiliary_primes.is_empty() ||
+            hybrid.auxiliary_primes.iter().any(|&p| {
+                p < 3 || primes.contains(&p) || plaintext_modulus % p == 0 || !is_prime(p)
+            })
+        {
+            return Err(FheError::InvalidParameters("invalid hybrid partition or auxiliary basis"));
+        }
+        let mut extended_primes = primes;
+        extended_primes.extend(&hybrid.auxiliary_primes);
+        let bits = extended_primes.iter().map(|p| (64 - p.leading_zeros()) as usize).max().unwrap();
+        let extended = DCRTPolyParams::try_new(
+            common.ring.ring_dimension(),
+            extended_primes.len(),
+            bits,
+            common.ring.base_bits(),
+            Some(extended_primes),
+            None,
+        )
+        .map_err(|_| FheError::InvalidParameters("invalid hybrid extended CRT basis"))?;
+        if extended.to_crt().0.iter().any(|&p| extended.select_modulus(&BigUint::from(p)).is_none())
+        {
+            return Err(FheError::InvalidParameters("hybrid single-prime basis is unsupported"));
+        }
+        let params = Self { common, plaintext_modulus, hybrid, extended };
         // Every BGV message uses SIMD slots, so the plaintext ring must split
         // into N linear factors before any encryption graph can be built.
         params.batching_root()?;
@@ -140,12 +205,72 @@ impl BgvParams {
         Ok(self.phase_from_noise(&ct.noise_bound) * 2u8 < *parameters.modulus())
     }
 
-    /// One exact CRT gadget switch adds sum(e_i*d_i), with L polynomials and |d_i| <= B/2.
+    /// Concrete Q_level*P key ring and its number of RNS columns.
+    pub fn key_switch_parameters(&self, level: usize) -> Result<(DCRTPolyParams, usize), FheError> {
+        let q = self.common.parameters_at(level)?;
+        let p = self.hybrid.auxiliary_primes.iter().map(|&p| BigUint::from(p)).product::<BigUint>();
+        Ok((
+            self.extended
+                .select_modulus(&(q.modulus().as_ref() * p))
+                .ok_or(FheError::LevelMismatch)?,
+            (level + 1).div_ceil(self.hybrid.digit_size),
+        ))
+    }
+
+    /// Register these exact ordered rings with either runtime backend.
+    pub fn runtime_parameters(&self) -> Result<Vec<DCRTPolyParams>, FheError> {
+        let mut rings = vec![self.batching_parameters()?];
+        for p in self.common.ring.to_crt().0 {
+            rings.push(self.common.ring.select_modulus(&BigUint::from(p)).unwrap());
+        }
+        for level in 0..self.common.ring.crt_depth() {
+            rings.push(self.common.parameters_at(level)?);
+            rings.push(self.key_switch_parameters(level)?.0);
+        }
+        Ok(rings)
+    }
+
+    // e_add = (sum_j d_j*e_j + U_b - s*U_a)/P. Approximate ModUp
+    // gives |d_j| <= alpha_j*floor(Q_j/2); ModDown gives
+    // |U| <= k*floor(P/2). The numerator is divisible by P modulo Q;
+    // ceil also covers its fractional error relative to the integer target.
     fn key_switch_noise(&self, parameters: &DCRTPolyParams) -> BigUint {
-        BigUint::from(parameters.ring_dimension()) *
-            BigUint::from(parameters.modulus_digits()) *
-            (BigUint::from(1u8) << (parameters.base_bits() - 1) as usize) *
-            &self.common.error_cutoff
+        let digits = parameters
+            .to_crt()
+            .0
+            .chunks(self.hybrid.digit_size)
+            .map(|group| {
+                let q = group.iter().map(|&p| BigUint::from(p)).product::<BigUint>();
+                BigUint::from(group.len()) * (q / 2u8)
+            })
+            .sum::<BigUint>();
+        let p = self.hybrid.auxiliary_primes.iter().map(|&p| BigUint::from(p)).product::<BigUint>();
+        let n = BigUint::from(parameters.ring_dimension());
+        (&n * &self.common.error_cutoff * digits +
+            (n + 1u8) * BigUint::from(self.hybrid.auxiliary_primes.len()) * (&p / 2u8) +
+            &p -
+            1u8) /
+            p
+    }
+
+    fn key_switch(&self, value: &Mat, key: &Mat, level: usize) -> Result<Mat, FheError> {
+        let q = self.common.parameters_at(level)?;
+        let (extended, width) = self.key_switch_parameters(level)?;
+        check_matrix(&extended, key, 2, width)?;
+        let digits = value.clone().rns_mod_up(
+            extended.modulus().as_ref().clone(),
+            q.to_crt().0,
+            self.hybrid.digit_size,
+            true,
+        );
+        let accumulated = key * &digits;
+        // The key target contains P. Dividing by P cancels it, so the
+        // ciphertext correction factor is unchanged (unlike level dropping).
+        Ok(accumulated.rns_mod_down(
+            q.modulus().as_ref().clone(),
+            extended.to_crt().0,
+            self.plaintext_modulus,
+        ))
     }
 
     pub(crate) fn level_of(&self, matrix: &Mat) -> Result<usize, FheError> {
@@ -186,15 +311,35 @@ impl BgvParams {
         utils::check_matrix(&self.common.ring, secret, 1, 1)?;
         let params = self.common.parameters_at(level)?;
         utils::check_matrix(&params, target, 1, 1)?;
-        let ring = Ring::new(params.modulus().as_ref().clone(), params.ring_dimension());
-        let s = secret.clone().reduce_modulus(params.modulus().as_ref().clone());
-        let width = params.modulus_digits();
+        let (extended, width) = self.key_switch_parameters(level)?;
+        let ring = Ring::new(extended.modulus().as_ref().clone(), extended.ring_dimension());
+        // The secret is ternary: lifting one tower recovers its actual integer
+        // coefficients. A target lift need only agree modulo Q since it is scaled by P.
+        let s = secret
+            .clone()
+            .reduce_modulus(self.common.ring.to_crt().0[0])
+            .centered_rebase(extended.modulus().as_ref().clone());
+        let target = target.clone().rns_mod_up(
+            extended.modulus().as_ref().clone(),
+            params.to_crt().0,
+            params.crt_depth(),
+            false,
+        );
+        let p = extended.modulus().as_ref() / params.modulus().as_ref();
+        let targets = params
+            .to_crt()
+            .0
+            .chunks(self.hybrid.digit_size)
+            .map(|group| {
+                let digit = group.iter().map(|&p| BigUint::from(p)).product::<BigUint>();
+                &target * &utils::scalar(&extended, &p * (params.modulus().as_ref() / digit))
+            })
+            .collect::<Vec<_>>();
         let a = ring.uniform_residue((1, width));
-        let e = self.common.gaussian(&params, 1, width);
-        let g = ring.gadget(1, BigUint::from(1u8) << params.base_bits(), width);
-        // The key phase is target*G + t*e, so multiplying by exact gadget
-        // digits substitutes the target without introducing a rounding error.
-        let b = &s * &a + &utils::scalar(&params, self.plaintext_modulus) * &e + target * &g;
+        let e = self.common.gaussian(&extended, 1, width);
+        let b = &s * &a +
+            utils::scalar(&extended, self.plaintext_modulus) * e +
+            Mat::concat(ConcatAxis::Columns, targets);
         Ok(concat_rows![a, b])
     }
     /// Evaluation keys encrypt a secret-dependent target; callers must account for this assumption.
@@ -233,12 +378,8 @@ impl BgvParams {
     pub fn relinearize(&self, ct: &BgvCiphertext, key: &Mat) -> Result<BgvCiphertext, FheError> {
         let level = self.validate_ciphertext(ct, 3)?;
         let params = self.common.parameters_at(level)?;
-        utils::check_matrix(&params, key, 2, params.modulus_digits())?;
-        let digits = row(&ct.components, 0)
-            .decompose(BigUint::from(1u8) << params.base_bits(), params.modulus_digits());
-        // The leading coefficient multiplies s^2; its key encrypts +s^2,
-        // so the switched pair is added to the remaining linear polynomial.
-        let switched = digits.mul_small_rhs(key.clone());
+        // The leading coefficient multiplies +s^2.
+        let switched = self.key_switch(&row(&ct.components, 0), key, level)?;
         Ok(BgvCiphertext {
             components: concat_rows![row(&ct.components, 1), row(&ct.components, 2)] + switched,
             correction_factor: ct.correction_factor,
@@ -620,17 +761,13 @@ impl BgvParams {
     ) -> Result<BgvCiphertext, FheError> {
         let level = self.validate_ciphertext(ct, 2)?;
         let parameters = self.common.parameters_at(level)?;
-        let digits = parameters.modulus_digits();
-        check_matrix(&parameters, key, 2, digits)?;
         // The automorphism changes the decryption secret to sigma(s). The
         // switch key encrypts sigma(s) under s; subtract its phase to recover
         // sigma(b) - sigma(s)*sigma(a), explaining both minus signs below.
         let transformed = ct.components.clone().ring_automorphism(index);
         let a = row(&transformed, 0);
         let b = row(&transformed, 1);
-        let switched = a
-            .decompose(IntExpr::constant(1u64 << parameters.base_bits()), digits)
-            .mul_small_rhs(key.clone());
+        let switched = self.key_switch(&a, key, level)?;
         let switched_a = row(&switched, 0);
         let switched_b = row(&switched, 1);
         Ok(BgvCiphertext {
@@ -651,9 +788,106 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn test_bgv_hybrid_multilimb_partitions_and_noise() {
+        let common = common();
+        let defaults = BgvParams::new(common.clone(), 17, None).unwrap();
+        let order = 2 * u64::from(common.ring.ring_dimension());
+        let mut auxiliary_primes = defaults.hybrid.auxiliary_primes.clone();
+        let mut candidate = *auxiliary_primes.last().unwrap() - order;
+        while auxiliary_primes.len() < 2 {
+            if is_prime(candidate) && !common.ring.to_crt().0.contains(&candidate) {
+                auxiliary_primes.push(candidate);
+            }
+            candidate -= order;
+        }
+        // Multiple P limbs, non-prefix/reordered Q groups, truncated last
+        // digits, and every level exercise both approximate basis conversions.
+        let mut reversed = common.ring.to_crt().0;
+        reversed.reverse();
+        let mut common = common;
+        common.ring = DCRTPolyParams::new(
+            common.ring.ring_dimension(),
+            reversed.len(),
+            common.ring.to_crt().1,
+            common.ring.base_bits(),
+            Some(reversed),
+            None,
+        );
+        for digit_size in [1, 2, common.ring.crt_depth()] {
+            if digit_size > common.ring.crt_depth() {
+                continue;
+            }
+            let bgv = BgvParams::new(
+                common.clone(),
+                17,
+                Some(BgvHybridParams { digit_size, auxiliary_primes: auxiliary_primes.clone() }),
+            )
+            .unwrap();
+            let secret = common.sample_secret();
+            let mut context = DslContext::new("fhe-hybrid-key-phase");
+            for level in 0..common.ring.crt_depth() {
+                let q = common.parameters_at(level).unwrap();
+                let ring = Ring::new(q.modulus().as_ref().clone(), q.ring_dimension());
+                let target = secret.clone().reduce_modulus(q.modulus().as_ref().clone());
+                let key = bgv.key_switch_key(&secret, level, &target).unwrap();
+                let value = ring.uniform_residue((1, 1));
+                let switched = bgv.key_switch(&value, &key, level).unwrap();
+                let error = row(&switched, 1) - &target * &row(&switched, 0) - &value * &target;
+                let coefficients = error.coefficients();
+                let centered = parallel(q.ring_dimension(), |i| {
+                    utils::centered(coefficients.at(i), q.modulus().as_ref())
+                })
+                .unwrap();
+                context = context.private_output(format!("error{level}"), centered).unwrap();
+            }
+            let result = execute_graph(
+                context.build().unwrap(),
+                &common,
+                BTreeMap::new(),
+                &bgv.runtime_parameters().unwrap(),
+            );
+            for level in 0..common.ring.crt_depth() {
+                let bound = bgv.key_switch_noise(&common.parameters_at(level).unwrap());
+                for error in integers(&result, &format!("error{level}")) {
+                    assert_eq!(error.mod_floor(&BigInt::from(17)), BigInt::from(0));
+                    assert!(error.abs().to_biguint().unwrap() <= &bound * 17u8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_bgv_hybrid_rejects_invalid_basis() {
+        let common = common();
+        let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
+        let p = bgv.hybrid.auxiliary_primes[0];
+        if common.ring.base_bits() > 3 {
+            // 97 is a compatible prime for the default N=8, but its seven
+            // bits cannot support the inherited four-bit primitive base.
+            assert!(
+                BgvParams::new(
+                    common.clone(),
+                    17,
+                    Some(BgvHybridParams { digit_size: 1, auxiliary_primes: vec![97] })
+                )
+                .is_err()
+            );
+        }
+        for config in [
+            BgvHybridParams { digit_size: 0, auxiliary_primes: vec![p] },
+            BgvHybridParams { digit_size: 1, auxiliary_primes: vec![] },
+            BgvHybridParams { digit_size: 1, auxiliary_primes: vec![p, p] },
+            BgvHybridParams { digit_size: 1, auxiliary_primes: vec![common.ring.to_crt().0[0]] },
+            BgvHybridParams { digit_size: 1, auxiliary_primes: vec![17] },
+        ] {
+            assert!(BgvParams::new(common.clone(), 17, Some(config)).is_err());
+        }
+    }
+
+    #[test]
     fn test_bgv_phase_bounds_cover_noisy_runtime_composition() {
         let common = common();
-        let bgv = BgvParams::new(common.clone(), 17).unwrap();
+        let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
         let top = common.ring.to_crt().2 - 1;
         assert!(top >= 1, "phase bound test needs at least two CRT limbs");
         let n = common.ring.ring_dimension() as usize;
@@ -706,6 +940,7 @@ mod tests {
             context.build().unwrap(),
             &common,
             BTreeMap::from([("message".into(), int_input(&message))]),
+            &bgv.runtime_parameters().unwrap(),
         );
         for (name, ct, _, _) in cases {
             // Recover the actual e from the runtime phase, independently of
@@ -746,7 +981,7 @@ mod tests {
         let n = common.ring.ring_dimension() as usize;
         let top = common.ring.to_crt().2 - 1;
         assert!(top >= 2, "BGV test requires at least three CRT limbs");
-        let bgv = BgvParams::new(common.clone(), 17).unwrap();
+        let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
         let context = DslContext::new("fhe-bgv-noisy-arithmetic");
         let input = context.int_family_input("slots", n);
         let (secret, pk) = bgv.keygen().unwrap();
@@ -786,6 +1021,7 @@ mod tests {
             graph,
             &common,
             BTreeMap::from([("slots".to_owned(), int_input(&message))]),
+            &bgv.runtime_parameters().unwrap(),
         );
         assert_eq!(
             integers(&result, "roundtrip"),
@@ -805,7 +1041,7 @@ mod tests {
     #[test]
     fn test_bgv_rejects_invalid_metadata_and_shapes() {
         let common = common();
-        let bgv = BgvParams::new(common.clone(), 17).unwrap();
+        let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
         let ct = BgvCiphertext {
             components: common.ring().zero((2, 1)),
             correction_factor: 1,
@@ -834,8 +1070,8 @@ mod tests {
             noise_bound: BigUint::from(0u8),
         };
         assert!(bgv.add(&ct, &wrong_modulus).is_err());
-        assert!(BgvParams::new(common.clone(), common.ring.to_crt().0[0]).is_err());
-        assert!(BgvParams::new(common, 1).is_err());
+        assert!(BgvParams::new(common.clone(), common.ring.to_crt().0[0], None).is_err());
+        assert!(BgvParams::new(common, 1, None).is_err());
     }
     #[test]
     fn test_bgv_staged_evaluator_without_secret_input() {
@@ -847,20 +1083,9 @@ mod tests {
         use num_traits::ToPrimitive;
         let common = common();
         let n = common.ring.ring_dimension() as usize;
-        let bgv = BgvParams::new(common.clone(), 17).unwrap();
+        let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
         let top = common.ring.to_crt().2 - 1;
-        let mut parameters =
-            (0..=top).map(|level| common.parameters_at(level).unwrap()).collect::<Vec<_>>();
-        parameters.extend(
-            common
-                .ring
-                .to_crt()
-                .0
-                .iter()
-                .map(|&p| common.ring.select_modulus(&BigUint::from(p)).unwrap()),
-        );
-        parameters.push(bgv.batching_parameters().unwrap());
-        let mut backend = cpu_backend(parameters);
+        let mut backend = cpu_backend(bgv.runtime_parameters().unwrap());
         // Distinct graphs exchange manifests and in-memory artifacts, exercising
         // the protocol boundary without serializing secrets or ciphertexts to files.
         let mut store = MemoryArtifactStore::default();
@@ -915,10 +1140,11 @@ mod tests {
             correction_factor: 1,
             noise_bound: exported_encryption_noise.to_biguint().unwrap(),
         };
-        let input_key = common.ring().artifact_input(
+        let (key_params, key_width) = bgv.key_switch_parameters(top).unwrap();
+        let input_key = Ring::new(key_params.modulus().as_ref().clone(), n).artifact_input(
             encryption_id.clone(),
             "evaluation_key",
-            (2, common.ring.modulus_digits()),
+            (2, key_width),
             ArtifactConfidentiality::Public,
         );
         let evaluated = bgv
@@ -1018,7 +1244,7 @@ mod tests {
             None,
         );
         assert!(common.ring.modulus().bits() > 128, "wide RNS test requires Q > 128 bits");
-        let bgv = BgvParams::new(common.clone(), 17).unwrap();
+        let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
         let ct = BgvCiphertext {
             components: common.ring().input("ciphertext", (2, 1)),
             correction_factor: 1,
@@ -1054,8 +1280,12 @@ mod tests {
             .build()
             .unwrap();
         let message = (0..n).map(|i| (i % 17) as i64).collect::<Vec<_>>();
-        let result =
-            execute_graph(graph, &common, BTreeMap::from([("slots".into(), int_input(&message))]));
+        let result = execute_graph(
+            graph,
+            &common,
+            BTreeMap::from([("slots".into(), int_input(&message))]),
+            &bgv.runtime_parameters().unwrap(),
+        );
         assert_eq!(
             integers(&result, "plaintext"),
             message.into_iter().map(BigInt::from).collect::<Vec<_>>()
@@ -1105,7 +1335,7 @@ mod tests {
                 None,
             );
             assert!(common.ring.modulus().bits() > 128, "oracle test requires Q > 128 bits");
-            let bgv = BgvParams::new(common.clone(), 17).unwrap();
+            let bgv = BgvParams::new(common.clone(), 17, None).unwrap();
             let p = *primes.last().unwrap();
             // Force the correction -c/t mod p to lie at both center boundaries,
             // and at zero and p-1. Large lifts exercise the complete CRT value.
@@ -1148,6 +1378,7 @@ mod tests {
                 context.build().unwrap(),
                 &common,
                 BTreeMap::from([("ciphertext".into(), RuntimeValue::Matrix(Arc::new(input)))]),
+                &bgv.runtime_parameters().unwrap(),
             );
             // Compare each complete DSL reduction against the native primitive
             // applied one level at a time, rather than reimplementing its formula.
@@ -1192,7 +1423,7 @@ mod simd_tests {
         let common = common();
         let order = 2 * u64::from(common.ring.ring_dimension());
         let t = (1..).map(|k| k * order + 1).find(|&t| is_prime(t)).unwrap();
-        BgvParams::new(common, t).unwrap()
+        BgvParams::new(common, t, None).unwrap()
     }
 
     #[test]
@@ -1216,6 +1447,7 @@ mod simd_tests {
             graph,
             &bgv.common,
             BTreeMap::from([("slots".into(), int_input(&slots))]),
+            &bgv.runtime_parameters().unwrap(),
         );
         assert_eq!(
             integers(&result, "slots"),
@@ -1297,6 +1529,7 @@ mod simd_tests {
             context.build().unwrap(),
             &bgv.common,
             BTreeMap::from([("slots".into(), int_input(&slots))]),
+            &bgv.runtime_parameters().unwrap(),
         );
         let assert_output = |name: &str, expected: Vec<i64>| {
             assert_eq!(
@@ -1361,6 +1594,7 @@ mod simd_tests {
                 ("scalar".into(), int_input(&[scalar_value])),
                 ("partial".into(), int_input(&partial_values[..count])),
             ]),
+            &bgv.runtime_parameters().unwrap(),
         );
         let mut expected_scalar = vec![BigInt::from(0); n];
         expected_scalar[0] = BigInt::from(scalar_value.rem_euclid(t));
@@ -1383,10 +1617,10 @@ mod simd_tests {
         let public = bgv.common.ring().input("public", (2, 1));
         assert!(bgv.encrypt(&public, &context.int_family_input("empty", 0)).is_err());
         assert!(bgv.encrypt(&public, &context.int_family_input("overfull", n + 1)).is_err());
-        assert!(BgvParams::new(bgv.common.clone(), 2).is_err());
+        assert!(BgvParams::new(bgv.common.clone(), 2, None).is_err());
         assert!(!is_prime(341550071728321));
         let t = bgv.plaintext_modulus;
-        assert!(BgvParams::new(bgv.common.clone(), t * t).is_err());
+        assert!(BgvParams::new(bgv.common.clone(), t * t, None).is_err());
         let ring = Ring::new(bgv.common.ring.modulus().as_ref().clone(), n);
         let ct = BgvCiphertext {
             components: ring.input("ct", (2, 1)),
@@ -1398,5 +1632,79 @@ mod simd_tests {
             assert!(bgv.rotate_rows(Some(&ring.input("bad-key", (1, 1))), &ct, 1).is_err());
         }
         assert!(bgv.rotate_rows(None, &ct, 0).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod benchmarks {
+    use super::*;
+    use mxx_dsl::DslContext;
+    use mxx_ir_core::ParamEnv;
+    use mxx_runtime::{
+        MemoryArtifactStore, backend::poly::cpu_backend, execute, transcript::SamplingMode,
+    };
+    use std::{collections::BTreeMap, time::Instant};
+    #[test]
+    #[ignore = "manual CPU key-switch timing; excludes key generation"]
+    fn test_cpu_key_switch_evaluation_timing() {
+        let common = crate::utils::common();
+        let n = common.ring.ring_dimension();
+        let t = (1..).map(|k| k * 2 * u64::from(n) + 1).find(|&p| is_prime(p)).unwrap();
+        let bgv = BgvParams::new(common.clone(), t, None).unwrap();
+        let level = common.ring.crt_depth() - 1;
+        let secret = common.sample_secret();
+        let key = bgv.relinearization_key(&secret, level).unwrap();
+        let value = common.ring().uniform_residue((1, 1));
+        let preparation = DslContext::new("prepare-switch")
+            .private_output("key", key)
+            .unwrap()
+            .private_output("value", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = cpu_backend(bgv.runtime_parameters().unwrap());
+        let mut store = MemoryArtifactStore::default();
+        let mut prepared =
+            execute(&preparation, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let key = prepared.materialize_output("key", &backend, &mut store).unwrap().clone();
+        let value = prepared.materialize_output("value", &backend, &mut store).unwrap().clone();
+        let (kp, width) = bgv.key_switch_parameters(level).unwrap();
+        let kr = Ring::new(kp.modulus().as_ref().clone(), n);
+        let switched = bgv
+            .key_switch(&common.ring().input("value", (1, 1)), &kr.input("key", (2, width)), level)
+            .unwrap();
+        let graph = DslContext::new("evaluate-switch")
+            .private_output("switched", switched)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let repeats =
+            std::env::var("FHE_BENCH_REPEATS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        assert!(repeats > 0, "FHE_BENCH_REPEATS must be positive");
+        let mut times = Vec::new();
+        for repeat in 0..=repeats {
+            let inputs =
+                BTreeMap::from([("key".into(), key.clone()), ("value".into(), value.clone())]);
+            let start = Instant::now();
+            let mut output =
+                execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
+            output.materialize_output("switched", &backend, &mut store).unwrap();
+            let elapsed = start.elapsed().as_secs_f64();
+            output.cleanup_staged(&mut store).unwrap();
+            if repeat != 0 {
+                times.push(elapsed);
+            }
+        }
+        prepared.cleanup_staged(&mut store).unwrap();
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "KEY_SWITCH_TIMING N={n} samples_seconds={times:?} median_seconds={}",
+            (times[(times.len() - 1) / 2] + times[times.len() / 2]) / 2.0
+        );
     }
 }

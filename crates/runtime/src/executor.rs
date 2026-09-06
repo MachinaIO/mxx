@@ -1951,6 +1951,33 @@ where
                 .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
+            NodeKind::RnsModUp { source_moduli, digit_size, normalize, .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let output = self
+                    .backend
+                    .rns_mod_up(&input, &ty, source_moduli, *digit_size, *normalize)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::RnsModDown { source_moduli, plaintext_modulus, .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let plaintext_modulus = plaintext_modulus
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?
+                    .to_u64()
+                    .ok_or_else(|| {
+                        self.expression_error(node.id, "plaintext modulus does not fit u64")
+                    })?;
+                let output = self
+                    .backend
+                    .rns_mod_down(&input, &ty, source_moduli, plaintext_modulus)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
             NodeKind::RingAutomorphism { index } => {
                 let input = self.matrix(values, node.args[0])?;
                 let index = self.eval_usize(node.id, index, env)?;
@@ -4429,6 +4456,26 @@ mod tests {
             destination: &ConcreteMatrixType,
         ) -> Result<Self::Matrix, Self::Error> {
             unused_probe_operation!(value, destination)
+        }
+
+        fn rns_mod_up(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+            source_moduli: &[u64],
+            digit_size: usize,
+            normalize: bool,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination, source_moduli, digit_size, normalize)
+        }
+        fn rns_mod_down(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+            source_moduli: &[u64],
+            plaintext_modulus: u64,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination, source_moduli, plaintext_modulus)
         }
 
         fn preimage_target(

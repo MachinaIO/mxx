@@ -293,6 +293,14 @@ unsafe extern "C" {
         scalars: *const *const GpuMatrixOpaque,
         matrix_count: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_rns_conversion(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        digit_size: usize,
+        plaintext_modulus: u64,
+        scales: *const u64,
+        inverses: *const u64,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_centered_rebase(
         out: *mut GpuMatrixOpaque,
         source: *const GpuMatrixOpaque,

@@ -266,6 +266,59 @@ noncomputable def centeredRebaseRuns {q p n rows columns : Nat}
     (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
   1 < p ∧ output = centeredRebase input
 
+/-- The inverse is taken in the native residue ring, before centered lifting. -/
+noncomputable def rnsInverse (modulus : Nat) (value : Int) : Int :=
+  Int.ofNat (((value : ZMod modulus)⁻¹).val)
+
+noncomputable def rnsCentered (modulus : Nat) (value : Int) : Int :=
+  let residue := value % Int.ofNat modulus
+  if residue ≤ Int.ofNat (modulus / 2) then residue else residue - Int.ofNat modulus
+
+/-- One contiguous CRT digit, using the same unreduced centered sum as the backend. -/
+noncomputable def rnsDigit (basis : List Nat) (digitSize digit : Nat)
+    (normalize : Bool) (value : Int) : Int :=
+  let group := (basis.drop (digit * digitSize)).take digitSize
+  let digitModulus := group.prod
+  (group.map fun prime ↦
+    let factor := digitModulus / prime
+    let normalization := if normalize then rnsInverse prime (basis.prod / digitModulus) else 1
+    Int.ofNat factor * rnsCentered prime
+      (value * rnsInverse prime factor * normalization)).sum
+
+/-- Group-major row stacking fixes both the CRT formula and the digit layout. -/
+noncomputable def rnsModUpRuns {q p n rows columns outputRows : Nat}
+    (basis : List Nat) (digitSize : Nat) (normalize : Bool)
+    (input : ExactMatrix q n rows columns)
+    (output : ExactMatrix p n outputRows columns) : Prop :=
+  basis.prod = q ∧ basis ≠ [] ∧ basis.Pairwise Nat.Coprime ∧
+  (∀ prime ∈ basis, 2 < prime ∧ (2 * n) ∣ (prime - 1)) ∧
+  0 < digitSize ∧ 1 < p ∧ q ∣ p ∧
+  outputRows = rows * ((basis.length + digitSize - 1) / digitSize) ∧
+  ∀ (digit : Fin ((basis.length + digitSize - 1) / digitSize))
+    (row : Fin rows) (outRow : Fin outputRows) (column : Fin columns),
+    outRow.val = digit.val * rows + row.val →
+    output outRow column = polynomialOfCoefficients (fun i ↦
+      rnsDigit basis digitSize digit.val normalize
+        (Int.ofNat ((input row column).coeff i).val))
+
+/-- The dropped basis computes the centered BGV correction without exact CRT reduction. -/
+noncomputable def rnsModDownRuns {q p n rows columns : Nat}
+    (basis : List Nat) (plaintext : Int)
+    (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
+  let dropped := basis.filter (fun prime ↦ p % prime != 0)
+  let auxiliary := dropped.prod
+  basis.prod = q ∧ basis ≠ [] ∧ basis.Pairwise Nat.Coprime ∧
+  (∀ prime ∈ basis, 2 < prime ∧ (2 * n) ∣ (prime - 1)) ∧
+  1 < p ∧ p < q ∧ p * auxiliary = q ∧ 2 ≤ plaintext ∧
+  Int.gcd plaintext (Int.ofNat auxiliary) = 1 ∧
+  ∀ row column, output row column = polynomialOfCoefficients (fun i ↦
+    let value := Int.ofNat ((input row column).coeff i).val
+    let correction := (dropped.map fun prime ↦
+      let factor := auxiliary / prime
+      Int.ofNat factor * rnsCentered prime
+        (-value * rnsInverse prime plaintext * rnsInverse prime factor)).sum
+    (value + plaintext * correction) * rnsInverse p auxiliary)
+
 /-- Substitution in the negacyclic quotient incorporates the runtime's wraparound sign. -/
 noncomputable def ringAutomorphism {q n rows columns : Nat} (index : Nat)
     (input : ExactMatrix q n rows columns) : ExactMatrix q n rows columns :=

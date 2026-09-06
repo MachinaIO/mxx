@@ -578,6 +578,26 @@ pub trait PolyMatrix:
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Transfers a single source limb's centered coefficients to a new CRT basis.
     fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Fused centered RNS ModUp, with contiguous digits stacked in group-major row order.
+    /// The destination must contain every source prime. For a source group Q_j,
+    /// the result is sum_i (Q_j/q_i) * centered(x_i / (Q_j/q_i) mod q_i).
+    /// With normalization, x_i is additionally divided by Q/Q_j modulo q_i.
+    /// This is the approximate sum of centered CRT terms, not a canonical lift.
+    fn rns_mod_up(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self, String>;
+    /// Fused BGV RNS ModDown, dropping the source limbs absent from destination.
+    /// For the product P of dropped primes, returns (x + t*U)/P modulo the
+    /// destination, where U is the centered CRT-term extension of -x/t from P.
+    /// The destination must be a strict subset and t must be invertible modulo P.
+    fn rns_mod_down(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String>;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),

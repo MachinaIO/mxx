@@ -1065,6 +1065,52 @@ impl Mat {
         Self::from_node(NodeKind::CenteredRebase { modulus }, vec![self], ty)
     }
 
+    /// Extends contiguous CRT digits into `modulus`, stacking digits by rows.
+    /// Normalization includes the inverse complementary digit product.
+    #[track_caller]
+    pub fn rns_mod_up(
+        self,
+        modulus: impl Into<IntExpr>,
+        source_moduli: Vec<u64>,
+        digit_size: usize,
+        normalize: bool,
+    ) -> Self {
+        let modulus = modulus.into();
+        let digits = if digit_size == 0 { 0 } else { source_moduli.len().div_ceil(digit_size) };
+        let ty = MatrixType {
+            modulus: modulus.clone(),
+            rows: self.matrix_type.rows.clone() * IntExpr::constant(digits),
+            ..self.matrix_type.clone()
+        };
+        Self::from_node(
+            NodeKind::RnsModUp { modulus, source_moduli, digit_size, normalize },
+            vec![self],
+            ty,
+        )
+    }
+
+    /// Removes the auxiliary CRT basis using the BGV correction `(x + t*U)/P`.
+    /// In key switching, division cancels the evaluation key target's factor P.
+    #[track_caller]
+    pub fn rns_mod_down(
+        self,
+        modulus: impl Into<IntExpr>,
+        source_moduli: Vec<u64>,
+        plaintext_modulus: impl Into<IntExpr>,
+    ) -> Self {
+        let modulus = modulus.into();
+        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
+        Self::from_node(
+            NodeKind::RnsModDown {
+                modulus,
+                source_moduli,
+                plaintext_modulus: plaintext_modulus.into(),
+            },
+            vec![self],
+            ty,
+        )
+    }
+
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }

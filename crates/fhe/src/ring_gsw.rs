@@ -314,7 +314,7 @@ mod tests {
             .decompose(base.clone(), digits)
             .mul_small_rhs(common.ring().gadget(2, base, digits));
         ctx = ctx.output("original", column).unwrap().output("recomposed", recomposed).unwrap();
-        let result = execute_graph(ctx.build().unwrap(), &common, inputs);
+        let result = execute_graph(ctx.build().unwrap(), &common, inputs, &[]);
         let mxx_runtime::RuntimeValue::Matrix(original) = &result.outputs["original"] else {
             panic!("matrix")
         };
@@ -476,6 +476,7 @@ mod tests {
                 ("message".into(), int_input(&values)),
                 ("multiplier".into(), int_input(&mu_values)),
             ]),
+            &[],
         );
         assert_eq!(integers(&result, "decoded"), integers(&result, "expected"));
         let q = BigInt::from(common.ring.modulus().as_ref().clone());

@@ -14,7 +14,7 @@ mod ring_gsw;
 mod tests_gpu;
 mod utils;
 
-pub use bgv::{BgvCiphertext, BgvCiphertextSchema, BgvParams};
+pub use bgv::{BgvCiphertext, BgvCiphertextSchema, BgvHybridParams, BgvParams};
 use mxx_dsl::{DslError, GraphValue, Mat};
 pub use params::FheCommonParams;
 pub use ring_gsw::{

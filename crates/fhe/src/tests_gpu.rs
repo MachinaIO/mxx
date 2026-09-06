@@ -1,5 +1,8 @@
 //! GPU execution of the production FHE graphs; all artifacts stay in memory.
-use crate::{BgvCiphertext, BgvParams, FheCommonParams, FheScheme, RingGswParams, utils::common};
+use crate::{
+    BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme, RingGswParams,
+    utils::common,
+};
 use mxx_dsl::{DslContext, Ring};
 use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality};
 use mxx_primitives::poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams};
@@ -66,14 +69,17 @@ fn configure_widths(backend: &mut GpuDcrtBackend, graph: &mxx_ir_core::Validated
     }
 }
 
-fn backend(common: &FheCommonParams, plaintext_modulus: Option<u64>) -> GpuDcrtBackend {
-    let (primes, _, depth) = common.ring.to_crt();
-    let mut rings =
-        (0..depth).map(|level| common.parameters_at(level).unwrap()).collect::<Vec<_>>();
-    rings.extend(primes.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
-    if let Some(t) = plaintext_modulus {
-        rings.push(BgvParams::new(common.clone(), t).unwrap().batching_parameters().unwrap());
-    }
+fn backend(common: &FheCommonParams, bgv: Option<&BgvParams>) -> GpuDcrtBackend {
+    let rings = if let Some(bgv) = bgv {
+        bgv.runtime_parameters().unwrap()
+    } else {
+        let (primes, _, depth) = common.ring.to_crt();
+        let mut rings =
+            (0..depth).map(|level| common.parameters_at(level).unwrap()).collect::<Vec<_>>();
+        rings
+            .extend(primes.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
+        rings
+    };
     gpu_backend(
         rings
             .iter()
@@ -188,7 +194,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let top = common.ring.to_crt().2 - 1;
     assert!(top >= 2);
     let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
-    let bgv = BgvParams::new(common.clone(), t).unwrap();
+    let bgv = BgvParams::new(common.clone(), t, None).unwrap();
     let context = DslContext::new("gpu-bgv-encrypt");
     let slots = context.int_family_input("slots", n);
     let (secret, pk) = bgv.keygen().unwrap();
@@ -218,7 +224,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         .unwrap()
         .validate(&ParamEnv::default())
         .unwrap();
-    let mut backend = backend(&common, Some(t));
+    let mut backend = backend(&common, Some(&bgv));
     let mut store = MemoryArtifactStore::default();
     let message = (0..n).map(|i| (i as u64 % t) as i64).collect::<Vec<_>>();
     configure_widths(&mut backend, &encryption);
@@ -243,19 +249,20 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         correction_factor: 1,
         noise_bound: encryption_noise,
     };
-    let relin = common.ring().artifact_input(
+    let (relin_parameters, relin_width) = bgv.key_switch_parameters(top).unwrap();
+    let relin = Ring::new(relin_parameters.modulus().as_ref().clone(), n).artifact_input(
         encryption_id.clone(),
         "relin",
-        (2, common.ring.modulus_digits()),
+        (2, relin_width),
         ArtifactConfidentiality::Public,
     );
-    let lower = common.parameters_at(top - 1).unwrap();
+    let (lower, lower_width) = bgv.key_switch_parameters(top - 1).unwrap();
     let ring = Ring::new(lower.modulus().as_ref().clone(), n);
     let import_key = |name| {
         ring.artifact_input(
             encryption_id.clone(),
             name,
-            (2, lower.modulus_digits()),
+            (2, lower_width),
             ArtifactConfidentiality::Public,
         )
     };
@@ -357,7 +364,7 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
     let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
-    let bgv = BgvParams::new(common.clone(), t).unwrap();
+    let bgv = BgvParams::new(common.clone(), t, None).unwrap();
     let context = DslContext::new("gpu-bgv-short-slots");
     let single = context.int_family_input("single", 1);
     let partial = context.int_family_input("partial", n - 1);
@@ -379,7 +386,7 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
         .unwrap()
         .validate(&ParamEnv::default())
         .unwrap();
-    let mut backend = backend(&common, Some(t));
+    let mut backend = backend(&common, Some(&bgv));
     configure_widths(&mut backend, &graph);
     let mut store = MemoryArtifactStore::default();
     let partial_values = (0..n - 1).map(|i| i as i64 - t as i64 - 1).collect::<Vec<_>>();
@@ -407,5 +414,86 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
         .collect::<Vec<_>>();
     expected.push(BigInt::from(0));
     assert_eq!(values(&mut result, "partial", &backend, &mut store), expected);
+    result.cleanup_staged(&mut store).unwrap();
+}
+
+#[test]
+fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
+    let common = common();
+    let n = common.ring.ring_dimension() as usize;
+    let depth = common.ring.crt_depth();
+    let order = 2 * n as u64;
+    let t = (1..).map(|k| k * order + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
+    let defaults = BgvParams::new(common.clone(), t, None).unwrap();
+    let q_primes = common.ring.to_crt().0;
+    let mut auxiliary_primes = defaults
+        .key_switch_parameters(depth - 1)
+        .unwrap()
+        .0
+        .to_crt()
+        .0
+        .into_iter()
+        .filter(|p| !q_primes.contains(p))
+        .collect::<Vec<_>>();
+    let mut candidate = *auxiliary_primes.last().unwrap() - order;
+    while auxiliary_primes.len() < 2 {
+        if !q_primes.contains(&candidate) && t % candidate != 0 && crate::bgv::is_prime(candidate) {
+            auxiliary_primes.push(candidate);
+        }
+        candidate -= order;
+    }
+    let bgv = BgvParams::new(
+        common.clone(),
+        t,
+        Some(BgvHybridParams { digit_size: depth.min(2), auxiliary_primes }),
+    )
+    .unwrap();
+    let mut context = DslContext::new("gpu-bgv-hybrid-multilimb");
+    let slots = context.int_family_input("slots", n);
+    let (secret, public) = bgv.keygen().unwrap();
+    let fresh = bgv.encrypt(&public, &slots).unwrap();
+    // Default depth three exercises a two-prime digit and an uneven final
+    // digit. Every level uses both approximate ModUp and multi-prime ModDown.
+    for level in 0..depth {
+        let ct = bgv.mod_switch_to(&fresh, level).unwrap();
+        let quadratic = bgv.mul_unrelinearized(&ct, &ct).unwrap();
+        let key = bgv.relinearization_key(&secret, level).unwrap();
+        let product = bgv.relinearize(&quadratic, &key).unwrap();
+        let rotation_key = bgv.rotation_key(&secret, level, 1).unwrap();
+        let rotated = bgv.rotate_rows(Some(&rotation_key), &product, 1).unwrap();
+        assert!(bgv.can_decrypt(&product).unwrap(), "product level {level}");
+        assert!(bgv.can_decrypt(&rotated).unwrap(), "rotation level {level}");
+        context = context
+            .private_output(format!("product{level}"), bgv.decrypt(&secret, &product).unwrap())
+            .unwrap()
+            .private_output(format!("rotated{level}"), bgv.decrypt(&secret, &rotated).unwrap())
+            .unwrap();
+    }
+    let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+    let mut backend = backend(&common, Some(&bgv));
+    configure_widths(&mut backend, &graph);
+    let mut store = MemoryArtifactStore::default();
+    let message = (0..n).map(|i| (i as u64 % t) as i64).collect::<Vec<_>>();
+    let mut result = execute(
+        &graph,
+        &mut backend,
+        BTreeMap::from([("slots".into(), input(&message))]),
+        &mut store,
+        SamplingMode::Fresh,
+    )
+    .unwrap();
+    let expected = message
+        .iter()
+        .map(|&m| {
+            BigInt::from((u128::from(m as u64) * u128::from(m as u64) % u128::from(t)) as u64)
+        })
+        .collect::<Vec<_>>();
+    let mut rotated = expected.clone();
+    rotated[..n / 2].rotate_left(1);
+    rotated[n / 2..].rotate_left(1);
+    for level in 0..depth {
+        assert_eq!(values(&mut result, &format!("product{level}"), &backend, &mut store), expected);
+        assert_eq!(values(&mut result, &format!("rotated{level}"), &backend, &mut store), rotated);
+    }
     result.cleanup_staged(&mut store).unwrap();
 }

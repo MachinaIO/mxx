@@ -1019,6 +1019,45 @@ where
             .map_err(PolyBackendError::BasisConversion)
     }
 
+    fn rns_mod_up(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<M, Self::Error> {
+        if value.params().to_crt().0 != source_moduli {
+            return Err(PolyBackendError::BasisConversion(
+                "RNS source tower order disagrees with graph".into(),
+            ));
+        }
+        let output = value
+            .rns_mod_up(self.parameters(destination)?, digit_size, normalize)
+            .map_err(PolyBackendError::BasisConversion)?;
+        if output.row_size() != destination.rows {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        Ok(output)
+    }
+
+    fn rns_mod_down(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: u64,
+    ) -> Result<M, Self::Error> {
+        if value.params().to_crt().0 != source_moduli {
+            return Err(PolyBackendError::BasisConversion(
+                "RNS source tower order disagrees with graph".into(),
+            ));
+        }
+        value
+            .rns_mod_down(self.parameters(destination)?, plaintext_modulus)
+            .map_err(PolyBackendError::BasisConversion)
+    }
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<M>, usize)>,
@@ -1726,6 +1765,39 @@ mod tests {
         let reduced = backend.reduce_modulus(&input, &ty(&low)).unwrap();
         assert_eq!(reduced.entry(0, 0).coeffs_biguints()[0], BigUint::from(3u32));
         assert_eq!(reduced.entry(0, 0).coeffs_biguints()[1], &low_modulus - 1u32);
+    }
+
+    #[test]
+    fn test_rns_conversion_rejects_wrong_declared_basis_order() {
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let extended = DCRTPolyParams::new(n, 4, 17, 2, None, None);
+        let primes = extended.to_crt().0;
+        let modulus = primes[..3].iter().map(|&p| BigUint::from(p)).product::<BigUint>();
+        let source = extended.select_modulus(&modulus).unwrap();
+        let input = DCRTPolyMatrix::zero(&source, 2, 3);
+        let mut backend = cpu_backend([source.clone(), extended.clone()]);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(extended.modulus().as_ref().clone()),
+            ring_dimension: n as usize,
+            rows: 4,
+            columns: 3,
+        };
+        let mut wrong_basis = source.to_crt().0;
+        wrong_basis.reverse();
+        assert!(matches!(
+            backend.rns_mod_up(&input, &ty, &wrong_basis, 2, true),
+            Err(PolyBackendError::BasisConversion(_))
+        ));
+        let result = backend.rns_mod_up(&input, &ty, &source.to_crt().0, 2, true).unwrap();
+        assert_eq!(result.size(), (4, 3));
+        let output_type = ConcreteMatrixType { modulus: BigInt::from(modulus), ..ty };
+        let mut wrong_basis = primes;
+        wrong_basis.reverse();
+        assert!(matches!(
+            backend.rns_mod_down(&result, &output_type, &wrong_basis, 3),
+            Err(PolyBackendError::BasisConversion(_))
+        ));
     }
 
     #[test]

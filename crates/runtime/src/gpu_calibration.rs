@@ -62,6 +62,8 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
             NodeKind::CenteredRebase { .. } |
+            NodeKind::RnsModUp { .. } |
+            NodeKind::RnsModDown { .. } |
             NodeKind::MatrixBinary(_) |
             NodeKind::MatrixMulAccumulate { .. } |
             NodeKind::MatrixMulSmallRhs |
@@ -234,6 +236,8 @@ pub fn gpu_calibration_operation_identity(
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
         NodeKind::CenteredRebase { .. } |
+        NodeKind::RnsModUp { .. } |
+        NodeKind::RnsModDown { .. } |
         NodeKind::MatrixNegate => {
             if let Some(input) = argument_types.first_mut() {
                 one_column(input);

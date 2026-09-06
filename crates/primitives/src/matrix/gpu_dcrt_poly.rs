@@ -26,12 +26,13 @@ use crate::{
                 gpu_matrix_mul_small_rhs, gpu_matrix_mul_vertical_pair, gpu_matrix_negate_batch,
                 gpu_matrix_ntt_all, gpu_matrix_ntt_in_place_batch,
                 gpu_matrix_preimage_add_correction, gpu_matrix_preimage_residual,
-                gpu_matrix_ring_automorphism_batch, gpu_matrix_sample_distribution,
-                gpu_matrix_sample_distribution_columns, gpu_matrix_sample_p1_full_cached,
-                gpu_matrix_store_compact_bytes, gpu_matrix_store_compact_bytes_batch,
-                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
-                gpu_matrix_wait, gpu_small_matrix_copy, gpu_small_matrix_copy_columns,
-                gpu_small_matrix_create, gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
+                gpu_matrix_ring_automorphism_batch, gpu_matrix_rns_conversion,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
+                gpu_matrix_sample_p1_full_cached, gpu_matrix_store_compact_bytes,
+                gpu_matrix_store_compact_bytes_batch, gpu_matrix_store_const_coeff_batch,
+                gpu_matrix_store_rns_batch, gpu_matrix_sub, gpu_matrix_wait, gpu_small_matrix_copy,
+                gpu_small_matrix_copy_columns, gpu_small_matrix_create,
+                gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
                 gpu_small_matrix_load_coefficients, gpu_small_matrix_prepare_preimage_hard_cutoff,
                 gpu_small_matrix_store_coefficients,
                 gpu_small_matrix_try_pack_preimage_hard_cutoff_tile, gpu_small_matrix_view_columns,
@@ -57,6 +58,9 @@ use std::{
     sync::Arc,
 };
 use tracing::debug;
+
+#[path = "gpu_rns.rs"]
+mod gpu_rns;
 
 pub struct GpuDCRTPolyMatrix {
     pub params: GpuDCRTPolyParams,
@@ -3505,6 +3509,26 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self {
         self.convert_modulus(destination, false)
+    }
+
+    fn rns_mod_up(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self, String> {
+        self.rns_conversion(destination, digit_size, normalize, 0)
+    }
+
+    fn rns_mod_down(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String> {
+        if plaintext_modulus < 2 {
+            return Err("RNS ModDown plaintext modulus must be at least two".into());
+        }
+        self.rns_conversion(destination, self.params.crt_depth(), false, plaintext_modulus)
     }
 
     fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String> {

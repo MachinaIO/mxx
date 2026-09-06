@@ -83,6 +83,19 @@ pub enum NodeKind {
     CenteredRebase {
         modulus: IntExpr,
     },
+    /// Fused centered CRT digit extension into a multiple modulus.
+    RnsModUp {
+        modulus: IntExpr,
+        source_moduli: Vec<u64>,
+        digit_size: usize,
+        normalize: bool,
+    },
+    /// Fused BGV plaintext-preserving removal of the auxiliary CRT basis.
+    RnsModDown {
+        modulus: IntExpr,
+        source_moduli: Vec<u64>,
+        plaintext_modulus: IntExpr,
+    },
     Transpose,
     Slice {
         rows: Option<IndexRange>,

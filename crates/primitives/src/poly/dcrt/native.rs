@@ -17,6 +17,18 @@ pub(crate) mod ffi {
         fn exact_basis_coefficients(input: &DCRTPoly) -> Result<Vec<u8>>;
         #[namespace = "openfhe"]
         type Matrix = openfhe::ffi::Matrix;
+        fn exact_basis_matrix_entry(
+            matrix: &Matrix,
+            row: usize,
+            column: usize,
+        ) -> Result<UniquePtr<DCRTPoly>>;
+        fn exact_basis_rns(
+            input: &DCRTPoly,
+            moduli: &[u64],
+            digit_size: usize,
+            normalize: bool,
+            plaintext_modulus: u64,
+        ) -> Result<UniquePtr<Matrix>>;
         fn exact_basis_matrix_coefficients(matrix: Pin<&mut Matrix>) -> Result<()>;
         fn exact_basis_p1(
             a: &Matrix,

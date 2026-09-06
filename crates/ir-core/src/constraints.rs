@@ -197,6 +197,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::ModulusSwitch { .. } |
                 NodeKind::ModulusReduce { .. } |
                 NodeKind::CenteredRebase { .. } |
+                NodeKind::RnsModUp { .. } |
+                NodeKind::RnsModDown { .. } |
                 NodeKind::Transpose |
                 NodeKind::Tensor |
                 NodeKind::UniformResidueSample { .. } |

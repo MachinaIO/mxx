@@ -347,6 +347,23 @@ pub trait Backend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
 
+    fn rns_mod_up(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn rns_mod_down(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error>;
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, usize)>,

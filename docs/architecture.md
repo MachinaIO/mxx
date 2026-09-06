@@ -71,13 +71,17 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 ### Application crates
 
 `mxx-fhe` builds Ring Regev/Ring-GSW and leveled BGV graphs, including CRT modulus
-switching, relinearization, and rotations. BGV encrypt/decrypt exchange SIMD slots
+switching, hybrid RNS key switching over QP, relinearization, and rotations. BGV encrypt/decrypt exchange SIMD slots
 by default, with internal encoding and zero-padding of short inputs. Cryptographic arithmetic
 and sampling execute through the DSL runtime; runtime is a test-only dependency.
 It tracks coefficient noise bounds per ciphertext and reuses primitive ring parameters and DSL
 matrix handles. Bootstrapping is out of scope. CPU and GPU backends share the same
 FHE graphs. GPU centered basis conversion uses native unsigned CRT residues and
 stream-ordered INTT/lift/NTT operations without a host coefficient round trip.
+Hybrid RNS ModUp/ModDown use dedicated graph nodes with an explicit ordered
+source basis, checked by the runtime against registered parameters. CPU and CUDA
+primitives fuse CRT accumulation between one input INTT and one output NTT per
+digit, preserving the approximate centered-sum semantics and noise bounds.
 FHE artifacts stay in memory or enter the protocol as direct runtime inputs.
 
 `mxx-we` owns the implementation-independent witness-encryption declaration/runtime traits and the

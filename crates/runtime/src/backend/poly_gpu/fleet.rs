@@ -1210,7 +1210,8 @@ impl GpuDcrtBackend {
                 .collect::<Result<Vec<_>, _>>()?;
             self.commit_column_wave(&mut shards, launched, &mut next_column)?;
         }
-        Ok(GpuFleetMatrix::new(value.rows, value.columns, shards))
+        let rows = shards.first().map_or(value.rows, |shard| shard.value.row_size());
+        Ok(GpuFleetMatrix::new(rows, value.columns, shards))
     }
 
     fn binary_columns(
@@ -2385,6 +2386,34 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         self.unary_columns(value, |backend, input| backend.centered_rebase(input, destination))
+    }
+
+    fn rns_mod_up(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self::Matrix, Self::Error> {
+        if value.columns == 0 {
+            return Ok(GpuFleetMatrix::new(destination.rows, 0, Vec::new()));
+        }
+        self.unary_columns(value, |backend, input| {
+            backend.rns_mod_up(input, destination, source_moduli, digit_size, normalize)
+        })
+    }
+
+    fn rns_mod_down(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| {
+            backend.rns_mod_down(input, destination, source_moduli, plaintext_modulus)
+        })
     }
 
     fn reduce_modulus(

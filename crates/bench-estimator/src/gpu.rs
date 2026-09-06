@@ -1449,6 +1449,8 @@ impl GpuNodeMeasurementBackend {
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
             NodeKind::CenteredRebase { .. } |
+            NodeKind::RnsModUp { .. } |
+            NodeKind::RnsModDown { .. } |
             NodeKind::MatrixNegate => {
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) |
@@ -2377,6 +2379,43 @@ impl GpuNodeMeasurementBackend {
                     )
                     .map_err(backend_error)
                     .map(|outputs| outputs.into_iter().map(GpuMeasurementOutput::matrix).collect())
+            }
+            NodeKind::RnsModUp { source_moduli, digit_size, normalize, .. } => {
+                let destination = output_matrix_type()?;
+                matrix_outputs(
+                    (0..batch_size)
+                        .map(|_| {
+                            backend
+                                .rns_mod_up(
+                                    matrix(0)?,
+                                    &destination,
+                                    source_moduli,
+                                    *digit_size,
+                                    *normalize,
+                                )
+                                .map_err(backend_error)
+                        })
+                        .collect(),
+                )
+            }
+            NodeKind::RnsModDown { source_moduli, plaintext_modulus, .. } => {
+                let destination = output_matrix_type()?;
+                let t = plaintext_modulus
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?
+                    .to_u64()
+                    .ok_or_else(|| {
+                        GpuMeasurementError("plaintext modulus does not fit u64".into())
+                    })?;
+                matrix_outputs(
+                    (0..batch_size)
+                        .map(|_| {
+                            backend
+                                .rns_mod_down(matrix(0)?, &destination, source_moduli, t)
+                                .map_err(backend_error)
+                        })
+                        .collect(),
+                )
             }
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |

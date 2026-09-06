@@ -107,6 +107,7 @@ pub(crate) fn execute_graph(
     graph: BuiltGraph,
     common: &FheCommonParams,
     inputs: BTreeMap<String, RuntimeValue<CpuDcrtBackend>>,
+    extra_parameters: &[DCRTPolyParams],
 ) -> ExecutionResult<CpuDcrtBackend> {
     // Register prefix rings for ciphertext levels and single-prime rings for
     // modswitch corrections; a modulus alone does not specify CRT tower order.
@@ -116,34 +117,7 @@ pub(crate) fn execute_graph(
     parameters
         .extend(moduli.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
     let validated = graph.validate(&ParamEnv::default()).expect("valid FHE DSL graph");
-    // SIMD import nodes also use R_t. Discover that extra plaintext ring from
-    // the graph while keeping Ring-GSW fixtures independent of a plaintext modulus.
-    for scope in graph.graph.scopes().values() {
-        for node in scope.nodes() {
-            if let mxx_ir_core::node::NodeKind::PolynomialFromValues { matrix_type, .. } =
-                node.kind()
-            {
-                use num_traits::ToPrimitive;
-                let q = matrix_type
-                    .modulus
-                    .evaluate(&ParamEnv::default())
-                    .unwrap()
-                    .to_biguint()
-                    .unwrap();
-                if parameters.iter().any(|p| p.modulus().as_ref() == &q) {
-                    continue;
-                }
-                let t = q.to_u64().unwrap();
-                let params = crate::BgvParams::new(common.clone(), t)
-                    .unwrap()
-                    .batching_parameters()
-                    .unwrap();
-                if !parameters.contains(&params) {
-                    parameters.push(params);
-                }
-            }
-        }
-    }
+    parameters.extend_from_slice(extra_parameters);
     let mut backend = cpu_backend(parameters);
     let mut store = MemoryArtifactStore::default();
     let mut result = execute(&validated, &mut backend, inputs, &mut store, SamplingMode::Fresh)

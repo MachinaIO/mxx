@@ -165,6 +165,8 @@ fn test_gpu_fhe_ring_gsw_runtime() {
                 .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
             .collect::<Vec<_>>()
     );
+    // Multiplication by X shifts coefficients, with a negated wrapped term
+    // because this is R_q = Z_q[X]/(X^N + 1), not a cyclic polynomial ring.
     let mut expected = message;
     expected.rotate_right(1);
     expected[0] = -expected[0];
@@ -195,6 +197,9 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let rotation = bgv.rotation_key(&secret, top - 1, 1).unwrap();
     let backwards = bgv.rotation_key(&secret, top - 1, -1).unwrap();
     let swap = bgv.row_swap_key(&secret, top - 1).unwrap();
+    // The following three graphs model separate protocol participants. Only
+    // public ciphertext/evaluation-key artifacts cross into the evaluator;
+    // the secret key is imported privately by the final decryption graph.
     let encryption_noise = ct.noise_bound.clone();
     let encryption = context
         .private_output("secret", secret)
@@ -264,6 +269,8 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let backward = bgv.rotate_rows(Some(&import_key("backwards")), &reduced, -1).unwrap();
     let wrapped = bgv.rotate_rows(None, &reduced, n as i32 / 2).unwrap();
     let swapped = bgv.swap_rows(&import_key("swap"), &reduced).unwrap();
+    // Cover both ciphertext degrees, two level drops, factor alignment, and
+    // rotations in both directions; a full-row rotation needs no switch key.
     let outputs = [
         ("sum", sum),
         ("quadratic", quadratic),
@@ -308,6 +315,8 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
                 ArtifactConfidentiality::Public,
             ),
             correction_factor: ct.correction_factor,
+            // Bounds are public graph metadata, not part of a Matrix artifact.
+            // Carry the evaluator's bound into the specialized decryption graph.
             noise_bound: ct.noise_bound.clone(),
         };
         decryption = decryption

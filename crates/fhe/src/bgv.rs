@@ -104,6 +104,8 @@ impl BgvParams {
         BigUint::from(self.plaintext_modulus / 2) + BigUint::from(self.plaintext_modulus) * noise
     }
 
+    // Re-centering the plaintext residue can add a carry to e. Bounding the
+    // whole phase first includes that carry even when the sampled noise is zero.
     fn noise_from_phase(&self, phase: &BigUint) -> BigUint {
         (phase + BigUint::from(self.plaintext_modulus / 2)) / self.plaintext_modulus
     }
@@ -167,6 +169,8 @@ impl BgvParams {
         let a = ring.uniform_residue((1, width));
         let e = self.common.gaussian(&params, 1, width);
         let g = ring.gadget(1, BigUint::from(1u8) << params.base_bits(), width);
+        // The key phase is target*G + t*e, so multiplying by exact gadget
+        // digits substitutes the target without introducing a rounding error.
         let b = &s * &a + &utils::scalar(&params, self.plaintext_modulus) * &e + target * &g;
         Ok(concat_rows![a, b])
     }
@@ -190,6 +194,8 @@ impl BgvParams {
         let b1 = row(&lhs.components, 1);
         let a2 = row(&rhs.components, 0);
         let b2 = row(&rhs.components, 1);
+        // Expand (b1 - s*a1)(b2 - s*a2) in descending powers of -s.
+        // A negacyclic product coefficient sums N signed products, hence N*V1*V2.
         Ok(BgvCiphertext {
             components: concat_rows![&a1 * &a2, &a1 * &b2 + &b1 * &a2, &b1 * &b2],
             noise_bound: self.noise_from_phase(
@@ -207,6 +213,8 @@ impl BgvParams {
         utils::check_matrix(&params, key, 2, params.modulus_digits())?;
         let digits = row(&ct.components, 0)
             .decompose(BigUint::from(1u8) << params.base_bits(), params.modulus_digits());
+        // The leading coefficient multiplies s^2; its key encrypts +s^2,
+        // so the switched pair is added to the remaining linear polynomial.
         let switched = digits.mul_small_rhs(key.clone());
         Ok(BgvCiphertext {
             components: concat_rows![row(&ct.components, 1), row(&ct.components, 2)] + switched,
@@ -263,12 +271,17 @@ impl BgvParams {
                 source.select_modulus(&BigUint::from(p)).ok_or(FheError::LevelMismatch)?;
             let inverse_t = mod_inverse(self.plaintext_modulus % p, p)
                 .ok_or(FheError::InvalidParameters("noninvertible plaintext modulus"))?;
+            // Choose U = -C/t mod p so C + t*U is divisible by the dropped
+            // prime. Only this one-limb residue is centered and rebased; the
+            // full coefficient modulo Q is never reconstructed as a big integer.
             let u = output.components.clone().reduce_modulus(p) *
                 utils::scalar(&dropped, p - inverse_t);
             let correction = u.centered_rebase(dest.modulus().as_ref().clone());
             let inverse_p = mod_inverse_biguints(&BigUint::from(p), dest.modulus().as_ref())
                 .ok_or(FheError::InvalidParameters("noninvertible dropped prime"))?;
             let prime = BigUint::from(p);
+            // Each correction has norm <= floor(p/2). The phase correction
+            // is t*(U_b - s*U_a), bounded by t*floor(p/2)*(1 + N) for |s| <= 1.
             let correction_bound = BigUint::from(self.plaintext_modulus) *
                 (&prime / 2u8) *
                 (BigUint::from(source.ring_dimension()) + 1u8);
@@ -279,6 +292,8 @@ impl BgvParams {
             let components = (output.components.reduce_modulus(dest.modulus().as_ref().clone()) +
                 correction * utils::scalar(&dest, self.plaintext_modulus)) *
                 utils::scalar(&dest, inverse_p);
+            // Division by p also scales the plaintext phase modulo t; retain
+            // that public factor so decryption can undo it after later operations.
             let factor = ((output.correction_factor as u128 *
                 mod_inverse(p % self.plaintext_modulus, self.plaintext_modulus)
                     .ok_or(FheError::InvalidCorrectionFactor)? as u128) %
@@ -318,6 +333,8 @@ impl FheScheme for BgvParams {
         let message = utils::pack(&self.common.ring, &centered)?;
         let u = self.common.sample_secret();
         let t = utils::scalar(&self.common.ring, self.plaintext_modulus);
+        // The phase noise is e_pk*u + e_b - s*e_a. Both secret polynomials
+        // have coefficient magnitude <= 1, giving the fresh bound (2N + 1)*cutoff.
         let a = row(key, 0) * &u + &t * self.common.gaussian(&self.common.ring, 1, 1);
         let b = row(key, 1) * u + &t * self.common.gaussian(&self.common.ring, 1, 1) + message;
         Ok(BgvCiphertext {
@@ -332,6 +349,8 @@ impl FheScheme for BgvParams {
         utils::check_matrix(&self.common.ring, secret, 1, 1)?;
         let params = self.common.parameters_at(self.level_of(&ct.components)?)?;
         let minus_s = -secret.clone().reduce_modulus(params.modulus().as_ref().clone());
+        // Horner evaluation supports both ordinary pairs and unrelinearized
+        // triples with the same descending-in-minus-s component convention.
         let mut phase = row(&ct.components, 0);
         for index in 1..rows {
             phase = phase * &minus_s + row(&ct.components, index);
@@ -450,12 +469,16 @@ impl BgvParams {
         let params = self.batching_parameters()?;
         let n = params.ring_dimension() as usize;
         let zeta = self.batching_root()?;
+        // Evaluating X exposes each native slot root directly. Matching roots
+        // avoids duplicating the primitive backend's NTT ordering conventions.
         let native = DCRTPoly::const_rotate_poly(&params, 1)
             .evals_biguints()
             .into_iter()
             .enumerate()
             .map(|(i, root)| (root, i))
             .collect::<std::collections::BTreeMap<_, _>>();
+        // The two rows use exponents +5^j and -5^j modulo 2N. Multiplying an
+        // exponent by 5 rotates within a row; negating it exchanges the rows.
         Ok((0..n)
             .map(|i| {
                 let exponent = pow_mod(5, (i % (n / 2)) as u64, (2 * n) as u64);
@@ -554,6 +577,9 @@ impl BgvParams {
         let parameters = self.common.parameters_at(level)?;
         let digits = parameters.modulus_digits();
         check_matrix(&parameters, key, 2, digits)?;
+        // The automorphism changes the decryption secret to sigma(s). The
+        // switch key encrypts sigma(s) under s; subtract its phase to recover
+        // sigma(b) - sigma(s)*sigma(a), explaining both minus signs below.
         let transformed = ct.components.clone().ring_automorphism(index);
         let a = row(&transformed, 0);
         let b = row(&transformed, 1);
@@ -626,6 +652,9 @@ mod tests {
                 .private_output(format!("decoded-{name}"), bgv.decrypt(&secret, ct).unwrap())
                 .unwrap();
         }
+        // Squaring 3 gives 9, outside the centered interval for t = 17. This
+        // exercises plaintext carries in addition to sampled Gaussian errors,
+        // including the representative changes accounted for by the bound.
         let mut message = vec![0; n];
         message[0] = 3;
         let result = execute_graph(
@@ -634,6 +663,8 @@ mod tests {
             BTreeMap::from([("message".into(), int_input(&message))]),
         );
         for (name, ct, _, _) in cases {
+            // Recover the actual e from the runtime phase, independently of
+            // the bound formulas, then also check the decoded semantic result.
             for coefficient in integers(&result, name) {
                 let t = BigInt::from(bgv.plaintext_modulus);
                 let residue = coefficient.mod_floor(&t);
@@ -782,6 +813,8 @@ mod tests {
                 .map(|&p| common.ring.select_modulus(&BigUint::from(p)).unwrap()),
         );
         let mut backend = cpu_backend(parameters);
+        // Distinct graphs exchange manifests and in-memory artifacts, exercising
+        // the protocol boundary without serializing secrets or ciphertexts to files.
         let mut store = MemoryArtifactStore::default();
         let env = ParamEnv::default();
         let context = DslContext::new("fhe-bgv-staged-encryption");
@@ -789,6 +822,8 @@ mod tests {
         let (secret, pk) = bgv.keygen().unwrap();
         let ct = bgv.encrypt(&pk, &input).unwrap();
         let key = bgv.relinearization_key(&secret, top).unwrap();
+        // Matrix artifacts contain no Rust schema metadata. Export the public
+        // bound explicitly and rebuild the ciphertext record in the next stage.
         let encryption_noise = ct.noise_bound.clone();
         let encryption = context
             .private_output("secret", secret)
@@ -1009,6 +1044,8 @@ mod tests {
                     .0[i]
             })
             .collect::<Vec<_>>();
+        // Mixed prime widths and a permuted basis catch assumptions that CRT
+        // towers are sorted or share a width; the default Q also exceeds 128 bits.
         for reordered in [false, true] {
             if reordered {
                 primes.reverse();
@@ -1067,6 +1104,8 @@ mod tests {
                 &common,
                 BTreeMap::from([("ciphertext".into(), RuntimeValue::Matrix(Arc::new(input)))]),
             );
+            // Compare each complete DSL reduction against the native primitive
+            // applied one level at a time, rather than reimplementing its formula.
             let mut expected = polys;
             for level in (0..depth - 1).rev() {
                 expected = expected.iter().map(|p| p.bgv_mod_reduce(17).unwrap()).collect();
@@ -1187,6 +1226,8 @@ mod simd_tests {
                 bgv.decode_slots(&bgv.decrypt(&secret, &product).unwrap()).unwrap(),
             )
             .unwrap();
+        // Include negative and wrapped steps, plus both identity encodings;
+        // identity rotations deliberately omit a key to test the no-op contract.
         let steps = [1, -1, 0, n as i32 / 2 + 1, n as i32 / 2];
         for (i, step) in steps.into_iter().enumerate() {
             let key = if step.rem_euclid(n as i32 / 2) == 0 {
@@ -1210,6 +1251,8 @@ mod simd_tests {
                 bgv.decode_slots(&bgv.decrypt(&secret, &swapped).unwrap()).unwrap(),
             )
             .unwrap();
+        // Rotation after multiplication and level reduction must use a key at
+        // the new level while preserving the nontrivial correction factor.
         let reduced = bgv.mod_switch_to(&product, top - 1).unwrap();
         let low_key = bgv.rotation_key(&secret, top - 1, 1).unwrap();
         let pipeline = bgv.rotate_rows(Some(&low_key), &reduced, 1).unwrap();

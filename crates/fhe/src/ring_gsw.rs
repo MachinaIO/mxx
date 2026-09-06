@@ -32,6 +32,8 @@ pub struct RingCiphertextSchema {
 
 impl GraphValue for RingCiphertext {
     type Schema = RingCiphertextSchema;
+    // Only matrices become runtime wires. Public bounds travel in the schema,
+    // so reconstructing a graph value must retain both bounds explicitly.
     fn flatten(&self) -> Vec<ValueHandle> {
         (self.a.clone(), self.b.clone()).flatten()
     }
@@ -111,6 +113,8 @@ impl RingGswParams {
         let digits = params.modulus_digits();
         let ring = self.common.ring();
         let base = IntExpr::constant(BigInt::from(1u64 << params.base_bits()));
+        // Adding mu*G on the two diagonal blocks makes the phase row
+        // (-s, 1)*C equal mu*(-s, 1)*G plus the sampled error row.
         let h = message * ring.gadget(1, base, digits);
         let zero = ring.zero((1, digits));
         let a = ring.uniform_residue((1, 2 * digits));
@@ -201,6 +205,8 @@ impl FheScheme for RingGswParams {
         for part in [secret, &ciphertext.a, &ciphertext.b] {
             check_matrix(p, part, 1, 1)?;
         }
+        // Center before rounding: a residue near q represents a small negative
+        // phase. Packing the decoded integers returns canonical R_q residues.
         let phase = &ciphertext.b - secret * &ciphertext.a;
         let coefficients = utils::extract(p, &phase)?;
         let delta = BigInt::from(self.scale.clone());
@@ -262,6 +268,8 @@ mod tests {
         let mut inputs = BTreeMap::new();
         let values = (0..n).map(|_| rand::rng().random_range(-2..=2)).collect::<Vec<i64>>();
         inputs.insert("message".into(), int_input(&values));
+        // Constants isolate zero/identity/sign behavior; X also exercises the
+        // sign change when a coefficient wraps across X^N = -1.
         for (name, index, value) in
             [("zero", 0, 0), ("one", 0, 1), ("negative", 0, -1), ("rotate", 1, 1)]
         {
@@ -295,6 +303,8 @@ mod tests {
         let column = Mat::concat(ConcatAxis::Rows, vec![ct.a.clone(), ct.b.clone()]);
         let digits = common.ring.modulus_digits();
         let base = BigUint::from(1u8) << common.ring.base_bits();
+        // Check G*decompose(c) = c independently of encryption/decryption, so
+        // a gadget-layout mismatch cannot hide behind a successful round trip.
         let recomposed = column
             .clone()
             .decompose(base.clone(), digits)
@@ -322,6 +332,8 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
         };
+        // Use the existing polynomial primitive as the multiplication oracle,
+        // including negacyclic wraparound and canonical residues.
         let expected = (native(&values) * native(&multiplier))
             .coeffs()
             .iter()
@@ -429,11 +441,15 @@ mod tests {
         assert_eq!(sum.noise_bound, &second.noise_bound + &first.noise_bound);
         assert_eq!(sum.plaintext_bound, &second.plaintext_bound + &first.plaintext_bound);
         assert!(scheme.can_decrypt(&sum));
+        // Graph reconstruction and loop placeholders must preserve metadata
+        // even though flatten() exposes only the two matrix handles.
         let schema = sum.schema();
         let restored = RingCiphertext::from_values(&schema, &sum.flatten()).unwrap();
         assert!(restored.schema() == schema);
         assert!(schema.placeholders().schema() == schema);
         let expected = &m * &mu * &mu + &m * &mu;
+        // Measure the actual accumulated error separately from decoding: a
+        // correct plaintext alone would not prove that the bound is sound.
         let residual =
             &sum.b - &secret * &sum.a - &expected * scalar(&common.ring, scheme.scale.clone());
         let graph = context

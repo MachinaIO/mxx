@@ -27,6 +27,8 @@ impl FheCommonParams {
                 "positive finite Gaussian sigma and cutoff are required",
             ));
         }
+        // Noise formulas use ||s||_infinity <= 1, so accepting wider secret
+        // intervals here would invalidate every downstream convolution bound.
         let env = ParamEnv::default();
         let lo = self.secret_range.minimum.evaluate(&env).ok();
         let hi = self.secret_range.maximum.evaluate(&env).ok();
@@ -45,6 +47,8 @@ impl FheCommonParams {
 
     pub fn parameters_at(&self, level: usize) -> Result<DCRTPolyParams, FheError> {
         let (moduli, _, _) = self.ring.to_crt();
+        // Level zero retains the first prime; switching drops trailing primes
+        // while preserving the primitive parameter object's CRT tower order.
         let primes = moduli.get(..=level).ok_or(FheError::LevelMismatch)?;
         let modulus = primes.iter().map(|p| BigUint::from(*p)).product::<BigUint>();
         self.ring.select_modulus(&modulus).ok_or(FheError::LevelMismatch)

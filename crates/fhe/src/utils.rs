@@ -40,6 +40,8 @@ pub(crate) fn scalar(parameters: &DCRTPolyParams, value: impl Into<BigInt>) -> M
 
 pub(crate) fn centered(value: Int, modulus: &BigUint) -> Result<Int, DslError> {
     let q = BigInt::from(modulus.clone());
+    // select uses index 0 for false and 1 for true; the latter keeps residues
+    // at or below q/2, while larger residues are interpreted as value - q.
     let above_half = value.clone().mul(2).less_equal(Int::constant(q.clone()));
     select(above_half.to_int(), vec![value.clone().sub(Int::constant(q)), value])
 }
@@ -106,12 +108,16 @@ pub(crate) fn execute_graph(
     common: &FheCommonParams,
     inputs: BTreeMap<String, RuntimeValue<CpuDcrtBackend>>,
 ) -> ExecutionResult<CpuDcrtBackend> {
+    // Register prefix rings for ciphertext levels and single-prime rings for
+    // modswitch corrections; a modulus alone does not specify CRT tower order.
     let (moduli, _, depth) = common.ring.to_crt();
     let mut parameters =
         (0..depth).map(|level| common.parameters_at(level).unwrap()).collect::<Vec<_>>();
     parameters
         .extend(moduli.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
     let validated = graph.validate(&ParamEnv::default()).expect("valid FHE DSL graph");
+    // SIMD import nodes also use R_t. Discover that extra plaintext ring from
+    // the graph instead of requiring every coefficient-only fixture to add it.
     for scope in graph.graph.scopes().values() {
         for node in scope.nodes() {
             if let mxx_ir_core::node::NodeKind::PolynomialFromValues { matrix_type, .. } =
@@ -142,6 +148,8 @@ pub(crate) fn execute_graph(
     let mut store = MemoryArtifactStore::default();
     let mut result = execute(&validated, &mut backend, inputs, &mut store, SamplingMode::Fresh)
         .expect("FHE graph execution");
+    // Structural families may be lazy staged outputs. Materialize them before
+    // dropping the memory store so assertions observe actual runtime values.
     for name in result.outputs.keys().cloned().collect::<Vec<_>>() {
         result.materialize_output(&name, &backend, &mut store).expect("load FHE output");
     }

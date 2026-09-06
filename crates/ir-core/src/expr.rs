@@ -1250,7 +1250,11 @@ mod tests {
                     IntExpr::Mul(Box::new(partial.clone()), Box::new(IntExpr::constant(0))),
                     IntExpr::Mul(Box::new(IntExpr::constant(0)), Box::new(partial.clone())),
                 ];
-                let operators = [partial - partial, partial * 0, IntExpr::constant(0) * partial];
+                let operators = [
+                    partial - partial,
+                    partial * IntExpr::constant(0),
+                    IntExpr::constant(0) * partial,
+                ];
                 for (raw, operator) in raw.into_iter().zip(operators) {
                     let expected = raw.evaluate(&env);
                     let canonical = raw.canonicalize();

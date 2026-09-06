@@ -544,7 +544,7 @@ impl DiamondWeProtocolFamily {
         let witness_end = &instance_width + witness_size - 1;
         let zero = CircuitEncoding {
             vector: zero_encoding.vector,
-            public_key: &one_public_key.matrix - &one_public_key.matrix,
+            public_key: public_key_compiler.sub(&one_public_key, &one_public_key).matrix,
             plaintext: zero_encoding.plaintext.expect("revealed"),
         };
         let one = CircuitEncoding {

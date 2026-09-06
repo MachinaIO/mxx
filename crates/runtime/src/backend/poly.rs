@@ -294,6 +294,9 @@ where
     M: PolyMatrixSmallRhs,
     T: PolyTrapdoorSampler<M = M>,
 {
+    if parameters.dropped_moduli() != 0 {
+        return Err(SmallMatrixError::InvalidConfig.into());
+    }
     validate_regular_gadget_layout_for_params(
         parameters,
         &request.gadget_base,
@@ -1086,6 +1089,9 @@ where
     ) -> Result<(M, T::Trapdoor), Self::Error> {
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
+        if parameters.dropped_moduli() != 0 {
+            return Err(SmallMatrixError::InvalidConfig.into());
+        }
         let sampler = T::new(parameters, sigma);
         let (trapdoor, public) = sampler.trapdoor(parameters, ty.rows);
         Ok((public, trapdoor))
@@ -1104,6 +1110,9 @@ where
     ) -> Result<M::SmallMatrix, Self::Error> {
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
+        if parameters.dropped_moduli() != 0 {
+            return Err(SmallMatrixError::InvalidConfig.into());
+        }
         let max_coefficient_bound =
             max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         let sampler = T::new(parameters, sigma);
@@ -1151,6 +1160,10 @@ where
 
     fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M::SmallMatrix, Self::Error> {
         Ok(value.clone().gadget_decompose(small)?)
+    }
+
+    fn gadget_error_bound(&self, ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
+        Ok(BigInt::from(self.parameters(ty)?.gadget_error_bound()))
     }
 
     fn multiply_small_rhs(&mut self, lhs: &M, rhs: &M::SmallMatrix) -> Result<M, Self::Error> {
@@ -1443,8 +1456,26 @@ mod tests {
     use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
 
     #[test]
+    fn approximate_layout_rejects_exact_trapdoor_sampling() {
+        let parameters = DCRTPolyParams::new(4, 2, 10, 5, Some(1));
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 4,
+            rows: 1,
+            columns: parameters.modulus_digits(),
+        };
+        let digits = parameters.modulus_digits();
+        let base = BigInt::from(1u8) << parameters.base_bits();
+        let mut backend = cpu_backend([parameters]);
+        assert!(matches!(
+            backend.sample_trapdoor(&ty, 4.578, &base, digits),
+            Err(PolyBackendError::SmallMatrix(SmallMatrixError::InvalidConfig))
+        ));
+    }
+
+    #[test]
     fn coefficient_extraction_returns_a_canonical_index_above_half_modulus() {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5);
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
         let modulus = parameters.modulus();
         let residue = modulus.as_ref() - BigUint::from(1u8);
         let value = DCRTPolyMatrix::from_poly_vec_row(
@@ -1461,7 +1492,7 @@ mod tests {
 
     #[test]
     fn decomposed_hash_uses_the_explicit_backend_layout() {
-        let parameters = DCRTPolyParams::new(4, 1, 10, 5);
+        let parameters = DCRTPolyParams::new(4, 1, 10, 5, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digits = parameters.modulus_digits();
         let base = BigInt::from(1u8) << parameters.base_bits();
@@ -1495,7 +1526,7 @@ mod tests {
 
     #[test]
     fn compact_artifact_codec_keeps_semantics_external_and_rejects_malformed_payloads() {
-        let parameters = DCRTPolyParams::new(4, 1, 16, 8);
+        let parameters = DCRTPolyParams::new(4, 1, 16, 8, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digits = parameters.modulus_digits();
         let base = BigInt::from(1u8) << parameters.base_bits();

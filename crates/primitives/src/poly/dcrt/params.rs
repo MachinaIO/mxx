@@ -19,6 +19,7 @@ pub struct DCRTPolyParams {
     modulus: Arc<BigUint>,
     /// bit size of the base for the gadget vector and decomposition
     base_bits: u32,
+    dropped_moduli: usize,
     decompose_last_mask: Option<u64>,
 }
 
@@ -30,6 +31,7 @@ impl Debug for DCRTPolyParams {
             .field("crt_depth", &self.crt_depth())
             .field("crt_bits", &self.crt_bits())
             .field("base_bits", &self.base_bits)
+            .field("dropped_moduli", &self.dropped_moduli)
             .finish()
     }
 }
@@ -54,7 +56,11 @@ impl PolyParams for DCRTPolyParams {
     }
 
     fn modulus_digits(&self) -> usize {
-        self.crt_bits.div_ceil(self.base_bits as usize) * self.crt_depth
+        self.crt_bits.div_ceil(self.base_bits as usize) * (self.crt_depth - self.dropped_moduli)
+    }
+
+    fn dropped_moduli(&self) -> usize {
+        self.dropped_moduli
     }
 
     fn to_crt(&self) -> (Vec<u64>, usize, usize) {
@@ -69,14 +75,26 @@ impl PolyParams for DCRTPolyParams {
 impl Default for DCRTPolyParams {
     /// **note**  these parameters are insecure and only for test purpose
     fn default() -> Self {
-        Self::new(4, 2, 17, 1)
+        Self::new(4, 2, 17, 1, None)
     }
 }
 
 impl DCRTPolyParams {
-    pub fn new(ring_dimension: u32, crt_depth: usize, crt_bits: usize, base_bits: u32) -> Self {
+    pub fn new(
+        ring_dimension: u32,
+        crt_depth: usize,
+        crt_bits: usize,
+        base_bits: u32,
+        dropped_moduli: Option<usize>,
+    ) -> Self {
         // assert that ring_dimension is a power of 2
         assert!(ring_dimension.is_power_of_two(), "ring_dimension must be a power of 2");
+        let dropped_moduli = dropped_moduli.unwrap_or(0);
+        assert!(dropped_moduli < crt_depth, "dropped_moduli must be less than crt_depth");
+        assert!(
+            base_bits > 0 && base_bits as usize <= crt_bits / 2,
+            "base_bits must be positive and <= crt_bits / 2"
+        );
         let modulus =
             crate::openfhe_guard::gen_modulus_and_warmup(ring_dimension, crt_depth, crt_bits);
         let decompose_last_mask = if crt_bits.is_multiple_of(base_bits as usize) {
@@ -94,6 +112,7 @@ impl DCRTPolyParams {
             crt_bits,
             modulus: Arc::new(BigUint::from_str_radix(&modulus, 10).expect("invalid string")),
             base_bits,
+            dropped_moduli,
             decompose_last_mask,
         }
     }
@@ -116,12 +135,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_approximate_params_preserve_modulus_and_bound() {
+        let exact = DCRTPolyParams::new(8, 3, 17, 4, None);
+        let (moduli, _, _) = exact.to_crt();
+        for k in [0, 1, 2] {
+            let params = DCRTPolyParams::new(8, 3, 17, 4, Some(k));
+            assert_eq!(params.modulus(), exact.modulus());
+            assert_eq!(params.to_crt(), exact.to_crt());
+            assert_eq!(params.modulus_digits(), (3 - k) * 5);
+            let p = moduli[3 - k..].iter().fold(BigUint::from(1u8), |a, b| a * b);
+            assert_eq!(params.gadget_error_bound(), (p / 2u8) * k);
+            assert_eq!(params == exact, k == 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "dropped_moduli must be less than crt_depth")]
+    fn test_approximate_params_require_retained_modulus() {
+        DCRTPolyParams::new(8, 2, 17, 4, Some(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "base_bits must be positive and <= crt_bits / 2")]
+    fn test_approximate_params_preserve_base_constraint() {
+        DCRTPolyParams::new(8, 2, 17, 9, Some(1));
+    }
+
+    #[test]
     fn test_params_initiation_ring_dimension() {
         let ring_dimension = 16;
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.ring_dimension(), ring_dimension);
         assert_eq!(p.modulus_bits(), 204);
         assert_eq!(p.base_bits(), base_bits);
@@ -130,7 +176,7 @@ mod tests {
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.ring_dimension(), 2);
         assert_eq!(p.modulus_bits(), 204);
 
@@ -138,7 +184,7 @@ mod tests {
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.ring_dimension(), 1);
         assert_eq!(p.modulus_bits(), 204);
     }
@@ -149,7 +195,7 @@ mod tests {
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.ring_dimension(), ring_dimension);
         assert_eq!(p.modulus_bits() as u32, (crt_depth * crt_bits) as u32);
 
@@ -157,7 +203,7 @@ mod tests {
         let crt_depth = 5;
         let crt_bits = 51;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.ring_dimension(), ring_dimension);
         assert_eq!(p.modulus_bits() as u32, (crt_depth * crt_bits) as u32);
 
@@ -165,7 +211,7 @@ mod tests {
         let crt_depth = 6;
         let crt_bits = 51;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.ring_dimension(), ring_dimension);
         assert_eq!(p.modulus_bits() as u32, (crt_depth * crt_bits) as u32);
 
@@ -173,7 +219,7 @@ mod tests {
         let crt_depth = 7;
         let crt_bits = 20;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.ring_dimension(), ring_dimension);
         assert_eq!(p.modulus_bits() as u32, (crt_depth * crt_bits) as u32);
     }
@@ -184,21 +230,21 @@ mod tests {
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 1;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.base_bits(), base_bits);
 
         let ring_dimension = 16;
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 4;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.base_bits(), base_bits);
 
         let ring_dimension = 16;
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 20;
-        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+        let p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
         assert_eq!(p.base_bits(), base_bits);
     }
 
@@ -209,7 +255,7 @@ mod tests {
         let crt_depth = 4;
         let crt_bits = 51;
         let base_bits = 1;
-        let _p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits); // This should
+        let _p = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None); // This should
         // panic
     }
 }

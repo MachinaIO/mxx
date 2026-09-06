@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn runtime_addition_zips_every_component_and_matches_primitives() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
         let ring = Ring::new(
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn runtime_matrix_multiplication_matches_primitive_decomposition() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
         let ring = Ring::new(
@@ -856,7 +856,7 @@ mod tests {
     }
     #[test]
     fn naive_sampler_runtime_preserves_tags_and_encoding_formulas() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let layout = concrete_layout(&parameters, 2);
         let key = [47u8; 32];
         let tag = b"naive-bgg-ir";

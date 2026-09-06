@@ -189,6 +189,7 @@ impl DiamondParameterSearch {
                 crt_depth,
                 self.crt_modulus_bits,
                 self.gadget_base_bits,
+                None,
             );
             let started = Instant::now();
             debug!(
@@ -233,6 +234,7 @@ impl DiamondParameterSearch {
             crt_depth,
             self.crt_modulus_bits,
             self.gadget_base_bits,
+            None,
         );
         let modulus: Arc<BigUint> = parameters.modulus();
         let error_sigma = RealExpr::from_f64_exact(self.error_sigma)

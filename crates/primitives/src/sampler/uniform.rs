@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn truncated_gaussian_never_exceeds_the_integer_cutoff() {
-        let params = DCRTPolyParams::new(32, 1, 20, 4);
+        let params = DCRTPolyParams::new(32, 1, 20, 4, None);
         let cutoff = BigUint::from(2u8);
         let matrix = DCRTPolyUniformSampler::new().sample_uniform(
             &params,

@@ -488,7 +488,8 @@ static int gpu_matrix_fill_gadget_columns_impl(
     uint32_t base_bits,
     bool small,
     size_t full_size,
-    size_t global_column_start)
+    size_t global_column_start,
+    size_t dropped_moduli)
 {
     if (!out)
     {
@@ -518,6 +519,7 @@ static int gpu_matrix_fill_gadget_columns_impl(
         return set_error("invalid level in gpu_matrix_fill_gadget");
     }
     const size_t crt_depth = static_cast<size_t>(level + 1);
+    if (dropped_moduli >= crt_depth) return set_error("invalid dropped_moduli");
     if (out->ctx->moduli.size() < crt_depth)
     {
         return set_error("unexpected modulus count in gpu_matrix_fill_gadget");
@@ -544,7 +546,7 @@ static int gpu_matrix_fill_gadget_columns_impl(
     }
     const size_t log_base_q =
         small ? static_cast<size_t>(digits_per_tower)
-              : static_cast<size_t>(digits_per_tower) * crt_depth;
+              : static_cast<size_t>(digits_per_tower) * (crt_depth - dropped_moduli);
     if (full_size != 0 && log_base_q > std::numeric_limits<size_t>::max() / full_size)
     {
         return set_error("ranged gadget column count overflow");
@@ -626,12 +628,13 @@ extern "C" int gpu_matrix_fill_gadget_columns(
     uint32_t base_bits,
     int small,
     size_t full_size,
-    size_t global_column_start)
+    size_t global_column_start,
+    size_t dropped_moduli)
 {
     if (small != 0 && small != 1)
         return set_error("invalid ranged gadget mode");
     return gpu_matrix_fill_gadget_columns_impl(
-        out, base_bits, small != 0, full_size, global_column_start);
+        out, base_bits, small != 0, full_size, global_column_start, dropped_moduli);
 }
 
 __global__ void matrix_fill_small_decomposed_identity_chunk_all_limbs_kernel(
@@ -1071,11 +1074,139 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
     return 0;
 }
 
+// Constants for Section 3.2 of ePrint 2024/909. No full-modulus integers or
+// coefficient transfers are needed: every product is reduced in its own limb.
+__global__ void gadget_low_constants_kernel(
+    const uint64_t *moduli, uint64_t *constants, size_t retained, size_t dropped)
+{
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= dropped * (retained + 1)) return;
+    const size_t low = index % dropped;
+    const size_t tower = index / dropped;
+    const uint64_t modulus = moduli[tower == retained ? retained + low : tower];
+    uint64_t weight = 1;
+    for (size_t u = 0; u < dropped; ++u)
+        if (u != low)
+            weight = static_cast<uint64_t>(
+                (static_cast<unsigned __int128>(weight) * moduli[retained + u]) % modulus);
+    if (tower == retained)
+    {
+        // Extended Euclid also handles a coprime non-prime CRT basis.
+        __int128 t = 0, next_t = 1;
+        uint64_t r = modulus, next_r = weight;
+        while (next_r != 0)
+        {
+            const uint64_t quotient = r / next_r;
+            const uint64_t remainder = r % next_r;
+            const __int128 next = t - static_cast<__int128>(quotient) * next_t;
+            r = next_r; next_r = remainder; t = next_t; next_t = next;
+        }
+        if (t < 0) t += modulus;
+        weight = static_cast<uint64_t>(t);
+    }
+    constants[index] = weight;
+}
+
+__global__ void gadget_correct_residues_kernel(
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors,
+    const uint64_t *moduli, const uint64_t *constants,
+    size_t retained, size_t dropped, size_t n, size_t polys)
+{
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t poly = index / n;
+    const size_t coefficient = index % n;
+    const size_t tower = blockIdx.y;
+    if (poly >= polys || tower >= retained) return;
+    const uint64_t modulus = moduli[tower];
+    const auto dest = descriptors[tower];
+    uint64_t value = matrix_load_limb_u64(dest.base, poly, coefficient, dest.stride, dest.width);
+    for (size_t low = 0; low < dropped; ++low)
+    {
+        const auto src = descriptors[retained + low];
+        const uint64_t low_modulus = moduli[retained + low];
+        const uint64_t residue = matrix_load_limb_u64(
+            src.base, poly, coefficient, src.stride, src.width);
+        const uint64_t twisted = static_cast<uint64_t>(
+            (static_cast<unsigned __int128>(residue) *
+             constants[retained * dropped + low]) % low_modulus);
+        const uint64_t centered = signed_digit_to_residue(
+            centered_lift_u64(twisted, low_modulus), modulus);
+        const uint64_t term = static_cast<uint64_t>(
+            (static_cast<unsigned __int128>(centered) *
+             constants[tower * dropped + low]) % modulus);
+        value = value >= term ? value - term : modulus - (term - value);
+    }
+    // Low limbs are read-only throughout this launch, so no cross-block race.
+    matrix_store_limb_u64(dest.base, poly, coefficient, dest.stride, dest.width, value);
+}
+
+extern "C" int gpu_matrix_correct_gadget_residues(GpuMatrix *src, size_t dropped)
+{
+    if (!src || !src->ctx || src->format != GPU_POLY_FORMAT_COEFF || src->level < 0)
+        return set_error("invalid approximate gadget source");
+    const size_t limbs = static_cast<size_t>(src->level + 1);
+    if (dropped >= limbs) return set_error("invalid dropped_moduli");
+    if (dropped == 0 || src->rows == 0 || src->cols == 0) return 0;
+    const size_t retained = limbs - dropped;
+    if (src->ctx->limb_gpu_ids.size() < limbs) return set_error("missing approximate gadget limbs");
+    const dim3 first = src->ctx->limb_gpu_ids[0];
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    if (matrix_limb_device(src, first, &device) != 0 ||
+        matrix_limb_stream(src, first, &stream) != 0) return 1;
+    if (first.x >= src->shared_limb_buffers.size() ||
+        first.x >= src->ctx->ntt_device_constants.size())
+        return set_error("missing approximate gadget descriptors");
+    const auto &buffers = src->shared_limb_buffers[first.x];
+    const auto &constants = src->ctx->ntt_device_constants[first.x];
+    if (!buffers.device_descriptors || buffers.limb_count < limbs ||
+        !constants.moduli || constants.limb_count < limbs)
+        return set_error("missing approximate gadget constants");
+    for (size_t limb = 0; limb < limbs; ++limb)
+    {
+        const dim3 id = src->ctx->limb_gpu_ids[limb];
+        int limb_device = -1;
+        if (matrix_limb_device(src, id, &limb_device) != 0 || limb_device != device ||
+            id.x != first.x || id.y != limb)
+            return set_error("approximate gadget requires ordered limbs on one device");
+        if (matrix_wait_limb_stream(src, id, device, stream) != 0) return 1;
+    }
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) return set_error(err);
+    uint64_t *weights = nullptr;
+    const size_t entries = dropped * (retained + 1);
+    err = cudaMallocAsync(reinterpret_cast<void **>(&weights), entries * sizeof(uint64_t), stream);
+    if (err != cudaSuccess) return set_error(err);
+    gadget_low_constants_kernel<<<(entries + 255) / 256, 256, 0, stream>>>(
+        constants.moduli, weights, retained, dropped);
+    err = cudaGetLastError();
+    if (err == cudaSuccess)
+    {
+        const dim3 grid((static_cast<size_t>(src->ctx->N) * src->rows * src->cols + 255) / 256, retained);
+        gadget_correct_residues_kernel<<<grid, 256, 0, stream>>>(
+            buffers.device_descriptors, constants.moduli, weights,
+            retained, dropped, src->ctx->N, src->rows * src->cols);
+        err = cudaGetLastError();
+    }
+    cudaFreeAsync(weights, stream);
+    if (err != cudaSuccess) return set_error(err);
+    for (size_t limb = 0; limb < limbs; ++limb)
+    {
+        const dim3 id = src->ctx->limb_gpu_ids[limb];
+        const int status = limb < retained
+            ? matrix_record_limb_write(src, id, stream)
+            : matrix_track_limb_consumer_readonly(src, id, device, stream);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
 static int gpu_matrix_decompose_base_impl(
     const GpuMatrix *src,
     uint32_t base_bits,
     GpuMatrix *out,
-    bool small)
+    bool small,
+    size_t dropped_moduli)
 {
     if (!src || !out)
     {
@@ -1104,6 +1235,7 @@ static int gpu_matrix_decompose_base_impl(
         return set_error("invalid level in gpu_matrix_decompose_base");
     }
     const size_t crt_depth = static_cast<size_t>(level + 1);
+    if (dropped_moduli >= crt_depth) return set_error("invalid dropped_moduli");
     uint32_t crt_bits = 0;
     for (const auto &modulus : src->ctx->moduli)
     {
@@ -1121,7 +1253,7 @@ static int gpu_matrix_decompose_base_impl(
     }
     const size_t out_log_base_q =
         small ? static_cast<size_t>(digits_per_tower)
-              : static_cast<size_t>(digits_per_tower) * crt_depth;
+              : static_cast<size_t>(digits_per_tower) * (crt_depth - dropped_moduli);
     if (out->rows != rows * out_log_base_q || out->cols != cols)
     {
         return set_error("output size mismatch in gpu_matrix_decompose_base");
@@ -1144,7 +1276,7 @@ static int gpu_matrix_decompose_base_impl(
     };
 
     int status = 0;
-    if (src->format == GPU_POLY_FORMAT_EVAL)
+    if (src->format == GPU_POLY_FORMAT_EVAL || dropped_moduli > 0)
     {
         const int matrix_format =
             src->format == GPU_POLY_FORMAT_EVAL ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
@@ -1160,13 +1292,18 @@ static int gpu_matrix_decompose_base_impl(
             cleanup_tmp_inputs();
             return status;
         }
-        status = gpu_matrix_intt_all(tmp_inputs_matrix);
+        status = src->format == GPU_POLY_FORMAT_EVAL ? gpu_matrix_intt_all(tmp_inputs_matrix) : 0;
         if (status != 0)
         {
             cleanup_tmp_inputs();
             return status;
         }
         inputs_matrix = tmp_inputs_matrix;
+        if (dropped_moduli > 0)
+        {
+            status = gpu_matrix_correct_gadget_residues(tmp_inputs_matrix, dropped_moduli);
+            if (status != 0) { cleanup_tmp_inputs(); return status; }
+        }
     }
 
     auto &limb_map = src->ctx->limb_gpu_ids;
@@ -1248,7 +1385,7 @@ static int gpu_matrix_decompose_base_impl(
     }
 
     const int src_limb_begin = 0;
-    const int src_limb_end = small ? 1 : (level + 1);
+    const int src_limb_end = small ? 1 : static_cast<int>(crt_depth - dropped_moduli);
     for (int src_limb = src_limb_begin; src_limb < src_limb_end; ++src_limb)
     {
         const dim3 src_limb_id = active_limb_ids[static_cast<size_t>(src_limb)];
@@ -1515,12 +1652,12 @@ static int gpu_matrix_decompose_base_impl(
     return 0;
 }
 
-extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out)
+extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out, size_t dropped_moduli)
 {
-    return gpu_matrix_decompose_base_impl(src, base_bits, out, false);
+    return gpu_matrix_decompose_base_impl(src, base_bits, out, false, dropped_moduli);
 }
 
 extern "C" int gpu_matrix_decompose_base_small(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out)
 {
-    return gpu_matrix_decompose_base_impl(src, base_bits, out, true);
+    return gpu_matrix_decompose_base_impl(src, base_bits, out, true, 0);
 }

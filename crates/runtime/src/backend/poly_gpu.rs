@@ -169,7 +169,7 @@ mod crt_tests {
         // process-global transform/cache state) in this GPU correctness oracle.
         // Each prime is 1 mod 2N for N = 32.
         let moduli = vec![131_009, 130_817, 129_793, 129_281, 128_833];
-        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8);
+        let gpu_parameters = GpuDCRTPolyParams::new(32, moduli.clone(), 8, None);
         let q = moduli.iter().map(|modulus| BigUint::from(*modulus)).product::<BigUint>();
         assert!(q.bits() > 64, "test must exercise a multi-word ring modulus");
         let q_minus_one = &q - BigUint::from(1u8);
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_gpu_explicit_device_override_controls_placement_count() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let backend = CpuDcrtBackend::new_for_execution_on([parameters], &[17, 23]);
 
         assert_eq!(backend.placement_count(), 2);

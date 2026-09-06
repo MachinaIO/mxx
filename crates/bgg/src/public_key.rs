@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn runtime_operations_match_primitive_matrix_formulas() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
         let ring = Ring::new(

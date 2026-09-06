@@ -1264,7 +1264,7 @@ mod tests {
         let name = "MXX_GPU_VRAM_PERCENT";
         let previous = std::env::var_os(name);
         unsafe { std::env::set_var(name, "37") };
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
         unsafe { std::env::set_var(name, "91") };
         let backend = super::super::gpu_backend_on([parameters], [device]);
         match previous {
@@ -1372,7 +1372,7 @@ mod tests {
     fn gpu_fleet_waves_preserve_decomposition_and_canonical_artifacts() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let mut backend = super::super::gpu_backend_on([parameters.clone()], [device]);
         let operation = [17u8; 32];
@@ -1443,7 +1443,7 @@ mod tests {
             super::super::wait_for_gpu_test_context_quiescence(device);
         }
 
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let devices = first_bidirectional_peer_pair(&detected, &parameters).unwrap_or_else(|| {
             panic!(
                 "this ignored test requires a GPU pair with bidirectional CUDA peer access; \
@@ -1528,7 +1528,7 @@ mod tests {
     fn gpu_runtime_miss_records_a_profile_and_cache_hit_defers_width_derivation() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let mut backend = super::super::gpu_backend_on([parameters], [device]);
         let operation = [91u8; 32];
@@ -1554,9 +1554,9 @@ mod tests {
     fn gpu_shared_context_fails_without_retaining_a_profile_or_width() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let _other_context = GpuDCRTPolyParams::new(32, vec![65_537, 67_073], 2);
+        let _other_context = GpuDCRTPolyParams::new(32, vec![65_537, 67_073], 2, None);
         let operation = [92u8; 32];
 
         assert!(matches!(
@@ -1575,7 +1575,7 @@ mod tests {
     fn gpu_runtime_pilots_reslice_wide_matrix_inputs() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let mut backend = super::super::gpu_backend_on([parameters], [device]);
         let setup = [3u8; 32];
@@ -1671,7 +1671,7 @@ mod tests {
     fn gpu_tensor_and_diagonal_concat_match_single_device_semantics() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let mut backend = super::super::gpu_backend_on([parameters], [device]);
         let operation = [63u8; 32];
@@ -1696,7 +1696,7 @@ mod tests {
     fn gpu_transpose_and_concat_calibration_preserve_mixed_layouts() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let mut backend = super::super::gpu_backend_on([parameters], [device]);
         let setup = [70u8; 32];
@@ -2716,6 +2716,10 @@ impl Backend for GpuDcrtBackend {
         }
         let rows = shards.first().map(|shard| shard.value.rows()).unwrap_or(0);
         Ok(GpuFleetSmallMatrix::new(rows, value.columns, shards))
+    }
+
+    fn gadget_error_bound(&self, ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
+        self.devices[0].1.gadget_error_bound(ty)
     }
 
     fn multiply_small_rhs(

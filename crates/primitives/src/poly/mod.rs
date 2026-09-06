@@ -25,8 +25,19 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     fn base_bits(&self) -> u32;
     /// Fewest bits necessary to represent the modulus value `q`.
     fn modulus_bits(&self) -> usize;
-    /// Fewest digits necessary to represent the modulus value `q` in the given base.
+    /// Number of regular gadget digits, excluding the dropped CRT towers.
     fn modulus_digits(&self) -> usize;
+    /// Number of trailing CRT moduli used as the low part of approximate decomposition.
+    fn dropped_moduli(&self) -> usize {
+        0
+    }
+    /// Inclusive coefficient bound on `A - G D(A)` (ePrint 2024/909, Proposition 1).
+    fn gadget_error_bound(&self) -> BigUint {
+        let (moduli, _, depth) = self.to_crt();
+        let k = self.dropped_moduli();
+        let low = moduli[depth - k..].iter().fold(BigUint::from(1u8), |p, q| p * q);
+        (low / 2u8) * k
+    }
     /// Returns the integer `n` that specifies the size of the polynomial ring used in this
     /// polynomial. Specifically, this is the degree parameter for the ring `Z_q[x]/(x^n - 1)`.
     fn ring_dimension(&self) -> u32;

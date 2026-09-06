@@ -29,6 +29,7 @@ pub struct LeanRingLayout {
     pub crt_bits: usize,
     pub crt_depth: usize,
     pub base_bits: u32,
+    pub dropped_moduli: usize,
     pub regular_digit_count: usize,
     pub small_digit_count: usize,
 }
@@ -47,6 +48,8 @@ pub enum LayoutError {
     ProductMismatch,
     #[error("CRT depth does not equal the ordered basis length")]
     DepthMismatch,
+    #[error("dropped moduli must leave at least one retained tower")]
+    InvalidDroppedModuli,
     #[error("CRT bit width must be positive")]
     InvalidCrtBits,
     #[error("CRT modulus at position {0} exceeds the regular digit capacity")]
@@ -138,6 +141,8 @@ pub fn render_backend_context(
             r#"def moduli{index} : List Nat := [{moduli}]
 def layout{index} : MxxRuntime.RegularLayout {q} :=
   {{ crtModuli := moduli{index}
+    droppedModuli := {dropped}
+    dropped_lt := by decide
     crtModuli_nonempty := by decide
     modulus_pos := by decide
     pairwise_coprime := by unfold Pairwise; decide
@@ -153,6 +158,7 @@ def layout{index} : MxxRuntime.RegularLayout {q} :=
 
 "#,
             q = layout.modulus,
+            dropped = layout.dropped_moduli,
             bits = layout.base_bits,
             digits = layout.small_digit_count
         ));
@@ -193,6 +199,7 @@ impl LeanRingLayout {
             crt_bits,
             crt_depth,
             base_bits: parameters.base_bits(),
+            dropped_moduli: parameters.dropped_moduli(),
             regular_digit_count: parameters.modulus_digits(),
             small_digit_count: 0,
         };
@@ -210,7 +217,7 @@ impl LeanRingLayout {
         if self.crt_bits == 0 {
             return Err(LayoutError::InvalidCrtBits);
         }
-        if self.base_bits == 0 {
+        if self.base_bits == 0 || self.base_bits as usize > self.crt_bits / 2 {
             return Err(LayoutError::InvalidBaseBits);
         }
         if self.ring_dimension == 0 {
@@ -237,6 +244,9 @@ impl LeanRingLayout {
             return Err(LayoutError::ProductMismatch);
         }
 
+        if self.dropped_moduli >= self.crt_depth {
+            return Err(LayoutError::InvalidDroppedModuli);
+        }
         let digits_per_tower = self.crt_bits.div_ceil(self.base_bits as usize);
         let capacity_bits = digits_per_tower
             .checked_mul(self.base_bits as usize)
@@ -250,7 +260,7 @@ impl LeanRingLayout {
             }
         }
         let regular_digits = digits_per_tower
-            .checked_mul(self.crt_depth)
+            .checked_mul(self.crt_depth - self.dropped_moduli)
             .ok_or(LayoutError::RegularDigitCountMismatch)?;
         if self.regular_digit_count != regular_digits {
             return Err(LayoutError::RegularDigitCountMismatch);
@@ -327,6 +337,7 @@ mod tests {
             crt_bits,
             crt_depth: moduli.len(),
             base_bits,
+            dropped_moduli: 0,
             regular_digit_count: regular,
             small_digit_count: 0,
         }
@@ -350,7 +361,7 @@ mod tests {
     #[test]
     fn rejects_insufficient_regular_capacity() {
         assert_eq!(
-            layout(vec![17], 4, 4, 1).validate(),
+            layout(vec![17], 4, 2, 2).validate(),
             Err(LayoutError::InsufficientDigitCapacity(0))
         );
     }
@@ -368,6 +379,21 @@ mod tests {
         assert!(source.contains("[17, 19]"));
         assert!(matches!(
             render_backend_context(&[first, reversed], "Fixture", "Fixture"),
+            Err(LayoutError::ConflictingRingLayout { .. })
+        ));
+    }
+
+    #[test]
+    fn approximate_layout_shortens_digits_and_conflicts_with_exact_layout() {
+        let exact = layout(vec![17, 19], 8, 4, 4).validate().unwrap();
+        let mut approximate = exact.clone();
+        approximate.dropped_moduli = 1;
+        approximate.regular_digit_count = 2;
+        let approximate = approximate.validate().unwrap();
+        assert_eq!(approximate.digit_count(LeanGadgetMode::Regular), 2);
+        assert_eq!(approximate.digit_count(LeanGadgetMode::Small), 2);
+        assert!(matches!(
+            render_backend_context(&[exact, approximate], "Fixture", "Fixture"),
             Err(LayoutError::ConflictingRingLayout { .. })
         ));
     }

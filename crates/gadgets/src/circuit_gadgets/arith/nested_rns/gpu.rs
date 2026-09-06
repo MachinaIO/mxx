@@ -69,7 +69,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         gpu_device_sync();
 
-        let cpu_params = DCRTPolyParams::new(4, 6, 18, BASE_BITS);
+        let cpu_params = DCRTPolyParams::new(4, 6, 18, BASE_BITS, None);
         let (moduli, _, _) = cpu_params.to_crt();
         let gpu_ids = detected_gpu_device_ids();
         assert!(
@@ -82,6 +82,7 @@ mod tests {
             cpu_params.base_bits(),
             gpu_ids.clone(),
             Some(gpu_ids.len() as u32),
+            None,
         );
         let window = CrtWindow::new(0, 2, cpu_params.to_crt().2);
 

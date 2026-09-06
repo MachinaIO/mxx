@@ -103,6 +103,7 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         selected.parameters.base_bits(),
         device_ids.clone(),
         Some(effective_parallel_width as u32),
+        None,
     );
     let warm_up_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_WARMUPS", 1);
     let measured_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_ITERATIONS", 1);

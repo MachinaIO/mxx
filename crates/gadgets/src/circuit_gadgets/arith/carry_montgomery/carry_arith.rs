@@ -652,7 +652,7 @@ mod tests {
     use std::sync::Arc;
 
     fn test_parameters() -> DCRTPolyParams {
-        DCRTPolyParams::new(4, 2, 15, 8)
+        DCRTPolyParams::new(4, 2, 16, 8, None)
     }
 
     fn execute_polys(

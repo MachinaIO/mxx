@@ -18,7 +18,7 @@ fn bench_cpu_preimage() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Keep parameters aligned with the GPU benchmark for a fair comparison.
-    let params = DCRTPolyParams::new(16384, 10, 24, 12);
+    let params = DCRTPolyParams::new(16384, 10, 24, 12, None);
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
     let uniform_sampler = DCRTPolyUniformSampler::new();
 

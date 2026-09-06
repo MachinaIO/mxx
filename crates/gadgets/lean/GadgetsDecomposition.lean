@@ -21,8 +21,8 @@ theorem gadget_target_preserved
     {gadget : ExactMatrix q n rows columns}
     {decomposition : ExactMatrix q n columns columns}
     {target : ExactMatrix q n rows columns}
-    (fact : GadgetDecomposition gadget decomposition target) :
-    gadget * decomposition = target :=
-  fact.equation
+    {bound : Nat}
+    (fact : GadgetDecomposition gadget decomposition target bound) :
+    Approx target (gadget * decomposition) bound := fact
 
 end Mxx.Gadgets

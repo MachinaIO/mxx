@@ -25,6 +25,7 @@ structure GadgetLayoutMetadata where
   crtModuli : List Nat
   baseBits : Nat
   digitsPerTower : Nat
+  droppedModuli : Nat
   deriving DecidableEq, Repr
 
 structure TrapdoorValue (Public : Type u) (Token : Type v) where
@@ -73,6 +74,8 @@ theorem publicGadgetTrapdoorRuns_public {Public : Type u} {Token : Type v} (publ
 structure RegularLayout (q : Nat) where
   crtModuli : List Nat
   crtModuli_nonempty : crtModuli ≠ []
+  droppedModuli : Nat
+  dropped_lt : droppedModuli < crtModuli.length
   modulus_pos : ∀ tower : Fin crtModuli.length, 0 < crtModuli.get tower
   pairwise_coprime : Pairwise (fun left right : Fin crtModuli.length =>
     Nat.Coprime (crtModuli.get left) (crtModuli.get right))
@@ -172,13 +175,13 @@ theorem regularUnflattened_reconstruct {q n rows columns : Nat}
     simp [Ne.symm hne]
   · simp
 
-noncomputable def regularGadgetMatrix {q n rows : Nat} (layout : RegularLayout q) :
+noncomputable def fullGadgetMatrix {q n rows : Nat} (layout : RegularLayout q) :
     ExactMatrix q n rows (rows * (layout.crtModuli.length * layout.digitsPerTower)) :=
   castExactMatrix layout.product_eq.symm
     (fun row column ↦ regularGadgetUnflattened layout row
       ((regularIndexEquiv layout rows).symm column))
 
-noncomputable def regularDecomposeMatrix {q n rows columns : Nat}
+noncomputable def fullDecomposeMatrix {q n rows columns : Nat}
     (layout : RegularLayout q) (target : ExactMatrix q n rows columns) :
     ExactMatrix q n (rows * (layout.crtModuli.length * layout.digitsPerTower)) columns :=
   castExactMatrix layout.product_eq.symm
@@ -206,11 +209,11 @@ theorem castExactMatrix_bounded {q q' n rows columns : Nat} (h : q = q')
   cases h
   exact hbound
 
-theorem regularDecomposeMatrix_bounded {q n rows columns : Nat}
+theorem fullDecomposeMatrix_bounded {q n rows columns : Nat}
     (layout : RegularLayout q) (target : ExactMatrix q n rows columns)
     (hq : 1 < q) (hn : 0 < n) :
-    PreimageWithin (regularDecomposeMatrix layout target) (layout.base / 2) := by
-  unfold regularDecomposeMatrix
+    PreimageWithin (fullDecomposeMatrix layout target) (layout.base / 2) := by
+  unfold fullDecomposeMatrix
   apply castExactMatrix_bounded
   let value := castExactMatrix layout.product_eq target
   let witness : ErrorMatrix n
@@ -226,12 +229,12 @@ theorem regularDecomposeMatrix_bounded {q n rows columns : Nat}
     exact (coeff_natAbs_le_polyNorm _ coefficient).trans
       (CrtDecomposition.regularDigitPoly_bound layout.ordered hn _ _)
 
-theorem regularGadgetMatrix_reconstruct {q n rows columns : Nat}
+theorem fullGadgetMatrix_reconstruct {q n rows columns : Nat}
     (layout : RegularLayout q) (target : ExactMatrix q n rows columns)
     (hq : 1 < q) (hn : 0 < n) :
-    regularGadgetMatrix layout * regularDecomposeMatrix layout target = target := by
+    fullGadgetMatrix layout * fullDecomposeMatrix layout target = target := by
   classical
-  unfold regularGadgetMatrix regularDecomposeMatrix
+  unfold fullGadgetMatrix fullDecomposeMatrix
   rw [← castExactMatrix_mul]
   let g : ExactMatrix layout.ordered.modulusProduct n rows
       (rows * (layout.crtModuli.length * layout.digitsPerTower)) :=
@@ -255,6 +258,116 @@ theorem regularGadgetMatrix_reconstruct {q n rows columns : Nat}
           regularDigitsUnflattened layout (castExactMatrix layout.product_eq target) index column)
   rw [hinner, castExactMatrix_cancel]
 
+/-- The same trailing low-part selection used by the concrete CRT parameters. -/
+def RegularLayout.retainedTowers {q : Nat} (layout : RegularLayout q) : Nat :=
+  layout.crtModuli.length - layout.droppedModuli
+
+def RegularLayout.digitCount {q : Nat} (layout : RegularLayout q) : Nat :=
+  layout.retainedTowers * layout.digitsPerTower
+
+def RegularLayout.lowProduct {q : Nat} (layout : RegularLayout q) : Nat :=
+  (layout.crtModuli.drop layout.retainedTowers).prod
+
+/-- Inclusive bound of Proposition 1; adding one gives a strict integer bound. -/
+def RegularLayout.errorBound {q : Nat} (layout : RegularLayout q) : Nat :=
+  layout.droppedModuli * (layout.lowProduct / 2)
+
+def regularColumnIndex {q rows : Nat} (layout : RegularLayout q)
+    (index : Fin (rows * layout.digitCount)) :
+    Fin (rows * (layout.crtModuli.length * layout.digitsPerTower)) :=
+  finProdFinEquiv
+    ((finProdFinEquiv.symm index).1,
+      Fin.castLE (Nat.mul_le_mul_right layout.digitsPerTower
+        (Nat.sub_le layout.crtModuli.length layout.droppedModuli))
+        (finProdFinEquiv.symm index).2)
+
+noncomputable def regularLowCoefficient {q n : Nat} (layout : RegularLayout q)
+    (value : ExactPoly q n) (coefficient : Fin n) : Int :=
+  ((layout.crtModuli.drop layout.retainedTowers).map fun (p : Nat) ↦
+    ((layout.lowProduct / p : Nat) : Int) *
+      centeredLift p (((value.coeff coefficient).val : ZMod p) *
+        ((layout.lowProduct / p : Nat) : ZMod p)⁻¹)).sum
+
+noncomputable def regularLowResidual {q n rows columns : Nat} (layout : RegularLayout q)
+    (target : ExactMatrix q n rows columns) : ErrorMatrix n rows columns :=
+  fun row column ↦ ∑ coefficient : Fin n,
+    scaledBasis (regularLowCoefficient layout (target row column) coefficient) coefficient
+
+noncomputable def regularCorrectedTarget {q n rows columns : Nat} (layout : RegularLayout q)
+    (target : ExactMatrix q n rows columns) : ExactMatrix q n rows columns :=
+  if layout.droppedModuli = 0 then target
+  else target - reduceMatrix q n rows columns (regularLowResidual layout target)
+
+noncomputable def regularGadgetMatrix {q n rows : Nat} (layout : RegularLayout q) :
+    ExactMatrix q n rows (rows * layout.digitCount) :=
+  fun row column ↦ fullGadgetMatrix layout row (regularColumnIndex layout column)
+
+noncomputable def regularDecomposeMatrix {q n rows columns : Nat}
+    (layout : RegularLayout q) (target : ExactMatrix q n rows columns) :
+    ExactMatrix q n (rows * layout.digitCount) columns :=
+  fun row column ↦ fullDecomposeMatrix layout (regularCorrectedTarget layout target)
+    (regularColumnIndex layout row) column
+
+theorem regularDecomposeMatrix_bounded {q n rows columns : Nat}
+    (layout : RegularLayout q) (target : ExactMatrix q n rows columns)
+    (hq : 1 < q) (hn : 0 < n) :
+    PreimageWithin (regularDecomposeMatrix layout target) (layout.base / 2) := by
+  obtain ⟨witness, heq, hbound⟩ :=
+    fullDecomposeMatrix_bounded layout (regularCorrectedTarget layout target) hq hn
+  refine ⟨(fun row column ↦ witness (regularColumnIndex layout row) column), ?_, ?_⟩
+  · funext row column
+    exact congrFun (congrFun heq (regularColumnIndex layout row)) column
+  · intro row column coefficient
+    exact hbound (regularColumnIndex layout row) column coefficient
+
+theorem regularGadgetMatrix_reconstruct {q n rows columns : Nat}
+    (layout : RegularLayout q) (target : ExactMatrix q n rows columns)
+    (hq : 1 < q) (hn : 0 < n) (hexact : layout.droppedModuli = 0) :
+    regularGadgetMatrix layout * regularDecomposeMatrix layout target = target := by
+  have hindex (index : Fin (rows * layout.digitCount)) :
+      (regularColumnIndex layout index).val = index.val := by
+    simp [regularColumnIndex, RegularLayout.digitCount, RegularLayout.retainedTowers, hexact,
+      finProdFinEquiv, Nat.mod_add_div]
+  have hcount : layout.digitCount = layout.crtModuli.length * layout.digitsPerTower := by
+    simp [RegularLayout.digitCount, RegularLayout.retainedTowers, hexact]
+  have hsum := fullGadgetMatrix_reconstruct layout target hq hn
+  funext row column
+  rw [Matrix.mul_apply]
+  have hg (index : Fin (rows * layout.digitCount)) :
+      regularColumnIndex layout index = Fin.cast (congrArg (rows * ·) hcount) index :=
+    Fin.ext (hindex index)
+  simp only [regularGadgetMatrix, regularDecomposeMatrix, regularCorrectedTarget, hexact,
+    ↓reduceIte, hg]
+  calc
+    _ = ∑ index : Fin (rows * (layout.crtModuli.length * layout.digitsPerTower)),
+        fullGadgetMatrix layout row index * fullDecomposeMatrix layout target index column :=
+      (finCongr (congrArg (rows * ·) hcount)).sum_comp _
+    _ = target row column := congrFun (congrFun hsum row) column
+
+/-- Approximation is an invocation-local primitive premise. The equation and the bound
+refer to the same concrete target and deterministic digits, never to independent limb errors. -/
+theorem regularGadgetMatrix_approximate {q n rows columns : Nat}
+    (layout : RegularLayout q) (target : ExactMatrix q n rows columns)
+    (hresidual : PreimageWithin
+      (target - regularGadgetMatrix layout * regularDecomposeMatrix layout target)
+      layout.errorBound) :
+    Approx target (regularGadgetMatrix layout * regularDecomposeMatrix layout target)
+      layout.errorBound := by
+  obtain ⟨error, heq, hbound⟩ := hresidual
+  exact ⟨error, (sub_eq_iff_eq_add.mp heq).trans (add_comm _ _), hbound⟩
+
+theorem regularGadgetMatrix_residual_exact {q n rows columns : Nat}
+    (layout : RegularLayout q) (target : ExactMatrix q n rows columns)
+    (hq : 1 < q) (hn : 0 < n) (hexact : layout.droppedModuli = 0) :
+    PreimageWithin (target - regularGadgetMatrix layout * regularDecomposeMatrix layout target)
+      layout.errorBound := by
+  rw [regularGadgetMatrix_reconstruct layout target hq hn hexact, sub_self]
+  refine ⟨0, ?_, ?_⟩
+  · funext row column
+    exact (map_zero (reducePoly q n)).symm
+  · simpa [RegularLayout.errorBound, hexact] using
+      (coeffBound_zero (n := n) (rows := rows) (columns := columns))
+
 def publicGadgetPreimageRuns {q n sourceRows inner targetColumns : Nat} {Token : Type v}
     (publicMatrix : ExactMatrix q n sourceRows inner)
     (trapdoor : TrapdoorValue (ExactMatrix q n sourceRows inner) Token)
@@ -263,36 +376,39 @@ def publicGadgetPreimageRuns {q n sourceRows inner targetColumns : Nat} {Token :
   trapdoor.kind = .publicGadget ∧ trapdoor.publicMatrix = publicMatrix ∧
     trapdoor.mode = .regular ∧
     ∃ layout : RegularLayout q,
+      layout.droppedModuli = 0 ∧
       layout.crtModuli = trapdoor.layout.crtModuli ∧
       layout.baseBits = trapdoor.layout.baseBits ∧
       layout.digitsPerTower = trapdoor.layout.digitsPerTower ∧
       trapdoor.gadgetBase = layout.base ∧
-      trapdoor.digitCount = layout.crtModuli.length * layout.digitsPerTower ∧
-      ∃ hwidth : inner = sourceRows * (layout.crtModuli.length * layout.digitsPerTower),
+      trapdoor.digitCount = layout.digitCount ∧
+      ∃ hwidth : inner = sourceRows * (layout.digitCount),
         publicMatrix = castMatrixColumns hwidth.symm (regularGadgetMatrix layout) ∧
           preimage = castMatrixRows hwidth.symm (regularDecomposeMatrix layout target)
 
 /-- The public gadget constructor fixes its matrix from the same backend layout as decomposition. -/
 noncomputable def regularGadgetTrapdoor {q n rows : Nat} (layout : RegularLayout q)
     (sigma : Rat) : TrapdoorValue
-      (ExactMatrix q n rows (rows * (layout.crtModuli.length * layout.digitsPerTower))) Unit :=
+      (ExactMatrix q n rows (rows * (layout.digitCount))) Unit :=
   { publicMatrix := regularGadgetMatrix layout
     privateToken := ()
     kind := .publicGadget
     sigma := sigma
     gadgetBase := layout.base
-    digitCount := layout.crtModuli.length * layout.digitsPerTower
+    digitCount := layout.digitCount
     mode := .regular
     layout :=
       { crtModuli := layout.crtModuli
         baseBits := layout.baseBits
-        digitsPerTower := layout.digitsPerTower } }
+        digitsPerTower := layout.digitsPerTower
+        droppedModuli := layout.droppedModuli } }
 
 theorem regularGadgetTrapdoor_preimage {q n rows columns : Nat}
-    (layout : RegularLayout q) (sigma : Rat) (target : ExactMatrix q n rows columns) :
+    (layout : RegularLayout q) (sigma : Rat) (target : ExactMatrix q n rows columns)
+    (hexact : layout.droppedModuli = 0) :
     publicGadgetPreimageRuns (regularGadgetMatrix layout)
       (regularGadgetTrapdoor layout sigma) target (regularDecomposeMatrix layout target) := by
-  exact ⟨rfl, rfl, rfl, layout, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨rfl, rfl, rfl, layout, hexact, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 theorem publicGadgetPreimageRuns_equation {q n rows inner columns : Nat} {Token : Type v}
     {publicMatrix : ExactMatrix q n rows inner}
@@ -301,11 +417,11 @@ theorem publicGadgetPreimageRuns_equation {q n rows inner columns : Nat} {Token 
     (hq : 1 < q) (hn : 0 < n)
     (h : publicGadgetPreimageRuns publicMatrix trapdoor target preimage) :
     publicMatrix * preimage = target := by
-  rcases h with ⟨_, _, _, layout, _, _, _, _, _, hwidth, hpublic, hpreimage⟩
+  rcases h with ⟨_, _, _, layout, hexact, _, _, _, _, _, hwidth, hpublic, hpreimage⟩
   subst inner
   simp only [castMatrixColumns, castMatrixRows] at hpublic hpreimage
   rw [hpublic, hpreimage]
-  exact regularGadgetMatrix_reconstruct layout target hq hn
+  exact regularGadgetMatrix_reconstruct layout target hq hn hexact
 
 /-- Fixed backend parameters, selected by the same modulus/ring-dimension key as execution. -/
 structure BackendContext where
@@ -318,8 +434,9 @@ def trapdoorLayoutMatches {q n rows columns : Nat} {Token : Type v}
     trapdoor.layout.crtModuli = layout.crtModuli ∧
     trapdoor.layout.baseBits = layout.baseBits ∧
     trapdoor.layout.digitsPerTower = layout.digitsPerTower ∧
+    trapdoor.layout.droppedModuli = layout.droppedModuli ∧
     trapdoor.gadgetBase = layout.base ∧
-    trapdoor.digitCount = layout.crtModuli.length * layout.digitsPerTower
+    trapdoor.digitCount = layout.digitCount
 
 /- A sampled trapdoor draw exposes all payload fields used by the IR node while coupling its two
    output ports through the same trapdoor value.  The private token remains abstract: this relation
@@ -460,9 +577,11 @@ def gadgetDecomposeRuns {q n rows columns inner : Nat}
     (target : ExactMatrix q n rows columns)
     (decomposition : ExactMatrix q n inner columns) : Prop :=
   ∃ layout, backend.regularLayout q n = some layout ∧
-    base = layout.base ∧ digits = layout.crtModuli.length * layout.digitsPerTower ∧
-    ∃ hwidth : inner = rows * (layout.crtModuli.length * layout.digitsPerTower),
-      decomposition = castMatrixRows hwidth.symm (regularDecomposeMatrix layout target)
+    base = layout.base ∧ digits = layout.digitCount ∧
+    ∃ hwidth : inner = rows * (layout.digitCount),
+      decomposition = castMatrixRows hwidth.symm (regularDecomposeMatrix layout target) ∧
+        PreimageWithin (target - regularGadgetMatrix layout * regularDecomposeMatrix layout target)
+          layout.errorBound
 
 theorem gadgetDecomposeRuns_deterministic {q n rows columns inner : Nat}
     {backend : BackendContext} {base digits : Int}
@@ -471,8 +590,8 @@ theorem gadgetDecomposeRuns_deterministic {q n rows columns inner : Nat}
     (firstRuns : gadgetDecomposeRuns backend base digits target first)
     (secondRuns : gadgetDecomposeRuns backend base digits target second) :
     first = second := by
-  rcases firstRuns with ⟨left, hl, _, _, hw, hf⟩
-  rcases secondRuns with ⟨right, hr, _, _, hw', hs⟩
+  rcases firstRuns with ⟨left, hl, _, _, hw, hf, _⟩
+  rcases secondRuns with ⟨right, hr, _, _, hw', hs, _⟩
   have heq : left = right := Option.some.inj (hl.symm.trans hr)
   subst right
   exact hf.trans hs.symm
@@ -481,9 +600,28 @@ def gadgetMatrixRuns {q n rows columns : Nat}
     (backend : BackendContext) (base digits : Int)
     (output : ExactMatrix q n rows columns) : Prop :=
   ∃ layout, backend.regularLayout q n = some layout ∧
-    base = layout.base ∧ digits = layout.crtModuli.length * layout.digitsPerTower ∧
-    ∃ hwidth : columns = rows * (layout.crtModuli.length * layout.digitsPerTower),
+    base = layout.base ∧ digits = layout.digitCount ∧
+    ∃ hwidth : columns = rows * (layout.digitCount),
       output = castMatrixColumns hwidth.symm (regularGadgetMatrix layout)
+
+theorem gadgetDecomposeRuns_approximate {q n rows columns inner : Nat}
+    {backend : BackendContext} {base digits : Int}
+    {target : ExactMatrix q n rows columns}
+    {decomposition : ExactMatrix q n inner columns}
+    {gadget : ExactMatrix q n rows inner}
+    (hg : gadgetMatrixRuns backend base digits gadget)
+    (hd : gadgetDecomposeRuns backend base digits target decomposition) :
+    ∃ layout, backend.regularLayout q n = some layout ∧
+      Approx target (gadget * decomposition) layout.errorBound := by
+  rcases hg with ⟨layout, hl, _, _, hw, hg⟩
+  rcases hd with ⟨other, ho, _, _, hw', hd, he⟩
+  have hsame : other = layout := Option.some.inj (ho.symm.trans hl)
+  subst other
+  subst inner
+  simp only [castMatrixColumns, castMatrixRows] at hg hd
+  refine ⟨layout, hl, ?_⟩
+  rw [hg, hd]
+  exact regularGadgetMatrix_approximate layout target he
 
 def gadgetTrapdoorRuns {q n rows columns : Nat} {Token : Type v}
     (backend : BackendContext) (sigma : Rat) (base digits cutoff : Int)

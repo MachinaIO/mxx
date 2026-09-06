@@ -277,7 +277,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn runtime_parameters_preserve_every_chunk_relation_against_direct_j_and_hash_oracles() {
-        let parameters = DCRTPolyParams::new(4, 1, 12, 4);
+        let parameters = DCRTPolyParams::new(4, 1, 12, 4, None);
         let layout = Wee25CommitmentCompiler {
             modulus: IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
             ring_dimension: IntExpr::constant(parameters.ring_dimension()),

@@ -39,10 +39,10 @@ fn bench_gpu_small_rhs() {
 
     let ring_dimension = u32::try_from(ring_dimension).expect("ring dimension exceeds u32");
     let base_bits = u32::try_from(base_bits).expect("base bits exceeds u32");
-    let cpu_params = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits);
+    let cpu_params = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
     let (moduli, _, _) = cpu_params.to_crt();
     let params =
-        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits());
+        GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits(), None);
     let digit_count = params.crt_bits().div_ceil(params.base_bits() as usize);
     let lhs_columns = inner_rows.checked_mul(digit_count).expect("lhs column count overflow");
     let sampler = GpuDCRTPolyUniformSampler::new();

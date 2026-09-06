@@ -87,7 +87,7 @@ theorem final_public_digits (params : Stage_encrypt.Params)
       publicInputs publicCircuit) :
     w.gadget * digits = w.target ∧
       ∃ lift : ErrorMatrix n ell 1, digits = reduceMatrix q n ell 1 lift ∧ CoeffBound lift D := by
-  obtain ⟨layout, hlayout, _, _, hwidth, hd⟩ := w.decompositionRun
+  obtain ⟨layout, hlayout, _, _, hwidth, hd, _⟩ := w.decompositionRun
   have hl : layout = DiamondBackend.layout0 := by
     simpa [DiamondBackend.backend] using hlayout.symm
   subst layout
@@ -101,7 +101,7 @@ theorem final_public_digits (params : Stage_encrypt.Params)
     simpa [castMatrixColumns] using hg
   constructor
   · exact (congrArg₂ (fun g d ↦ g * d) hg' hd').trans
-      (regularGadgetMatrix_reconstruct _ _ (by decide) (by decide))
+      (regularGadgetMatrix_reconstruct _ _ (by decide) (by decide) (by decide))
   · have hb := regularDecomposeMatrix_bounded DiamondBackend.layout0 w.target
       (by decide) (by decide)
     obtain ⟨lift, hlift, hbound⟩ := hb

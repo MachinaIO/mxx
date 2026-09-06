@@ -1,10 +1,10 @@
 //! Emit a concrete Lean regular-gadget layout from the DCRT parameters used by setup.
 
 use crate::lean::{export_dcrt_layouts, render_backend_context};
-use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
+use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 
 fn render_fixture() -> String {
-    let parameters = DCRTPolyParams::new(2, 1, 10, 5);
+    let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
     let layout = export_dcrt_layouts([&parameters]).expect("concrete DCRT layout").remove(0);
     let q = layout.modulus.to_str_radix(10);
     let modulus_list = layout.crt_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
@@ -13,12 +13,16 @@ fn render_fixture() -> String {
     let regular_digits = layout.regular_digit_count;
     let n = layout.ring_dimension;
 
-    let multi_parameters = DCRTPolyParams::new(2, 2, 10, 5);
+    let multi_parameters = DCRTPolyParams::new(2, 2, 10, 5, None);
     let multi_layout =
         export_dcrt_layouts([&multi_parameters]).expect("multi-tower layout").remove(0);
     let multi_q = multi_layout.modulus.to_string();
+    let approximate_parameters = DCRTPolyParams::new(2, 3, 10, 5, Some(1));
+    let approximate_layout = export_dcrt_layouts([&approximate_parameters]).unwrap().remove(0);
+    let approximate_q = approximate_layout.modulus.to_string();
+    let approximate_bound = approximate_parameters.gadget_error_bound();
     let context = render_backend_context(
-        &[layout.clone(), multi_layout],
+        &[layout.clone(), multi_layout, approximate_layout],
         "GeneratedBackend",
         "GeneratedBackend",
     )
@@ -41,8 +45,10 @@ def moduli : List Nat := [{modulus_list}]
 def concreteLayout : MxxRuntime.RegularLayout q :=
   {{ crtModuli := moduli
     crtModuli_nonempty := by simp [moduli]
+    droppedModuli := 0
+    dropped_lt := by norm_num [moduli]
     modulus_pos := by
-      intro tower; fin_cases tower <;> norm_num [moduli]
+      intro tower; fin_cases tower; norm_num [moduli]
     pairwise_coprime := by simp [moduli]
     product_eq := by norm_num [q, moduli]
     baseBits := {base_bits}
@@ -53,7 +59,7 @@ def concreteLayout : MxxRuntime.RegularLayout q :=
     digitsPerTower := digitsPerTower
     digits_pos := by norm_num [digitsPerTower]
     capacity := by
-      intro tower; fin_cases tower <;> norm_num [moduli, base, digitsPerTower] }}
+      intro tower; fin_cases tower; norm_num [moduli, base, digitsPerTower] }}
 
 def publicMatrix : Mxx.Primitives.ExactMatrix q ringDimension 1 2 :=
   MxxRuntime.regularGadgetMatrix concreteLayout
@@ -80,14 +86,14 @@ theorem generated_digit_bound
 
 theorem generated_public_preimage_fixture :
     MxxRuntime.publicGadgetPreimageRuns publicMatrix trapdoor target preimage := by
-  exact MxxRuntime.regularGadgetTrapdoor_preimage concreteLayout 0 target
+  exact MxxRuntime.regularGadgetTrapdoor_preimage concreteLayout 0 target (by rfl)
 
 theorem generated_arbitrary_target_reconstruction
     (value : Mxx.Primitives.ExactMatrix q ringDimension 1 1) :
     MxxRuntime.regularGadgetMatrix (n := ringDimension) (rows := 1) concreteLayout *
       MxxRuntime.regularDecomposeMatrix concreteLayout value = value := by
   exact MxxRuntime.regularGadgetMatrix_reconstruct concreteLayout value
-    (by norm_num [q]) (by norm_num [ringDimension])
+    (by norm_num [q]) (by norm_num [ringDimension]) (by rfl)
 
 theorem generated_preimage_bound : Mxx.Primitives.PreimageWithin preimage 16 := by
   exact MxxRuntime.regularDecomposeMatrix_bounded concreteLayout target
@@ -102,9 +108,13 @@ theorem generated_backend_decomposition
     (value : Mxx.Primitives.ExactMatrix q ringDimension 1 1) :
     MxxRuntime.gadgetDecomposeRuns GeneratedBackend.backend base regularDigits value
       (MxxRuntime.regularDecomposeMatrix GeneratedBackend.layout0 value) := by
-  refine ⟨GeneratedBackend.layout0, generated_backend_lookup, ?_, ?_, rfl, rfl⟩
+  refine ⟨GeneratedBackend.layout0, generated_backend_lookup, ?_, ?_, rfl, ?_, ?_⟩
   · norm_num [base, GeneratedBackend.layout0]
-  · norm_num [regularDigits, GeneratedBackend.layout0, GeneratedBackend.moduli0]
+  · norm_num [regularDigits, GeneratedBackend.layout0, GeneratedBackend.moduli0,
+      MxxRuntime.RegularLayout.digitCount, MxxRuntime.RegularLayout.retainedTowers]
+  · simp [MxxRuntime.castMatrixRows]
+  · exact MxxRuntime.regularGadgetMatrix_residual_exact _ _
+      (by norm_num [q]) (by norm_num [ringDimension]) (by rfl)
 
 theorem generated_multitower_lookup :
     GeneratedBackend.backend.regularLayout {multi_q} {n} =
@@ -116,10 +126,34 @@ theorem generated_multitower_reconstruction
     MxxRuntime.regularGadgetMatrix (n := {n}) (rows := 1) GeneratedBackend.layout1 *
       MxxRuntime.regularDecomposeMatrix GeneratedBackend.layout1 value = value := by
   exact MxxRuntime.regularGadgetMatrix_reconstruct GeneratedBackend.layout1 value
-    (by norm_num) (by norm_num)
+    (by norm_num) (by norm_num) (by rfl)
 
 end
 end GeneratedConcreteRegular
+
+namespace GeneratedApproximateRegular
+open Mxx.Primitives MxxRuntime
+
+theorem generated_approximate_shape : GeneratedBackend.layout2.digitCount = 4 := by decide
+theorem generated_approximate_bound : GeneratedBackend.layout2.errorBound = {approximate_bound} :=
+  by decide
+
+theorem generated_approximate_digits
+    (target : ExactMatrix {approximate_q} 2 1 3) :
+    PreimageWithin (regularDecomposeMatrix GeneratedBackend.layout2 target) 16 := by
+  exact regularDecomposeMatrix_bounded _ _ (by decide) (by decide)
+
+/-- The bounded primitive premise is tied to the exact corrected decomposition of this target. -/
+theorem generated_approximate_reconstruction
+    (target : ExactMatrix {approximate_q} 2 1 3)
+    (hresidual : PreimageWithin
+      (target - regularGadgetMatrix GeneratedBackend.layout2 *
+        regularDecomposeMatrix GeneratedBackend.layout2 target) {approximate_bound}) :
+    Approx target (regularGadgetMatrix GeneratedBackend.layout2 *
+      regularDecomposeMatrix GeneratedBackend.layout2 target) {approximate_bound} := by
+  exact regularGadgetMatrix_approximate _ _ hresidual
+
+end GeneratedApproximateRegular
 "#,
         q = q,
         context = context,
@@ -130,6 +164,8 @@ end GeneratedConcreteRegular
         regular_digits = regular_digits,
         modulus_list = modulus_list,
         base_bits = layout.base_bits,
+        approximate_q = approximate_q,
+        approximate_bound = approximate_bound,
     )
 }
 

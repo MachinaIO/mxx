@@ -1608,7 +1608,7 @@ mod tests {
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
         let (moduli, _, _) = params.to_crt();
-        GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+        GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits(), Some(params.dropped_moduli()))
     }
 
     fn prepare_clean_storage(dir_path: &str) {
@@ -1649,7 +1649,7 @@ mod tests {
             nested_rns_scale,
             "AKY24 GPU test constructing native and GPU params"
         );
-        let native_poly_params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, base_bits);
+        let native_poly_params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, base_bits, None);
         let poly_params = gpu_params_from_cpu(&native_poly_params);
         let q: Arc<BigUint> = poly_params.modulus().into();
         let prf_mask_output_bound = q.as_ref() / 4u32;

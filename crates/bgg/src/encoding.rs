@@ -9,6 +9,25 @@ use mxx_ir_core::{
 use rayon::prelude::*;
 use thiserror::Error;
 
+/// Worst-case BGG product error for a scalar plaintext with the given coefficient l1 norm.
+/// The final term is `x_L * s * (A_R - G D(A_R))`, sharing the actual decomposition residual.
+/// For binary plaintexts pass one; no Gaussian independence assumption is made.
+pub fn multiplication_error_bound<P: mxx_primitives::poly::PolyParams>(
+    params: &P,
+    secret_dimension: usize,
+    left_error: &num_bigint::BigUint,
+    right_error: &num_bigint::BigUint,
+    secret_bound: &num_bigint::BigUint,
+    plaintext_l1_bound: &num_bigint::BigUint,
+) -> num_bigint::BigUint {
+    let n = num_bigint::BigUint::from(params.ring_dimension());
+    let columns = num_bigint::BigUint::from(secret_dimension) * params.modulus_digits();
+    let digit_bound = num_bigint::BigUint::from(1u8) << (params.base_bits() - 1);
+    columns * &n * left_error * digit_bound +
+        plaintext_l1_bound *
+            (right_error + n * secret_dimension * secret_bound * params.gadget_error_bound())
+}
+
 #[derive(Clone)]
 pub struct BggEncodingWire {
     pub vector: Mat,
@@ -477,7 +496,7 @@ mod tests {
 
     #[test]
     fn runtime_multiplication_matches_the_bgg_encoding_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
         let ring = Ring::new(
@@ -550,6 +569,74 @@ mod tests {
         );
         assert_eq!(matrix_output(&result, "plaintext"), &(lhs_plaintext * rhs_plaintext));
     }
+
+    #[test]
+    fn runtime_approximate_multiplication_accounts_for_secret_weighted_residual() {
+        use mxx_primitives::sampler::{
+            PolyUniformSampler, bounds::matrix_within_coefficient_bound,
+            uniform::DCRTPolyUniformSampler,
+        };
+        use num_bigint::BigUint;
+        for dropped in [1, 2] {
+            let parameters = DCRTPolyParams::new(4, 3, 17, 4, Some(dropped));
+            let columns = parameters.modulus_digits();
+            let layout = concrete_layout(&parameters, 1);
+            let ring = layout.ring();
+            let compiler = BggEncodingCompiler {
+                public_key: BggPublicKeyCompiler {
+                    ring: ring.clone(),
+                    base: layout.gadget_base.clone(),
+                    digit_count: columns.into(),
+                },
+            };
+            let encoding = |prefix: &str| BggEncodingWire {
+                vector: ring.input(format!("{prefix}-vector"), (1, columns)),
+                pubkey: BggPublicKeyWire {
+                    matrix: ring.input(format!("{prefix}-public"), (1, columns)),
+                    reveal_plaintext: true,
+                },
+                plaintext: Some(ring.identity(1)),
+            };
+            let output = compiler.mul(&encoding("left"), &encoding("right")).unwrap();
+            let graph = DslContext::new("approximate-bgg-product")
+                .output("vector", output.vector)
+                .unwrap()
+                .output("public", output.pubkey.matrix)
+                .unwrap()
+                .build()
+                .unwrap();
+            let sampler = DCRTPolyUniformSampler::new();
+            let left = sampler.sample_uniform(&parameters, 1, columns, DistType::FinRingDist);
+            let right = sampler.sample_uniform(&parameters, 1, columns, DistType::FinRingDist);
+            let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, 1);
+            let secret = DCRTPoly::from_usize_to_constant(&parameters, 2);
+            let left_ciphertext = (&left - &gadget) * secret.clone();
+            let right_ciphertext = (&right - &gadget) * secret.clone();
+            let result = execute_graph(
+                graph,
+                parameters.clone(),
+                BTreeMap::from([
+                    ("left-vector".into(), RuntimeValue::matrix(left_ciphertext)),
+                    ("right-vector".into(), RuntimeValue::matrix(right_ciphertext)),
+                    ("left-public".into(), RuntimeValue::matrix(left)),
+                    ("right-public".into(), RuntimeValue::matrix(right.clone())),
+                ]),
+            );
+            let ideal = (matrix_output(&result, "public") - &gadget) * secret.clone();
+            let actual_error = matrix_output(&result, "vector") - &ideal;
+            let residual = &right - &(&gadget * right.decompose());
+            assert_eq!(actual_error, residual * secret);
+            let bound = multiplication_error_bound(
+                &parameters,
+                1,
+                &BigUint::from(0u8),
+                &BigUint::from(0u8),
+                &BigUint::from(2u8),
+                &BigUint::from(1u8),
+            );
+            assert!(matrix_within_coefficient_bound(&actual_error, &bound));
+        }
+    }
     #[test]
     fn bgg_sampling_builds_a_packed_executable_graph() {
         let layout = BggSamplerLayout {
@@ -611,7 +698,7 @@ mod tests {
     }
     #[test]
     fn runtime_public_keys_and_encodings_match_the_bgg_sampling_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
         let layout = concrete_layout(&parameters, 2);
         let key = [23u8; 32];
         let tag = b"bgg-ir-sampler";

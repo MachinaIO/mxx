@@ -40,10 +40,10 @@ use std::{collections::BTreeMap, sync::Arc};
 #[test]
 #[serial_test::serial]
 fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
-    let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
-        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits());
+        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let lhs = circuit.input(1).as_single_wire();
     let rhs = circuit.input(1).as_single_wire();
@@ -91,10 +91,10 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
 #[test]
 #[serial_test::serial]
 fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
-    let parameters = DCRTPolyParams::new(8, 1, 20, 4);
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
-        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits());
+        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
     let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
     let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
     let families = (0..4)
@@ -141,10 +141,10 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
 #[test]
 #[serial_test::serial]
 fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
-    let parameters = DCRTPolyParams::new(2, 2, 12, 6);
+    let parameters = DCRTPolyParams::new(2, 2, 12, 6, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
-        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits());
+        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let context =
         Arc::new(NestedRnsPolyContext::setup(&mut circuit, &parameters, 6, 2, 16, false, None));
@@ -224,10 +224,10 @@ fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
 fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
     let ring_dimension = 2u32;
     let active_levels = 1usize;
-    let parameters = DCRTPolyParams::new(ring_dimension, active_levels, 10, 5);
+    let parameters = DCRTPolyParams::new(ring_dimension, active_levels, 10, 5, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
-        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits());
+        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
     let mut circuit = PolyCircuit::<DCRTPoly>::new();
     let nested_rns = Arc::new(NestedRnsPolyContext::setup(
         &mut circuit,

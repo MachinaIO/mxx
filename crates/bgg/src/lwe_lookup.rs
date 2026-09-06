@@ -1829,7 +1829,7 @@ mod tests {
 
     #[test]
     fn v1_lookup_artifact_metadata_is_rejected() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let lookup = compiler(
             &parameters,
             LweLookupIdentity {
@@ -1857,7 +1857,7 @@ mod tests {
 
     #[test]
     fn preprocessing_is_one_logical_table_length_parallel_producer() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let lookup = compiler(
             &parameters,
@@ -1947,7 +1947,7 @@ mod tests {
 
     #[test]
     fn shuffled_preprocessing_rows_have_distinct_v2_hashes_and_satisfy_the_lwe_equation() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let table =
             LweLookupTable::new([(2, BigInt::from(5)), (0, BigInt::from(4)), (1, BigInt::from(6))])
@@ -2095,7 +2095,7 @@ mod tests {
 
     #[test]
     fn tall_lookup_shares_one_helper_family_and_matches_every_runtime_row() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let slots = 4;
         let table = LweLookupTable::new([
@@ -2545,7 +2545,7 @@ mod tests {
 
     #[test]
     fn tall_lookup_rejects_hidden_mismatched_and_wrong_width_inputs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let lookup = compiler(
             &parameters,
@@ -2670,7 +2670,7 @@ mod tests {
 
     #[test]
     fn preprocessing_lowering_reuses_public_table_families_across_lookup_invocations() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
@@ -2762,7 +2762,7 @@ mod tests {
 
     #[test]
     fn naive_preprocessing_lowering_reuses_shared_trapdoors_and_namespaces_artifacts() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
@@ -2824,7 +2824,7 @@ mod tests {
 
     #[test]
     fn circuit_public_lookup_lowers_to_logical_artifact_family_access() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
@@ -2990,7 +2990,7 @@ mod tests {
 
     #[test]
     fn single_public_lookup_keeps_the_output_signal_in_secret_public_key_gadget_order() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
@@ -3132,7 +3132,7 @@ mod tests {
 
     #[test]
     fn naive_lookup_lowerings_build_structural_family_graphs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();

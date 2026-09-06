@@ -74,6 +74,7 @@ jobs:
 
       - name: Run clippy memory
         run: cargo +nightly-2026-07-25 clippy --workspace --all-targets
+        env:
           RUSTFLAGS: -A unused
 
       - name: Run test

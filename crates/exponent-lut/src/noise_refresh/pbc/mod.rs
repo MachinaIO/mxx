@@ -761,7 +761,7 @@ mod tests {
 
         let parameters = PbcParameters::custom(5, 1, 2, 3, 1, None);
         let generated = generate_key_layout(&parameters, seed(18), &[0]).unwrap();
-        let poly_parameters = DCRTPolyParams::new(4, 1, 20, 2, None);
+        let poly_parameters = DCRTPolyParams::new(4, 1, 20, 2, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, poly_parameters.modulus().as_ref().clone());
         let ring = mxx_dsl::Ring::new(modulus, 4);
         let trusted = PbcTrustedSelectorBits::from_schedule(&generated, &ring, [9; 32]).unwrap();

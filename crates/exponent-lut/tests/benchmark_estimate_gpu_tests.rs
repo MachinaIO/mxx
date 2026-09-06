@@ -539,12 +539,13 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         accepted.candidate.crt_bits,
         accepted.candidate.base_bits,
         None,
+        None,
     );
     let (moduli, _, _) = parameters.to_crt();
     let device_ids = detected_gpu_device_ids();
     assert!(!device_ids.is_empty(), "Exponent-LUT benchmark estimate requires a CUDA GPU");
     let gpu_parameters =
-        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits());
+        GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
     let warm_up_iterations = optional_usize("MXX_EXPONENT_LUT_BENCH_WARMUPS", 1);
     let measured_iterations = optional_usize("MXX_EXPONENT_LUT_BENCH_ITERATIONS", 2);
     assert!(measured_iterations > 0, "benchmark iterations must be positive");

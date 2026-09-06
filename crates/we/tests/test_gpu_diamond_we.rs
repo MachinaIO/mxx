@@ -49,7 +49,7 @@ fn and_circuit() -> BooleanCircuitData {
     }
 }
 
-/// Exercises the real selection, Rust operational checker, GPU cost model, and GPU runtime path.
+/// Exercises parameter selection with generated Lean certificates, the GPU cost model, and runtime.
 ///
 /// The small defaults are intentionally only a smoke configuration. All search, measurement, and
 /// execution settings are environment-overridable for a larger benchmark invocation.
@@ -103,6 +103,7 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         selected.parameters.base_bits(),
         device_ids.clone(),
         Some(effective_parallel_width as u32),
+        None,
         None,
     );
     let warm_up_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_WARMUPS", 1);

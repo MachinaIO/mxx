@@ -53,6 +53,11 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
     type Trapdoor = DCRTTrapdoor;
 
     fn new(params: &<<Self::M as PolyMatrix>::P as Poly>::Params, sigma: f64) -> Self {
+        assert_eq!(
+            params.dropped_moduli(),
+            0,
+            "exact trapdoor sampling requires dropped_moduli = 0"
+        );
         let base = 1 << params.base_bits();
         let c = preimage_c(base, sigma);
         Self { sigma, base, c }
@@ -102,6 +107,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         max_coefficient_bound: BigUint,
         _randomness_seed: [u8; 32],
     ) -> Result<CpuSmallMatrix<DCRTPolyMatrix>, SmallMatrixError> {
+        if params.dropped_moduli() != 0 {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
         let minimum = default_preimage_cutoff(
             params.ring_dimension(),
             public_matrix.row_size(),
@@ -340,7 +348,7 @@ mod test {
 
     #[test]
     fn test_decompose_dcrt_gadget_base_8() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let target = uniform_sampler.sample_uniform(&params, 1, 1, DistType::FinRingDist);
         let decomposed = DCRTPolyMatrix::from_poly_vec(
@@ -398,9 +406,9 @@ mod test {
     #[serial_test::serial]
     fn test_preimage_generation_exact_non_prefix_basis() {
         let (n, depth, bits, base) = crate::env::modulus_conversion_test_parameters();
-        let original = DCRTPolyParams::new(n, depth, bits, base, None);
+        let original = DCRTPolyParams::new(n, depth, bits, base, None, None);
         let primes = original.to_crt().0;
-        let params = DCRTPolyParams::new(n, 2, bits, base, Some(vec![primes[2], primes[0]]));
+        let params = DCRTPolyParams::new(n, 2, bits, base, Some(vec![primes[2], primes[0]]), None);
         let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, public_matrix) = sampler.trapdoor(&params, 1);
         let target =
@@ -636,7 +644,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_generation_base_8() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let size = 4;
         let target_cols = 6;
         let k = params.modulus_digits();
@@ -685,7 +693,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_generation_base_1024() {
-        let params = DCRTPolyParams::new(4, 2, 17, 10, None);
+        let params = DCRTPolyParams::new(4, 2, 20, 10, None, None);
         let size = 4;
         let target_cols = 6;
         let k = params.modulus_digits();
@@ -734,7 +742,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_sampler_parameters_follow_instance_sigma() {
-        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let base = 1u32 << params.base_bits();
         let default_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let larger_sigma = SIGMA * 1.5;
@@ -754,7 +762,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_rejects_bound_below_default_cutoff_before_sampling() {
-        let params = DCRTPolyParams::new(4, 2, 17, 2, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 2, None, None);
         let size = 2usize;
         let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, public_matrix) = sampler.trapdoor(&params, size);
@@ -787,7 +795,7 @@ mod test {
         bound_sigma: Option<f64>,
     ) {
         let size = 2usize;
-        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, sigma);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -858,7 +866,7 @@ mod test {
     #[serial_test::serial]
     fn test_p_hat_coefficients_below_compute_preimage_sigma() {
         let size = 2usize;
-        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
 

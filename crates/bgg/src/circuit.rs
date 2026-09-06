@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn lookup_and_slot_providers_compose_in_one_circuit() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let preimage_max_coefficient_bound = default_preimage_cutoff(
             parameters.ring_dimension(),

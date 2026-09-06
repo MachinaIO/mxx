@@ -1127,7 +1127,8 @@ extern "C" int gpu_small_matrix_decompose_base(
     int small_mode,
     const uint64_t *max_coefficient_bound,
     size_t bound_word_count,
-    GpuSmallMatrix *out)
+    GpuSmallMatrix *out,
+    size_t dropped_moduli)
 {
     if (!src || !out || !src->ctx || src->ctx != out->ctx || !max_coefficient_bound ||
         bound_word_count == 0 || base_bits == 0 || base_bits >= 63 ||
@@ -1141,9 +1142,10 @@ extern "C" int gpu_small_matrix_decompose_base(
         crt_bits = std::max(crt_bits, bit_width_u64(src->ctx->moduli[limb]));
     const size_t digits = (crt_bits + base_bits - 1) / base_bits;
     const bool small = small_mode != 0;
+    if (dropped_moduli >= limbs) return set_error("invalid dropped_moduli");
     size_t expected_rows = 0;
     if (!small_mul_size(src->rows, digits, &expected_rows) ||
-        (!small && !small_mul_size(expected_rows, limbs, &expected_rows)))
+        (!small && !small_mul_size(expected_rows, limbs - dropped_moduli, &expected_rows)))
         return set_error("compact decomposition shape overflow");
     const uint64_t base = uint64_t{1} << base_bits;
     const uint64_t expected_bound = small ? base - 1 : (base + 1) / 2;
@@ -1179,7 +1181,7 @@ extern "C" int gpu_small_matrix_decompose_base(
     size_t poly_count = 0;
     if (!small_mul_size(src->rows, src->cols, &poly_count))
         return set_error("compact decomposition polynomial count overflow");
-    const size_t slots = digits * (small ? 1 : limbs);
+    const size_t slots = digits * (small ? 1 : limbs - dropped_moduli);
     const dim3 grid((out->n + kSmallThreads - 1) / kSmallThreads,
                     static_cast<uint32_t>(poly_count), static_cast<uint32_t>(slots));
     compact_decompose_kernel<<<grid, kSmallThreads, 0, stream>>>(

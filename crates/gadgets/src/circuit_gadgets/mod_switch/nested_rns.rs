@@ -494,7 +494,7 @@ mod compact_tests {
 
     #[test]
     fn mod_up_and_mod_down_resize_compact_windows() {
-        let params = DCRTPolyParams::new(4, 4, 17, 6, None);
+        let params = DCRTPolyParams::new(4, 4, 17, 6, None, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let ctx = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
@@ -543,7 +543,7 @@ mod tests {
         circuit: &mut PolyCircuit<DCRTPoly>,
         q_level: Option<usize>,
     ) -> (DCRTPolyParams, std::sync::Arc<crate::circuit_gadgets::arith::NestedRnsPolyContext>) {
-        let params = DCRTPolyParams::new(2, 4, 12, BASE_BITS, None);
+        let params = DCRTPolyParams::new(2, 4, 12, BASE_BITS, None, None);
         let ctx = std::sync::Arc::new(crate::circuit_gadgets::arith::NestedRnsPolyContext::setup(
             circuit,
             &params,
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn sparse_reduction_and_subtraction_preserve_literal_zero_lanes() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let params = DCRTPolyParams::new(2, 3, 12, BASE_BITS, None);
+        let params = DCRTPolyParams::new(2, 3, 12, BASE_BITS, None, None);
         let ctx = Arc::new(crate::circuit_gadgets::arith::NestedRnsPolyContext::setup(
             &mut circuit,
             &params,
@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn small_packed_mod_up_preserves_the_source_basis() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let params = DCRTPolyParams::new(2, 4, 12, BASE_BITS, None);
+        let params = DCRTPolyParams::new(2, 4, 12, BASE_BITS, None, None);
         let ctx = Arc::new(crate::circuit_gadgets::arith::NestedRnsPolyContext::setup(
             &mut circuit,
             &params,
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn small_packed_mod_down_one_level_matches_exact_rescale() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let params = DCRTPolyParams::new(2, 3, 12, BASE_BITS, None);
+        let params = DCRTPolyParams::new(2, 3, 12, BASE_BITS, None, None);
         let ctx = Arc::new(crate::circuit_gadgets::arith::NestedRnsPolyContext::setup(
             &mut circuit,
             &params,

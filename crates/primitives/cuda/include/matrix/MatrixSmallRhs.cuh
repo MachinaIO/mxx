@@ -58,7 +58,8 @@ int gpu_small_matrix_decompose_base(
     int small_mode,
     const uint64_t *max_coefficient_bound,
     size_t bound_word_count,
-    GpuSmallMatrix *out);
+    GpuSmallMatrix *out,
+    size_t dropped_moduli);
 int gpu_small_matrix_prepare_preimage_hard_cutoff(GpuSmallMatrix *mat);
 int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
     GpuSmallMatrix *dst,

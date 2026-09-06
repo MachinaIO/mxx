@@ -94,6 +94,7 @@ fn test_gpu_noise_refresh_round_trip() {
         candidate.crt_bits,
         candidate.base_bits,
         None,
+        None,
     );
     let n = params.ring_dimension() as usize;
     println!(
@@ -215,6 +216,7 @@ fn test_gpu_noise_refresh_round_trip() {
             params.ring_dimension(),
             moduli,
             params.base_bits(),
+            None,
         )],
         devices,
     );
@@ -336,6 +338,7 @@ fn gpu_artifact_backed_refresh_replays_across_wave_settings() {
         poly_parameters.ring_dimension(),
         moduli,
         poly_parameters.base_bits(),
+        None,
     );
     let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU required for artifact-backed smoke test");

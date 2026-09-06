@@ -1762,7 +1762,7 @@ mod tests {
 
     #[test]
     fn odd_width_segmented_reduction_matches_scalar_addition() {
-        let parameters = DCRTPolyParams::new(4, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(4, 1, 20, 4, None, None);
         let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 4);
         let mut context = DslContext::new("odd-width-segmented-reduction");
         for width in [1usize, 3, 5] {
@@ -2048,7 +2048,7 @@ mod tests {
 
     #[test]
     fn public_lut_lowering_propagates_native_plaintext() {
-        let parameters = DCRTPolyParams::new(4, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(4, 1, 20, 4, None, None);
         let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 4);
         let compiler = ExponentLutEncodingCompiler::with_layout(
             BggPublicKeyCompiler { ring: ring.clone(), base: 4.into(), digit_count: 2.into() },
@@ -2104,7 +2104,7 @@ mod tests {
         for (ring_dimension, stride_log2) in
             [(8usize, 0u32), (8, 1), (8, 2), (16, 0), (16, 1), (16, 2)]
         {
-            let parameters = DCRTPolyParams::new(ring_dimension as u32, 1, 20, 4, None);
+            let parameters = DCRTPolyParams::new(ring_dimension as u32, 1, 20, 4, None, None);
             let modulus = BigInt::from(parameters.modulus().as_ref().clone());
             let ring = Ring::new(modulus, ring_dimension);
             let width = ring_dimension >> stride_log2;
@@ -2889,17 +2889,23 @@ mod tests {
         impl Fixture {
             fn new(width_log2: u32) -> Self {
                 let ring_dimension = parameter(RING_DIMENSION_ENV, 4);
-                let crt_bits = parameter(CRT_BITS_ENV, 17);
+                let crt_bits = parameter(CRT_BITS_ENV, 18);
                 let base_bits = parameter(BASE_BITS_ENV, 9);
                 assert!(ring_dimension.is_power_of_two() && ring_dimension >= 2);
-                assert!(base_bits > 0 && base_bits < 63 && crt_bits > base_bits);
-                let parameters =
-                    DCRTPolyParams::new(ring_dimension, 1, crt_bits as usize, base_bits, None);
+                assert!(base_bits > 0 && base_bits <= crt_bits / 2);
+                let parameters = DCRTPolyParams::new(
+                    ring_dimension,
+                    1,
+                    crt_bits as usize,
+                    base_bits,
+                    None,
+                    None,
+                );
                 assert_eq!(parameters.modulus_digits(), 2, "GPU fixture requires digit_count=2");
                 let (moduli, _, crt_depth) = parameters.to_crt();
                 assert_eq!(crt_depth, 1);
                 let gpu_parameters =
-                    GpuDCRTPolyParams::new(ring_dimension, moduli, parameters.base_bits());
+                    GpuDCRTPolyParams::new(ring_dimension, moduli, parameters.base_bits(), None);
                 let modulus = BigInt::from(parameters.modulus().as_ref().clone());
                 let ring = Ring::new(modulus.clone(), ring_dimension as usize);
                 let layout = mxx_bgg::BggSamplerLayout {

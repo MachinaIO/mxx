@@ -44,7 +44,12 @@ type TrapdoorMatrix = DCRTPolyMatrix;
 #[cfg(feature = "gpu")]
 fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
     let (moduli, _, _) = params.to_crt();
-    GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+    GpuDCRTPolyParams::new(
+        params.ring_dimension(),
+        moduli,
+        params.base_bits(),
+        Some(params.dropped_moduli()),
+    )
 }
 
 #[cfg(feature = "gpu")]
@@ -93,6 +98,11 @@ impl Eq for DCRTTrapdoor {}
 
 impl DCRTTrapdoor {
     pub fn new(params: &DCRTPolyParams, size: usize, sigma: f64) -> Self {
+        assert_eq!(
+            params.dropped_moduli(),
+            0,
+            "exact trapdoor sampling requires dropped_moduli = 0"
+        );
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let log_base_q = params.modulus_digits();
         let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };

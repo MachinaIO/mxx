@@ -42,9 +42,38 @@ separate projection used by the final decoder.
 
 ## Correctness and parameters
 
-The Rust operational checker is the active acceptance path for the constructed closed protocol
-and registered-rule analysis. There is currently no end-to-end correctness theorem; the checker
-uses explicit hard bounds and the executable parameter checker instead.
+The active acceptance path is a generated Lean correctness theorem for the actual frozen protocol
+graphs. It links encryption, decryption, all requirement graphs, and the ideal message through the
+same external inputs and exported artifacts. For bounded successful executions with valid,
+accepting inputs, it proves the actual residual is below the exact decoder threshold and the
+operational decoder returns the ideal message, for both Boolean messages.
+
+`crates/we/src/lean.rs::export_claim` supplies WE decoder semantics and runtime backend bindings.
+`crates/ir-core/src/lean/protocol.rs::export_claim` exports the declaration's graphs and converts
+their protocol connections into a linked claim.
+`crates/ir-core/src/lean/claim.rs::assemble_claim` owns application-independent graph linking,
+input predicates, and final Boolean threshold claim rendering. The WE adapter supplies the
+decoder's Lean helper names; endpoint identities come from the core protocol declaration.
+The generic renderer contains no WE
+protocol or noise-inference rules. Application-specific bounds, proof sources, and certificate
+verification remain under `crates/we/src/lean` and `crates/we/lean`.
+
+Handwritten Lean sources live together in `crates/we/lean`. The `Diamond*.lean` proofs import
+candidate-generated IR modules; the exporter copies them unchanged into the candidate directory
+and checks them there. For local editing, select that directory with
+`python3 scripts/select_we_lean_candidate.py <candidate-directory>`, then run `lake build` in
+`crates/we/lean`. Lake builds the current handwritten sources through `Certificate` against the
+selected generated snapshot. See `crates/we/lean/README.md` for bootstrap and VS Code setup.
+
+The fixed audit entry point is `crates/we/lean/Certificate.lean`, containing
+`DiamondCertificate.correctness : GeneratedClaim.CorrectnessClaim`. The candidate's generated
+`Claim.lean` supplies the IR-derived statement and execution assumptions; generated
+`NumericCertificate.lean` proves the numeric gate. The final theorem has no numeric premise.
+
+The parameter search called by `test_gpu_diamond_we.rs` already generates and checks these
+artifacts; no example executable or separate emission command is needed. Extractor fixtures are
+ordinary unit tests. `mxx-ir-core::protocol` supplies declarations and structural validation;
+the separate correctness crate and former generic symbolic noise simulator have been removed.
 
 `DiamondWeProtocolFamily::protocol_decl` returns a validated `WitnessEncryptionProtocolDecl`. The
 declaration is built directly from symbolic circuit and cryptographic parameters; it does not own a
@@ -63,12 +92,14 @@ declared cutoff. CPU preimage sampling rejects a whole candidate, preserving the
 
 `DiamondParameterSearch` fixes the circuit shape and searches ring dimension and modulus depth. It
 uses the ordinary untruncated Gaussian only for lattice-security estimation. Correctness uses a
-worst-case recurrence with full ring and inner-dimension factors, then invokes the Rust
-checker before accepting a candidate. The checker receives all 15 symbolic protocol parameters,
-including the four circuit-family dimensions and both sampler sigmas. Rational sigmas are passed as
-exact numerator/denominator pairs. Candidate acceptance therefore evaluates the generated
-parameter-validity predicate and the Diamond parameter relations, rather than only the derived
-hard-bound arithmetic.
+worst-case recurrence with full ring and inner-dimension factors, then invokes Lean on freshly
+generated source modules before accepting a candidate. A compact capped binary computation is
+checked in the Lean kernel and discharges the strict numeric gate of the full theorem. All protocol
+parameters, including circuit dimensions and exact sampler sigmas, come from the same compiler and
+backend setup. The selected result retains the verified artifact directory. Conservative numeric
+rejection is separate from export, unsupported-semantics, compiler, and timeout errors; there is no
+fallback to the older operational checker. Search is a candidate-finding heuristic, not a claim of
+CRT-depth minimality or exhaustive failure.
 
 Certified GPU Diamond execution is not exposed. The GPU Gaussian and preimage paths must enforce
 the same bounded support, including whole-candidate preimage rejection, before a GPU integration

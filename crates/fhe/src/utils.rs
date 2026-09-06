@@ -117,7 +117,7 @@ pub(crate) fn execute_graph(
         .extend(moduli.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
     let validated = graph.validate(&ParamEnv::default()).expect("valid FHE DSL graph");
     // SIMD import nodes also use R_t. Discover that extra plaintext ring from
-    // the graph instead of requiring every coefficient-only fixture to add it.
+    // the graph while keeping Ring-GSW fixtures independent of a plaintext modulus.
     for scope in graph.graph.scopes().values() {
         for node in scope.nodes() {
             if let mxx_ir_core::node::NodeKind::PolynomialFromValues { matrix_type, .. } =

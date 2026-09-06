@@ -71,7 +71,8 @@ slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 ### Application crates
 
 `mxx-fhe` builds Ring Regev/Ring-GSW and leveled BGV graphs, including CRT modulus
-switching, relinearization, SIMD encoding, and rotations. Cryptographic arithmetic
+switching, relinearization, and rotations. BGV encrypt/decrypt exchange SIMD slots
+by default, with internal encoding and zero-padding of short inputs. Cryptographic arithmetic
 and sampling execute through the DSL runtime; runtime is a test-only dependency.
 It tracks coefficient noise bounds per ciphertext and reuses primitive ring parameters and DSL
 matrix handles. Bootstrapping is out of scope. CPU and GPU backends share the same

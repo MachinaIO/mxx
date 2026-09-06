@@ -192,7 +192,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let context = DslContext::new("gpu-bgv-encrypt");
     let slots = context.int_family_input("slots", n);
     let (secret, pk) = bgv.keygen().unwrap();
-    let ct = bgv.encrypt(&pk, &bgv.encode_slots(&slots).unwrap()).unwrap();
+    let ct = bgv.encrypt(&pk, &slots).unwrap();
     let relin = bgv.relinearization_key(&secret, top).unwrap();
     let rotation = bgv.rotation_key(&secret, top - 1, 1).unwrap();
     let backwards = bgv.rotation_key(&secret, top - 1, -1).unwrap();
@@ -319,12 +319,8 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
             // Carry the evaluator's bound into the specialized decryption graph.
             noise_bound: ct.noise_bound.clone(),
         };
-        decryption = decryption
-            .private_output(
-                *name,
-                bgv.decode_slots(&bgv.decrypt(&secret, &imported).unwrap()).unwrap(),
-            )
-            .unwrap();
+        decryption =
+            decryption.private_output(*name, bgv.decrypt(&secret, &imported).unwrap()).unwrap();
     }
     let decryption = decryption
         .build()
@@ -352,5 +348,64 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
             .collect::<Vec<_>>();
         assert_eq!(values(&mut result, name, &backend, &mut store), expected, "{name}");
     }
+    result.cleanup_staged(&mut store).unwrap();
+}
+
+#[test]
+fn test_gpu_fhe_bgv_short_slot_inputs() {
+    let common = common();
+    let n = common.ring.ring_dimension() as usize;
+    let top = common.ring.to_crt().2 - 1;
+    let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
+    let bgv = BgvParams::new(common.clone(), t).unwrap();
+    let context = DslContext::new("gpu-bgv-short-slots");
+    let single = context.int_family_input("single", 1);
+    let partial = context.int_family_input("partial", n - 1);
+    let (secret, key) = bgv.keygen().unwrap();
+    // A scalar occupies slot zero only; neither encryption nor decryption
+    // broadcasts it. The unused slots must survive as zeros on the GPU too.
+    let single = bgv.encrypt(&key, &single).unwrap();
+    let partial = bgv.encrypt(&key, &partial).unwrap();
+    let rotation = bgv.rotation_key(&secret, top, 1).unwrap();
+    let rotated = bgv.rotate_rows(Some(&rotation), &single, 1).unwrap();
+    let graph = context
+        .private_output("single", bgv.decrypt(&secret, &single).unwrap())
+        .unwrap()
+        .private_output("partial", bgv.decrypt(&secret, &partial).unwrap())
+        .unwrap()
+        .private_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let mut backend = backend(&common, Some(t));
+    configure_widths(&mut backend, &graph);
+    let mut store = MemoryArtifactStore::default();
+    let partial_values = (0..n - 1).map(|i| i as i64 - t as i64 - 1).collect::<Vec<_>>();
+    let mut result = execute(
+        &graph,
+        &mut backend,
+        BTreeMap::from([
+            ("single".into(), input(&[-1])),
+            ("partial".into(), input(&partial_values)),
+        ]),
+        &mut store,
+        SamplingMode::Fresh,
+    )
+    .unwrap();
+    let mut expected = vec![BigInt::from(0); n];
+    expected[0] = BigInt::from(t - 1);
+    assert_eq!(values(&mut result, "single", &backend, &mut store), expected);
+    // Positive rotation moves slot zero to the last position of its row,
+    // which was outside the single-value input. Decryption must still return it.
+    expected[..n / 2].rotate_left(1);
+    assert_eq!(values(&mut result, "rotated", &backend, &mut store), expected);
+    let mut expected = partial_values
+        .into_iter()
+        .map(|v| BigInt::from(v).mod_floor(&BigInt::from(t)))
+        .collect::<Vec<_>>();
+    expected.push(BigInt::from(0));
+    assert_eq!(values(&mut result, "partial", &backend, &mut store), expected);
     result.cleanup_staged(&mut store).unwrap();
 }

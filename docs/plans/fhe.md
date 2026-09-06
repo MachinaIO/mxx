@@ -110,13 +110,13 @@ for homogeneous repeated values; `Vec<Mat>` can carry different per-entry moduli
 
 | Object | Representation and invariant |
 | --- | --- |
-| Coefficient plaintext | `Family<Int>` for BGV residues modulo t; scalar `Mat` in R_q for Ring Regev |
-| SIMD slots | `Family<Int>`, exactly N values in the fixed two-row order |
+| Ring Regev plaintext | Scalar `Mat` in R_q with declared centered coefficient bound |
+| BGV plaintext | `Family<Int>`, 1 to N slots on input (zero-padded), N slots on output, in fixed two-row order |
 | Ring-GSW multiplier plaintext | Scalar `Mat` in R_q, with declared centered coefficient bound |
 | Secret key | `Mat`, shape (1,1), sampled at the top modulus |
-| Ring Regev ciphertext | `(Mat,Mat)`, named/destructured as (a,b), each (1,1) |
+| Ring Regev ciphertext | `RingCiphertext` with a/b parts each (1,1), noise and plaintext bounds |
 | BGV public key | `Mat`, shape (2,1), rows (A,B) |
-| Ring-GSW ciphertext | `(Mat,Mat)`, named/destructured as (a,b), each (1,2L) |
+| Ring-GSW ciphertext | The same `RingCiphertext` record with a/b parts each (1,2L) |
 | Relinearization or rotation key | `Mat`, shape (2,L), rows (A_j,B_j) |
 | Decomposed polynomial/ciphertext | Existing `Preimage` from `Mat::decompose` |
 | Keygen output | Existing tuple `(secret, encryption_key)` |
@@ -125,13 +125,12 @@ for homogeneous repeated values; `Vec<Mat>` can carry different per-entry moduli
 | Rotation request | Existing method arguments `level: usize, steps: i32` |
 | Artifact identity/confidentiality | Existing `ProductionId`, artifact handles, `ArtifactConfidentiality` |
 
-Coefficient and slot arrays intentionally share storage; `encode_slots` and
-`decode_slots` make their interpretation explicit. N and, for BGV, t come from the
-parameter object, not duplicated plaintext/layout wrappers. Validate length
-and canonical value contracts at the existing runtime input boundary. Use
-separate parameter names for coefficient and slot arguments. This gives up
-nominal Rust type checking of slot-versus-coefficient misuse; it does not pretend
-that `Family<Int>` encodes those semantics.
+BGV encrypt/decrypt always exchange slots. Private encode/decode helpers handle
+coefficient conversion inside the graph; callers do not choose an encoding mode.
+N and t come from the parameter object. Inputs have a concrete length from 1 to N
+and are reduced modulo t, with unused slots set to zero. Decryption returns N
+slots, including positions populated by rotation. A single integer is the
+one-slot case; no input-length metadata or separate scalar type is added.
 
 The parameter and ciphertext records reuse existing DSL values and schemas:
 
@@ -201,8 +200,8 @@ Derive the lower rings through `DCRTPolyParams::select_modulus`, rejecting
 `dropped_moduli != 0`. Compute scale, gadget widths, SIMD root/order, and public
 modswitch inverses from these parameters. Precompute repeated constants once
 per built subgraph using ordinary local values/arrays; do not expose a new public
-cache type. `BgvParams::encode_slots` validates the batching condition when called;
-coefficient-only use does not require a separate SIMD-enabled parameter variant.
+cache type. `BgvParams::new` validates the batching condition because SIMD is
+the default and only public plaintext interpretation.
 `RingGswParams::new(common, scale, plaintext_bound)` and
 `BgvParams::new(common, plaintext_modulus)` validate their own fields and return
 `Result<Self,FheError>`. These parameter objects themselves implement the graph
@@ -297,7 +296,7 @@ They share a private helper taking the key-switch target polynomial.
 No operation-specific traits are needed. Keep scheme-specific graph builders
 as inherent methods: RingGswParams::encrypt_gsw/external_product and
 BgvParams::mul_unrelinearized/relinearize/mod_switch_to,
-match_correction_factor, encode_slots/decode_slots, rotate_rows/swap_rows.
+match_correction_factor and rotate_rows/swap_rows. Slot encoding/decoding is private.
 Methods accept the required key Mat directly rather than a key registry.
 All return graph handles and compose existing Subgraph definitions. No new
 keyset container or execution wrapper is introduced. Use existing DSL/runtime
@@ -452,7 +451,10 @@ centered(b-s*a mod Q_l) = centered(f*m mod t)+t*e
 
 Public key: sample `A,e_pk`, set `B=s*A+t*e_pk`. Encryption samples `u,e_a,e_b`
 in DSL and computes `a=A*u+t*e_a`, `b=B*u+t*e_b+m`, with f=1. Decryption
-extracts the centered phase and returns `f^(-1)*phase mod t` as a `Family<Int>`.
+extracts the centered phase and computes coefficients `f^(-1)*phase mod t`,
+then evaluates the polynomial modulo t and returns logical SIMD slots.
+Here m is the encoded plaintext polynomial obtained from input slot evaluations
+modulo t; its coefficients are centered before lifting into R_Q.
 Only the inverse of public schema metadata f is precomputed on the host.
 The t-scaled BGV error convention differs from Ring Regev's unscaled error.
 
@@ -552,7 +554,7 @@ This is the usual two-row batching geometry; the root condition and row operatio
 are documented in the [SEAL manual, Section 5.6](https://www.microsoft.com/en-us/research/wp-content/uploads/2017/12/sealmanual.pdf).
 No global N-slot cyclic rotation is implied by `rotate_rows`.
 
-`encode_slots(&Family<Int>) -> Result<Family<Int>,FheError>` permutes slots into
+The private `encode_slots` helper zero-pads short inputs, permutes slots into
 native evaluation order and calls `Ring::from_evaluations(...).coefficients()`.
 `decode_slots` calls `Ring::from_coefficients(...).evaluations()` and restores
 logical slot order. The generic `PolynomialFromValues` and `PolynomialValues`
@@ -575,10 +577,11 @@ at t, with an explicit root/order adapter, in addition to slotwise runtime tests
 The [SEAL encoder](https://github.com/microsoft/SEAL/blob/main/native/src/seal/batchencoder.cpp)
 provides a primary implementation reference for the transform convention.
 
-Require exactly N runtime slot values; convenience padding, when offered, emits
-DSL zeros. Arithmetic modulo t acts independently on slots after encode/encrypt
-and decrypt/decode. Use explicitly named coefficient/slot method arguments and round-trip tests
-to verify the two interpretations of the shared `Family<Int>` storage.
+Accept 1 to N runtime slot values and fill unused positions with DSL zeros.
+Arithmetic modulo t acts independently on slots through the ordinary encrypt,
+add/mul, and decrypt API. Private coefficient helpers never change the public
+plaintext interpretation. Tests cover a single negative value, partial inputs,
+full inputs, and rotations into initially unused slots.
 
 ```rust
 fn rotate_rows(&self, key: Option<&Mat>,
@@ -622,9 +625,9 @@ For each test:
 
 1. Construct explicit small ring/chain parameters, registering every Q_l and
    every dropped-prime single-limb ring with
-   `cpu_backend`. Use public NTT constants for t when SIMD is enabled. Read test
+   `cpu_backend`. Use public NTT constants for t for BGV. Read test
    sizes from environment variables and draw fresh runtime randomness.
-2. Build production DSL keygen, encode, encrypt, evaluate, decrypt, and decode
+2. Build production DSL keygen, encrypt (including encoding), evaluate, and decrypt (including decoding)
    calls, then declare the final plaintext/slot result as a private output.
    Runtime message inputs use `DslContext::int_family_input`; do not bake input
    messages into graph constants or host-produced ciphertexts.
@@ -765,3 +768,11 @@ Validation after ciphertext-bound tracking and module consolidation:
 - CPU and GPU workspace library test builds: warning-free.
 - GPU FHE unit tests: both tests passed in each of five identical-binary runs
   outside the sandbox (zero failures).
+
+Validation after making SIMD slots the default BGV plaintext interface:
+
+- CPU FHE unit tests: 13 passed, including single/partial slot inputs and
+  unchanged coefficientwise noise and native CRT modulus-switch checks.
+- CPU and GPU workspace library test builds: warning-free.
+- All three GPU FHE tests passed in each of five identical-binary runs outside
+  the sandbox, including zero padding and rotation into an initially unused slot.

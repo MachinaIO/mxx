@@ -41,7 +41,7 @@ Bootstrapping is not implemented.
 | `FheScheme` | Shared `keygen`, `encrypt`, `decrypt`, `add`, and `mul` graph builders, with scheme-specific plaintext, multiplication operand, and evaluation-key types. |
 | `RingGswParams` | `new(common, scale, plaintext_bound)`; scalar polynomial `Mat` plaintexts in the ciphertext ring R_q. Regev ciphertexts have separate a/b parts with phase `b - s*a = scale*m + e`. |
 | `RingCiphertext` | Shared storage for Regev and GSW aliases, with a/b parts and public noise/plaintext bounds. GSW encrypts an unscaled gadget diagonal; its external product multiplies a Regev plaintext by the GSW polynomial. |
-| `BgvParams` | `new(common, plaintext_modulus)`; coefficient plaintexts are `Family<Int>` modulo t. Supports addition, multiplication with relinearization, CRT modulus switching, SIMD, and rotations. |
+| `BgvParams` | `new(common, plaintext_modulus)`; messages are `Family<Int>` with 1 to N SIMD slots modulo t. Supports addition, multiplication with relinearization, CRT modulus switching, SIMD, and rotations. |
 | `BgvCiphertext` | Components are descending coefficients in `-s`: `(a,b)` for ordinary ciphertexts or three rows before relinearization. `correction_factor` tracks the plaintext multiplier modulo t, while `noise_bound` tracks coefficient noise. |
 
 Ring Regev's plaintext ring and ciphertext ring have the same modulus q.
@@ -51,9 +51,20 @@ residues modulo q. BGV instead decrypts modulo its separate plaintext modulus t.
 For BGV multiplication, `mul` takes a relinearization key; alternatively,
 `mul_unrelinearized` and `relinearize` expose the two steps explicitly.
 
-For SIMD, choose a prime t with `t = 1 mod 2N`. `encode_slots` and `decode_slots`
-map N slots to and from polynomial coefficients using native polynomial
-coefficient/evaluation operations. Slots occupy two rows of N/2 entries.
+BGV uses SIMD by default and requires a prime t with `t = 1 mod 2N`.
+Call `encrypt(&key, &slots)` directly; `decrypt(&secret, &ciphertext)` returns
+all N slots. Inputs with 1 to N integers fill successive slots, and unused slots
+are zero. A single integer occupies slot zero without broadcasting. Returning
+all slots preserves values moved into initially unused positions by rotations,
+without storing an input length in the ciphertext.
+
+Slots are interpreted as evaluation values in the plaintext ring R_t. Internal
+encoding uses the native inverse NTT modulo t, centers and lifts the resulting
+coefficients into R_Q, and uses the native evaluation representation for
+ciphertext arithmetic. The t-to-Q coefficient lift is necessary; copying
+R_t evaluation values directly into R_Q would change the message polynomial.
+Encoding and decoding are internal details, so callers need no separate steps.
+Slots occupy two rows of N/2 entries.
 `rotate_rows` rotates both rows (positive offsets move entries left), and
 `swap_rows` exchanges them. Nontrivial rotations and row swaps need their
 respective evaluation keys at the ciphertext's level. CRT modulus switching
@@ -66,7 +77,7 @@ To execute a graph:
    as private outputs.
 2. Build and validate the graph with a `ParamEnv`. Register the exact ordered
    ciphertext CRT bases with the runtime backend, including single-prime rings
-   used by modulus switching and `batching_parameters()` when using SIMD.
+   used by modulus switching and `batching_parameters()` for BGV.
 3. Call runtime `execute` with inputs, a backend, a `MemoryArtifactStore`, and a
    sampling mode. Materialize lazy family outputs before inspecting their values.
 
@@ -79,7 +90,7 @@ connecting separate protocol stages. Artifacts remain in memory or are passed as
 direct runtime inputs.
 
 Start with the runtime unit tests in `crates/fhe/src/ring_gsw.rs` and
-`crates/fhe/src/bgv.rs` for coefficient arithmetic, measured noise, SIMD, and
+`crates/fhe/src/bgv.rs` for slot arithmetic, measured noise, and
 staged evaluation. `crates/fhe/src/tests_gpu.rs` executes the production graphs
 on GPU, including a public evaluator that receives no secret key. The design
 and formulas are documented in `docs/plans/fhe.md`.

@@ -19,6 +19,7 @@ use mxx_primitives::{
     utils::{mod_inverse, mod_inverse_biguints},
 };
 use num_bigint::{BigInt, BigUint};
+use num_traits::ToPrimitive;
 
 #[derive(Clone)]
 pub struct BgvParams {
@@ -111,7 +112,11 @@ impl BgvParams {
                 "plaintext modulus must be at least two and coprime to every CRT prime",
             ));
         }
-        Ok(Self { common, plaintext_modulus })
+        let params = Self { common, plaintext_modulus };
+        // Every BGV message uses SIMD slots, so the plaintext ring must split
+        // into N linear factors before any encryption graph can be built.
+        params.batching_root()?;
+        Ok(params)
     }
 
     // For v = r + t*e with centered r, |r| <= floor(t/2) and |e| <= noise.
@@ -341,15 +346,20 @@ impl FheScheme for BgvParams {
                 self.common.gaussian(&self.common.ring, 1, 1);
         Ok((s, concat_rows![a, b]))
     }
-    fn encrypt(&self, key: &Mat, coefficients: &Family<Int>) -> Result<BgvCiphertext, FheError> {
+    /// Encrypts 1..=N row-major SIMD slots modulo t; unused slots are zero.
+    /// A single integer occupies slot zero rather than being broadcast.
+    fn encrypt(&self, key: &Mat, slots: &Family<Int>) -> Result<BgvCiphertext, FheError> {
         utils::check_matrix(&self.common.ring, key, 2, 1)?;
-        utils::check_family(coefficients, self.common.ring.ring_dimension() as usize)?;
+        let coefficients = self.encode_slots(slots)?;
         let centered = parallel(self.common.ring.ring_dimension(), |i| {
             utils::centered(
                 coefficients.at(i).rem(Int::constant(self.plaintext_modulus)),
                 &BigUint::from(self.plaintext_modulus),
             )
         })?;
+        // Slot values are evaluations in R_t. Lift the encoded coefficients,
+        // not their evaluations, to R_Q: the two rings have different NTT roots.
+        // The primitive then stores the lifted polynomial in evaluation format.
         let message = utils::pack(&self.common.ring, &centered)?;
         let u = self.common.sample_secret();
         let t = utils::scalar(&self.common.ring, self.plaintext_modulus);
@@ -364,6 +374,7 @@ impl FheScheme for BgvParams {
                 &self.common.error_cutoff,
         })
     }
+    /// Returns all N canonical slot residues in [0, t), including unused slots.
     fn decrypt(&self, secret: &Mat, ct: &BgvCiphertext) -> Result<Family<Int>, FheError> {
         let rows = self.ciphertext_rows(ct)?;
         utils::check_matrix(&self.common.ring, secret, 1, 1)?;
@@ -380,11 +391,12 @@ impl FheScheme for BgvParams {
         // to recover m even after modulus switching has made f different from 1.
         let inverse = mod_inverse(ct.correction_factor, self.plaintext_modulus)
             .ok_or(FheError::InvalidCorrectionFactor)?;
-        Ok(parallel(params.ring_dimension(), |i| {
+        let plaintext = parallel(params.ring_dimension(), |i| {
             Ok(utils::centered(coefficients.at(i), params.modulus().as_ref())?
                 .mul(Int::constant(inverse))
                 .rem(Int::constant(self.plaintext_modulus)))
-        })?)
+        })?;
+        self.decode_slots(&plaintext)
     }
     fn add(&self, lhs: &BgvCiphertext, rhs: &BgvCiphertext) -> Result<BgvCiphertext, FheError> {
         let rows = self.ciphertext_rows(lhs)?;
@@ -511,9 +523,20 @@ impl BgvParams {
     }
 
     /// Encodes row-major slots through the primitive inverse NTT at modulus t.
-    pub fn encode_slots(&self, slots: &Family<Int>) -> Result<Family<Int>, FheError> {
+    fn encode_slots(&self, slots: &Family<Int>) -> Result<Family<Int>, FheError> {
         let n = self.common.ring.ring_dimension() as usize;
-        check_family(slots, n)?;
+        let count = slots
+            .count()
+            .evaluate(&Default::default())
+            .ok()
+            .and_then(|count| count.to_usize())
+            .filter(|&count| count > 0 && count <= n)
+            .ok_or(FheError::ShapeMismatch)?;
+        // Padding at graph construction needs no runtime length or ciphertext
+        // metadata. Decryption always returns N slots, also after rotations.
+        let slots = Family::pack(
+            (0..n).map(|i| if i < count { slots.at(i) } else { Int::constant(0) }).collect(),
+        )?;
         let mut inverse = vec![0; n];
         for (slot, native) in self.batching_indices()?.into_iter().enumerate() {
             inverse[native] = slot;
@@ -524,7 +547,7 @@ impl BgvParams {
     }
 
     /// Decodes coefficients through the primitive forward NTT at modulus t.
-    pub fn decode_slots(&self, coefficients: &Family<Int>) -> Result<Family<Int>, FheError> {
+    fn decode_slots(&self, coefficients: &Family<Int>) -> Result<Family<Int>, FheError> {
         let n = self.common.ring.ring_dimension() as usize;
         check_family(coefficients, n)?;
         let indices =
@@ -674,9 +697,9 @@ mod tests {
                 .private_output(format!("decoded-{name}"), bgv.decrypt(&secret, ct).unwrap())
                 .unwrap();
         }
-        // Squaring 3 gives 9, outside the centered interval for t = 17. This
-        // exercises plaintext carries in addition to sampled Gaussian errors,
-        // including the representative changes accounted for by the bound.
+        // A single occupied slot encodes to a nonconstant polynomial. Its
+        // product exercises coefficient carries as well as sampled Gaussian
+        // errors; noise is measured from phase coefficients, not slot values.
         let mut message = vec![0; n];
         message[0] = 3;
         let result = execute_graph(
@@ -698,7 +721,9 @@ mod tests {
                 );
             }
             let mut expected = vec![BigInt::from(0); n];
-            expected[0] = BigInt::from(if name == "fresh" {
+            // Positive rotation moves slot zero to the last column of its row.
+            let slot = if name == "rotated" { n / 2 - 1 } else { 0 };
+            expected[slot] = BigInt::from(if name == "fresh" {
                 3
             } else if name == "sum" || name == "rotated" {
                 1
@@ -723,7 +748,7 @@ mod tests {
         assert!(top >= 2, "BGV test requires at least three CRT limbs");
         let bgv = BgvParams::new(common.clone(), 17).unwrap();
         let context = DslContext::new("fhe-bgv-noisy-arithmetic");
-        let input = context.int_family_input("coefficients", n);
+        let input = context.int_family_input("slots", n);
         let (secret, pk) = bgv.keygen().unwrap();
         let ct = bgv.encrypt(&pk, &input).unwrap();
         let square = bgv.mul_unrelinearized(&ct, &ct).unwrap();
@@ -753,14 +778,14 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        // Constant polynomial multiplication has a trusted scalar expectation;
-        // SIMD tests separately exercise every nonconstant coefficient and slot.
+        // One occupied slot has a trusted scalar multiplication expectation;
+        // the other slots must stay zero through every arithmetic operation.
         let mut message = vec![0i64; n];
         message[0] = 3;
         let result = execute_graph(
             graph,
             &common,
-            BTreeMap::from([("coefficients".to_owned(), int_input(&message))]),
+            BTreeMap::from([("slots".to_owned(), int_input(&message))]),
         );
         assert_eq!(
             integers(&result, "roundtrip"),
@@ -834,13 +859,14 @@ mod tests {
                 .iter()
                 .map(|&p| common.ring.select_modulus(&BigUint::from(p)).unwrap()),
         );
+        parameters.push(bgv.batching_parameters().unwrap());
         let mut backend = cpu_backend(parameters);
         // Distinct graphs exchange manifests and in-memory artifacts, exercising
         // the protocol boundary without serializing secrets or ciphertexts to files.
         let mut store = MemoryArtifactStore::default();
         let env = ParamEnv::default();
         let context = DslContext::new("fhe-bgv-staged-encryption");
-        let input = context.int_family_input("coefficients", n);
+        let input = context.int_family_input("slots", n);
         let (secret, pk) = bgv.keygen().unwrap();
         let ct = bgv.encrypt(&pk, &input).unwrap();
         let key = bgv.relinearization_key(&secret, top).unwrap();
@@ -865,7 +891,7 @@ mod tests {
         let encrypted = execute(
             &encryption,
             &mut backend,
-            BTreeMap::from([("coefficients".into(), int_input(&message))]),
+            BTreeMap::from([("slots".into(), int_input(&message))]),
             &mut store,
             SamplingMode::Fresh,
         )
@@ -1018,7 +1044,7 @@ mod tests {
         }
         let n = common.ring.ring_dimension() as usize;
         let context = DslContext::new("fhe-bgv-wide-rns-roundtrip");
-        let input = context.int_family_input("coefficients", n);
+        let input = context.int_family_input("slots", n);
         let (secret, key) = bgv.keygen().unwrap();
         let encrypted = bgv.encrypt(&key, &input).unwrap();
         let switched = bgv.mod_switch_to(&encrypted, 0).unwrap();
@@ -1028,11 +1054,8 @@ mod tests {
             .build()
             .unwrap();
         let message = (0..n).map(|i| (i % 17) as i64).collect::<Vec<_>>();
-        let result = execute_graph(
-            graph,
-            &common,
-            BTreeMap::from([("coefficients".into(), int_input(&message))]),
-        );
+        let result =
+            execute_graph(graph, &common, BTreeMap::from([("slots".into(), int_input(&message))]));
         assert_eq!(
             integers(&result, "plaintext"),
             message.into_iter().map(BigInt::from).collect::<Vec<_>>()
@@ -1236,17 +1259,14 @@ mod simd_tests {
         let context = DslContext::new("fhe-simd-pipeline");
         let input = context.int_family_input("slots", n);
         let (secret, public) = bgv.keygen().unwrap();
-        let ct = bgv.encrypt(&public, &bgv.encode_slots(&input).unwrap()).unwrap();
+        let ct = bgv.encrypt(&public, &input).unwrap();
         let relin = bgv.relinearization_key(&secret, top).unwrap();
         let sum = bgv.add(&ct, &ct).unwrap();
         let product = bgv.mul(&ct, &ct, &relin).unwrap();
         let mut context = context
-            .private_output("sum", bgv.decode_slots(&bgv.decrypt(&secret, &sum).unwrap()).unwrap())
+            .private_output("sum", bgv.decrypt(&secret, &sum).unwrap())
             .unwrap()
-            .private_output(
-                "product",
-                bgv.decode_slots(&bgv.decrypt(&secret, &product).unwrap()).unwrap(),
-            )
+            .private_output("product", bgv.decrypt(&secret, &product).unwrap())
             .unwrap();
         // Include negative and wrapped steps, plus both identity encodings;
         // identity rotations deliberately omit a key to test the no-op contract.
@@ -1259,31 +1279,19 @@ mod simd_tests {
             };
             let rotated = bgv.rotate_rows(key.as_ref(), &ct, step).unwrap();
             context = context
-                .private_output(
-                    format!("rotate{i}"),
-                    bgv.decode_slots(&bgv.decrypt(&secret, &rotated).unwrap()).unwrap(),
-                )
+                .private_output(format!("rotate{i}"), bgv.decrypt(&secret, &rotated).unwrap())
                 .unwrap();
         }
         let swap_key = bgv.row_swap_key(&secret, top).unwrap();
         let swapped = bgv.swap_rows(&swap_key, &ct).unwrap();
-        context = context
-            .private_output(
-                "swap",
-                bgv.decode_slots(&bgv.decrypt(&secret, &swapped).unwrap()).unwrap(),
-            )
-            .unwrap();
+        context = context.private_output("swap", bgv.decrypt(&secret, &swapped).unwrap()).unwrap();
         // Rotation after multiplication and level reduction must use a key at
         // the new level while preserving the nontrivial correction factor.
         let reduced = bgv.mod_switch_to(&product, top - 1).unwrap();
         let low_key = bgv.rotation_key(&secret, top - 1, 1).unwrap();
         let pipeline = bgv.rotate_rows(Some(&low_key), &reduced, 1).unwrap();
-        context = context
-            .private_output(
-                "pipeline",
-                bgv.decode_slots(&bgv.decrypt(&secret, &pipeline).unwrap()).unwrap(),
-            )
-            .unwrap();
+        context =
+            context.private_output("pipeline", bgv.decrypt(&secret, &pipeline).unwrap()).unwrap();
         let slots = (0..n).map(|i| i as i64).collect::<Vec<_>>();
         let result = execute_graph(
             context.build().unwrap(),
@@ -1319,17 +1327,66 @@ mod simd_tests {
     }
 
     #[test]
+    fn test_bgv_default_slots_normalize_pad_and_rotate() {
+        let bgv = parameters();
+        let n = bgv.common.ring.ring_dimension() as usize;
+        let t = bgv.plaintext_modulus as i64;
+        let context = DslContext::new("fhe-bgv-default-slots");
+        let scalar_input = context.int_family_input("scalar", 1);
+        let partial_values = [-t - 1, 2 * t + 3, -2 * t];
+        let count = partial_values.len().min(n - 1);
+        let partial_input = context.int_family_input("partial", count);
+        let (secret, public) = bgv.keygen().unwrap();
+        let scalar = bgv.encrypt(&public, &scalar_input).unwrap();
+        let partial = bgv.encrypt(&public, &partial_input).unwrap();
+        // Positive rotation moves the single occupied slot into a previously
+        // unused column. Decryption must retain that slot, not truncate to the
+        // original input length or replicate a scalar throughout the vector.
+        let key = bgv.rotation_key(&secret, bgv.common.ring.crt_depth() - 1, 1).unwrap();
+        let rotated = bgv.rotate_rows(Some(&key), &scalar, 1).unwrap();
+        let graph = context
+            .private_output("scalar", bgv.decrypt(&secret, &scalar).unwrap())
+            .unwrap()
+            .private_output("partial", bgv.decrypt(&secret, &partial).unwrap())
+            .unwrap()
+            .private_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let scalar_value = -t - 2;
+        let result = execute_graph(
+            graph,
+            &bgv.common,
+            BTreeMap::from([
+                ("scalar".into(), int_input(&[scalar_value])),
+                ("partial".into(), int_input(&partial_values[..count])),
+            ]),
+        );
+        let mut expected_scalar = vec![BigInt::from(0); n];
+        expected_scalar[0] = BigInt::from(scalar_value.rem_euclid(t));
+        assert_eq!(integers(&result, "scalar"), expected_scalar);
+        let mut expected_partial = vec![BigInt::from(0); n];
+        for (output, value) in expected_partial.iter_mut().zip(&partial_values[..count]) {
+            *output = BigInt::from(value.rem_euclid(t));
+        }
+        assert_eq!(integers(&result, "partial"), expected_partial);
+        let mut expected_rotated = vec![BigInt::from(0); n];
+        expected_rotated[n / 2 - 1] = BigInt::from(scalar_value.rem_euclid(t));
+        assert_eq!(integers(&result, "rotated"), expected_rotated);
+    }
+
+    #[test]
     fn test_simd_rejects_invalid_parameters_shapes_and_missing_keys() {
         let bgv = parameters();
         let n = bgv.common.ring.ring_dimension() as usize;
         let context = DslContext::new("fhe-simd-invalid");
-        assert!(bgv.encode_slots(&context.int_family_input("short", n - 1)).is_err());
-        let bad = BgvParams::new(bgv.common.clone(), 2).unwrap();
-        assert!(bad.encode_slots(&context.int_family_input("slots", n)).is_err());
+        let public = bgv.common.ring().input("public", (2, 1));
+        assert!(bgv.encrypt(&public, &context.int_family_input("empty", 0)).is_err());
+        assert!(bgv.encrypt(&public, &context.int_family_input("overfull", n + 1)).is_err());
+        assert!(BgvParams::new(bgv.common.clone(), 2).is_err());
         assert!(!is_prime(341550071728321));
         let t = bgv.plaintext_modulus;
-        let bad = BgvParams::new(bgv.common.clone(), t * t).unwrap();
-        assert!(bad.batching_root().is_err());
+        assert!(BgvParams::new(bgv.common.clone(), t * t).is_err());
         let ring = Ring::new(bgv.common.ring.modulus().as_ref().clone(), n);
         let ct = BgvCiphertext {
             components: ring.input("ct", (2, 1)),

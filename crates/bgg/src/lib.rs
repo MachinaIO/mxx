@@ -17,8 +17,8 @@ pub mod wee25_public_parameters;
 mod test_utils;
 
 pub use boolean::{
-    BggEncodingFamily, BggPublicKeyFamily, DynamicBooleanBggError,
-    evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
+    BggEncodingFamily, BggPublicKeyFamily, CircuitEncoding, CircuitEncodingType,
+    DynamicBooleanBggError, evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
 };
 pub use circuit::{
     CircuitCompileError, NaiveEncodingSlotOperations, NaivePublicKeySlotOperations, NoPublicLookup,

@@ -8,7 +8,7 @@ use super::root_inputs::value_expression;
 use mxx_ir_core::{
     FrozenGraphScopeId, ValidatedGraph,
     lean::{BoundaryValue, LeanArtifact},
-    node::{HashVariant, LoopInputMode, NodeKind},
+    node::{HashTagComponent, HashVariant, LoopInputMode, NodeKind},
     types::{ConcreteWireType, NodeId, Port, WireRef},
 };
 
@@ -37,13 +37,16 @@ fn mask_sampler(graph: &ValidatedGraph) -> Result<MaskSampler, String> {
             }
             let hash = scope.arguments(output_node).ok_or("missing mask slice input")?[0];
             let hash_node = scope.node(hash.node).ok_or("missing mask packed source")?;
-            let NodeKind::HashSample { variant: HashVariant::Plain, tag_prefix, .. } =
+            let NodeKind::HashSample { variant: HashVariant::Plain, tag_components, .. } =
                 hash_node.kind()
             else {
                 continue
             };
             let domain = b"exponent-lut-native-mask-bank-v1";
-            if !tag_prefix.windows(domain.len()).any(|part| part == domain) {
+            if !tag_components
+                .iter()
+                .any(|part| matches!(part, HashTagComponent::Bytes(bytes) if bytes == domain))
+            {
                 continue;
             }
             let args = scope.arguments(hash_node).ok_or("missing mask hash key")?;

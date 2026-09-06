@@ -12,7 +12,7 @@ use crate::{
     BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout,
     tall_rotation_encoding::{TallLinearTransformEncodingWires, TallRotationEncodingKey},
 };
-use mxx_dsl::{DslError, Family, Int, Mat, Parallel};
+use mxx_dsl::{DslError, Family, Int, Mat, parallel, select};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     node::{ConcatAxis, IndexRange},
@@ -159,19 +159,16 @@ impl BggTallEncodingCompiler {
             .matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        let rows = lhs.rows.clone().parallel_zip3(
-            rhs.rows.clone(),
-            lhs_plaintexts.clone(),
-            move |_, left, right, plaintext| {
-                decomposed_rhs.clone().mul_small_rhs(left) + right * plaintext
-            },
-        )?;
+        let rows = parallel(lhs.rows.count().clone(), |i| {
+            Ok(decomposed_rhs.clone().mul_small_rhs(lhs.rows.at(&i)) +
+                rhs.rows.at(&i) * lhs_plaintexts.at(i))
+        })?;
         let plaintext = match &rhs.plaintext {
-            BggTallPlaintext::Diagonal(rhs_plaintexts) => BggTallPlaintext::Diagonal(
-                lhs_plaintexts
-                    .clone()
-                    .parallel_zip(rhs_plaintexts.clone(), |_, left, right| left * right)?,
-            ),
+            BggTallPlaintext::Diagonal(rhs_plaintexts) => {
+                BggTallPlaintext::Diagonal(parallel(lhs_plaintexts.count().clone(), |i| {
+                    Ok(lhs_plaintexts.at(&i) * rhs_plaintexts.at(i))
+                })?)
+            }
             BggTallPlaintext::Hidden => BggTallPlaintext::Hidden,
         };
         Ok(BggTallEncodingWire {
@@ -230,21 +227,18 @@ impl BggTallEncodingCompiler {
             .matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        let step1 =
-            transform.left_rows.clone().parallel_zip(rotated_rows, move |_, left, input| {
-                decomposed_input.clone().mul_small_rhs(left) + input
-            })?;
+        let step1 = parallel(transform.left_rows.count().clone(), |i| {
+            Ok(decomposed_input.clone().mul_small_rhs(transform.left_rows.at(&i)) +
+                rotated_rows.at(i))
+        })?;
         let decomposed_right = transform
             .right_matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        let rows = step1.parallel_zip3(
-            rotated_plaintexts.clone(),
-            rotated_right_rows,
-            move |_, intermediate, plaintext, right| {
-                decomposed_right.clone().mul_small_rhs(intermediate) + right * plaintext
-            },
-        )?;
+        let rows = parallel(step1.count().clone(), |i| {
+            Ok(decomposed_right.clone().mul_small_rhs(step1.at(&i)) +
+                rotated_right_rows.at(&i) * rotated_plaintexts.at(i))
+        })?;
         Ok(BggTallEncodingWire {
             rows,
             pubkey: self.linear_transform_public_key(
@@ -310,33 +304,34 @@ impl BggTallEncodingCompiler {
         }
         let mut left_times_input_rows = input_lanes[1].clone();
         for lane_rows in input_lanes.iter().skip(2) {
-            left_times_input_rows = left_times_input_rows
-                .parallel_zip(lane_rows.clone(), |_, left, right| left + right)?;
+            left_times_input_rows = parallel(left_times_input_rows.count().clone(), |i| {
+                Ok(left_times_input_rows.at(&i) + lane_rows.at(i))
+            })?;
         }
-        let mut left_message_times_right_rows = right_helper_lanes[1]
-            .clone()
-            .parallel_zip(plaintext_lanes[1].clone(), |_, row, plaintext| plaintext.tensor(row))?;
+        let mut left_message_times_right_rows =
+            parallel(right_helper_lanes[1].count().clone(), |i| {
+                Ok(plaintext_lanes[1].at(&i).tensor(right_helper_lanes[1].at(i)))
+            })?;
         for lane in 2..lanes {
-            left_message_times_right_rows = left_message_times_right_rows.parallel_zip3(
-                right_helper_lanes[lane].clone(),
-                plaintext_lanes[lane].clone(),
-                |_, sum, row, plaintext| sum + plaintext.tensor(row),
-            )?;
+            left_message_times_right_rows =
+                parallel(left_message_times_right_rows.count().clone(), |i| {
+                    Ok(left_message_times_right_rows.at(&i) +
+                        plaintext_lanes[lane].at(&i).tensor(right_helper_lanes[lane].at(i)))
+                })?;
         }
         let ring = self.public_key.ring.clone();
-        let mut helper_plaintexts = plaintext_lanes[1].clone().parallel_map({
-            let scalar = ring
-                .polynomial([IntExpr::constant(num_bigint::BigInt::from(lane_scalars[1].clone()))]);
-            move |_, value| value * scalar.clone()
+        let first_scalar =
+            ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(lane_scalars[1].clone()))]);
+        let mut helper_plaintexts = parallel(plaintext_lanes[1].count().clone(), |i| {
+            Ok(plaintext_lanes[1].at(i) * &first_scalar)
         })?;
         for lane in 2..lanes {
             let scalar = ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(
                 lane_scalars[lane].clone(),
             ))]);
-            helper_plaintexts = helper_plaintexts
-                .parallel_zip(plaintext_lanes[lane].clone(), move |_, sum, value| {
-                    sum + value * scalar.clone()
-                })?;
+            helper_plaintexts = parallel(helper_plaintexts.count().clone(), |i| {
+                Ok(helper_plaintexts.at(&i) + plaintext_lanes[lane].at(i) * &scalar)
+            })?;
         }
         let helper_output = self.linear_transform(
             input,
@@ -367,25 +362,28 @@ impl BggTallEncodingCompiler {
         left_message_times_right_rows: Family<Mat>,
         output_plaintexts: Family<Mat>,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
+        if left_rows.count() != left_times_input_rows.count() ||
+            left_rows.count() != left_message_times_right_rows.count()
+        {
+            return Err(DslError::FamilyCountMismatch.into());
+        }
         let decomposed_input = input
             .pubkey
             .matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        let intermediate = left_rows
-            .parallel_zip(left_times_input_rows, move |_, left, input| {
-                decomposed_input.clone().mul_small_rhs(left) + input
-            })?;
+        let intermediate = parallel(left_rows.count().clone(), |i| {
+            Ok(decomposed_input.clone().mul_small_rhs(left_rows.at(&i)) +
+                left_times_input_rows.at(i))
+        })?;
         let decomposed_right = transform
             .right_matrix
             .clone()
             .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone());
-        let rows = intermediate.parallel_zip(
-            left_message_times_right_rows,
-            move |_, intermediate, right| {
-                decomposed_right.clone().mul_small_rhs(intermediate) + right
-            },
-        )?;
+        let rows = parallel(intermediate.count().clone(), |i| {
+            Ok(decomposed_right.clone().mul_small_rhs(intermediate.at(&i)) +
+                left_message_times_right_rows.at(i))
+        })?;
         Ok(BggTallEncodingWire {
             rows,
             pubkey: self.linear_transform_public_key(
@@ -431,17 +429,13 @@ impl BggTallEncodingCompiler {
         ) -> BggPublicKeyWire,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
         validate_pair(lhs, rhs)?;
-        let rows = lhs
-            .rows
-            .clone()
-            .parallel_zip(rhs.rows.clone(), move |_, left, right| operation(left, right))?;
+        let rows =
+            parallel(lhs.rows.count().clone(), |i| Ok(operation(lhs.rows.at(&i), rhs.rows.at(i))))?;
         let plaintext = match (&lhs.plaintext, &rhs.plaintext) {
             (BggTallPlaintext::Diagonal(left), BggTallPlaintext::Diagonal(right)) => {
-                BggTallPlaintext::Diagonal(
-                    left.clone().parallel_zip(right.clone(), move |_, left, right| {
-                        operation(left, right)
-                    })?,
-                )
+                BggTallPlaintext::Diagonal(parallel(left.count().clone(), |i| {
+                    Ok(operation(left.at(&i), right.at(i)))
+                })?)
             }
             _ => BggTallPlaintext::Hidden,
         };
@@ -462,19 +456,18 @@ impl BggTallEncodingCompiler {
         large: bool,
     ) -> Result<BggTallEncodingWire, TallCompileError> {
         let rows = match decomposed_row_factor {
-            Some(decomposed) => input
-                .rows
-                .clone()
-                .parallel_map(move |_, row| decomposed.clone().mul_small_rhs(row))?,
-            None => input.rows.clone().parallel_map(move |_, row| row * row_factor.clone())?,
+            Some(decomposed) => parallel(input.rows.count().clone(), |i| {
+                Ok(decomposed.clone().mul_small_rhs(input.rows.at(i)))
+            })?,
+            None => parallel(input.rows.count().clone(), |i| Ok(input.rows.at(i) * &row_factor))?,
         };
         let plaintext = match &input.plaintext {
             BggTallPlaintext::Hidden => BggTallPlaintext::Hidden,
             BggTallPlaintext::Diagonal(values) => {
                 let scalar = scalar.clone();
-                BggTallPlaintext::Diagonal(
-                    values.clone().parallel_map(move |_, value| value * scalar.clone())?,
-                )
+                BggTallPlaintext::Diagonal(parallel(values.count().clone(), |i| {
+                    Ok(values.at(i) * &scalar)
+                })?)
             }
         };
         let pubkey = if large {
@@ -496,10 +489,7 @@ impl BggTallEncodingWire {
         if count == 0 {
             return Err(TallCompileError::InvalidLayout);
         }
-        Ok(Mat::concat(
-            ConcatAxis::Rows,
-            (0..count).map(|index| self.rows.get_static(index)).collect(),
-        ))
+        Ok(Mat::concat(ConcatAxis::Rows, (0..count).map(|index| self.rows.at(index)).collect()))
     }
 }
 
@@ -538,17 +528,18 @@ impl BggTallEncodingSampler {
         let sigma = self.gaussian_sigma.clone();
         let bound = self.gaussian_max_coefficient_bound.clone();
         let public_matrix = public_key.matrix.clone();
-        let rows =
-            secret_rows.clone().parallel_zip(plaintexts.clone(), move |_, secret, plaintext| {
-                secret.clone() * public_matrix.clone() - plaintext * (secret * gadget.clone()) +
-                    match (&sigma, &bound) {
-                        (Some(sigma), Some(bound)) => {
-                            ring.gaussian((1, columns), sigma.clone(), bound.clone())
-                        }
-                        (None, None) => ring.zero((1, columns)),
-                        _ => unreachable!("validated Gaussian sampler configuration"),
+        let rows = parallel(secret_rows.count().clone(), |i| {
+            let secret = secret_rows.at(&i);
+            let plaintext = plaintexts.at(i);
+            Ok(&secret * &public_matrix - plaintext * (secret * &gadget) +
+                match (&sigma, &bound) {
+                    (Some(sigma), Some(bound)) => {
+                        ring.gaussian((1, columns), sigma.clone(), bound.clone())
                     }
-            })?;
+                    (None, None) => ring.zero((1, columns)),
+                    _ => unreachable!("validated Gaussian sampler configuration"),
+                })
+        })?;
         Ok(BggTallEncodingWire {
             rows,
             pubkey: public_key,
@@ -594,10 +585,7 @@ impl BggTallEncodingSampler {
         {
             return Err(TallCompileError::InvalidLayout);
         }
-        let ones = secret_rows.clone().parallel_map({
-            let ring = ring.clone();
-            move |_, _| ring.identity(1)
-        })?;
+        let ones = parallel(secret_rows.count().clone(), |_| Ok(ring.identity(1)))?;
         let count = public_keys.len();
         let gadget =
             ring.gadget(secret_size, self.layout.gadget_base.clone(), self.layout.digit_count);
@@ -608,33 +596,36 @@ impl BggTallEncodingSampler {
         input_families.push(secret_rows);
         input_families.push(ones.clone());
         input_families.extend(plaintexts.iter().cloned());
-        let row_families =
-            Family::<Mat>::parallel_zip_many_values(input_families, move |_, values| {
-                let secret_row = &values[0];
-                let secret_gadget = secret_row.clone() * gadget.clone();
-                let packed_error = match (&sigma, &bound) {
-                    (Some(sigma), Some(bound)) => {
-                        ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
-                    }
-                    (None, None) => ring.zero((1, columns * count)),
-                    _ => unreachable!("validated Gaussian sampler configuration"),
-                };
-                (0..count)
-                    .map(|index| {
-                        let plaintext = if index == 0 { &values[1] } else { &values[index + 1] };
-                        let error = packed_error.clone().slice(
-                            None,
-                            Some(IndexRange {
-                                start: (columns * index).into(),
-                                end: (columns * (index + 1)).into(),
-                            }),
-                        );
-                        secret_row.clone() * public_matrices[index].clone() -
-                            plaintext.clone().tensor(secret_gadget.clone()) +
-                            error
-                    })
-                    .collect::<Vec<_>>()
-            })?;
+        let row_families = parallel(slot_count, |i| {
+            let values = input_families.iter().map(|family| family.at(&i)).collect::<Vec<_>>();
+            let secret_row = &values[0];
+            let secret_gadget = secret_row * &gadget;
+            let packed_error = match (&sigma, &bound) {
+                (Some(sigma), Some(bound)) => {
+                    ring.gaussian((1, columns * count), sigma.clone(), bound.clone())
+                }
+                (None, None) => ring.zero((1, columns * count)),
+                _ => unreachable!("validated Gaussian sampler configuration"),
+            };
+            Ok((0..count)
+                .map(|index| {
+                    let plaintext = if index == 0 { &values[1] } else { &values[index + 1] };
+                    let error = packed_error.clone().slice(
+                        None,
+                        Some(IndexRange {
+                            start: (columns * index).into(),
+                            end: (columns * (index + 1)).into(),
+                        }),
+                    );
+                    secret_row * public_matrices[index].clone() -
+                        plaintext.clone().tensor(secret_gadget.clone()) +
+                        error
+                })
+                .collect::<Vec<_>>())
+        })?;
+        let row_families = (0..count)
+            .map(|index| row_families.field(|values| values[index].clone()))
+            .collect::<Result<Vec<_>, _>>()?;
         let encodings = row_families
             .into_iter()
             .enumerate()
@@ -715,10 +706,9 @@ pub(crate) fn rotate_family(
     let offset = offset % num_slots;
     // Keep the permutation as one generated gather. Packing static gets would lower to an
     // explicit family and erase the source expression from checker-visible program bodies.
-    let indices = Parallel::range(num_slots).map_values(|destination| {
-        destination.as_int().add(Int::constant(num_slots - offset)).rem(Int::constant(num_slots))
-    })?;
-    Ok(rows.clone().parallel_gather(indices)?)
+    Ok(parallel(num_slots, |destination| {
+        Ok(rows.at((destination + Int::constant(num_slots - offset)) % Int::constant(num_slots)))
+    })?)
 }
 
 /// Applies the sparse matrix `U` used by anchor reduction to a row family.
@@ -736,32 +726,26 @@ pub(crate) fn anchor_matrix_rows(
         return Err(TallCompileError::InvalidAnchorReduceLayout);
     }
     let source = rows.clone();
-    let work = rows.clone();
     let ring = ring.clone();
     let scalars = lane_scalars.to_vec();
-    Ok(Family::<Mat>::parallel_zip_many_with_broadcast_values(
-        vec![work],
-        vec![source],
-        move |index, _, families| {
-            let lane_count = Int::constant(lanes);
-            let flat = index.as_int();
-            let block_base = flat.clone().div(lane_count.clone()).mul(lane_count.clone());
-            let lane = flat.rem(lane_count);
-            let source = &families[0];
-            let mut anchor = ring.zero((1, source.element_type().columns.clone()));
-            for source_lane in 1..lanes {
-                anchor = anchor + source.get(block_base.clone().add(Int::constant(source_lane)));
-            }
-            let anchor_source = source.get(block_base);
-            let mut branches = Vec::with_capacity(lanes);
-            branches.push(anchor);
-            branches.extend(scalars.iter().skip(1).map(|scalar| {
-                anchor_source.clone() *
-                    ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(scalar.clone()))])
-            }));
-            Ok(lane.select(branches)?)
-        },
-    )?)
+    Ok(parallel(slot_count, |index| {
+        let lane_count = Int::constant(lanes);
+        let flat = index;
+        let block_base = flat.clone().div(lane_count.clone()).mul(lane_count.clone());
+        let lane = flat.rem(lane_count);
+        let mut anchor = ring.zero((1, source.element_type().columns.clone()));
+        for source_lane in 1..lanes {
+            anchor = anchor + source.at(block_base.clone().add(Int::constant(source_lane)));
+        }
+        let anchor_source = source.at(block_base);
+        let mut branches = Vec::with_capacity(lanes);
+        branches.push(anchor);
+        branches.extend(scalars.iter().skip(1).map(|scalar| {
+            &anchor_source *
+                ring.polynomial([IntExpr::constant(num_bigint::BigInt::from(scalar.clone()))])
+        }));
+        select(lane, branches)
+    })?)
 }
 
 fn gather_repeated_lane(
@@ -773,10 +757,9 @@ fn gather_repeated_lane(
     if lane >= lanes || rows.count() != &IntExpr::constant(num_blocks.saturating_mul(lanes)) {
         return Err(TallCompileError::InvalidAnchorReduceLayout);
     }
-    let indices = Parallel::range(num_blocks).map_values(move |block| {
-        block.as_int().mul(Int::constant(lanes)).add(Int::constant(lane))
-    })?;
-    Ok(rows.clone().parallel_gather(indices)?)
+    Ok(parallel(num_blocks, |block| {
+        Ok(rows.at(block * Int::constant(lanes) + Int::constant(lane)))
+    })?)
 }
 
 pub(crate) fn same_matrix_type(lhs: &MatrixType, rhs: &MatrixType) -> bool {
@@ -972,11 +955,11 @@ mod tests {
         };
         for slot in 0..slots {
             context = context
-                .output(format!("sum-row-{slot}"), sum.rows.get_static(slot))
+                .output(format!("sum-row-{slot}"), sum.rows.at(slot))
                 .unwrap()
-                .output(format!("product-row-{slot}"), product.rows.get_static(slot))
+                .output(format!("product-row-{slot}"), product.rows.at(slot))
                 .unwrap()
-                .output(format!("product-plain-{slot}"), product_plaintexts.get_static(slot))
+                .output(format!("product-plain-{slot}"), product_plaintexts.at(slot))
                 .unwrap();
         }
         let graph = context.build().unwrap();
@@ -1107,9 +1090,9 @@ mod tests {
             .unwrap();
         for slot in 0..slots {
             context = context
-                .output(format!("row-{slot}"), output.rows.get_static(slot))
+                .output(format!("row-{slot}"), output.rows.at(slot))
                 .unwrap()
-                .output(format!("plain-{slot}"), output_plaintexts.get_static(slot))
+                .output(format!("plain-{slot}"), output_plaintexts.at(slot))
                 .unwrap();
         }
 
@@ -1227,9 +1210,8 @@ mod tests {
         .unwrap();
         let mut context = DslContext::new("tall-sampler-runtime");
         for slot in 0..slots {
-            context = context
-                .output(format!("row-{slot}"), sample.encodings[1].rows.get_static(slot))
-                .unwrap();
+            context =
+                context.output(format!("row-{slot}"), sample.encodings[1].rows.at(slot)).unwrap();
         }
 
         let public_one = public_matrix(&parameters, secret_size, columns, 4);
@@ -1446,7 +1428,7 @@ mod tests {
         for (block, encoding) in sample.encodings.iter().enumerate() {
             for slot in 0..slots {
                 context = context
-                    .output(format!("formula-row-{block}-{slot}"), encoding.rows.get_static(slot))
+                    .output(format!("formula-row-{block}-{slot}"), encoding.rows.at(slot))
                     .expect("row output");
             }
         }
@@ -1630,15 +1612,9 @@ mod tests {
                 .unwrap();
             for slot in 0..slots {
                 context = context
-                    .output(
-                        format!("c-forward-{offset}-{slot}"),
-                        rotation.left_rows.get_static(slot),
-                    )
+                    .output(format!("c-forward-{offset}-{slot}"), rotation.left_rows.at(slot))
                     .unwrap()
-                    .output(
-                        format!("c-backward-{offset}-{slot}"),
-                        rotation.right_rows.get_static(slot),
-                    )
+                    .output(format!("c-backward-{offset}-{slot}"), rotation.right_rows.at(slot))
                     .unwrap();
             }
         }

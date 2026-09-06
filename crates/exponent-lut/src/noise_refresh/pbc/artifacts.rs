@@ -750,22 +750,30 @@ pub fn build_structural_selector_families(
     }
     let sampler = sampler.clone();
     let layout_id = layout.layout_id;
-    let components: Vec<Family<Mat>> = bits
-        .parallel_map_values(move |index, bit| {
-            let mut tag = selector_rhs_tag(layout_id, key_instance_id);
-            tag.push(index);
-            let package = sampler
-                .sample_cross_secret_rhs(source.clone(), target.clone(), bit, hash_key.clone(), tag)
-                .unwrap_or_else(|error: ExponentLutSamplingError| {
-                    panic!("validated selector sampler failed while building graph: {error}")
-                });
-            vec![package.gsw_ciphertext().clone()]
+    let gsw = {
+        let source_family = bits;
+        mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+            let bit = source_family.at(&family_index);
+            let index = family_index;
+            Ok({
+                let mut tag = selector_rhs_tag(layout_id, key_instance_id);
+                tag.push(index);
+                let package = sampler
+                    .sample_cross_secret_rhs(
+                        source.clone(),
+                        target.clone(),
+                        bit,
+                        hash_key.clone(),
+                        tag,
+                    )
+                    .unwrap_or_else(|error: ExponentLutSamplingError| {
+                        panic!("validated selector sampler failed while building graph: {error}")
+                    });
+                package.gsw_ciphertext().clone()
+            })
         })
-        .map_err(|_| PbcError::InvalidSchedule("selector RHS loop construction failed".into()))?;
-    let gsw = components
-        .into_iter()
-        .next()
-        .ok_or(PbcError::InvalidSchedule("missing GSW family".into()))?;
+    }
+    .map_err(|_| PbcError::InvalidSchedule("selector RHS loop construction failed".into()))?;
     Ok(PbcStructuralSelectorFamilies { gsw })
 }
 

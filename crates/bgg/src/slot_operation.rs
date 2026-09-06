@@ -129,7 +129,7 @@ mod naive {
         let outputs = descriptors
             .into_iter()
             .map(|(source, scalar)| {
-                let selected = input.get_static(source);
+                let selected = input.at(source);
                 scalar.map_or(selected.clone(), |scalar| {
                     selected * ring.polynomial([IntExpr::constant(scalar)])
                 })
@@ -153,7 +153,7 @@ mod naive {
             let ty = input.element_type();
             let ring = Ring::new(ty.modulus.clone(), ty.ring_dimension.clone());
             let mut terms = (0..source_slot_count).map(|source| {
-                input.get_static(source) *
+                input.at(source) *
                     ring.polynomial(
                         (0..=source).map(|index| IntExpr::constant(usize::from(index == source))),
                     )
@@ -240,7 +240,7 @@ mod naive {
                         ("plaintext", output.plaintexts.as_ref().expect("plaintext family")),
                     ] {
                         context = context
-                            .output(format!("{prefix}_{component}_{slot}"), family.get_static(slot))
+                            .output(format!("{prefix}_{component}_{slot}"), family.at(slot))
                             .expect("matrix output");
                     }
                 }
@@ -292,9 +292,9 @@ mod naive {
                 compiler.transfer_public_keys(&input, &[(1, None), (0, None)]).expect("transfer");
             let reduced = compiler.reduce_public_keys(&[input], 2).expect("reduction");
             let built = DslContext::new("slot-symbolics")
-                .output("transferred", transferred.matrices.get_static(0))
+                .output("transferred", transferred.matrices.at(0))
                 .expect("transfer output")
-                .output("reduced", reduced.matrices.get_static(0))
+                .output("reduced", reduced.matrices.at(0))
                 .expect("reduction output")
                 .build()
                 .expect("build");
@@ -315,7 +315,7 @@ mod naive {
                 .reduce_public_keys(&[input], 9)
                 .expect("construction leaves rotation validation to ir-core");
             let graph = DslContext::new("oversized-slot-reduction")
-                .output("output", output.matrices.get_static(0))
+                .output("output", output.matrices.at(0))
                 .unwrap()
                 .build()
                 .unwrap();
@@ -571,9 +571,7 @@ fn slot_gate_public_key_name(reduction: bool, identity: &str) -> String {
 
 mod artifact {
     use crate::BggSlotTransferGateRequest;
-    use mxx_dsl::{
-        Bytes, DslContext, DslError, Family, HashTag, Mat, Parallel, Preimage, Ring, Trapdoor,
-    };
+    use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Ring, Trapdoor};
     use mxx_ir_core::{
         IntExpr, RealExpr,
         artifact::{ArtifactConfidentiality, ProductionId},
@@ -754,18 +752,22 @@ mod artifact {
             let ring = self.ring();
             let secret_size = self.secret_size;
             let public_columns = self.gadget_columns();
-            let (secrets, public_keys) = Parallel::range(self.slot_count).map_values({
+            let slot_values = {
                 let ring = ring.clone();
-                move |index| {
-                    let mut tag = HashTag::from(b"slot_transfer_slot_a_".as_slice());
-                    tag.push_decimal(index);
-                    (
-                        ring.uniform_interval((secret_size, secret_size), -1, 1),
-                        ring.hash_matrix(hash_key.clone(), tag, (secret_size, public_columns)),
-                    )
-                }
-            })?;
+                mxx_dsl::parallel(self.slot_count, |index| {
+                    Ok({
+                        let mut tag = HashTag::from(b"slot_transfer_slot_a_".as_slice());
+                        tag.push_decimal(index)?;
+                        (
+                            ring.uniform_interval((secret_size, secret_size), -1, 1),
+                            ring.hash_matrix(hash_key.clone(), tag, (secret_size, public_columns)),
+                        )
+                    })
+                })
+            }?;
 
+            let secrets = slot_values.field(|(secret, _)| secret)?;
+            let public_keys = slot_values.field(|(_, public_key)| public_key)?;
             let identity = ring.identity(secret_size);
             let b1_public = base.b1.public_matrix();
             let b0_preimage_chunks = self
@@ -778,21 +780,24 @@ mod artifact {
                     let b0 = base.b0.clone();
                     let b1_public = b1_public.clone();
                     let identity = identity.clone();
-                    secrets.clone().parallel_map_values(move |_, secret| {
-                        let secret_identity =
-                            Mat::concat(ConcatAxis::Columns, vec![secret, identity.clone()]);
-                        let target = secret_identity *
-                            b1_public.clone().slice(None, Some(target_columns.clone()));
-                        let columns = target.matrix_type().columns.clone();
-                        b0.sample_preimage(
-                            target +
-                                ring.gaussian(
-                                    (secret_size, columns.clone()),
-                                    error_sigma.clone(),
-                                    self.error_max_coefficient_bound.clone(),
-                                ),
-                            (b0.public_matrix().matrix_type().columns.clone(), columns),
-                        )
+                    mxx_dsl::parallel(secrets.count().clone(), |index| {
+                        let secret = secrets.at(&index);
+                        Ok({
+                            let secret_identity =
+                                Mat::concat(ConcatAxis::Columns, vec![secret, identity.clone()]);
+                            let target = secret_identity *
+                                b1_public.clone().slice(None, Some(target_columns.clone()));
+                            let columns = target.matrix_type().columns.clone();
+                            b0.sample_preimage(
+                                target +
+                                    ring.gaussian(
+                                        (secret_size, columns.clone()),
+                                        error_sigma.clone(),
+                                        self.error_max_coefficient_bound.clone(),
+                                    ),
+                                (b0.public_matrix().matrix_type().columns.clone(), columns),
+                            )
+                        })
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -807,9 +812,10 @@ mod artifact {
                     let ring = ring.clone();
                     let b1 = base.b1.clone();
                     let gadget = gadget.clone();
-                    secrets.clone().parallel_zip_values(
-                        public_keys.clone(),
-                        move |_, secret, public_key| {
+                    mxx_dsl::parallel(secrets.count().clone(), |index| {
+                        let secret = secrets.at(&index);
+                        let public_key = public_keys.at(&index);
+                        Ok({
                             let a_chunk = public_key.slice(None, Some(target_columns.clone()));
                             let gadget_chunk =
                                 gadget.clone().slice(None, Some(target_columns.clone()));
@@ -826,8 +832,8 @@ mod artifact {
                                     ),
                                 (b1.public_matrix().matrix_type().columns.clone(), columns),
                             )
-                        },
-                    )
+                        })
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(BggSlotTransferSlotWires {
@@ -1076,8 +1082,8 @@ mod artifact {
                 let rows = self.b0_public_columns();
                 let columns = range_len(&columns);
                 let b0 = base.b0.clone();
-                return Ok(Parallel::range(0).map_values(move |_| {
-                    b0.sample_preimage(ring.zero((self.secret_size, columns)), (rows, columns))
+                return Ok(mxx_dsl::parallel(0, |_| {
+                    Ok(b0.sample_preimage(ring.zero((self.secret_size, columns)), (rows, columns)))
                 })?);
             }
             let results = source_slots
@@ -1085,9 +1091,9 @@ mod artifact {
                 .enumerate()
                 .map(|(destination, (source, scalar))| {
                     let source = usize::try_from(*source).expect("u32 fits usize");
-                    let source_secret = slots.secrets.get_static(source);
-                    let destination_secret = slots.secrets.get_static(destination);
-                    let destination_public = slots.public_keys.get_static(destination);
+                    let source_secret = slots.secrets.at(source);
+                    let destination_secret = slots.secrets.at(destination);
+                    let destination_public = slots.public_keys.at(destination);
                     let destination_chunk = destination_public.slice(None, Some(columns.clone()));
                     let decomposed =
                         destination_chunk.decompose(self.gadget_base.clone(), self.digit_count);
@@ -1121,18 +1127,16 @@ mod artifact {
                 .iter()
                 .enumerate()
                 .map(|(destination, input)| {
-                    let destination_secret = slots.secrets.get_static(destination);
-                    let destination_chunk = slots
-                        .public_keys
-                        .get_static(destination)
-                        .slice(None, Some(columns.clone()));
+                    let destination_secret = slots.secrets.at(destination);
+                    let destination_chunk =
+                        slots.public_keys.at(destination).slice(None, Some(columns.clone()));
                     let decomposed =
                         destination_chunk.decompose(self.gadget_base.clone(), self.digit_count);
                     let rhs = (0..source_slot_count)
                         .map(|source| {
                             decomposed
                                 .clone()
-                                .mul_small_rhs(slots.secrets.get_static(source) * input.clone()) *
+                                .mul_small_rhs(slots.secrets.at(source) * input.clone()) *
                                 ring.constant(
                                     (1, 1),
                                     ConstantMatrix::Rotation {
@@ -1383,18 +1387,18 @@ mod artifact {
                 .expect("b1");
             for slot in 0..compiler.slot_count {
                 context = context
-                    .output(format!("secret_{slot}"), slots.secrets.get_static(slot))
+                    .output(format!("secret_{slot}"), slots.secrets.at(slot))
                     .expect("secret")
-                    .output(format!("public_{slot}"), slots.public_keys.get_static(slot))
+                    .output(format!("public_{slot}"), slots.public_keys.at(slot))
                     .expect("public key");
                 for (chunk, family) in slots.b0_preimage_chunks.iter().enumerate() {
                     context = context
-                        .output(format!("slot_b0_{chunk}_{slot}"), family.get_static(slot))
+                        .output(format!("slot_b0_{chunk}_{slot}"), family.at(slot))
                         .expect("b0 preimage");
                 }
                 for (chunk, family) in slots.b1_preimage_chunks.iter().enumerate() {
                     context = context
-                        .output(format!("slot_b1_{chunk}_{slot}"), family.get_static(slot))
+                        .output(format!("slot_b1_{chunk}_{slot}"), family.at(slot))
                         .expect("b1 preimage");
                 }
             }
@@ -1406,7 +1410,7 @@ mod artifact {
                         context = context
                             .output(
                                 format!("gate_{identity}_{chunk}_{destination}"),
-                                family.get_static(destination),
+                                family.at(destination),
                             )
                             .expect("gate preimage");
                     }
@@ -1594,7 +1598,7 @@ mod tall {
             TallRotationEncodingKey,
         },
     };
-    use mxx_dsl::{Family, Int, Mat, Parallel};
+    use mxx_dsl::{Family, Int, Mat};
     use mxx_gadgets::{
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
@@ -1986,8 +1990,9 @@ mod tall {
         lane_scalars: &[Option<u32>],
     ) -> Result<Family<Mat>, mxx_dsl::DslError> {
         let lanes = lane_scalars.len();
-        Parallel::range(total_slots).try_map(|index| {
-            index.as_int().rem(Int::constant(lanes)).select(
+        mxx_dsl::parallel(total_slots, |index| {
+            mxx_dsl::select(
+                index.rem(Int::constant(lanes)),
                 lane_scalars
                     .iter()
                     .map(|scalar| ring.polynomial([IntExpr::constant(scalar.unwrap_or(1))]))
@@ -2022,9 +2027,8 @@ mod tall {
                 .expect("compact identity lane masks");
             let mut context = DslContext::new("compact-identity-lane-mask-runtime");
             for slot in 0..6 {
-                context = context
-                    .output(format!("mask-{slot}"), masks.get_static(slot))
-                    .expect("mask output");
+                context =
+                    context.output(format!("mask-{slot}"), masks.at(slot)).expect("mask output");
             }
             let result = execute_graph(
                 context.build().expect("compact mask graph"),

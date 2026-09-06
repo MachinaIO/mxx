@@ -53,10 +53,7 @@ use crate::{
 };
 use bigdecimal::BigDecimal;
 use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout};
-use mxx_dsl::{
-    Bool, BuiltGraph, Bytes, DslContext, Family, HashTag, Int, Mat, Parallel, ParallelZipTuple,
-    Preimage,
-};
+use mxx_dsl::{Bool, BuiltGraph, Bytes, DslContext, Family, HashTag, Int, Mat, Preimage};
 use mxx_ir_core::{
     BenchmarkRole, IntExpr, ParamEnv, ScopedWireRef,
     artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId},
@@ -1748,7 +1745,7 @@ fn producer_readout_plan_schema(
         return Err(RefreshSetupError::InvalidManifest);
     }
     Ok(CompactReadoutPlanSchema {
-        target: compact_preimage_schema(&artifacts.target_decompositions().get_static(0))?,
+        target: compact_preimage_schema(&artifacts.target_decompositions().at(0))?,
         normalization: compact_preimage_schema(artifacts.normalization_decomposition())?,
         trace,
         decoder,
@@ -2107,30 +2104,65 @@ fn corrected_route_scalar_family(
     }
     let count = refresh_route_family_count(p, &digits)?;
     let offsets = Family::pack(offsets.into_iter().map(Int::constant).collect())?;
-    let slots = Parallel::range(count).try_map_values(Vec::<Mat>::new(), |index, _| {
-        let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
-            index.expression(),
-            p.prf_component_count(),
-            p.coefficient_count,
-            &digits,
-        )
-        .map_err(|_| mxx_dsl::DslError::Schema)?;
-        Ok(Int::evaluate(slot))
-    })?;
-    let offsets = offsets.parallel_gather(slots)?;
-    let digit_indices = Parallel::range(count).try_map_values(Vec::<Mat>::new(), |index, _| {
-        let (_, digit, _, _) = crate::noise_refresh::refresh::route_coordinates(
-            index.expression(),
-            p.prf_component_count(),
-            p.coefficient_count,
-            &digits,
-        )
-        .map_err(|_| mxx_dsl::DslError::Schema)?;
-        Ok(Int::evaluate(digit))
-    })?;
-    let indices = (offsets, digit_indices)
-        .parallel_zip_tuple_result(|_, (offset, digit)| Ok(offset.add(digit)))?;
-    Ok(Family::pack(scalars)?.parallel_gather(indices)?)
+    let slots = {
+        let captured_values = Vec::<Mat>::new();
+        mxx_dsl::parallel(count, |index| {
+            let _ = captured_values;
+            {
+                let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
+                    index.expression()?,
+                    p.prf_component_count(),
+                    p.coefficient_count,
+                    &digits,
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                Ok(Int::evaluate(slot))
+            }
+        })
+    }?;
+    let offsets = {
+        let source_family = offsets;
+        let gather_indices = slots;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?;
+    let digit_indices = {
+        let captured_values = Vec::<Mat>::new();
+        mxx_dsl::parallel(count, |index| {
+            let _ = captured_values;
+            {
+                let (_, digit, _, _) = crate::noise_refresh::refresh::route_coordinates(
+                    index.expression()?,
+                    p.prf_component_count(),
+                    p.coefficient_count,
+                    &digits,
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                Ok(Int::evaluate(digit))
+            }
+        })
+    }?;
+    let indices = {
+        let source_families = (offsets, digit_indices);
+        if source_families.0.count() != source_families.1.count() {
+            Err(mxx_dsl::DslError::Schema)
+        } else {
+            mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                let (offset, digit) =
+                    (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                let _ = family_index;
+                Ok(offset.add(digit))
+            })
+        }
+    }?;
+    Ok({
+        let source_family = Family::pack(scalars)?;
+        let gather_indices = indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?)
 }
 
 fn compact_mask_routes(
@@ -2444,7 +2476,7 @@ impl RefreshPreprocessingProducer {
         let fresh_route_count = refresh_route_family_count(p, &fresh_digits)?;
         // The route constructor uses only the matrix type. Selecting one
         // symbolic member does not enumerate or share its value.
-        let public_key_for_routes = public_readout_output.get_static(0);
+        let public_key_for_routes = public_readout_output.at(0);
         let mask_route_rhs_decompositions = crate::noise_refresh::refresh::route_preimage_family(
             &ring,
             &public_key_for_routes,
@@ -2463,9 +2495,16 @@ impl RefreshPreprocessingProducer {
             decomposition_base.clone(),
             IntExpr::constant(decomposition_digit_count),
         )?;
-        let slot_indices = Parallel::range(fresh_route_count)
-            .map_values(|index| index.as_int().div(Int::constant(fresh_group)))?;
-        let repeated_scales = Family::pack(scales.clone())?.parallel_gather(slot_indices)?;
+        let slot_indices = mxx_dsl::parallel(fresh_route_count, |index| {
+            Ok(index.clone().div(Int::constant(fresh_group)))
+        })?;
+        let repeated_scales = {
+            let source_family = Family::pack(scales.clone())?;
+            let gather_indices = slot_indices;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }?;
         let fresh_route_rhs_decompositions = crate::noise_refresh::refresh::route_preimage_family(
             &ring,
             &public_key_for_routes,
@@ -2508,20 +2547,35 @@ impl RefreshPreprocessingProducer {
         let scaled_fresh_public_family = Family::pack(public_fresh.clone())?;
         let state_public = request.state.clone();
         let state_scaling_family = Family::pack(state_scaling.clone())?;
-        let scaled_state_family =
-            state_scaling_family.parallel_map_values(|_, decomposition| {
-                decomposition.mul_small_rhs(state_public.matrix.clone())
-            })?;
+        let scaled_state_family = {
+            let source_family = state_scaling_family;
+            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                let decomposition = source_family.at(&family_index);
+                let _ = family_index;
+                Ok(decomposition.mul_small_rhs(state_public.matrix.clone()))
+            })
+        }?;
         // Sum all high-q public terms before the single coefficient switch.
-        let sum_family = Family::<Mat>::parallel_zip_many_values(
-            vec![mask_public_family, scaled_fresh_public_family, scaled_state_family],
-            |_, mut items| {
-                let scaled_state = items.pop().expect("scaled state family");
-                let fresh_public = items.pop().expect("scaled fresh family");
-                let mask_public = items.pop().expect("mask family");
-                scaled_state + mask_public + fresh_public
-            },
-        )?;
+        let sum_family = {
+            let source_families =
+                vec![mask_public_family, scaled_fresh_public_family, scaled_state_family];
+            if source_families.is_empty() ||
+                source_families.iter().any(|family| family.count() != source_families[0].count())
+            {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families[0].count().clone(), |index| {
+                    let mut items =
+                        source_families.iter().map(|family| family.at(&index)).collect::<Vec<_>>();
+                    Ok({
+                        let scaled_state = items.pop().expect("scaled state family");
+                        let fresh_public = items.pop().expect("scaled fresh family");
+                        let mask_public = items.pop().expect("mask family");
+                        scaled_state + mask_public + fresh_public
+                    })
+                })
+            }
+        }?;
         let (public_b, refresh_targets, ks) =
             sample_refresh_decoders(p, sum_family, &a_prime, &decoder_preimage_bound)?;
         let ring_dimension = p
@@ -2826,8 +2880,7 @@ fn sample_refresh_decoders(
         );
         public_b.push(trapdoor.public_matrix());
         let low_a_prime = a_prime.clone().reduce_modulus(modulus.clone());
-        let group_sums =
-            Family::pack(slots.iter().map(|slot| sum_family.get_static(*slot)).collect())?;
+        let group_sums = Family::pack(slots.iter().map(|slot| sum_family.at(*slot)).collect())?;
         let deltas = Family::pack(
             slots
                 .iter()
@@ -2839,15 +2892,30 @@ fn sample_refresh_decoders(
                 })
                 .collect(),
         )?;
-        let targets = (group_sums, deltas).parallel_zip_tuple(|_, (sum, delta)| {
-            sum.modulus_switch(modulus.clone()) - delta * low_a_prime.clone()
-        })?;
-        let preimages = targets.clone().parallel_map_values(|_, target| {
-            trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns()))
-        })?;
+        let targets = {
+            let source_families = (group_sums, deltas);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (sum, delta) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(sum.modulus_switch(modulus.clone()) - delta * low_a_prime.clone())
+                })
+            }
+        }?;
+        let preimages = {
+            let source_family = targets.clone();
+            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                let target = source_family.at(&family_index);
+                let _ = family_index;
+                Ok(trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns())))
+            })
+        }?;
         for (local, slot) in slots.into_iter().enumerate() {
-            targets_by_slot.insert(slot, targets.get_static(local));
-            preimages_by_slot.insert(slot, preimages.get_static(local));
+            targets_by_slot.insert(slot, targets.at(local));
+            preimages_by_slot.insert(slot, preimages.at(local));
         }
     }
     let refresh_targets = targets_by_slot.into_values().collect();
@@ -2928,8 +2996,14 @@ fn aggregate_public_refresh_prf(
         return Err(RefreshSetupError::InvalidManifest);
     }
 
-    let mask_indices = Parallel::range(mask_total).map_values(|index| index.as_int())?;
-    let mask_outputs = outputs.clone().parallel_gather(mask_indices)?;
+    let mask_indices = mxx_dsl::parallel(mask_total, |index| Ok(index.clone()))?;
+    let mask_outputs = {
+        let source_family = outputs.clone();
+        let gather_indices = mask_indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?;
     let routed_masks = route_public_prf_family(
         compiler,
         base_p,
@@ -2951,28 +3025,55 @@ fn aggregate_public_refresh_prf(
         .map(|digits| {
             let count =
                 coordinates.checked_mul(*digits).ok_or(RefreshSetupError::InvalidManifest)?;
-            let indices = Parallel::range(count)
-                .map_values(|index| Int::constant(start).add(index.as_int()))?;
-            let slice = routed_masks.clone().parallel_gather(indices)?;
+            let indices =
+                mxx_dsl::parallel(count, |index| Ok(Int::constant(start).add(index.clone())))?;
+            let slice = {
+                let source_family = routed_masks.clone();
+                let gather_indices = indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }?;
             start = start.checked_add(count).ok_or(RefreshSetupError::InvalidManifest)?;
-            Ok(reduce_public_family_segments(slice, 1, count)?.get_static(0))
+            Ok(reduce_public_family_segments(slice, 1, count)?.at(0))
         })
         .collect::<Result<Vec<_>, RefreshSetupError>>()?;
 
-    let fresh_indices = Parallel::range(fresh_group)
-        .map_values(|index| Int::constant(mask_total).add(index.as_int()))?;
-    let fresh_outputs = outputs.parallel_gather(fresh_indices)?;
+    let fresh_indices =
+        mxx_dsl::parallel(fresh_group, |index| Ok(Int::constant(mask_total).add(index.clone())))?;
+    let fresh_outputs = {
+        let source_family = outputs;
+        let gather_indices = fresh_indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?;
     let repeated_count =
         fresh_group.checked_mul(slot_count).ok_or(RefreshSetupError::InvalidManifest)?;
-    let repeated_fresh_indices = Parallel::range(repeated_count).map_values(|index| {
-        let flat = index.as_int();
-        let quotient = flat.clone().div(Int::constant(fresh_group));
-        flat.sub(quotient.mul(Int::constant(fresh_group)))
+    let repeated_fresh_indices = mxx_dsl::parallel(repeated_count, |index| {
+        Ok({
+            let flat = index.clone();
+            let quotient = flat.clone().div(Int::constant(fresh_group));
+            flat.sub(quotient.mul(Int::constant(fresh_group)))
+        })
     })?;
-    let slot_indices = Parallel::range(repeated_count)
-        .map_values(|index| index.as_int().div(Int::constant(fresh_group)))?;
-    let repeated_fresh = fresh_outputs.parallel_gather(repeated_fresh_indices)?;
-    let repeated_scales = Family::pack(scales)?.parallel_gather(slot_indices)?;
+    let slot_indices = mxx_dsl::parallel(repeated_count, |index| {
+        Ok(index.clone().div(Int::constant(fresh_group)))
+    })?;
+    let repeated_fresh = {
+        let source_family = fresh_outputs;
+        let gather_indices = repeated_fresh_indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?;
+    let repeated_scales = {
+        let source_family = Family::pack(scales)?;
+        let gather_indices = slot_indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?;
     let routed_fresh = route_public_prf_family(
         compiler,
         base_p,
@@ -2987,7 +3088,7 @@ fn aggregate_public_refresh_prf(
     if !family_count_is(&fresh, slot_count)? {
         return Err(RefreshSetupError::InvalidManifest);
     }
-    Ok((masks, (0..slot_count).map(|slot| fresh.get_static(slot)).collect()))
+    Ok((masks, (0..slot_count).map(|slot| fresh.at(slot)).collect()))
 }
 
 fn refresh_prf_output_count(p: &RefreshSetupParameters) -> Result<usize, RefreshSetupError> {
@@ -3043,17 +3144,29 @@ fn route_scale_family(
             .and_then(|count| total.checked_add(count))
             .ok_or(RefreshSetupError::InvalidManifest)
     })?;
-    let indices = Parallel::range(count).try_map_values(Vec::<Mat>::new(), |index, _| {
-        let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
-            index.expression(),
-            component_count,
-            coefficient_count,
-            digit_counts,
-        )
-        .map_err(|_| mxx_dsl::DslError::Schema)?;
-        Ok(Int::evaluate(slot))
-    })?;
-    Ok(Family::pack(scales)?.parallel_gather(indices)?)
+    let indices = {
+        let captured_values = Vec::<Mat>::new();
+        mxx_dsl::parallel(count, |index| {
+            let _ = captured_values;
+            {
+                let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
+                    index.expression()?,
+                    component_count,
+                    coefficient_count,
+                    digit_counts,
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                Ok(Int::evaluate(slot))
+            }
+        })
+    }?;
+    Ok({
+        let source_family = Family::pack(scales)?;
+        let gather_indices = indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?)
 }
 
 fn route_public_prf_family(
@@ -3083,49 +3196,68 @@ fn route_public_prf_family(
     if let Some(scales) = scales {
         families.push(scales);
     }
-    Family::<Mat>::try_parallel_zip_many_values(families, |index, mut inputs| {
-        let scale = has_scales.then(|| inputs.pop().expect("scale family"));
-        let public_key = inputs.pop().ok_or(mxx_dsl::DslError::Schema)?;
-        let (_, digit, coefficient, component) = crate::noise_refresh::refresh::route_coordinates(
-            index.expression(),
-            component_count,
-            coefficient_count,
-            digit_counts,
-        )
-        .map_err(|_| mxx_dsl::DslError::Schema)?;
-        let public_type = public_key.matrix_type();
-        let ring =
-            mxx_dsl::Ring::new(public_type.modulus.clone(), public_type.ring_dimension.clone());
-        let scalar = ring.constant(
-            (1, 1),
-            mxx_ir_core::node::ConstantMatrix::PowerOfBase {
-                base: mxx_ir_core::IntExpr::constant(base_p),
-                exponent: digit,
-            },
-        ) * ring.constant(
-            (1, 1),
-            mxx_ir_core::node::ConstantMatrix::Rotation { exponent: coefficient },
-        );
-        let route = -scalar *
-            ring.constant(
-                (public_type.rows.clone(), 1),
-                mxx_ir_core::node::ConstantMatrix::UnitColumn {
-                    index: mxx_ir_core::IntExpr::constant(1),
-                },
-            ) *
-            ring.constant(
-                (1, public_type.columns.clone()),
-                mxx_ir_core::node::ConstantMatrix::UnitRow { index: component },
-            );
-        let target = match scale {
-            Some(scale) => scale * route,
-            None => route,
-        };
-        Ok(compiler
-            .public_key
-            .matrix_mul(&BggPublicKeyWire { matrix: public_key, reveal_plaintext: false }, &target)
-            .matrix)
-    })
+    {
+        let source_families = families;
+        if source_families.is_empty() ||
+            source_families.iter().any(|family| family.count() != source_families[0].count())
+        {
+            Err(mxx_dsl::DslError::Schema)
+        } else {
+            mxx_dsl::parallel(source_families[0].count().clone(), |index| {
+                let mut inputs =
+                    source_families.iter().map(|family| family.at(&index)).collect::<Vec<_>>();
+                {
+                    let scale = has_scales.then(|| inputs.pop().expect("scale family"));
+                    let public_key = inputs.pop().ok_or(mxx_dsl::DslError::Schema)?;
+                    let (_, digit, coefficient, component) =
+                        crate::noise_refresh::refresh::route_coordinates(
+                            index.expression()?,
+                            component_count,
+                            coefficient_count,
+                            digit_counts,
+                        )
+                        .map_err(|_| mxx_dsl::DslError::Schema)?;
+                    let public_type = public_key.matrix_type();
+                    let ring = mxx_dsl::Ring::new(
+                        public_type.modulus.clone(),
+                        public_type.ring_dimension.clone(),
+                    );
+                    let scalar = ring.constant(
+                        (1, 1),
+                        mxx_ir_core::node::ConstantMatrix::PowerOfBase {
+                            base: mxx_ir_core::IntExpr::constant(base_p),
+                            exponent: digit,
+                        },
+                    ) * ring.constant(
+                        (1, 1),
+                        mxx_ir_core::node::ConstantMatrix::Rotation { exponent: coefficient },
+                    );
+                    let route = -scalar *
+                        ring.constant(
+                            (public_type.rows.clone(), 1),
+                            mxx_ir_core::node::ConstantMatrix::UnitColumn {
+                                index: mxx_ir_core::IntExpr::constant(1),
+                            },
+                        ) *
+                        ring.constant(
+                            (1, public_type.columns.clone()),
+                            mxx_ir_core::node::ConstantMatrix::UnitRow { index: component },
+                        );
+                    let target = match scale {
+                        Some(scale) => scale * route,
+                        None => route,
+                    };
+                    Ok(compiler
+                        .public_key
+                        .matrix_mul(
+                            &BggPublicKeyWire { matrix: public_key, reveal_plaintext: false },
+                            &target,
+                        )
+                        .matrix)
+                }
+            })
+        }
+    }
     .map_err(RefreshSetupError::from)
 }
 
@@ -4746,15 +4878,25 @@ fn sample_setup_public_key_families(
         active_count.checked_add(1).ok_or(RefreshSetupError::InvalidManifest)?,
         sampler.layout.public_key_columns(),
     )?;
-    let indices =
-        Parallel::range(active_count).map_values(|index| index.as_int().add(Int::constant(1)))?;
-    let public_keys = sampled.matrices.parallel_gather(indices)?;
-    let decompositions = public_keys.clone().parallel_map_values(|_, matrix| {
-        matrix.decompose(
-            sampler.layout.gadget_base.clone(),
-            IntExpr::constant(sampler.layout.digit_count),
-        )
-    })?;
+    let indices = mxx_dsl::parallel(active_count, |index| Ok(index.clone().add(Int::constant(1))))?;
+    let public_keys = {
+        let source_family = sampled.field(|key| key.matrix)?;
+        let gather_indices = indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }?;
+    let decompositions = {
+        let source_family = public_keys.clone();
+        mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+            let matrix = source_family.at(&family_index);
+            let _ = family_index;
+            Ok(matrix.decompose(
+                sampler.layout.gadget_base.clone(),
+                IntExpr::constant(sampler.layout.digit_count),
+            ))
+        })
+    }?;
     Ok((public_keys, decompositions))
 }
 
@@ -5342,17 +5484,28 @@ impl RefreshParameterSimulationRequest {
             ring.input_family("refresh-parameter-search-native-monomials", total_labels, (1, 1));
         let online_secret_for_labels = online_secret.clone();
         let label_plaintext_family_for_sampling = label_plaintext_family.clone();
-        let label_vectors = (setup_public_key_rhs, label_plaintext_family_for_sampling)
-            .parallel_zip_tuple_result(move |_, (rhs, plaintext)| {
-                sample_online_label_vector_from_preimage(
-                    &sampler,
-                    &online_secret_for_labels,
-                    rhs,
-                    plaintext,
-                )
-                .map_err(|_| mxx_dsl::DslError::Schema)
-            })
-            .map_err(|_| RefreshSetupError::InvalidManifest)?;
+        let label_vectors = {
+            let source_families = (setup_public_key_rhs, label_plaintext_family_for_sampling);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (rhs, plaintext) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    {
+                        sample_online_label_vector_from_preimage(
+                            &sampler,
+                            &online_secret_for_labels,
+                            rhs,
+                            plaintext,
+                        )
+                        .map_err(|_| mxx_dsl::DslError::Schema)
+                    }
+                })
+            }
+        }
+        .map_err(|_| RefreshSetupError::InvalidManifest)?;
         let labels = NativePrfOnlineBatchInputs::new_for_layout(
             label_vectors,
             label_plaintext_family,

@@ -821,14 +821,7 @@ fn validate_node(
             vec![ConcreteWireType::Matrix(concrete_matrix(matrix_type, env, scope, node.id)?)]
         }
         NodeKind::HashSample {
-            matrix_type,
-            variant,
-            tag_expressions,
-            tag_decimal_expressions,
-            tag_u64_le_expressions,
-            base,
-            digit_count,
-            ..
+            matrix_type, variant, tag_components, base, digit_count, ..
         } => {
             if argument(scope, values, node, 0)? != &(ConcreteWireType::Bytes { length: 32 }) {
                 return node_error(scope, node.id, "hash sampling requires a 32-byte key");
@@ -836,12 +829,26 @@ fn validate_node(
             for index in 1..node.args.len() {
                 require_scalar(scope, values, node, index, is_integer, "integer")?;
             }
-            for expression in tag_expressions.iter().chain(tag_decimal_expressions) {
-                expression.evaluate(env)?;
-            }
-            for expression in tag_u64_le_expressions {
-                if expression.evaluate(env)?.to_u64().is_none() {
-                    return node_error(scope, node.id, "little-endian hash tag must fit in u64");
+            for component in tag_components {
+                use crate::node::HashTagComponent;
+                match component {
+                    HashTagComponent::Bytes(_) => {}
+                    HashTagComponent::Integer(expression) |
+                    HashTagComponent::Decimal(expression) => {
+                        expression.evaluate(env)?;
+                    }
+                    HashTagComponent::U64Le(expression) => {
+                        if expression.evaluate(env)?.to_u64().is_none() {
+                            return node_error(
+                                scope,
+                                node.id,
+                                "little-endian hash tag must fit in u64",
+                            );
+                        }
+                    }
+                    HashTagComponent::Operand(index) => {
+                        require_scalar(scope, values, node, *index, is_integer, "integer")?;
+                    }
                 }
             }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
@@ -1001,7 +1008,7 @@ fn validate_node(
         }
         NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
             require_arity(scope, node, 1)?;
-            if !matches!(values.get(&node.args[0]), Some(ConcreteWireType::Int)) {
+            if !is_integer(argument(scope, values, node, 0)?) {
                 return node_error(scope, node.id, "constant-polynomial lift requires an integer");
             }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
@@ -1339,7 +1346,7 @@ fn validate_structural_boundaries(
                                 LoopInputMode::ZipOffset { offset } => offset,
                                 _ => 0,
                             };
-                            if *count < iterations.saturating_add(offset) {
+                            if iterations > 0 && *count < iterations.saturating_add(offset) {
                                 return node_error(scope_id, node_id, "zipped family is too short");
                             }
                         }
@@ -1937,9 +1944,7 @@ mod tests {
                 matrix_type: matrix_type.clone(),
                 variant,
                 tag_prefix: Vec::new(),
-                tag_expressions: Vec::new(),
-                tag_decimal_expressions: Vec::new(),
-                tag_u64_le_expressions: Vec::new(),
+                tag_components: Vec::new(),
                 base,
                 digit_count,
             },
@@ -1970,6 +1975,56 @@ mod tests {
             ValidationError::ParameterConstraint(message) => message,
             other => panic!("expected node validation error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_integer_lift_accepts_a_parallel_binder_and_rejects_nonintegers() {
+        let matrix = matrix_type(17, 1, 1);
+        let (body, scope) = crate::with_new_construction_scope(|scope| {
+            let index = value(
+                NodeKind::EvaluateInt(IntExpr::LoopIndex(0)),
+                Vec::new(),
+                vec![WireType::ConstantInt],
+            );
+            let lifted = value(
+                NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix.clone() },
+                vec![index],
+                vec![WireType::Matrix(matrix.clone())],
+            );
+            (lifted, scope)
+        });
+        let body =
+            crate::SubgraphHandle::new("integer-lift", scope, Vec::new(), vec![body]).unwrap();
+        let output = NodeHandle::parallel_loop(
+            body,
+            Vec::new(),
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Matrix(matrix.clone())),
+                count: IntExpr::constant(2),
+            }],
+            ParallelLoop {
+                count: IntExpr::constant(2),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: Vec::new(),
+                input_modes: Vec::new(),
+            },
+        )
+        .output(0)
+        .unwrap();
+        validate(&graph("binder-lift", output), &ParamEnv::default()).unwrap();
+
+        let invalid = value(
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix.clone() },
+            vec![input("matrix", matrix.clone())],
+            vec![WireType::Matrix(matrix)],
+        );
+        assert!(
+            node_message(
+                validate(&graph("noninteger-lift", invalid), &ParamEnv::default()).unwrap_err()
+            )
+            .contains("requires an integer")
+        );
     }
 
     #[test]

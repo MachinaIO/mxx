@@ -166,8 +166,22 @@ pub(super) fn root_refresh_route_targets(
         if scaled_args.len() != 2 {
             return Err("route target lacks actual scale zip".into());
         }
-        let target = scaled_args[0];
-        let gather = scaled_args[1];
+        // Lexical capture order follows operand use, not the old zip tuple order.
+        // Identify the actual gathered scale family by its producer operation.
+        let gathered = scaled_args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, wire)| {
+                let scope = pre.source.scopes().get(&child(*wire))?;
+                let node = scope.node(scope.outputs().first()?.node)?;
+                matches!(node.kind(), NodeKind::FamilyGetDynamic).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if gathered.len() != 1 {
+            return Err("route target must capture exactly one gathered scale family".into());
+        }
+        let gather = scaled_args[gathered[0]];
+        let target = scaled_args[1 - gathered[0]];
         let gather_scope = pre.source.scopes().get(&child(gather)).ok_or("missing route gather")?;
         let getter =
             gather_scope.node(gather_scope.outputs()[0].node).ok_or("missing route getter")?;

@@ -27,7 +27,7 @@ use crate::{
     },
 };
 use mxx_bgg::{BggEncodingWire, BggPublicKeyWire};
-use mxx_dsl::{Family, Int, Mat, Parallel, ParallelZipTuple, Preimage, Ring};
+use mxx_dsl::{Family, Int, Mat, Preimage, Ring};
 use mxx_ir_core::IntExpr;
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
@@ -493,14 +493,16 @@ impl RefreshPrfFamilyMaterial {
             .checked_mul(self.coverage.coefficient_count)
             .and_then(|value| value.checked_mul(digits))
             .ok_or(RefreshError::InvalidLayout)?;
-        let indices = Parallel::range(count)
-            .map_values(|index| index.as_int())
+        let indices = mxx_dsl::parallel(count, |index| Ok(index.clone()))
             .map_err(|_| RefreshError::InvalidLayout)?;
-        let vectors = self
-            .vectors
-            .clone()
-            .parallel_gather(indices.clone())
-            .map_err(|_| RefreshError::InvalidLayout)?;
+        let vectors = {
+            let source_family = self.vectors.clone();
+            let gather_indices = indices.clone();
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| RefreshError::InvalidLayout)?;
         Ok(vectors)
     }
 
@@ -521,14 +523,18 @@ impl RefreshPrfFamilyMaterial {
             .checked_mul(self.coverage.coefficient_count)
             .and_then(|value| value.checked_mul(self.coverage.fresh_error_base_p_digit_count))
             .ok_or(RefreshError::InvalidLayout)?;
-        let indices = Parallel::range(fresh_group)
-            .map_values(|index| mxx_dsl::Int::constant(start).add(index.as_int()))
-            .map_err(|_| RefreshError::InvalidLayout)?;
-        let vectors = self
-            .vectors
-            .clone()
-            .parallel_gather(indices.clone())
-            .map_err(|_| RefreshError::InvalidLayout)?;
+        let indices = mxx_dsl::parallel(fresh_group, |index| {
+            Ok(mxx_dsl::Int::constant(start).add(index.clone()))
+        })
+        .map_err(|_| RefreshError::InvalidLayout)?;
+        let vectors = {
+            let source_family = self.vectors.clone();
+            let gather_indices = indices.clone();
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| RefreshError::InvalidLayout)?;
         Ok(vectors)
     }
 
@@ -709,15 +715,22 @@ pub(crate) fn aggregate_refresh_fresh_error_per_slot(
         return Err(RefreshError::PrfOutputMismatch);
     }
     let total = group.checked_mul(slot_count).ok_or(RefreshError::InvalidLayout)?;
-    let raw_indices = Parallel::range(total)
-        .map_values(|index| {
-            let flat = index.as_int();
+    let raw_indices = mxx_dsl::parallel(total, |index| {
+        Ok({
+            let flat = index.clone();
             let quotient = flat.clone().div(Int::constant(group));
             flat.sub(quotient.mul(Int::constant(group)))
         })
-        .map_err(|_| RefreshError::InvalidLayout)?;
-    let repeated_vectors =
-        vectors.parallel_gather(raw_indices).map_err(|_| RefreshError::InvalidLayout)?;
+    })
+    .map_err(|_| RefreshError::InvalidLayout)?;
+    let repeated_vectors = {
+        let source_family = vectors;
+        let gather_indices = raw_indices;
+        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+            Ok(source_family.at(gather_indices.at(&family_index)))
+        })
+    }
+    .map_err(|_| RefreshError::InvalidLayout)?;
     let scales_for_offset = scales.clone();
     let routed_vectors = route_prf_family(repeated_vectors, route_preimages)?;
     let vectors = reduce_family_segments(routed_vectors, slot_count, group)?;
@@ -737,7 +750,7 @@ pub(crate) fn aggregate_refresh_fresh_error_per_slot(
         .map(|slot| {
             let scale = scales_for_offset.get(slot).ok_or(RefreshError::InvalidLayout)?;
             Ok(BggEncodingWire {
-                vector: vectors.get_static(slot) + scale.clone() * offset.clone(),
+                vector: vectors.at(slot) + scale.clone() * offset.clone(),
                 plaintext: None,
             })
         })
@@ -751,9 +764,20 @@ fn route_prf_family(
     vectors: Family<Mat>,
     route_preimages: Family<Preimage>,
 ) -> Result<Family<Mat>, RefreshError> {
-    (vectors, route_preimages)
-        .parallel_zip_tuple_result(|_, (vector, rhs)| Ok(rhs.mul_small_rhs(vector)))
-        .map_err(|_| RefreshError::InvalidLayout)
+    {
+        let source_families = (vectors, route_preimages);
+        if source_families.0.count() != source_families.1.count() {
+            Err(mxx_dsl::DslError::Schema)
+        } else {
+            mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                let (vector, rhs) =
+                    (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                let _ = family_index;
+                Ok(rhs.mul_small_rhs(vector))
+            })
+        }
+    }
+    .map_err(|_| RefreshError::InvalidLayout)
 }
 
 fn reduce_family_segments(
@@ -858,14 +882,19 @@ pub(crate) fn aggregate_refresh_masks(
         .enumerate()
         .map(|(slot, digits)| {
             let count = coordinates.checked_mul(*digits).ok_or(RefreshError::InvalidLayout)?;
-            let indices = Parallel::range(count)
-                .map_values(|index| mxx_dsl::Int::constant(start).add(index.as_int()))
-                .map_err(|_| RefreshError::InvalidLayout)?;
-            let slice = routed_vectors
-                .clone()
-                .parallel_gather(indices)
-                .map_err(|_| RefreshError::InvalidLayout)?;
-            let vector = reduce_family_segments(slice, 1, count)?.get_static(0);
+            let indices = mxx_dsl::parallel(count, |index| {
+                Ok(mxx_dsl::Int::constant(start).add(index.clone()))
+            })
+            .map_err(|_| RefreshError::InvalidLayout)?;
+            let slice = {
+                let source_family = routed_vectors.clone();
+                let gather_indices = indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| RefreshError::InvalidLayout)?;
+            let vector = reduce_family_segments(slice, 1, count)?.at(0);
             let offset = public_half_offset_vector(&ring, base_p, *digits, columns, true)?;
             start = start.checked_add(count).ok_or(RefreshError::InvalidLayout)?;
             Ok(BggEncodingWire { vector: vector + lifts[slot].clone() * offset, plaintext: None })
@@ -997,38 +1026,58 @@ pub(crate) fn route_preimage_family(
     // carrier is deliberately absent. The supplied setup public key provides
     // the two-row BGG+ target shape needed by `u_2`; only its public type is
     // used, and its value is not copied into the route target.
-    let targets = Parallel::range(count)
-        .try_map_values(Vec::<Mat>::new(), |index, _| {
-            let (_, digit, coefficient, component) = route_coordinates(
-                index.expression(),
-                component_count,
-                coefficient_count,
-                digit_counts,
-            )
-            .map_err(|_| mxx_dsl::DslError::Schema)?;
-            symbolic_prf_route_matrix(
-                ring,
-                public_key,
-                if corrected_scalars.is_some() { 1 } else { base_p },
-                digit,
-                coefficient,
-                component,
-            )
-            .map_err(|_| mxx_dsl::DslError::Schema)
+    let targets = {
+        let captured_values = Vec::<Mat>::new();
+        mxx_dsl::parallel(count, |index| {
+            let _ = captured_values;
+            {
+                let (_, digit, coefficient, component) = route_coordinates(
+                    index.expression()?,
+                    component_count,
+                    coefficient_count,
+                    digit_counts,
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                symbolic_prf_route_matrix(
+                    ring,
+                    public_key,
+                    if corrected_scalars.is_some() { 1 } else { base_p },
+                    digit,
+                    coefficient,
+                    component,
+                )
+                .map_err(|_| mxx_dsl::DslError::Schema)
+            }
         })
-        .map_err(|_| RefreshError::InvalidLayout)?;
+    }
+    .map_err(|_| RefreshError::InvalidLayout)?;
     let targets = if let Some(scales) = corrected_scalars.or(scales) {
-        (targets, scales)
-            .parallel_zip_tuple_result(|_, (target, scale)| Ok(scale * target))
-            .map_err(|_| RefreshError::InvalidLayout)?
+        {
+            let source_families = (targets, scales);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (target, scale) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(scale * target)
+                })
+            }
+        }
+        .map_err(|_| RefreshError::InvalidLayout)?
     } else {
         targets
     };
-    targets
-        .parallel_map_values(|_, target| {
-            target.decompose(decomposition_base.clone(), decomposition_digit_count.clone())
+    {
+        let source_family = targets;
+        mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+            let target = source_family.at(&family_index);
+            let _ = family_index;
+            Ok(target.decompose(decomposition_base.clone(), decomposition_digit_count.clone()))
         })
-        .map_err(|_| RefreshError::InvalidLayout)
+    }
+    .map_err(|_| RefreshError::InvalidLayout)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1636,28 +1685,48 @@ impl RefreshCompiler {
                 slots.iter().map(|slot| packages[*slot].decoder.encoding.vector.clone()).collect(),
             )
             .map_err(|_| RefreshError::InvalidLayout)?;
-            let family = Family::parallel_zip_many_values(
-                vec![scaled, masks, fresh, decoders],
-                |_, mut values| {
-                    let decoder = values.pop().expect("low-P decoder");
-                    let fresh =
-                        BggEncodingWire { vector: values.pop().expect("fresh"), plaintext: None };
-                    let mask =
-                        BggEncodingWire { vector: values.pop().expect("mask"), plaintext: None };
-                    let scaled = BggEncodingWire {
-                        vector: values.pop().expect("scaled state"),
-                        plaintext: None,
-                    };
-                    let combined = compiler.bgg.add(&scaled, &mask).expect("validated high-q add");
-                    let sum = compiler.bgg.add(&combined, &fresh).expect("validated high-q add");
-                    // The complete high-q sum is switched exactly once. No high-q
-                    // combined decoder is provided to this online graph.
-                    sum.vector.modulus_switch(modulus.clone()) - decoder
-                },
-            )
+            let family = {
+                let source_families = vec![scaled, masks, fresh, decoders];
+                if source_families.is_empty() ||
+                    source_families
+                        .iter()
+                        .any(|family| family.count() != source_families[0].count())
+                {
+                    Err(mxx_dsl::DslError::Schema)
+                } else {
+                    mxx_dsl::parallel(source_families[0].count().clone(), |index| {
+                        let mut values = source_families
+                            .iter()
+                            .map(|family| family.at(&index))
+                            .collect::<Vec<_>>();
+                        Ok({
+                            let decoder = values.pop().expect("low-P decoder");
+                            let fresh = BggEncodingWire {
+                                vector: values.pop().expect("fresh"),
+                                plaintext: None,
+                            };
+                            let mask = BggEncodingWire {
+                                vector: values.pop().expect("mask"),
+                                plaintext: None,
+                            };
+                            let scaled = BggEncodingWire {
+                                vector: values.pop().expect("scaled state"),
+                                plaintext: None,
+                            };
+                            let combined =
+                                compiler.bgg.add(&scaled, &mask).expect("validated high-q add");
+                            let sum =
+                                compiler.bgg.add(&combined, &fresh).expect("validated high-q add");
+                            // The complete high-q sum is switched exactly once. No high-q
+                            // combined decoder is provided to this online graph.
+                            sum.vector.modulus_switch(modulus.clone()) - decoder
+                        })
+                    })
+                }
+            }
             .map_err(|_| RefreshError::InvalidLayout)?;
             for (local, slot) in slots.into_iter().enumerate() {
-                levels_by_slot.insert(slot, family.get_static(local));
+                levels_by_slot.insert(slot, family.at(local));
             }
         }
         let mut levels = Vec::with_capacity(packages.len());

@@ -2,7 +2,7 @@
 use crate::{
     Graph, GraphOutput, NodeHandle, ParamEnv, WireType,
     lean::{ExportOptions, export},
-    node::{HashVariant, NodeKind},
+    node::{HashTagComponent, HashVariant, NodeKind},
     types::MatrixType,
     validate,
 };
@@ -36,9 +36,12 @@ fn export_hash_fixture() {
             matrix_type: matrix.clone(),
             variant: HashVariant::Plain,
             tag_prefix: vec![0, 255],
-            tag_expressions: vec![(-256).into()],
-            tag_decimal_expressions: vec![(-42).into()],
-            tag_u64_le_expressions: vec![258.into()],
+            tag_components: vec![
+                HashTagComponent::Integer((-256).into()),
+                HashTagComponent::Decimal((-42).into()),
+                HashTagComponent::U64Le(258.into()),
+                HashTagComponent::Operand(1),
+            ],
             base: None,
             digit_count: None,
         },
@@ -72,15 +75,17 @@ fn export_hash_fixture() {
     let proof = r#"
 example : MxxRuntime.signedIntegerTag (-256) = [1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0] := by decide
 example : MxxRuntime.signedIntegerTag 0 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 0] := by decide
+example : MxxRuntime.completeHashTag [] [.integer 0] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0] := by decide
 example : MxxRuntime.u64LittleEndian 258 = [2, 1, 0, 0, 0, 0, 0, 0] := by decide
-example : MxxRuntime.completeHashTag [] [] [(-42)] [] [] = [45, 52, 50] := by decide
+example : MxxRuntime.completeHashTag [] [.decimal (-42)] = [2, 0, 0, 0, 0, 0, 0, 0, 3, 45, 52, 50] := by decide
 
 theorem generated_hash_output {model : MxxRuntime.HashModel} {key : ByteArray} {operand : Int}
     {outputs : Int × Mxx.Primitives.ExactMatrix 17 2 1 1 × Unit}
     (h : Generated.generatedRoot model { unit := () } (key, operand, ()) outputs) :
     outputs.2.1 = model.sample 17 2 1 1 key
-      (MxxRuntime.completeHashTag [0, 255] [(-256)] [(-42)] [258] [operand]) := by
-  rcases h with ⟨sample, coefficient, hashRun, extractRun, outputEq⟩
+      (MxxRuntime.completeHashTag [0, 255]
+        [.integer (-256), .decimal (-42), .u64Le 258, .integer operand]) := by
+  rcases h with ⟨witness, hashRun, extractRun, outputEq⟩
   rw [outputEq]
   exact hashRun.2.2
 
@@ -90,7 +95,7 @@ theorem generated_canonical_coefficient {model : MxxRuntime.HashModel}
     (h : Generated.generatedRoot model { unit := () } (key, operand, ()) outputs) :
     ∃ index : Fin 2, (index.val : Int) = 1 ∧
       outputs.1 = ((outputs.2.1 0 0).coeff index).val := by
-  rcases h with ⟨sample, coefficient, hashRun, extractRun, outputEq⟩
+  rcases h with ⟨witness, hashRun, extractRun, outputEq⟩
   rw [outputEq]
   exact extractRun
 "#;

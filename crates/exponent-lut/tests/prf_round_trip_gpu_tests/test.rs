@@ -639,12 +639,23 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
         .unwrap()
         .remove(0);
     let plaintexts = ring.input_family("prf-monomials", active.len(), (1, 1));
-    let vectors = (import_preimage_family("label-rhs"), plaintexts.clone())
-        .parallel_zip_tuple_result(|_, (rhs, plaintext)| {
-            sample_online_label_vector_from_preimage(&sampler, &s, rhs, plaintext)
-                .map_err(|_| mxx_dsl::DslError::Schema)
-        })
-        .unwrap();
+    let vectors = {
+        let source_families = (import_preimage_family("label-rhs"), plaintexts.clone());
+        if source_families.0.count() != source_families.1.count() {
+            Err(mxx_dsl::DslError::Schema)
+        } else {
+            mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                let (rhs, plaintext) =
+                    (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                let _ = family_index;
+                {
+                    sample_online_label_vector_from_preimage(&sampler, &s, rhs, plaintext)
+                        .map_err(|_| mxx_dsl::DslError::Schema)
+                }
+            })
+        }
+    }
+    .unwrap();
     let inputs =
         NativePrfOnlineBatchInputs::new_for_layout(vectors, plaintexts, 1, public_layout.layout_id)
             .unwrap();
@@ -700,35 +711,44 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
     )
     .unwrap();
     let mask_publics = import_matrix_family("public-masks");
-    let masks = mask_publics
-        .parallel_map(|index, matrix| {
-            let sigma = profile
-                .layout
-                .automorphism_index_expression(
-                    n,
-                    IntExpr::Add(Box::new(index.expression()), Box::new(IntExpr::constant(1))),
+    let masks = {
+        let source_family = mask_publics;
+        mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+            let matrix = source_family.at(&family_index);
+            let index = family_index;
+            Ok({
+                let sigma = profile
+                    .layout
+                    .automorphism_index_expression(
+                        n,
+                        IntExpr::Add(Box::new(index.expression()?), Box::new(IntExpr::constant(1))),
+                    )
+                    .unwrap();
+                let mask_sigma = s.clone().ring_automorphism(sigma);
+                mxx_bgg::BggEncodingSampler {
+                    layout: layout.clone(),
+                    gaussian_sigma: sampler.gaussian_sigma.clone(),
+                    gaussian_max_coefficient_bound: sampler.gaussian_max_coefficient_bound.clone(),
+                }
+                .sample(
+                    s.clone(),
+                    Some(mask_sigma),
+                    &[
+                        BggPublicKeyWire {
+                            matrix: ring.zero((2, columns)),
+                            reveal_plaintext: false,
+                        },
+                        BggPublicKeyWire { matrix, reveal_plaintext: false },
+                    ],
+                    &[ring.identity(1)],
                 )
-                .unwrap();
-            let mask_sigma = s.clone().ring_automorphism(sigma);
-            mxx_bgg::BggEncodingSampler {
-                layout: layout.clone(),
-                gaussian_sigma: sampler.gaussian_sigma.clone(),
-                gaussian_max_coefficient_bound: sampler.gaussian_max_coefficient_bound.clone(),
-            }
-            .sample(
-                s.clone(),
-                Some(mask_sigma),
-                &[
-                    BggPublicKeyWire { matrix: ring.zero((2, columns)), reveal_plaintext: false },
-                    BggPublicKeyWire { matrix, reveal_plaintext: false },
-                ],
-                &[ring.identity(1)],
-            )
-            .unwrap()
-            .remove(1)
-            .vector
+                .unwrap()
+                .remove(1)
+                .vector
+            })
         })
-        .unwrap();
+    }
+    .unwrap();
     let output = program
         .execute_value_readout_batch_with_mask_family(
             &compiler.bgg,
@@ -738,7 +758,7 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
         )
         .unwrap()
         .vectors()
-        .get_static(0);
+        .at(0);
     let public_vector =
         (0..universe).map(|_| rng.random_range(0..q_native as u64)).collect::<Vec<_>>();
     let z = clear_pbc_inner_product(
@@ -764,7 +784,7 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
     let inverse_two = (&modulus + BigInt::one()) / BigInt::from(2u8);
     let g = ring.polynomial([(&doubled_g * inverse_two).into()]);
     let anchor =
-        s.clone() * import_matrix_family("output-public").get_static(0) - g * (imported_t * gadget);
+        s.clone() * import_matrix_family("output-public").at(0) - g * (imported_t * gadget);
     let estimate_online = DslContext::new("one-output-prf-production-online")
         .private_output("vector", output.clone())
         .unwrap()

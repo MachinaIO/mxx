@@ -26,7 +26,7 @@ use crate::{
     rhs::{ExponentRhsPackage, ExponentRhsPackageError},
 };
 use mxx_bgg::{BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
-use mxx_dsl::{Bytes, DslError, Family, HashTag, Int, Mat, Parallel, ParallelZipTuple, Preimage};
+use mxx_dsl::{Bytes, DslError, Family, HashTag, Int, Mat, Preimage};
 use mxx_ir_core::{
     IntExpr, ParamEnv,
     node::{ConcatAxis, IndexRange},
@@ -335,12 +335,12 @@ impl ExponentLutEncodingSampler {
         helper_root.push("exponent-lut-lut-v1");
         let sampler = self.clone();
         let helper_count = helper_sigmas.len();
-        let (switch_ciphertexts, public_masks, online_mask_vectors) = Parallel::range(helper_count)
-            .map_values(move |index| {
+        let helpers = mxx_dsl::parallel(helper_count, |index| {
+            Ok({
                 let sigma = lut_layout
                     .automorphism_index_expression(
                         n,
-                        IntExpr::Add(Box::new(index.expression()), Box::new(IntExpr::constant(1))),
+                        IntExpr::Add(Box::new(index.expression()?), Box::new(IntExpr::constant(1))),
                     )
                     .expect("validated canonical readout automorphisms");
                 let mask_key = mxx_bgg::BggPublicKeySampler { layout: sampler.layout.clone() }
@@ -382,7 +382,7 @@ impl ExponentLutEncodingSampler {
                 let mut switch_tag = helper_root.clone();
                 switch_tag.push("switch");
                 switch_tag.push(IntExpr::Add(
-                    Box::new(index.expression()),
+                    Box::new(index.expression()?),
                     Box::new(IntExpr::constant(1)),
                 ));
                 let switch = sampler
@@ -396,7 +396,11 @@ impl ExponentLutEncodingSampler {
                     .expect("validated structural readout switch");
                 (switch.gsw_ciphertext().clone(), mask_key.matrix, online_mask.vector)
             })
-            .map_err(ExponentLutSamplingError::Dsl)?;
+        })
+        .map_err(ExponentLutSamplingError::Dsl)?;
+        let switch_ciphertexts = helpers.field(|fields| fields.0)?;
+        let public_masks = helpers.field(|fields| fields.1)?;
+        let online_mask_vectors = helpers.field(|fields| fields.2)?;
         Ok(NativeReadoutHelperFamilies {
             sigmas: helper_sigmas,
             switch_ciphertexts,
@@ -984,11 +988,28 @@ impl ExponentLutEncodingCompiler {
         let mask_vectors =
             Family::pack(helpers.iter().map(|helper| helper.mask().vector.clone()).collect())
                 .map_err(|_| ExponentLutError::InvalidLut)?;
-        let vectors = (raw_vectors, cache.switch.clone(), mask_vectors, cache.branch.clone())
-            .parallel_zip_tuple(|_, (raw, switch, mask, branch)| {
-                branch.mul_small_rhs(mask) + switch.mul_small_rhs(raw)
-            })
-            .map_err(|_| ExponentLutError::InvalidLut)?;
+        let vectors = {
+            let source_families =
+                (raw_vectors, cache.switch.clone(), mask_vectors, cache.branch.clone());
+            if source_families.0.count() != source_families.1.count() ||
+                source_families.0.count() != source_families.2.count() ||
+                source_families.0.count() != source_families.3.count()
+            {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (raw, switch, mask, branch) = (
+                        source_families.0.at(&family_index),
+                        source_families.1.at(&family_index),
+                        source_families.2.at(&family_index),
+                        source_families.3.at(&family_index),
+                    );
+                    let _ = family_index;
+                    Ok(branch.mul_small_rhs(mask) + switch.mul_small_rhs(raw))
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         let plaintext = input_plaintext.cloned().map(|value| {
             let branches = sigmas
                 .iter()
@@ -1034,47 +1055,91 @@ impl ExponentLutEncodingCompiler {
         {
             return Err(ExponentLutError::InvalidLut);
         }
-        let member_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().div(Int::constant(width)))
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let branch_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().rem(Int::constant(width)))
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let flat_vectors = input
-            .vectors
-            .clone()
-            .parallel_gather(member_indices.clone())
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let flat_masks =
-            Family::pack(helpers.iter().map(|helper| helper.mask().vector.clone()).collect())
-                .map_err(|_| ExponentLutError::InvalidLut)?
-                .parallel_gather(branch_indices.clone())
+        let member_indices =
+            mxx_dsl::parallel(flat_count, |index| Ok(index.clone().div(Int::constant(width))))
                 .map_err(|_| ExponentLutError::InvalidLut)?;
-        let sigma_values = sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
-        let switched = (flat_vectors, cache.switch.clone())
-            .parallel_zip_tuple(move |index, (raw, switch)| {
-                let flat = index.expression();
-                let divisor = IntExpr::constant(width);
-                let branch_index = IntExpr::Sub(
-                    Box::new(flat.clone()),
-                    Box::new(IntExpr::Mul(
-                        Box::new(IntExpr::Div(Box::new(flat), Box::new(divisor.clone()))),
-                        Box::new(divisor),
-                    )),
-                );
-                let sigma = IntExpr::Select {
-                    selector: Box::new(branch_index),
-                    branches: sigma_values.clone(),
-                };
-                switch.mul_small_rhs(raw.ring_automorphism(sigma))
+        let branch_indices =
+            mxx_dsl::parallel(flat_count, |index| Ok(index.clone().rem(Int::constant(width))))
+                .map_err(|_| ExponentLutError::InvalidLut)?;
+        let flat_vectors = {
+            let source_family = input.vectors.clone();
+            let gather_indices = member_indices.clone();
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
             })
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let aligned = (flat_masks, cache.branch.clone())
-            .parallel_zip_tuple(|_, (mask, branch)| branch.mul_small_rhs(mask))
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let branches = (switched, aligned)
-            .parallel_zip_tuple(|_, (switched, aligned)| switched + aligned)
-            .map_err(|_| ExponentLutError::InvalidLut)?;
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let flat_masks = {
+            let source_family =
+                Family::pack(helpers.iter().map(|helper| helper.mask().vector.clone()).collect())
+                    .map_err(|_| ExponentLutError::InvalidLut)?;
+            let gather_indices = branch_indices.clone();
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let sigma_values = sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
+        let switched = {
+            let source_families = (flat_vectors, cache.switch.clone());
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (raw, switch) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let index = family_index;
+                    Ok({
+                        let flat = index.expression()?;
+                        let divisor = IntExpr::constant(width);
+                        let branch_index = IntExpr::Sub(
+                            Box::new(flat.clone()),
+                            Box::new(IntExpr::Mul(
+                                Box::new(IntExpr::FloorDiv(
+                                    Box::new(flat),
+                                    Box::new(divisor.clone()),
+                                )),
+                                Box::new(divisor),
+                            )),
+                        );
+                        let sigma = IntExpr::Select {
+                            selector: Box::new(branch_index),
+                            branches: sigma_values.clone(),
+                        };
+                        switch.mul_small_rhs(raw.ring_automorphism(sigma))
+                    })
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let aligned = {
+            let source_families = (flat_masks, cache.branch.clone());
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (mask, branch) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(branch.mul_small_rhs(mask))
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let branches = {
+            let source_families = (switched, aligned);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (switched, aligned) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(switched + aligned)
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         let vectors = reduce_encoding_family_segments(branches, member_count, width)?;
         let plaintexts = if let Some(plaintexts) = &input.plaintexts {
             let coefficients = sigmas
@@ -1082,33 +1147,58 @@ impl ExponentLutEncodingCompiler {
                 .map(|sigma| lut_coefficient(&self.ring, &layout, *sigma, table.values()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| ExponentLutError::InvalidLut)?;
-            let flat_plaintexts = plaintexts
-                .clone()
-                .parallel_gather(member_indices)
-                .map_err(|_| ExponentLutError::InvalidLut)?;
-            let flat_coefficients = Family::pack(coefficients)
-                .map_err(|_| ExponentLutError::InvalidLut)?
-                .parallel_gather(branch_indices)
-                .map_err(|_| ExponentLutError::InvalidLut)?;
-            let sigma_values = sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
-            let branches = (flat_plaintexts, flat_coefficients)
-                .parallel_zip_tuple(move |index, (value, coefficient)| {
-                    let flat = index.expression();
-                    let divisor = IntExpr::constant(width);
-                    let branch_index = IntExpr::Sub(
-                        Box::new(flat.clone()),
-                        Box::new(IntExpr::Mul(
-                            Box::new(IntExpr::Div(Box::new(flat), Box::new(divisor.clone()))),
-                            Box::new(divisor),
-                        )),
-                    );
-                    let sigma = IntExpr::Select {
-                        selector: Box::new(branch_index),
-                        branches: sigma_values.clone(),
-                    };
-                    value.ring_automorphism(sigma) * coefficient
+            let flat_plaintexts = {
+                let source_family = plaintexts.clone();
+                let gather_indices = member_indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
                 })
-                .map_err(|_| ExponentLutError::InvalidLut)?;
+            }
+            .map_err(|_| ExponentLutError::InvalidLut)?;
+            let flat_coefficients = {
+                let source_family =
+                    Family::pack(coefficients).map_err(|_| ExponentLutError::InvalidLut)?;
+                let gather_indices = branch_indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidLut)?;
+            let sigma_values = sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
+            let branches = {
+                let source_families = (flat_plaintexts, flat_coefficients);
+                if source_families.0.count() != source_families.1.count() {
+                    Err(mxx_dsl::DslError::Schema)
+                } else {
+                    mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                        let (value, coefficient) = (
+                            source_families.0.at(&family_index),
+                            source_families.1.at(&family_index),
+                        );
+                        let index = family_index;
+                        Ok({
+                            let flat = index.expression()?;
+                            let divisor = IntExpr::constant(width);
+                            let branch_index = IntExpr::Sub(
+                                Box::new(flat.clone()),
+                                Box::new(IntExpr::Mul(
+                                    Box::new(IntExpr::FloorDiv(
+                                        Box::new(flat),
+                                        Box::new(divisor.clone()),
+                                    )),
+                                    Box::new(divisor),
+                                )),
+                            );
+                            let sigma = IntExpr::Select {
+                                selector: Box::new(branch_index),
+                                branches: sigma_values.clone(),
+                            };
+                            value.ring_automorphism(sigma) * coefficient
+                        })
+                    })
+                }
+            }
+            .map_err(|_| ExponentLutError::InvalidLut)?;
             Some(reduce_encoding_family_segments(branches, member_count, width)?)
         } else {
             None
@@ -1188,12 +1278,15 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
                 if decompositions.count() != range.count() || selectors.count() < range.count() {
                     return Err(ExponentLutError::InvalidSparseLwrBlock);
                 }
-                let vectors = decompositions
-                    .clone()
-                    .parallel_map_values(|_, decomposition| {
-                        decomposition.mul_small_rhs(input.vector.clone())
+                let vectors = {
+                    let source_family = decompositions.clone();
+                    mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                        let decomposition = source_family.at(&family_index);
+                        let _ = family_index;
+                        Ok(decomposition.mul_small_rhs(input.vector.clone()))
                     })
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 Ok(EncodingProgramWire::Materialized {
                     value: EncodingFamilyIntermediate { vectors, plaintexts: None },
                     range: range.clone(),
@@ -1255,30 +1348,74 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
                 {
                     return Err(ExponentLutError::InvalidSparseLwrBlock);
                 }
-                let indices = Parallel::range(count)
-                    .map_values(|index| index.as_int().add(mxx_dsl::Int::constant(start)))
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-                let values_vector = values
-                    .vector_family()
-                    .clone()
-                    .parallel_gather(indices.clone())
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-                let values_plaintext = values
-                    .plaintext_family()
-                    .clone()
-                    .parallel_gather(indices)
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-                let first = (values_vector, decompositions.clone())
-                    .parallel_zip_tuple_result(|_, (value, decomposition)| {
-                        Ok(decomposition.mul_small_rhs(value))
+                let indices = mxx_dsl::parallel(count, |index| {
+                    Ok(index.clone().add(mxx_dsl::Int::constant(start)))
+                })
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let values_vector = {
+                    let source_family = values.vector_family().clone();
+                    let gather_indices = indices.clone();
+                    mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                        Ok(source_family.at(gather_indices.at(&family_index)))
                     })
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-                let second = (values_plaintext, mapped.vectors.clone())
-                    .parallel_zip_tuple_result(|_, (value, vector)| Ok(value * vector))
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-                let vectors = (first, second)
-                    .parallel_zip_tuple_result(|_, (left, right)| Ok(left + right))
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let values_plaintext = {
+                    let source_family = values.plaintext_family().clone();
+                    let gather_indices = indices;
+                    mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                        Ok(source_family.at(gather_indices.at(&family_index)))
+                    })
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let first = {
+                    let source_families = (values_vector, decompositions.clone());
+                    if source_families.0.count() != source_families.1.count() {
+                        Err(mxx_dsl::DslError::Schema)
+                    } else {
+                        mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                            let (value, decomposition) = (
+                                source_families.0.at(&family_index),
+                                source_families.1.at(&family_index),
+                            );
+                            let _ = family_index;
+                            Ok(decomposition.mul_small_rhs(value))
+                        })
+                    }
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let second = {
+                    let source_families = (values_plaintext, mapped.vectors.clone());
+                    if source_families.0.count() != source_families.1.count() {
+                        Err(mxx_dsl::DslError::Schema)
+                    } else {
+                        mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                            let (value, vector) = (
+                                source_families.0.at(&family_index),
+                                source_families.1.at(&family_index),
+                            );
+                            let _ = family_index;
+                            Ok(value * vector)
+                        })
+                    }
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let vectors = {
+                    let source_families = (first, second);
+                    if source_families.0.count() != source_families.1.count() {
+                        Err(mxx_dsl::DslError::Schema)
+                    } else {
+                        mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                            let (left, right) = (
+                                source_families.0.at(&family_index),
+                                source_families.1.at(&family_index),
+                            );
+                            let _ = family_index;
+                            Ok(left + right)
+                        })
+                    }
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 Ok(EncodingProgramWire::Materialized {
                     value: EncodingFamilyIntermediate { vectors, plaintexts: None },
                     range: range.clone(),
@@ -1302,9 +1439,22 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
                 EncodingProgramWire::Materialized { value: lhs, range },
                 EncodingProgramWire::Materialized { value: rhs, range: rhs_range },
             ) if range == rhs_range => {
-                let vectors = (lhs.vectors.clone(), rhs.vectors.clone())
-                    .parallel_zip_tuple_result(|_, (lhs, rhs)| Ok(lhs + rhs))
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let vectors = {
+                    let source_families = (lhs.vectors.clone(), rhs.vectors.clone());
+                    if source_families.0.count() != source_families.1.count() {
+                        Err(mxx_dsl::DslError::Schema)
+                    } else {
+                        mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                            let (lhs, rhs) = (
+                                source_families.0.at(&family_index),
+                                source_families.1.at(&family_index),
+                            );
+                            let _ = family_index;
+                            Ok(lhs + rhs)
+                        })
+                    }
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 Ok(EncodingProgramWire::Materialized {
                     value: EncodingFamilyIntermediate { vectors, plaintexts: None },
                     range: range.clone(),
@@ -1444,34 +1594,38 @@ fn active_encoding_family(
             Ok(value.clone())
         }
         EncodingProgramWire::Broadcast { value, range } if range == expected_range => {
-            let vectors = Parallel::range(count)
-                .map_values(|_| value.vector.clone())
+            let vectors = mxx_dsl::parallel(count, |_| Ok(value.vector.clone()))
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             let plaintexts = value
                 .plaintext
                 .as_ref()
                 .map(|plaintext| {
-                    Parallel::range(count)
-                        .map_values(|_| plaintext.clone())
+                    mxx_dsl::parallel(count, |_| Ok(plaintext.clone()))
                         .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)
                 })
                 .transpose()?;
             Ok(EncodingFamilyIntermediate { vectors, plaintexts })
         }
         EncodingProgramWire::Members(values) => {
-            let indices = Parallel::range(count)
-                .map_values(|index| index.as_int().add(Int::constant(start)))
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let vectors = values
-                .vector_family()
-                .clone()
-                .parallel_gather(indices.clone())
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let plaintexts = values
-                .plaintext_family()
-                .clone()
-                .parallel_gather(indices)
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let indices =
+                mxx_dsl::parallel(count, |index| Ok(index.clone().add(Int::constant(start))))
+                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let vectors = {
+                let source_family = values.vector_family().clone();
+                let gather_indices = indices.clone();
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let plaintexts = {
+                let source_family = values.plaintext_family().clone();
+                let gather_indices = indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             Ok(EncodingFamilyIntermediate { vectors, plaintexts: Some(plaintexts) })
         }
         _ => Err(ExponentLutError::InvalidSparseLwrBlock),
@@ -1515,36 +1669,58 @@ pub(crate) fn reduce_encoding_family_segments(
         let next_width = width.div_ceil(2);
         let count = segment_count.checked_mul(next_width).ok_or(ExponentLutError::InvalidLut)?;
         let indices = |offset| {
-            Parallel::range(count).map_values(|index| {
-                let flat = index.as_int();
-                let segment = flat.clone().div(Int::constant(next_width));
-                let member = flat.rem(Int::constant(next_width)).mul(Int::constant(2));
-                segment
-                    .mul(Int::constant(width))
-                    .add(member.add(Int::constant(offset)).rem(Int::constant(width)))
+            mxx_dsl::parallel(count, |index| {
+                Ok({
+                    let flat = index.clone();
+                    let segment = flat.clone().div(Int::constant(next_width));
+                    let member = flat.rem(Int::constant(next_width)).mul(Int::constant(2));
+                    segment
+                        .mul(Int::constant(width))
+                        .add(member.add(Int::constant(offset)).rem(Int::constant(width)))
+                })
             })
         };
-        let left = current
-            .clone()
-            .parallel_gather(indices(0).map_err(|_| ExponentLutError::InvalidLut)?)
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let right = current
-            .parallel_gather(indices(1).map_err(|_| ExponentLutError::InvalidLut)?)
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        current = (left, right)
-            .parallel_zip_tuple_result(|index, (left, right)| {
-                if width % 2 == 0 {
-                    Ok(left + right)
-                } else {
-                    index
-                        .as_int()
-                        .rem(Int::constant(next_width))
-                        .equal(Int::constant(next_width - 1))
-                        .to_int()
-                        .select(vec![left.clone() + right, left])
-                }
+        let left = {
+            let source_family = current.clone();
+            let gather_indices = indices(0).map_err(|_| ExponentLutError::InvalidLut)?;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
             })
-            .map_err(|_| ExponentLutError::InvalidLut)?;
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let right = {
+            let source_family = current;
+            let gather_indices = indices(1).map_err(|_| ExponentLutError::InvalidLut)?;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        current = {
+            let source_families = (left, right);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (left, right) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let index = family_index;
+                    {
+                        if width % 2 == 0 {
+                            Ok(left + right)
+                        } else {
+                            let selector = index
+                                .clone()
+                                .rem(Int::constant(next_width))
+                                .equal(Int::constant(next_width - 1))
+                                .to_int();
+                            mxx_dsl::select(selector, vec![left.clone() + right, left])
+                        }
+                    }
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         width = next_width;
     }
     Ok(current)
@@ -1678,42 +1854,58 @@ pub(crate) fn balanced_sum_family(family: Family<Mat>) -> Result<Mat, ExponentLu
     let mut count = count;
     while count > 1 {
         let next = count.div_ceil(2);
-        let left = current
-            .clone()
-            .parallel_gather(
-                Parallel::range(next)
-                    .map_values(|i| i.as_int().mul(mxx_dsl::Int::constant(2)))
-                    .map_err(|_| ExponentLutError::InvalidLut)?,
-            )
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let right = current
-            .clone()
-            .parallel_gather(
-                Parallel::range(next)
-                    .map_values(|i| {
-                        i.as_int()
-                            .mul(mxx_dsl::Int::constant(2))
-                            .add(mxx_dsl::Int::constant(1))
-                            .rem(mxx_dsl::Int::constant(count))
-                    })
-                    .map_err(|_| ExponentLutError::InvalidLut)?,
-            )
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        current =
-            Family::try_parallel_zip_many_values(vec![left, right], move |index, mut items| {
-                let r = items.pop().ok_or(DslError::Schema)?;
-                let l = items.pop().ok_or(DslError::Schema)?;
-                if count % 2 == 1 {
-                    let last = index.as_int().equal(mxx_dsl::Int::constant(next - 1)).to_int();
-                    last.select(vec![l.clone() + r, l])
-                } else {
-                    Ok(l + r)
-                }
+        let left = {
+            let source_family = current.clone();
+            let gather_indices =
+                mxx_dsl::parallel(next, |i| Ok(i.clone().mul(mxx_dsl::Int::constant(2))))
+                    .map_err(|_| ExponentLutError::InvalidLut)?;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let right = {
+            let source_family = current.clone();
+            let gather_indices = mxx_dsl::parallel(next, |i| {
+                Ok(i.clone()
+                    .mul(mxx_dsl::Int::constant(2))
+                    .add(mxx_dsl::Int::constant(1))
+                    .rem(mxx_dsl::Int::constant(count)))
             })
             .map_err(|_| ExponentLutError::InvalidLut)?;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        current = {
+            let source_families = vec![left, right];
+            if source_families.is_empty() ||
+                source_families.iter().any(|family| family.count() != source_families[0].count())
+            {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families[0].count().clone(), |index| {
+                    let mut items =
+                        source_families.iter().map(|family| family.at(&index)).collect::<Vec<_>>();
+                    {
+                        let r = items.pop().ok_or(DslError::Schema)?;
+                        let l = items.pop().ok_or(DslError::Schema)?;
+                        if count % 2 == 1 {
+                            let last =
+                                index.clone().equal(mxx_dsl::Int::constant(next - 1)).to_int();
+                            mxx_dsl::select(last, vec![l.clone() + r, l])
+                        } else {
+                            Ok(l + r)
+                        }
+                    }
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         count = next;
     }
-    Ok(current.get_static(0))
+    Ok(current.at(0))
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -1779,7 +1971,7 @@ mod tests {
                 let inputs = &values[segment * width..(segment + 1) * width];
                 let expected = inputs.iter().cloned().reduce(|left, right| left + right).unwrap();
                 context = context
-                    .output(format!("actual-{width}-{segment}"), actual.get_static(segment))
+                    .output(format!("actual-{width}-{segment}"), actual.at(segment))
                     .unwrap()
                     .output(format!("expected-{width}-{segment}"), expected)
                     .unwrap()

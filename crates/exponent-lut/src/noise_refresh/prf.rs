@@ -24,7 +24,7 @@ use crate::{
     public_key::{ProgramCacheBatchBindings, ProgramCacheBindings},
 };
 use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
-use mxx_dsl::{Family, Mat, Parallel, ParallelZipTuple, Preimage, Ring};
+use mxx_dsl::{Family, Mat, Preimage, Ring};
 use mxx_ir_core::{BenchmarkRole, IntExpr, with_benchmark_role};
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
@@ -629,26 +629,33 @@ impl NativePrfOnlineBatchInputs {
         self.layout_id
     }
 
-    fn label(&self, label: mxx_dsl::LoopIndex) -> Result<NativePrfLabelInputs, ExponentLutError> {
+    fn label(&self, label: mxx_dsl::Int) -> Result<NativePrfLabelInputs, ExponentLutError> {
         let vector_count = self.vectors.count().clone();
         let slot_count = mxx_ir_core::IntExpr::Div(
             Box::new(vector_count),
             Box::new(mxx_ir_core::IntExpr::constant(self.label_count)),
         )
         .canonicalize();
-        let base = label.as_int().mul(mxx_dsl::Int::evaluate(slot_count.clone()));
-        let indices = Parallel::range(slot_count)
-            .map_values(|slot| base.clone().add(slot.as_int()))
+        let base = label.clone().mul(mxx_dsl::Int::evaluate(slot_count.clone()));
+        let indices = mxx_dsl::parallel(slot_count, |slot| Ok(base.clone().add(slot.clone())))
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         NativePrfLabelInputs::new(
-            self.vectors
-                .clone()
-                .parallel_gather(indices.clone())
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
-            self.plaintexts
-                .clone()
-                .parallel_gather(indices)
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
+            {
+                let source_family = self.vectors.clone();
+                let gather_indices = indices.clone();
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
+            {
+                let source_family = self.plaintexts.clone();
+                let gather_indices = indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
         )
         .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)
     }
@@ -994,9 +1001,11 @@ impl SparseLwrPrfProgram {
         }
         let construction_error = std::cell::RefCell::new(None);
         let vectors_result = with_benchmark_role(BenchmarkRole::EncodingPrfAccumulation, || {
-            Parallel::range(inputs.label_count).try_map_values(
-                (inputs.vectors.clone(), inputs.plaintexts.clone(), selectors.gsw().clone()),
-                |label, (vectors, plaintexts, gsw)| {
+            let captured_values =
+                (inputs.vectors.clone(), inputs.plaintexts.clone(), selectors.gsw().clone());
+            mxx_dsl::parallel(inputs.label_count, |label| {
+                let (vectors, plaintexts, gsw) = captured_values;
+                {
                     let inputs = NativePrfOnlineBatchInputs {
                         vectors,
                         plaintexts,
@@ -1030,8 +1039,8 @@ impl SparseLwrPrfProgram {
                             mxx_dsl::DslError::Schema
                         })?;
                     Ok(output.vector)
-                },
-            )
+                }
+            })
         });
         let vectors = match vectors_result {
             Ok(vectors) => vectors,
@@ -1101,25 +1110,42 @@ impl SparseLwrPrfProgram {
         helpers: &[ValueReadoutHelper],
     ) -> Result<NativePrfEncodingBatchOutputs, ValueReadoutError> {
         let vectors = with_benchmark_role(BenchmarkRole::EncodingReadout, || {
-            Family::try_parallel_zip_many_values(vec![inputs.vectors.clone()], |_, mut values| {
-                let input = BggEncodingWire {
-                    vector: values.pop().ok_or(mxx_dsl::DslError::Schema)?,
-                    plaintext: None,
-                };
-                let output = self
-                    .readout
-                    .execute_with_preprocessed_artifacts(
-                        compiler,
-                        &input,
-                        artifacts.target_decomposition.clone(),
-                        artifacts.target_schema.clone(),
-                        &helpers,
-                        artifacts.normalization_decomposition.clone(),
-                        artifacts.normalization_schema.clone(),
-                    )
-                    .map_err(|_| mxx_dsl::DslError::Schema)?;
-                Ok(output.vector)
-            })
+            {
+                let source_families = vec![inputs.vectors.clone()];
+                if source_families.is_empty() ||
+                    source_families
+                        .iter()
+                        .any(|family| family.count() != source_families[0].count())
+                {
+                    Err(mxx_dsl::DslError::Schema)
+                } else {
+                    mxx_dsl::parallel(source_families[0].count().clone(), |index| {
+                        let mut values = source_families
+                            .iter()
+                            .map(|family| family.at(&index))
+                            .collect::<Vec<_>>();
+                        {
+                            let input = BggEncodingWire {
+                                vector: values.pop().ok_or(mxx_dsl::DslError::Schema)?,
+                                plaintext: None,
+                            };
+                            let output = self
+                                .readout
+                                .execute_with_preprocessed_artifacts(
+                                    compiler,
+                                    &input,
+                                    artifacts.target_decomposition.clone(),
+                                    artifacts.target_schema.clone(),
+                                    &helpers,
+                                    artifacts.normalization_decomposition.clone(),
+                                    artifacts.normalization_schema.clone(),
+                                )
+                                .map_err(|_| mxx_dsl::DslError::Schema)?;
+                            Ok(output.vector)
+                        }
+                    })
+                }
+            }
             .map_err(|error| {
                 ValueReadoutError::Graph(ExponentLutError::OnlinePrfStage {
                     stage: "compile readout batch",
@@ -1358,55 +1384,93 @@ impl SparseLwrPrfProgram {
         let target = self.readout.target(&ring)?;
         let target_for_outputs = target.clone();
         let target_compiler = compiler.public_key.clone();
-        let target_decompositions = inputs
-            .clone()
-            .parallel_map_values(move |_, input| {
-                target_compiler.large_scalar_decomposition(
-                    &BggPublicKeyWire { matrix: input, reveal_plaintext: false },
-                    &target_for_outputs,
-                )
+        let target_decompositions = {
+            let source_family = inputs.clone();
+            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                let input = source_family.at(&family_index);
+                let _ = family_index;
+                Ok({
+                    target_compiler.large_scalar_decomposition(
+                        &BggPublicKeyWire { matrix: input, reveal_plaintext: false },
+                        &target_for_outputs,
+                    )
+                })
             })
-            .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
-        let transformed = (inputs, target_decompositions.clone())
-            .parallel_zip_tuple(|_, (input, target)| target.mul_small_rhs(input))
-            .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
-        let switch_decompositions = helpers
-            .switch_ciphertexts
-            .clone()
-            .parallel_map_values(|_, switch| {
-                switch.decompose(compiler.public_key.base.clone(), digit_count)
+        }
+        .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
+        let transformed = {
+            let source_families = (inputs, target_decompositions.clone());
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (input, target) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(target.mul_small_rhs(input))
+                })
+            }
+        }
+        .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
+        let switch_decompositions = {
+            let source_family = helpers.switch_ciphertexts.clone();
+            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                let switch = source_family.at(&family_index);
+                let _ = family_index;
+                Ok(switch.decompose(compiler.public_key.base.clone(), digit_count))
             })
-            .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
+        }
+        .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
         let helper_count = helpers.sigmas.len();
         let flat_count =
             output_count.checked_mul(helper_count).ok_or(ValueReadoutError::InvalidTraceSet)?;
-        let label_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().div(mxx_dsl::Int::constant(helper_count)))
-            .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
-        let flat_transformed = transformed
-            .parallel_gather(label_indices)
-            .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
-        let flat_switches = switch_decompositions
-            .clone()
-            .parallel_gather(
-                Parallel::range(flat_count)
-                    .map_values(|index| index.as_int().rem(mxx_dsl::Int::constant(helper_count)))
-                    .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?,
-            )
-            .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
-        let sigma_branches =
-            helpers.sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
-        let public_decompositions = (flat_transformed, flat_switches)
-            .parallel_zip_tuple(move |index, (transformed, switch)| {
-                let sigma = crate::noise_refresh::readout::helper_sigma_for_flat_index(
-                    index.expression(),
-                    sigma_branches.clone(),
-                );
-                switch
-                    .mul_small_rhs(transformed.ring_automorphism(sigma))
-                    .decompose(compiler.public_key.base.clone(), digit_count)
+        let label_indices = mxx_dsl::parallel(flat_count, |index| {
+            Ok(index.clone().div(mxx_dsl::Int::constant(helper_count)))
+        })
+        .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
+        let flat_transformed = {
+            let source_family = transformed;
+            let gather_indices = label_indices;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
+        let flat_switches = {
+            let source_family = switch_decompositions.clone();
+            let gather_indices = mxx_dsl::parallel(flat_count, |index| {
+                Ok(index.clone().rem(mxx_dsl::Int::constant(helper_count)))
             })
             .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
+        let sigma_branches =
+            helpers.sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
+        let public_decompositions = {
+            let source_families = (flat_transformed, flat_switches);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (transformed, switch) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let index = family_index;
+                    Ok({
+                        let sigma = crate::noise_refresh::readout::helper_sigma_for_flat_index(
+                            index.expression()?,
+                            sigma_branches.clone(),
+                        );
+                        switch
+                            .mul_small_rhs(transformed.ring_automorphism(sigma))
+                            .decompose(compiler.public_key.base.clone(), digit_count)
+                    })
+                })
+            }
+        }
+        .map_err(|_| ValueReadoutError::Graph(ExponentLutError::InvalidLut))?;
         let normalization_target =
             self.readout.normalization_target(&ring, normalization_gadget)?;
         let normalization_decomposition =
@@ -1626,12 +1690,12 @@ mod tests {
         let inputs = NativePrfOnlineBatchInputs::new(vectors, monomials, label_count)
             .expect("native online inputs");
         assert_ne!(
-            inputs.vectors().get(Int::constant(0)).value_handle(),
-            inputs.vectors().get(Int::constant(active_count)).value_handle()
+            inputs.vectors().at(Int::constant(0)).value_handle(),
+            inputs.vectors().at(Int::constant(active_count)).value_handle()
         );
         assert_ne!(
-            inputs.plaintexts().get(Int::constant(0)).value_handle(),
-            inputs.plaintexts().get(Int::constant(active_count)).value_handle()
+            inputs.plaintexts().at(Int::constant(0)).value_handle(),
+            inputs.plaintexts().at(Int::constant(active_count)).value_handle()
         );
     }
 

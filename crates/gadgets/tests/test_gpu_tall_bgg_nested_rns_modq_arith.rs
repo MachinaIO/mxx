@@ -14,7 +14,7 @@ use mxx_bgg::{
     bind_lwe_lookup_invocations, collect_lwe_lookup_identities,
     required_tall_anchor_reduce_encoding, required_tall_rotation_encodings,
 };
-use mxx_dsl::{BuiltGraph, DslContext, Int, Parallel, Ring, SemanticAnchor, parallel_zip};
+use mxx_dsl::{BuiltGraph, DslContext, Int, Ring, SemanticAnchor, parallel};
 use mxx_gadgets::{
     circuit::{PolyCircuit, PolyGateKind},
     circuit_gadgets::{
@@ -991,18 +991,13 @@ fn build_encoding_graph(
     // family below contains row views of that one `physical_slots × n` sample,
     // not independently sampled per-slot secrets.
     let tall_secret = ring.uniform_interval((physical_slots, layout.secret_dimension), -1, 1);
-    let secret_rows = Parallel::range(physical_slots)
-        .map_values(move |slot| {
-            let start = slot.expression();
-            tall_secret.clone().slice(
-                Some(IndexRange {
-                    end: IntExpr::Add(Box::new(start.clone()), Box::new(IntExpr::constant(1))),
-                    start,
-                }),
-                None,
-            )
-        })
-        .map_err(|error| error.to_string())?;
+    let secret_rows = parallel(physical_slots, |slot| {
+        let start = slot.expression()?;
+        Ok(tall_secret
+            .clone()
+            .slice(Some(IndexRange { end: (start.clone() + IntExpr::constant(1)), start }), None))
+    })
+    .map_err(|error| error.to_string())?;
     let sample = BggTallEncodingSampler {
         layout: layout.clone(),
         gaussian_sigma: Some(
@@ -1041,17 +1036,16 @@ fn build_encoding_graph(
     let lookup_ring = ring.clone();
     let lookup_columns = layout.secret_dimension * (layout.digit_count + 2);
     let lookup_public_b_for_c_b = lookup_public_b.clone();
-    let lookup_c_b = secret_rows
-        .clone()
-        .parallel_map(move |_, secret_row| {
-            secret_row * lookup_public_b_for_c_b.clone() +
-                lookup_ring.gaussian(
-                    (1, lookup_columns),
-                    lookup_error_sigma.clone(),
-                    lookup_error_bound.clone(),
-                )
-        })
-        .map_err(|error| error.to_string())?;
+    let lookup_c_b = parallel(secret_rows.count().clone(), |index| {
+        let secret_row = secret_rows.at(index);
+        Ok(secret_row * lookup_public_b_for_c_b.clone() +
+            lookup_ring.gaussian(
+                (1, lookup_columns),
+                lookup_error_sigma.clone(),
+                lookup_error_bound.clone(),
+            ))
+    })
+    .map_err(|error| error.to_string())?;
     let mut lookup = LweLookupTallEncodingLowering::new(invocations, lookup_c_b)
         .map_err(|error| error.to_string())?;
     let rotation_compiler = TallRotationEncodingCompiler {
@@ -1163,20 +1157,15 @@ fn build_encoding_graph(
         ));
     }
     let anchor_count = physical_slots / encoding_crt_depth;
-    let anchor_index_family = Parallel::range(anchor_count)
-        .map_values(|index| index.as_int().mul(Int::constant(encoding_crt_depth)))
-        .map_err(|error| error.to_string())?;
-    let encoding_rows = output
-        .rows
-        .parallel_gather(anchor_index_family.clone())
-        .map_err(|error| error.to_string())?;
-    let output_plaintexts = output_plaintexts
-        .parallel_gather(anchor_index_family.clone())
-        .map_err(|error| error.to_string())?;
-    let residual_secret_rows = secret_rows
-        .clone()
-        .parallel_gather(anchor_index_family)
-        .map_err(|error| error.to_string())?;
+    let anchors = parallel(anchor_count, |index| {
+        let source = index * Int::constant(encoding_crt_depth);
+        Ok((output.rows.at(&source), output_plaintexts.at(&source)))
+    })
+    .map_err(|error| error.to_string())?;
+    let encoding_rows =
+        anchors.field(|(encoding, _)| encoding).map_err(|error| error.to_string())?;
+    let output_plaintexts =
+        anchors.field(|(_, plaintext)| plaintext).map_err(|error| error.to_string())?;
     let output_public_key = ring.artifact_input(
         production.clone(),
         OUTPUT_PUBLIC_KEY_ARTIFACT,
@@ -1192,18 +1181,18 @@ fn build_encoding_graph(
         let gadget =
             ring.gadget(layout.secret_dimension, layout.gadget_base.clone(), layout.digit_count);
         let public_key = output_public_key.clone();
-        let residuals = parallel_zip(
-            (encoding_rows.clone(), output_plaintexts.clone(), residual_secret_rows),
-            move |_, (encoding, plaintext, secret_row)| {
-                let signal = secret_row.clone() * public_key.clone() -
-                    plaintext * (secret_row * gadget.clone());
-                encoding - signal
-            },
-        )
+        let residuals = parallel(anchor_count, |index| {
+            let encoding = encoding_rows.at(&index);
+            let plaintext = output_plaintexts.at(&index);
+            let secret_row = secret_rows.at(index * Int::constant(encoding_crt_depth));
+            let signal =
+                secret_row.clone() * public_key.clone() - plaintext * (secret_row * gadget.clone());
+            Ok(encoding - signal)
+        })
         .map_err(|error| error.to_string())?;
         // The operational target contains only the authoritative q1 anchors.
         let decoder_input = residuals
-            .get_static(0)
+            .at(0)
             .slice(
                 Some(IndexRange { start: 0.into(), end: 1.into() }),
                 Some(IndexRange { start: 0.into(), end: 1.into() }),

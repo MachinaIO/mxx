@@ -336,7 +336,7 @@ impl ReadoutCacheFamily {
                 max_coefficient_bound.clone(),
                 self.confidentiality,
             )
-            .get_static(index))
+            .at(index))
     }
 }
 

@@ -6,6 +6,18 @@ use crate::{
 use num_bigint::{BigInt, BigUint};
 use serde::{Deserialize, Serialize};
 
+/// Ordered components after the caller's explicit hash-tag namespace prefix.
+/// Byte strings and decimal integers are length-framed; integer encodings have type markers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum HashTagComponent {
+    Bytes(Vec<u8>),
+    Integer(IntExpr),
+    Decimal(IntExpr),
+    U64Le(IntExpr),
+    /// Index into HashSample arguments, including the key at index zero.
+    Operand(usize),
+}
+
 /// Executable operation represented by a declarative graph node.
 ///
 /// Node identity, arguments, output types, and structural child definitions
@@ -97,12 +109,7 @@ pub enum NodeKind {
         matrix_type: crate::types::MatrixType,
         variant: HashVariant,
         tag_prefix: Vec<u8>,
-        #[serde(default)]
-        tag_expressions: Vec<IntExpr>,
-        #[serde(default)]
-        tag_decimal_expressions: Vec<IntExpr>,
-        #[serde(default)]
-        tag_u64_le_expressions: Vec<IntExpr>,
+        tag_components: Vec<HashTagComponent>,
         base: Option<IntExpr>,
         #[serde(default)]
         digit_count: Option<IntExpr>,

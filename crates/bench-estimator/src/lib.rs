@@ -1288,7 +1288,7 @@ fn wire_type_depends_on(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_dsl::{DslContext, Int, IntType, Parallel, Ring, Sequential, Subgraph};
+    use mxx_dsl::{DslContext, Int, IntType, Ring, Subgraph, iterate, parallel};
     use std::{collections::BTreeSet, convert::Infallible};
 
     struct UnitBackend;
@@ -1664,9 +1664,8 @@ mod tests {
     }
 
     fn estimate_parallel_integer_loop(count: usize) -> CostReport {
-        let values = Parallel::range(count)
-            .map_values(|index| index.as_int().add(Int::constant(1)))
-            .expect("parallel map");
+        let values =
+            parallel(count, |index| Ok(index.add(Int::constant(1)))).expect("parallel map");
         let built = DslContext::new("estimate-parallel")
             .int_family_output("values", values)
             .expect("output")
@@ -1703,13 +1702,15 @@ mod tests {
     #[test]
     fn parallel_loop_rejects_index_dependent_sampler_cost() {
         let ring = Ring::new(257, 8);
-        let values = Parallel::range(2)
-            .map_values(|index| {
-                let cutoff =
-                    IntExpr::Add(Box::new(IntExpr::constant(8)), Box::new(index.expression()));
-                ring.gaussian((1, 1), 5, cutoff)
-            })
-            .expect("parallel samples");
+        let values = parallel(2, |index| {
+            // This deliberately constructs an unsupported IR cost dependency.
+            let NodeKind::EvaluateInt(expression) = index.value_handle().node().kind() else {
+                panic!("parallel binder must evaluate its structural index");
+            };
+            let cutoff = IntExpr::Add(Box::new(IntExpr::constant(8)), Box::new(expression.clone()));
+            Ok(ring.gaussian((1, 1), 5, cutoff))
+        })
+        .expect("parallel samples");
         let built = DslContext::new("estimate-varying-sampler")
             .family_output("values", values)
             .expect("output")
@@ -1724,12 +1725,9 @@ mod tests {
 
     #[test]
     fn sequential_loop_iterations_extend_latency_without_parallel_memory_multiplication() {
-        let total =
-            Sequential::range(3)
-                .scan(Int::constant(0), Int::constant(1), |_, total, increment| {
-                    Ok(total.add(increment))
-                })
-                .expect("sequential scan");
+        let increment = Int::constant(1);
+        let total = iterate(3, Int::constant(0), |_, total| Ok(total.add(increment.clone())))
+            .expect("sequential scan");
         let built = DslContext::new("estimate-sequential")
             .int_output("total", total)
             .expect("output")
@@ -1770,17 +1768,16 @@ mod tests {
             }
         }
         let initial = Ring::new(17, 65536).input("packed", (1, (1usize << 50)));
-        let total = Sequential::range(3)
-            .scan(initial.clone(), initial, |_, total, _| {
-                let lanes = Parallel::range(2).try_map_values(total, |_, value| {
-                    mxx_ir_core::graph::with_benchmark_role(
-                        BenchmarkRole::PublicPrfAccumulation,
-                        || Ok(-value),
-                    )
-                })?;
-                Ok(lanes.get_static(0))
-            })
-            .unwrap();
+        let total = iterate(3, initial, |_, total| {
+            let lanes = parallel(2, |_| {
+                mxx_ir_core::graph::with_benchmark_role(
+                    BenchmarkRole::PublicPrfAccumulation,
+                    || Ok(-total.clone()),
+                )
+            })?;
+            Ok(lanes.at(0))
+        })
+        .unwrap();
         let built = DslContext::new("nested-independent-waves")
             .output("total", total)
             .unwrap()
@@ -1802,11 +1799,10 @@ mod tests {
     #[test]
     fn sequential_loop_scales_latency_and_work_but_not_resources() {
         let estimate_loop = |count| {
-            let total = Sequential::range(count)
-                .scan(Int::constant(0), Int::constant(1), |_, total, increment| {
-                    Ok(total.add(increment))
-                })
-                .expect("sequential scan");
+            let increment = Int::constant(1);
+            let total =
+                iterate(count, Int::constant(0), |_, total| Ok(total.add(increment.clone())))
+                    .expect("sequential scan");
             let built = DslContext::new("estimate-sequential-scaling")
                 .int_output("total", total)
                 .expect("output")
@@ -1831,15 +1827,12 @@ mod tests {
         let increment =
             Subgraph::<Int, Int>::define("increment", IntType, |value| value.add(Int::constant(1)))
                 .expect("increment subgraph");
-        let total = Sequential::range(3)
-            .scan(Int::constant(0), Int::constant(0), |_, total, _| {
-                let direct = increment.call(total)?;
-                let parallel = Parallel::range(2).map_values(|_| {
-                    increment.call(direct.clone()).expect("nested subgraph call")
-                })?;
-                Ok(parallel.get_static(0))
-            })
-            .expect("nested sequential scan");
+        let total = iterate(3, Int::constant(0), |_, total| {
+            let direct = increment.call(total)?;
+            let values = parallel(2, |_| increment.call(direct.clone()))?;
+            Ok(values.at(0))
+        })
+        .expect("nested sequential scan");
         let built = DslContext::new("estimate-nested-sequential")
             .int_output("total", total)
             .expect("output")

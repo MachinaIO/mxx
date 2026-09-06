@@ -7,8 +7,7 @@ use crate::{
 };
 use mxx_dsl::{
     Bytes, DslContext, DslError, Family, FamilyType, GraphValue, HashTag, Int, Mat, MatType,
-    Preimage, PreimageType, Ring, SmallMatrix, SmallMatrixType, Subgraph, Trapdoor, parallel_zip,
-    parallel_zip_bundle_with_broadcast,
+    Preimage, PreimageType, Ring, SmallMatrix, SmallMatrixType, Subgraph, Trapdoor, parallel,
 };
 use mxx_gadgets::{
     Poly,
@@ -627,6 +626,9 @@ impl LweLookupCompiler {
             self.digit_count.clone(),
         );
         let (rows, output_plaintexts) = (table_families.0.clone(), table_families.1.clone());
+        if rows.count() != output_plaintexts.count() {
+            return Err(DslError::FamilyCountMismatch.into());
+        }
         let input_public_key = input_public_key.matrix.clone();
         let output_for_loop = output_public_key.clone();
         let trapdoor = trapdoor.clone();
@@ -637,27 +639,28 @@ impl LweLookupCompiler {
         let low_tag_prefix = self.identity.low_matrix_tag_prefix();
         let gadget_base = self.gadget_base.clone();
         let digit_count = self.digit_count.clone();
-        let (low_matrices, high_matrices) =
-            parallel_zip((rows, output_plaintexts.clone()), move |index, (row, output)| {
-                let input_scalar = index
-                    .as_int()
-                    .add(Int::constant(0))
-                    .lift_to_constant_polynomial(scalar_type.clone());
-                let mut low_tag = HashTag::from(low_tag_prefix.clone());
-                low_tag.push(row);
-                let low = ring.hash_decomposed(
-                    hash_key.clone(),
-                    low_tag,
-                    low_shape.clone(),
-                    gadget_base.clone(),
-                    digit_count.clone(),
-                );
-                let extended_input = input_public_key.clone() - gadget.clone() * input_scalar;
-                let target = output_for_loop.clone() - gadget.clone() * output;
-                let adjusted_target = target - extended_input.mul_small_rhs(low.clone());
-                let high = trapdoor.sample_preimage(adjusted_target, high_shape.clone());
-                (low, high)
-            })?;
+        let matrices = parallel(rows.count().clone(), |index| {
+            let row = rows.at(&index);
+            let output = output_plaintexts.at(&index);
+            let input_scalar =
+                index.add(Int::constant(0)).lift_to_constant_polynomial(scalar_type.clone());
+            let mut low_tag = HashTag::from(low_tag_prefix.clone());
+            low_tag.push(row);
+            let low = ring.hash_decomposed(
+                hash_key.clone(),
+                low_tag,
+                low_shape.clone(),
+                gadget_base.clone(),
+                digit_count.clone(),
+            );
+            let extended_input = &input_public_key - &gadget * input_scalar;
+            let target = &output_for_loop - &gadget * output;
+            let adjusted_target = target - extended_input.mul_small_rhs(low.clone());
+            let high = trapdoor.sample_preimage(adjusted_target, high_shape.clone());
+            Ok((low, high))
+        })?;
+        let low_matrices = matrices.field(|pair| pair.0)?;
+        let high_matrices = matrices.field(|pair| pair.1)?;
         Ok(LweLookupPreprocessingWires {
             output_public_key,
             low_matrices,
@@ -759,9 +762,9 @@ impl LweLookupCompiler {
             0,
             Some(BigUint::from(self.table.len())),
         );
-        let low = artifacts.low_matrices.get(input_index.clone());
-        let high = artifacts.high_matrices.get(input_index.clone());
-        let output_plaintext = artifacts.output_plaintexts.get(input_index.clone());
+        let low = artifacts.low_matrices.at(input_index.clone());
+        let high = artifacts.high_matrices.at(input_index.clone());
+        let output_plaintext = artifacts.output_plaintexts.at(input_index.clone());
         Ok(BggEncodingWire {
             vector: high.mul_small_rhs(c_b.clone()) + input.vector.clone().mul_small_rhs(low),
             plaintext: Some(output_plaintext),
@@ -795,20 +798,21 @@ impl LweLookupCompiler {
 
         let output_public_key = self.public_key(artifacts);
         let artifact_rows = artifacts.clone();
-        let (rows, plaintexts) = parallel_zip(
-            (input.rows.clone(), input_plaintexts.clone(), c_b_rows.clone()),
-            move |_, (input_row, plaintext, c_b)| {
-                let input_index = plaintext
-                    .extract_coefficient_with_canonical_input_exclusive_upper(
-                        0,
-                        input.canonical_input_exclusive_upper.clone(),
-                    );
-                let low = artifact_rows.low_matrices.get(input_index.clone());
-                let high = artifact_rows.high_matrices.get(input_index.clone());
-                let output_plaintext = artifact_rows.output_plaintexts.get(input_index.clone());
-                (high.mul_small_rhs(c_b) + input_row.mul_small_rhs(low), output_plaintext)
-            },
-        )?;
+        let encodings = parallel(input.rows.count().clone(), |i| {
+            let input_row = input.rows.at(&i);
+            let plaintext = input_plaintexts.at(&i);
+            let c_b = c_b_rows.at(i);
+            let input_index = plaintext.extract_coefficient_with_canonical_input_exclusive_upper(
+                0,
+                input.canonical_input_exclusive_upper.clone(),
+            );
+            let low = artifact_rows.low_matrices.at(input_index.clone());
+            let high = artifact_rows.high_matrices.at(input_index.clone());
+            let output_plaintext = artifact_rows.output_plaintexts.at(input_index.clone());
+            Ok((high.mul_small_rhs(c_b) + input_row.mul_small_rhs(low), output_plaintext))
+        })?;
+        let rows = encodings.field(|pair| pair.0)?;
+        let plaintexts = encodings.field(|pair| pair.1)?;
         Ok(BggTallEncodingWire {
             rows,
             pubkey: output_public_key,
@@ -894,18 +898,10 @@ impl LweLookupCompiler {
     }
 
     fn validate_layout(&self) -> Result<(), LweLookupCompileError> {
-        let expected_public_columns = IntExpr::Mul(
-            Box::new(self.public_key_type.rows.clone()),
-            Box::new(self.digit_count.clone()),
-        )
-        .canonicalize();
-        let expected_high_rows = IntExpr::Mul(
-            Box::new(self.public_key_type.rows.clone()),
-            Box::new(IntExpr::Add(
-                Box::new(self.digit_count.clone()),
-                Box::new(IntExpr::constant(2)),
-            )),
-        )
+        let expected_public_columns =
+            (&self.public_key_type.rows * &self.digit_count).canonicalize();
+        let expected_high_rows = (&self.public_key_type.rows *
+            (&self.digit_count + IntExpr::constant(2)))
         .canonicalize();
         let types = [&self.low_matrix_type, &self.high_matrix_type];
         if types.iter().any(|ty| {
@@ -1002,11 +998,7 @@ fn lookup_compiler_for_table<P: Poly>(
     preimage_max_coefficient_bound: IntExpr,
 ) -> Result<LweLookupCompiler, LweLookupCompileError> {
     let public_columns = public_key_type.columns.clone();
-    let high_rows = IntExpr::Mul(
-        Box::new(public_key_type.rows.clone()),
-        Box::new(IntExpr::Add(Box::new(digit_count.clone()), Box::new(IntExpr::constant(2)))),
-    )
-    .canonicalize();
+    let high_rows = (&public_key_type.rows * (&digit_count + IntExpr::constant(2))).canonicalize();
     let low_matrix_type = MatrixType {
         rows: public_columns.clone(),
         columns: public_columns.clone(),
@@ -1243,7 +1235,7 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupPreprocessingLowering<P>
                 .preprocess_with_table_families(
                     self.hash_key.clone(),
                     &BggPublicKeyWire {
-                        matrix: input.matrices.get_static(slot),
+                        matrix: input.matrices.at(slot),
                         reveal_plaintext: input.reveal_plaintext,
                     },
                     &self.trapdoors[slot],
@@ -1412,6 +1404,9 @@ fn tall_lookup_kernel_for(
         (input_rows, input_plaintexts, c_b_rows),
         (low_matrices, high_matrices, output_plaintexts),
     ) = input_families.clone();
+    if input_rows.count() != input_plaintexts.count() || input_rows.count() != c_b_rows.count() {
+        return Err(LweLookupCompileError::SlotCountMismatch);
+    }
     let key = TallLookupKernelKey {
         input_types: (
             (input_rows.schema(), input_plaintexts.schema(), c_b_rows.schema()),
@@ -1431,25 +1426,19 @@ fn tall_lookup_kernel_for(
             (input_rows, input_plaintexts, c_b_rows),
             (low_matrices, high_matrices, output_plaintexts),
         ): TallLookupInputs| {
-            let (rows, plaintexts) = parallel_zip_bundle_with_broadcast(
-                (input_rows, input_plaintexts, c_b_rows),
-                (low_matrices, high_matrices, output_plaintexts),
-                move |_index,
-                      (input_row, input_plaintext, c_b_row),
-                      (low_matrices, high_matrices, output_plaintexts)| {
-                    let input_index = input_plaintext
-                        .extract_coefficient_with_canonical_input_exclusive_upper(
-                            0,
-                            canonical_upper,
-                        );
-                    let low = low_matrices.get(input_index.clone());
-                    let high = high_matrices.get(input_index.clone());
-                    let output_plaintext = output_plaintexts.get(input_index);
-                    let row = high.mul_small_rhs(c_b_row) + input_row.mul_small_rhs(low);
-                    (row, output_plaintext)
-                },
-            )?;
-            Ok((rows, plaintexts))
+            let encodings = parallel(input_rows.count().clone(), |index| {
+                let input_row = input_rows.at(&index);
+                let input_plaintext = input_plaintexts.at(&index);
+                let c_b_row = c_b_rows.at(index);
+                let input_index = input_plaintext
+                    .extract_coefficient_with_canonical_input_exclusive_upper(0, canonical_upper);
+                let low = low_matrices.at(input_index.clone());
+                let high = high_matrices.at(input_index.clone());
+                let output_plaintext = output_plaintexts.at(input_index);
+                let row = high.mul_small_rhs(c_b_row) + input_row.mul_small_rhs(low);
+                Ok((row, output_plaintext))
+            })?;
+            Ok((encodings.field(|pair| pair.0)?, encodings.field(|pair| pair.1)?))
         },
     )?;
     kernels.insert(key, kernel.clone());
@@ -1651,10 +1640,10 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupEncodingLowering {
                 slot.compiler
                     .encoding(
                         &BggEncodingWire {
-                            vector: input.vectors.get_static(slot_index),
-                            plaintext: Some(plaintexts.get_static(slot_index)),
+                            vector: input.vectors.at(slot_index),
+                            plaintext: Some(plaintexts.at(slot_index)),
                         },
-                        &self.c_b_by_slot.get_static(slot_index),
+                        &self.c_b_by_slot.at(slot_index),
                         &artifacts,
                     )
                     .map_err(|source| lookup_error(gate, source))
@@ -1753,7 +1742,7 @@ mod tests {
         BggPublicKeyCompiler, BggTallEncodingCompiler,
         test_utils::{matrix_output, row},
     };
-    use mxx_dsl::{DslContext, parallel_zip_bundle};
+    use mxx_dsl::DslContext;
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{
         FrozenGraphScopeId, ParamEnv,
@@ -1986,19 +1975,17 @@ mod tests {
         let input_a = input_public_key.matrix;
         let output_a = wires.output_public_key.clone();
         let high_matrices = wires.high_matrices.clone();
-        let residuals = parallel_zip_bundle(
-            (wires.low_matrices.clone(), high_matrices, outputs),
-            move |index, (low, high, output)| {
-                let index = index.as_int();
-                let x =
-                    index.add(Int::constant(0)).lift_to_constant_polynomial(scalar_type.clone());
-                let y = output.lift_to_constant_polynomial(scalar_type.clone());
-                high.mul_small_rhs(public_b.clone()) -
-                    (output_a.clone() -
-                        gadget.clone() * y -
-                        (input_a.clone() - gadget.clone() * x).mul_small_rhs(low))
-            },
-        )
+        let residuals = parallel(outputs.count().clone(), |index| {
+            let low = wires.low_matrices.at(&index);
+            let high = high_matrices.at(&index);
+            let output = outputs.at(&index);
+            let x = index.add(Int::constant(0)).lift_to_constant_polynomial(scalar_type.clone());
+            let y = output.lift_to_constant_polynomial(scalar_type.clone());
+            Ok(high.mul_small_rhs(public_b.clone()) -
+                (output_a.clone() -
+                    gadget.clone() * y -
+                    (input_a.clone() - gadget.clone() * x).mul_small_rhs(low)))
+        })
         .unwrap();
         let validated = DslContext::new("shuffled-logical-lwe-preprocessing")
             .public_output("low", wires.low_matrices)
@@ -2277,11 +2264,11 @@ mod tests {
         let mut context = DslContext::new("tall-lookup-runtime");
         for slot in 0..slots {
             context = context
-                .output(format!("row-{slot}"), output.rows.get_static(slot))
+                .output(format!("row-{slot}"), output.rows.at(slot))
                 .unwrap()
-                .output(format!("plain-{slot}"), output_plaintexts.get_static(slot))
+                .output(format!("plain-{slot}"), output_plaintexts.at(slot))
                 .unwrap()
-                .output(format!("final-plain-{slot}"), final_plaintexts.get_static(slot))
+                .output(format!("final-plain-{slot}"), final_plaintexts.at(slot))
                 .unwrap();
         }
         let graph = context.build().unwrap();
@@ -2502,22 +2489,32 @@ mod tests {
                 matches!(id, FrozenGraphScopeId::Subgraph { .. }).then_some(scope)
             })
             .collect::<Vec<_>>();
-        assert!(named_scopes.iter().all(|scope| {
-            scope.nodes().iter().any(|node| {
-                matches!(
-                    node.kind(),
-                    NodeKind::ParallelLoop(spec)
-                        if spec.input_modes == vec![
-                            LoopInputMode::Zip,
-                            LoopInputMode::Zip,
-                            LoopInputMode::Zip,
-                            LoopInputMode::Broadcast,
-                            LoopInputMode::Broadcast,
-                            LoopInputMode::Broadcast,
-                        ]
-                )
-            })
-        }));
+        for scope in named_scopes {
+            let loop_node = scope
+                .nodes()
+                .iter()
+                .find(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+                .expect("one lookup loop");
+            let NodeKind::ParallelLoop(spec) = loop_node.kind() else { unreachable!() };
+            assert_eq!(loop_node.arguments().len(), 6);
+            // Lexical captures follow use order. Each formal input retains its original role.
+            for (input, expected) in scope.inputs().iter().zip([
+                LoopInputMode::Zip,
+                LoopInputMode::Zip,
+                LoopInputMode::Zip,
+                LoopInputMode::Broadcast,
+                LoopInputMode::Broadcast,
+                LoopInputMode::Broadcast,
+            ]) {
+                let position = scope
+                    .arguments(loop_node)
+                    .expect("scoped loop arguments")
+                    .iter()
+                    .position(|argument| argument == input)
+                    .expect("all formal lookup families are captured");
+                assert_eq!(spec.input_modes[position], expected);
+            }
+        }
         let parallel_bodies = built
             .graph
             .scopes()

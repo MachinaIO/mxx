@@ -21,7 +21,7 @@ use crate::{
     rhs::ExponentRhsPackage,
 };
 use mxx_bgg::BggPublicKeyWire;
-use mxx_dsl::{Bytes, Family, HashTag, Int, Mat, Parallel, ParallelZipTuple, Preimage};
+use mxx_dsl::{Bytes, Family, HashTag, Int, Mat, Preimage};
 use mxx_ir_core::{IntExpr, ParamEnv};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -140,7 +140,7 @@ impl ProgramCacheBatchBindings {
     /// storage using the symbolic outer-loop index.
     pub(crate) fn output(
         &self,
-        output: mxx_dsl::LoopIndex,
+        output: mxx_dsl::Int,
     ) -> Result<ProgramCacheBindings, ExponentLutError> {
         let mut selected = ProgramCacheBindings::new();
         for (&(step, body_gate), entry) in &self.family {
@@ -151,18 +151,21 @@ impl ProgramCacheBatchBindings {
                 }
                 ProgramCacheBatchFamily::OutputIndexed { count, values } => (*count, values),
             };
-            let base = output.as_int().mul(Int::constant(count));
+            let base = output.clone().mul(Int::constant(count));
             let values = values.clone();
             selected.insert_family(
                 step,
                 body_gate,
-                values
-                    .parallel_gather(
-                        Parallel::range(count)
-                            .map_values(move |index| base.clone().add(index.as_int()))
-                            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
-                    )
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
+                {
+                    let source_family = values;
+                    let gather_indices =
+                        mxx_dsl::parallel(count, |index| Ok(base.clone().add(index.clone())))
+                            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                    mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                        Ok(source_family.at(gather_indices.at(&family_index)))
+                    })
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
             );
         }
         Ok(selected)
@@ -625,8 +628,7 @@ impl ExponentLutPublicKeyCompiler {
         {
             return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
-        let mut state = Parallel::range(output_count)
-            .map_values(|_| initial.matrix.clone())
+        let mut state = mxx_dsl::parallel(output_count, |_| Ok(initial.matrix.clone()))
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         let mut cache = ProgramCacheBatchBindings::new(output_count)?;
         for (step, &(start, count)) in ranges.iter().enumerate() {
@@ -635,74 +637,135 @@ impl ExponentLutPublicKeyCompiler {
             }
             let flat_count =
                 output_count.checked_mul(count).ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
-            let output_indices = Parallel::range(flat_count)
-                .map_values(|index| index.as_int().div(Int::constant(count)))
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let local_indices = Parallel::range(flat_count)
-                .map_values(|index| index.as_int().rem(Int::constant(count)))
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let selector_indices = local_indices
-                .clone()
-                .parallel_map(|_, index| index.add(Int::constant(start)))
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let lhs = state
-                .clone()
-                .parallel_gather(output_indices.clone())
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let output_indices =
+                mxx_dsl::parallel(flat_count, |index| Ok(index.clone().div(Int::constant(count))))
+                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let local_indices =
+                mxx_dsl::parallel(flat_count, |index| Ok(index.clone().rem(Int::constant(count))))
+                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let selector_indices = {
+                let source_family = local_indices.clone();
+                mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                    let index = source_family.at(&family_index);
+                    let _ = family_index;
+                    Ok(index.add(Int::constant(start)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let lhs = {
+                let source_family = state.clone();
+                let gather_indices = output_indices.clone();
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             // Selector GSW material is setup-fixed and independent of the
             // output index. Keep one cache family and broadcast it online.
-            let shared_selector_decompositions = selectors
-                .gsw()
-                .clone()
-                .parallel_gather(
-                    Parallel::range(count)
-                        .map_values(|index| index.as_int().add(Int::constant(start)))
-                        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
-                )
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
-                .parallel_map_values(|_, matrix| {
-                    matrix.decompose(
+            let shared_selector_decompositions = {
+                let source_family = {
+                    let source_family = selectors.gsw().clone();
+                    let gather_indices = mxx_dsl::parallel(count, |index| {
+                        Ok(index.clone().add(Int::constant(start)))
+                    })
+                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                    mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                        Ok(source_family.at(gather_indices.at(&family_index)))
+                    })
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                    let matrix = source_family.at(&family_index);
+                    let _ = family_index;
+                    Ok(matrix.decompose(
                         self.public_key.base.clone(),
                         self.public_key.digit_count.clone(),
-                    )
+                    ))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let shared_for_outputs = shared_selector_decompositions.clone();
+            let selector_decompositions = {
+                let source_family = shared_for_outputs;
+                let gather_indices = mxx_dsl::parallel(flat_count, |index| {
+                    Ok(index.clone().rem(Int::constant(count)))
                 })
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let shared_for_outputs = shared_selector_decompositions.clone();
-            let selector_decompositions = shared_for_outputs
-                .parallel_gather(
-                    Parallel::range(flat_count)
-                        .map_values(move |index| index.as_int().rem(Int::constant(count)))
-                        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?,
-                )
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let selected = (lhs, selector_decompositions)
-                .parallel_zip_tuple(|_, (lhs, decomposition)| decomposition.mul_small_rhs(lhs))
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let selected = {
+                let source_families = (lhs, selector_decompositions);
+                if source_families.0.count() != source_families.1.count() {
+                    Err(mxx_dsl::DslError::Schema)
+                } else {
+                    mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                        let (lhs, decomposition) = (
+                            source_families.0.at(&family_index),
+                            source_families.1.at(&family_index),
+                        );
+                        let _ = family_index;
+                        Ok(decomposition.mul_small_rhs(lhs))
+                    })
+                }
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             cache.insert_shared_family(step, 0, count, shared_selector_decompositions)?;
 
-            let value_indices = (output_indices, selector_indices)
-                .parallel_zip_tuple(move |_, (output, source)| {
-                    output.mul(Int::constant(active_count)).add(source)
+            let value_indices = {
+                let source_families = (output_indices, selector_indices);
+                if source_families.0.count() != source_families.1.count() {
+                    Err(mxx_dsl::DslError::Schema)
+                } else {
+                    mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                        let (output, source) = (
+                            source_families.0.at(&family_index),
+                            source_families.1.at(&family_index),
+                        );
+                        let _ = family_index;
+                        Ok(output.mul(Int::constant(active_count)).add(source))
+                    })
+                }
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let values = {
+                let source_family = public_values.clone();
+                let gather_indices = value_indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
                 })
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let values = public_values
-                .clone()
-                .parallel_gather(value_indices)
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let selected_decompositions = selected
-                .clone()
-                .parallel_map_values(|_, matrix| {
-                    matrix.decompose(
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let selected_decompositions = {
+                let source_family = selected.clone();
+                mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                    let matrix = source_family.at(&family_index);
+                    let _ = family_index;
+                    Ok(matrix.decompose(
                         self.public_key.base.clone(),
                         self.public_key.digit_count.clone(),
-                    )
+                    ))
                 })
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            let weighted = (values, selected_decompositions.clone())
-                .parallel_zip_tuple(|_, (public, decomposition)| {
-                    decomposition.mul_small_rhs(public)
-                })
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            let weighted = {
+                let source_families = (values, selected_decompositions.clone());
+                if source_families.0.count() != source_families.1.count() {
+                    Err(mxx_dsl::DslError::Schema)
+                } else {
+                    mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                        let (public, decomposition) = (
+                            source_families.0.at(&family_index),
+                            source_families.1.at(&family_index),
+                        );
+                        let _ = family_index;
+                        Ok(decomposition.mul_small_rhs(public))
+                    })
+                }
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
             cache.insert_family(step, 1, count, selected_decompositions)?;
             state = reduce_family_segments(weighted, output_count, count)?;
         }
@@ -848,39 +911,56 @@ impl ExponentLutPublicKeyCompiler {
         .map_err(|_| ExponentLutError::InvalidLut)?;
         let masks = Family::pack(helpers.iter().map(|helper| helper.mask().clone()).collect())
             .map_err(|_| ExponentLutError::InvalidLut)?;
-        let branches = Family::try_parallel_zip_many_values(
-            vec![raw_publics, switches, masks],
-            move |_index, mut items| {
-                // The families were zipped as `[raw_publics, switches, masks]`;
-                // `pop` therefore yields the public mask, the concrete
-                // setup-fixed selector ciphertext `C_{sigma,L}`, then the
-                // automorphed public-key matrix `A^{\sigma}`.
-                let mask = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                // `mask` is the public matrix from the mask-alignment helper
-                // encoding. Its private vector switches the mask secret from
-                // `sigma(s)` back to `s` after the automorphed fixed-C Fuse;
-                // this public closure computes only that helper's projection.
-                let switch = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                // `switch` is the concrete setup-fixed GSW ciphertext
-                // `C_{sigma,L}`, wrapped below for fixed-RHS shape validation.
-                let raw = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                // `raw = A^\sigma` is the automorphed public-key matrix; no
-                // payload or plaintext term is formed on this public path.
-                let rhs = ExponentRhsPackage::new(switch).map_err(|_| mxx_dsl::DslError::Schema)?;
-                // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
-                let fused = rhs
-                    .gsw_ciphertext()
-                    .clone()
-                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                    .mul_small_rhs(raw);
-                // `decomp = G^{-1}(fused)` has the gadget-digit shape needed
-                // by `mask`; `mask * decomp` is the helper's public projection
-                // that accompanies the private vector-side alignment.
-                Ok(fused
-                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
-                    .mul_small_rhs(mask))
-            },
-        )
+        let branches = {
+            let source_families = vec![raw_publics, switches, masks];
+            if source_families.is_empty() ||
+                source_families.iter().any(|family| family.count() != source_families[0].count())
+            {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families[0].count().clone(), |_index| {
+                    let mut items =
+                        source_families.iter().map(|family| family.at(&_index)).collect::<Vec<_>>();
+                    {
+                        // The families were zipped as `[raw_publics, switches, masks]`;
+                        // `pop` therefore yields the public mask, the concrete
+                        // setup-fixed selector ciphertext `C_{sigma,L}`, then the
+                        // automorphed public-key matrix `A^{\sigma}`.
+                        let mask = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
+                        // `mask` is the public matrix from the mask-alignment helper
+                        // encoding. Its private vector switches the mask secret from
+                        // `sigma(s)` back to `s` after the automorphed fixed-C Fuse;
+                        // this public closure computes only that helper's projection.
+                        let switch = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
+                        // `switch` is the concrete setup-fixed GSW ciphertext
+                        // `C_{sigma,L}`, wrapped below for fixed-RHS shape validation.
+                        let raw = items.pop().ok_or(mxx_dsl::DslError::Schema)?;
+                        // `raw = A^\sigma` is the automorphed public-key matrix; no
+                        // payload or plaintext term is formed on this public path.
+                        let rhs = ExponentRhsPackage::new(switch)
+                            .map_err(|_| mxx_dsl::DslError::Schema)?;
+                        // `fused = A^{\sigma} G^{-1}(C_{sigma,L})` is still public.
+                        let fused = rhs
+                            .gsw_ciphertext()
+                            .clone()
+                            .decompose(
+                                self.public_key.base.clone(),
+                                self.public_key.digit_count.clone(),
+                            )
+                            .mul_small_rhs(raw);
+                        // `decomp = G^{-1}(fused)` has the gadget-digit shape needed
+                        // by `mask`; `mask * decomp` is the helper's public projection
+                        // that accompanies the private vector-side alignment.
+                        Ok(fused
+                            .decompose(
+                                self.public_key.base.clone(),
+                                self.public_key.digit_count.clone(),
+                            )
+                            .mul_small_rhs(mask))
+                    }
+                })
+            }
+        }
         .map_err(|_| ExponentLutError::InvalidLut)?;
         balanced_sum_family(branches)
     }
@@ -927,11 +1007,20 @@ impl ExponentLutPublicKeyCompiler {
         }
         let masks = Family::pack(helpers.iter().map(|helper| helper.mask().clone()).collect())
             .map_err(|_| ExponentLutError::InvalidLut)?;
-        let aligned = (masks, cache.branch.clone())
-            .parallel_zip_tuple_result(|_, (mask, decomposition)| {
-                Ok(decomposition.mul_small_rhs(mask))
-            })
-            .map_err(|_| ExponentLutError::InvalidLut)?;
+        let aligned = {
+            let source_families = (masks, cache.branch.clone());
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (mask, decomposition) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(decomposition.mul_small_rhs(mask))
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         let _ = input;
         balanced_sum_family(aligned)
     }
@@ -990,7 +1079,7 @@ impl ExponentLutPublicKeyCompiler {
     ) -> Result<ProgramLutCache, ExponentLutError> {
         let member_count = concrete_mat_family_count(inputs)?;
         let width = table.values().len();
-        let first = inputs.get(Int::constant(0));
+        let first = inputs.at(Int::constant(0));
         let n = first
             .matrix_type()
             .ring_dimension
@@ -1021,39 +1110,63 @@ impl ExponentLutPublicKeyCompiler {
         )
         .map_err(|_| ExponentLutError::InvalidLut)?;
         let flat_count = member_count.checked_mul(width).ok_or(ExponentLutError::InvalidLut)?;
-        let member_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().div(Int::constant(width)))
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let flat_inputs = inputs
-            .clone()
-            .parallel_gather(member_indices)
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let flat_switches = switch_base
-            .parallel_gather(
-                Parallel::range(flat_count)
-                    .map_values(|index| index.as_int().rem(Int::constant(width)))
-                    .map_err(|_| ExponentLutError::InvalidLut)?,
-            )
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let sigma_values = sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
-        let branches = (flat_inputs, flat_switches.clone())
-            .parallel_zip_tuple(move |index, (input, switch)| {
-                let flat = index.expression();
-                let divisor = IntExpr::constant(width);
-                let branch = IntExpr::Sub(
-                    Box::new(flat.clone()),
-                    Box::new(IntExpr::Mul(
-                        Box::new(IntExpr::Div(Box::new(flat), Box::new(divisor.clone()))),
-                        Box::new(divisor),
-                    )),
-                );
-                let sigma =
-                    IntExpr::Select { selector: Box::new(branch), branches: sigma_values.clone() };
-                switch
-                    .mul_small_rhs(input.ring_automorphism(sigma))
-                    .decompose(self.public_key.base.clone(), self.public_key.digit_count.clone())
+        let member_indices =
+            mxx_dsl::parallel(flat_count, |index| Ok(index.clone().div(Int::constant(width))))
+                .map_err(|_| ExponentLutError::InvalidLut)?;
+        let flat_inputs = {
+            let source_family = inputs.clone();
+            let gather_indices = member_indices;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
             })
-            .map_err(|_| ExponentLutError::InvalidLut)?;
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let flat_switches = {
+            let source_family = switch_base;
+            let gather_indices =
+                mxx_dsl::parallel(flat_count, |index| Ok(index.clone().rem(Int::constant(width))))
+                    .map_err(|_| ExponentLutError::InvalidLut)?;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let sigma_values = sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
+        let branches = {
+            let source_families = (flat_inputs, flat_switches.clone());
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (input, switch) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let index = family_index;
+                    Ok({
+                        let flat = index.expression()?;
+                        let divisor = IntExpr::constant(width);
+                        let branch = IntExpr::Sub(
+                            Box::new(flat.clone()),
+                            Box::new(IntExpr::Mul(
+                                Box::new(IntExpr::FloorDiv(
+                                    Box::new(flat),
+                                    Box::new(divisor.clone()),
+                                )),
+                                Box::new(divisor),
+                            )),
+                        );
+                        let sigma = IntExpr::Select {
+                            selector: Box::new(branch),
+                            branches: sigma_values.clone(),
+                        };
+                        switch.mul_small_rhs(input.ring_automorphism(sigma)).decompose(
+                            self.public_key.base.clone(),
+                            self.public_key.digit_count.clone(),
+                        )
+                    })
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         Ok(ProgramLutCache { switch: flat_switches, branch: branches })
     }
 
@@ -1072,16 +1185,33 @@ impl ExponentLutPublicKeyCompiler {
         {
             return Err(ExponentLutError::InvalidLut);
         }
-        let branch_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().rem(Int::constant(width)))
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let masks = Family::pack(helpers.iter().map(|helper| helper.mask().clone()).collect())
-            .map_err(|_| ExponentLutError::InvalidLut)?
-            .parallel_gather(branch_indices)
-            .map_err(|_| ExponentLutError::InvalidLut)?;
-        let aligned = (masks, cache.branch.clone())
-            .parallel_zip_tuple_result(|_, (mask, branch)| Ok(branch.mul_small_rhs(mask)))
-            .map_err(|_| ExponentLutError::InvalidLut)?;
+        let branch_indices =
+            mxx_dsl::parallel(flat_count, |index| Ok(index.clone().rem(Int::constant(width))))
+                .map_err(|_| ExponentLutError::InvalidLut)?;
+        let masks = {
+            let source_family =
+                Family::pack(helpers.iter().map(|helper| helper.mask().clone()).collect())
+                    .map_err(|_| ExponentLutError::InvalidLut)?;
+            let gather_indices = branch_indices;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
+        let aligned = {
+            let source_families = (masks, cache.branch.clone());
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (mask, branch) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(branch.mul_small_rhs(mask))
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidLut)?;
         reduce_family_segments(aligned, member_count, width)
     }
 
@@ -1117,14 +1247,22 @@ impl ExponentLutPublicKeyCompiler {
         {
             return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
-        let inputs = Parallel::range(count)
-            .map_values(|_| input.matrix.clone())
+        let inputs = mxx_dsl::parallel(count, |_| Ok(input.matrix.clone()))
             .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-        let matrices = (inputs, decompositions)
-            .parallel_zip_tuple_result(|_, (matrix, decomposition)| {
-                Ok(decomposition.mul_small_rhs(matrix))
-            })
-            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+        let matrices = {
+            let source_families = (inputs, decompositions);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (matrix, decomposition) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(decomposition.mul_small_rhs(matrix))
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         Ok(PublicFamilyIntermediate { matrices })
     }
 
@@ -1161,19 +1299,31 @@ impl ExponentLutPublicKeyCompiler {
         {
             return Err(ExponentLutError::InvalidSparseLwrBlock);
         }
-        let indices = Parallel::range(count)
-            .map_values(|index| index.as_int().add(mxx_dsl::Int::constant(start)))
-            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-        let values = values
-            .matrices()
-            .clone()
-            .parallel_gather(indices)
-            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-        let matrices = (values, decompositions)
-            .parallel_zip_tuple_result(|_, (value, decomposition)| {
-                Ok(decomposition.mul_small_rhs(value))
+        let indices =
+            mxx_dsl::parallel(count, |index| Ok(index.clone().add(mxx_dsl::Int::constant(start))))
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+        let values = {
+            let source_family = values.matrices().clone();
+            let gather_indices = indices;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
             })
-            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+        }
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+        let matrices = {
+            let source_families = (values, decompositions);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (value, decomposition) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(decomposition.mul_small_rhs(value))
+                })
+            }
+        }
+        .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
         Ok(PublicFamilyIntermediate { matrices })
     }
 
@@ -1268,21 +1418,29 @@ impl ExponentProgramLowering for PublicProgramLowering<'_> {
                     .ok()
                     .and_then(|value| value.to_usize())
                     .ok_or(ExponentLutError::InvalidSparseLwrBlock)?;
-                let indices = Parallel::range(count)
-                    .map_values(|index| index.as_int().add(mxx_dsl::Int::constant(start)))
+                let indices = mxx_dsl::parallel(count, |index| {
+                    Ok(index.clone().add(mxx_dsl::Int::constant(start)))
+                })
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let decompositions = {
+                    let source_family = {
+                        let source_family = selectors.gsw().clone();
+                        let gather_indices = indices;
+                        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                            Ok(source_family.at(gather_indices.at(&family_index)))
+                        })
+                    }
                     .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-                let decompositions = selectors
-                    .gsw()
-                    .clone()
-                    .parallel_gather(indices)
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?
-                    .parallel_map_values(|_, matrix| {
-                        matrix.decompose(
+                    mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                        let matrix = source_family.at(&family_index);
+                        let _ = family_index;
+                        Ok(matrix.decompose(
                             self.compiler.public_key.base.clone(),
                             self.compiler.public_key.digit_count.clone(),
-                        )
+                        ))
                     })
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 if let Some(cache) = &mut self.cache {
                     cache.insert_family(step, gate, decompositions.clone());
                 }
@@ -1328,16 +1486,18 @@ impl ExponentProgramLowering for PublicProgramLowering<'_> {
                 PublicProgramWire::Members(values),
                 ProgramGateInstance::FamilyGate { step, gate },
             ) => {
-                let decompositions = private
-                    .matrices
-                    .clone()
-                    .parallel_map_values(|_, matrix| {
-                        matrix.decompose(
+                let decompositions = {
+                    let source_family = private.matrices.clone();
+                    mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                        let matrix = source_family.at(&family_index);
+                        let _ = family_index;
+                        Ok(matrix.decompose(
                             self.compiler.public_key.base.clone(),
                             self.compiler.public_key.digit_count.clone(),
-                        )
+                        ))
                     })
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 if let Some(cache) = &mut self.cache {
                     cache.insert_family(step, gate, decompositions.clone());
                 }
@@ -1367,9 +1527,22 @@ impl ExponentProgramLowering for PublicProgramLowering<'_> {
                 PublicProgramWire::Materialized { value: lhs, range },
                 PublicProgramWire::Materialized { value: rhs, range: rhs_range },
             ) if range == rhs_range => {
-                let matrices = (lhs.matrices.clone(), rhs.matrices.clone())
-                    .parallel_zip_tuple_result(|_, (lhs, rhs)| Ok(lhs + rhs))
-                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+                let matrices = {
+                    let source_families = (lhs.matrices.clone(), rhs.matrices.clone());
+                    if source_families.0.count() != source_families.1.count() {
+                        Err(mxx_dsl::DslError::Schema)
+                    } else {
+                        mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                            let (lhs, rhs) = (
+                                source_families.0.at(&family_index),
+                                source_families.1.at(&family_index),
+                            );
+                            let _ = family_index;
+                            Ok(lhs + rhs)
+                        })
+                    }
+                }
+                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
                 Ok(PublicProgramWire::Materialized {
                     value: PublicFamilyIntermediate { matrices },
                     range: range.clone(),
@@ -1498,19 +1671,21 @@ fn active_public_family(
             Ok(value.matrices.clone())
         }
         PublicProgramWire::Broadcast { value, range } if range == expected_range => {
-            Parallel::range(count)
-                .map_values(|_| value.matrix.clone())
+            mxx_dsl::parallel(count, |_| Ok(value.matrix.clone()))
                 .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)
         }
         PublicProgramWire::Members(values) => {
-            let indices = Parallel::range(count)
-                .map_values(|index| index.as_int().add(Int::constant(start)))
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
-            values
-                .matrices()
-                .clone()
-                .parallel_gather(indices)
-                .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)
+            let indices =
+                mxx_dsl::parallel(count, |index| Ok(index.clone().add(Int::constant(start))))
+                    .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)?;
+            {
+                let source_family = values.matrices().clone();
+                let gather_indices = indices;
+                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                    Ok(source_family.at(gather_indices.at(&family_index)))
+                })
+            }
+            .map_err(|_| ExponentLutError::InvalidSparseLwrBlock)
         }
         _ => Err(ExponentLutError::InvalidSparseLwrBlock),
     }

@@ -18,7 +18,7 @@ use crate::{
     noise_refresh::artifacts::ReadoutCacheImportError,
 };
 use mxx_bgg::{BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
-use mxx_dsl::{Family, Int, Mat, Parallel, ParallelZipTuple, Preimage, Ring};
+use mxx_dsl::{Family, Int, Mat, Preimage, Ring};
 use mxx_ir_core::{IntExpr, ParamEnv, artifact::ArtifactType, types::ConcreteMatrixType};
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, ToPrimitive, Zero};
@@ -440,7 +440,7 @@ impl ValueReadout {
             return Err(ValueReadoutError::InvalidPreimageSchema);
         }
         validate_encoding_action_preimage_schema_type(
-            &target_decompositions.get_static(0),
+            &target_decompositions.at(0),
             input_type,
             &target_schema.gadget_base,
             target_schema.digit_count,
@@ -461,102 +461,173 @@ impl ValueReadout {
         let target = self.target(&ring)?;
         let target_for_labels = target.clone();
         let label_compiler = compiler.clone();
-        let transformed = (inputs, target_decompositions)
-            .parallel_zip_tuple(move |_, (vector, target_decomposition)| {
-                label_compiler
-                    .large_scalar_mul(
-                        &BggEncodingWire { vector, plaintext: None },
-                        &target_for_labels,
-                        target_decomposition,
-                    )
-                    .vector
-            })
-            .map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "transform readout input family",
-                    detail: error.to_string(),
+        let transformed = {
+            let source_families = (inputs, target_decompositions);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (vector, target_decomposition) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok({
+                        label_compiler
+                            .large_scalar_mul(
+                                &BggEncodingWire { vector, plaintext: None },
+                                &target_for_labels,
+                                target_decomposition,
+                            )
+                            .vector
+                    })
                 })
-            })?;
+            }
+        }
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "transform readout input family",
+                detail: error.to_string(),
+            })
+        })?;
         let flat_count =
             label_count.checked_mul(helper_count).ok_or(ValueReadoutError::InvalidTraceSet)?;
-        let helper_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().rem(Int::constant(helper_count)))
-            .map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "index aligned readout masks",
-                    detail: error.to_string(),
-                })
-            })?;
-        let flat_masks = masks.parallel_gather(helper_indices.clone()).map_err(|error| {
+        let helper_indices = mxx_dsl::parallel(flat_count, |index| {
+            Ok(index.clone().rem(Int::constant(helper_count)))
+        })
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "index aligned readout masks",
+                detail: error.to_string(),
+            })
+        })?;
+        let flat_masks = {
+            let source_family = masks;
+            let gather_indices = helper_indices.clone();
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|error| {
             ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
                 stage: "gather aligned readout masks",
                 detail: error.to_string(),
             })
         })?;
-        let aligned_public = (flat_masks, public_decompositions)
-            .parallel_zip_tuple(|_, (mask, public)| public.mul_small_rhs(mask))
-            .map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "align readout public helper family",
-                    detail: error.to_string(),
+        let aligned_public = {
+            let source_families = (flat_masks, public_decompositions);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (mask, public) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(public.mul_small_rhs(mask))
                 })
-            })?;
+            }
+        }
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "align readout public helper family",
+                detail: error.to_string(),
+            })
+        })?;
 
-        let label_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().div(Int::constant(helper_count)))
-            .map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "index readout label family",
-                    detail: error.to_string(),
-                })
-            })?;
-        let flat_transformed =
-            transformed.clone().parallel_gather(label_indices).map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "gather readout labels",
-                    detail: error.to_string(),
-                })
-            })?;
+        let label_indices = mxx_dsl::parallel(flat_count, |index| {
+            Ok(index.clone().div(Int::constant(helper_count)))
+        })
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "index readout label family",
+                detail: error.to_string(),
+            })
+        })?;
+        let flat_transformed = {
+            let source_family = transformed.clone();
+            let gather_indices = label_indices;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "gather readout labels",
+                detail: error.to_string(),
+            })
+        })?;
         let flat_aligned = aligned_public;
-        let flat_switches = switch_decompositions
-            .parallel_gather(
-                Parallel::range(flat_count)
-                    .map_values(|index| index.as_int().rem(Int::constant(helper_count)))
-                    .map_err(|error| {
-                        ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                            stage: "index readout switches",
-                            detail: error.to_string(),
-                        })
-                    })?,
-            )
-            .map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "reindex readout switches",
-                    detail: error.to_string(),
-                })
-            })?;
-        let sigma_branches =
-            helper_sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
-        let helper_vectors = (flat_transformed, flat_aligned, flat_switches)
-            .parallel_zip_tuple(move |index, (transformed, aligned, switch)| {
-                let sigma = helper_sigma_for_flat_index(index.expression(), sigma_branches.clone());
-                aligned + switch.mul_small_rhs(transformed.ring_automorphism(sigma))
+        let flat_switches = {
+            let source_family = switch_decompositions;
+            let gather_indices = mxx_dsl::parallel(flat_count, |index| {
+                Ok(index.clone().rem(Int::constant(helper_count)))
             })
             .map_err(|error| {
                 ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "construct flat readout helper family",
+                    stage: "index readout switches",
                     detail: error.to_string(),
                 })
             })?;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "reindex readout switches",
+                detail: error.to_string(),
+            })
+        })?;
+        let sigma_branches =
+            helper_sigmas.iter().copied().map(IntExpr::constant).collect::<Vec<_>>();
+        let helper_vectors = {
+            let source_families = (flat_transformed, flat_aligned, flat_switches);
+            if source_families.0.count() != source_families.1.count() ||
+                source_families.0.count() != source_families.2.count()
+            {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (transformed, aligned, switch) = (
+                        source_families.0.at(&family_index),
+                        source_families.1.at(&family_index),
+                        source_families.2.at(&family_index),
+                    );
+                    let index = family_index;
+                    Ok({
+                        let sigma = helper_sigma_for_flat_index(
+                            index.expression()?,
+                            sigma_branches.clone(),
+                        );
+                        aligned + switch.mul_small_rhs(transformed.ring_automorphism(sigma))
+                    })
+                })
+            }
+        }
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "construct flat readout helper family",
+                detail: error.to_string(),
+            })
+        })?;
         let helper_sums = reduce_matrix_family_segments(helper_vectors, label_count, helper_count)?;
-        let traced = (transformed, helper_sums)
-            .parallel_zip_tuple(|_, (identity, helpers)| identity + helpers)
-            .map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "add readout identity branches",
-                    detail: error.to_string(),
+        let traced = {
+            let source_families = (transformed, helper_sums);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (identity, helpers) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(identity + helpers)
                 })
-            })?;
+            }
+        }
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "add readout identity branches",
+                detail: error.to_string(),
+            })
+        })?;
 
         let denominator = normalization_denominator(&self.layout, ring_dimension)?;
         let modulus = ring
@@ -575,22 +646,28 @@ impl ValueReadout {
         )?;
         let normalization_scalar = ring.polynomial([inverse.into()]);
         let normalization_compiler = compiler.clone();
-        traced
-            .parallel_map_values(move |_, vector| {
-                normalization_compiler
-                    .large_scalar_mul(
-                        &BggEncodingWire { vector, plaintext: None },
-                        &normalization_scalar,
-                        normalization_decomposition.clone(),
-                    )
-                    .vector
-            })
-            .map_err(|error| {
-                ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
-                    stage: "normalize readout output family",
-                    detail: error.to_string(),
+        {
+            let source_family = traced;
+            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                let vector = source_family.at(&family_index);
+                let _ = family_index;
+                Ok({
+                    normalization_compiler
+                        .large_scalar_mul(
+                            &BggEncodingWire { vector, plaintext: None },
+                            &normalization_scalar,
+                            normalization_decomposition.clone(),
+                        )
+                        .vector
                 })
             })
+        }
+        .map_err(|error| {
+            ValueReadoutError::Graph(crate::ExponentLutError::OnlinePrfStage {
+                stage: "normalize readout output family",
+                detail: error.to_string(),
+            })
+        })
     }
 
     /// Creates a readout declaration after checking the table's structural
@@ -1033,39 +1110,78 @@ impl ValueReadout {
             return Err(ValueReadoutError::InvalidPreimageSchema);
         }
         validate_preimage_schema(
-            &target_decompositions.get_static(0),
-            &inputs.get_static(0),
+            &target_decompositions.at(0),
+            &inputs.at(0),
             &gadget_base,
             digit_count,
             Some(&target_schema.max_coefficient_bound),
         )?;
         validate_family_preimage_shape(
             public_decompositions.element_type(),
-            &inputs.get_static(0),
+            &inputs.at(0),
             digit_count,
         )?;
-        validate_family_output_shape(masks.element_type(), &inputs.get_static(0), &ring)?;
+        validate_family_output_shape(masks.element_type(), &inputs.at(0), &ring)?;
 
         if *target_decompositions.count() != IntExpr::constant(output_count) {
             return Err(ValueReadoutError::InvalidTraceSet);
         }
-        let transformed = (inputs, target_decompositions)
-            .parallel_zip_tuple(|_, (input, target)| target.mul_small_rhs(input))
-            .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
-        let helper_indices = Parallel::range(flat_count)
-            .map_values(|index| index.as_int().rem(Int::constant(helper_count)))
-            .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
-        let flat_masks = masks
-            .parallel_gather(helper_indices)
-            .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
-        let helper_branches = (public_decompositions, flat_masks)
-            .parallel_zip_tuple(|_, (public, mask)| public.mul_small_rhs(mask))
-            .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
+        let transformed = {
+            let source_families = (inputs, target_decompositions);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (input, target) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(target.mul_small_rhs(input))
+                })
+            }
+        }
+        .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
+        let helper_indices = mxx_dsl::parallel(flat_count, |index| {
+            Ok(index.clone().rem(Int::constant(helper_count)))
+        })
+        .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
+        let flat_masks = {
+            let source_family = masks;
+            let gather_indices = helper_indices;
+            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
+                Ok(source_family.at(gather_indices.at(&family_index)))
+            })
+        }
+        .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
+        let helper_branches = {
+            let source_families = (public_decompositions, flat_masks);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (public, mask) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(public.mul_small_rhs(mask))
+                })
+            }
+        }
+        .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
         let helper_sums =
             reduce_matrix_family_segments(helper_branches, output_count, helper_count)?;
-        let traced = (transformed, helper_sums)
-            .parallel_zip_tuple(|_, (identity, helpers)| identity + helpers)
-            .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
+        let traced = {
+            let source_families = (transformed, helper_sums);
+            if source_families.0.count() != source_families.1.count() {
+                Err(mxx_dsl::DslError::Schema)
+            } else {
+                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
+                    let (identity, helpers) =
+                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
+                    let _ = family_index;
+                    Ok(identity + helpers)
+                })
+            }
+        }
+        .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))?;
         let denominator = normalization_denominator(&self.layout, ring_dimension)?;
         let modulus = ring
             .matrix_type((1, 1))
@@ -1076,16 +1192,20 @@ impl ValueReadout {
             .ok_or(ValueReadoutError::NonInvertibleNormalization)?;
         validate_preimage_schema(
             &normalization_decomposition,
-            &traced.get_static(0),
+            &traced.at(0),
             &normalization_schema.gadget_base,
             normalization_schema.digit_count,
             Some(&normalization_schema.max_coefficient_bound),
         )?;
-        traced
-            .parallel_map_values(|_, matrix| {
-                normalization_decomposition.clone().mul_small_rhs(matrix)
+        {
+            let source_family = traced;
+            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
+                let matrix = source_family.at(&family_index);
+                let _ = family_index;
+                Ok(normalization_decomposition.clone().mul_small_rhs(matrix))
             })
-            .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))
+        }
+        .map_err(|_| ValueReadoutError::Graph(crate::ExponentLutError::InvalidLut))
     }
 
     /// Returns the normalization descriptor `(2*n')^-1` for this ring.

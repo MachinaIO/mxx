@@ -1959,6 +1959,35 @@ impl Backend for GpuDcrtBackend {
     type Trapdoor = GpuFleetTrapdoor;
     type Error = PolyBackendError;
 
+    fn polynomial_from_values(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        values: &[BigInt],
+        evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.devices[0]
+            .1
+            .polynomial_from_values(ty, values, evaluation)
+            .map(GpuFleetMatrix::from_matrix)
+    }
+
+    fn polynomial_values(
+        &mut self,
+        value: &Self::Matrix,
+        evaluation: bool,
+    ) -> Result<Vec<BigInt>, Self::Error> {
+        if value.size() != (1, 1) || value.shards.len() != 1 {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let first = &value.shards[0];
+        let device = self
+            .devices
+            .iter()
+            .position(|(id, _)| *id == first.device_id)
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        self.devices[device].1.polynomial_values(&first.value, evaluation)
+    }
+
     fn select_gpu_operation(&mut self, operation: [u8; 32]) -> Result<(), Self::Error> {
         self.select_operation(operation)
     }
@@ -2348,6 +2377,14 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         self.unary_columns(value, |backend, input| backend.modulus_switch(input, destination))
+    }
+
+    fn centered_rebase(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.centered_rebase(input, destination))
     }
 
     fn reduce_modulus(

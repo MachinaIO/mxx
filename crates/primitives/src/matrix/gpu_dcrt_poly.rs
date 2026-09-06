@@ -12,10 +12,10 @@ use crate::{
                 GpuRngSeed, GpuSmallMatrixAllocationReportRaw, GpuSmallMatrixOpaque,
                 PinnedHostBuffer, check_status, gpu_event_set_destroy, gpu_event_set_wait,
                 gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_binary_batch,
-                gpu_matrix_convert_modulus, gpu_matrix_copy, gpu_matrix_copy_block,
-                gpu_matrix_copy_peer, gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
-                gpu_matrix_crt_recompose, gpu_matrix_decompose_base,
-                gpu_matrix_decompose_base_small, gpu_matrix_destroy,
+                gpu_matrix_centered_rebase, gpu_matrix_convert_modulus, gpu_matrix_copy,
+                gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
+                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
+                gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
                 gpu_matrix_fill_gadget_columns, gpu_matrix_fill_identity_columns,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_unit_row_columns,
@@ -3507,6 +3507,31 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         self.convert_modulus(destination, false)
     }
 
+    fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String> {
+        if self.params.ring_dimension() != destination.ring_dimension() ||
+            self.params.crt_depth() != 1 ||
+            self.level != 0 ||
+            self.params.execution_owner_id() != destination.execution_owner_id()
+        {
+            return Err("centered rebase requires matching dimensions, shared execution, and one source CRT limb".into());
+        }
+        let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
+        let source = coefficients.as_ref().unwrap_or(self);
+        let mut output = Self::new_empty_with_state(
+            destination,
+            self.nrow,
+            self.ncol,
+            destination.crt_depth() - 1,
+            false,
+        );
+        let status = unsafe { gpu_matrix_centered_rebase(output.raw, source.raw) };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        output.ntt_all_in_place();
+        Ok(output)
+    }
+
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
         debug_assert_eq!(self.ncol, other.nrow * identity_size);
         let slice_width = other.nrow;
@@ -6249,6 +6274,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_centered_rebase_matches_cpu() {
+        let (dimension, _, _, base_bits) = crate::env::modulus_conversion_test_parameters();
+        // Exercise both device storage widths and target moduli smaller than the lift magnitude.
+        let narrow = DCRTPolyParams::new(dimension, 1, 17, base_bits, None, None);
+        let wide = DCRTPolyParams::new(dimension, 1, 59, base_bits, None, None);
+        let target_cpu = DCRTPolyParams::new(
+            dimension,
+            2,
+            59,
+            base_bits,
+            Some(vec![narrow.to_crt().0[0], wide.to_crt().0[0]]),
+            None,
+        );
+        let target = gpu_params_from_cpu(&target_cpu);
+        let mut random = rng();
+        for source_cpu in [narrow, wide] {
+            let source = GpuDCRTPolyParams::new_with_gpu(
+                dimension,
+                source_cpu.to_crt().0,
+                base_bits,
+                target.gpu_ids().to_vec(),
+                Some(1),
+                Some(&target),
+                None,
+            );
+            let modulus = source.moduli()[0];
+            let cases = [0, 1, modulus / 2, modulus / 2 + 1, modulus - 1];
+            for (rows, columns) in [(1, 1), (2, 3)] {
+                let cpu = DCRTPolyMatrix::from_poly_vec(
+                    &source_cpu,
+                    (0..rows)
+                        .map(|row| {
+                            (0..columns)
+                                .map(|column| {
+                                    let coefficients = (0..dimension as usize)
+                                        .map(|index| {
+                                            BigUint::from(if index < cases.len() {
+                                                cases
+                                                    [(index + row * columns + column) % cases.len()]
+                                            } else {
+                                                random.random_range(0..modulus)
+                                            })
+                                        })
+                                        .collect::<Vec<_>>();
+                                    DCRTPoly::from_biguints(&source_cpu, &coefficients)
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                );
+                let expected = cpu.centered_rebase(&target_cpu).unwrap();
+                let eval = GpuDCRTPolyMatrix::from_cpu_matrix(&source, &cpu);
+                let coefficients = eval.clone().into_coeff_domain();
+                for input in [&eval, &coefficients] {
+                    let rebased = input.centered_rebase(&target).unwrap();
+                    assert!(rebased.is_ntt());
+                    assert_eq!(rebased.to_cpu_matrix(), expected);
+                }
+                // Dropping the source immediately exercises the kernel's consumer event.
+                let rebased = eval.centered_rebase(&target).unwrap();
+                drop(eval);
+                drop(coefficients);
+                assert_eq!(rebased.to_cpu_matrix(), expected);
+            }
+        }
+        let multi_limb = GpuDCRTPolyMatrix::zero(&target, 1, 1);
+        assert!(multi_limb.centered_rebase(&target).is_err());
+        let source_cpu = DCRTPolyParams::new(dimension, 1, 17, base_bits, None, None);
+        let unregistered = gpu_params_from_cpu(&source_cpu);
+        assert!(GpuDCRTPolyMatrix::zero(&unregistered, 1, 1).centered_rebase(&target).is_err());
+        let incompatible =
+            gpu_params_from_cpu(&DCRTPolyParams::new(dimension * 2, 1, 17, base_bits, None, None));
+        assert!(
+            GpuDCRTPolyMatrix::zero(&unregistered, 1, 1).centered_rebase(&incompatible).is_err()
+        );
     }
 
     #[test]

@@ -61,6 +61,7 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
             NodeKind::RingAutomorphism { .. } |
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredRebase { .. } |
             NodeKind::MatrixBinary(_) |
             NodeKind::MatrixMulAccumulate { .. } |
             NodeKind::MatrixMulSmallRhs |
@@ -232,6 +233,7 @@ pub fn gpu_calibration_operation_identity(
         NodeKind::MatrixScale { .. } |
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
+        NodeKind::CenteredRebase { .. } |
         NodeKind::MatrixNegate => {
             if let Some(input) = argument_types.first_mut() {
                 one_column(input);

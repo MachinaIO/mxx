@@ -15,6 +15,8 @@ extern "C"
         const uint64_t *reconstruction_residues,
         size_t reconstruction_stride);
 
+    int gpu_matrix_centered_rebase(GpuMatrix *out, const GpuMatrix *source);
+
     int gpu_matrix_convert_modulus(
         GpuMatrix *out,
         const GpuMatrix *source,

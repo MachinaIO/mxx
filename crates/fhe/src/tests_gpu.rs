@@ -1,0 +1,347 @@
+//! GPU execution of the production FHE graphs; all artifacts stay in memory.
+use crate::{BgvCiphertext, BgvParams, FheCommonParams, FheScheme, RingGswParams, utils::common};
+use mxx_dsl::{DslContext, Ring};
+use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality};
+use mxx_primitives::poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams};
+use mxx_runtime::{
+    ExecutionResult, MemoryArtifactStore, RuntimeValue,
+    backend::poly_gpu::{GpuDcrtBackend, gpu_backend},
+    execute,
+    transcript::SamplingMode,
+};
+use num_bigint::{BigInt, BigUint};
+use num_integer::Integer;
+use std::collections::BTreeMap;
+
+fn configure_widths(backend: &mut GpuDcrtBackend, graph: &mxx_ir_core::ValidatedGraph) {
+    use mxx_runtime::gpu_calibration::{
+        GpuColumnWidths, gpu_calibration_operation_identity,
+        gpu_operation_is_column_separable_for_types,
+    };
+    // Correctness fixtures allocate their complete output widths explicitly.
+    // Avoid measuring the shared CUDA pool while another test owns a context,
+    // without serializing tests or fabricating a measured calibration profile.
+    let mut widths = BTreeMap::<[u8; 32], usize>::new();
+    for (id, validated) in &graph.scopes {
+        let scope = graph.source.scope(id).unwrap();
+        for node in &validated.execution_order {
+            let arguments = scope
+                .arguments(node)
+                .unwrap()
+                .iter()
+                .map(|wire| validated.wire_types[wire].clone())
+                .collect::<Vec<_>>();
+            if !gpu_operation_is_column_separable_for_types(node.kind(), &arguments) {
+                continue;
+            }
+            let outputs = (0..node.output_types().len())
+                .map(|port| {
+                    validated.wire_types
+                        [&scope.wire_ref(&node.output(port as u32).unwrap()).unwrap()]
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let identity = gpu_calibration_operation_identity(
+                node.kind(),
+                &arguments,
+                &outputs,
+                &graph.bindings,
+            )
+            .unwrap();
+            let width = outputs
+                .iter()
+                .filter_map(|ty| ty.matrix_type())
+                .map(|ty| ty.columns)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            widths.entry(identity).and_modify(|old| *old = (*old).max(width)).or_insert(width);
+        }
+    }
+    for (identity, width) in widths {
+        backend.set_column_widths_for_operation(
+            identity,
+            GpuColumnWidths { gpu0: width, nonzero: Some(width) },
+        );
+    }
+}
+
+fn backend(common: &FheCommonParams, plaintext_modulus: Option<u64>) -> GpuDcrtBackend {
+    let (primes, _, depth) = common.ring.to_crt();
+    let mut rings =
+        (0..depth).map(|level| common.parameters_at(level).unwrap()).collect::<Vec<_>>();
+    rings.extend(primes.iter().map(|p| common.ring.select_modulus(&BigUint::from(*p)).unwrap()));
+    if let Some(t) = plaintext_modulus {
+        rings.push(BgvParams::new(common.clone(), t).unwrap().batching_parameters().unwrap());
+    }
+    gpu_backend(
+        rings
+            .iter()
+            .map(|p| GpuDCRTPolyParams::new(p.ring_dimension(), p.to_crt().0, p.base_bits(), None)),
+    )
+}
+
+fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
+    RuntimeValue::IndexedFamily(
+        values.iter().map(|v| RuntimeValue::Int(BigInt::from(*v))).collect(),
+    )
+}
+
+fn values(
+    result: &mut ExecutionResult<GpuDcrtBackend>,
+    name: &str,
+    backend: &GpuDcrtBackend,
+    store: &mut MemoryArtifactStore,
+) -> Vec<BigInt> {
+    let RuntimeValue::IndexedFamily(values) =
+        result.materialize_output(name, backend, store).unwrap()
+    else {
+        panic!("integer family")
+    };
+    values
+        .iter()
+        .map(|v| {
+            let RuntimeValue::Int(v) = v else { panic!("integer") };
+            v.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn test_gpu_fhe_ring_gsw_runtime() {
+    let common = common();
+    let n = common.ring.ring_dimension() as usize;
+    let scheme =
+        RingGswParams::new(common.clone(), BigUint::from(1u64 << 22), BigUint::from(2u8)).unwrap();
+    let context = DslContext::new("gpu-ring-gsw");
+    let message = context.int_family_input("message", n);
+    let multiplier = context.int_family_input("multiplier", n);
+    let (secret, key) = scheme.keygen().unwrap();
+    let ct = scheme.encrypt(&key, &common.ring().from_coefficients(&message)).unwrap();
+    let gsw = scheme.encrypt_gsw(&secret, &common.ring().from_coefficients(&multiplier)).unwrap();
+    let product = scheme.mul(&ct, &gsw, &()).unwrap();
+    let sum = scheme.add(&ct, &ct).unwrap();
+    let graph = context
+        .private_output("roundtrip", scheme.decrypt(&secret, &ct).unwrap().coefficients())
+        .unwrap()
+        .private_output("sum", scheme.decrypt(&secret, &sum).unwrap().coefficients())
+        .unwrap()
+        .private_output("product", scheme.decrypt(&secret, &product).unwrap().coefficients())
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let message = (0..n).map(|i| i as i64 % 5 - 2).collect::<Vec<_>>();
+    let mut multiplier = vec![0; n];
+    multiplier[1] = 1;
+    let mut backend = backend(&common, None);
+    let mut store = MemoryArtifactStore::default();
+    configure_widths(&mut backend, &graph);
+    let mut result = execute(
+        &graph,
+        &mut backend,
+        BTreeMap::from([
+            ("message".into(), input(&message)),
+            ("multiplier".into(), input(&multiplier)),
+        ]),
+        &mut store,
+        SamplingMode::Fresh,
+    )
+    .unwrap();
+    assert_eq!(
+        values(&mut result, "roundtrip", &backend, &mut store),
+        message
+            .iter()
+            .map(|v| BigInt::from(*v)
+                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        values(&mut result, "sum", &backend, &mut store),
+        message
+            .iter()
+            .map(|v| BigInt::from(2 * v)
+                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
+            .collect::<Vec<_>>()
+    );
+    let mut expected = message;
+    expected.rotate_right(1);
+    expected[0] = -expected[0];
+    assert_eq!(
+        values(&mut result, "product", &backend, &mut store),
+        expected
+            .into_iter()
+            .map(|v| BigInt::from(v)
+                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
+            .collect::<Vec<_>>()
+    );
+    result.cleanup_staged(&mut store).unwrap();
+}
+
+#[test]
+fn test_gpu_fhe_bgv_simd_staged_runtime() {
+    let common = common();
+    let n = common.ring.ring_dimension() as usize;
+    let top = common.ring.to_crt().2 - 1;
+    assert!(top >= 2);
+    let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
+    let bgv = BgvParams::new(common.clone(), t).unwrap();
+    let context = DslContext::new("gpu-bgv-encrypt");
+    let slots = context.int_family_input("slots", n);
+    let (secret, pk) = bgv.keygen().unwrap();
+    let ct = bgv.encrypt(&pk, &bgv.encode_slots(&slots).unwrap()).unwrap();
+    let relin = bgv.relinearization_key(&secret, top).unwrap();
+    let rotation = bgv.rotation_key(&secret, top - 1, 1).unwrap();
+    let backwards = bgv.rotation_key(&secret, top - 1, -1).unwrap();
+    let swap = bgv.row_swap_key(&secret, top - 1).unwrap();
+    let encryption_noise = ct.noise_bound.clone();
+    let encryption = context
+        .private_output("secret", secret)
+        .unwrap()
+        .public_output("ciphertext", ct.components)
+        .unwrap()
+        .public_output("relin", relin)
+        .unwrap()
+        .public_output("rotation", rotation)
+        .unwrap()
+        .public_output("backwards", backwards)
+        .unwrap()
+        .public_output("swap", swap)
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let mut backend = backend(&common, Some(t));
+    let mut store = MemoryArtifactStore::default();
+    let message = (0..n).map(|i| (i as u64 % t) as i64).collect::<Vec<_>>();
+    configure_widths(&mut backend, &encryption);
+    let encrypted = execute(
+        &encryption,
+        &mut backend,
+        BTreeMap::from([("slots".into(), input(&message))]),
+        &mut store,
+        SamplingMode::Fresh,
+    )
+    .unwrap();
+    let encryption_id = encrypted.production_id.unwrap();
+    let mut manifests =
+        BTreeMap::from([(encryption_id.clone(), store.manifest(&encryption_id).unwrap().clone())]);
+    let ct = BgvCiphertext {
+        components: common.ring().artifact_input(
+            encryption_id.clone(),
+            "ciphertext",
+            (2, 1),
+            ArtifactConfidentiality::Public,
+        ),
+        correction_factor: 1,
+        noise_bound: encryption_noise,
+    };
+    let relin = common.ring().artifact_input(
+        encryption_id.clone(),
+        "relin",
+        (2, common.ring.modulus_digits()),
+        ArtifactConfidentiality::Public,
+    );
+    let lower = common.parameters_at(top - 1).unwrap();
+    let ring = Ring::new(lower.modulus().as_ref().clone(), n);
+    let import_key = |name| {
+        ring.artifact_input(
+            encryption_id.clone(),
+            name,
+            (2, lower.modulus_digits()),
+            ArtifactConfidentiality::Public,
+        )
+    };
+    let sum = bgv.add(&ct, &ct).unwrap();
+    let quadratic = bgv.mul_unrelinearized(&ct, &ct).unwrap();
+    let product = bgv.relinearize(&quadratic, &relin).unwrap();
+    let reduced = bgv.mod_switch_to(&product, top - 1).unwrap();
+    let twice = bgv.mod_switch_to(&reduced, top - 2).unwrap();
+    let aligned = bgv.match_correction_factor(&reduced, 1).unwrap();
+    let forward = bgv.rotate_rows(Some(&import_key("rotation")), &reduced, 1).unwrap();
+    let backward = bgv.rotate_rows(Some(&import_key("backwards")), &reduced, -1).unwrap();
+    let wrapped = bgv.rotate_rows(None, &reduced, n as i32 / 2).unwrap();
+    let swapped = bgv.swap_rows(&import_key("swap"), &reduced).unwrap();
+    let outputs = [
+        ("sum", sum),
+        ("quadratic", quadratic),
+        ("product", product),
+        ("reduced", reduced),
+        ("twice", twice),
+        ("aligned", aligned),
+        ("forward", forward),
+        ("backward", backward),
+        ("wrapped", wrapped),
+        ("swapped", swapped),
+    ];
+    let mut evaluator = DslContext::new("gpu-bgv-public-evaluator");
+    for (name, ct) in &outputs {
+        evaluator = evaluator.public_output(*name, ct.components.clone()).unwrap();
+    }
+    let evaluator = evaluator
+        .build()
+        .unwrap()
+        .validate_with_manifests(&ParamEnv::default(), &manifests)
+        .unwrap();
+    configure_widths(&mut backend, &evaluator);
+    let evaluated =
+        execute(&evaluator, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+            .unwrap();
+    let evaluation_id = evaluated.production_id.unwrap();
+    manifests.insert(evaluation_id.clone(), store.manifest(&evaluation_id).unwrap().clone());
+    let secret = common.ring().artifact_input(
+        encryption_id,
+        "secret",
+        (1, 1),
+        ArtifactConfidentiality::Private,
+    );
+    let mut decryption = DslContext::new("gpu-bgv-decrypt");
+    for (name, ct) in &outputs {
+        let ty = ct.components.matrix_type();
+        let imported = BgvCiphertext {
+            components: Ring::new(ty.modulus.clone(), n).artifact_input(
+                evaluation_id.clone(),
+                *name,
+                (ty.rows.clone(), 1),
+                ArtifactConfidentiality::Public,
+            ),
+            correction_factor: ct.correction_factor,
+            noise_bound: ct.noise_bound.clone(),
+        };
+        decryption = decryption
+            .private_output(
+                *name,
+                bgv.decode_slots(&bgv.decrypt(&secret, &imported).unwrap()).unwrap(),
+            )
+            .unwrap();
+    }
+    let decryption = decryption
+        .build()
+        .unwrap()
+        .validate_with_manifests(&ParamEnv::default(), &manifests)
+        .unwrap();
+    configure_widths(&mut backend, &decryption);
+    let mut result =
+        execute(&decryption, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+            .unwrap();
+    for (name, _) in outputs {
+        let expected = (0..n)
+            .map(|i| {
+                let row = i / (n / 2);
+                let col = i % (n / 2);
+                let source = match name {
+                    "forward" => row * (n / 2) + (col + 1) % (n / 2),
+                    "backward" => row * (n / 2) + (col + n / 2 - 1) % (n / 2),
+                    "swapped" => (1 - row) * (n / 2) + col,
+                    _ => i,
+                };
+                let m = message[source] as u64;
+                BigInt::from(if name == "sum" { (2 * m) % t } else { (m * m) % t })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values(&mut result, name, &backend, &mut store), expected, "{name}");
+    }
+    result.cleanup_staged(&mut store).unwrap();
+}

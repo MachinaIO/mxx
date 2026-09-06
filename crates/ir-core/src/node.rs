@@ -79,6 +79,10 @@ pub enum NodeKind {
     ModulusReduce {
         modulus: IntExpr,
     },
+    /// Re-encodes centered residues from a single native CRT limb.
+    CenteredRebase {
+        modulus: IntExpr,
+    },
     Transpose,
     Slice {
         rows: Option<IndexRange>,
@@ -156,6 +160,15 @@ pub enum NodeKind {
     PackPolynomialCoefficients {
         matrix_type: crate::types::MatrixType,
         coefficient_bits: IntExpr,
+    },
+    /// Imports runtime coefficients or native evaluation slots into a scalar polynomial.
+    PolynomialFromValues {
+        matrix_type: crate::types::MatrixType,
+        evaluation: bool,
+    },
+    /// Exports a scalar polynomial as canonical coefficients or native evaluation slots.
+    PolynomialValues {
+        evaluation: bool,
     },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),

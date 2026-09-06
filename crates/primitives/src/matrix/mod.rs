@@ -576,6 +576,8 @@ pub trait PolyMatrix:
     fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Ordinary ring reduction into an exact destination CRT basis, without scaling.
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
+    /// Transfers a single source limb's centered coefficients to a new CRT basis.
+    fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),

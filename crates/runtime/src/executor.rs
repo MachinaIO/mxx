@@ -1218,6 +1218,10 @@ where
         artifact_type: &ArtifactType,
     ) -> Result<(ArtifactPayload, Vec<u8>), ExecutionError> {
         match (value, artifact_type) {
+            (RuntimeValue::Int(value), ArtifactType::Int) => {
+                let bytes = value.to_signed_bytes_le();
+                Ok((ArtifactPayload::Bytes(bytes.clone()), bytes))
+            }
             (RuntimeValue::Matrix(matrix), ArtifactType::Matrix(_)) => {
                 let bytes = self.backend.matrix_to_bytes(matrix);
                 Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
@@ -1456,6 +1460,45 @@ where
                 let bit = self.eval_usize(node.id, bit, env)?;
                 let output = ((value >> bit) & BigInt::one()) == BigInt::one();
                 self.put(values, node.id, 0, RuntimeValue::Bool(output));
+            }
+            NodeKind::PolynomialFromValues { matrix_type, evaluation } => {
+                let concrete = mxx_ir_core::concretize_wire_type(
+                    &mxx_ir_core::types::WireType::Matrix(matrix_type.clone()),
+                    env,
+                    scope_id,
+                    node.id,
+                )
+                .map_err(|error| self.expression_error(node.id, error))?;
+                let ConcreteWireType::Matrix(ty) = concrete else { unreachable!() };
+                let wire = node.args[0];
+                let count = self.family_count(values, wire)?;
+                // Materialization borrows the artifact store and backend mutably.
+                let members = (0..count)
+                    .map(|index| match self.family_member(values, wire, index, node.id)? {
+                        RuntimeValue::Int(value) => Ok(value),
+                        _ => Err(ExecutionError::ValueKind(wire)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let output = self
+                    .backend
+                    .polynomial_from_values(&ty, &members, *evaluation)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::PolynomialValues { evaluation } => {
+                let input = self.matrix(values, node.args[0])?;
+                let output = self
+                    .backend
+                    .polynomial_values(&input, *evaluation)
+                    .map_err(Self::backend_error)?;
+                self.put(
+                    values,
+                    node.id,
+                    0,
+                    RuntimeValue::IndexedFamily(
+                        output.into_iter().map(RuntimeValue::Int).collect(),
+                    ),
+                );
             }
             NodeKind::IntToReal => {
                 let value = self
@@ -1892,12 +1935,16 @@ where
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
             }
-            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+            NodeKind::ModulusSwitch { .. } |
+            NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredRebase { .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let output = if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
                     self.backend.modulus_switch(&input, &ty)
+                } else if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
+                    self.backend.centered_rebase(&input, &ty)
                 } else {
                     self.backend.reduce_modulus(&input, &ty)
                 }
@@ -4030,6 +4077,11 @@ fn decode_artifact<B: Backend>(
     payload: ArtifactPayload,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     match (artifact_type, payload) {
+        (ArtifactType::Int, ArtifactPayload::Bytes(bytes))
+            if BigInt::from_signed_bytes_le(&bytes).to_signed_bytes_le() == bytes =>
+        {
+            Ok(RuntimeValue::Int(BigInt::from_signed_bytes_le(&bytes)))
+        }
         (ArtifactType::Matrix(matrix_type), ArtifactPayload::Matrix(bytes)) => {
             let matrix = backend
                 .matrix_from_bytes(&matrix_type, &bytes)
@@ -4155,6 +4207,23 @@ mod tests {
         type SmallMatrix = PlacementProbeSmallMatrix;
         type Trapdoor = ();
         type Error = PlacementProbeError;
+
+        fn polynomial_from_values(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            values: &[BigInt],
+            evaluation: bool,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, values, evaluation)
+        }
+
+        fn polynomial_values(
+            &mut self,
+            value: &Self::Matrix,
+            evaluation: bool,
+        ) -> Result<Vec<BigInt>, Self::Error> {
+            unused_probe_operation!(value, evaluation)
+        }
 
         fn placement_count(&self) -> usize {
             2
@@ -4347,6 +4416,14 @@ mod tests {
         }
 
         fn reduce_modulus(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+
+        fn centered_rebase(
             &mut self,
             value: &Self::Matrix,
             destination: &ConcreteMatrixType,

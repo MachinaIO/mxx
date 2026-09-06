@@ -187,6 +187,29 @@ namespace
         uint64_t moduli[kCrtMaxLimbs];
     };
 
+    __global__ void centered_rebase_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source,
+        CrtOutputMetadata output, uint64_t source_modulus,
+        size_t coefficient_count, size_t ring_dimension)
+    {
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index >= coefficient_count * output.limb_count) return;
+        const size_t limb = index / coefficient_count;
+        const size_t position = index % coefficient_count;
+        const size_t poly = position / ring_dimension;
+        const size_t coefficient = position % ring_dimension;
+        const auto input = source[0];
+        const uint64_t residue = matrix_load_limb_u64(input.base, poly, coefficient,
+            input.stride, input.width) % source_modulus;
+        const uint64_t modulus = output.moduli[limb];
+        // Keep the magnitude unsigned, including for source moduli above INT64_MAX.
+        const bool negative = residue > source_modulus / 2;
+        const uint64_t magnitude = (negative ? source_modulus - residue : residue) % modulus;
+        const uint64_t value = negative && magnitude != 0 ? modulus - magnitude : magnitude;
+        const auto target = output.descriptors[limb];
+        matrix_store_limb_u64(target.base, poly, coefficient, target.stride, target.width, value);
+    }
+
     __global__ void crt_recompose_kernel(
         const CrtLevelMetadata *levels, const CrtOutputMetadata *output,
         size_t level_count, size_t coefficient_count, size_t ring_dimension)
@@ -409,6 +432,66 @@ extern "C" int gpu_matrix_convert_modulus(
     {
         const int deferred = gpu_defer_pinned_frees(out->ctx, output.device, stream, pinned.data(), pinned.size());
         if (status == 0) status = deferred;
+    }
+    return status;
+}
+
+extern "C" int gpu_matrix_centered_rebase(GpuMatrix *out, const GpuMatrix *source)
+{
+    if (!out || !source || !out->ctx || !source->ctx ||
+        out->ctx->execution != source->ctx->execution || out->ctx->N != source->ctx->N ||
+        source->level != 0 || source->ctx->moduli.size() != 1 || out->level < 0 ||
+        source->rows != out->rows || source->cols != out->cols ||
+        source->format != GPU_POLY_FORMAT_COEFF || out->format != GPU_POLY_FORMAT_COEFF ||
+        source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1)
+        return set_error("centered rebase requires colocated single-limb coefficients and matching execution");
+    const size_t target_count = static_cast<size_t>(out->level) + 1;
+    if (target_count > kCrtMaxLimbs || target_count > out->ctx->moduli.size())
+        return set_error("invalid centered rebase destination basis");
+    const auto &input = source->shared_limb_buffers[0];
+    const auto &output = out->shared_limb_buffers[0];
+    if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
+        input.limb_count != 1 || output.limb_count < target_count)
+        return set_error("centered rebase requires colocated device descriptors");
+    if (!out->rows || !out->cols || out->rows > std::numeric_limits<size_t>::max() / out->cols ||
+        out->rows * out->cols > std::numeric_limits<size_t>::max() / static_cast<size_t>(out->ctx->N))
+        return set_error("centered rebase shape overflow");
+    const size_t coefficient_count = out->rows * out->cols * static_cast<size_t>(out->ctx->N);
+    if (coefficient_count > std::numeric_limits<size_t>::max() / target_count)
+        return set_error("centered rebase coefficient count overflow");
+    const size_t count = coefficient_count * target_count;
+    const size_t blocks = count / 128 + (count % 128 != 0);
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("centered rebase exceeds CUDA grid capacity");
+    cudaError_t error = cudaSetDevice(output.device);
+    if (error != cudaSuccess) return set_error(error);
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[0], output.device, stream);
+    if (status != 0) return status;
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        status = matrix_wait_limb_stream(out, out->ctx->limb_gpu_ids[limb], output.device, stream);
+        if (status != 0) return status;
+    }
+    CrtOutputMetadata metadata{};
+    metadata.descriptors = output.device_descriptors;
+    metadata.limb_count = target_count;
+    std::copy_n(out->ctx->moduli.begin(), target_count, metadata.moduli);
+    centered_rebase_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
+        input.device_descriptors, metadata, source->ctx->moduli[0],
+        coefficient_count, static_cast<size_t>(out->ctx->N));
+    error = cudaGetLastError();
+    if (error != cudaSuccess) status = set_error(error);
+    // The temporary INTT source can be dropped immediately after this call.
+    const int tracked = matrix_track_limb_consumer_readonly(source,
+        source->ctx->limb_gpu_ids[0], output.device, stream);
+    if (status == 0) status = tracked;
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        const int recorded = matrix_record_limb_write(out, out->ctx->limb_gpu_ids[limb], stream);
+        if (status == 0) status = recorded;
     }
     return status;
 }

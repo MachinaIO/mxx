@@ -1,5 +1,5 @@
 use crate::{
-    element::{PolyElem, finite_ring::FinRingElem},
+    element::PolyElem,
     matrix::{
         CpuSmallMatrix, MatrixElem, MatrixParams, PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError,
         cpp_matrix::CppMatrix,
@@ -209,20 +209,34 @@ impl PolyMatrix for DCRTPolyMatrix {
                 (0..self.ncol)
                     .into_par_iter()
                     .map(|column| {
-                        let coefficients = self
-                            .entry(row, column)
-                            .coeffs()
-                            .into_iter()
-                            .map(|coefficient| {
-                                FinRingElem::new(coefficient.value().clone(), destination.modulus())
-                            })
-                            .collect::<Vec<_>>();
-                        DCRTPoly::from_coeffs(destination, &coefficients)
+                        self.entry(row, column)
+                            .convert_basis(destination, false)
+                            .expect("exact CRT tower projection failed")
                     })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         Self::from_poly_vec(destination, polys)
+    }
+
+    fn centered_rebase(&self, destination: &DCRTPolyParams) -> Result<Self, String> {
+        if destination.ring_dimension() != self.params.ring_dimension() ||
+            self.params.to_crt().0.len() != 1
+        {
+            return Err(
+                "centered rebase requires matching dimensions and one source CRT limb".into()
+            );
+        }
+        let polys = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| self.entry(row, column).convert_basis(destination, true))
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self::from_poly_vec(destination, polys))
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {

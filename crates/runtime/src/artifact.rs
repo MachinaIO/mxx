@@ -1451,6 +1451,9 @@ impl MemoryArtifactStore {
 
 fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> bool {
     match (artifact_type, payload) {
+        (ArtifactType::Int, ArtifactPayload::Bytes(bytes)) => {
+            num_bigint::BigInt::from_signed_bytes_le(bytes).to_signed_bytes_le() == *bytes
+        }
         (ArtifactType::Matrix(_), ArtifactPayload::Matrix(_)) |
         (ArtifactType::SmallMatrix { .. }, ArtifactPayload::SmallMatrix(_)) |
         (ArtifactType::Preimage { .. }, ArtifactPayload::SmallMatrix(_)) |
@@ -1501,6 +1504,26 @@ mod tests {
 
     fn production(seed: u8) -> ProductionId {
         ProductionId { spec_hash: SpecHash([seed; 32]), execution_nonce: [seed + 1; 32] }
+    }
+
+    #[test]
+    fn test_integer_artifact_requires_canonical_signed_encoding() {
+        for value in [
+            BigInt::from(0),
+            BigInt::from(-129),
+            BigInt::from(128),
+            BigInt::from(1) << 200usize,
+            -(BigInt::from(1) << 200usize),
+        ] {
+            let bytes = value.to_signed_bytes_le();
+            assert!(payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(bytes.clone())));
+            assert_eq!(BigInt::from_signed_bytes_le(&bytes), value);
+            let mut redundant = bytes;
+            redundant.push(if value.sign() == num_bigint::Sign::Minus { 255 } else { 0 });
+            assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(redundant)));
+        }
+        assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(vec![])));
+        assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::TypedBlob(vec![0])));
     }
 
     #[test]

@@ -1448,6 +1448,7 @@ impl GpuNodeMeasurementBackend {
             NodeKind::RingAutomorphism { .. } |
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredRebase { .. } |
             NodeKind::MatrixNegate => {
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) |
@@ -2377,7 +2378,9 @@ impl GpuNodeMeasurementBackend {
                     .map_err(backend_error)
                     .map(|outputs| outputs.into_iter().map(GpuMeasurementOutput::matrix).collect())
             }
-            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+            NodeKind::ModulusSwitch { .. } |
+            NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredRebase { .. } => {
                 let destination = output_matrix_type()?;
                 matrix_outputs(
                     (0..batch_size)
@@ -2385,6 +2388,8 @@ impl GpuNodeMeasurementBackend {
                             let source = matrix(0)?;
                             if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
                                 backend.modulus_switch(source, &destination)
+                            } else if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
+                                backend.centered_rebase(source, &destination)
                             } else {
                                 backend.reduce_modulus(source, &destination)
                             }
@@ -2799,6 +2804,11 @@ impl GpuNodeMeasurementBackend {
                         .collect(),
                 )
             }
+            NodeKind::PolynomialFromValues { .. } | NodeKind::PolynomialValues { .. } => {
+                Err(GpuMeasurementError(
+                    "polynomial value import/export measurement is not supported".to_owned(),
+                ))
+            }
             NodeKind::Input { .. } |
             NodeKind::ConstantInt(_) |
             NodeKind::EvaluateInt(_) |
@@ -2832,6 +2842,14 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
     ) -> Result<NodeMeasurement, Self::Error> {
+        if matches!(
+            node.kind,
+            NodeKind::PolynomialFromValues { .. } | NodeKind::PolynomialValues { .. }
+        ) {
+            return Err(GpuMeasurementError(
+                "polynomial value import/export measurement is not supported".to_owned(),
+            ));
+        }
         if matches!(
             node.kind,
             NodeKind::Input { .. } |

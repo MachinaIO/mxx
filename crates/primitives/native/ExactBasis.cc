@@ -92,6 +92,30 @@ void exact_basis_matrix_coefficients(openfhe::Matrix &matrix) {
             transform_format(matrix(row, column), Format::COEFFICIENT);
 }
 
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_bgv_mod_reduce(
+    const openfhe::DCRTPoly &input, uint64_t plaintext_modulus) {
+    auto polynomial = input.GetPoly();
+    if (polynomial.GetNumOfElements() < 2 || plaintext_modulus < 2)
+        throw std::invalid_argument("BGV ModReduce requires two CRT limbs and plaintext modulus >= 2");
+    const auto format = polynomial.GetFormat();
+    // Use the thread-local transforms above instead of OpenFHE's global cache.
+    transform_format(polynomial, Format::COEFFICIENT);
+    const lbcrypto::NativeInteger t(plaintext_modulus);
+    const auto p = polynomial.GetAllElements().back().GetModulus();
+    const auto negative_inverse = p - t.Mod(p).ModInverse(p);
+    std::vector<lbcrypto::NativeInteger> t_precon, p_inverse, p_inverse_precon;
+    for (size_t index = 0; index + 1 < polynomial.GetNumOfElements(); ++index) {
+        const auto q = polynomial.GetElementAtIndex(index).GetModulus();
+        t_precon.push_back(t.Mod(q).PrepModMulConst(q));
+        p_inverse.push_back(p.Mod(q).ModInverse(q));
+        p_inverse_precon.push_back(p_inverse.back().PrepModMulConst(q));
+    }
+    polynomial.ModReduce(t, t_precon, negative_inverse,
+        negative_inverse.PrepModMulConst(p), p_inverse, p_inverse_precon);
+    transform_format(polynomial, format);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(polynomial));
+}
+
 rust::Vec<uint8_t> exact_basis_coefficients(const openfhe::DCRTPoly &input) {
     auto polynomial = input.GetPoly();
     transform_format(polynomial, Format::COEFFICIENT);
@@ -223,6 +247,54 @@ std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters_for_basis(
     return std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::BigInteger>>(
         2 * dimension, primes, roots);
 }
+}
+
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_convert(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> moduli, bool centered) {
+    auto source = input.GetPoly();
+    const auto dimension = source.GetRingDimension();
+    std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters;
+    std::vector<size_t> selected;
+    if (centered) {
+        parameters = parameters_for_basis(dimension, moduli);
+    } else {
+        std::vector<lbcrypto::NativeInteger> primes, roots;
+        for (const auto modulus : moduli) {
+            size_t index = 0;
+            const auto &towers = source.GetAllElements();
+            while (index < towers.size() && towers[index].GetModulus().ConvertToInt() != modulus)
+                ++index;
+            if (index == towers.size()) throw std::invalid_argument("destination is not a source CRT subset");
+            selected.push_back(index);
+            primes.push_back(towers[index].GetModulus());
+            roots.push_back(towers[index].GetRootOfUnity());
+        }
+        parameters = std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::BigInteger>>(
+            2 * dimension, primes, roots);
+    }
+    if (centered && source.GetNumOfElements() != 1)
+        throw std::invalid_argument("centered rebase requires one source CRT limb");
+    if (centered) transform_format(source, Format::COEFFICIENT);
+    lbcrypto::DCRTPoly output(parameters, source.GetFormat(), true);
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(moduli.size()))
+    for (size_t index = 0; index < moduli.size(); ++index) {
+        if (centered) {
+            const auto &tower = source.GetElementAtIndex(0);
+            const uint64_t p = tower.GetModulus().ConvertToInt(), q = moduli[index];
+            lbcrypto::NativeVector values(dimension, lbcrypto::NativeInteger(q));
+            for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+                const uint64_t u = tower.GetValues()[coefficient].ConvertToInt();
+                const uint64_t magnitude = (u <= p / 2 ? u : p - u) % q;
+                values[coefficient] = u <= p / 2 || magnitude == 0 ? magnitude : q - magnitude;
+            }
+            output.GetAllElements()[index].SetValues(std::move(values), Format::COEFFICIENT);
+        } else {
+            // Copy the native tower verbatim, preserving its root and NTT format.
+            output.SetElementAtIndex(index, source.GetElementAtIndex(selected[index]));
+        }
+    }
+    if (centered) transform_format(output, Format::EVALUATION);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(output));
 }
 
 std::unique_ptr<openfhe::DCRTPoly> exact_basis_poly(

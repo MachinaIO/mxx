@@ -120,6 +120,21 @@ pub trait Backend {
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Imports one polynomial from coefficient or native evaluation values.
+    fn polynomial_from_values(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        values: &[BigInt],
+        evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    /// Exports one scalar polynomial in coefficient or native evaluation order.
+    fn polynomial_values(
+        &mut self,
+        value: &Self::Matrix,
+        evaluation: bool,
+    ) -> Result<Vec<BigInt>, Self::Error>;
+
     /// Selects the setup-time GPU calibration for the next primitive. CPU and
     /// non-fleet backends ignore this hook.
     fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
@@ -321,6 +336,12 @@ pub trait Backend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
     fn reduce_modulus(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn centered_rebase(
         &mut self,
         value: &Self::Matrix,
         destination: &ConcreteMatrixType,

@@ -690,7 +690,9 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
-        NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
+        NodeKind::ModulusSwitch { modulus } |
+        NodeKind::ModulusReduce { modulus } |
+        NodeKind::CenteredRebase { modulus } => {
             require_arity(scope, node, 1)?;
             let input = match argument(scope, values, node, 0)? {
                 ConcreteWireType::Matrix(matrix) => matrix.clone(),
@@ -704,7 +706,8 @@ fn validate_node(
             };
             let modulus = modulus.evaluate(env)?;
             if modulus <= BigInt::one() ||
-                (&input.modulus % &modulus) != BigInt::zero() ||
+                (!matches!(node.kind, NodeKind::CenteredRebase { .. }) &&
+                    (&input.modulus % &modulus) != BigInt::zero()) ||
                 (matches!(node.kind, NodeKind::ModulusSwitch { .. }) &&
                     ((&input.modulus % 2u8).is_zero() || (&modulus % 2u8).is_zero()))
             {
@@ -1080,6 +1083,44 @@ fn validate_node(
                 }
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..first })]
+        }
+        NodeKind::PolynomialFromValues { matrix_type, .. } => {
+            require_arity(scope, node, 1)?;
+            let ring = concrete_matrix(matrix_type, env, scope, node.id)?;
+            if !ring.is_scalar() ||
+                ring.modulus <= BigInt::one() ||
+                ring.ring_dimension < 2 ||
+                !ring.ring_dimension.is_power_of_two()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "polynomial import requires a scalar negacyclic ring",
+                );
+            }
+            match argument(scope, values, node, 0)? {
+                ConcreteWireType::IndexedFamily { element, count }
+                    if is_integer(element) && *count == ring.ring_dimension => {}
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "polynomial import requires exactly N integer values",
+                    )
+                }
+            }
+            vec![ConcreteWireType::Matrix(ring)]
+        }
+        NodeKind::PolynomialValues { .. } => {
+            require_arity(scope, node, 1)?;
+            let ring = matrix_argument(scope, values, node, 0)?;
+            if !ring.is_scalar() {
+                return node_error(scope, node.id, "polynomial export requires a scalar matrix");
+            }
+            vec![ConcreteWireType::IndexedFamily {
+                element: Box::new(ConcreteWireType::Int),
+                count: ring.ring_dimension,
+            }]
         }
         NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
             require_arity(scope, node, 1)?;
@@ -2436,6 +2477,19 @@ mod tests {
             )
             .contains("plaintext modulus")
         );
+    }
+
+    #[test]
+    fn test_centered_rebase_validates_destination_and_preserves_shape() {
+        for (modulus, valid) in [(13, true), (257, true), (1, false), (0, false)] {
+            let source = input("source", matrix_type(17, 2, 3));
+            let rebased = value(
+                NodeKind::CenteredRebase { modulus: IntExpr::constant(modulus) },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(modulus, 2, 3))],
+            );
+            assert_eq!(validate(&graph("rebase", rebased), &ParamEnv::default()).is_ok(), valid);
+        }
     }
 
     #[test]

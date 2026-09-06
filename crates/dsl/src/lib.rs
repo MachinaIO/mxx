@@ -607,6 +607,30 @@ impl Ring {
         Mat { value: node.output(0).expect("packed polynomial"), matrix_type }
     }
 
+    /// Constructs a scalar polynomial from runtime integer coefficients, reduced modulo q.
+    #[track_caller]
+    pub fn from_coefficients(&self, values: &Family<Int>) -> Mat {
+        let matrix_type = self.matrix_type((1, 1));
+        let node = NodeHandle::new(
+            NodeKind::PolynomialFromValues { matrix_type: matrix_type.clone(), evaluation: false },
+            values.values.clone(),
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
+        Mat { value: node.output(0).expect("imported polynomial"), matrix_type }
+    }
+
+    /// Constructs a scalar polynomial from native-order runtime evaluation slots.
+    #[track_caller]
+    pub fn from_evaluations(&self, values: &Family<Int>) -> Mat {
+        let matrix_type = self.matrix_type((1, 1));
+        let node = NodeHandle::new(
+            NodeKind::PolynomialFromValues { matrix_type: matrix_type.clone(), evaluation: true },
+            values.values.clone(),
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
+        Mat { value: node.output(0).expect("imported polynomial"), matrix_type }
+    }
+
     #[track_caller]
     /// Samples a matrix uniformly from the full coefficient residue ring `R_q`.
     pub fn uniform_residue(&self, shape: impl IntoShape) -> Mat {
@@ -1033,6 +1057,14 @@ impl Mat {
         Self::from_node(NodeKind::ModulusReduce { modulus }, vec![self], ty)
     }
 
+    /// Re-encodes the centered coefficients of a single CRT limb in another ring.
+    #[track_caller]
+    pub fn centered_rebase(self, modulus: impl Into<IntExpr>) -> Self {
+        let modulus = modulus.into();
+        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
+        Self::from_node(NodeKind::CenteredRebase { modulus }, vec![self], ty)
+    }
+
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }
@@ -1116,6 +1148,44 @@ impl Mat {
             max_coefficient_bound,
         };
         preimage
+    }
+
+    /// Extracts all canonical coefficients of a scalar polynomial in one runtime operation.
+    #[track_caller]
+    pub fn coefficients(&self) -> Family<Int> {
+        let count = self.matrix_type.ring_dimension.clone();
+        let node = NodeHandle::new(
+            NodeKind::PolynomialValues { evaluation: false },
+            vec![self.value.clone()],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("coefficient family")],
+            element_schema: IntType,
+            count,
+        }
+    }
+
+    /// Extracts all canonical slots in the primitive's native evaluation order.
+    #[track_caller]
+    pub fn evaluations(&self) -> Family<Int> {
+        let count = self.matrix_type.ring_dimension.clone();
+        let node = NodeHandle::new(
+            NodeKind::PolynomialValues { evaluation: true },
+            vec![self.value.clone()],
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("evaluation family")],
+            element_schema: IntType,
+            count,
+        }
     }
 
     #[track_caller]
@@ -1695,6 +1765,37 @@ pub use mxx_ir_core::node::ConcatAxis;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_polynomial_values_validate_family_shape_and_preserve_runtime_nodes() {
+        let context = super::DslContext::new("native-ntt");
+        let input = context.int_family_input("values", 8);
+        let ring = super::Ring::new(17, 8);
+        let output =
+            ring.from_evaluations(&ring.from_coefficients(&input).evaluations()).coefficients();
+        let graph = context.output("result", output).unwrap().build().unwrap();
+        let validated = graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        let lean = mxx_ir_core::lean::export(&validated, &Default::default()).unwrap();
+        assert!(lean.source.contains("MxxRuntime.polynomialFromValues"));
+        assert!(lean.source.contains("MxxRuntime.polynomialValues"));
+        assert_eq!(
+            graph
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(
+                    node.kind(),
+                    mxx_ir_core::node::NodeKind::PolynomialFromValues { .. }
+                ))
+                .count(),
+            2
+        );
+        let context = super::DslContext::new("invalid-native-ntt");
+        let short = context.int_family_input("values", 7);
+        let graph =
+            context.output("result", ring.from_coefficients(&short)).unwrap().build().unwrap();
+        assert!(graph.validate(&mxx_ir_core::ParamEnv::default()).is_err());
+    }
     use super::*;
     use mxx_ir_core::node::LoopInputMode;
     use num_bigint::BigInt;

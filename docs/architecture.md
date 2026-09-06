@@ -11,6 +11,7 @@ mxx-bench-estimator      -> mxx-ir-core, mxx-runtime; optional mxx-primitives
 mxx-dsl                  -> mxx-ir-core
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
+mxx-fhe                  -> mxx-dsl, mxx-ir-core, mxx-primitives
 mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
 mxx-func-enc/io          -> interface-only crates with no dependencies
 ```
@@ -68,6 +69,15 @@ transcripts, sessions, artifacts, and bounded parallel waves.
 slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 
 ### Application crates
+
+`mxx-fhe` builds Ring Regev/Ring-GSW and leveled BGV graphs, including CRT modulus
+switching, relinearization, SIMD encoding, and rotations. Cryptographic arithmetic
+and sampling execute through the DSL runtime; runtime is a test-only dependency.
+It tracks coefficient noise bounds per ciphertext and reuses primitive ring parameters and DSL
+matrix handles. Bootstrapping is out of scope. CPU and GPU backends share the same
+FHE graphs. GPU centered basis conversion uses native unsigned CRT residues and
+stream-ordered INTT/lift/NTT operations without a host coefficient round trip.
+FHE artifacts stay in memory or enter the protocol as direct runtime inputs.
 
 `mxx-we` owns the implementation-independent witness-encryption declaration/runtime traits and the
 Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and

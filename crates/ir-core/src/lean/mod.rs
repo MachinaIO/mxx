@@ -60,8 +60,11 @@ pub struct PrimitiveNames {
     pub crt_recompose: String,
     pub modulus_switch: String,
     pub modulus_reduce: String,
+    pub centered_rebase: String,
     pub ring_automorphism: String,
     pub pack_polynomial: String,
+    pub polynomial_from_values: String,
+    pub polynomial_values: String,
     pub family_pack: String,
     pub family_get_static: String,
     pub family_get_dynamic: String,
@@ -106,8 +109,11 @@ impl Default for PrimitiveNames {
             crt_recompose: "MxxRuntime.crtRecomposeLevel".into(),
             modulus_switch: "MxxRuntime.modulusSwitchRuns".into(),
             modulus_reduce: "MxxRuntime.modulusReduceRuns".into(),
+            centered_rebase: "MxxRuntime.centeredRebaseRuns".into(),
             ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
+            polynomial_from_values: "MxxRuntime.polynomialFromValues".into(),
+            polynomial_values: "MxxRuntime.polynomialValues".into(),
             family_pack: "MxxRuntime.familyPack".into(),
             family_get_static: "MxxRuntime.familyGetStatic".into(),
             family_get_dynamic: "MxxRuntime.familyGetDynamic".into(),
@@ -1408,11 +1414,15 @@ impl<'a> Emitter<'a> {
                     &["hashModel".into(), prefix, format!("[{components}]"), key],
                 );
             }
-            NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
+            NodeKind::ModulusSwitch { modulus } |
+            NodeKind::ModulusReduce { modulus } |
+            NodeKind::CenteredRebase { modulus } => {
                 append_expression_guards(modulus, env, relations);
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
                 let relation = if matches!(kind, NodeKind::ModulusSwitch { .. }) {
                     &self.options.primitives.modulus_switch
+                } else if matches!(kind, NodeKind::CenteredRebase { .. }) {
+                    &self.options.primitives.centered_rebase
                 } else {
                     &self.options.primitives.modulus_reduce
                 };
@@ -1618,6 +1628,26 @@ impl<'a> Emitter<'a> {
                     "{} ({}) {} {}",
                     self.options.primitives.pack_polynomial,
                     env.expr(coefficient_bits),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::PolynomialFromValues { evaluation, .. } => {
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} {} {} {}",
+                    self.options.primitives.polynomial_from_values,
+                    evaluation,
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::PolynomialValues { evaluation } => {
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} {} {} {}",
+                    self.options.primitives.polynomial_values,
+                    evaluation,
                     arg(0)?,
                     output(0)
                 ));
@@ -2520,6 +2550,13 @@ mod tests {
         )
         .output(0)
         .unwrap();
+        let reduced = NodeHandle::new(
+            NodeKind::CenteredRebase { modulus: IntExpr::constant(5) },
+            vec![reduced],
+            vec![WireType::Matrix(matrix(5))],
+        )
+        .output(0)
+        .unwrap();
         let conjugate = NodeHandle::new(
             NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
             vec![reduced],
@@ -2551,6 +2588,7 @@ mod tests {
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("modulusSwitchRuns"));
         assert!(artifact.source.contains("modulusReduceRuns"));
+        assert!(artifact.source.contains("centeredRebaseRuns"));
         assert!(artifact.source.contains("ringAutomorphismRuns"));
         assert_eq!(artifact.source.matches("crtRecomposeLevel").count(), 2);
         assert!(artifact.source.contains("abbrev generatedRoot.constraints"));

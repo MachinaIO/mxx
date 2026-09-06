@@ -1121,6 +1121,9 @@ fn node_cost_inputs_depend_on(
         return true;
     }
     match kind {
+        NodeKind::PolynomialFromValues { matrix_type, .. } => {
+            matrix_type_depends_on(matrix_type, slots, dependent_variables)
+        }
         NodeKind::GadgetTrapdoor { base, .. } => {
             int_expr_depends_on(base, slots, dependent_variables)
         }

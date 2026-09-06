@@ -706,6 +706,8 @@ pub struct SearchConfig {
     /// ell-column minimization policy.
     pub crt_base_bits_grid: Vec<(usize, u32)>,
     pub secret_dimension: usize,
+    /// Ordinary gadget towers omitted everywhere; trapdoor preimages stay exact.
+    pub gadget_dropped_moduli: usize,
     pub error_sigma: f64,
     pub decoder_sigma: f64,
     /// Selected decoder cutoff policy. It is resolved and compared against
@@ -756,6 +758,7 @@ impl SearchConfig {
             base_bits: 25,
             crt_base_bits_grid: vec![(50, 25)],
             secret_dimension: 2,
+            gadget_dropped_moduli: 0,
             error_sigma: 4.0,
             decoder_sigma: 4.578,
             decoder_preimage_bound: TrapdoorPreimageCutoffPolicy::Default,
@@ -2281,7 +2284,19 @@ fn build_candidate_context(
         modulus: modulus.clone().into(),
         ring_dimension: ring_dimension.into(),
         secret_dimension: config.secret_dimension,
-        digit_count: dcrt.modulus_digits(),
+        digit_count: dcrt
+            .modulus_digits()
+            .checked_div(candidate.crt_depth)
+            .and_then(|per_tower| {
+                candidate
+                    .crt_depth
+                    .checked_sub(config.gadget_dropped_moduli)
+                    .filter(|retained| *retained > 0)
+                    .map(|retained| retained * per_tower)
+            })
+            .ok_or_else(|| {
+                CandidatePreparationError::Infeasible("invalid dropped gadget towers".to_owned())
+            })?,
         gadget_base: (BigInt::from(1_u8) << candidate.base_bits).into(),
     };
     let refresh = RefreshCompiler {
@@ -2628,6 +2643,10 @@ pub(crate) fn snapshot_with_mask_gain(
     mask_digits: usize,
     mask_gain: &[RightActionNoiseGain],
 ) -> Result<ExponentLutNoiseSnapshot, String> {
+    if base.refresh.route_bias_bounds.iter().any(|bias| !bias.is_zero()) {
+        return Err("approximate mask scan must rebuild corrected route bias for each digit count"
+            .to_owned());
+    }
     let mut snapshot = base.clone();
     let mut refresh = snapshot.refresh.clone();
     if mask_gain.len() != refresh.slot_count {

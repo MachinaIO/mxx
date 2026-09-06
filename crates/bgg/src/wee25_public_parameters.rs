@@ -240,7 +240,7 @@ mod tests {
         let m_g = layout.gadget_rows();
         let m_b = layout.public_columns();
         let block_group = block_index / m_g;
-        let gadget_row = DCRTPolyMatrix::gadget_matrix(parameters, 1).get_row(0);
+        let gadget_row = DCRTPolyMatrix::gadget_matrix(parameters, 1, None).get_row(0);
         let mut rows = (0..d)
             .map(|secret_row| {
                 let row_index = block_index * d + secret_row;
@@ -321,7 +321,7 @@ mod tests {
             BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]),
         );
         let b = matrix_output(&result, "b");
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_size);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_size, None);
         let hash_sampler = HashSampler::new();
         for digit_row in 0..layout.gadget_rows() {
             for part in 0..layout.public_parameter_part_count() {

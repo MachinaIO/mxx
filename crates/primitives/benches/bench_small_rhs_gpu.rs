@@ -60,7 +60,7 @@ fn bench_gpu_small_rhs() {
 
     let end_to_end_start = Instant::now();
     let decomposition_start = Instant::now();
-    let compact = target.gadget_decompose(true).expect("compact gadget decomposition failed");
+    let compact = target.gadget_decompose(true, None).expect("compact gadget decomposition failed");
     compact.wait_until_ready();
     let decomposition_seconds = decomposition_start.elapsed().as_secs_f64();
     let allocation =

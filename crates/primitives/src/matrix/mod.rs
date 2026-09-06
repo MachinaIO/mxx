@@ -439,7 +439,11 @@ pub trait PolyMatrix:
     ///
     /// A matrix of dimension n×(n·log_b(q)), in which each block row is a scaled identity
     /// under the ring modulus.
-    fn gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
+    fn gadget_matrix(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        digit_count: Option<usize>,
+    ) -> Self;
     /// Constructs a compact gadget matrix G_small = I_n ⊗ (1, b, ..., b^{k-1}),
     /// where k = ceil(crt_bits / base_bits) and b = 2^{base_bits}.
     fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
@@ -776,7 +780,11 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
 pub trait PolyMatrixSmallRhs: PolyMatrix {
     type SmallMatrix: SmallPolyMatrix<Params = <Self::P as Poly>::Params>;
 
-    fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError>;
+    fn gadget_decompose(
+        self,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, SmallMatrixError>;
     fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
 }
 

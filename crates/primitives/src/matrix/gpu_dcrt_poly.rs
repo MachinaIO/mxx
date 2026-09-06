@@ -772,23 +772,38 @@ impl SmallPolyMatrix for GpuSmallMatrix {
 impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
     type SmallMatrix = GpuSmallMatrix;
 
-    fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError> {
+    fn gadget_decompose(
+        self,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, SmallMatrixError> {
         let base = BigUint::from(1u8) << self.params.base_bits();
         let bound =
             if small { &base - BigUint::from(1u8) } else { (&base + BigUint::from(1u8)) >> 1 };
-        let digits = if small {
+        let default_digits = if small {
             self.params.crt_bits().div_ceil(self.params.base_bits() as usize)
         } else {
             self.params.modulus_digits()
         };
+        let digits = digit_count.unwrap_or(default_digits);
+        let dropped = if small {
+            if digits != default_digits {
+                return Err(SmallMatrixError::InvalidConfig);
+            }
+            self.params.dropped_moduli()
+        } else {
+            self.params
+                .gadget_dropped_moduli(Some(digits))
+                .ok_or(SmallMatrixError::InvalidConfig)?
+        };
+        if !small && dropped > 0 && !self.params.supports_shared_crt_correction() {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
         let rows = self.nrow.checked_mul(digits).ok_or(SmallMatrixError::DimensionOverflow)?;
         let source = self.into_coeff_domain();
-        if !small && source.params.dropped_moduli() > 0 {
+        if !small && dropped > 0 {
             let status = unsafe {
-                crate::poly::dcrt::gpu::gpu_matrix_correct_gadget_residues(
-                    source.raw,
-                    source.params.dropped_moduli(),
-                )
+                crate::poly::dcrt::gpu::gpu_matrix_correct_gadget_residues(source.raw, dropped)
             };
             check_status(status, "gpu_matrix_correct_gadget_residues");
         }
@@ -802,7 +817,7 @@ impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
                 words.as_ptr(),
                 words.len(),
                 out.raw,
-                source.params.dropped_moduli(),
+                dropped,
             )
         };
         check_status(status, "gpu_small_matrix_decompose_base");
@@ -1165,14 +1180,22 @@ impl GpuDCRTPolyMatrix {
         small: bool,
         global_column_start: usize,
         local_columns: usize,
+        digit_count: Option<usize>,
     ) -> Self {
         let digits_per_tower = params.crt_bits().div_ceil(params.base_bits() as usize);
-        let columns_per_row = if small {
+        let default_columns_per_row = if small {
             digits_per_tower
         } else {
             digits_per_tower
                 .checked_mul(params.crt_depth() - params.dropped_moduli())
                 .expect("gadget column count overflow")
+        };
+        let columns_per_row = digit_count.unwrap_or(default_columns_per_row);
+        let dropped = if small {
+            assert_eq!(columns_per_row, default_columns_per_row);
+            params.dropped_moduli()
+        } else {
+            params.gadget_dropped_moduli(Some(columns_per_row)).expect("valid gadget digit count")
         };
         let total_columns =
             size.checked_mul(columns_per_row).expect("gadget column count overflow");
@@ -1189,7 +1212,7 @@ impl GpuDCRTPolyMatrix {
                 i32::from(small),
                 size,
                 global_column_start,
-                params.dropped_moduli(),
+                dropped,
             )
         };
         check_status(status, "gpu_matrix_fill_gadget_columns");
@@ -3380,12 +3403,16 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         out
     }
 
-    fn gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self {
+    fn gadget_matrix(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        digit_count: Option<usize>,
+    ) -> Self {
         if size == 0 {
             return Self::new_zero(params, 0, 0);
         }
-        let log_base_q = params.modulus_digits();
-        Self::gadget_columns(params, size, false, 0, size * log_base_q)
+        let log_base_q = digit_count.unwrap_or_else(|| params.modulus_digits());
+        Self::gadget_columns(params, size, false, 0, size * log_base_q, Some(log_base_q))
     }
 
     fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self {
@@ -3393,7 +3420,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             return Self::new_zero(params, 0, 0);
         }
         let k = params.crt_bits().div_ceil(params.base_bits() as usize);
-        Self::gadget_columns(params, size, true, 0, size * k)
+        Self::gadget_columns(params, size, true, 0, size * k, None)
     }
 
     fn decompose(&self) -> Self {
@@ -4634,7 +4661,7 @@ mod tests {
         let params = gpu_test_params();
         let gpu_params = gpu_params_from_cpu(&params);
         let size = 3;
-        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, size);
+        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, size, None);
         assert_eq!(gadget_matrix.size().0, size);
         assert_eq!(gadget_matrix.size().1, size * gpu_params.modulus_bits());
     }
@@ -4666,12 +4693,12 @@ mod tests {
             let full = if small {
                 GpuDCRTPolyMatrix::small_gadget_matrix(&params, 3)
             } else {
-                GpuDCRTPolyMatrix::gadget_matrix(&params, 3)
+                GpuDCRTPolyMatrix::gadget_matrix(&params, 3, None)
             };
             let columns_per_row = full.col_size() / 3;
             let start = columns_per_row - 1;
             assert_eq!(
-                GpuDCRTPolyMatrix::gadget_columns(&params, 3, small, start, 3),
+                GpuDCRTPolyMatrix::gadget_columns(&params, 3, small, start, 3, None),
                 full.slice_columns(start, start + 3)
             );
         }
@@ -4735,7 +4762,7 @@ mod tests {
         assert_eq!(matrix.size().0, 2);
         assert_eq!(matrix.size().1, 8);
 
-        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 2);
+        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 2, None);
         assert_eq!(gadget_matrix.size().0, 2);
         assert_eq!(gadget_matrix.size().1, 2 * bit_length);
 
@@ -4764,8 +4791,8 @@ mod tests {
             &gpu_params,
             vec![GpuDCRTPoly::from_biguint_to_constant(&gpu_params, negative_three)],
         );
-        let regular = source.clone().gadget_decompose(false).unwrap();
-        let unsigned = source.gadget_decompose(true).unwrap();
+        let regular = source.clone().gadget_decompose(false, None).unwrap();
+        let unsigned = source.gadget_decompose(true, None).unwrap();
         assert_eq!(regular.rows_count(), unsigned.rows_count());
         assert_eq!(regular.max_coefficient_bound(), &BigUint::from(2u32));
         assert_eq!(unsigned.max_coefficient_bound(), &BigUint::from(3u32));
@@ -5430,7 +5457,7 @@ mod tests {
         assert_eq!(matrix.size().0, 2);
         assert_eq!(matrix.size().1, 8);
 
-        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 2);
+        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 2, None);
         assert_eq!(gadget_matrix.size().0, 2);
         assert_eq!(gadget_matrix.size().1, 2 * digits_length);
 
@@ -5464,25 +5491,62 @@ mod tests {
                 DistType::FinRingDist,
             );
             let gpu_input = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &input);
-            let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, 2);
-            let expected_gadget = DCRTPolyMatrix::gadget_matrix(&cpu_params, 2);
+            let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, 2, None);
+            let expected_gadget = DCRTPolyMatrix::gadget_matrix(&cpu_params, 2, None);
             assert_eq!(gadget.to_cpu_matrix(), expected_gadget);
             let expected_digits = input.decompose();
             assert_eq!(gpu_input.decompose().to_cpu_matrix(), expected_digits);
             let coefficient_input = gpu_input.clone().into_coeff_domain();
             assert_eq!(coefficient_input.decompose().to_cpu_matrix(), expected_digits);
-            let compact = gpu_input.gadget_decompose(false).unwrap();
+            let compact = gpu_input.gadget_decompose(false, None).unwrap();
             let restored = gadget.multiply_small_rhs(&compact).unwrap().to_cpu_matrix();
             assert_eq!(restored, expected_gadget * expected_digits);
             assert!(matrix_within_coefficient_bound(
                 &(&input - &restored),
-                &cpu_params.gadget_error_bound()
+                &cpu_params.gadget_error_bound(None)
             ));
             let width = params.modulus_digits();
-            let range = GpuDCRTPolyMatrix::gadget_columns(&params, 2, false, width - 1, 3);
+            let range = GpuDCRTPolyMatrix::gadget_columns(&params, 2, false, width - 1, 3, None);
             assert_eq!(
                 range.to_cpu_matrix(),
                 gadget.to_cpu_matrix().slice_columns(width - 1, width + 2)
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_mixed_gadget_counts_preserve_ring_owner() {
+        use crate::sampler::{
+            DistType, PolyUniformSampler, bounds::matrix_within_coefficient_bound,
+            uniform::DCRTPolyUniformSampler,
+        };
+        let n = std::env::var("MXX_TEST_RING_DIMENSION")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(8);
+        let cpu_params = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let input =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu_params, 2, 3, DistType::FinRingDist);
+        let gpu_input = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &input);
+        for digits in [15, 10, 5] {
+            let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, 2, Some(digits));
+            let compact = gpu_input.clone().gadget_decompose(false, Some(digits)).unwrap();
+            let restored = gadget.multiply_small_rhs(&compact).unwrap().to_cpu_matrix();
+            assert_eq!(restored.params(), &cpu_params);
+            assert_eq!(
+                gadget.to_cpu_matrix(),
+                DCRTPolyMatrix::gadget_matrix(&cpu_params, 2, Some(digits))
+            );
+            assert!(matrix_within_coefficient_bound(
+                &(&input - &restored),
+                &cpu_params.gadget_error_bound(Some(digits))
+            ));
+            let range =
+                GpuDCRTPolyMatrix::gadget_columns(&params, 2, false, digits - 1, 3, Some(digits));
+            assert_eq!(
+                range.to_cpu_matrix(),
+                gadget.to_cpu_matrix().slice_columns(digits - 1, digits + 2)
             );
         }
     }
@@ -5809,7 +5873,8 @@ mod tests {
         let g_small = GpuDCRTPolyMatrix::small_gadget_matrix(&gpu_params, n);
         let left = a.clone() * &g_small;
         let expected = a * &b;
-        let actual = left.multiply_small_rhs(&b.clone().gadget_decompose(true).unwrap()).unwrap();
+        let actual =
+            left.multiply_small_rhs(&b.clone().gadget_decompose(true, None).unwrap()).unwrap();
 
         assert_eq!(actual, expected);
     }
@@ -5832,7 +5897,7 @@ mod tests {
         );
         let base = 1u32 << gpu_params.base_bits();
         let c = (base as f64 + 1.0) * 4.578;
-        let gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, matrix.row_size());
+        let gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, matrix.row_size(), None);
         for offset in 0..16u64 {
             let sampled = matrix.clone().gauss_samp_gq_arb_base(
                 c,
@@ -5852,7 +5917,7 @@ mod tests {
             .collect::<Vec<_>>();
         let varied_poly = GpuDCRTPoly::from_coeffs(&gpu_params, &varied_coeffs);
         let varied_matrix = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, vec![vec![varied_poly]]);
-        let varied_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 1);
+        let varied_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, 1, None);
         for offset in 0..16u64 {
             let sampled = varied_matrix.clone().gauss_samp_gq_arb_base(
                 c,
@@ -5880,7 +5945,8 @@ mod tests {
                 ],
             ],
         );
-        let wide_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, wide_matrix.row_size());
+        let wide_gadget =
+            GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, wide_matrix.row_size(), None);
         for offset in 0..16u64 {
             let sampled = wide_matrix.clone().gauss_samp_gq_arb_base(
                 c,
@@ -5905,7 +5971,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let random_matrix = GpuDCRTPolyMatrix::from_poly_vec(&gpu_params, random_matrix_vec);
-        let random_gadget = GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, random_matrix.row_size());
+        let random_gadget =
+            GpuDCRTPolyMatrix::gadget_matrix(&gpu_params, random_matrix.row_size(), None);
         for offset in 0..8u64 {
             let sampled = random_matrix.clone().gauss_samp_gq_arb_base(
                 c,

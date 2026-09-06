@@ -27,7 +27,8 @@ pub fn multiplication_error_bound<P: mxx_primitives::poly::PolyParams>(
     let digit_bound = num_bigint::BigUint::from(1u8) << (params.base_bits() - 1);
     columns * &n * left_error * digit_bound +
         plaintext_l1_bound *
-            (right_error + n * secret_dimension * secret_bound * params.gadget_error_bound())
+            (right_error +
+                n * secret_dimension * secret_bound * params.gadget_error_bound(None))
 }
 
 #[derive(Clone)]
@@ -507,7 +508,9 @@ mod tests {
                 ("rhs-vector".to_owned(), RuntimeValue::matrix(rhs_vector.clone())),
                 (
                     "rhs-decomposition".to_owned(),
-                    RuntimeValue::small_matrix(rhs_public.clone().gadget_decompose(false).unwrap()),
+                    RuntimeValue::small_matrix(
+                        rhs_public.clone().gadget_decompose(false, None).unwrap(),
+                    ),
                 ),
                 ("lhs-plaintext".to_owned(), RuntimeValue::matrix(lhs_plaintext.clone())),
                 ("rhs-plaintext".to_owned(), RuntimeValue::matrix(rhs_plaintext.clone())),
@@ -516,7 +519,7 @@ mod tests {
 
         let expected_vector = lhs_vector
             .clone()
-            .multiply_small_rhs(&rhs_public.clone().gadget_decompose(false).unwrap())
+            .multiply_small_rhs(&rhs_public.clone().gadget_decompose(false, None).unwrap())
             .unwrap() +
             rhs_vector * lhs_plaintext.entry(0, 0);
         assert_eq!(matrix_output(&result, "vector"), &expected_vector);
@@ -594,7 +597,7 @@ mod tests {
             let sampler = DCRTPolyUniformSampler::new();
             let left = sampler.sample_uniform(&parameters, 1, columns, DistType::FinRingDist);
             let right = sampler.sample_uniform(&parameters, 1, columns, DistType::FinRingDist);
-            let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, 1);
+            let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, 1, None);
             let secret = DCRTPoly::from_usize_to_constant(&parameters, 2);
             let left_ciphertext = (&left - &gadget) * secret.clone();
             let right_ciphertext = (&right - &gadget) * secret.clone();
@@ -800,7 +803,7 @@ mod tests {
             layout.public_key_columns() * public_keys.len(),
             DistType::FinRingDist,
         );
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension, None);
         let encoded_plaintexts = DCRTPolyMatrix::from_poly_vec_row(
             &parameters,
             vec![

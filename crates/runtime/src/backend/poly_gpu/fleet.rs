@@ -553,6 +553,7 @@ impl GpuDcrtBackend {
             false,
             global_column_start,
             local_columns,
+            Some(digit_count),
         )))
     }
 
@@ -1339,7 +1340,7 @@ mod tests {
         let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"load-input").unwrap();
         let bytes = backend.devices[0].1.matrix_to_bytes(&source);
         let staged = source.to_cpu_staging_bytes();
-        let small = backend.devices[0].1.gadget_decompose(&source, false).unwrap();
+        let small = backend.devices[0].1.gadget_decompose(&source, false, None).unwrap();
         let schema = ConcreteBoundedMatrixSchema {
             matrix: ConcreteMatrixType { rows: small.rows(), ..ty.clone() },
             max_coefficient_bound: BigInt::from(small.max_coefficient_bound().clone()),
@@ -1543,7 +1544,7 @@ mod tests {
 
         let digits = parameters.modulus_digits();
         let base = BigInt::from(1u8) << parameters.base_bits();
-        let decomposed = backend.gadget_decompose(&source, false).unwrap();
+        let decomposed = backend.gadget_decompose(&source, false, None).unwrap();
         let schema = ConcreteBoundedMatrixSchema {
             matrix: ConcreteMatrixType { rows: digits, ..source_type.clone() },
             max_coefficient_bound: BigInt::from(
@@ -1557,7 +1558,7 @@ mod tests {
             .small_matrix_from_bytes(&schema, &compact_bytes, SmallMatrixSemanticKind::Generic)
             .unwrap();
         assert_eq!(decoded, decomposed);
-        let alternate = backend.gadget_decompose(&source, true).unwrap();
+        let alternate = backend.gadget_decompose(&source, true, None).unwrap();
         let mut mismatched = decoded.clone();
         mismatched.shards[1].value = alternate.shards[1].value.clone();
         assert!(matches!(
@@ -1623,7 +1624,7 @@ mod tests {
                 .all(|device| { source.shards().iter().any(|shard| shard.device_id == *device) })
         );
 
-        let decomposed = fleet.gadget_decompose(&source, false).unwrap();
+        let decomposed = fleet.gadget_decompose(&source, false, None).unwrap();
         let digits = parameters.modulus_digits();
         let gadget_type = ConcreteMatrixType { rows: 1, columns: digits, ..source_type.clone() };
         let gadget = fleet
@@ -1655,7 +1656,7 @@ mod tests {
         single.select_operation(operation).unwrap();
         let single_source =
             single.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
-        let single_decomposed = single.gadget_decompose(&single_source, false).unwrap();
+        let single_decomposed = single.gadget_decompose(&single_source, false, None).unwrap();
         let single_gadget = single
             .constant_matrix(
                 &gadget_type,
@@ -1989,6 +1990,7 @@ impl Backend for GpuDcrtBackend {
                                     small,
                                     start,
                                     end - start,
+                                    Some(ty.columns / ty.rows),
                                 ),
                                 RangeConstant::SingleColumn => {
                                     backend.constant_matrix(&local_ty, value, env)?
@@ -2759,13 +2761,14 @@ impl Backend for GpuDcrtBackend {
                                 end - start,
                                 DistType::FinRingDist,
                             );
-                        source.gadget_decompose(false).map_err(PolyBackendError::from).map(
-                            |value| GpuColumnShard {
+                        source
+                            .gadget_decompose(false, Some(digit_count))
+                            .map_err(PolyBackendError::from)
+                            .map(|value| GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
                                 value,
-                            },
-                        )
+                            })
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2812,13 +2815,14 @@ impl Backend for GpuDcrtBackend {
                                 end - start,
                                 DistType::FinRingDist,
                             );
-                        source.gadget_decompose(true).map_err(PolyBackendError::from).map(|value| {
-                            GpuColumnShard {
+                        source
+                            .gadget_decompose(true, Some(digit_count))
+                            .map_err(PolyBackendError::from)
+                            .map(|value| GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
                                 value,
-                            }
-                        })
+                            })
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2937,6 +2941,7 @@ impl Backend for GpuDcrtBackend {
         &mut self,
         value: &Self::Matrix,
         small: bool,
+        digit_count: Option<usize>,
     ) -> Result<Self::SmallMatrix, Self::Error> {
         self.restart_runtime_pilot_after_matrix_inputs(&[value])?;
         let mut shards = Vec::new();
@@ -2952,7 +2957,7 @@ impl Backend for GpuDcrtBackend {
                     let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
                     Some(
                         Self::matrix_piece_on_device(backend, value, start, end)
-                            .and_then(|piece| backend.gadget_decompose(&piece, small))
+                            .and_then(|piece| backend.gadget_decompose(&piece, small, digit_count))
                             .map(|value| GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
@@ -2967,8 +2972,12 @@ impl Backend for GpuDcrtBackend {
         Ok(GpuFleetSmallMatrix::new(rows, value.columns, shards))
     }
 
-    fn gadget_error_bound(&self, ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
-        self.devices[0].1.gadget_error_bound(ty)
+    fn gadget_error_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        digit_count: Option<usize>,
+    ) -> Result<BigInt, Self::Error> {
+        self.devices[0].1.gadget_error_bound(ty, digit_count)
     }
 
     fn multiply_small_rhs(

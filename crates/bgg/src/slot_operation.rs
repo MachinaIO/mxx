@@ -1430,7 +1430,7 @@ mod artifact {
             let b0 = matrix_output(&result, "b0");
             let b1 = matrix_output(&result, "b1");
             let identity = DCRTPolyMatrix::identity(&parameters, compiler.secret_size, None);
-            let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, compiler.secret_size);
+            let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, compiler.secret_size, None);
             for slot in 0..compiler.slot_count {
                 let secret = matrix_output(&result, &format!("secret_{slot}"));
                 let public = matrix_output(&result, &format!("public_{slot}"));

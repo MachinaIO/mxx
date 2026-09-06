@@ -1796,7 +1796,7 @@ where
                     let target = self.matrix(values, node.args[2])?;
                     if !small &&
                         self.backend
-                            .gadget_error_bound(&target_type)
+                            .gadget_error_bound(&target_type, Some(digit_count))
                             .map_err(Self::backend_error)? !=
                             BigInt::from(0u8)
                     {
@@ -1809,7 +1809,7 @@ where
                         .map_err(Self::backend_error)?;
                     (
                         self.backend
-                            .gadget_decompose(&target, small)
+                            .gadget_decompose(&target, small, Some(digit_count))
                             .map_err(Self::backend_error)?,
                         false,
                     )
@@ -1869,8 +1869,10 @@ where
                             .to_owned(),
                     });
                 }
-                let output =
-                    self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
+                let output = self
+                    .backend
+                    .gadget_decompose(&input, *small, Some(digit_count))
+                    .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
             }
             NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
@@ -2413,7 +2415,9 @@ where
                 let target = self.matrix(&mut values[instance], node.args[2])?;
                 let target_type = self.matrix_type(scope_id, &paths[instance], node.args[2])?;
                 if !small &&
-                    self.backend.gadget_error_bound(&target_type).map_err(Self::backend_error)? !=
+                    self.backend
+                        .gadget_error_bound(&target_type, Some(digit_count))
+                        .map_err(Self::backend_error)? !=
                         BigInt::from(0u8)
                 {
                     return Err(ExecutionError::Manifest(
@@ -2423,8 +2427,10 @@ where
                 self.backend
                     .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                     .map_err(Self::backend_error)?;
-                let value =
-                    self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?;
+                let value = self
+                    .backend
+                    .gadget_decompose(&target, small, Some(digit_count))
+                    .map_err(Self::backend_error)?;
                 self.put(&mut values[instance], node.id, 0, RuntimeValue::small_matrix(value));
                 continue;
             }
@@ -4415,8 +4421,9 @@ mod tests {
             &mut self,
             value: &Self::Matrix,
             small: bool,
+            digit_count: Option<usize>,
         ) -> Result<Self::SmallMatrix, Self::Error> {
-            unused_probe_operation!(value, small)
+            unused_probe_operation!(value, small, digit_count)
         }
 
         fn multiply_small_rhs(

@@ -32,9 +32,17 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
         0
     }
     /// Inclusive coefficient bound on `A - G D(A)` (ePrint 2024/909, Proposition 1).
-    fn gadget_error_bound(&self) -> BigUint {
+    fn gadget_dropped_moduli(&self, digit_count: Option<usize>) -> Option<usize> {
+        let (_, bits, depth) = self.to_crt();
+        let per_tower = bits.div_ceil(self.base_bits() as usize);
+        let digits = digit_count.unwrap_or_else(|| self.modulus_digits());
+        (digits > 0 && digits.is_multiple_of(per_tower) && digits / per_tower <= depth)
+            .then(|| depth - digits / per_tower)
+    }
+
+    fn gadget_error_bound(&self, digit_count: Option<usize>) -> BigUint {
         let (moduli, _, depth) = self.to_crt();
-        let k = self.dropped_moduli();
+        let k = self.gadget_dropped_moduli(digit_count).expect("valid gadget digit count");
         let low = moduli[depth - k..].iter().fold(BigUint::from(1u8), |p, q| p * q);
         (low / 2u8) * k
     }

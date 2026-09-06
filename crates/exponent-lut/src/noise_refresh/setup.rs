@@ -21,7 +21,7 @@ use crate::{
     encoding::{EncodingRhsFamily, ExponentLutEncodingSampler},
     noise::{
         AverageVariance, GateNoiseDecomposition, GateNoiseGains, GateNoiseOperation,
-        NoiseDecompositionPlan, RightActionNoiseGain,
+        NoiseDecompositionPlan, ProgramNoiseState, RightActionNoiseGain,
     },
     noise_refresh::{
         pbc::{
@@ -244,7 +244,7 @@ impl RefreshNoiseGainDecompositions {
                 aggregate.l1 += gain.l1 * multiplicity;
                 aggregate.l2_squared += gain.l2_squared * multiplicity;
             }
-            if aggregate.l1.is_zero() || aggregate.l2_squared.is_zero() {
+            if aggregate.l1.is_zero() != aggregate.l2_squared.is_zero() {
                 return Err(RefreshSetupError::InvalidParameters("invalid refresh decomposition"));
             }
             Ok(aggregate)
@@ -634,13 +634,17 @@ impl RefreshSetupParameters {
             .collect::<Result<Vec<_>, _>>()?;
         let fresh_digit_variances =
             vec![support_variance(self.fresh_error_base_p_digit_count)?; self.switch_moduli.len()];
-        let refresh = self
+        let mut refresh = self
             .refresh_noise_parameters()?
             .with_route_gains(route_gains)
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh route gains"))?
             .with_digit_variances(mask_digit_variances, fresh_digit_variances)
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid digit variances"))?;
-        ExponentLutNoiseSnapshot::from_setup(
+        let (_, mask_bias) = corrected_route_scalars(self, false)?;
+        let (_, fresh_bias) = corrected_route_scalars(self, true)?;
+        refresh.route_bias_bounds =
+            mask_bias.into_iter().zip(fresh_bias).map(|(mask, fresh)| mask + fresh).collect();
+        let mut snapshot = ExponentLutNoiseSnapshot::from_setup(
             setup_identity,
             prf_program,
             helper_error_bound.clone(),
@@ -651,7 +655,77 @@ impl RefreshSetupParameters {
             gain_plan,
             family_active_counts,
         )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid exact noise snapshot"))
+        .map_err(|_| RefreshSetupError::InvalidParameters("invalid noise snapshot"))?;
+        let moduli = self
+            .refresh
+            .crt_plaintext_moduli
+            .iter()
+            .map(|p| {
+                p.evaluate(&ParamEnv::default())
+                    .ok()
+                    .and_then(|p| p.to_biguint())
+                    .ok_or(RefreshSetupError::InvalidManifest)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let base = self
+            .layout
+            .gadget_base
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .and_then(|base| base.to_biguint())
+            .ok_or(RefreshSetupError::InvalidManifest)?;
+        let (_, retained) = ordinary_gadget_towers(&moduli, &base, self.layout.digit_count)?;
+        if retained < moduli.len() {
+            if self.layout.secret_dimension != 2 {
+                return Err(RefreshSetupError::InvalidParameters(
+                    "approximate residual requires augmented ternary dimension two",
+                ));
+            }
+            let omitted = &moduli[retained..];
+            let product = omitted.iter().product::<BigUint>();
+            let epsilon = omitted.iter().map(|p| (&product / p) * (p / 2u8)).sum::<BigUint>();
+            let variance_sum =
+                omitted.iter().map(|p| (&product / p).pow(2) * (p.pow(2) - 1u8)).sum::<BigUint>();
+            // Independent uniform discarded residues and augmented ternary
+            // secret: Var(R)*(1+2N/3). The stored convention is four Var.
+            let residual = ProgramNoiseState {
+                bound: epsilon * BigUint::from(self.coefficient_count + 1),
+                doubled_variance: AverageVariance::new(
+                    variance_sum * BigUint::from(3 + 2 * self.coefficient_count),
+                    9u8.into(),
+                )
+                .map_err(|_| RefreshSetupError::InvalidManifest)?,
+            };
+            for gate in &snapshot.gate_gains {
+                if gate.operation == GateNoiseOperation::Add {
+                    continue;
+                }
+                let sources = if gate.operation == GateNoiseOperation::Lut { 2u8 } else { 1u8 };
+                snapshot.operation_residuals.insert(
+                    gate.operation_index,
+                    ProgramNoiseState {
+                        bound: &residual.bound * sources,
+                        doubled_variance: residual.doubled_variance.scaled(&BigUint::from(sources)),
+                    },
+                );
+            }
+            let zero = ProgramNoiseState {
+                bound: BigUint::zero(),
+                doubled_variance: AverageVariance::zero(),
+            };
+            let trace = ProgramNoiseState {
+                bound: &residual.bound * (&snapshot.target_plaintext_gain().l1 + 1u8),
+                doubled_variance: residual
+                    .doubled_variance
+                    .scaled(&(&snapshot.target_plaintext_gain().l2_squared + 1u8)),
+            };
+            snapshot.readout_residuals = Some((
+                zero.clone(),
+                vec![trace; snapshot.readout_gains.nonidentity_trace.len()],
+                zero,
+            ));
+        }
+        Ok(snapshot)
     }
 
     /// Evaluates one AverageCase search candidate using the same complete,
@@ -1736,14 +1810,10 @@ fn compact_noise_snapshot_plans(
                 .ok_or(RefreshSetupError::InvalidParameters("CRT modulus must be positive"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let digits_per_tower = digit_count
-        .checked_div(crt_moduli.len())
-        .filter(|digits| *digits != 0 && *digits * crt_moduli.len() == digit_count)
-        .ok_or(RefreshSetupError::InvalidParameters(
-            "gadget digits do not match the CRT tower count",
-        ))?;
+    let (digits_per_tower, retained_towers) =
+        ordinary_gadget_towers(&crt_moduli, &base, digit_count)?;
     let bind_crt = |plan: NoiseDecompositionPlan| {
-        plan.bind_crt_layout(crt_moduli.clone(), digits_per_tower)
+        plan.bind_crt_layout(crt_moduli[..retained_towers].to_vec(), digits_per_tower)
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid compact CRT decomposition"))
     };
     let public_bound = p
@@ -1755,6 +1825,18 @@ fn compact_noise_snapshot_plans(
         .ok_or(RefreshSetupError::InvalidParameters("full modulus must be positive"))? /
         2u8;
     let public_action = || {
+        if retained_towers < crt_moduli.len() {
+            return NoiseDecompositionPlan::bounded_matrix(
+                base.clone(),
+                target_rows * digit_count,
+                target_columns,
+                ring_dimension,
+                &base / 2u8,
+            )
+            .map_err(|_| {
+                RefreshSetupError::InvalidParameters("invalid approximate public action plan")
+            });
+        }
         NoiseDecompositionPlan::dense_bound(
             base.clone(),
             digit_count,
@@ -1914,82 +1996,143 @@ fn compact_noise_snapshot_plans(
             .map_err(|_| {
                 RefreshSetupError::InvalidParameters("invalid compact producer gain plan")
             })?;
-
-    let scales = (0..p.refresh.crt_plaintext_moduli.len())
-        .map(|slot| {
-            let expression = p.refresh.scale_expression(slot)?;
-            expression
-                .evaluate(&ParamEnv::default())
-                .map_err(|_| {
-                    RefreshSetupError::InvalidParameters("refresh scale must be concrete")
-                })?
-                .to_biguint()
-                .ok_or(RefreshSetupError::InvalidParameters("refresh scale must be positive"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let state_scaling = scales
-        .iter()
-        .map(|scale| {
-            NoiseDecompositionPlan::gadget_scalar(
-                base.clone(),
-                digit_count,
-                target_rows,
-                target_rows * digit_count,
-                ring_dimension,
-                scale.clone().into(),
-            )
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh scale plan"))
-            .and_then(bind_crt)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let route_plan = |value: BigInt, ring_coefficient: usize| {
-        NoiseDecompositionPlan::sparse_monomial(
-            base.clone(),
-            digit_count,
-            target_rows,
-            p.prf_component_count(),
-            ring_dimension,
-            target_rows.saturating_sub(1),
-            0,
-            ring_coefficient,
-            value,
-        )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid PRF route plan"))
-        .and_then(bind_crt)
-    };
-    let (mask, _) = compact_mask_routes(p)?;
-    let fresh = scales
-        .iter()
-        .map(|scale| {
-            (0..p.fresh_error_base_p_digit_count)
-                .map(|c| {
-                    let value = scale * BigUint::from(p.base_p).pow(c as u32);
-                    route_plan(-BigInt::from(value), 0)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let decoder = readout_schema
-        .decoder
-        .iter()
-        .map(|schema| bounded_plan_from_schema(&base, schema))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((
-        gain_plan,
-        RefreshNoiseGainDecompositions {
-            state_scaling,
-            mask,
-            mask_multiplicity: p.coefficient_count,
-            fresh_multiplicity: vec![p.coefficient_count; fresh.len()],
-            fresh,
-            decoder,
-        },
-    ))
+    Ok((gain_plan, compact_noise_snapshot_routes(p, readout_schema)?))
 }
 
 /// Rebuilds only the mask/fresh route decomposition for a changed `d_m`.
 /// Gate/readout plans are independent of the mask digit count and are cached
 /// by the parameter-search context.
+/// The ordinary gadget retains a prefix of the full CRT idempotents. Decoder
+/// trapdoors remain exact in their independently selected modulus.
+fn ordinary_gadget_towers(
+    moduli: &[BigUint],
+    base: &BigUint,
+    digits: usize,
+) -> Result<(usize, usize), RefreshSetupError> {
+    let bits = base
+        .bits()
+        .checked_sub(1)
+        .filter(|bits| *bits > 0)
+        .ok_or(RefreshSetupError::InvalidParameters("invalid gadget base"))?;
+    if base != &(BigUint::one() << bits as usize) {
+        return Err(RefreshSetupError::InvalidParameters("gadget base must be binary"));
+    }
+    let per_tower = moduli
+        .iter()
+        .map(|p| p.bits().div_ceil(bits) as usize)
+        .max()
+        .ok_or(RefreshSetupError::InvalidParameters("missing CRT towers"))?;
+    if digits == 0 || digits % per_tower != 0 || digits / per_tower > moduli.len() {
+        return Err(RefreshSetupError::InvalidParameters("invalid ordinary gadget width"));
+    }
+    Ok((per_tower, digits / per_tower))
+}
+
+/// An even representative prevents multiplication by the native half-integer
+/// readout payload from introducing a modular half-wrap. The corrected target
+/// is divisible by every omitted tower, hence ordinary approximate D is exact
+/// on this target. This is public target construction, not a modified gadget.
+fn even_route_correction(value: &BigInt, dropped_product: &BigUint) -> BigInt {
+    if dropped_product.is_one() {
+        return BigInt::zero();
+    }
+    let period = BigInt::from(dropped_product * 2u8);
+    let mut residue = ((value % &period) + &period) % &period;
+    if residue.magnitude() % 2u8 == BigUint::one() {
+        residue += BigInt::from(dropped_product.clone());
+        residue %= &period;
+    }
+    if residue > BigInt::from(dropped_product.clone()) {
+        residue -= period;
+    }
+    residue
+}
+
+fn corrected_route_scalars(
+    p: &RefreshSetupParameters,
+    fresh: bool,
+) -> Result<(Vec<Vec<BigInt>>, Vec<BigUint>), RefreshSetupError> {
+    let evaluate = |x: &IntExpr| {
+        x.evaluate(&ParamEnv::default())
+            .map_err(|_| RefreshSetupError::InvalidParameters("nonconcrete route parameter"))
+    };
+    let moduli = p
+        .refresh
+        .crt_plaintext_moduli
+        .iter()
+        .map(|x| evaluate(x)?.to_biguint().ok_or(RefreshSetupError::InvalidManifest))
+        .collect::<Result<Vec<_>, _>>()?;
+    let base =
+        evaluate(&p.layout.gadget_base)?.to_biguint().ok_or(RefreshSetupError::InvalidManifest)?;
+    let (_, retained) = ordinary_gadget_towers(&moduli, &base, p.layout.digit_count)?;
+    let dropped = moduli[retained..].iter().product::<BigUint>();
+    let full = moduli.iter().product::<BigUint>();
+    let mut values = Vec::new();
+    let mut biases = Vec::new();
+    for slot in 0..moduli.len() {
+        let scale = if fresh {
+            evaluate(&p.refresh.scale_expression(slot)?)?
+        } else {
+            BigInt::from(&full / &p.switch_moduli[slot])
+        };
+        let digits =
+            if fresh { p.fresh_error_base_p_digit_count } else { p.mask_base_p_digit_counts[slot] };
+        let mut bias = BigUint::zero();
+        let scalars = (0..digits)
+            .map(|digit| {
+                let value = &scale * BigInt::from(BigUint::from(p.base_p).pow(digit as u32));
+                let residual = even_route_correction(&value, &dropped);
+                bias += residual.magnitude();
+                value - residual
+            })
+            .collect();
+        values.push(scalars);
+        biases.push(bias * BigUint::from(p.base_p - 1) / 2u8);
+    }
+    Ok((values, biases))
+}
+
+fn corrected_route_scalar_family(
+    p: &RefreshSetupParameters,
+    ring: &mxx_dsl::Ring,
+    fresh: bool,
+) -> Result<Family<Mat>, RefreshSetupError> {
+    let (values, _) = corrected_route_scalars(p, fresh)?;
+    let digits = values.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut offsets = Vec::new();
+    let mut scalars = Vec::new();
+    for slot in values {
+        offsets.push(scalars.len());
+        scalars.extend(slot.into_iter().map(|value| ring.polynomial([IntExpr::constant(value)])));
+    }
+    let count = refresh_route_family_count(p, &digits)?;
+    let offsets = Family::pack(offsets.into_iter().map(Int::constant).collect())?;
+    let slots = Parallel::range(count).try_map_values(Vec::<Mat>::new(), |index, _| {
+        let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
+            index.expression(),
+            p.prf_component_count(),
+            p.coefficient_count,
+            &digits,
+        )
+        .map_err(|_| mxx_dsl::DslError::Schema)?;
+        Ok(Int::evaluate(slot))
+    })?;
+    let offsets = offsets.parallel_gather(slots)?;
+    let digit_indices = Parallel::range(count).try_map_values(Vec::<Mat>::new(), |index, _| {
+        let (_, digit, _, _) = crate::noise_refresh::refresh::route_coordinates(
+            index.expression(),
+            p.prf_component_count(),
+            p.coefficient_count,
+            &digits,
+        )
+        .map_err(|_| mxx_dsl::DslError::Schema)?;
+        Ok(Int::evaluate(digit))
+    })?;
+    let indices = (offsets, digit_indices)
+        .parallel_zip_tuple_result(|_, (offset, digit)| Ok(offset.add(digit)))?;
+    Ok(Family::pack(scalars)?.parallel_gather(indices)?)
+}
+
 fn compact_mask_routes(
     parameters: &RefreshSetupParameters,
 ) -> Result<(Vec<Vec<NoiseDecompositionPlan>>, usize), RefreshSetupError> {
@@ -2022,17 +2165,26 @@ fn compact_mask_routes(
                 .ok_or(RefreshSetupError::InvalidParameters("CRT modulus must be positive"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let digits_per_tower = digit_count
-        .checked_div(crt_moduli.len())
-        .filter(|digits| *digits != 0 && *digits * crt_moduli.len() == digit_count)
-        .ok_or(RefreshSetupError::InvalidParameters(
-            "gadget digits do not match the CRT tower count",
-        ))?;
+    let (digits_per_tower, retained_towers) =
+        ordinary_gadget_towers(&crt_moduli, &base, digit_count)?;
     let bind_crt = |plan: NoiseDecompositionPlan| {
-        plan.bind_crt_layout(crt_moduli.clone(), digits_per_tower)
+        plan.bind_crt_layout(crt_moduli[..retained_towers].to_vec(), digits_per_tower)
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid compact CRT decomposition"))
     };
+    let dropped_product = crt_moduli[retained_towers..].iter().product::<BigUint>();
+    let retained_product = BigInt::from(crt_moduli[..retained_towers].iter().product::<BigUint>());
     let route_plan = |value: BigInt| {
+        // Gain-only representative: retained residues (and therefore every
+        // balanced digit) are unchanged. Runtime keeps the full-q target.
+        let mut value =
+            (&value - even_route_correction(&value, &dropped_product)) % &retained_product;
+        if value.magnitude() * 2u8 > *retained_product.magnitude() {
+            value = if value < BigInt::zero() {
+                value + &retained_product
+            } else {
+                value - &retained_product
+            };
+        }
         NoiseDecompositionPlan::sparse_monomial(
             base.clone(),
             digit_count,
@@ -2107,14 +2259,10 @@ fn compact_noise_snapshot_routes(
                 .ok_or(RefreshSetupError::InvalidParameters("CRT modulus must be positive"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let digits_per_tower = digit_count
-        .checked_div(crt_moduli.len())
-        .filter(|digits| *digits != 0 && *digits * crt_moduli.len() == digit_count)
-        .ok_or(RefreshSetupError::InvalidParameters(
-            "gadget digits do not match the CRT tower count",
-        ))?;
+    let (digits_per_tower, retained_towers) =
+        ordinary_gadget_towers(&crt_moduli, &base, digit_count)?;
     let bind_crt = |plan: NoiseDecompositionPlan| {
-        plan.bind_crt_layout(crt_moduli.clone(), digits_per_tower)
+        plan.bind_crt_layout(crt_moduli[..retained_towers].to_vec(), digits_per_tower)
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid compact CRT decomposition"))
     };
     let scales = (0..p.refresh.crt_plaintext_moduli.len())
@@ -2138,13 +2286,24 @@ fn compact_noise_snapshot_routes(
                 target_rows,
                 target_rows * digit_count,
                 ring_dimension,
-                scale.clone().into(),
+                BigInt::from(scale % crt_moduli[..retained_towers].iter().product::<BigUint>()),
             )
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh scale plan"))
             .and_then(&bind_crt)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let dropped_product = crt_moduli[retained_towers..].iter().product::<BigUint>();
+    let retained_product = BigInt::from(crt_moduli[..retained_towers].iter().product::<BigUint>());
     let route_plan = |value: BigInt, ring_coefficient: usize| {
+        let mut value =
+            (&value - even_route_correction(&value, &dropped_product)) % &retained_product;
+        if value.magnitude() * 2u8 > *retained_product.magnitude() {
+            value = if value < BigInt::zero() {
+                value + &retained_product
+            } else {
+                value - &retained_product
+            };
+        }
         NoiseDecompositionPlan::sparse_monomial(
             base.clone(),
             digit_count,
@@ -2300,6 +2459,7 @@ impl RefreshPreprocessingProducer {
                 p.coefficient_count,
                 &p.mask_base_p_digit_counts,
             )?),
+            Some(corrected_route_scalar_family(p, &ring, false)?),
             decomposition_base.clone(),
             IntExpr::constant(decomposition_digit_count),
         )?;
@@ -2315,6 +2475,7 @@ impl RefreshPreprocessingProducer {
             &fresh_digits,
             fresh_route_count,
             Some(repeated_scales),
+            Some(corrected_route_scalar_family(p, &ring, true)?),
             decomposition_base.clone(),
             IntExpr::constant(decomposition_digit_count),
         )?;
@@ -2331,6 +2492,7 @@ impl RefreshPreprocessingProducer {
             return Err(RefreshSetupError::InvalidManifest);
         }
         let (public_masks, public_fresh) = aggregate_public_refresh_prf(
+            p,
             &request.public_prf.compiler,
             public_readout_output,
             p.base_p,
@@ -2733,6 +2895,7 @@ fn shared_decoder_bases(
 /// fidelity: preprocessing must not pull private encoding-vector work into its
 /// graph merely to obtain the public matrices used by the decoder targets.
 fn aggregate_public_refresh_prf(
+    parameters: &RefreshSetupParameters,
     compiler: &ExponentLutPublicKeyCompiler,
     outputs: Family<Mat>,
     base_p: usize,
@@ -2780,6 +2943,7 @@ fn aggregate_public_refresh_prf(
             coefficient_count,
             mask_digit_counts,
         )?),
+        Some(corrected_route_scalar_family(parameters, &parameters.layout.ring(), false)?),
     )?;
     let mut start = 0usize;
     let masks = mask_digit_counts
@@ -2817,6 +2981,7 @@ fn aggregate_public_refresh_prf(
         coefficient_count,
         &vec![fresh_digit_count; slot_count],
         Some(repeated_scales),
+        Some(corrected_route_scalar_family(parameters, &parameters.layout.ring(), true)?),
     )?;
     let fresh = reduce_public_family_segments(routed_fresh, slot_count, fresh_group)?;
     if !family_count_is(&fresh, slot_count)? {
@@ -2899,7 +3064,10 @@ fn route_public_prf_family(
     coefficient_count: usize,
     digit_counts: &[usize],
     scales: Option<Family<Mat>>,
+    corrected_scalars: Option<Family<Mat>>,
 ) -> Result<Family<Mat>, RefreshSetupError> {
+    let base_p = if corrected_scalars.is_some() { 1 } else { base_p };
+    let scales = corrected_scalars.or(scales);
     let has_scales = scales.is_some();
     let total_digits = digit_counts.iter().try_fold(0usize, |sum, digits| {
         sum.checked_add(*digits).ok_or(RefreshSetupError::InvalidManifest)
@@ -5314,6 +5482,24 @@ pub(crate) mod tests {
     use crate::noise_refresh::pbc::{PbcParameters, PbcRootSeed, generate_key_layout};
     use mxx_ir_core::node::NodeKind;
     use num_bigint::BigInt;
+
+    #[test]
+    fn even_route_targets_preserve_omitted_residues_and_half_payload() {
+        for product in [5u32, 13, 65] {
+            let p = BigUint::from(product);
+            for scalar in -150i32..150 {
+                let value = BigInt::from(scalar);
+                let residual = even_route_correction(&value, &p);
+                assert_eq!(residual.magnitude() % 2u8, BigUint::zero());
+                assert!(residual.magnitude() <= &p);
+                assert_eq!((&value - &residual) % BigInt::from(p.clone()), BigInt::zero());
+                // Every p=32 native half-payload has a genuine integer error.
+                for odd in (-31i32..32).step_by(2) {
+                    assert_eq!((&residual * odd) % 2u8, BigInt::zero());
+                }
+            }
+        }
+    }
 
     fn parameters(gadget_base: i32, secret_dimension: usize) -> RefreshSetupParameters {
         let layout = BggSamplerLayout {

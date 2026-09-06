@@ -796,7 +796,7 @@ where
                 if *small {
                     M::small_gadget_matrix(parameters, ty.rows)
                 } else {
-                    M::gadget_matrix(parameters, ty.rows)
+                    M::gadget_matrix(parameters, ty.rows, Some(digit_count))
                 }
             }
             ConstantMatrix::PowerOfBase { base, exponent } if ty.rows == 1 && ty.columns == 1 => {
@@ -1134,7 +1134,7 @@ where
             ty.columns,
             DistType::FinRingDist,
         );
-        Ok(source.gadget_decompose(false)?)
+        Ok(source.gadget_decompose(false, Some(digit_count))?)
     }
 
     fn sample_hash_small_decomposed(
@@ -1158,7 +1158,7 @@ where
             ty.columns,
             DistType::FinRingDist,
         );
-        Ok(source.gadget_decompose(true)?)
+        Ok(source.gadget_decompose(true, Some(digit_count))?)
     }
 
     fn validate_gadget_layout(
@@ -1170,7 +1170,12 @@ where
     ) -> Result<(), Self::Error> {
         let parameters = self.parameters(ty)?;
         let (backend_base, backend_digits) = Self::expected_gadget_layout(parameters, small);
-        if gadget_base != &backend_base || digit_count != backend_digits {
+        let valid_digits = if small {
+            digit_count == backend_digits
+        } else {
+            parameters.gadget_dropped_moduli(Some(digit_count)).is_some()
+        };
+        if gadget_base != &backend_base || !valid_digits {
             return Err(PolyBackendError::GadgetLayoutMismatch {
                 declared_base: gadget_base.clone(),
                 declared_digits: digit_count,
@@ -1268,12 +1273,23 @@ where
             .collect()
     }
 
-    fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M::SmallMatrix, Self::Error> {
-        Ok(value.clone().gadget_decompose(small)?)
+    fn gadget_decompose(
+        &mut self,
+        value: &M,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        Ok(value.clone().gadget_decompose(small, digit_count)?)
     }
 
-    fn gadget_error_bound(&self, ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
-        Ok(BigInt::from(self.parameters(ty)?.gadget_error_bound()))
+    fn gadget_error_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        digit_count: Option<usize>,
+    ) -> Result<BigInt, Self::Error> {
+        let parameters = self.parameters(ty)?;
+        parameters.gadget_dropped_moduli(digit_count).ok_or(PolyBackendError::InvalidInteger)?;
+        Ok(BigInt::from(parameters.gadget_error_bound(digit_count)))
     }
 
     fn multiply_small_rhs(&mut self, lhs: &M, rhs: &M::SmallMatrix) -> Result<M, Self::Error> {
@@ -1666,7 +1682,8 @@ mod tests {
         assert_eq!(decomposed.value(), &plain.decompose());
         assert_eq!(small_decomposed.value(), &plain.small_decompose());
 
-        let gadget = DCRTPolyMatrix::gadget_matrix(decomposed.value().params(), plain_type.rows);
+        let gadget =
+            DCRTPolyMatrix::gadget_matrix(decomposed.value().params(), plain_type.rows, None);
         assert_eq!(
             backend
                 .multiply_small_rhs(&gadget, &decomposed)

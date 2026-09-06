@@ -976,6 +976,7 @@ pub(crate) fn route_preimage_family(
     digit_counts: &[usize],
     count: usize,
     scales: Option<Family<Mat>>,
+    corrected_scalars: Option<Family<Mat>>,
     decomposition_base: IntExpr,
     decomposition_digit_count: IntExpr,
 ) -> Result<Family<Preimage>, RefreshError> {
@@ -1005,11 +1006,18 @@ pub(crate) fn route_preimage_family(
                 digit_counts,
             )
             .map_err(|_| mxx_dsl::DslError::Schema)?;
-            symbolic_prf_route_matrix(ring, public_key, base_p, digit, coefficient, component)
-                .map_err(|_| mxx_dsl::DslError::Schema)
+            symbolic_prf_route_matrix(
+                ring,
+                public_key,
+                if corrected_scalars.is_some() { 1 } else { base_p },
+                digit,
+                coefficient,
+                component,
+            )
+            .map_err(|_| mxx_dsl::DslError::Schema)
         })
         .map_err(|_| RefreshError::InvalidLayout)?;
-    let targets = if let Some(scales) = scales {
+    let targets = if let Some(scales) = corrected_scalars.or(scales) {
         (targets, scales)
             .parallel_zip_tuple_result(|_, (target, scale)| Ok(scale * target))
             .map_err(|_| RefreshError::InvalidLayout)?
@@ -2076,6 +2084,7 @@ mod tests {
             &[2],
             16,
             None,
+            None,
             IntExpr::constant(2),
             IntExpr::constant(3),
         )
@@ -2099,6 +2108,7 @@ mod tests {
                 2,
                 &[2],
                 16,
+                None,
                 None,
                 IntExpr::constant(2),
                 IntExpr::constant(3),

@@ -495,7 +495,7 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let uniform_sampler = GpuDCRTPolyUniformSampler::new();
         let trapdoor = GpuDCRTTrapdoor::new(params, size, self.sigma);
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
-        let g = GpuDCRTPolyMatrix::gadget_matrix(params, size);
+        let g = GpuDCRTPolyMatrix::gadget_matrix(params, size, None);
         let a0 = a_bar.concat_columns(&[&GpuDCRTPolyMatrix::identity(params, size, None)]);
         let a1 = &g - &(&a_bar * &trapdoor.r + &trapdoor.e);
         let a = a0.concat_columns(&[&a1]);
@@ -1065,7 +1065,7 @@ mod tests {
         let identity = GpuDCRTPolyMatrix::identity(&params, size * k, None);
         let trapdoor_matrix = trapdoor.r.concat_rows(&[&trapdoor.e, &identity]);
         let muled = public_matrix * trapdoor_matrix;
-        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&params, size);
+        let gadget_matrix = GpuDCRTPolyMatrix::gadget_matrix(&params, size, None);
         assert_eq!(muled, gadget_matrix);
     }
 

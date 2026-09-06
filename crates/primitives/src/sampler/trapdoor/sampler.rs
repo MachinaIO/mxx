@@ -74,7 +74,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         debug!("{}", "uniform sampler created");
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
         debug!("{}", "a_bar generated");
-        let g = DCRTPolyMatrix::gadget_matrix(params, size);
+        let g = DCRTPolyMatrix::gadget_matrix(params, size, None);
         debug!("{}", "gadget matrix generated");
         let a0 = a_bar.concat_columns(&[&DCRTPolyMatrix::identity(params, size, None)]);
         debug!("{}", "a0 generated");
@@ -342,7 +342,7 @@ mod test {
             &params,
             decompose_dcrt_gadget(&target.entry(0, 0), 3.0 * SIGMA, &params, 2, SIGMA),
         );
-        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1);
+        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1, None);
         assert_eq!(gadget_vec * decomposed, target);
     }
 
@@ -355,7 +355,7 @@ mod test {
             &params,
             decompose_dcrt_gadget(&target.entry(0, 0), (8.0 + 1.0) * SIGMA, &params, 8, SIGMA),
         );
-        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1);
+        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1, None);
         assert_eq!(gadget_vec * decomposed, target);
     }
 
@@ -398,7 +398,7 @@ mod test {
             let trapdoor_matrix = trapdoor_r.concat_rows(&[&trapdoor_e, &identity]);
             public_matrix * trapdoor_matrix
         };
-        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size);
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size, None);
         assert_eq!(muled, gadget_matrix);
     }
 
@@ -428,7 +428,7 @@ mod test {
         let coefficients = target.entry(0, 0).coeffs();
         let reconstructed = DCRTPoly::from_coeffs(&params, &coefficients);
         assert_eq!(reconstructed, target.entry(0, 0));
-        let gadget = DCRTPolyMatrix::gadget_matrix(&params, 1);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&params, 1, None);
         let identity = DCRTPolyMatrix::identity(&params, params.modulus_digits(), None);
         let trapdoor_matrix = trapdoor.r_cpu().concat_rows(&[&trapdoor.e_cpu(), &identity]);
         assert_eq!(public_matrix * trapdoor_matrix, gadget);

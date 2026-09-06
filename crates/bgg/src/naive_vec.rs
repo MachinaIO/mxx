@@ -844,14 +844,14 @@ mod tests {
             matrix_output(&result, "vector"),
             &vector
                 .clone()
-                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&target.clone().gadget_decompose(false, None).unwrap())
                 .unwrap()
         );
         assert_eq!(
             matrix_output(&result, "public"),
             &public
                 .clone()
-                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&target.clone().gadget_decompose(false, None).unwrap())
                 .unwrap()
         );
         assert!(output.plaintexts.is_none());
@@ -910,7 +910,7 @@ mod tests {
             ]),
         );
         let hash_sampler = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new();
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension, None);
         for output in 0..public_keys.len() {
             for slot in 0..2 {
                 let mut slot_tag = tag.to_vec();

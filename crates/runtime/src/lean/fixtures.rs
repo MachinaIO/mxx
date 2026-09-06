@@ -20,7 +20,7 @@ fn render_fixture() -> String {
     let approximate_parameters = DCRTPolyParams::new(2, 3, 10, 5, None, Some(1));
     let approximate_layout = export_dcrt_layouts([&approximate_parameters]).unwrap().remove(0);
     let approximate_q = approximate_layout.modulus.to_string();
-    let approximate_bound = approximate_parameters.gadget_error_bound();
+    let approximate_bound = approximate_parameters.gadget_error_bound(None);
     let context = render_backend_context(
         &[layout.clone(), multi_layout, approximate_layout],
         "GeneratedBackend",

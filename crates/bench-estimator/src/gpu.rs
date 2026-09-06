@@ -2235,6 +2235,7 @@ impl GpuNodeMeasurementBackend {
                                         *small,
                                         range.start,
                                         local_columns,
+                                        Some(full_ty.columns / full_ty.rows),
                                     )
                                 }
                                 _ => unreachable!("only range-capable constants receive a range"),
@@ -2648,10 +2649,10 @@ impl GpuNodeMeasurementBackend {
                         .map_err(backend_error)
                 }
             }
-            NodeKind::GadgetDecompose { small, .. } => (0..batch_size)
+            NodeKind::GadgetDecompose { small, digit_count, .. } => (0..batch_size)
                 .map(|_| {
                     backend
-                        .gadget_decompose(matrix(0)?, *small)
+                        .gadget_decompose(matrix(0)?, *small, Some(evaluate_usize(digit_count)?))
                         .map(GpuMeasurementOutput::SmallMatrix)
                         .map_err(backend_error)
                 })
@@ -3765,7 +3766,7 @@ mod tests {
         };
         assert!(outputs.is_empty());
         let actual = &actual.shards()[0].value;
-        let expected = GpuDCRTPolyMatrix::gadget_matrix(actual.params(), rows)
+        let expected = GpuDCRTPolyMatrix::gadget_matrix(actual.params(), rows, None)
             .slice_columns(range.start, range.end);
         assert_eq!(actual.to_cpu_matrix(), expected.to_cpu_matrix());
     }

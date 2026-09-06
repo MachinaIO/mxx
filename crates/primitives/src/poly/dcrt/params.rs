@@ -285,7 +285,7 @@ mod tests {
             assert_eq!(params.to_crt(), exact.to_crt());
             assert_eq!(params.modulus_digits(), (3 - k) * 5);
             let p = moduli[3 - k..].iter().fold(BigUint::from(1u8), |a, b| a * b);
-            assert_eq!(params.gadget_error_bound(), (p / 2u8) * k);
+            assert_eq!(params.gadget_error_bound(None), (p / 2u8) * k);
             assert_eq!(params == exact, k == 0);
             if k != 0 {
                 assert!(params.select_modulus(params.modulus().as_ref()).is_none());

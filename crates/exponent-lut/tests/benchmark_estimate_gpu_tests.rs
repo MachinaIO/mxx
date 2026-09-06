@@ -2,8 +2,8 @@
 //!
 //! This target deliberately does not search parameters, invoke Sage or a
 //! lattice estimator, run a noise simulation, execute the graphs, or perform
-//! a round trip.  It rebuilds the accepted symbolic graphs from a completed
-//! Phase-2 checkpoint and measures representative GPU node shapes only.
+//! a round trip.  It rebuilds the symbolic graphs from an explicit source-generated accepted noise
+//! report and measures representative GPU node shapes only.
 
 #![cfg(feature = "gpu")]
 
@@ -25,60 +25,32 @@ use mxx_primitives::poly::{
 use mxx_runtime::backend::poly::gpu::gpu_backend_on;
 use serde::Deserialize;
 use std::{env, fs, path::PathBuf, time::Instant};
-use test_utils::{
-    Candidate, Phase1Checkpoint, SearchConfig, hex, prepare_candidate_with_fixed_digits,
-};
+use test_utils::{Candidate, SearchConfig, hex, prepare_candidate_with_fixed_digits};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Deserialize)]
 struct AcceptedReport {
-    phase1: AcceptedPhase1,
-    phase2: AcceptedPhase2,
     result: AcceptedResult,
-}
-
-#[derive(Deserialize)]
-struct AcceptedPhase1 {
-    selected_universe: usize,
-    selected_q_l: usize,
-    selected_p: usize,
-    selected_weight: usize,
-    selected_tier: String,
-    estimator_commit: String,
-    estimator_cost_model: String,
-    estimator_shape_model: String,
-}
-
-#[derive(Deserialize)]
-struct AcceptedPhase2 {
-    security_target_bits: u64,
-    noise_model: String,
 }
 
 #[derive(Deserialize)]
 struct AcceptedResult {
     candidate: Candidate,
+    gadget_dropped_moduli: usize,
     achieved_security_bits: u64,
     sparse_lwr_universe: usize,
     sparse_lwr_weight: usize,
     sparse_lwr_q_l: usize,
     sparse_lwr_p: usize,
-    sparse_lwr_tier: String,
-    estimator_commit: String,
-    estimator_cost_model: String,
-    estimator_shape_model: String,
     layout_id: String,
     program_id: String,
-    checker_accepted: bool,
-    average_evidence: Option<AcceptedAverageEvidence>,
+    average_evidence: AcceptedAverageEvidence,
 }
 
 #[derive(Deserialize)]
 struct AcceptedAverageEvidence {
     setup_identity: String,
-    layout_id: String,
-    program_id: String,
     switch_moduli: Vec<String>,
     mask_digit_count: usize,
     fresh_error_digit_count: usize,
@@ -312,90 +284,30 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     });
     let _ = tracing_subscriber::fmt().with_env_filter(filter).with_test_writer().try_init();
 
-    let checkpoint_path =
-        env::var_os("MXX_EXPONENT_LUT_REFRESH_PHASE1_CHECKPOINT").map(PathBuf::from).expect(
-            "MXX_EXPONENT_LUT_REFRESH_PHASE1_CHECKPOINT must name a completed Phase-2 checkpoint",
-        );
-    let mut config = SearchConfig::from_env().expect("valid accepted Exponent-LUT profile overlay");
-    let checkpoint: Phase1Checkpoint = serde_json::from_slice(
-        &fs::read(&checkpoint_path).expect("read accepted Exponent-LUT checkpoint"),
-    )
-    .expect("parse accepted Exponent-LUT checkpoint");
-    checkpoint.validate(&config).expect("validate accepted Exponent-LUT checkpoint");
-    let accepted = checkpoint
-        .accepted_phase2
-        .as_ref()
-        .expect("Exponent-LUT checkpoint must contain an accepted Phase-2 candidate");
-    // Phase 1's `selected` profile is only the first qualifying tuple under
-    // the Phase-1 security policy.  Phase 2 evaluates every qualifying tuple
-    // and may accept a different one when it has the globally smallest CRT
-    // depth.  The checkpoint validator already proves that the accepted tuple
-    // is declared, qualified, and consistent with the retained Phase-1 rows;
-    // it must not be confused with the Phase-1 representative.
-
+    let mut config = SearchConfig::from_env().expect("valid Exponent-LUT profile overlay");
     let report_path = env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT")
         .map(PathBuf::from)
-        .expect("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT must name the accepted AverageCase report");
+        .expect("explicit accepted noise-model benchmark input");
     let report: AcceptedReport =
-        serde_json::from_slice(&fs::read(&report_path).expect("read accepted Exponent-LUT report"))
-            .expect("parse accepted Exponent-LUT report");
-    assert_eq!(report.phase2.noise_model, "AverageCase");
-    assert_eq!(report.phase2.security_target_bits, config.security_bits);
-    assert!(
-        report.result.achieved_security_bits >= config.security_bits,
-        "accepted report must achieve at least the configured security target"
-    );
-    assert_eq!(report.result.candidate, accepted.candidate);
-    assert_eq!(report.phase1.selected_universe, accepted.tuple.nu);
-    assert_eq!(report.phase1.selected_q_l, accepted.tuple.q_l);
-    assert_eq!(report.phase1.selected_p, accepted.tuple.p);
-    assert_eq!(report.phase1.selected_weight, accepted.tuple.h);
-    assert_eq!(report.result.sparse_lwr_universe, accepted.tuple.nu);
-    assert_eq!(report.result.sparse_lwr_weight, accepted.tuple.h);
-    assert_eq!(report.result.sparse_lwr_q_l, accepted.tuple.q_l);
-    assert_eq!(report.result.sparse_lwr_p, accepted.tuple.p);
-    let selected_tier = format!("{:?}", checkpoint.selected.tier);
-    assert_eq!(report.phase1.selected_tier, selected_tier);
-    assert_eq!(report.result.sparse_lwr_tier, selected_tier);
-    assert_eq!(report.phase1.estimator_commit, checkpoint.selected.estimator_commit);
-    assert_eq!(report.phase1.estimator_cost_model, checkpoint.selected.estimator_cost_model);
-    assert_eq!(report.phase1.estimator_shape_model, checkpoint.selected.estimator_shape_model);
-    assert_eq!(report.result.estimator_commit, checkpoint.selected.estimator_commit);
-    assert_eq!(report.result.estimator_cost_model, checkpoint.selected.estimator_cost_model);
-    assert_eq!(report.result.estimator_shape_model, checkpoint.selected.estimator_shape_model);
-    assert!(report.result.checker_accepted, "accepted report must pass its checker");
-    let evidence = report
-        .result
-        .average_evidence
-        .as_ref()
-        .expect("benchmark requires an accepted AverageCase report");
+        serde_json::from_slice(&fs::read(&report_path).expect("read benchmark input"))
+            .expect("parse benchmark input");
+    let accepted = &report.result;
+    assert!(accepted.achieved_security_bits >= config.security_bits);
+    let evidence = &accepted.average_evidence;
     assert!(
         evidence.accepted && evidence.hard_authority_accepted && evidence.correctness_accepted,
-        "AverageCase report must be fully accepted"
+        "benchmark input must contain independently accepted noise-model evidence"
     );
-    assert_eq!(evidence.layout_id, report.result.layout_id);
-    assert_eq!(evidence.program_id, report.result.program_id);
     let mask_digits = evidence.mask_digit_count;
     let fresh_error_digits = evidence.fresh_error_digit_count;
-    // Reconstruct the graph for the Phase-2 winner, rather than for the
-    // Phase-1 representative or for an environment default that happens to
-    // differ from the winner's native (Q, P, nu, h) tuple.
-    config.sparse_lwr_universe = accepted.tuple.nu;
-    config.sparse_lwr_weight = accepted.tuple.h;
-    config.sparse_lwr_modulus = accepted.tuple.q_l;
-    config.sparse_lwr_output_modulus = accepted.tuple.p;
+    config.gadget_dropped_moduli = accepted.gadget_dropped_moduli;
+    config.sparse_lwr_universe = accepted.sparse_lwr_universe;
+    config.sparse_lwr_weight = accepted.sparse_lwr_weight;
+    config.sparse_lwr_modulus = accepted.sparse_lwr_q_l;
+    config.sparse_lwr_output_modulus = accepted.sparse_lwr_p;
     info!(
-        crt_depth = accepted.candidate.crt_depth,
-        log_ring_dimension = accepted.candidate.log_ring_dimension,
-        crt_bits = accepted.candidate.crt_bits,
-        base_bits = accepted.candidate.base_bits,
-        native_q = accepted.tuple.q_l,
-        native_p = accepted.tuple.p,
-        sparse_lwr_universe = accepted.tuple.nu,
-        sparse_lwr_weight = accepted.tuple.h,
-        mask_digits,
-        fresh_error_digits,
-        "starting accepted Exponent-LUT candidate graph preparation"
+        gadget_dropped_moduli = config.gadget_dropped_moduli,
+        "preparing universally approximate gadget graph; only trapdoor preimages retain exact row dimensions"
     );
     let graph_started = Instant::now();
     let prepared = prepare_candidate_with_fixed_digits(
@@ -490,7 +402,6 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     );
     let stages = [("preprocess", preprocessing), ("oneline_eval", online)];
     info!(
-        checkpoint = %checkpoint_path.display(),
         accepted_report = %report_path.display(),
         crt_depth = accepted.candidate.crt_depth,
         log_ring_dimension = accepted.candidate.log_ring_dimension,

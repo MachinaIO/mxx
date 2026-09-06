@@ -1100,6 +1100,10 @@ impl GpuDCRTPolyParams {
         &self.gpu_ids
     }
 
+    pub(crate) fn supports_shared_crt_correction(&self) -> bool {
+        self.gpu_ids.len() <= 1 || self.dnum == 1
+    }
+
     pub(crate) fn ctx_raw(&self) -> *mut GpuContextOpaque {
         self.ctx.raw_ptr()
     }

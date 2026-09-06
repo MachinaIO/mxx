@@ -718,7 +718,7 @@ impl DiamondGpuMeasurementBackend {
                             .map_err(Self::backend_error)?;
                         return this
                             .backend
-                            .gadget_decompose(&target, false)
+                            .gadget_decompose(&target, false, Some(*digit_count))
                             .map(ReadyOutput::SmallMatrix)
                             .map_err(Self::backend_error);
                     }
@@ -776,7 +776,7 @@ impl DiamondGpuMeasurementBackend {
                         .validate_gadget_layout(&input_type, &base, digit_count, *small)
                         .map_err(Self::backend_error)?;
                     this.backend
-                        .gadget_decompose(&input, *small)
+                        .gadget_decompose(&input, *small, Some(digit_count))
                         .map(ReadyOutput::SmallMatrix)
                         .map_err(Self::backend_error)
                 })

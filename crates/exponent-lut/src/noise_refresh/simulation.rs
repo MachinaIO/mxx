@@ -9,7 +9,7 @@ use crate::{
     noise::{
         AverageVariance, GateNoiseDecomposition, GateNoiseGains, NoiseDecompositionPlan,
         ProgramNoiseError, ProgramNoiseGainPlan, ProgramNoiseInputs, ProgramNoiseReport,
-        RightActionNoiseGain, simulate_program,
+        ProgramNoiseState, RightActionNoiseGain, simulate_program,
     },
     noise_refresh::prf::SparseLwrPrfProgram,
     program::{
@@ -19,6 +19,7 @@ use crate::{
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const AVERAGE_CASE_REPORT_SCHEMA_VERSION: u32 = 3;
@@ -126,7 +127,7 @@ impl NoiseGainPlanBuilder {
             .map(|plan| {
                 plan.validate()?;
                 let gain = plan.action_gain();
-                if gain.l1.is_zero() || gain.l2_squared.is_zero() {
+                if gain.l1.is_zero() != gain.l2_squared.is_zero() {
                     return Err(NoiseSimulationError::InvalidDecomposition);
                 }
                 Ok(gain)
@@ -240,6 +241,9 @@ pub struct RefreshNoiseParameters {
     pub smudging: Option<MaskSmudgingParameters>,
     pub mask_digit_variances: Vec<AverageVariance>,
     pub fresh_digit_variances: Vec<AverageVariance>,
+    /// Deterministic native half-payload error from public even-corrected
+    /// mask/fresh route targets, before coefficient modulus switching.
+    pub route_bias_bounds: Vec<BigUint>,
 }
 
 /// Setup-owned refresh transcript shape. `component_columns` is the concrete
@@ -346,7 +350,9 @@ impl RefreshNoiseParameters {
             self.mask_digit_counts.len() != self.slot_count ||
             self.mask_digit_counts.iter().any(|count| *count == 0) ||
             self.switch_moduli.len() != self.slot_count ||
-            self.fresh_digit_count == 0
+            self.fresh_digit_count == 0 ||
+            (!self.route_bias_bounds.is_empty() &&
+                self.route_bias_bounds.len() != self.slot_count)
         {
             return Err(NoiseSimulationError::InvalidRefresh("invalid refresh schema"));
         }
@@ -408,6 +414,7 @@ impl RefreshNoiseParameters {
             smudging: None,
             mask_digit_variances: Vec::new(),
             fresh_digit_variances: Vec::new(),
+            route_bias_bounds: Vec::new(),
         };
         parameters.validate()?;
         Ok(parameters)
@@ -425,12 +432,12 @@ impl RefreshNoiseParameters {
                 .state_scaling
                 .iter()
                 .chain(gains.mask.iter())
-                .any(|gain| gain.l1.is_zero() || gain.l2_squared.is_zero()) ||
+                .any(|gain| gain.l1.is_zero() != gain.l2_squared.is_zero()) ||
             gains
                 .fresh
                 .iter()
                 .chain(gains.decoder.iter())
-                .any(|gain| gain.l1.is_zero() || gain.l2_squared.is_zero())
+                .any(|gain| gain.l1.is_zero() != gain.l2_squared.is_zero())
         {
             return Err(NoiseSimulationError::InvalidRefresh("incomplete route gains"));
         }
@@ -510,6 +517,21 @@ pub struct PreRefreshNoiseEvaluation {
     pub program: ProgramNoiseReport,
     pub readout_bound: BigUint,
     pub readout_variance: AverageVariance,
+    /// Deterministic readout error already included in `readout_bound` but
+    /// excluded from `readout_variance`. Average refresh transports this with
+    /// l1 gains, since fixed bias must not receive independent-sum discounts.
+    pub readout_bias_bound: BigUint,
+}
+
+impl PreRefreshNoiseEvaluation {
+    /// Transports readout noise through a modeled scalar bridge. The residual
+    /// bias is supplied already weighted by the plaintext and secret bounds;
+    /// it remains deterministic in every downstream refresh route.
+    pub fn apply_gadget_bridge(&mut self, gain: &RightActionNoiseGain, bias: &BigUint) {
+        self.readout_bound = &self.readout_bound * &gain.l1 + bias;
+        self.readout_variance = self.readout_variance.scaled(&gain.l2_squared);
+        self.readout_bias_bound = &self.readout_bias_bound * &gain.l1 + bias;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -808,6 +830,11 @@ pub struct ExponentLutNoiseSnapshot {
     pub refresh: RefreshNoiseParameters,
     pub gain_plan: NoiseGainPlan,
     pub family_active_counts: Vec<usize>,
+    /// Optional modeled errors after the target, each nonidentity trace branch,
+    /// and normalization, respectively. They are already secret-weighted.
+    /// This metadata does not establish an executable approximate setup.
+    pub readout_residuals: Option<(ProgramNoiseState, Vec<ProgramNoiseState>, ProgramNoiseState)>,
+    pub operation_residuals: BTreeMap<usize, ProgramNoiseState>,
     target_plaintext_gain: RightActionNoiseGain,
     native_modulus: BigUint,
     identity: [u8; 32],
@@ -905,6 +932,8 @@ impl ExponentLutNoiseSnapshot {
             refresh,
             gain_plan,
             family_active_counts,
+            readout_residuals: None,
+            operation_residuals: BTreeMap::new(),
             target_plaintext_gain,
             native_modulus,
             identity,
@@ -913,6 +942,11 @@ impl ExponentLutNoiseSnapshot {
 
     pub fn setup_identity(&self) -> &[u8; 32] {
         &self.identity
+    }
+
+    /// Plaintext target action used to weight trace-switch residuals.
+    pub fn target_plaintext_gain(&self) -> &RightActionNoiseGain {
+        &self.target_plaintext_gain
     }
 
     pub fn simulate(&self) -> Result<ExponentLutNoiseReport, NoiseSimulationError> {
@@ -940,7 +974,27 @@ impl ExponentLutNoiseSnapshot {
             self.gain_plan.program.gates(),
             &self.family_active_counts,
         )?;
-        let target_bound = &self.readout_gains.target.l1 * &program.output_bound;
+        let zero =
+            ProgramNoiseState { bound: BigUint::zero(), doubled_variance: AverageVariance::zero() };
+        let (target_residual, trace_residuals, normalization_residual) =
+            match &self.readout_residuals {
+                Some((target, trace, normalization))
+                    if trace.len() == self.readout_gains.nonidentity_trace.len() =>
+                {
+                    (target, trace.as_slice(), normalization)
+                }
+                Some(_) => return Err(NoiseSimulationError::InvalidDecomposition),
+                None => (&zero, &[][..], &zero),
+            };
+        if std::iter::once(target_residual)
+            .chain(trace_residuals)
+            .chain(std::iter::once(normalization_residual))
+            .any(|residual| residual.doubled_variance.denominator.is_zero())
+        {
+            return Err(NoiseSimulationError::InvalidDecomposition);
+        }
+        let target_bound =
+            &self.readout_gains.target.l1 * &program.output_bound + &target_residual.bound;
         let mut trace_bound = &self.readout_gains.identity_trace.l1 * &target_bound;
         for gain in &self.readout_gains.nonidentity_trace {
             trace_bound += &gain.action.l1 * &target_bound;
@@ -950,7 +1004,11 @@ impl ExponentLutNoiseSnapshot {
             trace_bound += &(&self.target_plaintext_gain.l1 + &gain.helper_action.l1) *
                 &self.helper_error_cutoff;
         }
-        let readout_bound = &self.readout_gains.normalization.l1 * trace_bound;
+        for residual in trace_residuals {
+            trace_bound += &residual.bound;
+        }
+        let readout_bound =
+            &self.readout_gains.normalization.l1 * trace_bound + &normalization_residual.bound;
         let output_wire =
             *self.program.outputs().last().ok_or(NoiseSimulationError::MissingOutput)?;
         let target_variance = program
@@ -958,7 +1016,8 @@ impl ExponentLutNoiseSnapshot {
             .get(&output_wire)
             .cloned()
             .ok_or(NoiseSimulationError::MissingWireVariance(output_wire))?
-            .scaled(&self.readout_gains.target.l2_squared);
+            .scaled(&self.readout_gains.target.l2_squared)
+            .add(&target_residual.doubled_variance);
         let mut trace_variance = target_variance.clone();
         for gain in &self.readout_gains.nonidentity_trace {
             trace_variance = trace_variance.add(&target_variance.scaled(&gain.action.l2_squared));
@@ -966,8 +1025,18 @@ impl ExponentLutNoiseSnapshot {
                 &(&self.target_plaintext_gain.l2_squared + &gain.helper_action.l2_squared),
             ));
         }
-        let readout_variance = trace_variance.scaled(&self.readout_gains.normalization.l2_squared);
-        Ok(PreRefreshNoiseEvaluation { program, readout_bound, readout_variance })
+        for residual in trace_residuals {
+            trace_variance = trace_variance.add(&residual.doubled_variance);
+        }
+        let readout_variance = trace_variance
+            .scaled(&self.readout_gains.normalization.l2_squared)
+            .add(&normalization_residual.doubled_variance);
+        Ok(PreRefreshNoiseEvaluation {
+            program,
+            readout_bound,
+            readout_variance,
+            readout_bias_bound: BigUint::zero(),
+        })
     }
 
     pub fn simulate_with_inputs(
@@ -1047,7 +1116,8 @@ impl ExponentLutNoiseSnapshot {
                 let mask_bound = &mask_modulus / 2u8;
                 mask_coverage_accepted &= mask_modulus >= self.native_modulus;
                 let pre_switch_bound = &routes.state_scaling[slot].l1 * &self.initial_state_bound +
-                    (&routes.mask[slot].l1 + &routes.fresh[slot].l1) * output_bound;
+                    (&routes.mask[slot].l1 + &routes.fresh[slot].l1) * output_bound +
+                    self.refresh.route_bias_bounds.get(slot).cloned().unwrap_or_default();
                 let decoder_bound = &routes.decoder[slot].l1 * &self.helper_error_cutoff;
                 let destination = &self.refresh.switch_moduli[slot];
                 let lift = global_modulus / destination;
@@ -1118,8 +1188,9 @@ impl ExponentLutNoiseSnapshot {
     /// Build the complete candidate input state from setup-owned topology.
     /// Public-family error inputs are explicit here; an AverageCase run never
     /// silently substitutes an empty family map for a declared family.
-    fn setup_average_inputs(&self) -> ProgramNoiseInputs {
+    pub fn setup_average_inputs(&self) -> ProgramNoiseInputs {
         let mut inputs = ProgramNoiseInputs {
+            operation_residuals: self.operation_residuals.clone(),
             input_bounds: self
                 .program
                 .inputs()
@@ -1282,7 +1353,17 @@ impl ExponentLutNoiseSnapshot {
                 let mask_bound = &exact.mask_bound;
                 let (variance, variance_breakdown) = route_variance(slot)?;
                 let f_avg = average_favg(&z_squared, &variance, config.tail_correction_bits)? +
-                    ceil_div(&exact.rounding_numerator, &exact.rounding_denominator)?;
+                    ceil_div(&exact.rounding_numerator, &exact.rounding_denominator)? +
+                    ceil_div(
+                        &(&pre_refresh.readout_bias_bound *
+                            (&routes.mask[slot].l1 + &routes.fresh[slot].l1) +
+                            self.refresh
+                                .route_bias_bounds
+                                .get(slot)
+                                .cloned()
+                                .unwrap_or_default()),
+                        &exact.lift,
+                    )?;
                 if f_avg > max_f_avg {
                     max_f_avg = f_avg.clone();
                 }
@@ -1432,7 +1513,7 @@ fn ceil_sqrt(value: &BigUint) -> BigUint {
 
 /// Computes the exact integer average-case transfer bound
 /// `ceil(sqrt(ceil(z^2 * V * 4^b / 4)))`.
-fn average_favg(
+pub fn average_favg(
     z_squared: &AverageVariance,
     variance: &AverageVariance,
     tail_correction_bits: u32,
@@ -2138,6 +2219,7 @@ mod tests {
             action(GateNoiseOperation::Add, 3, 0, 1u8.into(), 1u8.into()),
         ];
         let inputs = ProgramNoiseInputs {
+            operation_residuals: BTreeMap::new(),
             input_bounds: BTreeMap::from([(input, BigUint::from(3u8))]),
             input_variances: BTreeMap::from([(input, unit.clone())]),
             public_family_uniform_bounds: BTreeMap::new(),
@@ -2198,6 +2280,7 @@ mod tests {
         // variances are distinct and therefore cannot be multiplied from a
         // single representative.
         let mixed_inputs = ProgramNoiseInputs {
+            operation_residuals: BTreeMap::new(),
             input_bounds: BTreeMap::from([(input, BigUint::from(3u8))]),
             input_variances: BTreeMap::from([(input, unit.clone())]),
             public_family_uniform_bounds: BTreeMap::from([(public_family, BigUint::from(5u8))]),

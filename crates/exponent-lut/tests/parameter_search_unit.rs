@@ -1,5 +1,745 @@
 include!("test_utils.rs");
 
+fn evaluate_universal_depth_case(
+    config: &SearchConfig,
+    directory: &Path,
+    depth: usize,
+    dropped: usize,
+) -> serde_json::Value {
+    let mut config = config.clone();
+    config.gadget_dropped_moduli = dropped;
+    let candidate =
+        Candidate { crt_depth: depth, log_ring_dimension: 16, crt_bits: 50, base_bits: 25 };
+    let result = (|| -> Result<serde_json::Value, CandidatePreparationError> {
+        let mut context = build_candidate_context(&config, candidate)?;
+        context.switch_moduli = candidate_switch_moduli(&context.crt_moduli, 5)?;
+        let prepared =
+            prepare_candidate_from_ring_context(&config, &context, Some((38, 1)), false)?;
+        let snapshot = prepared.noise_snapshot.as_ref().expect("production snapshot");
+        let average = snapshot.simulate_average(&average_case_config(&config).unwrap()).unwrap();
+        let row = serde_json::json!({
+            "depth":depth,"dropped":dropped,"retained":depth-dropped,
+            "gadget_columns":4*(depth-dropped),"accepted":average.accepted,
+            "full_modulus":snapshot.refresh.global_modulus.as_ref().unwrap().to_string(),
+            "crt_moduli":context.crt_moduli,
+            "switch_moduli":context.switch_moduli.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "max_f_avg":average.refresh.max_f_avg.to_string(),
+            "minimum_rounding_margin":average.refresh.slots.iter().map(|s| &s.rounding_margin).min().unwrap().to_string(),
+            "minimum_smudging_margin":average.refresh.slots.iter().map(|s| &s.smudging_margin).min().unwrap().to_string(),
+            "route_bias_bounds":snapshot.refresh.route_bias_bounds.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "average":average,
+            "setup_identity":hex(*snapshot.setup_identity()),
+        });
+        Ok(row)
+    })();
+    let row = match result {
+        Ok(row) => row,
+        Err(error) => serde_json::json!({"depth":depth,"dropped":dropped,
+                "accepted":false,"preparation_error":error.to_string()}),
+    };
+    fs::write(
+        directory.join(format!("depth-{depth}-drop-{dropped}.json")),
+        serde_json::to_vec_pretty(&row).unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "DEPTH_WINDOW_CASE depth={depth} dropped={dropped} accepted={} F={} error={}",
+        row["accepted"], row["max_f_avg"], row["preparation_error"]
+    );
+    row
+}
+
+#[test]
+#[ignore = "explicit CPU-only exact-depth baseline and bounded universal approximation sweep"]
+fn universal_approximate_minimum_depth_window() {
+    use rayon::prelude::*;
+    let mut config = SearchConfig::reviewed();
+    config.noise_model = NoiseSearchModel::AverageCase;
+    config.sparse_lwr_universe = 8192;
+    config.sparse_lwr_weight = 18;
+    config.sparse_lwr_modulus = 4096;
+    config.sparse_lwr_output_modulus = 32;
+    let run =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/universal_approximate_depth_window")
+        .join(run.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    eprintln!("DEPTH_WINDOW_DIRECTORY {}", directory.display());
+    let evaluate =
+        |depth, dropped| evaluate_universal_depth_case(&config, &directory, depth, dropped);
+    let mut baseline = (1..5)
+        .map(|depth| {
+            serde_json::json!({
+                "depth":depth,"dropped":0,"accepted":false,
+                "exclusion":"fixed exact decoder switch width five exceeds full CRT depth"
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut minimum = None;
+    for depth in 5..=33 {
+        let row = evaluate(depth, 0);
+        let accepted = row["accepted"] == true;
+        baseline.push(row);
+        if accepted {
+            minimum = Some(depth);
+            break;
+        }
+    }
+    let minimum = minimum.expect("exact accepted baseline inside conventional security cap");
+    assert!(minimum + 3 <= 33, "depth window extends beyond verified security envelope");
+    let candidates = (minimum..=minimum + 3)
+        .flat_map(|depth| (0..depth).map(move |drop| (depth, drop)))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    // Four concurrent independent snapshots cap peak program-state memory.
+    for chunk in candidates.chunks(4) {
+        rows.extend(
+            chunk.par_iter().map(|&(depth, drop)| evaluate(depth, drop)).collect::<Vec<_>>(),
+        );
+    }
+    let best = rows
+        .iter()
+        .filter(|row| row["accepted"] == true)
+        .map(|row| row["dropped"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    // Exact failure does not imply approximate failure: separately exclude
+    // every lower-depth configuration that could improve the incumbent.
+    // Depth <= best+1 cannot retain even one tower while dropping more.
+    let lower_candidates = (5.max(best as usize + 2)..minimum)
+        .flat_map(|depth| ((best as usize + 1)..depth).map(move |drop| (depth, drop)))
+        .collect::<Vec<_>>();
+    let mut lower_rows = Vec::new();
+    for chunk in lower_candidates.chunks(4) {
+        lower_rows.extend(
+            chunk.par_iter().map(|&(depth, drop)| evaluate(depth, drop)).collect::<Vec<_>>(),
+        );
+    }
+    assert!(
+        baseline
+            .iter()
+            .chain(&rows)
+            .chain(&lower_rows)
+            .all(|row| row.get("preparation_error").is_none()),
+        "unexpected preparation errors require explicit audit, not rejection by default"
+    );
+    let best = rows
+        .iter()
+        .chain(&lower_rows)
+        .filter(|row| row["accepted"] == true)
+        .map(|row| row["dropped"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    let winners = rows
+        .iter()
+        .chain(&lower_rows)
+        .filter(|row| row["accepted"] == true && row["dropped"] == best)
+        .map(|row| serde_json::json!({"depth":row["depth"],"dropped":row["dropped"]}))
+        .collect::<Vec<_>>();
+    fs::write(directory.join("search.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "scope":"Current universal approximate production model; fixed N65536, CRT50/base25, dm38/df1, five-tower exact decoder; conventional security envelope through depth33; not a joint-security proof",
+        "minimum_exact_depth":minimum,"maximum_dropped":best,"winners":winners,
+        "baseline":baseline,"window":rows,"lower_depth_exclusions":lower_rows
+    })).unwrap()).unwrap();
+    eprintln!(
+        "DEPTH_WINDOW_RESULT minimum_exact_depth={minimum} maximum_dropped={best} winners={winners:?}"
+    );
+}
+
+#[test]
+#[ignore = "explicit CPU-only universal approximate gadget noise and graph preparation"]
+fn universal_approximate_complete_lower_depths() {
+    use rayon::prelude::*;
+    let mut config = SearchConfig::reviewed();
+    config.noise_model = NoiseSearchModel::AverageCase;
+    config.sparse_lwr_universe = 8192;
+    config.sparse_lwr_weight = 18;
+    config.sparse_lwr_modulus = 4096;
+    config.sparse_lwr_output_modulus = 32;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/universal_approximate_depth_window");
+    let directory = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join("search.json").is_file())
+        .max()
+        .expect("completed first-stage sweep");
+    let mut search: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("search.json")).unwrap()).unwrap();
+    assert!(
+        search["lower_depth_exclusions"].is_array(),
+        "first-stage maximum proof must be complete"
+    );
+    let minimum = search["minimum_exact_depth"].as_u64().unwrap() as usize;
+    let best = search["maximum_dropped"].as_u64().unwrap() as usize;
+    let candidates = (5..minimum)
+        .flat_map(|depth| (1..=best.min(depth - 1)).map(move |drop| (depth, drop)))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for chunk in candidates.chunks(4) {
+        rows.extend(
+            chunk
+                .par_iter()
+                .map(|&(depth, drop)| {
+                    evaluate_universal_depth_case(&config, &directory, depth, drop)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert!(rows.iter().all(|row| row.get("preparation_error").is_none()));
+    let accepted = rows.iter().filter(|row| row["accepted"] == true).count();
+    search["lower_depth_small_drops"] = serde_json::Value::Array(rows);
+    fs::write(directory.join("complete-search.json"), serde_json::to_vec_pretty(&search).unwrap())
+        .unwrap();
+    eprintln!(
+        "DEPTH_WINDOW_SUPPLEMENT directory={} cases={} accepted={accepted}",
+        directory.display(),
+        candidates.len()
+    );
+}
+
+#[test]
+#[ignore = "explicit CPU-only universal approximate gadget noise and graph preparation"]
+fn universal_approximate_selected_noise() {
+    export_selected_noise_and_graph(
+        33,
+        7,
+        102,
+        "universal_approximate_selected",
+        "test_data/approximate_gadget_maximum_drop/1788656642909207371/mxx-approximate-n16-exact-security-cap.log",
+    );
+}
+
+#[test]
+#[ignore = "explicit CPU-only exact minimum-depth noise and benchmark graph export"]
+fn exact_minimum_depth_selected_noise() {
+    export_selected_noise_and_graph(
+        26,
+        0,
+        143,
+        "exact_minimum_depth_selected",
+        "test_data/universal_approximate_depth_window/1788660855725121579/security-depth26.log",
+    );
+}
+
+fn export_selected_noise_and_graph(
+    depth: usize,
+    dropped: usize,
+    security: u64,
+    output_name: &str,
+    security_evidence: &str,
+) {
+    let mut config = SearchConfig::reviewed();
+    config.noise_model = NoiseSearchModel::AverageCase;
+    config.sparse_lwr_universe = 8192;
+    config.sparse_lwr_weight = 18;
+    config.sparse_lwr_modulus = 4096;
+    config.sparse_lwr_output_modulus = 32;
+    config.gadget_dropped_moduli = dropped;
+    let candidate =
+        Candidate { crt_depth: depth, log_ring_dimension: 16, crt_bits: 50, base_bits: 25 };
+    let mut context = build_candidate_context(&config, candidate).unwrap();
+    context.switch_moduli = candidate_switch_moduli(&context.crt_moduli, 5).unwrap();
+    let prepared =
+        prepare_candidate_from_ring_context(&config, &context, Some((38, 1)), false).unwrap();
+    let snapshot = prepared.noise_snapshot.as_ref().unwrap();
+    let average = snapshot.simulate_average(&average_case_config(&config).unwrap()).unwrap();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data").join(output_name);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("noise.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "scope":"Universal approximate gadget, exact rectangular trapdoor preimages, even-corrected routes; AverageCase analytical acceptance only",
+        "candidate":candidate,"gadget_dropped_moduli":dropped,"gadget_columns":4*(depth-dropped),
+        "crt_moduli":context.crt_moduli,"switch_moduli":context.switch_moduli.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "route_bias_bounds":snapshot.refresh.route_bias_bounds.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "average":average,"setup_identity":hex(*snapshot.setup_identity()),
+        "layout_id":hex(prepared.layout_id),"program_id":hex(prepared.program_id),
+    })).unwrap()).unwrap();
+    eprintln!(
+        "UNIVERSAL_APPROXIMATE_RESULT {} accepted={} max_F={}",
+        directory.display(),
+        average.accepted,
+        average.refresh.max_f_avg
+    );
+    assert_eq!(context.sampler_layout.public_key_columns(), 4 * (depth - dropped));
+    assert_eq!(snapshot.operation_residuals.is_empty(), dropped == 0);
+    if dropped == 0 {
+        assert!(snapshot.readout_residuals.is_none());
+        assert!(snapshot.refresh.route_bias_bounds.iter().all(BigUint::is_zero));
+    }
+    assert!(average.accepted, "new universal approximate noise model must pass independently");
+    fs::write(directory.join("benchmark-input.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "security_scope":"Conventional full-q RLWE rough estimate and pinned sparse LWR 103.186; correlated joint-view security not established",
+        "security_evidence":security_evidence,
+        "result":{
+            "candidate":candidate,"gadget_dropped_moduli":dropped,"achieved_security_bits":security.min(103),
+            "bgg_security_bits":security,
+            "sparse_lwr_universe":8192,"sparse_lwr_weight":18,"sparse_lwr_q_l":4096,"sparse_lwr_p":32,
+            "layout_id":hex(prepared.layout_id),"program_id":hex(prepared.program_id),
+            "average_evidence":{
+                "setup_identity":hex(*snapshot.setup_identity()),
+                "switch_moduli":context.switch_moduli.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "mask_digit_count":38,"fresh_error_digit_count":1,
+                "hard_authority_accepted":average.hard_authority_accepted,
+                "correctness_accepted":average.correctness_accepted,"accepted":average.accepted
+            }
+        }
+    })).unwrap()).unwrap();
+    let graph_prepared =
+        prepare_candidate_with_fixed_digits(&config, candidate, 38, 1, &context.switch_moduli)
+            .unwrap();
+    let bundle = graph_prepared.bundle.as_ref().unwrap();
+    assert_eq!(bundle.public_identity(), snapshot.setup_identity());
+    let preprocessing = bundle.benchmark_preprocessing_graph();
+    preprocessing
+        .validate_with_manifests(
+            &mxx_ir_core::ParamEnv::default(),
+            bundle.preprocessing_manifests(),
+        )
+        .unwrap();
+    bundle
+        .benchmark_online_graph()
+        .validate_with_manifests(&mxx_ir_core::ParamEnv::default(), bundle.verification_manifests())
+        .unwrap();
+    eprintln!(
+        "UNIVERSAL_APPROXIMATE_GRAPH validated short ordinary gadget and exact rectangular decoder graph"
+    );
+}
+
+#[test]
+#[ignore = "explicit CPU-only approximate gadget noise model; no backend execution"]
+fn profile_b_approximate_gadget_noise_simulation() {
+    approximate_gadget_noise_cases(27, 16, 38, 5, false, None);
+}
+
+#[test]
+#[ignore = "explicit CPU-only fixed-N maximum-drop pilot; no backend execution"]
+fn approximate_gadget_maximum_drop_pilot() {
+    let retained = (1..=33usize).collect::<Vec<_>>();
+    for digits in [38usize, 39] {
+        let rows = approximate_gadget_noise_cases(33, 16, digits, 5, true, Some(&retained));
+        let selected = rows.iter().find(|row| row["modeled_refresh_accepted"] == true).unwrap();
+        eprintln!(
+            "MAXIMUM_DROP_PILOT dm={digits} dropped={} retained={} F_avg={}",
+            selected["dropped_towers"],
+            selected["retained_towers"],
+            selected["conditional_refresh_max_F_avg"]
+        );
+    }
+}
+
+#[test]
+#[ignore = "explicit CPU-only fixed-N maximum-drop proof grid; no backend execution"]
+fn approximate_gadget_maximum_drop_frontier() {
+    let mut config = SearchConfig::reviewed();
+    config.noise_model = NoiseSearchModel::AverageCase;
+    config.sparse_lwr_universe = 8192;
+    config.sparse_lwr_weight = 18;
+    config.sparse_lwr_modulus = 4096;
+    config.sparse_lwr_output_modulus = 32;
+    let policy = average_case_config(&config).unwrap();
+    let run =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/approximate_gadget_maximum_drop")
+        .join(run.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    eprintln!("MAXIMUM_DROP_DIRECTORY {}", directory.display());
+    let mut records = Vec::new();
+    let mut unresolved = Vec::new();
+    let max_mask = BigUint::from(32u8).pow(39);
+    let ceil_div = |n: BigUint, d: &BigUint| (n + d - 1u8) / d;
+    // Incumbent k=7 was independently found at depth33. Depth<=8 cannot
+    // beat it since at least one tower must remain. This is a count bound,
+    // not a monotonicity assumption about the noise model.
+    for depth in 9..=33usize {
+        let candidate =
+            Candidate { crt_depth: depth, log_ring_dimension: 16, crt_bits: 50, base_bits: 25 };
+        let mut context = build_candidate_context(&config, candidate).unwrap();
+        context.switch_moduli = candidate_switch_moduli(&context.crt_moduli, 5).unwrap();
+        let setup = setup_for_candidate_context(&config, &context, 3, 1).unwrap();
+        let prepared =
+            prepare_candidate_from_ring_context(&config, &context, Some((3, 1)), false).unwrap();
+        let baseline = prepared.noise_snapshot.unwrap();
+        for dropped in 8..depth {
+            let retained = depth - dropped;
+            let (snapshot, pre_refresh, _, _, _, _, _, _) =
+                modeled_approximate_pre_refresh(&baseline, &context, retained, true);
+            let average =
+                snapshot.simulate_average_with_pre_refresh(&policy, pre_refresh.clone()).unwrap();
+            let routes = snapshot.refresh.route_gains.as_ref().unwrap();
+            let smudging = snapshot.refresh.smudging.as_ref().unwrap();
+            let smudge_factor = (BigUint::one() << (smudging.lambda_mask + 1)) *
+                BigUint::from(smudging.transcript_coordinates);
+            // Drop every nonnegative mask error contribution, use the
+            // smallest joint-tail event count (dm3) and largest M (dm39).
+            // This is optimistic for every admissible mask digit count.
+            let witness=average.refresh.slots.iter().find_map(|slot| {
+                let variance=slot.variance_breakdown.readout_fresh.add(&slot.variance_breakdown.state).add(&slot.variance_breakdown.decoder);
+                let lower=mxx_exponent_lut::noise_refresh::simulation::average_favg(&average.refresh.z_squared,&variance,0).unwrap()
+                    +ceil_div(slot.rounding_numerator.clone(),&slot.rounding_denominator)
+                    +ceil_div(&pre_refresh.readout_bias_bound*&routes.fresh[slot.slot].l1,&slot.lift);
+                let smudge_lhs=&lower*&smudge_factor;
+                let round_lhs=&lower*2u8;
+                (smudge_lhs>max_mask || round_lhs>=slot.spacing).then(||serde_json::json!({"slot":slot.slot,"F_lower":lower.to_string(),"smudging_lhs":smudge_lhs.to_string(),"M_max":max_mask.to_string(),"rounding_lhs":round_lhs.to_string(),"spacing":slot.spacing.to_string()}))
+            });
+            if let Some(witness) = witness {
+                records.push(serde_json::json!({"depth":depth,"dropped":dropped,"status":"optimistic_lower_bound_rejects_all_dm3_to39","witness":witness}));
+            } else {
+                let mut accepted = None;
+                for digits in 3..=39 {
+                    let gains = RefreshParameterSimulationRequest::mask_route_gain_for_digit_count(
+                        &setup, digits,
+                    )
+                    .unwrap();
+                    let changed = snapshot_with_mask_gain(&snapshot, digits, &gains).unwrap();
+                    if changed
+                        .average_refresh_accepted_from_pre_refresh(&policy, &pre_refresh)
+                        .unwrap()
+                    {
+                        accepted = Some(digits);
+                        break;
+                    }
+                }
+                unresolved.push(
+                    serde_json::json!({"depth":depth,"dropped":dropped,"accepted_digits":accepted}),
+                );
+                records.push(serde_json::json!({"depth":depth,"dropped":dropped,"status":"exhaustive_dm3_to39","accepted_digits":accepted}));
+            }
+        }
+        fs::write(directory.join("frontier.json"), serde_json::to_vec_pretty(&records).unwrap())
+            .unwrap();
+        eprintln!(
+            "MAXIMUM_DROP_DEPTH depth={depth} checked={} unresolved={}",
+            records.len(),
+            unresolved.len()
+        );
+    }
+    assert!(
+        unresolved.iter().all(|row| row["accepted_digits"].is_null()),
+        "incumbent exceeded; inspect persisted grid"
+    );
+    fs::write(directory.join("search.json"),serde_json::to_vec_pretty(&serde_json::json!({"ring_dimension":65536,"security_depth_cap":33,"incumbent_dropped":7,"switch_width":5,"mask_digit_range":[3,39],"checked":records.len(),"exhaustive_fallback":unresolved,"records":records,"scope":"Maximum absolute dropped count within fixed50/25, fixed five-tower switching model and security-qualified depths; explicit analytical even-residual bridge, not runtime or joint-security proof"})).unwrap()).unwrap();
+    eprintln!("MAXIMUM_DROP_COMPLETE {}", directory.display());
+}
+
+#[test]
+#[ignore = "explicit CPU-only approximate gadget depth search; no backend execution"]
+fn approximate_gadget_depth_search() {
+    let config = SearchConfig::from_env().unwrap();
+    let log_ring = *config.log_ring_dimensions.start();
+    let started = std::time::Instant::now();
+    let mut selected = [None, None];
+    let mut rows = Vec::new();
+    for depth in 27..=90 {
+        for mask_digits in [38usize, 39] {
+            let cases = approximate_gadget_noise_cases(depth, log_ring, mask_digits, 5, true, None);
+            for (ratio, case) in [cases[1].clone(), cases[2].clone()].into_iter().enumerate() {
+                if selected[ratio].is_none() && case["modeled_refresh_accepted"] == true {
+                    selected[ratio] = Some(case.clone());
+                    eprintln!(
+                        "APPROXIMATE_DEPTH_FIRST_PASS ratio={ratio} depth={depth} dm={mask_digits} elapsed={:.3}",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                rows.push(case);
+            }
+        }
+        if selected.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    let run =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/approximate_gadget_depth_search")
+        .join(run.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("search.json"),serde_json::to_vec_pretty(&serde_json::json!({"log_ring_dimension":log_ring,"selected":selected,"cases":rows,"elapsed_seconds":started.elapsed().as_secs_f64(),"scope":"AverageCase noise model with explicit even-residual bridge; not runtime or security acceptance"})).unwrap()).unwrap();
+    eprintln!("APPROXIMATE_DEPTH_COMPLETE {}", directory.display());
+}
+
+fn modeled_approximate_pre_refresh(
+    baseline: &ExponentLutNoiseSnapshot,
+    context: &CandidatePreparationContext,
+    retained: usize,
+    include_bridge: bool,
+) -> (
+    ExponentLutNoiseSnapshot,
+    PreRefreshNoiseEvaluation,
+    BigUint,
+    BigUint,
+    mxx_exponent_lut::noise::ProgramNoiseState,
+    RightActionNoiseGain,
+    BigUint,
+    BigUint,
+) {
+    use mxx_exponent_lut::{
+        noise::{
+            GateNoiseDecomposition, GateNoiseOperation, NoiseDecompositionPlan, ProgramNoiseState,
+        },
+        noise_refresh::simulation::NoiseGainPlanBuilder,
+    };
+    let depth = context.candidate.crt_depth;
+    let ring = context.ring_dimension;
+    let mut snapshot = baseline.clone();
+    let mut inputs = snapshot.setup_average_inputs();
+    let dropped = depth - retained;
+    let params = DCRTPolyParams::new(
+        ring as u32,
+        depth,
+        50,
+        25,
+        Some(context.crt_moduli.clone()),
+        Some(dropped),
+    );
+    let epsilon = params.gadget_error_bound(None);
+    let low: BigUint = context.crt_moduli[retained..].iter().map(|p| BigUint::from(*p)).product();
+    // Proposition 1 residual is a sum of centered dropped CRT residues.
+    // Uniform, independent residues and augmented ternary secret are the
+    // explicit AverageCase assumptions. The stored convention is 4 Var.
+    let residual_sum = context.crt_moduli[retained..].iter().fold(BigUint::zero(), |sum, p| {
+        let p = BigUint::from(*p);
+        sum + (&low / &p).pow(2) * (p.pow(2) - 1u8)
+    });
+    let residual = ProgramNoiseState {
+        bound: &epsilon * BigUint::from(ring + 1),
+        doubled_variance: AverageVariance::new(
+            residual_sum * BigUint::from(3 + 2 * ring),
+            9u8.into(),
+        )
+        .unwrap(),
+    };
+    if dropped != 0 {
+        // Every retained balanced digit is bounded by beta/2. Retain the
+        // true secret, digit, and convolution axes instead of scaling a
+        // random-matrix variance without an operator bound.
+        let rows = 2 * 2 * retained;
+        let cap = BigUint::one() << 24usize;
+        let direct = RightActionNoiseGain {
+            l1: &cap * BigUint::from(rows * ring),
+            l2_squared: cap.pow(2) * BigUint::from(rows * ring),
+        };
+        let mut gates = snapshot.gate_gains.clone();
+        for gate in &mut gates {
+            if gate.operation == GateNoiseOperation::Add {
+                continue;
+            }
+            gate.action = direct.clone();
+            let multiplicity = if gate.operation == GateNoiseOperation::Lut {
+                gate.helper_action = Some(direct.clone());
+                2u8
+            } else {
+                1u8
+            };
+            inputs.operation_residuals.insert(
+                gate.operation_index,
+                ProgramNoiseState {
+                    bound: &residual.bound * multiplicity,
+                    doubled_variance: residual
+                        .doubled_variance
+                        .scaled(&BigUint::from(multiplicity)),
+                },
+            );
+        }
+        snapshot.gate_gains = gates.clone();
+        snapshot.readout_gains.target = direct.clone();
+        snapshot.readout_gains.normalization = direct.clone();
+        for trace in &mut snapshot.readout_gains.nonidentity_trace {
+            trace.action = direct.clone();
+            trace.helper_action = direct.clone();
+        }
+        let plan = NoiseDecompositionPlan::bounded_matrix(
+            BigUint::one() << 25usize,
+            rows,
+            rows,
+            ring,
+            cap,
+        )
+        .unwrap();
+        let add_plan = NoiseDecompositionPlan::unit(
+            BigUint::one() << 25usize,
+            2 * depth,
+            2,
+            4 * depth,
+            ring,
+            0,
+            0,
+            0,
+        )
+        .unwrap()
+        .bind_crt_layout(context.crt_moduli.iter().map(|p| BigUint::from(*p)).collect(), 2)
+        .unwrap();
+        snapshot.gain_plan = NoiseGainPlanBuilder::new(
+            gates
+                .iter()
+                .map(|gate| GateNoiseDecomposition {
+                    action: if gate.operation == GateNoiseOperation::Add {
+                        add_plan.clone()
+                    } else {
+                        plan.clone()
+                    },
+                    helper_action: gate.helper_action.as_ref().map(|_| plan.clone()),
+                })
+                .collect(),
+            plan.clone(),
+            vec![(plan.clone(), plan.clone()); snapshot.readout_gains.nonidentity_trace.len()],
+            plan,
+        )
+        .unwrap()
+        .build(gates, snapshot.readout_gains.clone())
+        .unwrap();
+        let zero =
+            ProgramNoiseState { bound: BigUint::zero(), doubled_variance: AverageVariance::zero() };
+        let trace_residual = ProgramNoiseState {
+            bound: &residual.bound * (&snapshot.target_plaintext_gain().l1 + 1u8),
+            doubled_variance: residual
+                .doubled_variance
+                .scaled(&(&snapshot.target_plaintext_gain().l2_squared + 1u8)),
+        };
+        // Scalar multiples of the shortened gadget have zero discarded
+        // residual; the two generic trace actions do not.
+        snapshot.readout_residuals = Some((
+            zero.clone(),
+            vec![trace_residual; snapshot.readout_gains.nonidentity_trace.len()],
+            zero,
+        ));
+    }
+    let mut pre_refresh = snapshot.evaluate_pre_refresh_with_inputs(inputs).unwrap();
+    let (bridge_gain, bridge_residual) = mxx_exponent_lut::noise::even_residual_gadget_bridge(
+        &context.crt_moduli,
+        retained,
+        &(BigUint::one() << 25usize),
+        2,
+    )
+    .unwrap();
+    let bridge_bias = &bridge_residual * 31u8 / 2u8;
+    if include_bridge {
+        pre_refresh.apply_gadget_bridge(&bridge_gain, &bridge_bias);
+    }
+    (snapshot, pre_refresh, epsilon, low, residual, bridge_gain, bridge_residual, bridge_bias)
+}
+
+fn approximate_gadget_noise_cases(
+    depth: usize,
+    log_ring: usize,
+    mask_digits: usize,
+    switch_width: usize,
+    include_bridge: bool,
+    retained_override: Option<&[usize]>,
+) -> Vec<serde_json::Value> {
+    let mut config = SearchConfig::reviewed();
+    config.noise_model = NoiseSearchModel::AverageCase;
+    config.sparse_lwr_universe = 8192;
+    config.sparse_lwr_weight = 18;
+    config.sparse_lwr_modulus = 4096;
+    config.sparse_lwr_output_modulus = 32;
+    assert_eq!(config.secret_dimension, 2);
+    let candidate =
+        Candidate { crt_depth: depth, log_ring_dimension: log_ring, crt_bits: 50, base_bits: 25 };
+    let ring = 1usize << log_ring;
+    let mut context = build_candidate_context(&config, candidate).unwrap();
+    context.switch_moduli = candidate_switch_moduli(&context.crt_moduli, switch_width).unwrap();
+    let prepared =
+        prepare_candidate_from_ring_context(&config, &context, Some((mask_digits, 1)), false)
+            .unwrap();
+    let baseline = prepared.noise_snapshot.unwrap();
+    let run =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test_data/profile_b_approximate_gadget_noise")
+        .join(run.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    eprintln!("APPROXIMATE_NOISE_DIRECTORY {}", directory.display());
+    let mut rows = Vec::new();
+    let retained_cases = retained_override
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| vec![depth, (2 * depth).div_ceil(3), depth.div_ceil(2), depth / 2]);
+    for retained in retained_cases {
+        let dropped = depth - retained;
+        let (
+            snapshot,
+            pre_refresh,
+            epsilon,
+            low,
+            residual,
+            bridge_gain,
+            bridge_residual,
+            bridge_bias,
+        ) = modeled_approximate_pre_refresh(&baseline, &context, retained, include_bridge);
+        let average = snapshot
+            .simulate_average_with_pre_refresh(
+                &average_case_config(&config).unwrap(),
+                pre_refresh.clone(),
+            )
+            .unwrap();
+        let program_variance = pre_refresh
+            .program
+            .wire_variances
+            .get(snapshot.program.outputs().last().unwrap())
+            .unwrap();
+        let program_favg = mxx_exponent_lut::noise_refresh::simulation::average_favg(
+            &average.refresh.z_squared,
+            program_variance,
+            0,
+        )
+        .unwrap();
+        let readout_stochastic_favg = mxx_exponent_lut::noise_refresh::simulation::average_favg(
+            &average.refresh.z_squared,
+            &pre_refresh.readout_variance,
+            0,
+        )
+        .unwrap();
+        let readout_favg = &readout_stochastic_favg + &pre_refresh.readout_bias_bound;
+        let row = serde_json::json!({
+            "depth":depth,"ring_dimension":ring,"mask_digits":mask_digits,"switch_width":switch_width,
+            "retained_towers":retained,"dropped_towers":dropped,"gadget_columns":4*retained,
+            "full_modulus":snapshot.refresh.global_modulus.as_ref().unwrap().to_string(),
+            "crt_moduli":context.crt_moduli,"low_modulus":low.to_string(),
+            "coefficient_residual_bound":epsilon.to_string(),"secret_weighted_residual":residual,
+            "program_bound":pre_refresh.program.output_bound.to_string(),
+            "program_bound_bits":pre_refresh.program.output_bound.bits(),
+            "readout_bound":pre_refresh.readout_bound.to_string(),"readout_bound_bits":pre_refresh.readout_bound.bits(),
+            "readout_doubled_variance":pre_refresh.readout_variance,
+            "bridge_included":include_bridge,"bridge_gain":bridge_gain,"bridge_residual":bridge_residual.to_string(),"bridge_bias":bridge_bias.to_string(),
+            "modeled_refresh_accepted":if include_bridge {Some(average.refresh.accepted)}else{None},
+            "program_F_avg":program_favg.to_string(),"program_F_avg_bits":program_favg.bits(),
+            "readout_F_avg":readout_favg.to_string(),"readout_F_avg_bits":readout_favg.bits(),
+            "readout_stochastic_F_avg":readout_stochastic_favg.to_string(),"readout_bias_bound":pre_refresh.readout_bias_bound.to_string(),
+            "joint_event_count":average.refresh.joint_event_count.to_string(),"z_squared":average.refresh.z_squared,
+            "conditional_refresh_F_avg_bits":average.refresh.max_f_avg.bits(),
+            "conditional_minimum_rounding_margin":average.refresh.slots.iter().map(|s| &s.rounding_margin).min().unwrap().to_string(),
+            "conditional_minimum_smudging_margin":average.refresh.slots.iter().map(|s| &s.smudging_margin).min().unwrap().to_string(),
+            "baseline_first_action":baseline.gate_gains.first().map(|g|&g.action),
+            "modeled_first_action":snapshot.gate_gains.first().map(|g|&g.action),
+            "conditional_refresh_max_F_avg":average.refresh.max_f_avg.to_string(),
+            "conditional_refresh_accepted":average.refresh.accepted,
+            "full_approximate_refresh_accepted":if dropped==0 { Some(average.refresh.accepted) } else { None },
+            "scope":if dropped==0 { "exact baseline" } else if include_bridge { "Approximate gadget noise model with explicit even-residual scalar bridge; not runtime or security acceptance" } else { "shortened-gadget PRF/readout model; full-width refresh figures conditional on a zero-error bridge, not executable acceptance" },
+            "program_steps":pre_refresh.program.steps,
+        });
+        fs::write(
+            directory.join(format!("retained-{retained}.json")),
+            serde_json::to_vec_pretty(&row).unwrap(),
+        )
+        .unwrap();
+        eprintln!(
+            "APPROXIMATE_NOISE depth={depth} logN={log_ring} dm={mask_digits} retained={retained} columns={} program_average_bits={} readout_average_bits={} conditional_F_avg={}",
+            4 * retained,
+            program_favg.bits(),
+            readout_favg.bits(),
+            average.refresh.max_f_avg
+        );
+        rows.push(row);
+    }
+    fs::write(directory.join("summary.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "parameters":{"N":ring,"crt_depth":depth,"crt_bits":50,"base_bits":25,"security_bits":100,"v":8192,"h":18,"Q":4096,"p":32,"mask_digits":mask_digits,"fresh_digits":1,"refresh_switch_retained_towers":switch_width,"secret_dimension":2},
+        "assumptions":"Uniform independent centered dropped CRT residues, augmented iid ternary secret, independent residual sources and TFHE-style propagation; stored variance is four times physical variance. See bridge_included per case: the optional custom even-residual bridge has deterministic bias propagated with l1 gains. Neither case establishes runtime or security acceptance.",
+        "cases":rows,
+    })).unwrap()).unwrap();
+    rows
+}
+
 #[test]
 #[ignore = "CPU-only inventory for an accepted real round-trip candidate"]
 fn test_round_trip_artifact_inventory() {

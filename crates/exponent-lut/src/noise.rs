@@ -557,7 +557,6 @@ impl NoiseDecompositionPlan {
                     *target_row < self.target_rows &&
                         *output_column < self.target_columns &&
                         *ring_coefficient < self.ring_dimension &&
-                        !value.is_zero() &&
                         self.sparse_source_valid(value)
                 }
                 NoiseDecompositionSource::Unit { target_row, output_column, ring_coefficient } => {
@@ -578,9 +577,8 @@ impl NoiseDecompositionPlan {
                         *exponent < self.digits_per_tower &&
                         u32::try_from(*exponent).is_ok()
                 }
-                NoiseDecompositionSource::GadgetScalar { value } => {
-                    Some(self.target_columns) == self.target_rows.checked_mul(self.digit_count) &&
-                        !value.is_zero()
+                NoiseDecompositionSource::GadgetScalar { .. } => {
+                    Some(self.target_columns) == self.target_rows.checked_mul(self.digit_count)
                 }
                 NoiseDecompositionSource::BoundedMatrix { coefficient_bound } => {
                     !coefficient_bound.is_zero()
@@ -857,6 +855,118 @@ pub struct ProgramNoiseState {
     pub doubled_variance: AverageVariance,
 }
 
+/// Scalar column gains and residual of an explicitly modeled even-residual
+/// bridge from a shortened gadget to the full gadget. Starting from the
+/// shared low-CRT correction (ePrint 2024/909, Section 3.2), an odd residual
+/// is shifted by plus or minus the odd low modulus to make it even. This
+/// preserves every dropped residue and allows half-integer readout payloads
+/// to weight the residual without modular inverse-of-two wraparound.
+/// This custom bridge is not the default primitive decomposition algorithm.
+/// The matrix is block diagonal across secret rows and constant in the ring,
+/// so neither a ring-convolution nor a secret-dimension factor applies.
+pub fn even_residual_gadget_bridge(
+    moduli: &[u64],
+    retained: usize,
+    base: &BigUint,
+    digits_per_tower: usize,
+) -> Result<(RightActionNoiseGain, BigUint), ProgramNoiseError> {
+    if retained == 0 ||
+        retained > moduli.len() ||
+        digits_per_tower == 0 ||
+        digits_per_tower > 64 ||
+        base.bits() > 64 ||
+        base < &BigUint::from(2u8) ||
+        !is_power_of_two(base)
+    {
+        return Err(ProgramNoiseError::InvalidDecomposition);
+    }
+    let largest_digit = base.pow((digits_per_tower - 1) as u32);
+    if moduli.iter().any(|p| *p <= 1 || *p % 2 == 0 || BigUint::from(*p) <= largest_digit) {
+        return Err(ProgramNoiseError::InvalidDecomposition);
+    }
+    let low: BigUint = moduli[retained..].iter().map(|p| BigUint::from(*p)).product();
+    let mut gain = RightActionNoiseGain::unit();
+    // Centered lifting can change even a retained radix column near p/2;
+    // derive these columns too rather than assuming every one is a unit.
+    for modulus in &moduli[..retained] {
+        for digit in 0..digits_per_tower {
+            let value = BigInt::from(base.pow(digit as u32));
+            let centered = centered_residue(&value, &BigUint::from(*modulus));
+            let (l1, l2_squared) = balanced_profile(&centered, base, digits_per_tower)?;
+            gain.l1 = gain.l1.max(l1);
+            gain.l2_squared = gain.l2_squared.max(l2_squared);
+        }
+    }
+    let mut residual_bound = BigUint::zero();
+    for p in &moduli[retained..] {
+        let weight = &low / p;
+        let inverse = mxx_primitives::utils::mod_inverse(
+            (&weight % p).to_u64().ok_or(ProgramNoiseError::IntegerConversion)?,
+            *p,
+        )
+        .ok_or(ProgramNoiseError::InvalidDecomposition)?;
+        for digit in 0..digits_per_tower {
+            let value =
+                base.pow(u32::try_from(digit).map_err(|_| ProgramNoiseError::IntegerConversion)?);
+            let twisted = (&value * inverse) % p;
+            let mut residual = BigInt::from(weight.clone()) *
+                centered_residue(&BigInt::from(twisted), &BigUint::from(*p));
+            if residual.magnitude() % 2u8 == BigUint::one() {
+                let positive = &residual + BigInt::from(low.clone());
+                let negative = &residual - BigInt::from(low.clone());
+                residual =
+                    if positive.magnitude() < negative.magnitude() { positive } else { negative };
+            }
+            residual_bound = residual_bound.max(residual.magnitude().clone());
+            let mut l1 = BigUint::zero();
+            let mut l2_squared = BigUint::zero();
+            for modulus in &moduli[..retained] {
+                let corrected = centered_residue(&(-&residual), &BigUint::from(*modulus));
+                let (column_l1, column_l2) = balanced_profile(&corrected, base, digits_per_tower)?;
+                l1 += column_l1;
+                l2_squared += column_l2;
+            }
+            gain.l1 = gain.l1.max(l1);
+            gain.l2_squared = gain.l2_squared.max(l2_squared);
+        }
+    }
+    Ok((gain, residual_bound))
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    #[test]
+    fn even_residual_bridge_preserves_small_crt_columns() {
+        // Dropped unit column: even residual -72, corrected retained
+        // residues 4 mod17 and -10 mod41, base16 digits (4,0),(6,-1).
+        // Dropped radix16 column: residual16, digits (1,0),(0,-1).
+        let (gain, residual) =
+            even_residual_gadget_bridge(&[17, 41, 73], 2, &16u8.into(), 2).unwrap();
+        assert_eq!(gain, RightActionNoiseGain { l1: 11u8.into(), l2_squared: 53u8.into() });
+        assert_eq!(residual, 72u8.into());
+        for (value, error, digits) in
+            [(1i64, -72i64, [[4i64, 0], [6, -1]]), (16, 16, [[1, 0], [0, -1]])]
+        {
+            assert_eq!(error % 2, 0);
+            assert_eq!((error - value).rem_euclid(73), 0);
+            for (p, column) in [17i64, 41].into_iter().zip(digits) {
+                assert_eq!((column[0] + 16 * column[1] + error).rem_euclid(p), 0);
+            }
+        }
+        let (exact_gain, exact_error) =
+            even_residual_gadget_bridge(&[17, 41, 73], 3, &16u8.into(), 2).unwrap();
+        assert_eq!(exact_gain, RightActionNoiseGain::unit());
+        assert!(exact_error.is_zero());
+        assert!(even_residual_gadget_bridge(&[0, 41], 1, &16u8.into(), 2).is_err());
+        assert_eq!(
+            even_residual_gadget_bridge(&[19], 1, &16u8.into(), 2).unwrap().0.l1,
+            3u8.into()
+        );
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FamilyNoiseState {
     /// A scalar broadcast, or a uniform input family, remains one shared state.
@@ -949,6 +1059,13 @@ enum NoiseProgramRhs {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProgramNoiseInputs {
+    /// Modeled additive errors keyed by the setup operation index. These are
+    /// applied after the operation's ordinary right actions. For approximate
+    /// gadgets the caller must supply the secret-weighted reconstruction error,
+    /// including both direct and helper residuals for each LUT branch.
+    /// An empty map preserves exact-gadget simulation.
+    #[serde(default)]
+    pub operation_residuals: BTreeMap<usize, ProgramNoiseState>,
     pub input_bounds: BTreeMap<ProgramInputId, BigUint>,
     pub input_variances: BTreeMap<ProgramInputId, AverageVariance>,
     #[serde(default)]
@@ -962,6 +1079,7 @@ pub struct ProgramNoiseInputs {
 impl Default for ProgramNoiseInputs {
     fn default() -> Self {
         Self {
+            operation_residuals: BTreeMap::new(),
             input_bounds: BTreeMap::new(),
             input_variances: BTreeMap::new(),
             public_family_uniform_bounds: BTreeMap::new(),
@@ -1050,6 +1168,16 @@ struct PrimitiveNoiseTransfer {
 }
 
 impl PrimitiveNoiseTransfer {
+    fn add_residual(mut self, residual: Option<&ProgramNoiseState>) -> Self {
+        if let Some(residual) = residual {
+            self.fresh_bound += &residual.bound;
+            self.output_bound += &residual.bound;
+            self.fresh_variance = self.fresh_variance.add(&residual.doubled_variance);
+            self.output_variance = self.output_variance.add(&residual.doubled_variance);
+        }
+        self
+    }
+
     fn output(&self) -> ProgramNoiseState {
         ProgramNoiseState {
             bound: self.output_bound.clone(),
@@ -1071,6 +1199,7 @@ struct ProgramNoiseInterpreter<'a> {
     helper_cutoff: &'a BigUint,
     helper_variance: &'a AverageVariance,
     actions: &'a [GateNoiseGains],
+    operation_residuals: &'a BTreeMap<usize, ProgramNoiseState>,
     records: BTreeMap<ProgramGateInstance, OperationRecord>,
 }
 
@@ -1134,11 +1263,14 @@ impl ExponentProgramLowering for ProgramNoiseInterpreter<'_> {
         rhs: &Self::Rhs,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
-        let action = self.action(gate, GateNoiseOperation::MulPrivate)?.action.clone();
+        let gain = self.action(gate, GateNoiseOperation::MulPrivate)?;
+        let action = gain.action.clone();
+        let residual = self.operation_residuals.get(&gain.operation_index);
         match (lhs, rhs) {
             (NoiseProgramWire::Scalar(state), NoiseProgramRhs::Scalar) => {
                 let transfer =
-                    transfer_mul_private(state, &action, self.helper_cutoff, self.helper_variance);
+                    transfer_mul_private(state, &action, self.helper_cutoff, self.helper_variance)
+                        .add_residual(residual);
                 let output = transfer.output();
                 self.record(gate, GateNoiseOperation::MulPrivate, vec![transfer], 1);
                 Ok(NoiseProgramWire::Scalar(output))
@@ -1148,6 +1280,7 @@ impl ExponentProgramLowering for ProgramNoiseInterpreter<'_> {
             {
                 let (output, transfers) = states.map(|state| {
                     transfer_mul_private(state, &action, self.helper_cutoff, self.helper_variance)
+                        .add_residual(residual)
                 });
                 self.record(gate, GateNoiseOperation::MulPrivate, transfers, *active_count);
                 Ok(NoiseProgramWire::Family(output))
@@ -1162,10 +1295,12 @@ impl ExponentProgramLowering for ProgramNoiseInterpreter<'_> {
         public: &Self::Wire,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
-        let action = self.action(gate, GateNoiseOperation::MulPublic)?.action.clone();
+        let gain = self.action(gate, GateNoiseOperation::MulPublic)?;
+        let action = gain.action.clone();
+        let residual = self.operation_residuals.get(&gain.operation_index);
         match (private, public) {
             (NoiseProgramWire::Scalar(private), NoiseProgramWire::Scalar(public)) => {
-                let transfer = transfer_mul_public(private, public, &action);
+                let transfer = transfer_mul_public(private, public, &action).add_residual(residual);
                 let output = transfer.output();
                 self.record(gate, GateNoiseOperation::MulPublic, vec![transfer], 1);
                 Ok(NoiseProgramWire::Scalar(output))
@@ -1173,7 +1308,7 @@ impl ExponentProgramLowering for ProgramNoiseInterpreter<'_> {
             (NoiseProgramWire::Family(private), NoiseProgramWire::Family(public)) => {
                 let active_count = private.active_count();
                 let (output, transfers) = private.zip_map(public, |private, public| {
-                    transfer_mul_public(private, public, &action)
+                    transfer_mul_public(private, public, &action).add_residual(residual)
                 })?;
                 self.record(gate, GateNoiseOperation::MulPublic, transfers, active_count);
                 Ok(NoiseProgramWire::Family(output))
@@ -1244,6 +1379,9 @@ impl ExponentProgramLowering for ProgramNoiseInterpreter<'_> {
                         self.helper_cutoff,
                         self.helper_variance,
                     )
+                    .map(|transfer| {
+                        transfer.add_residual(self.operation_residuals.get(&gain.operation_index))
+                    })
                 })
                 .collect::<Result<Vec<_>, ProgramNoiseError>>()?;
             let aggregate = aggregate_lut_branches(state, &branches);
@@ -1484,6 +1622,17 @@ pub fn simulate_program(
     actions: &[GateNoiseGains],
     family_active_counts: &[usize],
 ) -> Result<ProgramNoiseReport, ProgramNoiseError> {
+    // Reject stale or misclassified residual metadata instead of silently
+    // dropping a residual intended for another setup action.
+    for (index, residual) in &inputs.operation_residuals {
+        if residual.doubled_variance.denominator.is_zero() ||
+            !actions.iter().any(|gain| {
+                gain.operation_index == *index && gain.operation != GateNoiseOperation::Add
+            })
+        {
+            return Err(ProgramNoiseError::InvalidDecomposition);
+        }
+    }
     let mut scalar_inputs = BTreeMap::new();
     for (input, _) in program.input_wires() {
         scalar_inputs.insert(
@@ -1561,6 +1710,7 @@ pub fn simulate_program(
         helper_cutoff,
         helper_variance,
         actions,
+        operation_residuals: &inputs.operation_residuals,
         records: BTreeMap::new(),
     };
     let wires = lower_program(program, &bindings, &family_ranges, &mut interpreter)

@@ -1279,7 +1279,7 @@ mod tests {
         let mut context = DslContext::new("tall-blockwise-sampler");
         for (index, encoding) in sample.encodings.iter().enumerate() {
             context = context
-                .family_output(format!("block-row-{index}"), encoding.rows.clone())
+                .output(format!("block-row-{index}"), encoding.rows.clone())
                 .expect("family output");
         }
         let built = context.build().expect("build blockwise sampler graph");
@@ -1370,9 +1370,9 @@ mod tests {
             panic!("anchor reduction keeps the revealed anchor plaintexts")
         };
         DslContext::new("tall-anchor-reduce")
-            .family_output("rows", output.rows)
+            .output("rows", output.rows)
             .unwrap()
-            .family_output("plaintexts", plaintexts)
+            .output("plaintexts", plaintexts)
             .unwrap()
             .build()
             .unwrap()
@@ -1516,7 +1516,7 @@ mod tests {
         assert_eq!(sample.encodings.len(), 1);
         assert_eq!(sample.encodings[0].rows.count(), &IntExpr::constant(slots));
         let built = DslContext::new("tall-single-block-sampler")
-            .family_output("row", sample.encodings[0].rows.clone())
+            .output("row", sample.encodings[0].rows.clone())
             .expect("family output")
             .build()
             .expect("build single-block sampler graph");
@@ -1805,7 +1805,7 @@ mod tests {
         let rows = ring.input_family("rotation-rows", 4, (1, 2));
         let rotated = rotate_family(&rows, 1, 4).expect("generated rotation family");
         let built = DslContext::new("tall-rotation-generated-reindex")
-            .family_output("rotated", rotated)
+            .output("rotated", rotated)
             .unwrap()
             .build()
             .unwrap();
@@ -1894,7 +1894,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let built = DslContext::new("tall-slot-transfer")
-            .family_output("rows", output.rows)
+            .output("rows", output.rows)
             .unwrap()
             .output("public", output.pubkey.matrix.clone())
             .unwrap()
@@ -2005,7 +2005,7 @@ mod tests {
                 .expect("compact Tall transfer")
                 .remove(0);
             DslContext::new("compact-tall-slot-transfer")
-                .family_output("rows", output.rows)
+                .output("rows", output.rows)
                 .unwrap()
                 .output("public", public_output.matrix)
                 .unwrap()

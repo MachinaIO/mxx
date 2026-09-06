@@ -23,8 +23,8 @@ theorem generated_injector_loop_common_secret
     (hinitial : ∀ state : Fin stateCount, Stage_decrypt.parallel_generatedRoot_2 backend decryptParams
       state.val initial (states state))
     (hrun : MxxIR.IterRuns
-      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_8 backend decryptParams
-        layer (current, packed, transitions, ()) next) count states outputs) :
+      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_6 backend decryptParams
+        layer (current, transitions, packed, ()) next) count states outputs) :
     ∃ commonSecret : ExactPoly q n, ∀ state : Fin stateCount,
       (state.val : Int) ≤ Int.ofNat count * decryptParams.diamond_batch_bits →
       ∃ (position : Fin basePoolCount) (row : ExactMatrix q n 1 2)

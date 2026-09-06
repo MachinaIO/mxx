@@ -32,8 +32,8 @@ structure InjectorSelectorWitness
   zeroRun : concatDiagonal secret (1 : ExactMatrix q n 1 1) zeroState
   initialRun : select (if decide (state = 0) then 1 else 0) [regular, zeroState] initial
   scanRun : MxxIR.IterRuns
-    (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_72_21
-      backend hashModel params slot bit (current, digit, state, firstNew, secret, ()) next)
+    (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_60_22
+      backend hashModel params slot bit (current, state, firstNew, secret, digit, ()) next)
     params.diamond_batch_bits.toNat initial selector
   errorRun : gaussianSample params.diamond_error_sigma
     params.diamond_error_max_coefficient_bound error
@@ -41,16 +41,27 @@ structure InjectorSelectorWitness
 
 theorem generated_selector_witness
     (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
-    (slot : Nat) (secret : ExactMatrix q n 1 1)
-    (publicMatrix target : ExactMatrix q n 2 inner)
-    (hrun : Stage_encrypt.parallel_generatedRoot_72 backend hashModel params slot
-      (secret, publicMatrix, ()) target) :
-    Nonempty (InjectorSelectorWitness backend hashModel params slot secret publicMatrix target) := by
+    (slot : Nat) (samples : Fin sampleCount → ExactMatrix q n 1 1)
+    (bases : Fin basePoolCount → ExactMatrix q n 2 inner)
+    (target : ExactMatrix q n 2 inner)
+    (hrun : Stage_encrypt.parallel_generatedRoot_60 backend hashModel params slot
+      (samples, bases, ()) target) :
+    ∃ (secret : ExactMatrix q n 1 1) (publicMatrix : ExactMatrix q n 2 inner),
+      familyGetDynamic samples ((slot : Int) /
+        (1 + params.diamond_batch_bits * params.diamond_input_count)) secret ∧
+      familyGetDynamic bases ((((slot : Int) /
+        (params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
+          params.diamond_digit_base)) + 1) *
+        (1 + params.diamond_batch_bits * params.diamond_input_count) +
+        (slot : Int) % (1 + params.diamond_batch_bits * params.diamond_input_count)) publicMatrix ∧
+      Nonempty (InjectorSelectorWitness backend hashModel params slot secret publicMatrix target) := by
   obtain ⟨scopeWitness, facts⟩ := hrun
-  rcases scopeWitness with ⟨regular, initialZero, initial, selector, error⟩
-  dsimp only [Stage_encrypt.parallel_generatedRoot_72.body] at facts
-  rcases facts with ⟨_, hregular, hzero, _, _, _, hselect, _, _, _, _, hscan, herror, htarget⟩
-  exact ⟨{
+  rcases scopeWitness with ⟨secret, regular, initialZero, initial, selector, publicMatrix, error⟩
+  dsimp only [Stage_encrypt.parallel_generatedRoot_60.body,
+    Stage_encrypt.parallel_generatedRoot_60.constraints_0] at facts
+  rcases facts with ⟨_, _, _, _, hsecret, hregular, hzero, _, _, _, hselect,
+    _, _, _, hscan, _, _, hpublic, herror, htarget⟩
+  exact ⟨secret, publicMatrix, hsecret, hpublic, ⟨{
     regular := regular
     zeroState := initialZero
     initial := initial
@@ -67,7 +78,30 @@ theorem generated_selector_witness
     initialRun := hselect
     scanRun := hscan
     errorRun := herror
-    targetEquation := htarget }⟩
+    targetEquation := htarget }⟩⟩
+
+theorem generated_target_shared_secret
+    (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
+    (slot : Nat) (secret : ExactMatrix q n 1 1)
+    (publicMatrix target : ExactMatrix q n 2 inner)
+    (hrun : Nonempty (InjectorSelectorWitness backend hashModel params slot secret publicMatrix target)) :
+    ∃ (selector : ExactMatrix q n 2 2) (error : ExactMatrix q n 2 inner),
+      selector 0 0 = secret 0 0 ∧ selector 1 0 = 0 ∧
+      gaussianSample params.diamond_error_sigma params.diamond_error_max_coefficient_bound error ∧
+      target = selector * publicMatrix + error := by
+  obtain ⟨witness⟩ := hrun
+  have hr : witness.regular 0 0 = secret 0 0 ∧ witness.regular 1 0 = 0 := by
+    constructor <;> simpa [concatDiagonal] using witness.regularRun _ _
+  have hz : witness.zeroState 0 0 = secret 0 0 ∧ witness.zeroState 1 0 = 0 := by
+    constructor <;> simpa [concatDiagonal] using witness.zeroRun _ _
+  have hi : witness.initial 0 0 = secret 0 0 ∧ witness.initial 1 0 = 0 := by
+    rcases witness.initialRun with ⟨position, _, hvalue⟩
+    fin_cases position
+    · exact hvalue.symm ▸ hr
+    · exact hvalue.symm ▸ hz
+  obtain ⟨h00, h10⟩ := generated_selector_scan_first_column backend hashModel params slot
+    _ _ _ _ witness.initial witness.selector secret hi witness.scanRun
+  exact ⟨witness.selector, witness.error, h00, h10, witness.errorRun, witness.targetEquation⟩
 
 theorem selector_witness_existing_action
     (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)

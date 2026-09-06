@@ -4,13 +4,11 @@ use mxx_ir_core::node::IntBinaryOp;
 #[derive(Clone)]
 pub struct Int {
     pub(super) value: ValueHandle,
-    pub(super) pending: Pending,
 }
 
 #[derive(Clone)]
 pub struct Bool {
     pub(super) value: ValueHandle,
-    pub(super) pending: Pending,
 }
 
 impl Int {
@@ -20,7 +18,7 @@ impl Int {
             Vec::new(),
             vec![WireType::ConstantInt],
         );
-        Self { value: node.output(0).expect("constant integer"), pending: Pending::default() }
+        Self { value: node.output(0).expect("constant integer") }
     }
 
     pub fn evaluate(expression: impl Into<IntExpr>) -> Self {
@@ -29,15 +27,11 @@ impl Int {
             Vec::new(),
             vec![WireType::ConstantInt],
         );
-        Self { value: node.output(0).expect("evaluated integer"), pending: Pending::default() }
+        Self { value: node.output(0).expect("evaluated integer") }
     }
 
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
-    }
-
-    pub fn pending_assumptions(&self) -> bool {
-        false
     }
 
     pub fn add(self, rhs: impl Into<Int>) -> Self {
@@ -68,13 +62,12 @@ impl Int {
         operation: mxx_ir_core::node::IntBinaryOp,
         output_name: &'static str,
     ) -> Self {
-        let pending = Pending::merge([self.pending, rhs.pending]);
         let node = NodeHandle::new(
             NodeKind::IntBinary(operation),
             vec![self.value, rhs.value],
             vec![WireType::Int],
         );
-        Self { value: node.output(0).expect(output_name), pending }
+        Self { value: node.output(0).expect(output_name) }
     }
 
     pub fn equal(self, rhs: impl Into<Int>) -> Bool {
@@ -94,33 +87,29 @@ impl Int {
         let bit = position.compile_expression().ok_or(DslError::CompileTimeIndex)?;
         let node =
             NodeHandle::new(NodeKind::BitExtract { bit }, vec![self.value], vec![WireType::Bool]);
-        Ok(Bool {
-            value: node.output(0).expect("integer bit"),
-            pending: Pending::merge([self.pending, position.pending]),
-        })
+        Ok(Bool { value: node.output(0).expect("integer bit") })
     }
 
     #[track_caller]
     pub fn lift_to_constant_polynomial(self, matrix_type: MatrixType) -> Mat {
         assert_eq!(matrix_type.rows, IntExpr::constant(1), "constant-polynomial lift is scalar");
         assert_eq!(matrix_type.columns, IntExpr::constant(1), "constant-polynomial lift is scalar");
-        let pending = self.pending;
+
         let node = NodeHandle::new(
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix_type.clone() },
             vec![self.value],
             vec![WireType::Matrix(matrix_type.clone())],
         );
-        Mat { value: node.output(0).expect("constant-polynomial lift"), matrix_type, pending }
+        Mat { value: node.output(0).expect("constant-polynomial lift"), matrix_type }
     }
 
     fn compare(self, rhs: Self, operation: mxx_ir_core::node::IntCompareOp) -> Bool {
-        let pending = Pending::merge([self.pending, rhs.pending]);
         let node = NodeHandle::new(
             NodeKind::IntCompare(operation),
             vec![self.value, rhs.value],
             vec![WireType::Bool],
         );
-        Bool { value: node.output(0).expect("integer comparison"), pending }
+        Bool { value: node.output(0).expect("integer comparison") }
     }
 }
 
@@ -136,19 +125,18 @@ impl Bool {
             Vec::new(),
             vec![WireType::ConstantBool],
         );
-        Self { value: node.output(0).expect("constant boolean"), pending: Pending::default() }
+        Self { value: node.output(0).expect("constant boolean") }
     }
 
     pub fn to_int(self) -> Int {
         let node = NodeHandle::new(NodeKind::BoolToInt, vec![self.value], vec![WireType::Int]);
-        Int { value: node.output(0).expect("boolean integer"), pending: self.pending }
+        Int { value: node.output(0).expect("boolean integer") }
     }
 }
 
 #[derive(Clone)]
 pub struct Bytes {
     pub(super) value: ValueHandle,
-    pub(super) pending: Pending,
 }
 
 impl Bytes {

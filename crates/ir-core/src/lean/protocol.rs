@@ -152,6 +152,7 @@ pub fn assemble_claim(
     backend: &ClaimBackend<'_>,
     semantics: &ClaimSemantics<'_>,
 ) -> Result<String, String> {
+    declaration.validate().map_err(|error| error.to_string())?;
     let bundle = &declaration.bundle;
     let mut positions = BTreeMap::new();
     let mut entries = Vec::new();
@@ -249,16 +250,14 @@ pub fn assemble_claim(
         return Err("comparator endpoint mismatch".into());
     }
     let actual_position = position(&endpoint.workflow_output.stage)?;
-    let actual = entries[actual_position]
+    entries[actual_position]
         .artifact
         .root
         .outputs
         .get(&endpoint.workflow_output.output)
         .ok_or("missing actual endpoint")?;
     let target = &bundle.operational_decoder_targets[0];
-    if target.decoder_stage != endpoint.workflow_output.stage ||
-        target.decoder_node != actual.wire.node
-    {
+    if target.endpoint != endpoint.spec {
         return Err("operational decoder does not identify the actual endpoint".into());
     }
     let claim = LinkedClaim {
@@ -276,8 +275,8 @@ pub fn assemble_claim(
         ideal: Port { root: ideal_position, name: endpoint.ideal_output.clone() },
         endpoint: claim::Endpoint::BooleanInterval {
             residual: Port {
-                root: position(&target.residual_stage)?,
-                name: target.residual_output.clone(),
+                root: position(&target.residual.stage)?,
+                name: target.residual.output.clone(),
             },
         },
     };

@@ -1,21 +1,18 @@
 //! Small two-stage reference protocol used to test the shared correctness machinery.
 
-use crate::{DslContext, IdealSpec, Ring, SemanticAnchor};
+use crate::{DslContext, IdealSpec, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr,
     artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
     protocol::{
         ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
-        ComparatorSpec, EndpointAnchor, EndpointAnchors, EndpointSemanticBinding, EndpointSpecId,
+        ComparatorSpec, EndpointBinding, EndpointBindings, EndpointSemanticBinding, EndpointSpecId,
         InputContract, InputContractEntry, InputValueContract, OperationalDecoderKind,
         OperationalDecoderTarget, OutputRef, ParameterDecl, ParameterKind, ProtocolDecl,
         ProtocolInputBinding, ProtocolInputDestination, ProtocolInputId, ProtocolPreconditionSpec,
         ProtocolStage, StageId, StageInputName, Workflow,
     },
 };
-
-pub const DECODED_ENDPOINT: &str = "decoded-endpoint";
-pub const RESIDUAL_ANCHOR: &str = "toy.decoder.residual";
 pub fn protocol() -> ProtocolDecl {
     let ring = Ring::new(256, 1);
     let message = ring.bool_input("message");
@@ -26,9 +23,7 @@ pub fn protocol() -> ProtocolDecl {
         .expect("two equally typed encoding branches");
     let ciphertext = encoded.clone() +
         ring.gaussian((1, 1), RealExpr::from_integer(1), IntExpr::Var("cutoff".to_owned()));
-    let residual = (ciphertext.clone() - encoded)
-        .semantic_anchor(RESIDUAL_ANCHOR)
-        .expect("Toy decoder residual anchor");
+    let residual = ciphertext.clone() - encoded;
     let encrypt = DslContext::new("toy-example-encrypt")
         .int_parameter("cutoff")
         .public_output("ciphertext", ciphertext)
@@ -45,21 +40,18 @@ pub fn protocol() -> ProtocolDecl {
         .threshold_decode_bools(IntExpr::constant(2), 1)
         .into_iter()
         .next()
-        .expect("one decoded bit")
-        .semantic_anchor(DECODED_ENDPOINT)
-        .expect("decoded endpoint label");
+        .expect("one decoded bit");
     let decrypt = DslContext::new("toy-example-decrypt")
         .int_parameter("cutoff")
-        .bool_output("decoded", decoded)
+        .output("decoded", decoded)
         .expect("unique output")
         .build()
         .expect("toy decryption graph");
-    let decoder_node = decrypt.graph.outputs()["decoded"].value.node;
 
     let ideal = IdealSpec::new(
         DslContext::new("toy-example-ideal")
             .int_parameter("cutoff")
-            .bool_output("result", ring.bool_input("message"))
+            .output("result", ring.bool_input("message"))
             .expect("unique output")
             .build()
             .expect("toy ideal graph")
@@ -77,15 +69,11 @@ pub fn protocol() -> ProtocolDecl {
                     ProtocolStage {
                         id: StageId("encrypt".to_owned()),
                         graph: encrypt.graph,
-                        semantic_anchors: encrypt.anchors,
-                        derivation_attachments: encrypt.derivation_attachments,
                         bindings: Vec::new(),
                     },
                     ProtocolStage {
                         id: StageId("decrypt".to_owned()),
                         graph: decrypt.graph,
-                        semantic_anchors: decrypt.anchors,
-                        derivation_attachments: decrypt.derivation_attachments,
                         bindings: vec![ArtifactBinding {
                             consumer_input: StageInputName("ciphertext".to_owned()),
                             producer_stage: StageId("encrypt".to_owned()),
@@ -106,11 +94,9 @@ pub fn protocol() -> ProtocolDecl {
                     failure_value: true,
                 }],
             },
-            endpoints: EndpointAnchors {
-                entries: vec![EndpointAnchor {
+            endpoints: EndpointBindings {
+                entries: vec![EndpointBinding {
                     spec: endpoint,
-                    stage: StageId("decrypt".to_owned()),
-                    semantic_anchor: DECODED_ENDPOINT.to_owned(),
                     semantics: EndpointSemanticBinding::ThresholdDecode,
                     workflow_output: OutputRef {
                         stage: StageId("decrypt".to_owned()),
@@ -121,10 +107,11 @@ pub fn protocol() -> ProtocolDecl {
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "toy-threshold".to_owned(),
-                residual_stage: StageId("encrypt".to_owned()),
-                residual_output: "operational-residual".to_owned(),
-                decoder_stage: StageId("decrypt".to_owned()),
-                decoder_node,
+                residual: OutputRef {
+                    stage: StageId("encrypt".to_owned()),
+                    output: "operational-residual".to_owned(),
+                },
+                endpoint: EndpointSpecId::ToyThresholdDecode,
                 kind: OperationalDecoderKind::ThresholdDecode {
                     plaintext_modulus: IntExpr::constant(2),
                 },
@@ -223,7 +210,7 @@ mod tests {
                 "(observedResidual execution).natAbs < ThresholdFixture.decoderRadius 256"
             )
         );
-        assert!(conclusion.contains("execution.«stage_1».2.1 = execution.«ideal»"));
+        assert!(conclusion.contains("execution.«stage_1» = execution.«ideal»"));
         let decoder = fs::read_to_string(directory.join("Stage_decrypt.lean")).unwrap();
         assert!(decoder.contains("MxxRuntime.thresholdDecode (2) (1) 0"));
         assert!(decoder.contains("decide (w_1_0_decoded ≠ 0)"));
@@ -243,10 +230,10 @@ mod tests {
         let booleans = input.threshold_decode_bools(modulus, 2);
         let mut context = DslContext::new("threshold-ports").int_parameter("plaintext_modulus");
         for (index, value) in integers.into_iter().enumerate() {
-            context = context.int_output(format!("integer_{index}"), value).unwrap();
+            context = context.output(format!("integer_{index}"), value).unwrap();
         }
         for (index, value) in booleans.into_iter().enumerate() {
-            context = context.bool_output(format!("boolean_{index}"), value).unwrap();
+            context = context.output(format!("boolean_{index}"), value).unwrap();
         }
         let graph = context.build().unwrap();
         let bindings = ParamEnv {
@@ -279,7 +266,10 @@ mod tests {
     fn toy_protocol_is_a_closed_bundle_with_a_decoded_endpoint() {
         let protocol = protocol();
         assert_eq!(protocol.bundle.endpoint_specs, vec![EndpointSpecId::ToyThresholdDecode]);
-        assert_eq!(protocol.bundle.endpoints.entries[0].semantic_anchor, DECODED_ENDPOINT);
+        assert_eq!(
+            protocol.bundle.endpoints.entries[0].workflow_output,
+            OutputRef { stage: StageId("decrypt".to_owned()), output: "decoded".to_owned() }
+        );
         assert!(matches!(
             protocol.bundle.input_contract.inputs[0].value,
             InputValueContract::Boolean

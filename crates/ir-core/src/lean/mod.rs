@@ -2044,7 +2044,20 @@ impl<'a> Emitter<'a> {
                     .enumerate()
                     .map(|(position, wire)| match modes[position] {
                         crate::node::LoopInputMode::Broadcast => wire_name(*wire),
-                        crate::node::LoopInputMode::Zip => format!("({} i)", wire_name(*wire)),
+                        crate::node::LoopInputMode::Zip => {
+                            let crate::types::ConcreteWireType::IndexedFamily { count, .. } =
+                                &self.validated.scopes[scope_id].wire_types[wire]
+                            else {
+                                unreachable!("validated zip input is an indexed family")
+                            };
+                            if Some(*count) == parallel_count {
+                                format!("({} i)", wire_name(*wire))
+                            } else {
+                                // A zip may read a prefix of a longer family. Validation proves
+                                // its length covers the loop; Lean still needs the Fin coercion.
+                                format!("({} ⟨i.val, by omega⟩)", wire_name(*wire))
+                            }
+                        }
                         crate::node::LoopInputMode::ZipOffset { offset } => {
                             format!("({} ⟨i.val + {}, by omega⟩)", wire_name(*wire), offset)
                         }
@@ -2717,6 +2730,77 @@ mod tests {
         assert!(artifact.source.contains("parallel_generatedRoot_1 params i "));
         assert!(artifact.source.contains("(_ : Nat) (inputs : Int)"));
         assert_eq!(artifact.static_node_visits, 3);
+    }
+
+    #[test]
+    fn export_zip_prefix_preserves_source_indices_and_checks_family_extent() {
+        for count in [0, 1, 3, 4] {
+            let child = with_new_construction_scope(|scope| {
+                let value = scalar_input("value");
+                SubgraphHandle::new("prefix-identity", scope, vec![value.clone()], vec![value])
+                    .unwrap()
+            });
+            let family_type =
+                WireType::IndexedFamily { element: Box::new(WireType::Int), count: 3.into() };
+            let family = NodeHandle::new(
+                NodeKind::Input {
+                    name: "family".into(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                vec![],
+                vec![family_type],
+            )
+            .output(0)
+            .unwrap();
+            let output = NodeHandle::parallel_loop(
+                child,
+                vec![family],
+                vec![WireType::IndexedFamily {
+                    element: Box::new(WireType::Int),
+                    count: count.into(),
+                }],
+                ParallelLoop {
+                    count: count.into(),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: vec![],
+                    input_modes: vec![LoopInputMode::Zip],
+                },
+            )
+            .output(0)
+            .unwrap();
+            let (graph, _) = Graph::freeze(
+                "prefix",
+                vec![],
+                BTreeMap::from([(
+                    "out".into(),
+                    GraphOutput { value: output, confidentiality: None },
+                )]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let validated = crate::validate(&graph, &ParamEnv::default());
+            if count == 4 {
+                assert!(validated.is_err(), "zip must not read beyond the source family");
+                continue;
+            }
+            let artifact = export(&validated.unwrap(), &ExportOptions::default()).unwrap();
+            assert!(artifact.source.contains(&format!("∀ i : Fin {count}")));
+            if count == 3 {
+                assert!(artifact.source.contains("(w_0_0 i)"));
+                assert!(!artifact.source.contains("⟨i.val, by omega⟩"));
+            } else {
+                assert!(artifact.source.contains("(w_0_0 ⟨i.val, by omega⟩)"));
+            }
+            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test_data/lean_ir_fixtures")
+                .join(format!("zip_prefix_{count}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("Generated.lean"), artifact.source).unwrap();
+        }
     }
 
     #[test]

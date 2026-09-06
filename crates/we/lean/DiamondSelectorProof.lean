@@ -11,9 +11,9 @@ theorem generated_selector_no_match
     (slot bit : Nat) (digit state firstNew : Int)
     (prior output : ExactMatrix q n 2 2) (secret : ExactMatrix q n 1 1)
     (hstate : state ≠ firstNew + Int.ofNat bit)
-    (hrun : Stage_encrypt.sequential_parallel_generatedRoot_72_21 backend hashModel params
-      slot bit (prior, digit, state, firstNew, secret, ()) output) : output = prior := by
-  dsimp only [Stage_encrypt.sequential_parallel_generatedRoot_72_21] at hrun
+    (hrun : Stage_encrypt.sequential_parallel_generatedRoot_60_22 backend hashModel params
+      slot bit (prior, state, firstNew, secret, digit, ()) output) : output = prior := by
+  dsimp only [Stage_encrypt.sequential_parallel_generatedRoot_60_22] at hrun
   rcases hrun with ⟨bitValue, top, special, selected, _, _, _, _, _, _, _, _, _, _,
     hselect, hout⟩
   have hflag : decide (state = firstNew + Int.ofNat bit) = false := decide_eq_false hstate
@@ -31,13 +31,13 @@ theorem generated_selector_match
     (slot bit : Nat) (digit state firstNew : Int)
     (prior output : ExactMatrix q n 2 2) (secret : ExactMatrix q n 1 1)
     (hstate : state = firstNew + Int.ofNat bit)
-    (hrun : Stage_encrypt.sequential_parallel_generatedRoot_72_21 backend hashModel params
-      slot bit (prior, digit, state, firstNew, secret, ()) output) :
+    (hrun : Stage_encrypt.sequential_parallel_generatedRoot_60_22 backend hashModel params
+      slot bit (prior, state, firstNew, secret, digit, ()) output) :
     ∃ bitValue : ExactMatrix q n 1 1,
       select (if decide ((digit / (2 ^ bit)) % 2 = 1) then 1 else 0) [0, 1] bitValue ∧
       output 0 0 = secret 0 0 ∧ output 0 1 = secret 0 0 * bitValue 0 0 ∧
       output 1 0 = 0 ∧ output 1 1 = 0 := by
-  dsimp only [Stage_encrypt.sequential_parallel_generatedRoot_72_21] at hrun
+  dsimp only [Stage_encrypt.sequential_parallel_generatedRoot_60_22] at hrun
   rcases hrun with ⟨bitValue, top, special, selected, _, _, _, _, hbit, htop, hspecial,
     _, _, _, hselect, hout⟩
   have hflag : decide (state = firstNew + Int.ofNat bit) = true := decide_eq_true hstate
@@ -64,8 +64,8 @@ theorem generated_selector_scan_existing
     (initial output : ExactMatrix q n 2 2) (secret : ExactMatrix q n 1 1)
     (hstate : state < firstNew)
     (hrun : MxxIR.IterRuns
-      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_72_21
-        backend hashModel params slot bit (current, digit, state, firstNew, secret, ()) next)
+      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_60_22
+        backend hashModel params slot bit (current, state, firstNew, secret, digit, ()) next)
       count initial output) : output = initial := by
   apply MxxIR.IterRuns.invariant (Invariant := fun _ value ↦ value = initial) rfl _ hrun
   intro bit current next hcurrent hstep
@@ -83,8 +83,8 @@ theorem generated_selector_scan_new
     (initial output : ExactMatrix q n 2 2) (secret : ExactMatrix q n 1 1)
     (hstate : state = firstNew + Int.ofNat targetBit) (hbit : targetBit < count)
     (hrun : MxxIR.IterRuns
-      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_72_21
-        backend hashModel params slot bit (current, digit, state, firstNew, secret, ()) next)
+      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_60_22
+        backend hashModel params slot bit (current, state, firstNew, secret, digit, ()) next)
       count initial output) :
     ∃ bitValue : ExactMatrix q n 1 1,
       select (if decide ((digit / (2 ^ targetBit)) % 2 = 1) then 1 else 0) [0, 1] bitValue ∧
@@ -124,8 +124,8 @@ theorem generated_existing_selector_action
     (secret tail : ExactMatrix q n 1 1) (row : ExactMatrix q n 1 2)
     (hstate : state < firstNew) (hdiagonal : concatDiagonal secret tail initial)
     (hrun : MxxIR.IterRuns
-      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_72_21
-        backend hashModel params slot bit (current, digit, state, firstNew, secret, ()) next)
+      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_60_22
+        backend hashModel params slot bit (current, state, firstNew, secret, digit, ()) next)
       count initial output) :
     (row * output) 0 0 = row 0 0 * secret 0 0 ∧
       (row * output) 0 1 = row 0 1 * tail 0 0 := by
@@ -143,8 +143,8 @@ theorem generated_new_selector_action
     (secret : ExactMatrix q n 1 1) (row : ExactMatrix q n 1 2)
     (hstate : state = firstNew + Int.ofNat targetBit) (hbit : targetBit < count)
     (hrun : MxxIR.IterRuns
-      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_72_21
-        backend hashModel params slot bit (current, digit, state, firstNew, secret, ()) next)
+      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_60_22
+        backend hashModel params slot bit (current, state, firstNew, secret, digit, ()) next)
       count initial output) :
     ∃ bitValue : ExactMatrix q n 1 1,
       select (if decide ((digit / (2 ^ targetBit)) % 2 = 1) then 1 else 0) [0, 1] bitValue ∧

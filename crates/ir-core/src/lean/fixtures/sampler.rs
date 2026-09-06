@@ -121,7 +121,7 @@ theorem generated_sampled_trapdoor_path
       (td : MxxRuntime.TrapdoorValue (Mxx.Primitives.ExactMatrix 17 2 1 3) Unit),
       td.kind = .sampledSecret ∧ td.publicMatrix = publicMatrix ∧
         publicMatrix * k = target ∧ publicMatrix * second = target := by
-  rcases h with ⟨td, publicMatrix, sample, sample2, sampleRuns, _, preimageRuns, _, preimageRuns2, outputEq⟩
+  rcases h with ⟨⟨td, publicMatrix, sample, sample2⟩, sampleRuns, _, preimageRuns, _, preimageRuns2, outputEq⟩
   refine ⟨publicMatrix, td, MxxRuntime.trapdoorSample_sampled sampleRuns,
     MxxRuntime.trapdoorSample_public sampleRuns, ?_, ?_⟩
   · have hk := congrArg Prod.fst outputEq

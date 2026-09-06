@@ -17,8 +17,7 @@ theorem producer_transition_bounded
     (producer : InjectorRootWitness backend hashModel params message initial transitions)
     (slot : Fin transitionCount) :
     PreimageWithin (transitions slot) params.diamond_preimage_max_coefficient_bound.toNat := by
-  obtain ⟨position, _, _, hsourceTrapdoor⟩ := generated_source_pool_lookup backend hashModel
-    params slot.val _ _ _ _ _ (producer.sourcesRun slot)
+  obtain ⟨position, _, _, hsourceTrapdoor⟩ := generated_source_pool_lookup _ _ _ _ _ (producer.sourcesRun slot)
   have hsample := producer.basesRun position
   rcases hsample with ⟨trapdoor, matrixValue, hsample, hout⟩
   have hpool : producer.trapdoors position = trapdoor :=
@@ -26,9 +25,8 @@ theorem producer_transition_bounded
   have hkind : (producer.sourceTrapdoors slot).kind = .sampledSecret := by
     rw [hsourceTrapdoor, hpool]
     exact trapdoorSample_sampled hsample
-  rcases producer.preimagesRun slot with ⟨value, _, hdispatch, hvalue⟩
-  rcases hdispatch.2 with hsampled | hpublic
-  · exact hvalue.symm ▸ preimageRuns_bounded hsampled
+  rcases (producer.preimagesRun slot).2 with hsampled | hpublic
+  · exact preimageRuns_bounded hsampled
   · have hbad := hkind.symm.trans hpublic.1
     cases hbad
 
@@ -46,8 +44,8 @@ theorem generated_selector_scan_sparse
     (initial output : ExactMatrix q n 2 2) (secret : ExactMatrix q n 1 1)
     (hinitial : SparseSelectorColumn (secret 0 0) initial)
     (hrun : MxxIR.IterRuns
-      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_72_21
-        backend hashModel params slot bit (current, digit, state, firstNew, secret, ()) next)
+      (fun bit current next ↦ Stage_encrypt.sequential_parallel_generatedRoot_60_22
+        backend hashModel params slot bit (current, state, firstNew, secret, digit, ()) next)
       count initial output) : SparseSelectorColumn (secret 0 0) output := by
   apply MxxIR.IterRuns.invariant
     (Invariant := fun _ value ↦ SparseSelectorColumn (secret 0 0) value) hinitial _ hrun
@@ -180,18 +178,18 @@ theorem producer_integer_selected_secret
     ∃ position : Fin sampleCount, (position.val : Int) = producer.digitIndices slot ∧
       producer.digitSecrets slot 0 0 = reducePoly q n (samples position) ∧
       polyNorm (samples position) ≤ 1 := by
-  rcases producer.secretsRun slot with ⟨value, _, _, ⟨position, hindex, hvalue⟩, hout⟩
+  rcases producer.secretsRun slot with ⟨position, hindex, hvalue⟩
   refine ⟨position, hindex, ?_, (hsamples position).2⟩
-  rw [hout, hvalue]
+  rw [hvalue]
   exact (hsamples position).1
 
 theorem generated_integer_transition
     (backend : BackendContext) (hashModel : HashModel)
-    (params : Stage_encrypt.Params) (decryptParams : Stage_decrypt.Params)
+    (params : Stage_encrypt.Params)
     (message : Bool) (initial : ExactMatrix q n 1 inner)
     (transitions : Fin transitionCount → ExactMatrix q n inner inner)
     (producer : InjectorRootWitness backend hashModel params message initial transitions)
-    (slot : Fin transitionCount) (layer lane : Nat)
+    (slot : Fin transitionCount)
     (row : ErrorMatrix n 1 2) (error : ErrorMatrix n 1 inner)
     (secret : ErrorPoly n) (rowBound errorBound : Nat)
     (current next : ExactMatrix q n 1 inner)
@@ -200,8 +198,7 @@ theorem generated_integer_transition
     (hrow : CoeffBound row rowBound) (herror : CoeffBound error errorBound)
     (hcurrent : current = reduceMatrix q n 1 2 row * producer.sourcePublics slot +
       reduceMatrix q n 1 inner error)
-    (hstep : Stage_decrypt.parallel_sequential_generatedRoot_8_13 backend decryptParams
-      layer lane (current, transitions slot, ()) next) :
+    (hstep : next = current * transitions slot) :
     ∃ (selectorWitness : InjectorSelectorWitness backend hashModel params slot.val
         (producer.digitSecrets slot) (producer.targetPublics slot) (producer.targets slot))
       (nextRow : ErrorMatrix n 1 2) (nextError : ErrorMatrix n 1 inner),
@@ -214,8 +211,7 @@ theorem generated_integer_transition
       CoeffBound nextError (2 * n * rowBound *
         params.diamond_error_max_coefficient_bound.toNat +
         inner * n * errorBound * params.diamond_preimage_max_coefficient_bound.toNat) := by
-  obtain ⟨selectorWitness⟩ := generated_selector_witness backend hashModel params slot.val
-    _ _ _ (producer.targetsRun slot)
+  obtain ⟨selectorWitness⟩ := producer.targetsRun slot
   obtain ⟨selector, targetError, hselector, h00, h10, hsparse, htargetBound, htarget⟩ :=
     selector_witness_integer_error backend hashModel params slot.val _ _ _ selectorWitness
   rw [hsecret] at h00 hsparse
@@ -224,9 +220,7 @@ theorem generated_integer_transition
   obtain ⟨preimageLift, hpreimageLift, hpreimageBound⟩ :=
     producer_transition_bounded backend hashModel params message initial transitions producer slot
   have hrelation : producer.sourcePublics slot * transitions slot = producer.targets slot := by
-    rcases producer.preimagesRun slot with ⟨value, _, hdispatch, hvalue⟩
-    rw [hvalue]
-    exact preimageRunsDispatched_equation (by decide) (by decide) hdispatch
+    exact preimageRunsDispatched_equation (by decide) (by decide) (producer.preimagesRun slot)
   obtain ⟨nextError, hnext, hnextBound⟩ := consume_right_preimage_bound
     (q := q) (inner := inner) (targetColumns := inner) (value := current)
     (by decide : 0 < n) (hcurrent.trans (add_comm _ _)) htarget rfl hpreimageLift hrelation

@@ -680,13 +680,13 @@ mod tests {
         let encoding_output =
             compiler.large_scalar_mul_encoding_families(&encoding, scalars).unwrap();
         let graph = DslContext::new("native-ring-gsw-bgg-lift")
-            .family_output("public", public_output.matrices)
+            .output("public", public_output.matrices)
             .unwrap()
-            .family_output("vectors", encoding_output.vectors)
+            .output("vectors", encoding_output.vectors)
             .unwrap()
-            .family_output("encoding-public", encoding_output.pubkeys)
+            .output("encoding-public", encoding_output.pubkeys)
             .unwrap()
-            .family_output("plaintexts", encoding_output.plaintexts.unwrap())
+            .output("plaintexts", encoding_output.plaintexts.unwrap())
             .unwrap()
             .build()
             .unwrap();

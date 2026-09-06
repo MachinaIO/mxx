@@ -30,40 +30,35 @@ theorem generated_final_preimages_bounded
     PreimageWithin outputs.1 params.diamond_preimage_max_coefficient_bound.toNat ∧
     PreimageWithin outputs.2.2.1 params.diamond_preimage_max_coefficient_bound.toNat ∧
     PreimageWithin outputs.2.2.2.1 params.diamond_preimage_max_coefficient_bound.toNat := by
-  dsimp only [Stage_encrypt.generatedRoot] at hrun
-  obtain ⟨rootWitness, h⟩ := hrun
-  rcases rootWitness with ⟨w0, w1, t1, w2, t2, base, trapdoor, w6, uniform, w8, publicInputs,
-    publicOne, w19, w20, w26, w27, w32, w35, publicCircuit, w38, target, digits,
-    decoderTarget, decoder, w46, w51, w52, w53, w55, keyTarget, key, gadget,
-    oneTarget, one, w65, w66, t66, w67, w68, w69, w70, w71, w72, w73,
-    w74, w75, t75, w76, w77, w78⟩
-  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at h
-  have hsample (i : Fin basePoolCount) : (t1 i).kind = .sampledSecret := by
-    have hr : Stage_encrypt.parallel_generatedRoot_1 backend hashModel params i ()
-        (w1 i, t1 i, ()) := by tauto
+  obtain ⟨w, h⟩ := hrun
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0,
+    Stage_encrypt.generatedRoot.constraints_1] at h
+  have hsample (i : Fin basePoolCount) : (w.w_0_1 i).kind = .sampledSecret := by
+    have hr : Stage_encrypt.parallel_generatedRoot_0 backend hashModel params i ()
+        (w.w_0_0 i, w.w_0_1 i, ()) := by tauto
     obtain ⟨td, pub, htd, hout⟩ := hr
-    have ht : t1 i = td := congrArg (fun o ↦ o.2.1) hout
+    have ht : w.w_0_1 i = td := congrArg (fun o ↦ o.2.1) hout
     exact ht ▸ trapdoorSample_sampled htd
-  have ht : trapdoor.kind = .sampledSecret := by
-    obtain ⟨i, _, hi⟩ : familyGetStatic t2 0 trapdoor := by tauto
-    have hr : Stage_encrypt.parallel_generatedRoot_2 backend hashModel params i
-        (w0 i, w1, t1, ()) (w2 i, t2 i, ()) := by tauto
+  have ht : w.w_3_0.kind = .sampledSecret := by
+    obtain ⟨i, _, hi⟩ : familyGetStatic w.w_1_1 0 w.w_3_0 := by tauto
+    have hr : Stage_encrypt.parallel_generatedRoot_1 backend hashModel params i
+        (w.w_0_0, w.w_0_1, ()) (w.w_1_0 i, w.w_1_1 i, ()) := by tauto
     obtain ⟨pub, td, _, _, _, _, _, ⟨j, _, hj⟩, hout⟩ := hr
-    have htd : t2 i = td := congrArg (fun o ↦ o.2.1) hout
+    have htd : w.w_1_1 i = td := congrArg (fun o ↦ o.2.1) hout
     rw [hi, htd, hj]
     exact hsample j
-  have hd : PreimageWithin decoder params.diamond_preimage_max_coefficient_bound.toNat := by
+  have hd : PreimageWithin w.w_39_0 params.diamond_preimage_max_coefficient_bound.toNat := by
     apply final_sampled_preimage_bound ht
-    exact (show preimageRunsDispatched backend base trapdoor decoderTarget
-      params.diamond_preimage_max_coefficient_bound.toNat decoder from by tauto)
-  have hk : PreimageWithin key params.diamond_preimage_max_coefficient_bound.toNat := by
+    exact (show preimageRunsDispatched backend w.w_2_0 w.w_3_0 w.w_38_0
+      params.diamond_preimage_max_coefficient_bound.toNat w.w_39_0 from by tauto)
+  have hk : PreimageWithin w.w_53_0 params.diamond_preimage_max_coefficient_bound.toNat := by
     apply final_sampled_preimage_bound ht
-    exact (show preimageRunsDispatched backend base trapdoor keyTarget
-      params.diamond_preimage_max_coefficient_bound.toNat key from by tauto)
-  have ho : PreimageWithin one params.diamond_preimage_max_coefficient_bound.toNat := by
+    exact (show preimageRunsDispatched backend w.w_2_0 w.w_3_0 w.w_52_0
+      params.diamond_preimage_max_coefficient_bound.toNat w.w_53_0 from by tauto)
+  have ho : PreimageWithin w.w_58_0 params.diamond_preimage_max_coefficient_bound.toNat := by
     apply final_sampled_preimage_bound ht
-    exact (show preimageRunsDispatched backend base trapdoor oneTarget
-      params.diamond_preimage_max_coefficient_bound.toNat one from by tauto)
+    exact (show preimageRunsDispatched backend w.w_2_0 w.w_3_0 w.w_57_0
+      params.diamond_preimage_max_coefficient_bound.toNat w.w_58_0 from by tauto)
   repeat' obtain ⟨_, h⟩ := h
   exact ⟨hd, hk, ho⟩
 
@@ -156,9 +151,11 @@ derived from its sampled trapdoor cutoff. Only local injector/circuit induction 
 theorem final_residual_from_encrypt_run
     (hashModel : HashModel) (params : Stage_encrypt.Params) {inputs outputs}
     (hrun : Stage_encrypt.generatedRoot DiamondBackend.backend hashModel params inputs outputs)
+    {publicCircuit : ExactMatrix q n 1 ell}
     (w : FinalPublicWitness DiamondBackend.backend params outputs.1 outputs.2.2.1
-      outputs.2.2.2.1 outputs.2.2.2.2.2.1 outputs.2.2.2.2.2.2.2.2.1
-      outputs.2.2.2.2.1 outputs.2.2.2.2.2.2.2.2.2.1)
+      outputs.2.2.2.1 outputs.2.2.2.2.2.1
+      (matrixPolynomial [MxxIR.roundDiv params.diamond_modulus 2])
+      outputs.2.2.2.2.1 publicCircuit)
     (hq : params.diamond_modulus = (q : Int))
     (selector : ExactMatrix q n 1 2) (message : Bool)
     (hmessage : selector 0 1 = if message then 1 else 0)
@@ -166,7 +163,7 @@ theorem final_residual_from_encrypt_run
     {B BH : Nat} (hstate : Approx state (selector * w.base) B)
     (hcircuit : Approx circuit
       (matrixMul ((fun _ _ ↦ selector 0 0) : ExactMatrix q n 1 1)
-          outputs.2.2.2.2.2.2.2.2.2.1 -
+          publicCircuit -
         matrixMul ((fun _ _ ↦ selector 0 0) : ExactMatrix q n 1 1) w.gadget) BH) :
     let B0 := projection * B * params.diamond_preimage_max_coefficient_bound.toNat
     Approx (state * outputs.1 - (state * outputs.2.2.1 +

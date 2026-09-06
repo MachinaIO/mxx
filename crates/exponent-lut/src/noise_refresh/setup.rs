@@ -4698,7 +4698,7 @@ impl RefreshVerification {
         }
         let decoded_prefix = decoded_prefix.into();
         for (index, value) in self.decoded.iter().enumerate() {
-            context = context.bool_output(format!("{decoded_prefix}_{index}"), value.clone())?;
+            context = context.output(format!("{decoded_prefix}_{index}"), value.clone())?;
         }
         Ok(context)
     }
@@ -5535,16 +5535,8 @@ impl RefreshParameterSimulationRequest {
             .private_output("refreshed-encoding-vector", refreshed.encoding().vector.clone())?
             .build()?;
         validate_cache_required_online_graph(&benchmark_online_graph)?;
-        let preprocessing_graph = BuiltGraph {
-            graph: producer.built().graph.clone(),
-            anchors: producer.built().anchors.clone(),
-            derivation_attachments: producer.built().derivation_attachments.clone(),
-        };
-        let benchmark_preprocessing_graph = BuiltGraph {
-            graph: preprocessing_graph.graph.clone(),
-            anchors: preprocessing_graph.anchors.clone(),
-            derivation_attachments: preprocessing_graph.derivation_attachments.clone(),
-        };
+        let preprocessing_graph = BuiltGraph { graph: producer.built().graph.clone() };
+        let benchmark_preprocessing_graph = BuiltGraph { graph: preprocessing_graph.graph.clone() };
         let public_identity = producer.declaration().identity;
         let (gain_plan, route_decompositions) = producer.noise_snapshot_plans()?;
         let noise_snapshot = setup.build_noise_snapshot(
@@ -5558,11 +5550,7 @@ impl RefreshParameterSimulationRequest {
         }
         if benchmark_only {
             return Ok(RefreshParameterSimulationBundle {
-                selector_graph: BuiltGraph {
-                    graph: producer.built().graph.clone(),
-                    anchors: producer.built().anchors.clone(),
-                    derivation_attachments: producer.built().derivation_attachments.clone(),
-                },
+                selector_graph: BuiltGraph { graph: producer.built().graph.clone() },
                 preprocessing_graph: None,
                 verification_graph: None,
                 benchmark_preprocessing_graph,
@@ -5601,11 +5589,7 @@ impl RefreshParameterSimulationRequest {
             setup.base_p.into(),
         )?;
         Ok(RefreshParameterSimulationBundle {
-            selector_graph: BuiltGraph {
-                graph: producer.built().graph.clone(),
-                anchors: producer.built().anchors.clone(),
-                derivation_attachments: producer.built().derivation_attachments.clone(),
-            },
+            selector_graph: BuiltGraph { graph: producer.built().graph.clone() },
             preprocessing_graph: Some(preprocessing_graph),
             verification_graph: Some(verification_graph),
             benchmark_preprocessing_graph,

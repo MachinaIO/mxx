@@ -39,47 +39,47 @@ structure FinalPublicWitness (backend : BackendContext) (params : Stage_encrypt.
 
 theorem generated_final_public_witness
     (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
-    {inputs outputs} (hrun : Stage_encrypt.generatedRoot backend hashModel params inputs outputs) :
-    Nonempty (FinalPublicWitness backend params outputs.1 outputs.2.2.1 outputs.2.2.2.1
-      outputs.2.2.2.2.2.1 outputs.2.2.2.2.2.2.2.2.1 outputs.2.2.2.2.1
-      outputs.2.2.2.2.2.2.2.2.2.1) := by
-  dsimp only [Stage_encrypt.generatedRoot] at hrun
-  obtain ⟨rootWitness, h⟩ := hrun
-  rcases rootWitness with ⟨w0, w1, t1, w2, t2, base, trapdoor, w6, uniform, w8, publicInputs,
-    publicOne, w19, w20, w26, w27, w32, w35, publicCircuit, w38, target, digits,
-    decoderTarget, decoder, w46, w51, w52, w53, w55, keyTarget, key, gadget,
-    oneTarget, one, w65, w66, t66, w67, w68, w69, w70, w71, w72, w73,
-    w74, w75, t75, w76, w77, w78⟩
-  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at h
-  have hpublic : publicOne = publicInputs 0 := by
-    obtain ⟨i, hi, hv⟩ : familyGetStatic publicInputs 0 publicOne := by tauto
+    {inputs outputs} (rootWitness : Stage_encrypt.generatedRoot.Witness)
+    (hbody : Stage_encrypt.generatedRoot.body backend hashModel params inputs outputs rootWitness) :
+    ∃ witness : FinalPublicWitness backend params outputs.1 outputs.2.2.1 outputs.2.2.2.1
+      outputs.2.2.2.2.2.1 (matrixPolynomial [MxxIR.roundDiv params.diamond_modulus 2])
+      outputs.2.2.2.2.1 rootWitness.w_30_0,
+      witness.base = rootWitness.w_2_0 ∧ witness.gadget = rootWitness.w_54_0 := by
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0,
+    Stage_encrypt.generatedRoot.constraints_1] at hbody
+  have hpublic : rootWitness.w_9_0 = rootWitness.w_8_0 0 := by
+    obtain ⟨i, hi, hv⟩ : familyGetStatic rootWitness.w_8_0 0 rootWitness.w_9_0 := by tauto
     have hiz : i = 0 := Fin.ext (by change i.val = 0; omega)
     simpa [hiz] using hv
-  have hd : base * decoder = decoderTarget := by
+  have hd : rootWitness.w_2_0 * rootWitness.w_39_0 = rootWitness.w_38_0 := by
     apply preimageRunsDispatched_equation (by decide) (by decide)
-    exact (show preimageRunsDispatched backend base trapdoor decoderTarget
-      params.diamond_preimage_max_coefficient_bound.toNat decoder from by tauto)
-  have hk : base * key = keyTarget := by
+    exact (show preimageRunsDispatched backend rootWitness.w_2_0 rootWitness.w_3_0
+      rootWitness.w_38_0 params.diamond_preimage_max_coefficient_bound.toNat
+      rootWitness.w_39_0 from by tauto)
+  have hk : rootWitness.w_2_0 * rootWitness.w_53_0 = rootWitness.w_52_0 := by
     apply preimageRunsDispatched_equation (by decide) (by decide)
-    exact (show preimageRunsDispatched backend base trapdoor keyTarget
-      params.diamond_preimage_max_coefficient_bound.toNat key from by tauto)
-  have ho : base * one = oneTarget := by
+    exact (show preimageRunsDispatched backend rootWitness.w_2_0 rootWitness.w_3_0
+      rootWitness.w_52_0 params.diamond_preimage_max_coefficient_bound.toNat
+      rootWitness.w_53_0 from by tauto)
+  have ho : rootWitness.w_2_0 * rootWitness.w_58_0 = rootWitness.w_57_0 := by
     apply preimageRunsDispatched_equation (by decide) (by decide)
-    exact (show preimageRunsDispatched backend base trapdoor oneTarget
-      params.diamond_preimage_max_coefficient_bound.toNat one from by tauto)
+    exact (show preimageRunsDispatched backend rootWitness.w_2_0 rootWitness.w_3_0
+      rootWitness.w_57_0 params.diamond_preimage_max_coefficient_bound.toNat
+      rootWitness.w_58_0 from by tauto)
   have hdecomp : gadgetDecomposeRuns backend params.diamond_gadget_base
-      params.diamond_digit_count target digits := by tauto
-  have hg : gadgetMatrixRuns backend params.diamond_gadget_base ell gadget := by tauto
-  have hdr : concatRows (uniform + (publicInputs 0 - publicCircuit) * digits)
-      (0 : ExactMatrix q n 1 1)
-      decoderTarget := by rw [← hpublic]; tauto
-  have hkr : concatRows uniform (matrixPolynomial [MxxIR.roundDiv params.diamond_modulus 2])
-      keyTarget := by tauto
-  have hor : concatRows (publicInputs 0 - gadget) (0 : ExactMatrix q n 1 ell)
-      oneTarget := by rw [← hpublic]; tauto
-  repeat' obtain ⟨_, h⟩ := h
-  exact ⟨⟨base, uniform, target, gadget, decoderTarget, keyTarget, oneTarget,
-    hdecomp, hg, hdr, hkr, hor, hd, hk, ho, rfl⟩⟩
+      params.diamond_digit_count rootWitness.w_33_0 rootWitness.w_34_0 := by tauto
+  have hg : gadgetMatrixRuns backend params.diamond_gadget_base ell rootWitness.w_54_0 := by tauto
+  have hdr : concatRows (rootWitness.w_6_0 +
+      (rootWitness.w_8_0 0 - rootWitness.w_30_0) * rootWitness.w_34_0)
+      (0 : ExactMatrix q n 1 1) rootWitness.w_38_0 := by rw [← hpublic]; tauto
+  have hkr : concatRows rootWitness.w_6_0 (matrixPolynomial [MxxIR.roundDiv params.diamond_modulus 2])
+      rootWitness.w_52_0 := by tauto
+  have hor : concatRows (rootWitness.w_8_0 0 - rootWitness.w_54_0)
+      (0 : ExactMatrix q n 1 ell) rootWitness.w_57_0 := by rw [← hpublic]; tauto
+  repeat' obtain ⟨_, hbody⟩ := hbody
+  exact ⟨⟨rootWitness.w_2_0, rootWitness.w_6_0, rootWitness.w_33_0,
+    rootWitness.w_54_0, rootWitness.w_38_0, rootWitness.w_52_0, rootWitness.w_57_0,
+    hdecomp, hg, hdr, hkr, hor, hd, hk, ho, rfl⟩, rfl, rfl⟩
 
 /-- Canonical regular decomposition and integer digit bound use the exact registered
 layout that also constructs the public gadget. -/

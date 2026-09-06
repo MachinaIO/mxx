@@ -51,7 +51,7 @@ mod tests {
         // The first stage can export, so validating names only during emission would leave a file.
         protocol.protocol.bundle.workflow.stages[0].graph =
             mxx_dsl::DslContext::new("stage-id-test")
-                .bool_output("value", mxx_dsl::Bool::constant(true))
+                .output("value", mxx_dsl::Bool::constant(true))
                 .unwrap()
                 .build()
                 .unwrap()

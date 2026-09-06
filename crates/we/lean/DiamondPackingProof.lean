@@ -33,18 +33,18 @@ theorem packing_step (acc bit : Int) (width : Nat)
 
 theorem generated_packed_bits
     (backend : BackendContext) (params : Stage_decrypt.Params) (layer : Nat)
-    (raw : Fin witnessSlots → Int) (output : Int)
+    (raw : Fin circuitWidth → Int) (output : Int)
     (hraw : ∀ position, 0 ≤ raw position ∧ raw position ≤ 1)
-    (hrun : Stage_decrypt.parallel_generatedRoot_6 backend params layer raw output) :
+    (hrun : Stage_decrypt.parallel_generatedRoot_5 backend params layer raw output) :
     (0 ≤ output ∧ output < (2 : Int) ^ params.diamond_batch_bits.toNat) ∧
       ∀ bit, bit < params.diamond_batch_bits.toNat →
-        ∃ position : Fin witnessSlots,
+        ∃ position : Fin circuitWidth,
           (position.val : Int) = (layer : Int) * params.diamond_batch_bits + (bit : Int) ∧
           output / (2 ^ bit) % 2 = raw position := by
   rcases hrun with ⟨⟨finalAcc, finalPower⟩, _, hscan, hout⟩
   let Invariant := fun (width : Nat) (state : Int × Int × Unit) ↦
     state.2.1 = 2 ^ width ∧ (0 ≤ state.1 ∧ state.1 < 2 ^ width) ∧
-      ∀ bit, bit < width → ∃ position : Fin witnessSlots,
+      ∀ bit, bit < width → ∃ position : Fin circuitWidth,
         (position.val : Int) = (layer : Int) * params.diamond_batch_bits + (bit : Int) ∧
         state.1 / 2 ^ bit % 2 = raw position
   have hstart : Invariant 0 (0, 1, ()) := by
@@ -84,55 +84,28 @@ theorem rawWitnessBits_at (raw : Fin circuitWidth → Int) (position : Fin circu
   unfold rawWitnessBits
   rw [dif_pos position.isLt]
 
-theorem generated_witness_prefix
-    (backend : BackendContext) (params : Stage_decrypt.Params) (i : Fin witnessSlots)
-    (raw : Fin circuitWidth → Int) (index value : Int)
-    (hindex : Stage_decrypt.parallel_generatedRoot_3 backend params i.val () index)
-    (hget : Stage_decrypt.parallel_generatedRoot_5 backend params i.val
-      (index, raw, ()) value) :
-    ∃ position : Fin circuitWidth, position.val = i.val ∧ value = raw position := by
-  rcases hget with ⟨selected, _, _, ⟨position, hposition, hvalue⟩, hout⟩
-  refine ⟨position, ?_, hout.trans hvalue⟩
-  change index = Int.ofNat i.val + 0 at hindex
-  have h := hposition.trans hindex
-  change (position.val : Int) = (i.val : Int) + 0 at h
-  omega
-
 theorem generated_packed_raw_witness
     (backend : BackendContext) (params : Stage_decrypt.Params)
-    (raw : Fin circuitWidth → Int) (prefixIndices rawPrefix : Fin witnessSlots → Int)
-    (packed : Fin inputCount → Int)
+    (raw : Fin circuitWidth → Int) (packed : Fin inputCount → Int)
     (hraw : ∀ position, 0 ≤ raw position ∧ raw position ≤ 1)
-    (hindices : ∀ i : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_3 backend params i.val ()
-      (prefixIndices i))
-    (hprefix : ∀ i : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_5 backend params i.val
-      (prefixIndices i, raw, ()) (rawPrefix i))
-    (hpacking : ∀ i : Fin inputCount, Stage_decrypt.parallel_generatedRoot_6 backend params i.val
-      rawPrefix (packed i)) :
+    (hpacking : ∀ i : Fin inputCount, Stage_decrypt.parallel_generatedRoot_5 backend params i.val
+      raw (packed i)) :
     (∀ i, 0 ≤ packed i ∧ packed i < (2 : Int) ^ params.diamond_batch_bits.toNat) ∧
       ∀ i : Fin inputCount, ∀ bit, bit < params.diamond_batch_bits.toNat →
         rawWitnessBits raw (i.val * params.diamond_batch_bits.toNat + bit) =
           decide ((packed i / 2 ^ bit) % 2 = 1) := by
-  have hprefixRange : ∀ i, 0 ≤ rawPrefix i ∧ rawPrefix i ≤ 1 := by
-    intro i
-    obtain ⟨position, _, hvalue⟩ := generated_witness_prefix backend params i raw _ _
-      (hindices i) (hprefix i)
-    simpa only [hvalue] using hraw position
-  have hpacked := fun i ↦ generated_packed_bits backend params i.val rawPrefix (packed i)
-    hprefixRange (hpacking i)
+  have hpacked := fun i ↦ generated_packed_bits backend params i.val raw (packed i)
+    hraw (hpacking i)
   refine ⟨fun i ↦ (hpacked i).1, ?_⟩
   intro i bit hbit
-  obtain ⟨prefixPosition, hprefixPosition, hbitValue⟩ := (hpacked i).2 bit hbit
-  obtain ⟨position, hposition, hvalue⟩ := generated_witness_prefix backend params prefixPosition
-    raw _ _ (hindices prefixPosition) (hprefix prefixPosition)
+  obtain ⟨position, hposition, hbitValue⟩ := (hpacked i).2 bit hbit
   have hbatch : 0 ≤ params.diamond_batch_bits := by
     rcases hpacking i with ⟨_, hnonneg, _, _⟩
     exact hnonneg
   have haddress : position.val = i.val * params.diamond_batch_bits.toNat + bit := by
-    rw [← hposition] at hprefixPosition
-    rw [← Int.toNat_of_nonneg hbatch] at hprefixPosition
-    exact_mod_cast hprefixPosition
-  rw [← haddress, rawWitnessBits_at, hbitValue, hvalue]
+    rw [← Int.toNat_of_nonneg hbatch] at hposition
+    exact_mod_cast hposition
+  rw [← haddress, rawWitnessBits_at, hbitValue]
 
 #print axioms generated_packed_raw_witness
 #print axioms packing_step

@@ -3,13 +3,9 @@ use super::*;
 pub trait GraphValue: Clone {
     type Schema: GraphValueSchema<Value = Self>;
     fn flatten(&self) -> Vec<ValueHandle>;
-    fn pending(&self) -> Pending;
+
     fn schema(&self) -> Self::Schema;
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError>;
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError>;
 }
 
 pub trait GraphValueSchema: Clone + PartialEq {
@@ -33,19 +29,13 @@ impl GraphValue for Mat {
     fn flatten(&self) -> Vec<ValueHandle> {
         vec![self.value.clone()]
     }
-    fn pending(&self) -> Pending {
-        self.pending.clone()
-    }
+
     fn schema(&self) -> Self::Schema {
         MatType(self.matrix_type.clone())
     }
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
-        Ok(Mat { value: value.clone(), matrix_type: schema.0.clone(), pending })
+        Ok(Mat { value: value.clone(), matrix_type: schema.0.clone() })
     }
 }
 
@@ -66,10 +56,6 @@ impl GraphValue for Bytes {
         vec![self.value.clone()]
     }
 
-    fn pending(&self) -> Pending {
-        self.pending.clone()
-    }
-
     fn schema(&self) -> Self::Schema {
         let WireType::Bytes { length } = self.value.wire_type() else {
             unreachable!("Bytes always wraps a bytes wire")
@@ -77,13 +63,9 @@ impl GraphValue for Bytes {
         BytesType { length: length.clone() }
     }
 
-    fn from_values(
-        _schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(_schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
-        Ok(Self { value: value.clone(), pending })
+        Ok(Self { value: value.clone() })
     }
 }
 
@@ -94,21 +76,13 @@ impl GraphValue for Int {
         vec![self.value.clone()]
     }
 
-    fn pending(&self) -> Pending {
-        self.pending.clone()
-    }
-
     fn schema(&self) -> Self::Schema {
         IntType
     }
 
-    fn from_values(
-        _schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(_schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
-        Ok(Self { value: value.clone(), pending })
+        Ok(Self { value: value.clone() })
     }
 }
 
@@ -119,21 +93,13 @@ impl GraphValue for Bool {
         vec![self.value.clone()]
     }
 
-    fn pending(&self) -> Pending {
-        self.pending.clone()
-    }
-
     fn schema(&self) -> Self::Schema {
         BoolType
     }
 
-    fn from_values(
-        _schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(_schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
-        Ok(Self { value: value.clone(), pending })
+        Ok(Self { value: value.clone() })
     }
 }
 
@@ -150,7 +116,7 @@ impl GraphValueSchema for BoolType {
             Vec::new(),
             vec![WireType::Bool],
         );
-        Bool { value: node.output(0).expect("boolean argument"), pending: Pending::default() }
+        Bool { value: node.output(0).expect("boolean argument") }
     }
 
     fn wire_types(&self) -> Vec<WireType> {
@@ -171,7 +137,7 @@ impl GraphValueSchema for IntType {
             Vec::new(),
             vec![WireType::Int],
         );
-        Int { value: node.output(0).expect("integer argument"), pending: Pending::default() }
+        Int { value: node.output(0).expect("integer argument") }
     }
 
     fn wire_types(&self) -> Vec<WireType> {
@@ -193,7 +159,7 @@ impl GraphValueSchema for BytesType {
             Vec::new(),
             vec![wire_type],
         );
-        Bytes { value: node.output(0).expect("bytes argument"), pending: Pending::default() }
+        Bytes { value: node.output(0).expect("bytes argument") }
     }
 
     fn wire_types(&self) -> Vec<WireType> {
@@ -208,10 +174,6 @@ impl GraphValue for SmallMatrix {
         vec![self.value.clone()]
     }
 
-    fn pending(&self) -> Pending {
-        self.pending.clone()
-    }
-
     fn schema(&self) -> Self::Schema {
         SmallMatrixType {
             matrix: self.matrix_type.clone(),
@@ -219,17 +181,12 @@ impl GraphValue for SmallMatrix {
         }
     }
 
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
         Ok(Self {
             value: value.clone(),
             matrix_type: schema.matrix.clone(),
             max_coefficient_bound: schema.max_coefficient_bound.clone(),
-            pending,
         })
     }
 }
@@ -261,10 +218,6 @@ impl GraphValue for Preimage {
         vec![self.value.clone()]
     }
 
-    fn pending(&self) -> Pending {
-        self.pending.clone()
-    }
-
     fn schema(&self) -> Self::Schema {
         PreimageType {
             matrix: self.matrix_type.clone(),
@@ -272,17 +225,12 @@ impl GraphValue for Preimage {
         }
     }
 
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let [value] = values else { return Err(DslError::Schema) };
         Ok(Self {
             value: value.clone(),
             matrix_type: schema.matrix.clone(),
             max_coefficient_bound: schema.max_coefficient_bound.clone(),
-            pending,
         })
     }
 }
@@ -308,7 +256,6 @@ impl GraphValueSchema for PreimageType {
             value: node.output(0).expect("preimage argument"),
             matrix_type: self.matrix.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
-            pending: Pending::default(),
         }
     }
 
@@ -325,10 +272,6 @@ impl GraphValue for Trapdoor {
 
     fn flatten(&self) -> Vec<ValueHandle> {
         vec![self.public.value.clone(), self.value.clone()]
-    }
-
-    fn pending(&self) -> Pending {
-        Pending::merge([self.public.pending.clone(), self.pending.clone()])
     }
 
     fn schema(&self) -> Self::Schema {
@@ -351,22 +294,13 @@ impl GraphValue for Trapdoor {
         }
     }
 
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let [public, value] = values else { return Err(DslError::Schema) };
         Ok(Self {
-            public: Mat {
-                value: public.clone(),
-                matrix_type: schema.matrix.clone(),
-                pending: pending.clone(),
-            },
+            public: Mat { value: public.clone(), matrix_type: schema.matrix.clone() },
             value: value.clone(),
             matrix_type: schema.matrix.clone(),
             preimage_max_coefficient_bound: schema.preimage_max_coefficient_bound.clone(),
-            pending,
         })
     }
 }
@@ -398,7 +332,6 @@ impl GraphValueSchema for TrapdoorType {
             value: node.output(0).expect("trapdoor argument"),
             matrix_type: self.matrix.clone(),
             preimage_max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
-            pending: Pending::default(),
         }
     }
 
@@ -425,15 +358,15 @@ macro_rules! tuple_value {
                 $(values.extend(self.$field.flatten());)+
                 values
             }
-            fn pending(&self) -> Pending { Pending::merge([$(self.$field.pending(),)+]) }
+
             fn schema(&self) -> Self::Schema { ($(self.$field.schema(),)+) }
-            fn from_values(schema: &Self::Schema, values: &[ValueHandle], pending: Pending) -> Result<Self, DslError> {
+            fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
                 let mut offset = 0;
                 let result = ($({
                     let count = schema.$field.wire_types().len();
                     let fields = values.get(offset..offset + count).ok_or(DslError::Schema)?;
                     offset += count;
-                    $value::from_values(&schema.$field, fields, pending.clone())?
+                    $value::from_values(&schema.$field, fields)?
                 },)+);
                 if offset != values.len() { return Err(DslError::Schema); }
                 Ok(result)
@@ -471,19 +404,11 @@ impl<T: GraphValue> GraphValue for Vec<T> {
         self.iter().flat_map(GraphValue::flatten).collect()
     }
 
-    fn pending(&self) -> Pending {
-        Pending::merge(self.iter().map(GraphValue::pending))
-    }
-
     fn schema(&self) -> Self::Schema {
         self.iter().map(GraphValue::schema).collect()
     }
 
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let mut offset = 0;
         schema
             .iter()
@@ -492,7 +417,6 @@ impl<T: GraphValue> GraphValue for Vec<T> {
                 let result = T::from_values(
                     item,
                     values.get(offset..offset + count).ok_or(DslError::Schema)?,
-                    pending.clone(),
                 )?;
                 offset += count;
                 Ok(result)

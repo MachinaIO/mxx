@@ -14,7 +14,7 @@ use mxx_bgg::{
     bind_lwe_lookup_invocations, collect_lwe_lookup_identities,
     required_tall_anchor_reduce_encoding, required_tall_rotation_encodings,
 };
-use mxx_dsl::{BuiltGraph, DslContext, Int, Ring, SemanticAnchor, parallel};
+use mxx_dsl::{BuiltGraph, DslContext, Int, Ring, parallel};
 use mxx_gadgets::{
     circuit::{PolyCircuit, PolyGateKind},
     circuit_gadgets::{
@@ -80,8 +80,6 @@ const DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT: &str = "tall_nested_rns_diagonal_mask_p
 const OUTPUT_PUBLIC_KEY_ARTIFACT: &str = "tall_nested_rns_output_public_key";
 const TALL_OPERATIONAL_RESIDUAL: &str = "operational_residual";
 const TALL_OPERATIONAL_DECODED: &str = "operational_decoded";
-const TALL_DECODER_RESIDUAL_ANCHOR: &str = "tall.decoder.residual";
-const TALL_DECODER_RESULT_ANCHOR: &str = "tall.decoder.result";
 
 fn log_graph_phase(phase: &'static str, state: &'static str, started: Option<&Instant>) {
     let (vm_rss_kib, vm_hwm_kib) = process_memory_kib();
@@ -1173,9 +1171,9 @@ fn build_encoding_graph(
         ArtifactConfidentiality::Public,
     );
     let mut context = DslContext::new("gpu-tall-nested-rns-encoding")
-        .family_output("encoding_rows", encoding_rows.clone())
+        .output("encoding_rows", encoding_rows.clone())
         .map_err(|error| error.to_string())?
-        .family_output("output_plaintexts", output_plaintexts.clone())
+        .output("output_plaintexts", output_plaintexts.clone())
         .map_err(|error| error.to_string())?;
     if include_operational_residual {
         let gadget =
@@ -1191,26 +1189,20 @@ fn build_encoding_graph(
         })
         .map_err(|error| error.to_string())?;
         // The operational target contains only the authoritative q1 anchors.
-        let decoder_input = residuals
-            .at(0)
-            .slice(
-                Some(IndexRange { start: 0.into(), end: 1.into() }),
-                Some(IndexRange { start: 0.into(), end: 1.into() }),
-            )
-            .semantic_anchor(TALL_DECODER_RESIDUAL_ANCHOR)
-            .map_err(|error| error.to_string())?;
+        let decoder_input = residuals.at(0).slice(
+            Some(IndexRange { start: 0.into(), end: 1.into() }),
+            Some(IndexRange { start: 0.into(), end: 1.into() }),
+        );
         let q_max = q_moduli.into_iter().max().expect("nonempty CRT basis");
         let decoded = decoder_input
             .threshold_decode_bools(IntExpr::constant(q_max), 1)
             .into_iter()
             .next()
-            .ok_or_else(|| "Tall operational decoder has no Boolean output".to_owned())?
-            .semantic_anchor(TALL_DECODER_RESULT_ANCHOR)
-            .map_err(|error| error.to_string())?;
+            .ok_or_else(|| "Tall operational decoder has no Boolean output".to_owned())?;
         context = context
-            .family_output(TALL_OPERATIONAL_RESIDUAL, residuals)
+            .output(TALL_OPERATIONAL_RESIDUAL, residuals)
             .map_err(|error| error.to_string())?
-            .bool_output(TALL_OPERATIONAL_DECODED, decoded)
+            .output(TALL_OPERATIONAL_DECODED, decoded)
             .map_err(|error| error.to_string())?;
     }
     context.build().map_err(|error| error.to_string())

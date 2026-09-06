@@ -7,6 +7,9 @@ open DiamondProofParameters
 
 namespace DiamondGeneratedProof
 
+set_option maxHeartbeats 2000000
+set_option maxRecDepth 8192
+
 theorem initial_registered_gadget (params : Stage_encrypt.Params)
     {decoder key one digits half publicInputs publicCircuit}
     (w : FinalPublicWitness DiamondBackend.backend params decoder key one digits half
@@ -38,7 +41,7 @@ theorem initial_one_encoding (params : Stage_encrypt.Params)
 
 /-- The witness slot consumes its actual terminal row and sampled preimage. The second
     row is -G, so the row's secret-times-bit coefficient becomes the BGG payload term. -/
-theorem initial_witness_encoding (params : Stage_decrypt.Params) (slot B P : Nat)
+theorem initial_witness_encoding (B P : Nat)
     (secret : ExactMatrix q n 1 1) (selector : ExactMatrix q n 1 2)
     (state : ExactMatrix q n 1 inner) (base : ExactMatrix q n 2 inner)
     (publicKey output : ExactMatrix q n 1 ell) (target : ExactMatrix q n 2 ell)
@@ -48,8 +51,7 @@ theorem initial_witness_encoding (params : Stage_decrypt.Params) (slot B P : Nat
     (hstate : Approx state (selector * base) B)
     (hrows : concatRows publicKey (-gadget) target)
     (hpreimage : base * preimage = target) (hbounded : PreimageWithin preimage P)
-    (hrun : Stage_decrypt.parallel_generatedRoot_31 DiamondBackend.backend params slot
-      (state, preimage, ()) output) :
+    (hrun : output = state * preimage) :
     BooleanEncodingWithin secret publicKey (if bit then 1 else 0) output (projection * B * P) := by
   have hp := final_state_project (by decide : 0 < n) hstate hbounded
   have htarget : selector * target =
@@ -65,112 +67,6 @@ theorem initial_witness_encoding (params : Stage_decrypt.Params) (slot B P : Nat
   have ho : output = state * preimage := hrun
   simpa only [BooleanEncodingWithin, ← ho, Matrix.mul_assoc, hpreimage, htarget] using hp
 
-/-- The three real initialization selectors use one signed flag for ciphertext, key,
-    and message. This also applies definitionally to subsequent initialization selects. -/
-theorem initial_triple_select_within (backend : BackendContext)
-    (params : Stage_decrypt.Params) (lane B : Nat) (flag : Int)
-    (secret : ExactMatrix q n 1 1)
-    (leftCipher rightCipher leftKey rightKey output outputKey : ExactMatrix q n 1 ell)
-    (leftMessage rightMessage outputMessage : ExactMatrix q n 1 1)
-    (hl : BooleanEncodingWithin secret leftKey (leftMessage 0 0) leftCipher B)
-    (hr : BooleanEncodingWithin secret rightKey (rightMessage 0 0) rightCipher B)
-    (hlBool : leftMessage 0 0 = 0 ∨ leftMessage 0 0 = 1)
-    (hrBool : rightMessage 0 0 = 0 ∨ rightMessage 0 0 = 1)
-    (hcipher : Stage_decrypt.parallel_generatedRoot_33 backend params lane
-      (flag, leftCipher, rightCipher, ()) output)
-    (hkey : Stage_decrypt.parallel_generatedRoot_46 backend params lane
-      (flag, leftKey, rightKey, ()) outputKey)
-    (hmessage : Stage_decrypt.parallel_generatedRoot_58 backend params lane
-      (flag, leftMessage, rightMessage, ()) outputMessage) :
-    BooleanEncodingWithin secret outputKey (outputMessage 0 0) output B ∧
-      (outputMessage 0 0 = 0 ∨ outputMessage 0 0 = 1) := by
-  obtain ⟨cipher, _, _, _, ⟨ci, hci, hcv⟩, hco⟩ := hcipher
-  obtain ⟨key, _, _, _, ⟨ki, hki, hkv⟩, hko⟩ := hkey
-  obtain ⟨message, _, _, _, ⟨mi, hmi, hmv⟩, hmo⟩ := hmessage
-  change Fin 2 at ci ki mi
-  have hki' : ki = ci := Fin.ext (by dsimp at hki hci; omega)
-  have hmi' : mi = ci := Fin.ext (by dsimp at hmi hci; omega)
-  subst ki
-  subst mi
-  have hc := hco.trans hcv
-  have hk := hko.trans hkv
-  have hm := hmo.trans hmv
-  fin_cases ci
-  · simpa only [List.get, hc, hk, hm] using And.intro hl hlBool
-  · simpa only [List.get, hc, hk, hm] using And.intro hr hrBool
-
-/-- Actual initialization candidates and all three aligned selection stages yield the
-    initial circuit lane invariant. No equality of the final arrays is assumed. -/
-theorem generated_initial_lane_within (backend : BackendContext)
-    (params : Stage_decrypt.Params) (lane B : Nat) (instanceFlag witnessFlag instanceBit : Int)
-    (secret : ExactMatrix q n 1 1)
-    (oneCipher oneKey witnessCipher witnessKey witnessChoiceCipher witnessChoiceKey
-      instanceChoiceCipher instanceChoiceKey output outputKey : ExactMatrix q n 1 ell)
-    (witnessMessage witnessChoiceMessage instanceChoiceMessage outputMessage :
-      ExactMatrix q n 1 1)
-    (hone : BooleanEncodingWithin secret oneKey 1 oneCipher B)
-    (hwitness : BooleanEncodingWithin secret witnessKey (witnessMessage 0 0) witnessCipher B)
-    (hwitnessBool : witnessMessage 0 0 = 0 ∨ witnessMessage 0 0 = 1)
-    (hwc : Stage_decrypt.parallel_generatedRoot_33 backend params lane
-      (witnessFlag, oneCipher - oneCipher, witnessCipher, ()) witnessChoiceCipher)
-    (hwk : Stage_decrypt.parallel_generatedRoot_46 backend params lane
-      (witnessFlag, oneKey - oneKey, witnessKey, ()) witnessChoiceKey)
-    (hwm : Stage_decrypt.parallel_generatedRoot_58 backend params lane
-      (witnessFlag, 0, witnessMessage, ()) witnessChoiceMessage)
-    (hic : Stage_decrypt.parallel_generatedRoot_37 backend params lane
-      (instanceBit, oneCipher - oneCipher, oneCipher, ()) instanceChoiceCipher)
-    (hik : Stage_decrypt.parallel_generatedRoot_49 backend params lane
-      (instanceBit, oneKey - oneKey, oneKey, ()) instanceChoiceKey)
-    (him : Stage_decrypt.parallel_generatedRoot_61 backend params lane
-      (instanceBit, 0, 1, ()) instanceChoiceMessage)
-    (hoc : Stage_decrypt.parallel_generatedRoot_38 backend params lane
-      (instanceFlag, witnessChoiceCipher, instanceChoiceCipher, ()) output)
-    (hok : Stage_decrypt.parallel_generatedRoot_50 backend params lane
-      (instanceFlag, witnessChoiceKey, instanceChoiceKey, ()) outputKey)
-    (hom : Stage_decrypt.parallel_generatedRoot_62 backend params lane
-      (instanceFlag, witnessChoiceMessage, instanceChoiceMessage, ()) outputMessage) :
-    BooleanEncodingWithin secret outputKey (outputMessage 0 0) output B ∧
-      (outputMessage 0 0 = 0 ∨ outputMessage 0 0 = 1) := by
-  have hz : BooleanEncodingWithin secret (oneKey - oneKey) 0 (oneCipher - oneCipher) B := by
-    simpa only [sub_self] using boolean_encoding_zero secret B
-  have hmz : (0 : ExactMatrix q n 1 1) 0 0 = 0 ∨
-      (0 : ExactMatrix q n 1 1) 0 0 = 1 := Or.inl rfl
-  have hmo : (1 : ExactMatrix q n 1 1) 0 0 = 0 ∨
-      (1 : ExactMatrix q n 1 1) 0 0 = 1 := Or.inr (by simp)
-  obtain ⟨hw, hwb⟩ := initial_triple_select_within backend params lane B witnessFlag secret
-    _ _ _ _ _ _ _ _ _ hz hwitness hmz hwitnessBool hwc hwk hwm
-  obtain ⟨hi, hib⟩ := initial_triple_select_within backend params lane B instanceBit secret
-    _ _ _ _ _ _ _ _ _ hz (by simpa using hone) hmz hmo hic hik him
-  exact initial_triple_select_within backend params lane B instanceFlag secret
-    _ _ _ _ _ _ _ _ _ hw hi hwb hib hoc hok hom
-
-/-- Actual dynamic gathers retain the same slot across all three initial families. -/
-theorem initial_gathered_triple_within (backend : BackendContext)
-    (params : Stage_decrypt.Params) (lane B : Nat) (index : Int)
-    (secret : ExactMatrix q n 1 1)
-    (cipher keys : Fin witnessSlots → ExactMatrix q n 1 ell)
-    (messages : Fin witnessSlots → ExactMatrix q n 1 1)
-    (output outputKey : ExactMatrix q n 1 ell)
-    (outputMessage : ExactMatrix q n 1 1)
-    (hfamily : ∀ slot, BooleanEncodingWithin secret (keys slot)
-      (messages slot 0 0) (cipher slot) B ∧
-      (messages slot 0 0 = 0 ∨ messages slot 0 0 = 1))
-    (hc : Stage_decrypt.parallel_generatedRoot_32 backend params lane
-      (index, cipher, ()) output)
-    (hk : Stage_decrypt.parallel_generatedRoot_45 backend params lane
-      (index, keys, ()) outputKey)
-    (hm : Stage_decrypt.parallel_generatedRoot_57 backend params lane
-      (index, messages, ()) outputMessage) :
-    BooleanEncodingWithin secret outputKey (outputMessage 0 0) output B ∧
-      (outputMessage 0 0 = 0 ∨ outputMessage 0 0 = 1) := by
-  obtain ⟨c, _, _, hc, hco⟩ := hc
-  obtain ⟨k, _, _, hk, hko⟩ := hk
-  obtain ⟨m, _, _, hm, hmo⟩ := hm
-  obtain ⟨slot, hslot, hcv, hkv⟩ := circuit_gather_same_index cipher keys index c k hc hk
-  obtain ⟨slot', hslot', _, hmv⟩ := circuit_gather_same_index cipher messages index c m hc hm
-  have heq : slot' = slot := Fin.ext (by omega)
-  subst slot'
-  simpa only [hco, hko, hmo, hcv, hkv, hmv] using hfamily slot
 
 theorem initial_select_value {α : Type} (flag : Int) (left right output : α)
     (h : MxxRuntime.select flag [left, right] output) :
@@ -183,174 +79,195 @@ theorem initial_select_value {α : Type} (flag : Int) (left right output : α)
   · have hf : flag = 1 := hposition.symm
     simpa only [hf, Int.one_ne_zero, ↓reduceIte, List.get] using houtput
 
-/-- The actual plaintext selectors agree with the requirement's initial lane, including
-    instance priority and padding. The selected witness scalar is linked separately by
-    the actual common-index gathers, not by an equality of final initial arrays. -/
-theorem generated_initial_plaintext_lane_agrees (backend : BackendContext)
-    (params : Stage_decrypt.Params) (referenceParams : Requirement_2.Params)
-    (lane : Nat) (instanceWidth witnessWidth instanceFlag witnessFlag instanceBit witnessBit : Int)
-    (witnessMessage witnessChoice instanceChoice output : ExactMatrix q n 1 1)
-    (reference : Bool)
-    (hinstanceBit : instanceBit = 0 ∨ instanceBit = 1)
-    (hwitness : witnessMessage 0 0 = if witnessBit = 1 then 1 else 0)
-    (hinstanceFlag : Stage_decrypt.parallel_generatedRoot_19 backend params lane
-      instanceWidth instanceFlag)
-    (hwitnessFlag : Stage_decrypt.parallel_generatedRoot_24 backend params lane
-      (instanceWidth, instanceWidth + witnessWidth - 1, ()) witnessFlag)
-    (hw : Stage_decrypt.parallel_generatedRoot_58 backend params lane
-      (witnessFlag, 0, witnessMessage, ()) witnessChoice)
-    (hi : Stage_decrypt.parallel_generatedRoot_61 backend params lane
-      (instanceBit, 0, 1, ()) instanceChoice)
-    (ho : Stage_decrypt.parallel_generatedRoot_62 backend params lane
-      (instanceFlag, witnessChoice, instanceChoice, ()) output)
-    (hr : Requirement_2.parallel_generatedRoot_22 referenceParams lane
-      (instanceBit, witnessBit, instanceWidth, instanceWidth + witnessWidth, ()) reference) :
-    output 0 0 = if reference then 1 else 0 := by
-  obtain ⟨w, _, _, _, hw, hwo⟩ := hw
-  obtain ⟨i, _, _, _, hi, hio⟩ := hi
-  obtain ⟨o, _, _, _, ho, hoo⟩ := ho
-  have hwv := initial_select_value _ _ _ _ hw
-  have hiv := initial_select_value _ _ _ _ hi
-  have hov := initial_select_value _ _ _ _ ho
-  dsimp only [Stage_decrypt.parallel_generatedRoot_19] at hinstanceFlag
-  dsimp only [Stage_decrypt.parallel_generatedRoot_24] at hwitnessFlag
-  dsimp only [Requirement_2.parallel_generatedRoot_22] at hr
-  obtain ⟨r, r', _, _, _, hr, _, _, _, hr', hrout⟩ := hr
-  have hrv := initial_select_value _ _ _ _ hr
-  have hrv' := initial_select_value _ _ _ _ hr'
-  by_cases hleft : (lane : Int) ≤ instanceWidth - 1
-  · rcases hinstanceBit with hbit | hbit <;>
-      simp_all
-  · have hstart : instanceWidth ≤ (lane : Int) := by omega
-    by_cases hend : (lane : Int) ≤ instanceWidth + witnessWidth - 1
-    · simp_all
-    · simp_all
-
-/-- The generated clamped witness addresses equal the requirement's addresses. -/
-theorem generated_initial_indices_agree (backend : BackendContext)
-    (params : Stage_decrypt.Params) (referenceParams : Requirement_2.Params)
-    (lane : Nat) (instanceWidth witnessWidth instanceBit index referenceIndex : Int)
-    (hwidth : 0 ≤ witnessWidth)
-    (hd : Stage_decrypt.parallel_generatedRoot_27 backend params lane
-      (instanceWidth, instanceWidth + witnessWidth - 1, ()) index)
-    (hr : Requirement_2.parallel_generatedRoot_20 referenceParams lane
-      (instanceBit, instanceWidth + witnessWidth, instanceWidth, ()) referenceIndex) :
-    index = referenceIndex := by
-  dsimp only [Stage_decrypt.parallel_generatedRoot_27] at hd
-  obtain ⟨selected, _, _, _, hs, ho⟩ := hd
-  have hv := initial_select_value _ _ _ _ hs
-  dsimp only [Requirement_2.parallel_generatedRoot_20] at hr
-  by_cases hleft : (lane : Int) ≤ instanceWidth - 1
-  · have hstart : ¬instanceWidth ≤ (lane : Int) := by omega
-    have hend : (lane : Int) ≤ instanceWidth + witnessWidth - 1 := by omega
-    simp_all
-  · have hstart : instanceWidth ≤ (lane : Int) := by omega
-    by_cases hend : (lane : Int) ≤ instanceWidth + witnessWidth - 1 <;> simp_all
-
-/-- Actual raw-witness extraction, bit selection, and the later message gather agree
-    with the requirement's raw-witness gather at their proven common address. -/
-theorem generated_witness_plaintext_agrees (backend : BackendContext)
-    (params : Stage_decrypt.Params) (referenceParams : Requirement_2.Params)
-    (lane : Nat) (index referenceIndex selectedWitness : Int)
-    (raw : Fin circuitWidth → Int) (slotIndices sampled : Fin witnessSlots → Int)
+/-- The fused initialization run exposes its shared address and aligned selectors. -/
+structure InitialLaneFacts (lane : Nat) (start last bit : Int)
+    (zeroCipher oneCipher zeroKey oneKey : ExactMatrix q n 1 ell)
+    (zeroMessage oneMessage : ExactMatrix q n 1 1)
+    (cipher keys : Fin witnessSlots → ExactMatrix q n 1 ell)
     (messages : Fin witnessSlots → ExactMatrix q n 1 1)
-    (selectedMessage : ExactMatrix q n 1 1)
-    (hindex : index = referenceIndex)
-    (hindices : ∀ slot : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_3 backend params slot
-      () (slotIndices slot))
-    (hsampled : ∀ slot : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_5 backend params slot
-      (slotIndices slot, raw, ()) (sampled slot))
-    (hbits : ∀ slot : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_56 backend params slot
-      (sampled slot, 0, 1, ()) (messages slot))
-    (hmessage : Stage_decrypt.parallel_generatedRoot_57 backend params lane
-      (index, messages, ()) selectedMessage)
-    (hreference : Requirement_2.parallel_generatedRoot_21 referenceParams lane
-      (referenceIndex, raw, ()) selectedWitness) :
-    selectedMessage 0 0 = if selectedWitness = 1 then 1 else 0 := by
-  obtain ⟨message, _, _, ⟨slot, hslot, hmessage⟩, houtput⟩ := hmessage
-  have hslotIndex : slotIndices slot = referenceIndex := by
-    have hi := hindices slot
-    change slotIndices slot = (slot.val : Int) + 0 at hi
-    simpa only [add_zero, hslot, hindex] using hi
-  obtain ⟨sample, _, _, hs, hso⟩ := hsampled slot
-  obtain ⟨referenceValue, _, _, hr, hro⟩ := hreference
-  rw [hslotIndex] at hs
-  have hvalue : sampled slot = selectedWitness :=
-    hso.trans ((circuit_lookup_unique hs hr).trans hro.symm)
-  obtain ⟨bitMessage, _, _, _, ⟨position, hposition, hbit⟩, hbo⟩ := hbits slot
-  change Fin 2 at position
-  have hout : selectedMessage = bitMessage := houtput.trans (hmessage.trans hbo)
-  fin_cases position
-  · have hv : selectedWitness = 0 := hvalue.symm.trans hposition.symm
-    simp only [hout, hbit, List.get, Matrix.zero_apply, hv, Int.zero_ne_one, ↓reduceIte]
-  · have hv : selectedWitness = 1 := hvalue.symm.trans hposition.symm
-    simp only [hout, hbit, List.get, Matrix.one_apply_eq, hv, ↓reduceIte]
+    (output : ExactMatrix q n 1 ell × ExactMatrix q n 1 ell ×
+      ExactMatrix q n 1 1 × Unit) where
+  index : Int
+  c : ExactMatrix q n 1 ell
+  k : ExactMatrix q n 1 ell
+  m : ExactMatrix q n 1 1
+  address : index = if start ≤ (lane : Int) ∧ (lane : Int) ≤ last
+    then (lane : Int) - start else 0
+  cipherGet : familyGetDynamic cipher index c
+  keyGet : familyGetDynamic keys index k
+  messageGet : familyGetDynamic messages index m
+  cipherEquation : output.1 = if (lane : Int) ≤ start - 1
+    then (if bit = 0 then zeroCipher else oneCipher)
+    else (if start ≤ (lane : Int) ∧ (lane : Int) ≤ last then c else zeroCipher)
+  keyEquation : output.2.1 = if (lane : Int) ≤ start - 1
+    then (if bit = 0 then zeroKey else oneKey)
+    else (if start ≤ (lane : Int) ∧ (lane : Int) ≤ last then k else zeroKey)
+  messageEquation : output.2.2.1 = if (lane : Int) ≤ start - 1
+    then (if bit = 0 then zeroMessage else oneMessage)
+    else (if start ≤ (lane : Int) ∧ (lane : Int) ≤ last then m else zeroMessage)
 
-/-- Whole-family initial plaintext agreement obtained from actual initialization scopes
-    on the same raw instance/witness arrays. No final-family equality is a hypothesis. -/
-theorem generated_initial_plaintext_agrees (backend : BackendContext)
-    (params : Stage_decrypt.Params) (referenceParams : Requirement_2.Params)
-    (instanceWidth witnessWidth : Int) (initial : CircuitState)
-    (rawInstance rawWitness instanceFlags witnessFlags indices referenceIndices
-      referenceWitnesses : Fin circuitWidth → Int)
-    (slotIndices sampled : Fin witnessSlots → Int)
-    (slotMessages : Fin witnessSlots → ExactMatrix q n 1 1)
-    (witnessMessages witnessChoices instanceChoices : Fin circuitWidth → ExactMatrix q n 1 1)
-    (referenceInitial : Fin circuitWidth → Bool)
-    (hwidth : 0 ≤ witnessWidth)
-    (hraw : ∀ lane, rawInstance lane = 0 ∨ rawInstance lane = 1)
-    (hslotIndices : ∀ slot : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_3 backend params slot
-      () (slotIndices slot))
-    (hsampled : ∀ slot : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_5 backend params slot
-      (slotIndices slot, rawWitness, ()) (sampled slot))
-    (hbits : ∀ slot : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_56 backend params slot
-      (sampled slot, 0, 1, ()) (slotMessages slot))
-    (hindices : ∀ lane : Fin circuitWidth, Stage_decrypt.parallel_generatedRoot_27 backend params lane
-      (instanceWidth, instanceWidth + witnessWidth - 1, ()) (indices lane))
-    (hreferenceIndices : ∀ lane : Fin circuitWidth,
-      Requirement_2.parallel_generatedRoot_20 referenceParams lane
-        (rawInstance lane, instanceWidth + witnessWidth, instanceWidth, ())
-        (referenceIndices lane))
-    (hwitnesses : ∀ lane : Fin circuitWidth, Stage_decrypt.parallel_generatedRoot_57 backend params lane
-      (indices lane, slotMessages, ()) (witnessMessages lane))
-    (hreferenceWitnesses : ∀ lane : Fin circuitWidth,
-      Requirement_2.parallel_generatedRoot_21 referenceParams lane
-        (referenceIndices lane, rawWitness, ()) (referenceWitnesses lane))
-    (hinstanceFlags : ∀ lane : Fin circuitWidth, Stage_decrypt.parallel_generatedRoot_19 backend params lane
-      instanceWidth (instanceFlags lane))
-    (hwitnessFlags : ∀ lane : Fin circuitWidth, Stage_decrypt.parallel_generatedRoot_24 backend params lane
-      (instanceWidth, instanceWidth + witnessWidth - 1, ()) (witnessFlags lane))
-    (hw : ∀ lane : Fin circuitWidth, Stage_decrypt.parallel_generatedRoot_58 backend params lane
-      (witnessFlags lane, 0, witnessMessages lane, ()) (witnessChoices lane))
-    (hi : ∀ lane : Fin circuitWidth, Stage_decrypt.parallel_generatedRoot_61 backend params lane
-      (rawInstance lane, 0, 1, ()) (instanceChoices lane))
-    (ho : ∀ lane : Fin circuitWidth, Stage_decrypt.parallel_generatedRoot_62 backend params lane
-      (instanceFlags lane, witnessChoices lane, instanceChoices lane, ()) (initial.2.2.1 lane))
-    (hr : ∀ lane : Fin circuitWidth, Requirement_2.parallel_generatedRoot_22 referenceParams lane
-      (rawInstance lane, referenceWitnesses lane, instanceWidth,
-        instanceWidth + witnessWidth, ()) (referenceInitial lane)) :
-    CircuitPlaintextAgrees initial referenceInitial := by
-  intro lane
-  have hindex := generated_initial_indices_agree backend params referenceParams lane
-    instanceWidth witnessWidth (rawInstance lane) (indices lane) (referenceIndices lane)
-    hwidth (hindices lane) (hreferenceIndices lane)
-  have hwitness := generated_witness_plaintext_agrees backend params referenceParams lane
-    (indices lane) (referenceIndices lane) (referenceWitnesses lane) rawWitness slotIndices
-    sampled slotMessages (witnessMessages lane) hindex hslotIndices hsampled hbits
-    (hwitnesses lane) (hreferenceWitnesses lane)
-  exact generated_initial_plaintext_lane_agrees backend params referenceParams lane
-    instanceWidth witnessWidth (instanceFlags lane) (witnessFlags lane) (rawInstance lane)
-    (referenceWitnesses lane) (witnessMessages lane) (witnessChoices lane)
-    (instanceChoices lane) (initial.2.2.1 lane) (referenceInitial lane) (hraw lane) hwitness
-    (hinstanceFlags lane) (hwitnessFlags lane) (hw lane) (hi lane) (ho lane) (hr lane)
+theorem generated_initial_lane_facts (backend : BackendContext) (params : Stage_decrypt.Params)
+    (lane : Nat) (start last bit : Int)
+    (zc oc zk ok : ExactMatrix q n 1 ell) (zm om : ExactMatrix q n 1 1)
+    (cs ks : Fin witnessSlots → ExactMatrix q n 1 ell)
+    (ms : Fin witnessSlots → ExactMatrix q n 1 1) (output)
+    (h : Stage_decrypt.parallel_generatedRoot_28 backend params lane
+      (start, last, zc, cs, bit, oc, zk, ks, ok, zm, ms, om, ()) output) :
+    Nonempty (InitialLaneFacts lane start last bit zc oc zk ok zm om cs ks ms output) := by
+  dsimp only [Stage_decrypt.parallel_generatedRoot_28] at h
+  obtain ⟨index, c, wc, ic, outc, k, wk, ik, outk, m, wm, im, outm, h⟩ := h
+  dsimp only [Stage_decrypt.parallel_generatedRoot_28.constraints_0,
+    Stage_decrypt.parallel_generatedRoot_28.constraints_1] at h
+  have hcg : familyGetDynamic cs index c := by tauto
+  have hkg : familyGetDynamic ks index k := by tauto
+  have hmg : familyGetDynamic ms index m := by tauto
+  have hout : output = (outc, outk, outm, ()) := by tauto
+  have hi := initial_select_value _ _ _ _ (show select _ [0 + 0, (lane : Int) - start] index from by tauto)
+  have hwc := initial_select_value _ _ _ _ (show select _ [zc, c] wc from by tauto)
+  have hic := initial_select_value _ _ _ _ (show select bit [zc, oc] ic from by tauto)
+  have hoc := initial_select_value _ _ _ _ (show select _ [wc, ic] outc from by tauto)
+  have hwk := initial_select_value _ _ _ _ (show select _ [zk, k] wk from by tauto)
+  have hik := initial_select_value _ _ _ _ (show select bit [zk, ok] ik from by tauto)
+  have hok := initial_select_value _ _ _ _ (show select _ [wk, ik] outk from by tauto)
+  have hwm := initial_select_value _ _ _ _ (show select _ [zm, m] wm from by tauto)
+  have him := initial_select_value _ _ _ _ (show select bit [zm, om] im from by tauto)
+  have hom := initial_select_value _ _ _ _ (show select _ [wm, im] outm from by tauto)
+  clear h
+  refine ⟨⟨index, c, k, m, ?_, hcg, hkg, hmg, ?_, ?_, ?_⟩⟩ <;>
+    by_cases hstart : start ≤ (lane : Int) <;>
+    by_cases hend : (lane : Int) ≤ last <;> simp_all <;> split_ifs <;> first | rfl | omega
+
+/-- Ciphertext, key, and plaintext use the same address and branch at initialization. -/
+theorem generated_initial_lane_within (backend : BackendContext)
+    (params : Stage_decrypt.Params) (lane B : Nat) (start last bit : Int)
+    (secret : ExactMatrix q n 1 1) (oneCipher oneKey : ExactMatrix q n 1 ell)
+    (cipher keys : Fin witnessSlots → ExactMatrix q n 1 ell)
+    (messages : Fin witnessSlots → ExactMatrix q n 1 1) (output)
+    (hone : BooleanEncodingWithin secret oneKey 1 oneCipher B)
+    (hfamily : ∀ slot, BooleanEncodingWithin secret (keys slot)
+      (messages slot 0 0) (cipher slot) B ∧
+      (messages slot 0 0 = 0 ∨ messages slot 0 0 = 1))
+    (hrun : Stage_decrypt.parallel_generatedRoot_28 backend params lane
+      (start, last, 0, cipher, bit, oneCipher, 0, keys, oneKey, 0, messages, 1, ()) output) :
+    BooleanEncodingWithin secret output.2.1 (output.2.2.1 0 0) output.1 B ∧
+      (output.2.2.1 0 0 = 0 ∨ output.2.2.1 0 0 = 1) := by
+  obtain ⟨w⟩ := generated_initial_lane_facts backend params lane start last bit
+    0 oneCipher 0 oneKey 0 1 cipher keys messages output hrun
+  obtain ⟨slot, hslot, hc, hk⟩ := circuit_gather_same_index cipher keys w.index w.c w.k
+    w.cipherGet w.keyGet
+  obtain ⟨slot', hslot', _, hm⟩ := circuit_gather_same_index cipher messages w.index w.c w.m
+    w.cipherGet w.messageGet
+  have heq : slot' = slot := Fin.ext (by omega)
+  subst slot'
+  rw [w.cipherEquation, w.keyEquation, w.messageEquation]
+  have hz := boolean_encoding_zero secret B
+  by_cases hleft : (lane : Int) ≤ start - 1
+  · by_cases hb : bit = 0 <;> simp only [hleft, hb, ↓reduceIte, Matrix.zero_apply,
+      Matrix.one_apply_eq]
+    · exact ⟨hz, Or.inl trivial⟩
+    · exact ⟨hone, Or.inr trivial⟩
+  · by_cases hw : start ≤ (lane : Int) ∧ (lane : Int) ≤ last <;>
+      simp only [hleft, hw, ↓reduceIte, Matrix.zero_apply]
+    · simpa only [hc, hk, hm] using hfamily slot
+    · exact ⟨hz, Or.inl trivial⟩
+
+
+/-- The current reference initializer and decoder initializer read the same raw slot. -/
+theorem generated_initial_plaintext_lane_agrees
+    (params : Requirement_2.Params) (lane : Nat) (start width bit : Int)
+    (zc oc zk ok : ExactMatrix q n 1 ell)
+    (cipher keys : Fin witnessSlots → ExactMatrix q n 1 ell)
+    (messages : Fin witnessSlots → ExactMatrix q n 1 1)
+    (raw : Fin circuitWidth → Int) (output) (reference : Bool)
+    (w : InitialLaneFacts lane start (start + width - 1) bit
+      zc oc zk ok 0 1 cipher keys messages output)
+    (hbit : bit = 0 ∨ bit = 1)
+    (hmessages : ∀ slot : Fin witnessSlots,
+      messages slot 0 0 = if raw ⟨slot.val, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val < 3; omega⟩ = 1
+        then 1 else 0)
+    (hr : Requirement_2.parallel_generatedRoot_17 params lane
+      (start, start + width, raw, bit, ()) reference) :
+    output.2.2.1 0 0 = if reference then 1 else 0 := by
+  dsimp only [Requirement_2.parallel_generatedRoot_17] at hr
+  obtain ⟨sample, witnessChoice, choice, hr⟩ := hr
+  dsimp only [Requirement_2.parallel_generatedRoot_17.constraints_0] at hr
+  have hget : familyGetDynamic raw
+      (((if decide ((lane : Int) ≤ start + width - 1) then 1 else 0) -
+        (if decide ((lane : Int) ≤ start - 1) then 1 else 0)) * ((lane : Int) - start)) sample := by tauto
+  have hw := initial_select_value _ _ _ _ (show select _ [0 + 0, sample] witnessChoice from by tauto)
+  have hi := initial_select_value _ _ _ _ (show select _ [witnessChoice, bit] choice from by tauto)
+  have hout : reference = decide (choice = 1) := by tauto
+  clear hr
+  rw [w.messageEquation]
+  by_cases hleft : (lane : Int) ≤ start - 1
+  · rcases hbit with hb | hb <;> simp_all
+  · have hstart : start ≤ (lane : Int) := by omega
+    by_cases hend : (lane : Int) ≤ start + width - 1
+    · have hindex : w.index = (lane : Int) - start := by simp [w.address, hstart, hend]
+      obtain ⟨slot, hslot, hm⟩ := w.messageGet
+      obtain ⟨rawSlot, hrawSlot, hsample⟩ := hget
+      have hposition : rawSlot = ⟨slot.val, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val < 3; omega⟩ := by
+        apply Fin.ext
+        change rawSlot.val = slot.val
+        simp only [hleft, hend, decide_true, decide_false, Bool.false_eq_true,
+          ↓reduceIte, sub_zero, one_mul] at hrawSlot
+        omega
+      have hscalar := hmessages slot
+      rw [← hposition, ← hsample] at hscalar
+      simp_all
+    · simp_all; split_ifs <;> first | rfl | omega
+
+/-- Encryption and decryption initialize each public key through the same raw branch. -/
+theorem generated_initial_public_lane_agrees
+    (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
+    (lane : Nat) (start last bit index : Int)
+    (zc oc : ExactMatrix q n 1 ell)
+    (publicInputs : Fin stateCount → ExactMatrix q n 1 ell)
+    (cipher keys : Fin witnessSlots → ExactMatrix q n 1 ell)
+    (messages : Fin witnessSlots → ExactMatrix q n 1 1) (output)
+    (publicOutput : ExactMatrix q n 1 ell)
+    (w : InitialLaneFacts lane start last bit zc oc 0 (publicInputs 0) 0 1
+      cipher keys messages output)
+    (hkeys : ∀ slot : Fin witnessSlots, keys slot = publicInputs
+      ⟨slot.val + 1, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val + 1 < 2; omega⟩)
+    (hi : Stage_encrypt.parallel_generatedRoot_20 backend hashModel params lane
+      (start, last, ()) index)
+    (hr : Stage_encrypt.parallel_generatedRoot_22 backend hashModel params lane
+      (start, last, 0, publicInputs, index, bit, publicInputs 0, ()) publicOutput) :
+    output.2.1 = publicOutput := by
+  dsimp only [Stage_encrypt.parallel_generatedRoot_20] at hi
+  obtain ⟨selectedIndex, _, _, _, hselectIndex, hindexOutput⟩ := hi
+  have hindex := initial_select_value _ _ _ _ hselectIndex
+  dsimp only [Stage_encrypt.parallel_generatedRoot_22] at hr
+  obtain ⟨key, witnessChoice, instanceChoice, result, hr⟩ := hr
+  dsimp only [Stage_encrypt.parallel_generatedRoot_22.constraints_0] at hr
+  have hget : familyGetDynamic publicInputs index key := by tauto
+  have hw := initial_select_value _ _ _ _ (show select _ [0, key] witnessChoice from by tauto)
+  have hb := initial_select_value _ _ _ _ (show select bit [0, publicInputs 0] instanceChoice from by tauto)
+  have ho := initial_select_value _ _ _ _ (show select _ [witnessChoice, instanceChoice] result from by tauto)
+  have hout : publicOutput = result := by tauto
+  clear hr
+  rw [w.keyEquation]
+  by_cases hstart : start ≤ (lane : Int)
+  · have hleft : ¬(lane : Int) ≤ start - 1 := by omega
+    by_cases hend : (lane : Int) ≤ last
+    · have hshift : index = w.index + 1 := by simp_all [w.address]
+      obtain ⟨slot, hslot, hk⟩ := w.keyGet
+      have hpub : familyGetDynamic publicInputs index (keys slot) := by
+        refine ⟨⟨slot.val + 1, by have hs := slot.isLt; change slot.val < 1 at hs; change slot.val + 1 < 2; omega⟩, ?_, hkeys slot⟩
+        simp only [Nat.cast_add, Nat.cast_one]
+        omega
+      have heq : w.k = key := hk.trans (circuit_lookup_unique hpub hget)
+      simp_all
+    · simp_all; split_ifs <;> first | rfl | omega
+  · have hleft : (lane : Int) ≤ start - 1 := by omega
+    simp_all
 
 #print axioms initial_one_encoding
 #print axioms initial_witness_encoding
+#print axioms generated_initial_lane_facts
 #print axioms generated_initial_lane_within
-#print axioms initial_gathered_triple_within
 #print axioms generated_initial_plaintext_lane_agrees
-#print axioms generated_initial_indices_agree
-#print axioms generated_witness_plaintext_agrees
-#print axioms generated_initial_plaintext_agrees
+#print axioms generated_initial_public_lane_agrees
 
 end DiamondGeneratedProof

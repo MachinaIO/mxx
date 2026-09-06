@@ -1419,7 +1419,7 @@ fn tall_lookup_kernel_for(
     }
     let schemas = key.input_types.clone();
     let canonical_upper = key.canonical_input_exclusive_upper.clone();
-    let kernel = Subgraph::try_define(
+    let kernel = Subgraph::define(
         kernel_name,
         schemas,
         move |(
@@ -1990,7 +1990,7 @@ mod tests {
         let validated = DslContext::new("shuffled-logical-lwe-preprocessing")
             .public_output("low", wires.low_matrices)
             .unwrap()
-            .family_output("residual", residuals)
+            .output("residual", residuals)
             .unwrap()
             .build()
             .unwrap()
@@ -2811,7 +2811,7 @@ mod tests {
             entries[0].compilers.iter().all(|compiler| compiler.identity.call_path == vec![17])
         );
         let mut context = DslContext::new("naive-lookup-preprocessing")
-            .family_output("output", outputs[0].matrices.clone())
+            .output("output", outputs[0].matrices.clone())
             .unwrap();
         for entry in entries {
             context = entry.export(context).unwrap();
@@ -3198,7 +3198,7 @@ mod tests {
             )
             .expect("naive public-key lookup lowering");
         let naive_public_key_graph = DslContext::new("naive-lwe-public-key-lookup")
-            .family_output("public", naive_public_keys[0].matrices.clone())
+            .output("public", naive_public_keys[0].matrices.clone())
             .expect("public")
             .build()
             .expect("naive public-key graph");
@@ -3235,11 +3235,11 @@ mod tests {
             )
             .expect("naive lookup lowering");
         let naive_graph = DslContext::new("naive-lwe-lookup")
-            .family_output("vectors", naive_outputs[0].vectors.clone())
+            .output("vectors", naive_outputs[0].vectors.clone())
             .expect("vectors")
-            .family_output("public", naive_outputs[0].pubkeys.clone())
+            .output("public", naive_outputs[0].pubkeys.clone())
             .expect("public")
-            .family_output("plaintexts", naive_outputs[0].plaintexts.clone().expect("plaintexts"))
+            .output("plaintexts", naive_outputs[0].plaintexts.clone().expect("plaintexts"))
             .expect("plaintexts")
             .build()
             .expect("naive graph");

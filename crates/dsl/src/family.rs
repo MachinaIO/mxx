@@ -7,7 +7,6 @@ pub struct Family<T: GraphValue> {
     pub(super) values: Vec<ValueHandle>,
     pub(super) element_schema: T::Schema,
     pub(super) count: IntExpr,
-    pub(super) pending: Pending,
 }
 
 impl<T: GraphValue> Family<T> {
@@ -31,7 +30,7 @@ impl<T: GraphValue> Family<T> {
             return Err(DslError::Schema);
         }
         let count = IntExpr::constant(elements.len());
-        let pending = Pending::merge(elements.iter().map(GraphValue::pending));
+
         let flattened = elements.iter().map(GraphValue::flatten).collect::<Vec<_>>();
         let values = types
             .into_iter()
@@ -48,7 +47,7 @@ impl<T: GraphValue> Family<T> {
                 node.output(0).expect("packed family field")
             })
             .collect();
-        Ok(Self { values, element_schema: schema, count, pending })
+        Ok(Self { values, element_schema: schema, count })
     }
 
     /// Reads one element. Compile-time and runtime indices have the same surface API.
@@ -57,7 +56,7 @@ impl<T: GraphValue> Family<T> {
         let index = index.into();
         let expression =
             index.compile_expression().filter(|expression| !integer::has_loop_index(expression));
-        let pending = Pending::merge([self.pending.clone(), index.pending.clone()]);
+
         let values = self
             .values
             .iter()
@@ -73,7 +72,7 @@ impl<T: GraphValue> Family<T> {
                 NodeHandle::new(kind, arguments, vec![ty]).output(0).expect("family element field")
             })
             .collect::<Vec<_>>();
-        T::from_values(&self.element_schema, &values, pending).expect("family element schema")
+        T::from_values(&self.element_schema, &values).expect("family element schema")
     }
 
     /// Projects existing fields without introducing a loop or changing producer identities.
@@ -86,12 +85,6 @@ impl<T: GraphValue> Family<T> {
             let placeholder = self.element_schema.placeholders();
             let inputs = placeholder.flatten();
             let result = project(placeholder);
-            let annotations = result.pending();
-            if !annotations.semantic_anchors.is_empty() ||
-                !annotations.derivation_attachments.is_empty()
-            {
-                return Err(DslError::Schema);
-            }
             let values = result
                 .flatten()
                 .iter()
@@ -101,12 +94,7 @@ impl<T: GraphValue> Family<T> {
                     Ok(self.values[position].clone())
                 })
                 .collect::<Result<Vec<_>, DslError>>()?;
-            Ok(Family {
-                values,
-                element_schema: result.schema(),
-                count: self.count.clone(),
-                pending: self.pending.clone(),
-            })
+            Ok(Family { values, element_schema: result.schema(), count: self.count.clone() })
         })
     }
 
@@ -141,7 +129,7 @@ impl<T: GraphValue> Family<T> {
                 .expect("family input field")
             })
             .collect();
-        Self { values, element_schema, count, pending: Pending::default() }
+        Self { values, element_schema, count }
     }
 }
 
@@ -188,12 +176,7 @@ impl Family<Trapdoor> {
         )
         .output(0)
         .expect("trapdoor family secret input");
-        Self {
-            values: vec![public.values[0].clone(), secret],
-            element_schema,
-            count,
-            pending: public.pending,
-        }
+        Self { values: vec![public.values[0].clone(), secret], element_schema, count }
     }
 }
 
@@ -202,17 +185,11 @@ impl<T: GraphValue> GraphValue for Family<T> {
     fn flatten(&self) -> Vec<ValueHandle> {
         self.values.clone()
     }
-    fn pending(&self) -> Pending {
-        self.pending.clone()
-    }
+
     fn schema(&self) -> Self::Schema {
         FamilyType { element: self.element_schema.clone(), count: self.count.clone() }
     }
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         if values.iter().map(|value| value.wire_type().clone()).collect::<Vec<_>>() !=
             schema.wire_types()
         {
@@ -222,7 +199,6 @@ impl<T: GraphValue> GraphValue for Family<T> {
             values: values.to_vec(),
             element_schema: schema.element.clone(),
             count: schema.count.clone(),
-            pending,
         })
     }
 }
@@ -247,12 +223,7 @@ impl<S: GraphValueSchema> GraphValueSchema for FamilyType<S> {
                 .expect("family argument")
             })
             .collect();
-        Family {
-            values,
-            element_schema: self.element.clone(),
-            count: self.count.clone(),
-            pending: Pending::default(),
-        }
+        Family { values, element_schema: self.element.clone(), count: self.count.clone() }
     }
     fn wire_types(&self) -> Vec<WireType> {
         self.element
@@ -287,19 +258,13 @@ mod tests {
         fn flatten(&self) -> Vec<ValueHandle> {
             self.matrix.flatten()
         }
-        fn pending(&self) -> Pending {
-            self.matrix.pending()
-        }
+
         fn schema(&self) -> Self::Schema {
             TaggedMatrixSchema { matrix: self.matrix.schema(), revealed: self.revealed }
         }
-        fn from_values(
-            schema: &Self::Schema,
-            values: &[ValueHandle],
-            pending: Pending,
-        ) -> Result<Self, DslError> {
+        fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
             Ok(Self {
-                matrix: Mat::from_values(&schema.matrix, values, pending)?,
+                matrix: Mat::from_values(&schema.matrix, values)?,
                 revealed: schema.revealed,
             })
         }
@@ -325,7 +290,8 @@ mod tests {
             Err(DslError::Schema)
         ));
         assert!(matches!(select(0, vec![revealed.clone(), hidden.clone()]), Err(DslError::Schema)));
-        let function = Subgraph::define("revealed-only", revealed.schema(), |value| value).unwrap();
+        let function =
+            Subgraph::define("revealed-only", revealed.schema(), |value| Ok(value)).unwrap();
         assert!(matches!(function.call(hidden.clone()), Err(DslError::Schema)));
         assert!(matches!(
             function.call_with_canonical_input_exclusive_uppers(hidden.clone(), vec![None]),
@@ -347,10 +313,6 @@ mod tests {
         assert_eq!(first.flatten()[0], values.flatten()[0]);
         assert_eq!(second.flatten()[0], values.flatten()[1]);
         assert!(matches!(values.field(|value| value.0 + value.1), Err(DslError::Schema)));
-        assert!(matches!(
-            values.field(|value| value.0.semantic_anchor("lost").unwrap()),
-            Err(DslError::Schema)
-        ));
         let built = DslContext::new("field-projection")
             .output("a", first)
             .unwrap()

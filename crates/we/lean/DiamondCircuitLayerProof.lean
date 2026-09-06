@@ -32,8 +32,96 @@ theorem circuit_gather_same_index {α β : Type} {N : Nat}
   subst iy
   exact ⟨ix, hix, hxx, hyy⟩
 
-/-- A complete generated Boolean layer preserves bounded encodings and Boolean plaintexts.
-    Every candidate and gather below comes from this one execution of the actual layer. -/
+/-- Candidate lists are the primitive arithmetic of the fused lane, with no new evaluation. -/
+noncomputable def circuitCipherCandidates (one left right : ExactMatrix q n 1 ell)
+    (message : ExactMatrix q n 1 1) (digits : ExactMatrix q n ell ell) :=
+  let product := matrixAdd (matrixMul left digits) (matrixMulScalarRight right message)
+  [matrixSub one one, one, left, matrixSub one left, product,
+    matrixSub (matrixAdd left right)
+      (matrixMulScalarRight product (matrixPolynomial [2] : ExactMatrix q n 1 1))]
+
+noncomputable def circuitPublicCandidates (one left right : ExactMatrix q n 1 ell)
+    (digits : ExactMatrix q n ell ell) :=
+  [matrixSub one one, one, left, matrixSub one left, matrixMul left digits,
+    matrixSub (matrixAdd left right)
+      (matrixMulScalarRight (matrixMul left digits)
+        (matrixPolynomial [2] : ExactMatrix q n 1 1))]
+
+noncomputable def circuitMessageCandidates (one left right : ExactMatrix q n 1 1) :=
+  [matrixSub one one, one, left, matrixSub one left, matrixMulScalarLeft left right,
+    matrixSub (matrixAdd left right)
+      (matrixMulScalarLeft (matrixMulScalarLeft left right)
+        (matrixPolynomial [2] : ExactMatrix q n 1 1))]
+
+/-- Extract the shared reads and selectors of one actual fused lane. -/
+theorem generated_circuit_lane_facts (backend : BackendContext)
+    (params : Stage_decrypt.Params) (layer lane : Nat) (active : Int)
+    (current : CircuitState) (kinds leftSources rightSources : Fin metadataCount → Int)
+    (oneCipher onePublic : ExactMatrix q n 1 ell) (oneMessage : ExactMatrix q n 1 1)
+    (outCipher outPublic : ExactMatrix q n 1 ell) (outMessage : ExactMatrix q n 1 1)
+    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_33_12 backend params layer lane
+      (active, oneCipher, kinds, (layer : Int), current.1, leftSources, current.2.1,
+        rightSources, current.2.2.1, onePublic, oneMessage, ())
+      (outCipher, outPublic, outMessage, ())) :
+    ∃ (kind : Fin 6) (left right : Fin circuitWidth) (digits : ExactMatrix q n ell ell)
+      (selectedCipher selectedPublic : ExactMatrix q n 1 ell)
+      (selectedMessage : ExactMatrix q n 1 1),
+      familyGetDynamic kinds ((layer : Int) * params.max_layer_width + lane) (kind.val : Int) ∧
+      familyGetDynamic leftSources ((layer : Int) * params.max_layer_width + lane) (left.val : Int) ∧
+      familyGetDynamic rightSources ((layer : Int) * params.max_layer_width + lane) (right.val : Int) ∧
+      gadgetDecomposeRuns backend params.diamond_gadget_base params.diamond_digit_count
+        (current.2.1 right) digits ∧
+      MxxRuntime.select (kind.val : Int)
+        (circuitCipherCandidates oneCipher (current.1 left) (current.1 right)
+          (current.2.2.1 left) digits) selectedCipher ∧
+      MxxRuntime.select (kind.val : Int)
+        (circuitPublicCandidates onePublic (current.2.1 left) (current.2.1 right) digits)
+        selectedPublic ∧
+      MxxRuntime.select (kind.val : Int)
+        (circuitMessageCandidates oneMessage (current.2.2.1 left) (current.2.2.1 right))
+        selectedMessage ∧
+      MxxRuntime.select (if decide ((lane : Int) ≤ active - 1) then 1 else 0)
+        [matrixSub oneCipher oneCipher, selectedCipher] outCipher ∧
+      MxxRuntime.select (if decide ((lane : Int) ≤ active - 1) then 1 else 0)
+        [matrixSub onePublic onePublic, selectedPublic] outPublic ∧
+      MxxRuntime.select (if decide ((lane : Int) ≤ active - 1) then 1 else 0)
+        [matrixSub oneMessage oneMessage, selectedMessage] outMessage := by
+  dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_33_12] at hrun
+  rcases hrun with ⟨ki, li, lc, ri, rp, digits, rc, lm, sc, oc, lp, sp, op, rm, sm, om, h⟩
+  dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_33_12.constraints_0,
+    Stage_decrypt.parallel_sequential_generatedRoot_33_12.constraints_1] at h
+  rcases h with ⟨_, _, hk, _, _, hl, _, _, hlc, _, _, hr, _, _, hrp, hd,
+    _, _, hrc, _, _, hlm, hkn, hklt, _, hsc, _, _, _, hoc, _, _, hlp,
+    _, _, _, hsp, _, _, _, hop, _, _, hrm, _, _, _, hsm, _, _, _, hom, hout⟩
+  obtain ⟨left, hleft, hlc, hlp⟩ := circuit_gather_same_index current.1 current.2.1 li lc lp hlc hlp
+  obtain ⟨leftM, hleftM, _, hlm⟩ := circuit_gather_same_index current.1 current.2.2.1 li lc lm
+    ⟨left, hleft, hlc⟩ hlm
+  have hlpos : leftM = left := Fin.ext (by omega)
+  subst leftM
+  obtain ⟨right, hright, hrc, hrp⟩ := circuit_gather_same_index current.1 current.2.1 ri rc rp hrc hrp
+  obtain ⟨rightM, hrightM, _, hrm⟩ := circuit_gather_same_index current.1 current.2.2.1 ri rc rm
+    ⟨right, hright, hrc⟩ hrm
+  have hrpos : rightM = right := Fin.ext (by omega)
+  subst rightM
+  let kind : Fin 6 := ⟨ki.toNat, by omega⟩
+  have hkind : (kind.val : Int) = ki := by dsimp [kind]; omega
+  have hocout := congrArg Prod.fst hout
+  have hopout := congrArg (fun x => x.2.1) hout
+  have homout := congrArg (fun x => x.2.2.1) hout
+  dsimp only at hocout hopout homout
+  refine ⟨kind, left, right, digits, sc, sp, sm, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simpa only [hkind] using hk
+  · simpa only [hleft] using hl
+  · simpa only [hright] using hr
+  · simpa only [hrp] using hd
+  · simpa only [circuitCipherCandidates, hkind, hlc, hrc, hlm] using hsc
+  · simpa only [circuitPublicCandidates, hkind, hlp, hrp] using hsp
+  · simpa only [circuitMessageCandidates, hkind, hlm, hrm] using hsm
+  · simpa only [hocout] using hoc
+  · simpa only [hopout] using hop
+  · simpa only [homout] using hom
+
+/-- A complete fused Boolean layer preserves bounded encodings and Boolean plaintexts. -/
 theorem generated_circuit_layer_within
     (params : Stage_decrypt.Params) (layer B : Nat)
     (secret : ExactMatrix q n 1 1) (current next : CircuitState)
@@ -42,141 +130,76 @@ theorem generated_circuit_layer_within
     (hone : BooleanEncodingWithin secret onePublic 1 oneCipher B)
     (honeMessage : oneMessage 0 0 = 1)
     (hinvariant : CircuitStateWithin secret B current)
-    (hrun : Stage_decrypt.sequential_generatedRoot_67 DiamondBackend.backend params layer
-      (current.1, current.2.1, current.2.2.1, activeCounts, kinds, leftSources, rightSources,
-        oneCipher, onePublic, oneMessage, ()) next) :
+    (hrun : Stage_decrypt.sequential_generatedRoot_33 DiamondBackend.backend params layer
+      (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
+        rightSources, onePublic, oneMessage, ()) next) :
     CircuitStateWithin secret (factor * B) next := by
-  dsimp only [Stage_decrypt.sequential_generatedRoot_67] at hrun
-  obtain ⟨scopeWitness, h⟩ := hrun
-  rcases scopeWitness with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
-    rightIndices, w18, digits, w20, w21, w23, w24, w25, w26, w28, w29, w30, w31,
-    w33, w34, w35, w36, w37, w38, w39, w40, w41, w42, w44, w45, w46, w47,
-    w48, w49, w50, w51, w52, w53⟩
-  dsimp only [Stage_decrypt.sequential_generatedRoot_67.body] at h
-  rcases h with ⟨_, _, _, _, h3, _, h5, _, h6, _, _, _, _, _, _, _, h13,
-    _, h14, _, _, _, h18, _, h19, _, h20, _, h21, _, h23, _, h24, _, h25,
-    _, h26, _, h28, _, h29, _, h30, _, h31, _, h33, _, h34, _, h35, _, h36,
-    _, h37, _, h38, _, h39, _, h40, _, h41, _, h42, _, h44, _, h45, _, h46,
-    _, h47, _, h48, _, h49, _, h50, _, h51, _, h52, _, h53, hout⟩
+  obtain ⟨⟨active, outCipher, outPublic, outMessage⟩, _, _, _, _, hlanes, hout⟩ := hrun
   rw [hout]
   intro lane
-  obtain ⟨lc, _, _, hleftCipher, hlc⟩ := h13 lane
-  obtain ⟨lp, _, _, hleftPublic, hlp⟩ := h35 lane
-  obtain ⟨lm, _, _, hleftMessage, hlm⟩ := h23 lane
-  obtain ⟨leftPosition, hlIndex, hci, hpi⟩ := circuit_gather_same_index
-    current.1 current.2.1 (leftIndices lane) lc lp hleftCipher hleftPublic
-  obtain ⟨messagePosition, hmIndex, _, hmi⟩ := circuit_gather_same_index
-    current.1 current.2.2.1 (leftIndices lane) lc lm hleftCipher hleftMessage
-  have hpositions : leftPosition = messagePosition := Fin.ext (by omega)
-  have hlWithin : BooleanEncodingWithin secret (w35 lane) (w23 lane 0 0) (w13 lane) B := by
-    rw [hlc, hlp, hlm, hci, hpi, hmi, ← hpositions]
-    exact (hinvariant leftPosition).1
-  have hlBool : w23 lane 0 0 = 0 ∨ w23 lane 0 0 = 1 := by
-    rw [hlm, hmi]
-    exact (hinvariant messagePosition).2
-  obtain ⟨rc, _, _, hrightCipher, hrc⟩ := h21 lane
-  obtain ⟨rp, _, _, hrightPublic, hrp⟩ := h18 lane
-  obtain ⟨rm, _, _, hrightMessage, hrm⟩ := h47 lane
-  obtain ⟨ci, hciIndex, hciValue⟩ := hrightCipher
-  obtain ⟨pi, hpiIndex, hpiValue⟩ := hrightPublic
-  obtain ⟨mi, hmiIndex, hmiValue⟩ := hrightMessage
-  have hip : pi = ci := Fin.ext (by omega)
-  have him : mi = ci := Fin.ext (by omega)
-  have hrWithin : BooleanEncodingWithin secret (w18 lane) (w47 lane 0 0) (w21 lane) B := by
-    rw [hrc, hrp, hrm, hciValue, hpiValue, hmiValue, hip, him]
-    exact (hinvariant ci).1
-  have hrBool : w47 lane 0 0 = 0 ∨ w47 lane 0 0 = 1 := by
-    rw [hrm, hmiValue]
-    exact (hinvariant mi).2
-  obtain ⟨bit, hbit⟩ : ∃ bit : Bool, w23 lane 0 0 = if bit then 1 else 0 := by
+  obtain ⟨kind, left, right, digits, sc, sp, sm, _, _, _, hd, hc, hp, hm, hmc, hmp, hmm⟩ :=
+    generated_circuit_lane_facts DiamondBackend.backend params layer lane active current
+      kinds leftSources rightSources oneCipher onePublic oneMessage _ _ _ (hlanes lane)
+  obtain ⟨hlWithin, hlBool⟩ := hinvariant left
+  obtain ⟨hrWithin, hrBool⟩ := hinvariant right
+  obtain ⟨bit, hbit⟩ : ∃ bit : Bool, current.2.2.1 left 0 0 = if bit then 1 else 0 := by
     rcases hlBool with hz | ho
     · exact ⟨false, hz⟩
     · exact ⟨true, ho⟩
-  have hone' : BooleanEncodingWithin secret (w33 lane) 1 (w5 lane) B := by
-    rw [h33 lane, h5 lane]
-    exact hone
-  have candidates := generated_boolean_candidates_within params layer lane B
-    (w33 lane) (w35 lane) (w18 lane) (w5 lane) (w13 lane) (w21 lane) (w6 lane)
-    (w14 lane) (w20 lane) (w24 lane) (w25 lane) (w26 lane) (w28 lane) (w29 lane)
-    secret (w23 lane) (w47 lane 0 0) bit (digits lane) hbit hone' hlWithin hrWithin
-    (h6 lane) (h14 lane) (h19 lane) (h20 lane) (h24 lane) (h25 lane)
-    (h26 lane) (h28 lane) (h29 lane)
-  have hk0 : w34 lane = 0 := by
-    have h : w34 lane = w33 lane - w33 lane := h34 lane
-    simpa using h
-  have hm0 : w45 lane = 0 := by
-    have h : w45 lane = w44 lane - w44 lane := h45 lane
-    simpa using h
-  have hm1 : w44 lane 0 0 = 1 := by rw [h44 lane]; exact honeMessage
-  have hk3 : w36 lane = w33 lane - w35 lane := h36 lane
-  have hk4 : w37 lane = w35 lane * digits lane := h37 lane
-  have hk5 : w40 lane = w35 lane + w18 lane -
-      (2 : ExactPoly q n) • (w35 lane * digits lane) := by
-    rw [h40 lane, h38 lane, h39 lane, hk4]
-    funext row column
-    simp [matrixSub, matrixAdd, matrixMulScalarRight, matrixPolynomial,
-      Matrix.smul_apply, mul_comm]
-  have hm3 : w46 lane 0 0 = 1 - w23 lane 0 0 := by
-    rw [h46 lane]
-    change w44 lane 0 0 - w23 lane 0 0 = _
-    rw [hm1]
-  have hm4 : w48 lane 0 0 = w23 lane 0 0 * w47 lane 0 0 := by
-    rw [h48 lane]
-    rfl
-  have hm5 : w51 lane 0 0 = w23 lane 0 0 + w47 lane 0 0 -
-      2 * (w23 lane 0 0 * w47 lane 0 0) := by
-    rw [h51 lane, h49 lane, h50 lane, h48 lane]
-    change w23 lane 0 0 + w47 lane 0 0 - ((w23 lane 0 0 * w47 lane 0 0) *
-      (matrixPolynomial [2] : ExactMatrix q n 1 1) 0 0) = _
-    have htwo : (matrixPolynomial [2] : ExactMatrix q n 1 1) 0 0 = 2 := by
-      simp [matrixPolynomial]
-    rw [htwo]
+  let lc := current.1 left
+  let rc := current.1 right
+  let lp := current.2.1 left
+  let rp := current.2.1 right
+  let lm := current.2.2.1 left
+  let rm := current.2.2.1 right
+  let product := matrixAdd (matrixMul lc digits) (matrixMulScalarRight rc lm)
+  let double := matrixMulScalarRight product (matrixPolynomial [2] : ExactMatrix q n 1 1)
+  have candidates := generated_boolean_candidates_within params B
+    onePublic lp rp oneCipher lc rc (matrixSub oneCipher oneCipher)
+    (matrixSub oneCipher lc) (matrixMul lc digits) (matrixMulScalarRight rc lm)
+    product (matrixAdd lc rc) double (matrixSub (matrixAdd lc rc) double)
+    secret lm (rm 0 0) bit digits hbit hone hlWithin hrWithin
+    rfl rfl hd rfl rfl rfl rfl rfl rfl
+  let cs : Fin 6 → ExactMatrix q n 1 ell := (circuitCipherCandidates oneCipher lc rc lm digits).get
+  let ps : Fin 6 → ExactMatrix q n 1 ell := (circuitPublicCandidates onePublic lp rp digits).get
+  let ms : Fin 6 → ExactMatrix q n 1 1 := (circuitMessageCandidates oneMessage lm rm).get
+  have hmessage : ∀ k, ms k 0 0 =
+      ([0, 1, lm 0 0, 1 - lm 0 0, lm 0 0 * rm 0 0,
+        lm 0 0 + rm 0 0 - 2 * (lm 0 0 * rm 0 0)].get k) := by
+    intro k
+    fin_cases k <;> simp [ms, circuitMessageCandidates, matrixSub, matrixAdd,
+      matrixMulScalarLeft, matrixPolynomial, honeMessage, List.get, Matrix.mul_apply]
     ring
-  let cs : Fin 6 → ExactMatrix q n 1 ell :=
-    fun k ↦ [w6 lane, w5 lane, w13 lane, w14 lane, w25 lane, w29 lane].get k
-  let ks : Fin 6 → ExactMatrix q n 1 ell :=
-    fun k ↦ [w34 lane, w33 lane, w35 lane, w36 lane, w37 lane, w40 lane].get k
-  let ms : Fin 6 → ExactMatrix q n 1 1 :=
-    fun k ↦ [w45 lane, w44 lane, w23 lane, w46 lane, w48 lane, w51 lane].get k
-  have hcandidates : ∀ k, BooleanEncodingWithin secret (ks k) (ms k 0 0) (cs k)
+  have hpublic : ∀ k, ps k =
+      ([0, onePublic, lp, onePublic - lp, lp * digits,
+        lp + rp - (2 : ExactPoly q n) • (lp * digits)].get k) := by
+    intro k
+    fin_cases k <;> simp [ps, circuitPublicCandidates, matrixSub, matrixAdd, matrixMul, List.get]
+    funext row column
+    simp [matrixMulScalarRight, matrixPolynomial, Matrix.smul_apply, mul_comm]
+  have hcandidates : ∀ k, BooleanEncodingWithin secret (ps k) (ms k 0 0) (cs k)
       (factor * B) := by
     intro k
-    have h := candidates k
-    fin_cases k <;>
-      simpa only [cs, ks, ms, List.get, hk0, hm0, hm1, hk3, hk4, hk5, hm3, hm4, hm5,
-        Matrix.zero_apply] using h
-  have hmessages : ∀ k, ms k 0 0 = 0 ∨ ms k 0 0 = 1 := by
-    intro k
-    have h := boolean_gate_message_closed _ _ hlBool hrBool k
-    fin_cases k <;>
-      simpa only [ms, List.get, hm0, hm1, hm3, hm4, hm5, Matrix.zero_apply] using h
-  have hselect := h30 lane
-  obtain ⟨chosen, hkNonneg, hkLt, _, hs, _⟩ := hselect
-  let kind : Fin 6 := ⟨(gateKinds lane).toNat, by omega⟩
-  have hkind : (kind.val : Int) = gateKinds lane := by dsimp [kind]; omega
-  have hselected := generated_selected_encoding_within DiamondBackend.backend params layer lane
-    (factor * B) kind secret cs ks ms (w30 lane) (w41 lane) (w52 lane)
-    hcandidates (hkind.symm ▸ h30 lane) (hkind.symm ▸ h41 lane) (hkind.symm ▸ h52 lane)
-  have hz := generated_encrypted_zero DiamondBackend.backend params layer lane
-    (w5 lane) (w6 lane) (h6 lane)
-  have hbounded := generated_masked_encoding_within DiamondBackend.backend params layer lane
-    (factor * B) active (flags lane) secret (w30 lane) (w41 lane)
-    (w31 lane) (w42 lane) (w52 lane) (w53 lane) hselected (h3 lane)
-    (by simpa only [hz] using h31 lane) (by simpa only [hk0] using h42 lane)
-    (by simpa only [hm0] using h53 lane)
+    rw [hmessage, hpublic]
+    exact candidates k
+  have hselected := generated_selected_encoding_within
+    (factor * B) kind secret cs ps ms sc sp sm hcandidates hc hp hm
+  have hbounded := generated_masked_encoding_within lane
+    (factor * B) active (if decide ((lane.val : Int) ≤ active - 1) then 1 else 0)
+    secret sc sp (outCipher lane) (outPublic lane) sm (outMessage lane) hselected rfl
+    (by simpa [matrixSub] using hmc) (by simpa [matrixSub] using hmp)
+    (by simpa [matrixSub] using hmm)
   refine ⟨hbounded, ?_⟩
-  change w53 lane 0 0 = 0 ∨ w53 lane 0 0 = 1
-  obtain ⟨selectedMessage, _, _, _, ⟨position, hposition, hselectedMessage⟩, hmOut⟩ := h52 lane
-  have hpositionKind : position = kind := by apply Fin.ext; dsimp at hposition; omega
+  change outMessage lane 0 0 = 0 ∨ outMessage lane 0 0 = 1
+  obtain ⟨position, hposition, hsm⟩ := hm
+  have hpositionKind : position = kind := Fin.ext (by omega)
   subst position
-  have hmSelected : w52 lane = ms kind := hmOut.trans hselectedMessage
-  obtain ⟨maskedMessage, _, _, _, ⟨position, _, hmaskedMessage⟩, hmOut⟩ := h53 lane
-  fin_cases position
-  · have heq : w53 lane = w45 lane := hmOut.trans hmaskedMessage
-    exact Or.inl (by rw [heq, hm0]; rfl)
-  · have heq : w53 lane = w52 lane := hmOut.trans hmaskedMessage
-    rw [heq, hmSelected]
-    exact hmessages kind
+  obtain ⟨mask, _, hmask⟩ := hmm
+  fin_cases mask
+  · exact Or.inl (by simpa [List.get, matrixSub] using congrArg (fun m => m 0 0) hmask)
+  · have hms : sm 0 0 = ms kind 0 0 := congrArg (fun m => m 0 0) hsm
+    rw [show outMessage lane = sm from hmask, hms, hmessage]
+    exact boolean_gate_message_closed _ _ hlBool hrBool kind
 
 /-- The counted circuit run uses one symbolic layer induction, including zero iterations. -/
 theorem generated_circuit_iteration_within
@@ -188,10 +211,10 @@ theorem generated_circuit_iteration_within
     (honeMessage : oneMessage 0 0 = 1)
     (hinitial : CircuitStateWithin secret B initial)
     (hrun : MxxIR.IterRuns
-      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_67
+      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33
         DiamondBackend.backend params layer
-        (current.1, current.2.1, current.2.2.1, activeCounts, kinds, leftSources, rightSources,
-          oneCipher, onePublic, oneMessage, ()) next) count initial output) :
+        (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources, rightSources,
+          onePublic, oneMessage, ()) next) count initial output) :
     CircuitStateWithin secret (factor ^ count * B) output := by
   apply MxxIR.IterRuns.invariant
     (Invariant := fun layer state ↦
@@ -209,55 +232,8 @@ theorem generated_circuit_iteration_within
   rw [pow_succ]
   ring
 
-/-- The actual Boolean requirement gate has the same scalar arithmetic as the generated
-    ciphertext layer. This is local equivalence, not an assumed accepting output. -/
-theorem generated_requirement_gate_value
-    (params : Requirement_2.Params) (layer lane : Nat) (kind : Fin 6)
-    (left right output : Bool) (active : Int)
-    (hrun : Requirement_2.parallel_sequential_generatedRoot_27_13 params layer lane
-      ((kind.val : Int), left, right, active, ()) output) :
-    (if output then (1 : ExactPoly q n) else 0) =
-      if (lane : Int) < active then
-        ([0, 1, if left then 1 else 0, 1 - (if left then 1 else 0),
-          (if left then 1 else 0) * (if right then 1 else 0),
-          (if left then 1 else 0) + (if right then 1 else 0) -
-            2 * ((if left then 1 else 0) * (if right then 1 else 0))].get kind)
-      else 0 := by
-  dsimp only [Requirement_2.parallel_sequential_generatedRoot_27_13] at hrun
-  obtain ⟨selected, masked, _, _, _, hselect, _, _, _, hmask, hout⟩ := hrun
-  obtain ⟨position, hposition, hselected⟩ := hselect
-  have hp : position = kind := by apply Fin.ext; dsimp at hposition; omega
-  subst position
-  by_cases ha : (lane : Int) < active
-  · have hf : decide (Int.ofNat lane ≤ active - 1) = true := by
-      apply decide_eq_true
-      change (lane : Int) ≤ active - 1
-      omega
-    rw [hf, if_pos rfl] at hmask
-    obtain ⟨position, hposition, hmasked⟩ := hmask
-    have hp : position = (⟨1, by decide⟩ : Fin 2) := by
-      apply Fin.ext
-      dsimp at hposition ⊢
-      omega
-    subst position
-    rw [if_pos ha, hout.trans (hmasked.trans hselected)]
-    cases left <;> cases right <;> fin_cases kind <;> norm_num [List.get]
-  · have hf : decide (Int.ofNat lane ≤ active - 1) = false := by
-      apply decide_eq_false
-      change ¬ (lane : Int) ≤ active - 1
-      omega
-    rw [hf] at hmask
-    obtain ⟨position, hposition, hmasked⟩ := hmask
-    have hp : position = (⟨0, by decide⟩ : Fin 2) := by
-      apply Fin.ext
-      dsimp at hposition ⊢
-      omega
-    subst position
-    rw [if_neg ha, hout.trans hmasked]
-    rfl
-
+#print axioms generated_circuit_lane_facts
 #print axioms generated_circuit_layer_within
 #print axioms generated_circuit_iteration_within
-#print axioms generated_requirement_gate_value
 
 end DiamondGeneratedProof

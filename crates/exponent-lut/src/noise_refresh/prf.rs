@@ -1881,7 +1881,7 @@ mod tests {
             .unwrap();
         assert_eq!(batched.label_count(), 2);
         let built = mxx_dsl::DslContext::new("native-batch-readout")
-            .family_output("vectors", batched.vectors().clone())
+            .output("vectors", batched.vectors().clone())
             .unwrap()
             .build()
             .unwrap();
@@ -2111,7 +2111,7 @@ mod tests {
             .execute_value_readout_batch_with_masks(&compiler, &batch, &artifacts, &online_masks)
             .unwrap();
         let graph = mxx_dsl::DslContext::new("imported-readout-online")
-            .family_output("vectors", output.vectors().clone())
+            .output("vectors", output.vectors().clone())
             .unwrap()
             .build()
             .unwrap();

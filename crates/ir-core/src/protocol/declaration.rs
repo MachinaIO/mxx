@@ -1,7 +1,5 @@
-use super::{
-    BundleValidationError, ClosedProtocolBundle, FrozenDerivationAttachments, FrozenSemanticAnchors,
-};
-use crate::{CompileParameter, FrozenGraphScopeId, Graph, NodeId, Port, WireType};
+use super::{BundleValidationError, ClosedProtocolBundle};
+use crate::{CompileParameter, Graph, WireType};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -21,52 +19,11 @@ pub struct OutputRef {
     pub output: String,
 }
 
-/// A stable frozen-IR node identity retained as protocol data.
-///
-/// This reference has no symbolic or proof meaning on the Rust side.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct SemanticNodeRef {
-    pub stage: StageId,
-    pub scope: FrozenGraphScopeId,
-    pub node: NodeId,
-}
-
-/// A DSL label resolved directly to a frozen-IR wire.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct SemanticWireRef {
-    pub node: SemanticNodeRef,
-    pub port: Port,
-}
-
 #[derive(Clone)]
 pub struct ProtocolStage {
     pub id: StageId,
     pub graph: Graph,
-    pub semantic_anchors: FrozenSemanticAnchors,
-    /// Owning-crate operational rule references frozen with the executable graph.
-    /// They carry no asserted bounds or equations.
-    pub derivation_attachments: FrozenDerivationAttachments,
     pub bindings: Vec<ArtifactBinding>,
-}
-
-impl ProtocolStage {
-    /// Resolves a DSL label directly, without searching by node shape or numeric ID.
-    pub fn semantic_anchor(&self, name: &str) -> Result<Vec<SemanticWireRef>, ProtocolError> {
-        let wires = self.semantic_anchors.get(name).ok_or_else(|| {
-            ProtocolError::MissingSemanticAnchor { stage: self.id.clone(), name: name.to_owned() }
-        })?;
-        Ok(wires
-            .iter()
-            .map(|wire| SemanticWireRef {
-                node: SemanticNodeRef {
-                    stage: self.id.clone(),
-                    scope: wire.scope.clone(),
-                    node: wire.wire.node,
-                },
-                port: wire.wire.port,
-            })
-            .collect())
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -107,8 +64,6 @@ pub struct ProtocolDecl {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ProtocolError {
-    #[error("protocol stage {stage:?} has no semantic anchor named {name}")]
-    MissingSemanticAnchor { stage: StageId, name: String },
     #[error(transparent)]
     InvalidBundle(#[from] BundleValidationError),
     #[error("protocol stage dependencies contain a cycle")]

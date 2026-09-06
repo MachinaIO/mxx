@@ -185,10 +185,10 @@ where
         let schemas = input_examples.iter().map(GraphValue::schema).collect::<Vec<_>>();
         let mut body_error = None;
         let definition = Subgraph::define(name, schemas, |inputs| match body(self, inputs) {
-            Ok(outputs) => outputs,
+            Ok(outputs) => Ok(outputs),
             Err(error) => {
                 body_error = Some(error);
-                Vec::new()
+                Err(mxx_dsl::DslError::Schema)
             }
         });
         if let Some(error) = body_error {
@@ -1124,7 +1124,7 @@ mod tests {
             .compile_naive_public_keys(&circuit, one, [input])
             .expect("slot transfer lowering");
         let built = DslContext::new("slot-transfer")
-            .family_output("output", outputs[0].matrices.clone())
+            .output("output", outputs[0].matrices.clone())
             .expect("output")
             .build()
             .expect("build");
@@ -1148,7 +1148,7 @@ mod tests {
         let definition = Subgraph::define(
             "audited-lut-child",
             vec![input("definition-input").schema()],
-            |values| values,
+            |values| Ok(values),
         )
         .expect("subgraph definition");
         let bounds = vec![Some(BigUint::from(4u8))];

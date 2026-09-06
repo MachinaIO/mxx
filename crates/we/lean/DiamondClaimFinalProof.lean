@@ -21,10 +21,10 @@ theorem generated_claim_ideal {hashModel external execution}
 theorem generated_claim_decoder_of_approx {hashModel external execution B}
     (hrun : Runs hashModel external execution)
     (hbound : B < MxxWe.decoderRadius q)
-    (happrox : Approx execution.stage_1.2.2.2.2.1
+    (happrox : Approx execution.stage_1.2.1
       (matrixPolynomial [(MxxWe.messageCenter q external.input_7 : Int)]) B) :
     (observedResidual execution).natAbs < MxxWe.decoderRadius q ∧
-      execution.stage_1.2.2.2.2.2.1 = execution.ideal := by
+      execution.stage_1.1 = execution.ideal := by
   have hcenter :
       ((matrixPolynomial [(MxxWe.messageCenter q external.input_7 : Int)] :
         ExactMatrix q n 1 1) 0 0).coeff ⟨0, by decide⟩ =
@@ -60,7 +60,7 @@ def claimFinalNoise : Nat :=
 /-- Every approximation and shared-key equation is derived from the linked generated runs. -/
 theorem generated_claim_polynomial_bound {hashModel external execution}
     (hrun : Runs hashModel external execution) :
-    Approx execution.stage_1.2.2.2.2.1
+    Approx execution.stage_1.2.1
       (matrixPolynomial [(MxxWe.messageCenter q external.input_7 : Int)])
       claimFinalNoise := by
   obtain ⟨w⟩ := generated_claim_injector hashModel external execution hrun
@@ -69,10 +69,10 @@ theorem generated_claim_polynomial_bound {hashModel external execution}
     generated_claim_accepting_ciphertext w hrun
   obtain ⟨position, hposition, hget⟩ := hget
   have hp : position = 0 := Fin.ext (by change (position.val : Int) = 0 at hposition; omega)
-  have hs : state = execution.stage_1.2.2.2.2.2.2.1 0 := by simpa only [hp] using hget
+  have hs : state = w.decryptRoot.w_6_0 0 := by simpa only [hp] using hget
   have hc : Approx circuit
       (matrixMul ((fun _ _ ↦ selector 0 0) : ExactMatrix q n 1 1)
-          execution.stage_0.2.2.2.2.2.2.2.2.2.1 -
+          w.encryptRoot.w_30_0 -
         matrixMul ((fun _ _ ↦ selector 0 0) : ExactMatrix q n 1 1)
           w.finalPublic.gadget)
       (factor ^ stage_1_params.depth.toNat * claimInitialNoise) := by

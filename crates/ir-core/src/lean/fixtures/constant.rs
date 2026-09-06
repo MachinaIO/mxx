@@ -65,7 +65,7 @@ fn export_constant_fixture() {
         ),
     ] {
         proof.push_str(&format!(
-            "\ntheorem generated_{name} {{outputs : {}}}\n    (h : {} {{ unit := () }} () outputs) :\n    {} = ({expected} : {}) := by\n  change outputs = _ at h\n  {tactic}\n",
+            "\ntheorem generated_{name} {{outputs : {}}}\n    (h : {} {{ unit := () }} () outputs) :\n    {} = ({expected} : {}) := by\n  obtain ⟨witness, h⟩ := h\n  change outputs = _ at h\n  {tactic}\n",
             root.output_type, root.relation, root.outputs[name].projection,
             root.outputs[name].lean_type,
         ));

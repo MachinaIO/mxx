@@ -72,14 +72,13 @@ theorem selector_integer_row_encoding
     simp only [hnonzero, ite_false, hindex, hbits bit hbit, reducePoly_mul]
 
 theorem generated_existing_source_index
-    (backend : BackendContext) (params : Stage_decrypt.Params) (layer lane : Nat)
+    (params : Stage_decrypt.Params) (layer lane : Nat)
     (index : Int) (hbefore : (lane : Int) < (layer : Int) * params.diamond_batch_bits + 1)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_8_5 backend params layer lane
-      ((layer : Int) * params.diamond_batch_bits + 1) index) : index = (lane : Int) := by
-  rcases hrun with ⟨value, _, _, _, hselect, hout⟩
+    (hrun : select (if decide ((layer : Int) * params.diamond_batch_bits + 1 ≤ (lane : Int)) then 1 else 0)
+      [(lane : Int), 0] index) : index = (lane : Int) := by
+  have hselect := hrun
   have hflag : decide ((layer : Int) * params.diamond_batch_bits + 1 ≤ (lane : Int)) =
       false := decide_eq_false (by omega)
-  simp only [Int.ofNat_eq_natCast] at hselect
   simp only [hflag, Bool.false_eq_true, ite_false] at hselect
   rcases hselect with ⟨position, hposition, hvalue⟩
   have hp : position = (0 : Fin 2) := by
@@ -87,7 +86,7 @@ theorem generated_existing_source_index
     dsimp at hposition ⊢
     omega
   subst position
-  exact hout.trans hvalue
+  exact hvalue
 
 #print axioms generated_existing_source_index
 #print axioms selector_integer_row_encoding

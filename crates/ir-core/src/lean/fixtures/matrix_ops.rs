@@ -155,7 +155,7 @@ theorem generated_root_columns_projection
     (h : Generated.generatedRoot { unit := () } inputs outputs) :
     outputs.1 ⟨0, by omega⟩ ⟨0, by omega⟩ =
       inputs.1 ⟨0, by omega⟩ ⟨0, by omega⟩ := by
-  rcases h with ⟨columns, diagonal, rows, family, hColumns, hDiagonal, hRows, hFamily, hout⟩
+  rcases h with ⟨⟨columns, diagonal, rows, family⟩, hColumns, hDiagonal, hRows, _, hFamily, hout⟩
   rw [hout]
   simpa using hColumns ⟨0, by omega⟩ ⟨0, by omega⟩
 

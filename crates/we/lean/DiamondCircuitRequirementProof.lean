@@ -19,16 +19,33 @@ theorem circuit_lookup_unique {α : Type} {N : Nat}
   obtain ⟨position, _, hl, hr⟩ := circuit_gather_same_index values values index left right hl hr
   exact hl.trans hr.symm
 
-/-- A scalar output equation extracted from the actual circuit layer, retaining the exact
-    metadata and message gather positions. It is not a second circuit evaluator. -/
+theorem circuit_select_at {α : Type} {values : List α} (index : Nat) (output : α)
+    (hrun : MxxRuntime.select (index : Int) values output) (hindex : index < values.length) :
+    output = values.get ⟨index, hindex⟩ := by
+  obtain ⟨position, hposition, hvalue⟩ := hrun
+  have heq : position = ⟨index, hindex⟩ := Fin.ext (by change position.val = index; omega)
+  exact heq ▸ hvalue
+
+theorem circuit_mask_value {α : Type} (lane : Nat) (active : Int) (zero selected output : α)
+    (hrun : MxxRuntime.select (if decide ((lane : Int) ≤ active - 1) then 1 else 0)
+      [zero, selected] output) : output = if (lane : Int) < active then selected else zero := by
+  by_cases ha : (lane : Int) < active
+  · have hf : decide ((lane : Int) ≤ active - 1) = true := by apply decide_eq_true; omega
+    rw [hf, if_pos rfl] at hrun
+    exact (circuit_select_at 1 output hrun (by simp)).trans (by simp [ha])
+  · have hf : decide ((lane : Int) ≤ active - 1) = false := by apply decide_eq_false; omega
+    rw [hf] at hrun
+    exact (circuit_select_at 0 output hrun (by simp)).trans (by simp [ha])
+
+/-- The equation uses the same shared reads, selectors, and mask as the fused lane. -/
 theorem generated_circuit_plaintext_equation
     (params : Stage_decrypt.Params) (layer : Nat) (current next : CircuitState)
     (activeCounts : Fin circuitDepth → Int) (kinds leftSources rightSources : Fin metadataCount → Int)
     (oneCipher onePublic : ExactMatrix q n 1 ell) (oneMessage : ExactMatrix q n 1 1)
     (honeMessage : oneMessage 0 0 = 1)
-    (hrun : Stage_decrypt.sequential_generatedRoot_67 DiamondBackend.backend params layer
-      (current.1, current.2.1, current.2.2.1, activeCounts, kinds, leftSources, rightSources,
-        oneCipher, onePublic, oneMessage, ()) next) :
+    (hrun : Stage_decrypt.sequential_generatedRoot_33 DiamondBackend.backend params layer
+      (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
+        rightSources, onePublic, oneMessage, ()) next) :
     ∃ active : Int, familyGetDynamic activeCounts (layer : Int) active ∧
       ∀ lane : Fin circuitWidth, ∃ (kind : Fin 6) (left right : Fin circuitWidth),
         familyGetDynamic kinds ((layer : Int) * params.max_layer_width + lane.val)
@@ -42,103 +59,66 @@ theorem generated_circuit_plaintext_equation
             current.2.2.1 left 0 0 * current.2.2.1 right 0 0,
             current.2.2.1 left 0 0 + current.2.2.1 right 0 0 -
               2 * (current.2.2.1 left 0 0 * current.2.2.1 right 0 0)].get kind else 0 := by
-  dsimp only [Stage_decrypt.sequential_generatedRoot_67] at hrun
-  obtain ⟨scopeWitness, h⟩ := hrun
-  rcases scopeWitness with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
-    rightIndices, w18, digits, w20, w21, w23, w24, w25, w26, w28, w29, w30, w31,
-    w33, w34, w35, w36, w37, w38, w39, w40, w41, w42, w44, w45, w46, w47,
-    w48, w49, w50, w51, w52, w53⟩
-  dsimp only [Stage_decrypt.sequential_generatedRoot_67.body] at h
-  rcases h with ⟨_, _, hactive, _, h3, _, _, _, _, _, h7, _, h9, _, h11, _, _,
-    _, _, _, h16, _, _, _, _, _, _, _, _, _, h23, _, _, _, _,
-    _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
-    _, _, _, _, _, _, _, _, _, _, _, _, _, h44, _, h45, _, h46,
-    _, h47, _, h48, _, h49, _, h50, _, h51, _, h52, _, h53, hout⟩
+  obtain ⟨⟨active, oc, op, om⟩, _, _, hactive, _, hlanes, hout⟩ := hrun
   refine ⟨active, hactive, ?_⟩
   intro lane
-  obtain ⟨selected, hn, hlt, _, ⟨kind, hkind, hselected⟩, hsout⟩ := h52 lane
-  change Fin 6 at kind
-  dsimp only at hselected
-  obtain ⟨leftMessage, _, _, ⟨left, hleft, hlval⟩, hlout⟩ := h23 lane
-  obtain ⟨rightMessage, _, _, ⟨right, hright, hrval⟩, hrout⟩ := h47 lane
-  have haddr : addresses lane = (layer : Int) * params.max_layer_width + lane.val := by
-    simpa [Stage_decrypt.parallel_sequential_generatedRoot_67_7] using h7 lane
-  have hk : familyGetDynamic kinds ((layer : Int) * params.max_layer_width + lane.val)
-      (kind.val : Int) := by
-    obtain ⟨value, _, _, hget, hvalue⟩ := h9 lane
-    have heq : (kind.val : Int) = value := hkind.trans hvalue
-    simpa only [haddr, heq] using hget
-  have hl : familyGetDynamic leftSources ((layer : Int) * params.max_layer_width + lane.val)
-      (left.val : Int) := by
-    obtain ⟨value, _, _, hget, hvalue⟩ := h11 lane
-    have heq : (left.val : Int) = value := hleft.trans hvalue
-    simpa only [haddr, heq] using hget
-  have hr : familyGetDynamic rightSources ((layer : Int) * params.max_layer_width + lane.val)
-      (right.val : Int) := by
-    obtain ⟨value, _, _, hget, hvalue⟩ := h16 lane
-    have heq : (right.val : Int) = value := hright.trans hvalue
-    simpa only [haddr, heq] using hget
+  obtain ⟨kind, left, right, digits, sc, sp, sm, hk, hl, hr, _, _, _, hm, _, _, hmm⟩ :=
+    generated_circuit_lane_facts DiamondBackend.backend params layer lane active current
+      kinds leftSources rightSources oneCipher onePublic oneMessage _ _ _ (hlanes lane)
   refine ⟨kind, left, right, hk, hl, hr, ?_⟩
-  have hm0 : w45 lane = 0 := by
-    have h : w45 lane = w44 lane - w44 lane := h45 lane
-    simpa using h
-  have hm1 : w44 lane 0 0 = 1 := by rw [h44 lane]; exact honeMessage
-  have hm3 : w46 lane 0 0 = 1 - w23 lane 0 0 := by
-    rw [h46 lane]
-    change w44 lane 0 0 - w23 lane 0 0 = _
-    rw [hm1]
-  have hm4 : w48 lane 0 0 = w23 lane 0 0 * w47 lane 0 0 := by rw [h48 lane]; rfl
-  have hm5 : w51 lane 0 0 = w23 lane 0 0 + w47 lane 0 0 -
-      2 * (w23 lane 0 0 * w47 lane 0 0) := by
-    rw [h51 lane, h49 lane, h50 lane, h48 lane]
-    change w23 lane 0 0 + w47 lane 0 0 - ((w23 lane 0 0 * w47 lane 0 0) *
-      (matrixPolynomial [2] : ExactMatrix q n 1 1) 0 0) = _
-    have htwo : (matrixPolynomial [2] : ExactMatrix q n 1 1) 0 0 = 2 := by
-      simp [matrixPolynomial]
-    rw [htwo]
-    ring
-  have hs : w52 lane 0 0 =
-      [0, 1, current.2.2.1 left 0 0, 1 - current.2.2.1 left 0 0,
-        current.2.2.1 left 0 0 * current.2.2.1 right 0 0,
-        current.2.2.1 left 0 0 + current.2.2.1 right 0 0 -
-          2 * (current.2.2.1 left 0 0 * current.2.2.1 right 0 0)].get kind := by
-    rw [hsout.trans hselected]
-    fin_cases kind <;>
-      simp only [List.get, hm0, hm1, hm3, hm4, hm5, hlout, hlval, hrout, hrval,
-        Matrix.zero_apply]
   rw [hout]
-  change w53 lane 0 0 = _
-  obtain ⟨masked, _, _, _, ⟨position, hposition, hmasked⟩, hmout⟩ := h53 lane
-  have hflag := h3 lane
-  dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_67_3] at hflag
-  by_cases ha : (lane.val : Int) < active
-  · have hf : decide (Int.ofNat lane.val ≤ active - 1) = true := by
-      apply decide_eq_true
-      change (lane.val : Int) ≤ active - 1
-      omega
-    rw [hf] at hflag
-    have hp : position = (⟨1, by decide⟩ : Fin 2) := by
-      apply Fin.ext
-      dsimp at hposition hflag ⊢
-      omega
-    subst position
-    rw [hmout.trans hmasked, if_pos ha]
-    exact hs
-  · have hf : decide (Int.ofNat lane.val ≤ active - 1) = false := by
-      apply decide_eq_false
-      change ¬ (lane.val : Int) ≤ active - 1
-      omega
-    rw [hf] at hflag
-    have hp : position = (⟨0, by decide⟩ : Fin 2) := by
-      apply Fin.ext
-      dsimp at hposition hflag ⊢
-      omega
-    subst position
-    rw [hmout.trans hmasked, if_neg ha, hm0]
-    rfl
+  change om lane 0 0 = _
+  have hs := circuit_select_at kind.val sm hm (by simp [circuitMessageCandidates])
+  have hmask := circuit_mask_value lane active (matrixSub oneMessage oneMessage) sm (om lane) hmm
+  rw [hmask]
+  split_ifs with ha
+  · rw [hs]
+    fin_cases kind <;> simp [circuitMessageCandidates, matrixSub, matrixAdd,
+      matrixMulScalarLeft, Matrix.mul_apply, matrixPolynomial, honeMessage, List.get]
+    ring
+  · simp [matrixSub]
 
-/-- The generated requirement and ciphertext layers agree on every plaintext when their
-    actual input families agree and they read the same circuit metadata. -/
+/-- The requirement lane reads identical addresses and applies the six Boolean gates. -/
+theorem generated_requirement_lane_equation (params : Requirement_2.Params) (layer lane : Nat)
+    (active : Int) (reference : Fin circuitWidth → Bool)
+    (kinds leftSources rightSources : Fin metadataCount → Int) (output : Bool)
+    (hrun : Requirement_2.parallel_sequential_generatedRoot_22_7 params layer lane
+      (active, kinds, (layer : Int), reference, leftSources, rightSources, ()) output) :
+    ∃ (kind : Fin 6) (left right : Fin circuitWidth),
+      familyGetDynamic kinds ((layer : Int) * params.max_layer_width + lane) (kind.val : Int) ∧
+      familyGetDynamic leftSources ((layer : Int) * params.max_layer_width + lane) (left.val : Int) ∧
+      familyGetDynamic rightSources ((layer : Int) * params.max_layer_width + lane) (right.val : Int) ∧
+      (if output then (1 : ExactPoly q n) else 0) = if (lane : Int) < active then
+        [0, 1, if reference left then 1 else 0, 1 - (if reference left then 1 else 0),
+          (if reference left then 1 else 0) * (if reference right then 1 else 0),
+          (if reference left then 1 else 0) + (if reference right then 1 else 0) -
+            2 * ((if reference left then 1 else 0) * (if reference right then 1 else 0))].get kind
+        else 0 := by
+  dsimp only [Requirement_2.parallel_sequential_generatedRoot_22_7] at hrun
+  obtain ⟨ki, li, lv, ri, rv, selected, masked, h⟩ := hrun
+  dsimp only [Requirement_2.parallel_sequential_generatedRoot_22_7.constraints_0] at h
+  rcases h with ⟨_, _, hk, _, _, hl, _, _, hlv, _, _, hr, _, _, hrv,
+    hkn, hklt, _, hs, _, _, _, hm, hout⟩
+  obtain ⟨left, hleft, hleftValue⟩ := hlv
+  obtain ⟨right, hright, hrightValue⟩ := hrv
+  let kind : Fin 6 := ⟨ki.toNat, by omega⟩
+  have hkind : (kind.val : Int) = ki := by dsimp [kind]; omega
+  refine ⟨kind, left, right, ?_, ?_, ?_, ?_⟩
+  · simpa only [hkind] using hk
+  · simpa only [hleft] using hl
+  · simpa only [hright] using hr
+  · rw [← hkind] at hs
+    have hs' := circuit_select_at kind.val selected hs kind.isLt
+    have hm' := circuit_mask_value lane active false selected masked hm
+    rw [hout, hm']
+    by_cases ha : (lane : Int) < active
+    · simp only [if_pos ha]
+      rw [hs', ← hleftValue, ← hrightValue]
+      clear_value kind
+      cases lv <;> cases rv <;> fin_cases kind <;> norm_num [List.get]
+    · simp only [if_neg ha, Bool.false_eq_true, ↓reduceIte]
+
+/-- Paired actual layers preserve plaintext agreement without assuming an accepting result. -/
 theorem generated_circuit_requirement_layer_agrees
     (params : Stage_decrypt.Params) (requirementParams : Requirement_2.Params) (layer : Nat)
     (current next : CircuitState) (reference referenceNext : Fin circuitWidth → Bool)
@@ -146,58 +126,34 @@ theorem generated_circuit_requirement_layer_agrees
     (oneCipher onePublic : ExactMatrix q n 1 ell) (oneMessage : ExactMatrix q n 1 1)
     (hwidth : params.max_layer_width = requirementParams.max_layer_width)
     (honeMessage : oneMessage 0 0 = 1) (hagrees : CircuitPlaintextAgrees current reference)
-    (hcircuit : Stage_decrypt.sequential_generatedRoot_67 DiamondBackend.backend params layer
-      (current.1, current.2.1, current.2.2.1, activeCounts, kinds, leftSources, rightSources,
-        oneCipher, onePublic, oneMessage, ()) next)
-    (hrequirement : Requirement_2.sequential_generatedRoot_27 requirementParams layer
+    (hcircuit : Stage_decrypt.sequential_generatedRoot_33 DiamondBackend.backend params layer
+      (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
+        rightSources, onePublic, oneMessage, ()) next)
+    (hrequirement : Requirement_2.sequential_generatedRoot_22 requirementParams layer
       (reference, activeCounts, kinds, leftSources, rightSources, ()) referenceNext) :
     CircuitPlaintextAgrees next referenceNext := by
   obtain ⟨active, hactive, hc⟩ := generated_circuit_plaintext_equation params layer
     current next activeCounts kinds leftSources rightSources oneCipher onePublic oneMessage
     honeMessage hcircuit
-  dsimp only [Requirement_2.sequential_generatedRoot_27] at hrequirement
-  obtain ⟨⟨addresses, gateKinds, leftIndices, leftValues, rightIndices, rightValues,
-    referenceActive, values⟩, _, haddr, _, hkinds, _, hlefts, _, hleftValues, _, hrights,
-    _, hrightValues, _, _, hreferenceActive, _, hgates, hout⟩ := hrequirement
+  obtain ⟨⟨referenceActive, values⟩, _, _, hreferenceActive, _, hlanes, hout⟩ := hrequirement
   have ha : referenceActive = active := circuit_lookup_unique hreferenceActive hactive
   rw [hout]
   intro lane
-  obtain ⟨kind, left, right, hkind, hleft, hright, hvalue⟩ := hc lane
-  have haddress : addresses lane = (layer : Int) * params.max_layer_width + lane.val := by
-    simpa [Requirement_2.parallel_sequential_generatedRoot_27_0, hwidth] using haddr lane
-  obtain ⟨kindValue, _, _, hkindLookup, hkindOut⟩ := hkinds lane
-  have hkind' : (kind.val : Int) = gateKinds lane := by
-    have hk : (kind.val : Int) = kindValue :=
-      circuit_lookup_unique hkind (by simpa only [haddress] using hkindLookup)
-    exact hk.trans hkindOut.symm
-  obtain ⟨leftIndex, _, _, hleftLookup, hleftOut⟩ := hlefts lane
-  have hleft' : (left.val : Int) = leftIndices lane := by
-    have hl : (left.val : Int) = leftIndex :=
-      circuit_lookup_unique hleft (by simpa only [haddress] using hleftLookup)
-    exact hl.trans hleftOut.symm
-  obtain ⟨rightIndex, _, _, hrightLookup, hrightOut⟩ := hrights lane
-  have hright' : (right.val : Int) = rightIndices lane := by
-    have hr : (right.val : Int) = rightIndex :=
-      circuit_lookup_unique hright (by simpa only [haddress] using hrightLookup)
-    exact hr.trans hrightOut.symm
-  obtain ⟨leftValue, _, _, ⟨leftPosition, hleftPosition, hleftValue⟩, hlOut⟩ :=
-    hleftValues lane
-  have hlp : leftPosition = left := Fin.ext (by dsimp at hleftPosition; omega)
-  have hlv : leftValues lane = reference left := by
-    simpa only [hlp] using hlOut.trans hleftValue
-  obtain ⟨rightValue, _, _, ⟨rightPosition, hrightPosition, hrightValue⟩, hrOut⟩ :=
-    hrightValues lane
-  have hrp : rightPosition = right := Fin.ext (by dsimp at hrightPosition; omega)
-  have hrv : rightValues lane = reference right := by
-    simpa only [hrp] using hrOut.trans hrightValue
-  have hgate := generated_requirement_gate_value requirementParams layer lane kind
-    (leftValues lane) (rightValues lane) (values lane) referenceActive
-    (hkind'.symm ▸ hgates lane)
+  obtain ⟨kind, left, right, hk, hl, hr, heq⟩ := hc lane
+  obtain ⟨rkind, rleft, rright, hrk, hrl, hrr, hreq⟩ :=
+    generated_requirement_lane_equation requirementParams layer lane referenceActive reference
+      kinds leftSources rightSources _ (hlanes lane)
+  rw [← hwidth] at hrk hrl hrr
+  have hkval := circuit_lookup_unique hk hrk
+  have hlval := circuit_lookup_unique hl hrl
+  have hrval := circuit_lookup_unique hr hrr
+  have hkpos : rkind = kind := Fin.ext (by omega)
+  have hlpos : rleft = left := Fin.ext (by omega)
+  have hrpos : rright = right := Fin.ext (by omega)
+  subst rkind; subst rleft; subst rright
   change next.2.2.1 lane 0 0 = if values lane then 1 else 0
-  rw [hvalue]
-  rw [ha, hlv, hrv] at hgate
-  rw [hagrees left, hagrees right]
-  exact hgate.symm
+  rw [heq, hagrees left, hagrees right]
+  simpa only [ha] using hreq.symm
 
 /-- Paired induction over the two actual loop derivations; no lane or layer expansion. -/
 theorem generated_circuit_requirement_iteration_agrees
@@ -209,12 +165,12 @@ theorem generated_circuit_requirement_iteration_agrees
     (honeMessage : oneMessage 0 0 = 1)
     (hagrees : CircuitPlaintextAgrees initial referenceInitial)
     (hcircuit : MxxIR.IterRuns
-      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_67
+      (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33
         DiamondBackend.backend params layer
-        (current.1, current.2.1, current.2.2.1, activeCounts, kinds, leftSources, rightSources,
-          oneCipher, onePublic, oneMessage, ()) next) count initial output)
+        (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources, rightSources,
+          onePublic, oneMessage, ()) next) count initial output)
     (hrequirement : MxxIR.IterRuns
-      (fun layer current next ↦ Requirement_2.sequential_generatedRoot_27 requirementParams layer
+      (fun layer current next ↦ Requirement_2.sequential_generatedRoot_22 requirementParams layer
         (current, activeCounts, kinds, leftSources, rightSources, ()) next)
       count referenceInitial referenceOutput) :
     CircuitPlaintextAgrees output referenceOutput := by
@@ -231,9 +187,7 @@ theorem generated_circuit_requirement_iteration_agrees
         (ih referenceCurrent hagrees hreferencePrevious)
         hstep hreferenceStep
 
-/-- A successful actual requirement root supplies its own initial family, loop execution,
-    and accepting output position. The remaining implication concerns initial plaintext
-    alignment only; neither final acceptance nor a noise bound is a caller premise. -/
+
 theorem generated_accepting_requirement_plaintext
     (params : Stage_decrypt.Params) (requirementParams : Requirement_2.Params)
     (instanceValues witnessValues : Fin circuitWidth → Int) (activeCounts : Fin circuitDepth → Int)
@@ -242,38 +196,32 @@ theorem generated_accepting_requirement_plaintext
     (hroot : Requirement_2.generatedRoot requirementParams
       (instanceValues, witnessValues, activeCounts, kinds, leftSources, rightSources,
         outputSources, ()) true) :
-    ∃ (witnessIndices selectedWitnesses : Fin circuitWidth → Int) (referenceInitial : Fin circuitWidth → Bool)
-      (position : Fin circuitWidth),
-      (∀ lane : Fin circuitWidth, Requirement_2.parallel_generatedRoot_20 requirementParams lane
-        (instanceValues lane, requirementParams.instance_width + requirementParams.witness_width,
-          requirementParams.instance_width, ()) (witnessIndices lane)) ∧
-      (∀ lane : Fin circuitWidth, Requirement_2.parallel_generatedRoot_21 requirementParams lane
-        (witnessIndices lane, witnessValues, ()) (selectedWitnesses lane)) ∧
-      (∀ lane : Fin circuitWidth, Requirement_2.parallel_generatedRoot_22 requirementParams lane
-        (instanceValues lane, selectedWitnesses lane, requirementParams.instance_width,
-          requirementParams.instance_width + requirementParams.witness_width, ())
-        (referenceInitial lane)) ∧
+    ∃ (referenceInitial : Fin circuitWidth → Bool) (position : Fin circuitWidth),
+      (∀ lane : Fin circuitWidth, Requirement_2.parallel_generatedRoot_17 requirementParams lane
+        (requirementParams.instance_width,
+          requirementParams.instance_width + requirementParams.witness_width,
+          witnessValues, instanceValues lane, ()) (referenceInitial lane)) ∧
       (position.val : Int) = outputSources 0 ∧
       ∀ (initial output : CircuitState) (oneCipher onePublic : ExactMatrix q n 1 ell)
         (oneMessage : ExactMatrix q n 1 1),
         oneMessage 0 0 = 1 → CircuitPlaintextAgrees initial referenceInitial →
         MxxIR.IterRuns
-          (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_67
+          (fun layer current next ↦ Stage_decrypt.sequential_generatedRoot_33
             DiamondBackend.backend params layer
-            (current.1, current.2.1, current.2.2.1, activeCounts, kinds, leftSources,
-              rightSources, oneCipher, onePublic, oneMessage, ()) next)
+            (current.1, current.2.1, current.2.2.1, activeCounts, oneCipher, kinds, leftSources,
+              rightSources, onePublic, oneMessage, ()) next)
           requirementParams.depth.toNat initial output →
         output.2.2.1 position 0 0 = 1 := by
   dsimp only [Requirement_2.generatedRoot] at hroot
   obtain ⟨rootWitness, h⟩ := hroot
-  rcases rootWitness with ⟨instanceChecks, witnessChecks, inputChecks, validInputs, witnessIndices,
-    selectedWitnesses, referenceInitial, referenceOutput, selectedIndex, accepted⟩
+  rcases rootWitness with ⟨instanceChecks, witnessChecks, inputChecks, validInputs,
+    referenceInitial, referenceOutput, selectedIndex, accepted⟩
   dsimp only [Requirement_2.generatedRoot.body, Requirement_2.generatedRoot.constraints_0] at h
-  rcases h with ⟨_, _, _, _, _, _, _, _, _, hindices, _, hwitnesses, _, hinitial,
-    _, hloop, _, _, hsource, _, _, houtput, hsuccess⟩
+  rcases h with ⟨_, _, _, _, _, _, _, _, _, hinitial,
+    _, hloop, hsource, _, _, houtput, hsuccess⟩
   have haccept : accepted = true := by
     cases accepted
-    · simp at hsuccess
+    · cases validInputs <;> norm_num at hsuccess
     · rfl
   obtain ⟨sourcePosition, _, hsourceValue⟩ := hsource
   have hsourcePosition : sourcePosition = 0 := Subsingleton.elim _ _
@@ -281,8 +229,7 @@ theorem generated_accepting_requirement_plaintext
     simpa only [hsourcePosition] using hsourceValue
   obtain ⟨position, hposition, hvalue⟩ := houtput
   have hposition' : (position.val : Int) = outputSources 0 := hposition.trans hselectedIndex
-  refine ⟨witnessIndices, selectedWitnesses, referenceInitial, position,
-    by simpa only [add_zero] using hindices, hwitnesses,
+  refine ⟨referenceInitial, position,
     by simpa only [add_zero] using hinitial, hposition', ?_⟩
   intro initial output oneCipher onePublic oneMessage hone hagrees hrun
   have hfinal := generated_circuit_requirement_iteration_agrees params requirementParams
@@ -292,7 +239,9 @@ theorem generated_accepting_requirement_plaintext
   have hreference : referenceOutput position = true := hvalue.symm.trans haccept
   simpa only [hreference, ↓reduceIte] using hfinal position
 
+
 #print axioms generated_circuit_plaintext_equation
+#print axioms generated_requirement_lane_equation
 #print axioms generated_circuit_requirement_layer_agrees
 #print axioms generated_circuit_requirement_iteration_agrees
 #print axioms generated_accepting_requirement_plaintext

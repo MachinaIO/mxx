@@ -29,64 +29,76 @@ theorem transition_coordinates (stateCount digitBase layer : Nat)
       Nat.div_eq_of_lt state.isLt, Nat.zero_add]
 
 theorem generated_target_index
-    (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
+    (params : Stage_encrypt.Params)
     (stateCount digitBase layer : Nat) (hstates : 0 < stateCount) (hdigits : 0 < digitBase)
     (hstateGeometry : (stateCount : Int) =
       1 + params.diamond_batch_bits * params.diamond_input_count)
     (hbaseGeometry : (digitBase : Int) = params.diamond_digit_base)
     (digit : Fin digitBase) (state : Fin stateCount) (index : Int)
-    (hrun : Stage_encrypt.parallel_generatedRoot_70 backend hashModel params
-      ((layer * digitBase + digit.val) * stateCount + state.val) () index) :
+    (hrun : index =
+      ((((layer * digitBase + digit.val) * stateCount + state.val : Nat) : Int) /
+        (params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count + params.diamond_digit_base) + 1) *
+        (1 + params.diamond_batch_bits * params.diamond_input_count) +
+      (((layer * digitBase + digit.val) * stateCount + state.val : Nat) : Int) %
+        (1 + params.diamond_batch_bits * params.diamond_input_count)) :
     index = ((layer + 1) * stateCount + state.val : Nat) := by
   have hwidth : ((digitBase * stateCount : Nat) : Int) =
       params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
         params.diamond_digit_base := by
     rw [Nat.cast_mul, hstateGeometry, hbaseGeometry]
     ring
-  have heq := hrun.2.2
+  have heq := hrun
   rw [← hwidth, ← hstateGeometry] at heq
   obtain ⟨hlayer, hstate, _⟩ := transition_coordinates stateCount digitBase layer
     hstates hdigits digit state
-  simp only [Int.ofNat_eq_natCast, ← Int.natCast_ediv, ← Int.natCast_emod,
+  simp only [← Int.natCast_ediv, ← Int.natCast_emod,
     hlayer, hstate] at heq
   simpa only [Nat.cast_add, Nat.cast_mul, Nat.cast_one] using heq
 
 theorem generated_runtime_transition_index
-    (backend : BackendContext) (params : Stage_decrypt.Params)
+    (params : Stage_decrypt.Params)
     (stateCount digitBase layer digit state : Nat)
     (hstateGeometry : (stateCount : Int) =
       1 + params.diamond_batch_bits * params.diamond_input_count)
     (hbaseGeometry : (digitBase : Int) = params.diamond_digit_base)
     (index : Int)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_8_10 backend params layer state
-      (Int.ofNat layer, Int.ofNat digit, ()) index) :
+    (hrun : index = (layer : Int) *
+      (params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
+        params.diamond_digit_base) + (digit : Int) *
+      (1 + params.diamond_batch_bits * params.diamond_input_count) + (state : Int)) :
     index = ((layer * digitBase + digit) * stateCount + state : Nat) := by
   have hwidth : ((digitBase * stateCount : Nat) : Int) =
       params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
         params.diamond_digit_base := by
     rw [Nat.cast_mul, hstateGeometry, hbaseGeometry]
     ring
-  dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_8_10,
-    Stage_decrypt.parallel_sequential_generatedRoot_8_10.constraints_0] at hrun
   rw [← hwidth, ← hstateGeometry] at hrun
   convert hrun using 1
-  simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul]
+  simp only [Nat.cast_add, Nat.cast_mul]
   ring
 
 #print axioms generated_runtime_transition_index
 
 theorem generated_source_index_agrees
-    (backend : BackendContext) (hashModel : HashModel)
-    (params : Stage_encrypt.Params) (decryptParams : Stage_decrypt.Params)
+    (params : Stage_encrypt.Params)
     (stateCount digitBase layer : Nat) (hstates : 0 < stateCount) (hdigits : 0 < digitBase)
     (hstateGeometry : (stateCount : Int) =
       1 + params.diamond_batch_bits * params.diamond_input_count)
     (hbaseGeometry : (digitBase : Int) = params.diamond_digit_base)
     (digit : Fin digitBase) (state : Fin stateCount) (setupIndex sourceIndex : Int)
-    (hsetup : Stage_encrypt.parallel_generatedRoot_65 backend hashModel params
-      ((layer * digitBase + digit.val) * stateCount + state.val) () setupIndex)
-    (hruntime : Stage_decrypt.parallel_sequential_generatedRoot_8_5 backend decryptParams
-      layer state.val (Int.ofNat layer * params.diamond_batch_bits + 1) sourceIndex) :
+    (hsetup : ∃ selected : Int,
+      select (if decide (((((layer * digitBase + digit.val) * stateCount + state.val : Nat) : Int) /
+          (params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
+            params.diamond_digit_base)) * params.diamond_batch_bits + 1 ≤
+          (((layer * digitBase + digit.val) * stateCount + state.val : Nat) : Int) %
+            (1 + params.diamond_batch_bits * params.diamond_input_count)) then 1 else 0)
+        [(((layer * digitBase + digit.val) * stateCount + state.val : Nat) : Int) %
+          (1 + params.diamond_batch_bits * params.diamond_input_count), 0] selected ∧
+      setupIndex = ((((layer * digitBase + digit.val) * stateCount + state.val : Nat) : Int) /
+        (params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
+          params.diamond_digit_base)) * (1 + params.diamond_batch_bits * params.diamond_input_count) + selected)
+    (hruntime : select (if decide ((layer : Int) * params.diamond_batch_bits + 1 ≤ (state.val : Int)) then 1 else 0)
+      [(state.val : Int), 0] sourceIndex) :
     setupIndex = (layer * stateCount : Nat) + sourceIndex := by
   have hwidth : ((digitBase * stateCount : Nat) : Int) =
       params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
@@ -95,64 +107,53 @@ theorem generated_source_index_agrees
     ring
   obtain ⟨hlayer, hstate, _⟩ := transition_coordinates stateCount digitBase layer
     hstates hdigits digit state
-  dsimp only [Stage_encrypt.parallel_generatedRoot_65] at hsetup
-  rcases hsetup with ⟨setupSelected, _, _, _, _, _, hsetupSelect, hsetupOut⟩
+  rcases hsetup with ⟨setupSelected, hsetupSelect, hsetupOut⟩
   rw [← hwidth, ← hstateGeometry] at hsetupSelect hsetupOut
-  simp only [Int.ofNat_eq_natCast, ← Int.natCast_ediv, ← Int.natCast_emod,
-    hlayer, hstate, add_zero] at hsetupSelect hsetupOut
-  dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_8_5] at hruntime
-  rcases hruntime with ⟨runtimeSelected, _, _, _, hruntimeSelect, hruntimeOut⟩
-  simp only [Int.ofNat_eq_natCast, add_zero] at hruntimeSelect
+  simp only [← Int.natCast_ediv, ← Int.natCast_emod,
+    hlayer, hstate] at hsetupSelect hsetupOut
+  have hruntimeSelect := hruntime
   rcases hsetupSelect with ⟨setupPosition, hsetupPosition, hsetupValue⟩
   rcases hruntimeSelect with ⟨runtimePosition, hruntimePosition, hruntimeValue⟩
   have hp : setupPosition = runtimePosition := by
     apply Fin.ext
     omega
   subst runtimePosition
-  have hselected : setupSelected = runtimeSelected := hsetupValue.trans hruntimeValue.symm
-  rw [hsetupOut, hselected, ← hruntimeOut, Nat.cast_mul]
+  have hselected : setupSelected = sourceIndex := hsetupValue.trans hruntimeValue.symm
+  rw [hsetupOut, hselected, Nat.cast_mul]
 
 #print axioms generated_source_index_agrees
 
 theorem generated_source_pool_lookup
-    (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
-    (slot : Nat) (index : Int) (bases : Fin basePoolCount → ExactMatrix q n 2 inner)
+    (index : Int) (bases : Fin basePoolCount → ExactMatrix q n 2 inner)
     (trapdoors : Fin basePoolCount → TrapdoorValue (ExactMatrix q n 2 inner) Unit)
     (sourcePublic : ExactMatrix q n 2 inner)
     (sourceTrapdoor : TrapdoorValue (ExactMatrix q n 2 inner) Unit)
-    (hrun : Stage_encrypt.parallel_generatedRoot_66 backend hashModel params slot
-      (index, bases, trapdoors, ()) (sourcePublic, sourceTrapdoor, ())) :
+    (hrun : familyGetDynamic bases index sourcePublic ∧ familyGetDynamic trapdoors index sourceTrapdoor) :
     ∃ position : Fin basePoolCount, (position.val : Int) = index ∧ sourcePublic = bases position ∧
       sourceTrapdoor = trapdoors position := by
-  rcases hrun with ⟨matrixValue, trapdoorValue, _, _, ⟨position, hposition, hmatrix⟩,
-    _, _, ⟨trapdoorPosition, htrapdoorPosition, htrapdoor⟩, hout⟩
+  rcases hrun with ⟨⟨position, hposition, hmatrix⟩,
+    ⟨trapdoorPosition, htrapdoorPosition, htrapdoor⟩⟩
   have hp : position = trapdoorPosition := by
     apply Fin.ext
     omega
   subst trapdoorPosition
   refine ⟨position, hposition, ?_, ?_⟩
-  · exact (congrArg Prod.fst hout).trans hmatrix
-  · exact (congrArg (fun value ↦ value.2.1) hout).trans htrapdoor
+  · exact hmatrix
+  · exact htrapdoor
 
 theorem generated_target_pool_lookup
-    (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
-    (slot : Nat) (index : Int) (bases : Fin basePoolCount → ExactMatrix q n 2 inner)
+    (index : Int) (bases : Fin basePoolCount → ExactMatrix q n 2 inner)
     (targetPublic : ExactMatrix q n 2 inner)
-    (hrun : Stage_encrypt.parallel_generatedRoot_71 backend hashModel params slot
-      (index, bases, ()) targetPublic) :
+    (hrun : familyGetDynamic bases index targetPublic) :
     ∃ position : Fin basePoolCount, (position.val : Int) = index ∧ targetPublic = bases position := by
-  rcases hrun with ⟨value, _, _, ⟨position, hposition, hvalue⟩, hout⟩
-  exact ⟨position, hposition, hout.trans hvalue⟩
+  exact hrun
 
 theorem generated_selected_transition_lookup
-    (backend : BackendContext) (params : Stage_decrypt.Params) (layer lane : Nat)
     (index : Int) (transitions : Fin transitionCount → ExactMatrix q n inner inner)
     (selected : ExactMatrix q n inner inner)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_8_12 backend params layer lane
-      (index, transitions, ()) selected) :
+    (hrun : familyGetDynamic transitions index selected) :
     ∃ position : Fin transitionCount, (position.val : Int) = index ∧ selected = transitions position := by
-  rcases hrun with ⟨value, _, _, ⟨position, hposition, hvalue⟩, hout⟩
-  exact ⟨position, hposition, hout.trans hvalue⟩
+  exact hrun
 
 #print axioms generated_source_pool_lookup
 

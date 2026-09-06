@@ -10,21 +10,24 @@ namespace DiamondGeneratedProof
 /- These local theorems concern the generated structural example. Numeric acceptance and the
    invariant of the enclosing circuit loop remain separate obligations. -/
 
-theorem generated_public_gate_selection (backend : BackendContext) (hashModel : HashModel)
-    (params : Stage_encrypt.Params) (layer lane : Nat) (active : Int) (kind : Fin 6)
+theorem generated_public_gate_selection (backend : BackendContext)
+    (params : Stage_encrypt.Params) (lane : Nat) (active : Int) (kind : Fin 6)
     (left right base output : ExactMatrix q n 1 ell)
     (hactive : (lane : Int) < active)
-    (hrun : Stage_encrypt.parallel_sequential_generatedRoot_32_14 backend hashModel
-      params layer lane ((kind.val : Int), left, right, active, base, ()) output) :
+    (hrun : ∃ digits selected,
+      gadgetDecomposeRuns backend params.diamond_gadget_base params.diamond_digit_count right digits ∧
+      MxxRuntime.select (kind.val : Int) [base - base, base, left, base - left, left * digits,
+        left + right - matrixMulScalarRight (left * digits)
+          (matrixPolynomial [2] : ExactMatrix q n 1 1)] selected ∧
+      MxxRuntime.select (if decide (Int.ofNat lane ≤ active - 1) then 1 else 0)
+        [base - base, selected] output) :
     ∃ digits : ExactMatrix q n ell ell,
       gadgetDecomposeRuns backend params.diamond_gadget_base params.diamond_digit_count
         right digits ∧
       output = [base - base, base, left, base - left, left * digits,
         left + right - matrixMulScalarRight (left * digits)
           (matrixPolynomial [2] : ExactMatrix q n 1 1)].get kind := by
-  dsimp only [Stage_encrypt.parallel_sequential_generatedRoot_32_14] at hrun
-  rcases hrun with ⟨digits, selected, masked, hdecomp, _, _, _, hselect,
-    _, _, _, hmask, hout⟩
+  rcases hrun with ⟨digits, selected, hdecomp, hselect, hmask⟩
   have hflag : decide (Int.ofNat lane ≤ active - 1) = true := by
     apply decide_eq_true
     change (lane : Int) ≤ active - 1
@@ -42,16 +45,20 @@ theorem generated_public_gate_selection (backend : BackendContext) (hashModel : 
     dsimp at hposition ⊢
     omega
   subst position
-  exact ⟨digits, hdecomp, hout.trans (hmasked.trans hselected)⟩
+  exact ⟨digits, hdecomp, hmasked.trans hselected⟩
 
-theorem generated_public_inactive (backend : BackendContext) (hashModel : HashModel)
-    (params : Stage_encrypt.Params) (layer lane : Nat) (active kind : Int)
+theorem generated_public_inactive (backend : BackendContext)
+    (params : Stage_encrypt.Params) (lane : Nat) (active kind : Int)
     (left right base output : ExactMatrix q n 1 ell)
     (hinactive : active ≤ (lane : Int))
-    (hrun : Stage_encrypt.parallel_sequential_generatedRoot_32_14 backend hashModel
-      params layer lane (kind, left, right, active, base, ()) output) : output = 0 := by
-  dsimp only [Stage_encrypt.parallel_sequential_generatedRoot_32_14] at hrun
-  rcases hrun with ⟨digits, selected, masked, _, _, _, _, _, _, _, _, hmask, hout⟩
+    (hrun : ∃ digits selected,
+      gadgetDecomposeRuns backend params.diamond_gadget_base params.diamond_digit_count right digits ∧
+      MxxRuntime.select kind [base - base, base, left, base - left, left * digits,
+        left + right - matrixMulScalarRight (left * digits)
+          (matrixPolynomial [2] : ExactMatrix q n 1 1)] selected ∧
+      MxxRuntime.select (if decide (Int.ofNat lane ≤ active - 1) then 1 else 0)
+        [base - base, selected] output) : output = 0 := by
+  rcases hrun with ⟨digits, selected, _, _, hmask⟩
   have hflag : decide (Int.ofNat lane ≤ active - 1) = false := by
     apply decide_eq_false
     change ¬ (lane : Int) ≤ active - 1
@@ -63,38 +70,34 @@ theorem generated_public_inactive (backend : BackendContext) (hashModel : HashMo
     dsimp at hposition ⊢
     omega
   subst position
-  simpa [List.get, matrixSub] using hout.trans hmasked
+  simpa [List.get, matrixSub] using hmasked
 
-theorem generated_ciphertext_gate_selection (backend : BackendContext)
-    (params : Stage_decrypt.Params) (layer lane : Nat) (kind : Fin 6)
+theorem generated_ciphertext_gate_selection
+    (kind : Fin 6)
     (zero one left notValue product xorValue output : ExactMatrix q n 1 ell)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_67_30 backend params layer lane
-      ((kind.val : Int), zero, one, left, notValue, product, xorValue, ()) output) :
+    (hrun : MxxRuntime.select (kind.val : Int) [zero, one, left, notValue, product, xorValue] output) :
     output = [zero, one, left, notValue, product, xorValue].get kind := by
-  rcases hrun with ⟨selected, _, _, _, ⟨position, hposition, hselected⟩, hout⟩
+  rcases hrun with ⟨position, hposition, hselected⟩
   have hp : position = kind := by
     apply Fin.ext
     dsimp at hposition
     omega
   subst position
-  exact hout.trans hselected
+  exact hselected
 
-theorem generated_ciphertext_active_selection (backend : BackendContext)
-    (params : Stage_decrypt.Params) (layer lane : Nat) (active flag : Int)
+theorem generated_ciphertext_active_selection
+    (lane : Nat) (active flag : Int)
     (zero selected output : ExactMatrix q n 1 ell)
-    (hflag : Stage_decrypt.parallel_sequential_generatedRoot_67_3 backend params
-      layer lane active flag)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_67_31 backend params layer lane
-      (flag, zero, selected, ()) output) :
+    (hflag : flag = if decide (Int.ofNat lane ≤ active - 1) then 1 else 0)
+    (hrun : MxxRuntime.select flag [zero, selected] output) :
     output = if (lane : Int) < active then selected else zero := by
-  rcases hrun with ⟨value, _, _, _, ⟨position, hposition, hselected⟩, hout⟩
+  rcases hrun with ⟨position, hposition, hselected⟩
   by_cases ha : (lane : Int) < active
   · have hf : flag = 1 := by
       have hb : decide (Int.ofNat lane ≤ active - 1) = true := by
         apply decide_eq_true
         change (lane : Int) ≤ active - 1
         omega
-      dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_67_3] at hflag
       rw [hb] at hflag
       exact hflag
     have hp : position = (⟨1, by decide⟩ : Fin 2) := by
@@ -102,13 +105,12 @@ theorem generated_ciphertext_active_selection (backend : BackendContext)
       dsimp at hposition ⊢
       omega
     subst position
-    simpa [ha, List.get] using hout.trans hselected
+    simpa [ha, List.get] using hselected
   · have hf : flag = 0 := by
       have hb : decide (Int.ofNat lane ≤ active - 1) = false := by
         apply decide_eq_false
         change ¬ (lane : Int) ≤ active - 1
         omega
-      dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_67_3] at hflag
       rw [hb] at hflag
       exact hflag
     have hp : position = (⟨0, by decide⟩ : Fin 2) := by
@@ -116,25 +118,21 @@ theorem generated_ciphertext_active_selection (backend : BackendContext)
       dsimp at hposition ⊢
       omega
     subst position
-    simpa [ha, List.get] using hout.trans hselected
+    simpa [ha, List.get] using hselected
 
-theorem generated_encrypted_zero (backend : BackendContext)
-    (params : Stage_decrypt.Params) (layer lane : Nat)
+theorem generated_encrypted_zero
     (one output : ExactMatrix q n 1 ell)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_67_6 backend params layer lane
-      (one, one, ()) output) : output = 0 := by
+    (hrun : output = matrixSub one one) : output = 0 := by
   change output = one - one at hrun
   simpa using hrun
 
-theorem generated_encrypted_not (backend : BackendContext)
-    (params : Stage_decrypt.Params) (layer lane : Nat)
+theorem generated_encrypted_not
     (onePublic leftPublic oneCipher leftCipher oneError leftError output :
       ExactMatrix q n 1 ell)
     (secret payload : ExactMatrix q n 1 1) (message : ExactPoly q n)
     (hone : oneCipher = secret * onePublic - (payload * gadget) + oneError)
     (hleft : leftCipher = secret * leftPublic - message • (payload * gadget) + leftError)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_67_14 backend params layer lane
-      (oneCipher, leftCipher, ()) output) :
+    (hrun : output = matrixSub oneCipher leftCipher) :
     output = secret * (onePublic - leftPublic) - (1 - message) • (payload * gadget) +
       (oneError - leftError) := by
   change output = oneCipher - leftCipher at hrun
@@ -142,7 +140,7 @@ theorem generated_encrypted_not (backend : BackendContext)
   simp only [Matrix.mul_sub, sub_smul, one_smul]
   abel
 
-theorem generated_encrypted_xor (params : Stage_decrypt.Params) (layer lane : Nat)
+theorem generated_encrypted_xor (params : Stage_decrypt.Params)
     (leftPublic rightPublic leftCipher rightCipher leftError rightError
       productTerm messageTerm product sum doubled output : ExactMatrix q n 1 ell)
     (secret messageMatrix : ExactMatrix q n 1 1)
@@ -151,28 +149,20 @@ theorem generated_encrypted_xor (params : Stage_decrypt.Params) (layer lane : Na
       messageMatrix 0 0 • (secret * gadget) + leftError)
     (hright : rightCipher = secret * rightPublic -
       rightMessage • (secret * gadget) + rightError)
-    (hdecompose : Stage_decrypt.parallel_sequential_generatedRoot_67_19
-      DiamondBackend.backend params layer lane rightPublic digits)
-    (hproduct : Stage_decrypt.parallel_sequential_generatedRoot_67_20
-      DiamondBackend.backend params layer lane (leftCipher, digits, ()) productTerm)
-    (hmessage : Stage_decrypt.parallel_sequential_generatedRoot_67_24
-      DiamondBackend.backend params layer lane (rightCipher, messageMatrix, ()) messageTerm)
-    (hproductSum : Stage_decrypt.parallel_sequential_generatedRoot_67_25
-      DiamondBackend.backend params layer lane (productTerm, messageTerm, ()) product)
-    (hsum : Stage_decrypt.parallel_sequential_generatedRoot_67_26
-      DiamondBackend.backend params layer lane (leftCipher, rightCipher, ()) sum)
-    (hdouble : Stage_decrypt.parallel_sequential_generatedRoot_67_28
-      DiamondBackend.backend params layer lane
-      (product, (matrixPolynomial [2] : ExactMatrix q n 1 1), ()) doubled)
-    (hsub : Stage_decrypt.parallel_sequential_generatedRoot_67_29
-      DiamondBackend.backend params layer lane (sum, doubled, ()) output) :
+    (hdecompose : gadgetDecomposeRuns DiamondBackend.backend params.diamond_gadget_base params.diamond_digit_count rightPublic digits)
+    (hproduct : productTerm = matrixMul leftCipher digits)
+    (hmessage : messageTerm = matrixMulScalarRight rightCipher messageMatrix)
+    (hproductSum : product = matrixAdd productTerm messageTerm)
+    (hsum : sum = matrixAdd leftCipher rightCipher)
+    (hdouble : doubled = matrixMulScalarRight product (matrixPolynomial [2] : ExactMatrix q n 1 1))
+    (hsub : output = matrixSub sum doubled) :
     output = secret * (leftPublic + rightPublic - (2 : ExactPoly q n) •
       (leftPublic * digits)) -
       (messageMatrix 0 0 + rightMessage - 2 * (messageMatrix 0 0 * rightMessage)) •
         (secret * gadget) +
       (leftError + rightError - (2 : ExactPoly q n) •
         (leftError * digits + messageMatrix 0 0 • rightError)) ∧ PreimageWithin digits D := by
-  obtain ⟨hp, hd⟩ := generated_encrypted_product params layer lane leftPublic rightPublic
+  obtain ⟨hp, hd⟩ := generated_encrypted_product params leftPublic rightPublic
     leftCipher rightCipher leftError rightError productTerm messageTerm product
     secret secret secret messageMatrix rightMessage digits hleft hright
     hdecompose hproduct hmessage hproductSum
@@ -264,14 +254,13 @@ theorem boolean_xor_error_reduce {q n ell : Nat}
     boolean_product_error_reduce]
   simp only [two_smul]
 
-theorem generated_encrypted_not_within (backend : BackendContext)
-    (params : Stage_decrypt.Params) (layer lane B : Nat)
+theorem generated_encrypted_not_within
+    (B : Nat)
     (onePublic leftPublic oneCipher leftCipher output : ExactMatrix q n 1 ell)
     (secret : ExactMatrix q n 1 1) (message : ExactPoly q n)
     (hone : BooleanEncodingWithin secret onePublic 1 oneCipher B)
     (hleft : BooleanEncodingWithin secret leftPublic message leftCipher B)
-    (hrun : Stage_decrypt.parallel_sequential_generatedRoot_67_14 backend params layer lane
-      (oneCipher, leftCipher, ()) output) :
+    (hrun : output = matrixSub oneCipher leftCipher) :
     BooleanEncodingWithin secret (onePublic - leftPublic) (1 - message) output (2 * B) := by
   obtain ⟨oneError, hone, honeBound⟩ := hone
   obtain ⟨leftError, hleft, hleftBound⟩ := hleft
@@ -279,14 +268,14 @@ theorem generated_encrypted_not_within (backend : BackendContext)
       reduceMatrix q n 1 ell oneError := by simpa only [one_smul] using hone
   refine ⟨oneError - leftError, ?_, ?_⟩
   · rw [boolean_reduce_sub]
-    exact generated_encrypted_not backend params layer lane onePublic leftPublic
+    exact generated_encrypted_not onePublic leftPublic
       oneCipher leftCipher _ _ output secret secret message hone' hleft hrun
   · simpa only [two_mul] using boolean_error_sub honeBound hleftBound
 
 /-- Both actual nonlinear gate outputs have bounded integer witnesses. The digit lift comes
     from the same generated decomposition relation used by both outputs. -/
 theorem generated_encrypted_product_xor_within
-    (params : Stage_decrypt.Params) (layer lane B : Nat)
+    (params : Stage_decrypt.Params) (B : Nat)
     (leftPublic rightPublic leftCipher rightCipher productTerm messageTerm product
       sum doubled output : ExactMatrix q n 1 ell)
     (secret messageMatrix : ExactMatrix q n 1 1)
@@ -294,21 +283,13 @@ theorem generated_encrypted_product_xor_within
     (hbit : messageMatrix 0 0 = if bit then 1 else 0)
     (hleft : BooleanEncodingWithin secret leftPublic (messageMatrix 0 0) leftCipher B)
     (hright : BooleanEncodingWithin secret rightPublic rightMessage rightCipher B)
-    (hdecompose : Stage_decrypt.parallel_sequential_generatedRoot_67_19
-      DiamondBackend.backend params layer lane rightPublic digits)
-    (hproduct : Stage_decrypt.parallel_sequential_generatedRoot_67_20
-      DiamondBackend.backend params layer lane (leftCipher, digits, ()) productTerm)
-    (hmessage : Stage_decrypt.parallel_sequential_generatedRoot_67_24
-      DiamondBackend.backend params layer lane (rightCipher, messageMatrix, ()) messageTerm)
-    (hproductSum : Stage_decrypt.parallel_sequential_generatedRoot_67_25
-      DiamondBackend.backend params layer lane (productTerm, messageTerm, ()) product)
-    (hsum : Stage_decrypt.parallel_sequential_generatedRoot_67_26
-      DiamondBackend.backend params layer lane (leftCipher, rightCipher, ()) sum)
-    (hdouble : Stage_decrypt.parallel_sequential_generatedRoot_67_28
-      DiamondBackend.backend params layer lane
-      (product, (matrixPolynomial [2] : ExactMatrix q n 1 1), ()) doubled)
-    (hsub : Stage_decrypt.parallel_sequential_generatedRoot_67_29
-      DiamondBackend.backend params layer lane (sum, doubled, ()) output) :
+    (hdecompose : gadgetDecomposeRuns DiamondBackend.backend params.diamond_gadget_base params.diamond_digit_count rightPublic digits)
+    (hproduct : productTerm = matrixMul leftCipher digits)
+    (hmessage : messageTerm = matrixMulScalarRight rightCipher messageMatrix)
+    (hproductSum : product = matrixAdd productTerm messageTerm)
+    (hsum : sum = matrixAdd leftCipher rightCipher)
+    (hdouble : doubled = matrixMulScalarRight product (matrixPolynomial [2] : ExactMatrix q n 1 1))
+    (hsub : output = matrixSub sum doubled) :
     BooleanEncodingWithin secret (leftPublic * digits)
       (messageMatrix 0 0 * rightMessage) product ((a + 1) * B) ∧
     BooleanEncodingWithin secret
@@ -317,10 +298,10 @@ theorem generated_encrypted_product_xor_within
       output (factor * B) := by
   obtain ⟨leftError, hl, hlBound⟩ := hleft
   obtain ⟨rightError, hr, hrBound⟩ := hright
-  obtain ⟨hp, hd⟩ := generated_encrypted_product params layer lane leftPublic rightPublic
+  obtain ⟨hp, hd⟩ := generated_encrypted_product params leftPublic rightPublic
     leftCipher rightCipher _ _ productTerm messageTerm product secret secret secret
     messageMatrix rightMessage digits hl hr hdecompose hproduct hmessage hproductSum
-  obtain ⟨hx, _⟩ := generated_encrypted_xor params layer lane leftPublic rightPublic
+  obtain ⟨hx, _⟩ := generated_encrypted_xor params leftPublic rightPublic
     leftCipher rightCipher _ _ productTerm messageTerm product sum doubled output
     secret messageMatrix rightMessage digits hl hr hdecompose hproduct hmessage hproductSum
     hsum hdouble hsub
@@ -351,7 +332,7 @@ theorem boolean_encoding_zero (secret : ExactMatrix q n 1 1) (B : Nat) :
 /-- One proof for each of the six gate constructors, universally quantified over runtime
     operands and the lane. The uniform bound is derived from the actual candidate scopes. -/
 theorem generated_boolean_candidates_within
-    (params : Stage_decrypt.Params) (layer lane B : Nat)
+    (params : Stage_decrypt.Params) (B : Nat)
     (onePublic leftPublic rightPublic oneCipher leftCipher rightCipher zero notValue
       productTerm messageTerm product sum doubled xorValue : ExactMatrix q n 1 ell)
     (secret messageMatrix : ExactMatrix q n 1 1)
@@ -360,25 +341,15 @@ theorem generated_boolean_candidates_within
     (hone : BooleanEncodingWithin secret onePublic 1 oneCipher B)
     (hleft : BooleanEncodingWithin secret leftPublic (messageMatrix 0 0) leftCipher B)
     (hright : BooleanEncodingWithin secret rightPublic rightMessage rightCipher B)
-    (hzero : Stage_decrypt.parallel_sequential_generatedRoot_67_6
-      DiamondBackend.backend params layer lane (oneCipher, oneCipher, ()) zero)
-    (hnot : Stage_decrypt.parallel_sequential_generatedRoot_67_14
-      DiamondBackend.backend params layer lane (oneCipher, leftCipher, ()) notValue)
-    (hdecompose : Stage_decrypt.parallel_sequential_generatedRoot_67_19
-      DiamondBackend.backend params layer lane rightPublic digits)
-    (hproduct : Stage_decrypt.parallel_sequential_generatedRoot_67_20
-      DiamondBackend.backend params layer lane (leftCipher, digits, ()) productTerm)
-    (hmessage : Stage_decrypt.parallel_sequential_generatedRoot_67_24
-      DiamondBackend.backend params layer lane (rightCipher, messageMatrix, ()) messageTerm)
-    (hproductSum : Stage_decrypt.parallel_sequential_generatedRoot_67_25
-      DiamondBackend.backend params layer lane (productTerm, messageTerm, ()) product)
-    (hsum : Stage_decrypt.parallel_sequential_generatedRoot_67_26
-      DiamondBackend.backend params layer lane (leftCipher, rightCipher, ()) sum)
-    (hdouble : Stage_decrypt.parallel_sequential_generatedRoot_67_28
-      DiamondBackend.backend params layer lane
-      (product, (matrixPolynomial [2] : ExactMatrix q n 1 1), ()) doubled)
-    (hsub : Stage_decrypt.parallel_sequential_generatedRoot_67_29
-      DiamondBackend.backend params layer lane (sum, doubled, ()) xorValue) :
+    (hzero : zero = matrixSub oneCipher oneCipher)
+    (hnot : notValue = matrixSub oneCipher leftCipher)
+    (hdecompose : gadgetDecomposeRuns DiamondBackend.backend params.diamond_gadget_base params.diamond_digit_count rightPublic digits)
+    (hproduct : productTerm = matrixMul leftCipher digits)
+    (hmessage : messageTerm = matrixMulScalarRight rightCipher messageMatrix)
+    (hproductSum : product = matrixAdd productTerm messageTerm)
+    (hsum : sum = matrixAdd leftCipher rightCipher)
+    (hdouble : doubled = matrixMulScalarRight product (matrixPolynomial [2] : ExactMatrix q n 1 1))
+    (hsub : xorValue = matrixSub sum doubled) :
     ∀ kind : Fin 6, BooleanEncodingWithin secret
       ([0, onePublic, leftPublic, onePublic - leftPublic, leftPublic * digits,
         leftPublic + rightPublic - (2 : ExactPoly q n) • (leftPublic * digits)].get kind)
@@ -387,11 +358,11 @@ theorem generated_boolean_candidates_within
         messageMatrix 0 0 + rightMessage - 2 * (messageMatrix 0 0 * rightMessage)].get kind)
       ([zero, oneCipher, leftCipher, notValue, product, xorValue].get kind)
       (factor * B) := by
-  have hz := generated_encrypted_zero DiamondBackend.backend params layer lane
+  have hz := generated_encrypted_zero
     oneCipher zero hzero
-  have hn := generated_encrypted_not_within DiamondBackend.backend params layer lane B
+  have hn := generated_encrypted_not_within B
     onePublic leftPublic oneCipher leftCipher notValue secret (messageMatrix 0 0) hone hleft hnot
-  obtain ⟨hp, hx⟩ := generated_encrypted_product_xor_within params layer lane B
+  obtain ⟨hp, hx⟩ := generated_encrypted_product_xor_within params B
     leftPublic rightPublic leftCipher rightCipher productTerm messageTerm product sum doubled
     xorValue secret messageMatrix rightMessage bit digits hbit hleft hright hdecompose
     hproduct hmessage hproductSum hsum hdouble hsub
@@ -419,68 +390,57 @@ theorem boolean_gate_message_closed {R : Type*} [CommRing R] (left right : R)
 
 /-- The actual three selectors preserve the invariant at their shared gate kind. Candidate
     invariants are local results such as generated_boolean_candidates_within. -/
-theorem generated_selected_encoding_within (backend : BackendContext)
-    (params : Stage_decrypt.Params) (layer lane B : Nat) (kind : Fin 6)
+theorem generated_selected_encoding_within
+    (B : Nat) (kind : Fin 6)
     (secret : ExactMatrix q n 1 1)
     (ciphertexts publicKeys : Fin 6 → ExactMatrix q n 1 ell)
     (messages : Fin 6 → ExactMatrix q n 1 1)
     (output publicOutput : ExactMatrix q n 1 ell) (messageOutput : ExactMatrix q n 1 1)
     (hinvariant : ∀ k, BooleanEncodingWithin secret (publicKeys k) (messages k 0 0)
       (ciphertexts k) B)
-    (hcipher : Stage_decrypt.parallel_sequential_generatedRoot_67_30 backend params layer lane
-      ((kind.val : Int), ciphertexts 0, ciphertexts 1, ciphertexts 2, ciphertexts 3,
-        ciphertexts 4, ciphertexts 5, ()) output)
-    (hpublic : Stage_decrypt.parallel_sequential_generatedRoot_67_41 backend params layer lane
-      ((kind.val : Int), publicKeys 0, publicKeys 1, publicKeys 2, publicKeys 3,
-        publicKeys 4, publicKeys 5, ()) publicOutput)
-    (hmessage : Stage_decrypt.parallel_sequential_generatedRoot_67_52 backend params layer lane
-      ((kind.val : Int), messages 0, messages 1, messages 2, messages 3,
-        messages 4, messages 5, ()) messageOutput) :
+    (hcipher : MxxRuntime.select (kind.val : Int) [ciphertexts 0, ciphertexts 1, ciphertexts 2, ciphertexts 3, ciphertexts 4, ciphertexts 5] output)
+    (hpublic : MxxRuntime.select (kind.val : Int) [publicKeys 0, publicKeys 1, publicKeys 2, publicKeys 3, publicKeys 4, publicKeys 5] publicOutput)
+    (hmessage : MxxRuntime.select (kind.val : Int) [messages 0, messages 1, messages 2, messages 3, messages 4, messages 5] messageOutput) :
     BooleanEncodingWithin secret publicOutput (messageOutput 0 0) output B := by
-  have hc := generated_ciphertext_gate_selection backend params layer lane kind
+  have hc := generated_ciphertext_gate_selection kind
     (ciphertexts 0) (ciphertexts 1) (ciphertexts 2) (ciphertexts 3)
     (ciphertexts 4) (ciphertexts 5) output hcipher
-  have hp := generated_ciphertext_gate_selection backend params layer lane kind
+  have hp := generated_ciphertext_gate_selection kind
     (publicKeys 0) (publicKeys 1) (publicKeys 2) (publicKeys 3)
     (publicKeys 4) (publicKeys 5) publicOutput hpublic
-  rcases hmessage with ⟨selected, _, _, _, ⟨position, hposition, hselected⟩, hm⟩
+  rcases hmessage with ⟨position, hposition, hselected⟩
   have heq : position = kind := by
     apply Fin.ext
     dsimp at hposition
     omega
   subst position
-  have hm' := hm.trans hselected
+  have hm' := hselected
   have hi := hinvariant kind
   fin_cases kind <;> simpa only [List.get] using hc.symm ▸ hp.symm ▸ hm'.symm ▸ hi
 
 /-- Masking all three actual encoding components preserves the local bound, including the
     inactive branch whose ciphertext, public key, and message are all zero. -/
-theorem generated_masked_encoding_within (backend : BackendContext)
-    (params : Stage_decrypt.Params) (layer lane B : Nat) (active flag : Int)
+theorem generated_masked_encoding_within
+     (lane B : Nat) (active flag : Int)
     (secret : ExactMatrix q n 1 1)
     (selected publicSelected output publicOutput : ExactMatrix q n 1 ell)
     (messageSelected messageOutput : ExactMatrix q n 1 1)
     (hinvariant : BooleanEncodingWithin secret publicSelected (messageSelected 0 0) selected B)
-    (hflag : Stage_decrypt.parallel_sequential_generatedRoot_67_3 backend params
-      layer lane active flag)
-    (hcipher : Stage_decrypt.parallel_sequential_generatedRoot_67_31 backend params layer lane
-      (flag, 0, selected, ()) output)
-    (hpublic : Stage_decrypt.parallel_sequential_generatedRoot_67_42 backend params layer lane
-      (flag, 0, publicSelected, ()) publicOutput)
-    (hmessage : Stage_decrypt.parallel_sequential_generatedRoot_67_53 backend params layer lane
-      (flag, 0, messageSelected, ()) messageOutput) :
+    (hflag : flag = if decide (Int.ofNat lane ≤ active - 1) then 1 else 0)
+    (hcipher : MxxRuntime.select flag [0, selected] output)
+    (hpublic : MxxRuntime.select flag [0, publicSelected] publicOutput)
+    (hmessage : MxxRuntime.select flag [0, messageSelected] messageOutput) :
     BooleanEncodingWithin secret publicOutput (messageOutput 0 0) output B := by
-  have hc := generated_ciphertext_active_selection backend params layer lane active flag
+  have hc := generated_ciphertext_active_selection lane active flag
     0 selected output hflag hcipher
-  have hp := generated_ciphertext_active_selection backend params layer lane active flag
+  have hp := generated_ciphertext_active_selection lane active flag
     0 publicSelected publicOutput hflag hpublic
-  rcases hmessage with ⟨value, _, _, _, ⟨position, hposition, hselected⟩, hout⟩
+  rcases hmessage with ⟨position, hposition, hselected⟩
   by_cases ha : (lane : Int) < active
   · have hb : decide (Int.ofNat lane ≤ active - 1) = true := by
       apply decide_eq_true
       change (lane : Int) ≤ active - 1
       omega
-    dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_67_3] at hflag
     rw [hb] at hflag
     have hf : flag = 1 := hflag
     have heq : position = (⟨1, by decide⟩ : Fin 2) := by
@@ -488,14 +448,13 @@ theorem generated_masked_encoding_within (backend : BackendContext)
       dsimp at hposition ⊢
       omega
     subst position
-    have hm : messageOutput = messageSelected := hout.trans hselected
+    have hm : messageOutput = messageSelected := hselected
     rw [hc, hp, hm]
     simpa only [ha, ↓reduceIte] using hinvariant
   · have hb : decide (Int.ofNat lane ≤ active - 1) = false := by
       apply decide_eq_false
       change ¬ (lane : Int) ≤ active - 1
       omega
-    dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_67_3] at hflag
     rw [hb] at hflag
     have hf : flag = 0 := hflag
     have heq : position = (⟨0, by decide⟩ : Fin 2) := by
@@ -503,7 +462,7 @@ theorem generated_masked_encoding_within (backend : BackendContext)
       dsimp at hposition ⊢
       omega
     subst position
-    have hm : messageOutput = 0 := hout.trans hselected
+    have hm : messageOutput = 0 := hselected
     have hz := boolean_encoding_zero secret B
     rw [hc, hp, hm]
     simpa only [ha, ↓reduceIte, Matrix.zero_apply] using hz

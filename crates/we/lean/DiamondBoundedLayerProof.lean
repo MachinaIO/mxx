@@ -41,12 +41,10 @@ theorem generated_bounded_injector_lane
         reducePoly q n (row 0 1) =
           if state.val = 0 then (if message then 1 else 0)
           else reducePoly q n commonSecret * (if bits (state.val - 1) then 1 else 0))
-    (hsource : Stage_decrypt.parallel_sequential_generatedRoot_8_5 backend decryptParams
-      layer lane.val (Int.ofNat layer * decryptParams.diamond_batch_bits + 1) sourceIndex)
-    (hgather : Stage_decrypt.parallel_sequential_generatedRoot_8_7 backend decryptParams
-      layer lane.val (sourceIndex, states, ()) current)
-    (hstep : Stage_decrypt.parallel_sequential_generatedRoot_8_13 backend decryptParams
-      layer lane.val (current, transitions slot, ()) next) :
+    (hsource : select (if decide ((layer : Int) * decryptParams.diamond_batch_bits + 1 ≤ (lane.val : Int)) then 1 else 0)
+      [(lane.val : Int), 0] sourceIndex)
+    (hgather : familyGetDynamic states sourceIndex current)
+    (hstep : next = current * transitions slot) :
     ∃ (samplePosition : Fin sampleCount) (targetPosition : Fin basePoolCount)
       (row : ErrorMatrix n 1 2) (error : ErrorMatrix n 1 inner),
       samplePosition.val = layer * digitBase + digit.val ∧
@@ -65,27 +63,23 @@ theorem generated_bounded_injector_lane
       1 + params.diamond_batch_bits * params.diamond_input_count := producer.stateCount.symm
   have hsetup := producer.sourceIndicesRun slot
   have htargetIndex := producer.targetIndicesRun slot
-  change Stage_encrypt.parallel_generatedRoot_65 backend hashModel params slot.val ()
-    (producer.sourceIndices slot) at hsetup
-  change Stage_encrypt.parallel_generatedRoot_70 backend hashModel params slot.val ()
-    (producer.targetIndices slot) at htargetIndex
   rw [hslot] at hsetup htargetIndex
-  have hsource' : Stage_decrypt.parallel_sequential_generatedRoot_8_5 backend decryptParams
-      layer lane.val (Int.ofNat layer * params.diamond_batch_bits + 1) sourceIndex := by
+  have hsource' : select (if decide ((layer : Int) * params.diamond_batch_bits + 1 ≤ (lane.val : Int)) then 1 else 0)
+      [(lane.val : Int), 0] sourceIndex := by
     simpa only [hbatch] using hsource
-  have hsourceAddress := generated_source_index_agrees backend hashModel params decryptParams
+  have hsourceAddress := generated_source_index_agrees params
     DiamondProofParameters.stateCount digitBase layer (by decide) hdigits hstateGeometry hbase digit lane _ _ hsetup hsource'
-  have htargetAddress := generated_target_index backend hashModel params DiamondProofParameters.stateCount digitBase layer
+  have htargetAddress := generated_target_index params DiamondProofParameters.stateCount digitBase layer
     (by decide) hdigits hstateGeometry hbase digit lane _ htargetIndex
   obtain ⟨sourcePosition, hsourcePosition, hsourcePublic, _⟩ :=
-    generated_source_pool_lookup backend hashModel params slot.val _ _ _ _ _
+    generated_source_pool_lookup _ _ _ _ _
       (producer.sourcesRun slot)
   obtain ⟨targetPosition, htargetPosition, htargetPublic⟩ :=
-    generated_target_pool_lookup backend hashModel params slot.val _ _ _
+    generated_target_pool_lookup _ _ _
       (producer.targetPublicsRun slot)
-  have hbound := generated_source_index_bound backend decryptParams layer lane.val sourceIndex
+  have hbound := generated_source_index_bound decryptParams layer lane.val sourceIndex
     hbatchNonneg hsource
-  rcases hgather with ⟨value, _, _, ⟨state, hstate, hvalue⟩, hout⟩
+  rcases hgather with ⟨state, hstate, hvalue⟩
   obtain ⟨basePosition, row, error, hbasePosition, hrow, hcurrent, hrowBound, herrorBound,
     hcoordinateMeaning⟩ :=
     hinvariant state (by omega)
@@ -97,16 +91,16 @@ theorem generated_bounded_injector_lane
   have hcurrent' : current = reduceMatrix q n 1 2 row * producer.sourcePublics slot +
       reduceMatrix q n 1 inner error := by
     rw [hsourcePublic, hpositions]
-    exact hout.trans (hvalue.trans hcurrent)
+    exact hvalue.trans hcurrent
   obtain ⟨samplePosition, hsamplePosition, hsecret, hsecretBound⟩ :=
     producer_integer_selected_secret backend hashModel params message initial transitions
       producer samples hsamples slot
   obtain ⟨selectorWitness, nextRow, nextError, hrowReduce, hfirst, hnext,
     hnextRowBound, hnextErrorBound⟩ :=
-    generated_integer_transition backend hashModel params decryptParams message initial
-      transitions producer slot layer lane.val row error (samples samplePosition)
+    generated_integer_transition backend hashModel params message initial
+      transitions producer slot row error (samples samplePosition)
       rowBound errorBound current next hsecret hsecretBound hrowBound herrorBound hcurrent' hstep
-  have hdigitIndex := (producer.digitIndicesRun slot).2
+  have hdigitIndex := producer.digitIndicesRun slot
   change producer.digitIndices slot = Int.ofNat slot.val /
     (1 + params.diamond_batch_bits * params.diamond_input_count) at hdigitIndex
   rw [producer.stateCount, hslot] at hdigitIndex
@@ -138,7 +132,7 @@ theorem generated_bounded_injector_lane
     have hbefore : (lane.val : Int) < (layer : Int) * decryptParams.diamond_batch_bits + 1 := by
       rw [← hbatch, ← hbatchNat]
       exact_mod_cast Nat.lt_succ_of_le hexisting
-    have hsourceEq := generated_existing_source_index backend decryptParams layer lane.val
+    have hsourceEq := generated_existing_source_index decryptParams layer lane.val
       sourceIndex hbefore hsource
     have hs : state.val = lane.val := by exact_mod_cast hstate.trans hsourceEq
     simpa only [hs] using hcoordinateMeaning
@@ -178,8 +172,8 @@ theorem generated_bounded_injector_layer
         reducePoly q n (row 0 1) =
           if state.val = 0 then (if message then 1 else 0)
           else reducePoly q n commonSecret * (if bits (state.val - 1) then 1 else 0))
-    (hrun : Stage_decrypt.sequential_generatedRoot_8 backend decryptParams layer
-      (states, packed, transitions, ()) outputs) :
+    (hrun : Stage_decrypt.sequential_generatedRoot_6 backend decryptParams layer
+      (states, transitions, packed, ()) outputs) :
     ∃ (digit : Fin digitBase) (samplePosition : Fin sampleCount),
       familyGetDynamic packed (Int.ofNat layer) (digit.val : Int) ∧
       samplePosition.val = layer * digitBase + digit.val ∧
@@ -197,11 +191,10 @@ theorem generated_bounded_injector_layer
           if lane.val = 0 then (if message then 1 else 0)
           else reducePoly q n (row 0 0) * (if bits (lane.val - 1) then 1 else 0)) := by
   obtain ⟨scopeWitness, facts⟩ := hrun
-  rcases scopeWitness with ⟨sourceIndices, sourceStates, digitValue, transitionIndices,
-    selectedTransitions, nextStates⟩
-  dsimp only [Stage_decrypt.sequential_generatedRoot_8.body] at facts
-  rcases facts with ⟨hstateGeometry, hsources, _, hgathers, _, _, hdigitGet,
-    _, hindices, _, htransitions, _, hsteps, hout⟩
+  rcases scopeWitness with ⟨digitValue, nextStates⟩
+  dsimp only [Stage_decrypt.sequential_generatedRoot_6.body,
+    Stage_decrypt.sequential_generatedRoot_6.constraints_0] at facts
+  rcases facts with ⟨_, _, hdigitGet, hstateGeometry, hlanesRun, hout⟩
   obtain ⟨packedPosition, hpackedPosition, hpackedValue⟩ := hdigitGet
   have hdigitBounds : 0 ≤ digitValue ∧ digitValue < digitBase := by
     rw [hpackedValue]
@@ -225,19 +218,29 @@ theorem generated_bounded_injector_layer
         if lane.val = 0 then (if message then 1 else 0)
         else reducePoly q n (row 0 0) * (if bits (lane.val - 1) then 1 else 0)) := by
     intro lane
-    have hindexRun := hindices lane
-    change Stage_decrypt.parallel_sequential_generatedRoot_8_10 backend decryptParams layer
-      lane.val (Int.ofNat layer, digitValue, ()) (transitionIndices lane) at hindexRun
-    rw [← hdigitValue] at hindexRun
-    have hindex := generated_runtime_transition_index backend decryptParams DiamondProofParameters.stateCount digitBase layer
+    have hlane := hlanesRun lane
+    dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_6_9,
+      Stage_decrypt.parallel_sequential_generatedRoot_6_9.constraints_0] at hlane
+    rcases hlane with ⟨sourceIndex, sourceState, selectedTransition,
+      _, _, _, hsource, _, _, hgather, _, _, htransition, hstep⟩
+    simp only [add_zero] at hsource
+    let transitionIndex : Int := (layer : Int) *
+      (decryptParams.diamond_batch_bits * decryptParams.diamond_digit_base *
+        decryptParams.diamond_input_count + decryptParams.diamond_digit_base) +
+      digitValue * (1 + decryptParams.diamond_batch_bits * decryptParams.diamond_input_count) +
+      (lane.val : Int)
+    have hindexRun : transitionIndex = (layer : Int) *
+      (decryptParams.diamond_batch_bits * decryptParams.diamond_digit_base *
+        decryptParams.diamond_input_count + decryptParams.diamond_digit_base) +
+      (digit.val : Int) * (1 + decryptParams.diamond_batch_bits * decryptParams.diamond_input_count) +
+      (lane.val : Int) := by rw [hdigitValue]
+    have hindex := generated_runtime_transition_index decryptParams DiamondProofParameters.stateCount digitBase layer
       digit.val lane.val hstateGeometry.symm (hbase.trans hbaseParams) _ hindexRun
-    obtain ⟨slot, hslotIndex, hslotValue⟩ := generated_selected_transition_lookup backend
-      decryptParams layer lane.val _ _ _ (htransitions lane)
+    obtain ⟨slot, hslotIndex, hslotValue⟩ := generated_selected_transition_lookup _ _ _ htransition
     have hslot : slot.val = (layer * digitBase + digit.val) * DiamondProofParameters.stateCount + lane.val := by
       exact_mod_cast hslotIndex.trans hindex
-    have hstep : Stage_decrypt.parallel_sequential_generatedRoot_8_13 backend decryptParams
-        layer lane.val (sourceStates lane, transitions slot, ()) (nextStates lane) := by
-      simpa only [hslotValue] using hsteps lane
+    have hstep' : nextStates lane = sourceState * transitions slot := by
+      simpa only [matrixMul, hslotValue] using hstep
     exact generated_bounded_injector_lane backend hashModel params decryptParams message initial
       transitions producer samples hsamples digitBase layer hdigits hbase hbatch hbatchNonneg
       digit lane slot batch hbatchNat bits (by
@@ -248,8 +251,8 @@ theorem generated_bounded_injector_layer
         have hvalueEq : packed packedPosition = (digit.val : Int) :=
           hpackedValue.symm.trans hdigitValue.symm
         simpa only [hposition, hvalueEq] using hpackedBits packedPosition bit hbit)
-      hslot states commonSecret rowBound errorBound (sourceIndices lane)
-      (sourceStates lane) (nextStates lane) hinvariant (hsources lane) (hgathers lane) hstep
+      hslot states commonSecret rowBound errorBound sourceIndex
+      sourceState (nextStates lane) hinvariant hsource hgather hstep'
   obtain ⟨samplePosition, _, _, _, hsamplePosition, _⟩ := hlanes 0
   refine ⟨digit, samplePosition, ?_, hsamplePosition, ?_⟩
   · exact ⟨packedPosition, hpackedPosition, hdigitValue.trans hpackedValue⟩

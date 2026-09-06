@@ -17,7 +17,7 @@ theorem claim_zero_state_encoding {hashModel external execution}
     ∃ selector : ExactMatrix q n 1 2,
       selector 0 0 = reducePoly q n w.commonSecret ∧
       selector 0 1 = (if external.input_7 then 1 else 0) ∧
-      Approx (execution.stage_1.2.2.2.2.2.2.1 0)
+      Approx (w.decryptRoot.w_6_0 0)
         (selector * w.finalPublic.base) claimInjectorNoise := by
   obtain ⟨position, row, error, hposition, hsecret, hstate, _, herror, hmessage⟩ := w.states 0
   have hpos : position = w.terminal := by

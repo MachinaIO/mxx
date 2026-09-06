@@ -2416,6 +2416,38 @@ mod tests {
     }
 
     #[test]
+    fn export_supports_integer_expression_semantics() {
+        for (expression, expected) in [
+            (IntExpr::FloorDiv(Box::new(7.into()), Box::new(2.into())), "Int.fdiv (7) (2)"),
+            (IntExpr::Rem(Box::new(7.into()), Box::new(2.into())), "Int.fmod (7) (2)"),
+            (
+                IntExpr::Select { selector: Box::new(0.into()), branches: vec![7.into()] },
+                "MxxIR.selectInt (0) [(7)]",
+            ),
+        ] {
+            let value = NodeHandle::new(
+                NodeKind::EvaluateInt(expression),
+                vec![],
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .unwrap();
+            let (graph, _) = Graph::freeze(
+                "supported-expression",
+                vec![],
+                BTreeMap::from([("value".into(), GraphOutput { value, confidentiality: None })]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+            let artifact = export(&validated, &ExportOptions::default()).unwrap();
+            assert!(artifact.source.contains(expected));
+        }
+    }
+
+    #[test]
     fn export_boundary_preserves_retained_roots_and_output_aliases() {
         let x = scalar_input("source");
         let retained =

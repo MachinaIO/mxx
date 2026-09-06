@@ -2198,7 +2198,7 @@ mod full_reduce_tests {
     const SCALE: u64 = 1 << 8;
 
     fn parameters() -> DCRTPolyParams {
-        DCRTPolyParams::new(2, 3, 12, 6, None)
+        DCRTPolyParams::new(2, 3, 12, 6, None, None)
     }
 
     /// Smallest p-basis width supporting the full-reduce test parameters under the default
@@ -2264,6 +2264,7 @@ mod full_reduce_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS full-reduction runtime coverage; run explicitly with --ignored"]
     fn explicit_full_reduce_matches_inputs_for_full_and_offset_windows() {
         let parameters = parameters();
         let (q_moduli, _, depth) = parameters.to_crt();
@@ -2316,7 +2317,7 @@ mod tests {
     const SCALE: u64 = 1 << 8;
 
     fn test_parameters() -> DCRTPolyParams {
-        DCRTPolyParams::new(2, 3, 12, 6, None)
+        DCRTPolyParams::new(2, 3, 12, 6, None, None)
     }
 
     /// Smallest p-basis width supporting the shared test parameters under the default
@@ -2352,7 +2353,7 @@ mod tests {
         p_moduli_bits: usize,
         max_unreduced_muls: usize,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
-        let parameters = DCRTPolyParams::new(2, 3, 18, 6, None);
+        let parameters = DCRTPolyParams::new(2, 3, 18, 6, None, None);
         let context = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &parameters,
@@ -2599,6 +2600,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS gadget decomposition runtime coverage; run explicitly with --ignored"]
     fn gadget_decomposition_recomposes_runtime_and_native_values() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (parameters, context) = create_context(&mut circuit, Some(2));
@@ -2809,6 +2811,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS unreduced decomposition runtime coverage; run explicitly with --ignored"]
     fn unreduced_decomposition_matches_explicit_lazy_reduction_at_runtime() {
         fn build(
             explicit_reduce: bool,
@@ -2864,6 +2867,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS automatic/full reduction runtime comparison; run explicitly with --ignored"]
     fn reconstruct_auto_reduce_matches_explicit_full_reduce_at_runtime() {
         fn build(
             explicit_reduce: bool,

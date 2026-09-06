@@ -18,15 +18,15 @@ theorem generated_decomposition_reconstruct
     gadget * digits = target ∧ PreimageWithin digits D := by
   rcases hrun with ⟨value, hdecomp, hout⟩
   subst value
-  rcases hdecomp with ⟨layout, hlookup, _, _, hwidth, hdigits⟩
+  rcases hdecomp with ⟨layout, hlookup, _, _, hwidth, hdigits, _⟩
   have hl : layout = DiamondBackend.layout0 := by
     simpa [DiamondBackend.backend] using hlookup.symm
   subst layout
   have hd : digits = regularDecomposeMatrix DiamondBackend.layout0 target := by
-    simpa only [castMatrixRows] using hdigits
-  subst digits
+    simpa [castMatrixRows] using hdigits
+  rw [hd]
   constructor
-  · exact regularGadgetMatrix_reconstruct DiamondBackend.layout0 target (by decide) (by decide)
+  · exact regularGadgetMatrix_reconstruct DiamondBackend.layout0 target (by decide) (by decide) (by decide)
   · exact regularDecomposeMatrix_bounded DiamondBackend.layout0 target (by decide) (by decide)
 
 theorem generated_encrypted_product

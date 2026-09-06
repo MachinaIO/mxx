@@ -1343,7 +1343,7 @@ mod tests {
 
     #[test]
     fn private_prfe_decodes_with_nonzero_sampling_noise() {
-        let parameters = DCRTPolyParams::new(2, 1, 6, 1, None);
+        let parameters = DCRTPolyParams::new(2, 1, 6, 1, None, None);
         let mut config = config(&parameters);
         config.security_parameter_bits = 1;
         let test_error_sigma = RealExpr::from_f64_exact(0.125).unwrap();
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     fn ciphertext_canonical_bits_roundtrip_at_runtime_inner() {
-        let parameters = DCRTPolyParams::new(2, 1, 6, 1, None);
+        let parameters = DCRTPolyParams::new(2, 1, 6, 1, None, None);
         let mut config = config(&parameters);
         config.security_parameter_bits = 1;
         let layer = PrivatePrfeLayerWires::setup(&config, 1).unwrap();
@@ -1470,7 +1470,7 @@ mod tests {
     #[test]
     #[ignore = "canonical-bit GSW execution exceeds six minutes even at the minimum ring size"]
     fn private_prfe_evaluates_a_goldreich_predicate_with_gsw_multiplication() {
-        let parameters = DCRTPolyParams::new(1, 1, 2, 1, None);
+        let parameters = DCRTPolyParams::new(1, 1, 2, 1, None, None);
         let mut config = config(&parameters);
         config.security_parameter_bits = 1;
         // Keep every Appendix B.1 error tape nonzero while leaving a clear
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test]
     fn arithmetic_veval_builds_products_with_two_derived_operands() {
-        let parameters = DCRTPolyParams::new(2, 1, 6, 1, None);
+        let parameters = DCRTPolyParams::new(2, 1, 6, 1, None, None);
         let mut config = config(&parameters);
         config.modulus = BigInt::from(3);
         config.ring_dimension = 1;
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[test]
     fn modulus_split_rounds_positive_and_negative_centered_coefficients() {
-        let parameters = DCRTPolyParams::new(8, 2, 20, 1, None);
+        let parameters = DCRTPolyParams::new(8, 2, 20, 1, None, None);
         let mut config = config(&parameters);
         let split = BigInt::from(parameters.to_crt().0[0]);
         config.modulus_split = split.clone();

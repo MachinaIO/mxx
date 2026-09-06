@@ -514,6 +514,7 @@ pub fn check_refresh_bundle(
         candidate.crt_bits,
         candidate.base_bits,
         None,
+        None,
     );
     let rings = bundle.ring_parameters(parameters).map_err(|error| error.to_string())?;
     let layouts =
@@ -700,6 +701,7 @@ fn fresh_error_margins(
         candidate.crt_depth,
         candidate.crt_bits,
         candidate.base_bits,
+        None,
         None,
     );
     let bound = BigUint::from(config.sparse_lwr_output_modulus)
@@ -1076,9 +1078,8 @@ fn parse_lookup_u64(name: &str, value: &str) -> Result<u64, String> {
 }
 
 /// Returns the reviewed CRT/base search order: base widths descend globally,
-/// with CRT widths descending as the tie-break. The backend validates each
-/// generated pair for the concrete candidate; this helper does not impose a
-/// base-width heuristic such as `base_bits <= crt_bits / 2`.
+/// with CRT widths descending as the tie-break. Only backend-supported pairs
+/// are generated; the exact sampler requires `base_bits <= crt_bits / 2`.
 pub fn descending_crt_base_bits_grid(max_crt_bits: usize) -> Vec<(usize, u32)> {
     let mut widths = [max_crt_bits, 32, 30, 28]
         .into_iter()
@@ -1090,6 +1091,9 @@ pub fn descending_crt_base_bits_grid(max_crt_bits: usize) -> Vec<(usize, u32)> {
     (1..=max_base_bits as u32)
         .rev()
         .flat_map(|base_bits| widths.iter().copied().map(move |crt_bits| (crt_bits, base_bits)))
+        .filter(|&(crt_bits, base_bits)| {
+            DCRTPolyParams::validate_capability(1, 1, crt_bits, base_bits).is_ok()
+        })
         .collect()
 }
 
@@ -2268,12 +2272,13 @@ pub(crate) fn reviewed_bgg_security_bits(
     if candidate.crt_depth == 0 || candidate.crt_depth > 27 {
         return Err(format!("{REVIEWED_BGG_ENVELOPE_SOURCE} covers CRT depth 1..=27 only"));
     }
-    let q27 = DCRTPolyParams::new(1 << 16, 27, 50, 25, None).modulus();
+    let q27 = DCRTPolyParams::new(1 << 16, 27, 50, 25, None, None).modulus();
     let candidate_q = DCRTPolyParams::new(
         1 << candidate.log_ring_dimension,
         candidate.crt_depth,
         candidate.crt_bits,
         candidate.base_bits,
+        None,
         None,
     )
     .modulus();
@@ -2365,6 +2370,7 @@ fn build_candidate_context(
         candidate.crt_depth,
         candidate.crt_bits,
         candidate.base_bits,
+        None,
         None,
     );
     let (crt_moduli, _, _) = dcrt.to_crt();
@@ -3268,7 +3274,7 @@ pub fn hex(bytes: [u8; 32]) -> String {
 
 /// Small real-graph fixture shared by runtime smoke tests.
 pub fn tiny_native_refresh_bundle() -> (DCRTPolyParams, RefreshParameterSimulationBundle, usize) {
-    let poly_parameters = DCRTPolyParams::new(32, 2, 10, 10, None);
+    let poly_parameters = DCRTPolyParams::new(32, 2, 10, 5, None, None);
     let modulus = poly_parameters.modulus().as_ref().clone();
     let (crt_moduli, _, _) = poly_parameters.to_crt();
     let ring = mxx_dsl::Ring::new(
@@ -3288,8 +3294,8 @@ pub fn tiny_native_refresh_bundle() -> (DCRTPolyParams, RefreshParameterSimulati
             modulus: BigInt::from_biguint(num_bigint::Sign::Plus, modulus.clone()).into(),
             ring_dimension: 32.into(),
             secret_dimension: 2,
-            digit_count: 2,
-            gadget_base: (1usize << 10).into(),
+            digit_count: poly_parameters.modulus_digits(),
+            gadget_base: (1usize << poly_parameters.base_bits()).into(),
         },
         RefreshCompiler {
             full_modulus: BigInt::from_biguint(num_bigint::Sign::Plus, modulus).into(),

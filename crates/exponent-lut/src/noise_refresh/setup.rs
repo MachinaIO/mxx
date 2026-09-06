@@ -6401,7 +6401,7 @@ pub(crate) mod tests {
         let bits = parameter("MXX_PRIMITIVE_TEST_CRT_BITS", 40) as usize;
         let base_bits = parameter("MXX_PRIMITIVE_TEST_BASE_BITS", 4);
         assert!(depth >= 3, "mixed-P round trip requires at least three towers");
-        let parameters = DCRTPolyParams::new(n, depth, bits, base_bits, None);
+        let parameters = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
         let q = parameters.modulus().as_ref().clone();
         let (primes, _, _) = parameters.to_crt();
         let ring = mxx_dsl::Ring::new(BigInt::from(q.clone()), n as usize);

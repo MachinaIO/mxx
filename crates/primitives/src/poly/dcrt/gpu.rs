@@ -335,16 +335,22 @@ unsafe extern "C" {
         small: c_int,
         full_size: usize,
         global_column_start: usize,
+        dropped_moduli: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_fill_small_decomposed_identity_chunk(
         out: *mut GpuMatrixOpaque,
         scalar_by_digit: *const GpuMatrixOpaque,
         chunk_idx: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_correct_gadget_residues(
+        src: *mut GpuMatrixOpaque,
+        dropped_moduli: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_decompose_base(
         src: *const GpuMatrixOpaque,
         base_bits: u32,
         out: *mut GpuMatrixOpaque,
+        dropped_moduli: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_decompose_base_small(
         src: *const GpuMatrixOpaque,
@@ -466,6 +472,7 @@ unsafe extern "C" {
         max_coefficient_bound: *const u64,
         bound_word_count: usize,
         out: *mut GpuSmallMatrixOpaque,
+        dropped_moduli: usize,
     ) -> c_int;
     pub(crate) fn gpu_small_matrix_prepare_preimage_hard_cutoff(
         mat: *mut GpuSmallMatrixOpaque,
@@ -804,6 +811,7 @@ pub struct GpuDCRTPolyParams {
     crt_depth: usize,
     modulus: Arc<BigUint>,
     base_bits: u32,
+    dropped_moduli: usize,
     gpu_ids: Vec<i32>,
     dnum: u32,
     vram_percent: u32,
@@ -817,6 +825,7 @@ impl Debug for GpuDCRTPolyParams {
             .field("crt_depth", &self.crt_depth)
             .field("crt_bits", &self.crt_bits)
             .field("base_bits", &self.base_bits)
+            .field("dropped_moduli", &self.dropped_moduli)
             .field("gpu_ids", &self.gpu_ids)
             .field("dnum", &self.dnum)
             .field("vram_percent", &self.vram_percent)
@@ -829,6 +838,7 @@ impl PartialEq for GpuDCRTPolyParams {
         self.ring_dimension == other.ring_dimension &&
             self.moduli == other.moduli &&
             self.base_bits == other.base_bits &&
+            self.dropped_moduli == other.dropped_moduli &&
             self.gpu_ids == other.gpu_ids &&
             self.dnum == other.dnum &&
             self.vram_percent == other.vram_percent
@@ -841,7 +851,12 @@ impl Default for GpuDCRTPolyParams {
     fn default() -> Self {
         let cpu_params = DCRTPolyParams::default();
         let (moduli, _, _) = cpu_params.to_crt();
-        Self::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits())
+        Self::new(
+            cpu_params.ring_dimension(),
+            moduli,
+            cpu_params.base_bits(),
+            Some(cpu_params.dropped_moduli()),
+        )
     }
 }
 
@@ -865,7 +880,11 @@ impl PolyParams for GpuDCRTPolyParams {
     }
 
     fn modulus_digits(&self) -> usize {
-        self.crt_bits.div_ceil(self.base_bits as usize) * self.crt_depth
+        self.crt_bits.div_ceil(self.base_bits as usize) * (self.crt_depth - self.dropped_moduli)
+    }
+
+    fn dropped_moduli(&self) -> usize {
+        self.dropped_moduli
     }
 
     fn to_crt(&self) -> (Vec<u64>, usize, usize) {
@@ -873,6 +892,9 @@ impl PolyParams for GpuDCRTPolyParams {
     }
 
     fn select_modulus(&self, modulus: &BigUint) -> Option<Self> {
+        if self.dropped_moduli != 0 {
+            return None;
+        }
         let moduli = self
             .moduli
             .iter()
@@ -891,6 +913,7 @@ impl PolyParams for GpuDCRTPolyParams {
             self.gpu_ids.clone(),
             Some(self.dnum),
             Some(self),
+            None,
         ))
     }
 
@@ -928,6 +951,7 @@ impl PolyParams for GpuDCRTPolyParams {
             modulus: self.modulus.clone(),
             base_bits: self.base_bits,
             gpu_ids: vec![device_id],
+            dropped_moduli: self.dropped_moduli,
             dnum: 1,
             vram_percent: self.vram_percent,
             ctx,
@@ -981,14 +1005,33 @@ impl GpuDCRTPolyParams {
         created
     }
 
-    pub fn new(ring_dimension: u32, moduli: Vec<u64>, base_bits: u32) -> Self {
+    pub fn new(
+        ring_dimension: u32,
+        moduli: Vec<u64>,
+        base_bits: u32,
+        dropped_moduli: Option<usize>,
+    ) -> Self {
         let gpu_ids = available_gpu_ids();
         // Default params stay single-device so low-level matrix/poly ops keep the
         // invariant that all limbs of a matrix live on one device.
         let default_gpu_ids = gpu_ids.into_iter().take(1).collect::<Vec<_>>();
-        Self::new_with_gpu(ring_dimension, moduli, base_bits, default_gpu_ids, None, None)
+        Self::new_with_gpu(
+            ring_dimension,
+            moduli,
+            base_bits,
+            default_gpu_ids,
+            None,
+            None,
+            dropped_moduli,
+        )
     }
 
+    /// Constructs parameters with an explicit GPU placement.
+    ///
+    /// Approximate decomposition (`dropped_moduli > 0`) requires all CRT limbs
+    /// in one partition: use at most one GPU ID, or explicitly set `dnum = 1`.
+    /// Unsupported placements panic before creating a CUDA context. Exact
+    /// decomposition (`dropped_moduli = 0`) retains multi-partition support.
     pub fn new_with_gpu(
         ring_dimension: u32,
         moduli: Vec<u64>,
@@ -996,13 +1039,24 @@ impl GpuDCRTPolyParams {
         gpu_ids: Vec<i32>,
         dnum: Option<u32>,
         related: Option<&Self>,
+        dropped_moduli: Option<usize>,
     ) -> Self {
         assert!(!moduli.is_empty(), "moduli must not be empty");
         let crt_depth = moduli.len();
         let crt_bits = moduli.iter().map(|m| bits_in_u64(*m)).max().unwrap_or(0);
+        let dropped_moduli = dropped_moduli.unwrap_or(0);
+        assert!(dropped_moduli < crt_depth, "dropped_moduli must be less than crt_depth");
+        assert!(
+            base_bits > 0 && base_bits as usize <= crt_bits / 2,
+            "base_bits must be positive and <= crt_bits / 2"
+        );
         let modulus = moduli.iter().fold(BigUint::one(), |acc, m| acc * m);
         let dnum =
             dnum.unwrap_or_else(|| if gpu_ids.is_empty() { 1 } else { gpu_ids.len() as u32 });
+        assert!(
+            dropped_moduli == 0 || gpu_ids.len() <= 1 || dnum == 1,
+            "approximate gadget decomposition requires all CRT limbs in one GPU partition: use one GPU ID or dnum = 1"
+        );
         let vram_percent = crate::env::gpu_vram_percent()
             .unwrap_or_else(|error| panic!("invalid GPU VRAM percentage: {error}"));
         let log_n = log2_u32(ring_dimension);
@@ -1022,6 +1076,7 @@ impl GpuDCRTPolyParams {
             crt_depth,
             modulus: Arc::new(modulus),
             base_bits,
+            dropped_moduli,
             gpu_ids,
             dnum,
             vram_percent,
@@ -1732,13 +1787,49 @@ mod tests {
     };
     use rand::prelude::*;
 
+    #[test]
+    fn test_gpu_approximate_params_reject_partitioned_placement_before_context_creation() {
+        for dnum in [None, Some(0), Some(2), Some(4)] {
+            // Invalid device IDs prove that validation happens before CUDA setup.
+            // dnum = 0 is resolved to the GPU count by the CUDA constructor.
+            let error = std::panic::catch_unwind(|| {
+                GpuDCRTPolyParams::new_with_gpu(
+                    8,
+                    vec![97, 113],
+                    3,
+                    vec![-1, -2],
+                    dnum,
+                    None,
+                    Some(1),
+                )
+            })
+            .expect_err("partitioned approximate parameters must be rejected");
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied())
+                .expect("panic message");
+            assert!(
+                message.contains(
+                    "approximate gadget decomposition requires all CRT limbs in one GPU partition"
+                ),
+                "unexpected panic: {message}"
+            );
+        }
+    }
+
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 17, 1, None)
+        DCRTPolyParams::new(128, 2, 17, 1, None, None)
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
         let (moduli, _crt_bits, _crt_depth) = params.to_crt();
-        GpuDCRTPolyParams::new(params.ring_dimension(), moduli, params.base_bits())
+        GpuDCRTPolyParams::new(
+            params.ring_dimension(),
+            moduli,
+            params.base_bits(),
+            Some(params.dropped_moduli()),
+        )
     }
 
     fn gpu_poly_from_cpu(poly: &DCRTPoly, gpu_params: &GpuDCRTPolyParams) -> GpuDCRTPoly {
@@ -1758,6 +1849,7 @@ mod tests {
             vec![device],
             Some(1),
             None,
+            None,
         );
         let source_state = gpu_device_memory_usage(device).unwrap();
         assert_eq!(source_state.live_contexts, before.live_contexts + 1);
@@ -1768,6 +1860,7 @@ mod tests {
             vec![device],
             Some(1),
             Some(&source),
+            None,
         );
         let other = GpuDCRTPolyParams::new_with_gpu(
             32,
@@ -1776,6 +1869,7 @@ mod tests {
             vec![device],
             Some(1),
             Some(&source),
+            None,
         );
         assert_eq!(low.ctx.execution_identity(), source.ctx.execution_identity());
         assert_ne!(low.ctx_raw(), source.ctx_raw());
@@ -1783,8 +1877,15 @@ mod tests {
         let related_state = gpu_device_memory_usage(device).unwrap();
         assert_eq!(related_state.live_contexts, source_state.live_contexts);
         assert!(related_state.context_generation >= source_state.context_generation + 2);
-        let independent =
-            GpuDCRTPolyParams::new_with_gpu(32, vec![131_009], 2, vec![device], Some(1), None);
+        let independent = GpuDCRTPolyParams::new_with_gpu(
+            32,
+            vec![131_009],
+            2,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
         assert_ne!(independent.ctx.execution_identity(), low.ctx.execution_identity());
         assert_eq!(
             gpu_device_memory_usage(device).unwrap().live_contexts,
@@ -1827,7 +1928,7 @@ mod tests {
         let name = "MXX_GPU_VRAM_PERCENT";
         let previous = std::env::var_os(name);
         unsafe { std::env::set_var(name, "37") };
-        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
         match previous {
             Some(value) => unsafe { std::env::set_var(name, value) },
             None => unsafe { std::env::remove_var(name) },
@@ -1842,7 +1943,7 @@ mod tests {
     #[test]
     #[sequential]
     fn test_gpu_default_mempool_usage_and_high_water_reset() {
-        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2);
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
         let device = *params.gpu_ids().first().expect("GPU test requires one device");
         gpu_default_mempool_reset_high_water(device).expect("reset default mempool high-water");
         let usage = gpu_default_mempool_usage(device).expect("query default mempool usage");
@@ -1915,7 +2016,7 @@ mod tests {
         if devices.len() < 2 {
             return;
         }
-        let cpu = DCRTPolyParams::new(128, 4, 17, 1, None);
+        let cpu = DCRTPolyParams::new(128, 4, 17, 1, None, None);
         let (moduli, _, _) = cpu.to_crt();
         let params = GpuDCRTPolyParams::new_with_gpu(
             cpu.ring_dimension(),
@@ -1923,6 +2024,7 @@ mod tests {
             cpu.base_bits(),
             devices[..2].to_vec(),
             Some(2),
+            None,
             None,
         );
         assert_ne!(params.dnum as usize, params.crt_depth());

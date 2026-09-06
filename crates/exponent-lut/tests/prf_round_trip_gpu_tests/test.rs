@@ -57,6 +57,7 @@ fn test_gpu_prf_monomial_input_output_boundary() {
         params.ring_dimension(),
         params.to_crt().0,
         config.base_bits,
+        None,
     );
     let mut backend = gpu_backend_on([gpu_params], devices);
     let n = params.ring_dimension() as usize;
@@ -159,7 +160,7 @@ impl PrfTestParameters {
 
     fn build(&self) -> (DCRTPolyParams, RefreshSetupParameters, SparseLwrPrfProfile) {
         let Self { log_n, depth, crt_bits, base_bits, q_native, p, security, .. } = *self;
-        let params = DCRTPolyParams::new(1 << log_n, depth, crt_bits, base_bits, None);
+        let params = DCRTPolyParams::new(1 << log_n, depth, crt_bits, base_bits, None, None);
         let n = params.ring_dimension() as usize;
         let modulus = BigInt::from(params.modulus().as_ref().clone());
         let width_log2 = q_native.trailing_zeros() as usize - 1;
@@ -796,6 +797,7 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
         params.ring_dimension(),
         moduli,
         base_bits,
+        None,
     );
     {
         use mxx_bench_estimator::{

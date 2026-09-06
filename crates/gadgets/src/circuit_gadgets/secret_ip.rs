@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn runtime_result_matches_the_primitive_inner_product() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let ring = Ring::new(
             BigInt::from(parameters.modulus().as_ref().clone()),
             parameters.ring_dimension() as usize,

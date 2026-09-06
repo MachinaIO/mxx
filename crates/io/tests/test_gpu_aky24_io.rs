@@ -68,6 +68,7 @@ fn test_gpu_aky24_io_parameter_search_and_round_trip() {
         selected.parameters.ring_dimension(),
         moduli,
         selected.parameters.base_bits(),
+        None,
     );
     let mut runtime =
         GpuAky24Runtime::new(selected.compiler, gpu_parameters, MemoryArtifactStore::default())

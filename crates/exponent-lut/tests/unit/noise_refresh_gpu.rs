@@ -17,8 +17,12 @@ use std::collections::BTreeMap;
 fn test_gpu_switched_decoder_numeric_round_trip_with_shared_fresh_error() {
     let (graph, parameters, bounds) = super::setup::tests::switched_decoder_numeric_fixture();
     let source = &parameters[0];
-    let root =
-        GpuDCRTPolyParams::new(source.ring_dimension(), source.to_crt().0, source.base_bits());
+    let root = GpuDCRTPolyParams::new(
+        source.ring_dimension(),
+        source.to_crt().0,
+        source.base_bits(),
+        None,
+    );
     let selected = parameters
         .iter()
         .skip(1)

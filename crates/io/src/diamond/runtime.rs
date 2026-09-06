@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn generic_seed_setup_and_bindings_share_one_wire_layout() {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     #[ignore = "expands and executes the full nested-RNS Diamond iO graph"]
     fn obfuscation_runtime_matches_the_plaintext_goldreich_path_with_nonzero_noise() {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
         let modulus: Arc<num_bigint::BigUint> = parameters.modulus();
         let mut native_circuit = PolyCircuit::<DCRTPoly>::new();
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(

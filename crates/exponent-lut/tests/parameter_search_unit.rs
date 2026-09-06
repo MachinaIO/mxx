@@ -115,7 +115,7 @@ fn reviewed_grid_declares_phase_two_minimality_scope() {
 #[test]
 fn crt_base_grid_descends_base_width_for_each_crt_width() {
     let grid = descending_crt_base_bits_grid(6);
-    assert_eq!(grid, vec![(6, 5), (6, 4), (6, 3), (6, 2), (6, 1)]);
+    assert_eq!(grid, vec![(6, 3), (6, 2), (6, 1)]);
 }
 
 #[test]
@@ -290,7 +290,8 @@ fn lookup_overlay_accepts_reviewed_log_ring_dimension_and_crt_base_pair() {
 #[test]
 fn backend_capability_accepts_the_exact_50_25_singleton() {
     assert!(DCRTPolyParams::validate_capability(1 << 16, 1, 50, 25).is_ok());
-    assert!(DCRTPolyParams::validate_capability(1 << 16, 1, 60, 31).is_ok());
+    assert!(DCRTPolyParams::validate_capability(1 << 16, 1, 60, 30).is_ok());
+    assert!(DCRTPolyParams::validate_capability(1 << 16, 1, 60, 31).is_err());
     assert!(DCRTPolyParams::validate_capability(1 << 16, 1, 61, 25).is_err());
     assert!(DCRTPolyParams::validate_capability(1 << 16, 1, 50, 32).is_err());
 }
@@ -1061,7 +1062,7 @@ fn sparse_lwr_estimator_arguments_use_exact_reviewed_model() {
 
 #[test]
 fn reconstruction_coefficients_come_from_the_dcrt_parameters() {
-    let dcrt = DCRTPolyParams::new(32, 2, 28, 27, None);
+    let dcrt = DCRTPolyParams::new(32, 2, 28, 14, None, None);
     let coefficients = exact_reconstruction_coefficients(&dcrt);
     assert_eq!(coefficients.len(), 2);
     assert!(dcrt.reconst_coeffs().iter().any(|value| value != &BigUint::from(1_u8)));
@@ -1446,7 +1447,7 @@ fn emits_large_profile_sparse_prf_stage_diagnostics() {
     config.crt_bits = 32;
     config.base_bits = 1;
     let ring_dimension = 1usize << 16;
-    let dcrt = DCRTPolyParams::new(ring_dimension as u32, 62, 32, 1, None);
+    let dcrt = DCRTPolyParams::new(ring_dimension as u32, 62, 32, 1, None, None);
     let q_bits = dcrt.modulus().bits();
     info!(q_bits, ring_dimension, "large exact-noise diagnostic profile");
     let result = prepare_candidate(

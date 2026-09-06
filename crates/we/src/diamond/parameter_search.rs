@@ -190,6 +190,7 @@ impl DiamondParameterSearch {
                 self.crt_modulus_bits,
                 self.gadget_base_bits,
                 None,
+                None,
             );
             let started = Instant::now();
             debug!(
@@ -234,6 +235,7 @@ impl DiamondParameterSearch {
             crt_depth,
             self.crt_modulus_bits,
             self.gadget_base_bits,
+            None,
             None,
         );
         let modulus: Arc<BigUint> = parameters.modulus();

@@ -542,6 +542,7 @@ mod tests {
             parameter("MXX_PRIMITIVE_TEST_CRT_BITS", 40) as usize,
             parameter("MXX_PRIMITIVE_TEST_BASE_BITS", 4),
             None,
+            None,
         );
         let mut setup = parameters_for_numeric_refresh(&parameters);
         let profile = SparseLwrPrfProfile::new(
@@ -631,7 +632,7 @@ mod tests {
         // The first accepted tuple determines the next step. No graph is
         // materialized for rejected numerical candidates.
         'depths: for depth in 2..=max_depth {
-            let parameters = DCRTPolyParams::new(n, depth, bits, base_bits, None);
+            let parameters = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
             let mut setup = parameters_for_numeric_refresh(&parameters);
             let primes = parameters.to_crt().0;
             let full_modulus = parameters.modulus().as_ref().clone();

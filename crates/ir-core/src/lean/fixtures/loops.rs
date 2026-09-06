@@ -144,19 +144,20 @@ fn render(n: usize, l: usize, m: usize) -> String {
     let final_output = &artifact.root.outputs["output"].projection;
     let (unpack, extra_claim, extra_proof) = if n > 0 {
         (
-            "⟨family, gathered, final, _, hfamily, hget, _, hloop, hout⟩",
+            "⟨⟨family, gathered, final⟩, _, hfamily, hget, _, hloop, hout⟩",
             format!(" ∧ {} = 0", artifact.root.outputs["gathered"].projection),
             "\n  · obtain ⟨position, hposition, hvalue⟩ := hget\n    change gathered = 0\n    rw [hvalue, generated_parallel_value position (hfamily position)]\n    exact hposition",
         )
     } else {
-        ("⟨family, final, _, hfamily, _, hloop, hout⟩", String::new(), "")
+        ("⟨⟨family, final⟩, _, hfamily, _, hloop, hout⟩", String::new(), "")
     };
     let proof = format!(
         r#"
 theorem generated_parallel_value (i : Nat) {{output : Int}}
     (h : GeneratedLoops.parallel_generatedRoot_0 {{ unit := () }} i () output) :
     output = (i : Int) := by
-  obtain ⟨family, gathered, _, hfamily, ⟨position, hposition, hvalue⟩, hout⟩ := h
+  obtain ⟨⟨family, gathered⟩, _, hfamily, ⟨position, hposition, hvalue⟩, hout⟩ := h
+  dsimp only at hfamily hvalue hout
   have hv : family position = (i : Int) + (position.val : Int) := hfamily position
   rw [hout, hvalue, hv, hposition, add_zero]
 
@@ -164,6 +165,7 @@ theorem generated_loop_preserves_initial {{initial : Int}} {{outputs : {output_t
     (h : GeneratedLoops.generatedRoot {{ unit := () }} initial outputs) :
     {final_output} = initial ∧ (∀ i : Fin {n}, {family_output} i = (i.val : Int)){extra_claim} := by
   rcases h with {unpack}
+  dsimp only at *
   have hfinal : final = initial := by
     apply MxxIR.IterRuns.invariant
       (body := fun i current next => {sequence_relation} {{ unit := () }} i current next)

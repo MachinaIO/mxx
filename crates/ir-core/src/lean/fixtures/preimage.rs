@@ -179,7 +179,7 @@ theorem generated_nonzero_target_consumption
     (h : {namespace}.generatedRoot backend {{ unit := () }}
       (l, b, e, td, p, targetError, ()) (c, k, target, ())) :
     c = l * p + (l * targetError + e * k) := by
-  rcases h with ⟨sample, _, sampleRuns, outputEq⟩
+  rcases h with ⟨⟨sample⟩, _, sampleRuns, outputEq⟩
   have sampleEq : k = sample := by
     simpa using congrArg (fun value => value.2.1) outputEq
   have hc : c = (l * b + e) * k := by

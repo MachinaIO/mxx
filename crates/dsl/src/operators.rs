@@ -165,9 +165,9 @@ mod tests {
     use num_bigint::BigInt;
 
     #[test]
-    fn borrowed_matrix_arithmetic_retains_one_sampler_and_its_anchor() {
+    fn borrowed_matrix_arithmetic_retains_one_sampler() {
         let ring = Ring::new(257, 8);
-        let sample = ring.gaussian((2, 3), 3, 19).semantic_anchor("sample").unwrap();
+        let sample = ring.gaussian((2, 3), 3, 19);
         let output = -&sample + &sample * 3 + 3 * &sample - sample.clone();
         assert_eq!(output.matrix_type(), sample.matrix_type());
         let built = DslContext::new("borrowed-matrix-arithmetic")
@@ -186,7 +186,6 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(built.anchors.get("sample").unwrap().len(), 1);
     }
 
     #[test]

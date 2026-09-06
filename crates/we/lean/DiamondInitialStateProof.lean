@@ -15,13 +15,13 @@ set_option maxHeartbeats 1000000
     retaining one sampled base pool, digit-secret family, and Boolean message selection. -/
 theorem generated_injector_root
     (backend : BackendContext) (hashModel : HashModel) (params : Stage_encrypt.Params)
-    (inputs : _) (outputs : _)
-    (hrun : Stage_encrypt.generatedRoot backend hashModel params inputs outputs) :
+    (inputs : _) (outputs : _) (rootWitness : Stage_encrypt.generatedRoot.Witness)
+    (hbody : Stage_encrypt.generatedRoot.body backend hashModel params inputs outputs rootWitness) :
     ∃ producer : InjectorRootWitness backend hashModel params inputs.2.2.2.2.2.2.2.1
       outputs.2.1 outputs.2.2.2.2.2.2.1,
       ∃ finalPublic : FinalPublicWitness backend params outputs.1 outputs.2.2.1 outputs.2.2.2.1
-        outputs.2.2.2.2.2.1 outputs.2.2.2.2.2.2.2.2.1 outputs.2.2.2.2.1
-        outputs.2.2.2.2.2.2.2.2.2.1,
+        outputs.2.2.2.2.2.1 (matrixPolynomial [MxxIR.roundDiv params.diamond_modulus 2]) outputs.2.2.2.2.1
+        rootWitness.w_30_0,
         ∃ terminal : Fin basePoolCount,
           (terminal.val : Int) = params.diamond_input_count *
             (1 + params.diamond_batch_bits * params.diamond_input_count) ∧
@@ -34,59 +34,75 @@ theorem generated_injector_root
             producer.bases position * outputs.2.2.2.2.2.2.2.1 i = target ∧
             PreimageWithin (outputs.2.2.2.2.2.2.2.1 i)
               params.diamond_preimage_max_coefficient_bound.toNat := by
-  dsimp only [Stage_encrypt.generatedRoot] at hrun
-  obtain ⟨rootWitness, hrelations⟩ := hrun
-  rcases rootWitness with ⟨w_0_0, w_1_0, w_1_1, w_2_0, w_2_1, w_3_0, w_4_0, w_6_0, w_7_0, w_8_0, w_9_0, w_10_0,
-    w_19_0, w_20_0, w_26_0, w_27_0, w_32_0, w_35_0, w_36_0, w_38_0, w_39_0, w_40_0,
-    w_44_0, w_45_0, w_46_0, w_51_0, w_52_0, w_53_0, w_55_0, w_58_0, w_59_0, w_60_0,
-    w_63_0, w_64_0, w_65_0, w_66_0, w_66_1, w_67_0, w_68_0, w_69_0, w_70_0, w_71_0,
-    w_72_0, w_73_0, w_74_0, w_75_0, w_75_1, w_76_0, w_77_0, w_78_0⟩
-  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at hrelations
-  have hwhole := hrelations
-  rcases hrelations with ⟨hstateCount, hterminalIndices, _, hbases, _, hterminalBases,
-    hterminalBase, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
-    _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
-    _, _, _, _, _, hsecret, _, _, _, hmessage, hselector, hbase,
-    herror, _, _, _, _, _, _, _, _, _, hsourceIndices, _, hsources, _,
-    hdigitIndices, _, hsamples, _, hsecrets, _, htargetIndices, _,
-    htargetPublics, _, htargets, _, hpreimages, _, _, _, _, _, _, _, _,
-    _, _, houtputs⟩
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0,
+    Stage_encrypt.generatedRoot.constraints_1] at hbody
+  have hwhole := hbody
+  rcases hbody with ⟨_, hbases, hstates, hterminalBases, hterminalBase, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hsecret, _, _, _, hmessage, hselector, hinitialBase, herror, _, _, _, _, _, _, _, _, _, hsamples, _, htargets, _, hpreimages, _, hwitnesses, houtputValues⟩
+  have houtputs : outputs = (rootWitness.w_39_0,
+      rootWitness.w_46_0 * rootWitness.w_47_0 + rootWitness.w_49_0,
+      rootWitness.w_53_0, rootWitness.w_58_0, rootWitness.w_8_0, rootWitness.w_34_0,
+      rootWitness.w_61_0, rootWitness.w_62_0, ()) := houtputValues
   subst outputs
+  have htargetViews := fun i : Fin transitionCount ↦ generated_selector_witness
+    backend hashModel params i.val rootWitness.w_59_0 rootWitness.w_0_0
+    (rootWitness.w_60_0 i) (htargets i)
+  choose secrets targetPublics hsecrets htargetPublics hselectors using htargetViews
+  have hsourceViews (i : Fin transitionCount) := hpreimages i
+  dsimp only [Stage_encrypt.parallel_generatedRoot_61,
+    Stage_encrypt.parallel_generatedRoot_61.constraints_0] at hsourceViews
+  choose selected sourcePublics sourceTrapdoors sampled hsourceViews using hsourceViews
+  have hsampled (i : Fin transitionCount) : rootWitness.w_61_0 i = sampled i := by
+    exact (hsourceViews i).2.2.2.2.2.2.2.2.2.2.2.2.2.2
+  let sourceIndices := fun i : Fin transitionCount ↦ (i.val : Int) /
+    (params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count +
+      params.diamond_digit_base) * (1 + params.diamond_batch_bits * params.diamond_input_count) + selected i
   let producer : InjectorRootWitness backend hashModel params inputs.2.2.2.2.2.2.2.1
-      (w_52_0 * w_53_0 + w_55_0) w_73_0 := {
-    bases := w_1_0
-    trapdoors := w_1_1
-    secret := w_46_0
-    messageValue := w_51_0
-    initialSelector := w_52_0
-    initialBase := w_53_0
-    initialError := w_55_0
-    sourceIndices := w_65_0
-    digitIndices := w_67_0
-    targetIndices := w_70_0
-    sourcePublics := w_66_0
-    targetPublics := w_71_0
-    targets := w_72_0
-    sourceTrapdoors := w_66_1
-    digitSamples := w_68_0
-    digitSecrets := w_69_0
-    stateCount := hstateCount
+      (rootWitness.w_46_0 * rootWitness.w_47_0 + rootWitness.w_49_0) rootWitness.w_61_0 := {
+    bases := rootWitness.w_0_0
+    trapdoors := rootWitness.w_0_1
+    secret := rootWitness.w_40_0
+    messageValue := rootWitness.w_45_0
+    initialSelector := rootWitness.w_46_0
+    initialBase := rootWitness.w_47_0
+    initialError := rootWitness.w_49_0
+    sourceIndices := sourceIndices
+    digitIndices := fun i ↦ (i.val : Int) / (1 + params.diamond_batch_bits * params.diamond_input_count)
+    targetIndices := fun i ↦ (((i.val : Int) /
+      (params.diamond_batch_bits * params.diamond_digit_base * params.diamond_input_count + params.diamond_digit_base)) + 1) *
+      (1 + params.diamond_batch_bits * params.diamond_input_count) +
+      (i.val : Int) % (1 + params.diamond_batch_bits * params.diamond_input_count)
+    sourcePublics := sourcePublics
+    targetPublics := targetPublics
+    targets := rootWitness.w_60_0
+    sourceTrapdoors := sourceTrapdoors
+    digitSamples := rootWitness.w_59_0
+    digitSecrets := secrets
+    stateCount := hstates
     basesRun := hbases
     secretRun := hsecret
     messageRun := hmessage
     initialSelectorRun := hselector
-    initialBaseRun := hbase
+    initialBaseRun := hinitialBase
     initialErrorRun := herror
     initialEquation := rfl
-    sourceIndicesRun := hsourceIndices
-    sourcesRun := hsources
-    digitIndicesRun := hdigitIndices
+    sourceIndicesRun := by
+      intro i
+      have h := hsourceViews i
+      exact ⟨selected i, by simpa only [add_zero] using h.2.2.2.2.2.1, rfl⟩
+    sourcesRun := by
+      intro i
+      have h := hsourceViews i
+      exact ⟨h.2.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2.2.2.2.1⟩
+    digitIndicesRun := fun _ ↦ rfl
     samplesRun := hsamples
     secretsRun := hsecrets
-    targetIndicesRun := htargetIndices
+    targetIndicesRun := fun _ ↦ rfl
     targetPublicsRun := htargetPublics
-    targetsRun := htargets
-    preimagesRun := hpreimages }
+    targetsRun := hselectors
+    preimagesRun := by
+      intro i
+      rw [hsampled i]
+      exact (hsourceViews i).2.2.2.2.2.2.2.2.2.2.2.2.2.1 }
   obtain ⟨terminalFamilyPosition, hterminalFamilyPosition, hterminalValue⟩ := hterminalBase
   have hterminalZero : terminalFamilyPosition = (0 : Fin stateCount) := by
     apply Fin.ext
@@ -95,44 +111,25 @@ theorem generated_injector_root
   subst terminalFamilyPosition
   rcases hterminalBases 0 with ⟨baseValue, trapdoorValue, _, _,
     ⟨terminal, hterminalIndex, hbaseValue⟩, _, _, _, hterminalOutput⟩
-  have hbase : w_3_0 = w_1_0 terminal := hterminalValue.trans
+  have hbase : rootWitness.w_2_0 = rootWitness.w_0_0 terminal := hterminalValue.trans
     ((congrArg (fun value ↦ value.1) hterminalOutput).trans hbaseValue)
   have hterminalAddress : (terminal.val : Int) = params.diamond_input_count *
       (1 + params.diamond_batch_bits * params.diamond_input_count) := by
-    have hindex := hterminalIndices 0
-    change w_0_0 0 = params.diamond_input_count *
-      (1 + params.diamond_batch_bits * params.diamond_input_count) + Int.ofNat 0 at hindex
-    simpa only [Int.ofNat_eq_natCast, Nat.cast_zero, add_zero] using hterminalIndex.trans hindex
-  have hpublicOne : w_10_0 = w_9_0 0 := by
-    obtain ⟨position, hposition, hvalue⟩ : familyGetStatic w_9_0 0 w_10_0 := by tauto
-    have hz : position = 0 := Fin.ext (by change position.val = 0; omega)
-    simpa only [hz] using hvalue
-  let finalPublic : FinalPublicWitness backend params w_45_0 w_59_0 w_64_0 w_40_0
-      (matrixPolynomial [MxxIR.roundDiv params.diamond_modulus 2]) w_9_0 w_36_0 := {
-    base := w_3_0
-    uniform := w_7_0
-    target := w_39_0
-    gadget := w_60_0
-    decoderTarget := w_44_0
-    keyTarget := w_58_0
-    oneTarget := w_63_0
-    decompositionRun := by tauto
-    gadgetRun := by tauto
-    decoderRows := by rw [← hpublicOne]; tauto
-    keyRows := by tauto
-    oneRows := by rw [← hpublicOne]; tauto
-    decoderEquation := preimageRunsDispatched_equation (by decide) (by decide) (by tauto)
-    keyEquation := preimageRunsDispatched_equation (by decide) (by decide) (by tauto)
-    oneEquation := preimageRunsDispatched_equation (by decide) (by decide) (by tauto)
-    halfEquation := rfl }
-  refine ⟨producer, finalPublic, terminal, hterminalAddress, hbase, ?_⟩
+    apply hterminalIndex.trans
+    change params.diamond_batch_bits * params.diamond_input_count * params.diamond_input_count +
+      params.diamond_input_count + 0 = _
+    ring
+  obtain ⟨finalPublic, hfinalBase, hfinalGadget⟩ :=
+    generated_final_public_witness backend hashModel params rootWitness hwhole
+  refine ⟨producer, finalPublic, terminal, hterminalAddress, hfinalBase.trans hbase, ?_⟩
   intro i
-  obtain ⟨state, position, hstate, hposition, hrows, hequation, hbound⟩ :=
-    generated_witness_preimage_link backend hashModel params _ _ _ producer w_0_0 w_2_0 w_2_1
-      hterminalIndices hterminalBases w_9_0 w_60_0 i (w_74_0 i) (w_75_0 i) (w_75_1 i)
-      (w_76_0 i) (w_77_0 i) (w_78_0 i)
-      (by tauto) (by tauto) (by tauto) (by tauto) (by tauto)
-  exact ⟨state, position, w_77_0 i, hstate, hposition, hrows, hequation, hbound⟩
+  have hpreimage := hwitnesses i
+  obtain ⟨state, position, target, hstate, hposition, hrows, hequation, hbound⟩ :=
+    generated_witness_preimage_link backend hashModel params _ _ _ producer
+      rootWitness.w_1_0 rootWitness.w_1_1 hterminalBases rootWitness.w_8_0 rootWitness.w_54_0 i
+      (rootWitness.w_62_0 i) hpreimage
+  exact ⟨state, position, target, hstate, hposition, by simpa only [hfinalGadget] using hrows,
+    hequation, hbound⟩
 
 #print axioms generated_injector_root
 

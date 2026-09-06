@@ -221,13 +221,7 @@ impl ComparatorSpec {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EndpointSemanticBinding {
     ThresholdDecode,
-    DiamondBoolean {
-        residual_stage: StageId,
-        residual_anchor: String,
-        carrier_stage: StageId,
-        carrier_anchor: String,
-        message: ProtocolInputId,
-    },
+    DiamondBoolean { message: ProtocolInputId },
 }
 
 /// The executable decoder family selected by an operational target.  This is
@@ -243,26 +237,22 @@ pub enum OperationalDecoderKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationalDecoderTarget {
     pub target_id: String,
-    pub residual_stage: StageId,
-    pub residual_output: String,
-    pub decoder_stage: StageId,
-    pub decoder_node: NodeId,
+    pub residual: OutputRef,
+    pub endpoint: EndpointSpecId,
     pub kind: OperationalDecoderKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EndpointAnchor {
+pub struct EndpointBinding {
     pub spec: EndpointSpecId,
-    pub stage: StageId,
-    pub semantic_anchor: String,
     pub semantics: EndpointSemanticBinding,
     pub workflow_output: OutputRef,
     pub ideal_output: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EndpointAnchors {
-    pub entries: Vec<EndpointAnchor>,
+pub struct EndpointBindings {
+    pub entries: Vec<EndpointBinding>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -277,7 +267,7 @@ pub struct ClosedProtocolBundle {
     pub ideal: IdealSpec,
     pub requirements: Vec<PurePredicateSpec>,
     pub comparator: ComparatorSpec,
-    pub endpoints: EndpointAnchors,
+    pub endpoints: EndpointBindings,
     pub operational_decoder_targets: Vec<OperationalDecoderTarget>,
     pub endpoint_specs: Vec<EndpointSpecId>,
     pub input_contract: InputContract,
@@ -319,18 +309,12 @@ pub enum BundleValidationError {
     },
     #[error("endpoint spec ids must be unique")]
     DuplicateEndpointSpec,
-    #[error("endpoint specs, anchors, and comparator bindings must have equal cardinality")]
+    #[error("endpoint specs, bindings, and comparator bindings must have equal cardinality")]
     EndpointCardinalityMismatch,
-    #[error("an endpoint anchor or comparator binding references an unregistered endpoint spec")]
+    #[error("an endpoint binding or comparator binding references an unregistered endpoint spec")]
     UnknownEndpointSpec,
-    #[error(
-        "an endpoint anchor references a missing stage, output, ideal output, or semantic label"
-    )]
-    MissingEndpointAnchor,
-    #[error("a semantic endpoint label must resolve to exactly one wire")]
-    EndpointAnchorArity,
-    #[error("a semantic endpoint label must name the declared workflow output wire")]
-    EndpointAnchorMismatch,
+    #[error("an endpoint binding references a missing stage, output, or ideal output")]
+    MissingEndpointBinding,
     #[error("an endpoint has semantic identities that do not match its closed endpoint spec")]
     InvalidEndpointSemantics,
     #[error("the operational decoder target registry must be nonempty")]
@@ -544,64 +528,28 @@ impl ClosedProtocolBundle {
         {
             return Err(BundleValidationError::EndpointCardinalityMismatch);
         }
-        let anchored =
-            self.endpoints.entries.iter().map(|entry| entry.spec).collect::<BTreeSet<_>>();
+        let bound = self.endpoints.entries.iter().map(|entry| entry.spec).collect::<BTreeSet<_>>();
         let compared =
             self.comparator.endpoints().iter().map(|entry| entry.endpoint).collect::<BTreeSet<_>>();
-        if anchored != registered || compared != registered {
+        if bound != registered || compared != registered {
             return Err(BundleValidationError::UnknownEndpointSpec);
         }
 
         for endpoint in &self.endpoints.entries {
-            let stage =
-                stages.get(&endpoint.stage).ok_or(BundleValidationError::MissingEndpointAnchor)?;
-            if endpoint.workflow_output.stage != endpoint.stage ||
-                !self.ideal.graph.outputs().contains_key(&endpoint.ideal_output)
+            let stage = stages
+                .get(&endpoint.workflow_output.stage)
+                .ok_or(BundleValidationError::MissingEndpointBinding)?;
+            if !self.ideal.graph.outputs().contains_key(&endpoint.ideal_output) ||
+                !stage.graph.outputs().contains_key(&endpoint.workflow_output.output)
             {
-                return Err(BundleValidationError::MissingEndpointAnchor);
-            }
-            let workflow_output = stage
-                .graph
-                .outputs()
-                .get(&endpoint.workflow_output.output)
-                .ok_or(BundleValidationError::MissingEndpointAnchor)?;
-            let Some(wires) = stage.semantic_anchors.get(&endpoint.semantic_anchor) else {
-                return Err(BundleValidationError::MissingEndpointAnchor);
-            };
-            if wires.len() != 1 {
-                return Err(BundleValidationError::EndpointAnchorArity);
-            }
-            if wires[0].scope != crate::FrozenGraphScopeId::Root ||
-                wires[0].wire != workflow_output.value
-            {
-                return Err(BundleValidationError::EndpointAnchorMismatch);
+                return Err(BundleValidationError::MissingEndpointBinding);
             }
             match (&endpoint.spec, &endpoint.semantics) {
                 (EndpointSpecId::ToyThresholdDecode, EndpointSemanticBinding::ThresholdDecode) => {}
                 (
                     EndpointSpecId::DiamondBooleanInterval,
-                    EndpointSemanticBinding::DiamondBoolean {
-                        residual_stage,
-                        residual_anchor,
-                        carrier_stage,
-                        carrier_anchor,
-                        message,
-                    },
+                    EndpointSemanticBinding::DiamondBoolean { message },
                 ) => {
-                    for (semantic_stage, semantic_anchor) in
-                        [(residual_stage, residual_anchor), (carrier_stage, carrier_anchor)]
-                    {
-                        let semantic_stage = stages
-                            .get(semantic_stage)
-                            .ok_or(BundleValidationError::InvalidEndpointSemantics)?;
-                        let Some(wires) = semantic_stage.semantic_anchors.get(semantic_anchor)
-                        else {
-                            return Err(BundleValidationError::InvalidEndpointSemantics);
-                        };
-                        if wires.len() != 1 {
-                            return Err(BundleValidationError::InvalidEndpointSemantics);
-                        }
-                    }
                     let message_is_boolean = self.input_contract.inputs.iter().any(|entry| {
                         entry.id == *message && matches!(entry.value, InputValueContract::Boolean)
                     });
@@ -675,12 +623,12 @@ impl ClosedProtocolBundle {
         }
         for target in &self.operational_decoder_targets {
             let residual_stage = stages
-                .get(&target.residual_stage)
+                .get(&target.residual.stage)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
             let residual = residual_stage
                 .graph
                 .outputs()
-                .get(&target.residual_output)
+                .get(&target.residual.output)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
             let residual_matrix_type = match output_type(&residual_stage.graph, residual.value) {
                 Some(WireType::Matrix(matrix_type)) => matrix_type,
@@ -690,35 +638,31 @@ impl ClosedProtocolBundle {
                 },
                 _ => return Err(BundleValidationError::InvalidOperationalDecoderTarget),
             };
-            let decoder_stage = stages
-                .get(&target.decoder_stage)
-                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
-            let decoder_is_anchored =
-                decoder_stage.semantic_anchors.iter().flat_map(|(_, wires)| wires).any(|wire| {
-                    wire.scope == crate::FrozenGraphScopeId::Root &&
-                        wire.wire.node == target.decoder_node
-                });
-            if !decoder_is_anchored {
-                return Err(BundleValidationError::InvalidOperationalDecoderTarget);
-            }
             let endpoint = self
                 .endpoints
                 .entries
                 .iter()
-                .find(|endpoint| {
-                    endpoint.stage == target.decoder_stage &&
-                        decoder_stage
-                            .semantic_anchors
-                            .get(&endpoint.semantic_anchor)
-                            .is_some_and(|wires| {
-                                wires.len() == 1 && wires[0].wire.node == target.decoder_node
-                            })
-                })
+                .find(|endpoint| endpoint.spec == target.endpoint)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            let decoder_stage = stages
+                .get(&endpoint.workflow_output.stage)
+                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            let decoder_output = decoder_stage
+                .graph
+                .outputs()
+                .get(&endpoint.workflow_output.output)
+                .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
+            if !matches!(
+                output_type(&decoder_stage.graph, decoder_output.value),
+                Some(WireType::Bool | WireType::ConstantBool)
+            ) {
+                return Err(BundleValidationError::InvalidOperationalDecoderTarget);
+            }
+            let decoder_node = decoder_output.value.node;
             let decoder = decoder_stage
                 .graph
                 .root_scope()
-                .node(target.decoder_node)
+                .node(decoder_node)
                 .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
             match (&target.kind, endpoint.spec, decoder.kind()) {
                 (
@@ -746,11 +690,11 @@ impl ClosedProtocolBundle {
                     let residual_family_witness_matches = !matches!(
                         output_type(&residual_stage.graph, residual.value),
                         Some(WireType::IndexedFamily { .. })
-                    ) || (target.decoder_stage ==
-                        target.residual_stage &&
+                    ) || (endpoint.workflow_output.stage ==
+                        target.residual.stage &&
                         threshold_decoder_input_matches_residual_family(
                             &decoder_stage.graph,
-                            target.decoder_node,
+                            decoder_node,
                             residual.value,
                         ));
                     if plaintext_modulus != decoder_plaintext_modulus ||
@@ -765,26 +709,10 @@ impl ClosedProtocolBundle {
                     EndpointSpecId::DiamondBooleanInterval,
                     NodeKind::IntCompare(IntCompareOp::Equal),
                 ) => {
-                    let EndpointSemanticBinding::DiamondBoolean {
-                        residual_stage,
-                        residual_anchor,
-                        ..
-                    } = &endpoint.semantics
-                    else {
-                        return Err(BundleValidationError::OperationalDecoderTargetKindMismatch);
-                    };
-                    let residual_anchor = stages
-                        .get(residual_stage)
-                        .and_then(|stage| stage.semantic_anchors.get(residual_anchor))
-                        .filter(|wires| wires.len() == 1)
-                        .ok_or(BundleValidationError::InvalidOperationalDecoderTarget)?;
-                    if residual_stage != &target.residual_stage ||
-                        target.decoder_stage != target.residual_stage ||
-                        residual_anchor[0].scope != crate::FrozenGraphScopeId::Root ||
-                        residual_anchor[0].wire != residual.value ||
+                    if endpoint.workflow_output.stage != target.residual.stage ||
                         !boolean_interval_decoder_matches(
                             &decoder_stage.graph,
-                            target.decoder_node,
+                            decoder_node,
                             residual.value,
                         )
                     {
@@ -834,7 +762,7 @@ fn node_kind_and_arguments<const N: usize>(
 
 /// Checks the complete executable Boolean interval decoder rooted at `decoder_node`.
 ///
-/// The endpoint anchor alone identifies only the final equality.  Closing the operational target
+/// The endpoint output alone identifies only the final equality.  Closing the operational target
 /// additionally fixes every interior edge and requires the modulus used to construct the interval
 /// to match the residual matrix modulus in the canonical symbolic form. This
 /// comparison does not evaluate rounding, which could hide a different modulus.

@@ -5,7 +5,6 @@ pub struct Subgraph<I: GraphValue, O: GraphValue> {
     input_schema: I::Schema,
     output_schema: O::Schema,
     captures: Vec<ValueHandle>,
-    pending: Pending,
 }
 
 impl<I: GraphValue, O: GraphValue> Clone for Subgraph<I, O> {
@@ -15,21 +14,12 @@ impl<I: GraphValue, O: GraphValue> Clone for Subgraph<I, O> {
             input_schema: self.input_schema.clone(),
             output_schema: self.output_schema.clone(),
             captures: self.captures.clone(),
-            pending: self.pending.clone(),
         }
     }
 }
 
 impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
     pub fn define(
-        name: impl Into<String>,
-        input_schema: I::Schema,
-        body: impl FnOnce(I) -> O,
-    ) -> Result<Self, DslError> {
-        Self::try_define(name, input_schema, |inputs| Ok(body(inputs)))
-    }
-
-    pub fn try_define(
         name: impl Into<String>,
         input_schema: I::Schema,
         body: impl FnOnce(I) -> Result<O, DslError>,
@@ -54,7 +44,6 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
             input_schema,
             output_schema: output.schema(),
             captures: sealed.captures.iter().map(|capture| capture.outer.clone()).collect(),
-            pending: output.pending().remap(&sealed.remap),
         })
     }
 
@@ -64,7 +53,7 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
         }
         let flattened = input.flatten();
         let input_count = flattened.len();
-        self.call_flattened(flattened, input.pending(), vec![None; input_count])
+        self.call_flattened(flattened, vec![None; input_count])
     }
 
     /// Calls this subgraph with authoritative canonical coefficient bounds for
@@ -81,13 +70,12 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
             return Err(DslError::Schema);
         }
         let flattened = input.flatten();
-        self.call_flattened(flattened, input.pending(), canonical_input_exclusive_uppers)
+        self.call_flattened(flattened, canonical_input_exclusive_uppers)
     }
 
     fn call_flattened(
         &self,
         flattened: Vec<ValueHandle>,
-        input_pending: Pending,
         canonical_input_exclusive_uppers: Vec<Option<BigUint>>,
     ) -> Result<O, DslError> {
         if canonical_input_exclusive_uppers.len() != flattened.len() {
@@ -117,10 +105,6 @@ impl<I: GraphValue, O: GraphValue> Subgraph<I, O> {
         let values = (0..self.output_schema.wire_types().len())
             .map(|port| node.output(port as u32).expect("subgraph output"))
             .collect::<Vec<_>>();
-        O::from_values(
-            &self.output_schema,
-            &values,
-            Pending::merge([input_pending, self.pending.clone()]),
-        )
+        O::from_values(&self.output_schema, &values)
     }
 }

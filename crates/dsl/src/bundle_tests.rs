@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Bool, DslContext, Family, IdealSpec, Int, PurePredicateSpec, Ring, SemanticAnchor,
-    };
+    use crate::{Bool, DslContext, Family, IdealSpec, Int, PurePredicateSpec, Ring};
     use mxx_ir_core::{IntExpr, node::IndexRange, protocol::*};
 
     fn threshold_family_bundle(decoder_uses_residual_lane: bool) -> ClosedProtocolBundle {
@@ -17,20 +15,17 @@ mod tests {
             .threshold_decode_bools(IntExpr::constant(17), 1)
             .into_iter()
             .next()
-            .expect("decoder output")
-            .semantic_anchor("threshold-family.result")
-            .expect("decoder anchor");
+            .expect("decoder output");
         let stage = DslContext::new("threshold-family-stage")
-            .family_output("residual", residuals)
+            .output("residual", residuals)
             .expect("residual output")
-            .bool_output("decoded", decoder)
+            .output("decoded", decoder)
             .expect("decoded output")
             .build()
             .expect("threshold-family graph");
-        let decoder_node = stage.graph.outputs()["decoded"].value.node;
         let ideal = IdealSpec::new(
             DslContext::new("threshold-family-ideal")
-                .bool_output("ideal", Bool::constant(false))
+                .output("ideal", Bool::constant(false))
                 .expect("ideal output")
                 .build()
                 .expect("ideal graph")
@@ -44,8 +39,6 @@ mod tests {
                 stages: vec![ProtocolStage {
                     id: stage_id.clone(),
                     graph: stage.graph,
-                    semantic_anchors: stage.anchors,
-                    derivation_attachments: stage.derivation_attachments,
                     bindings: Vec::new(),
                 }],
                 entrypoint: stage_id.clone(),
@@ -61,11 +54,9 @@ mod tests {
                     failure_value: true,
                 }],
             },
-            endpoints: EndpointAnchors {
-                entries: vec![EndpointAnchor {
+            endpoints: EndpointBindings {
+                entries: vec![EndpointBinding {
                     spec: endpoint,
-                    stage: stage_id.clone(),
-                    semantic_anchor: "threshold-family.result".to_owned(),
                     semantics: EndpointSemanticBinding::ThresholdDecode,
                     workflow_output: OutputRef {
                         stage: stage_id.clone(),
@@ -76,10 +67,8 @@ mod tests {
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "threshold-family".to_owned(),
-                residual_stage: stage_id.clone(),
-                residual_output: "residual".to_owned(),
-                decoder_stage: stage_id,
-                decoder_node,
+                residual: OutputRef { stage: stage_id.clone(), output: "residual".to_owned() },
+                endpoint: EndpointSpecId::ToyThresholdDecode,
                 kind: OperationalDecoderKind::ThresholdDecode {
                     plaintext_modulus: IntExpr::constant(17),
                 },
@@ -93,19 +82,13 @@ mod tests {
 
     fn valid_bundle() -> ClosedProtocolBundle {
         let ring = Ring::new(17, 1);
-        let stage_value =
-            ring.bool_input("message").semantic_anchor("decoded-result").expect("semantic anchor");
+        let stage_value = ring.bool_input("message");
         let stage = DslContext::new("stage")
-            .bool_output("result", stage_value)
+            .output("result", stage_value)
             .expect("stage output")
             .build()
             .expect("stage graph");
-        let residual = ring
-            .input("residual", (1, 1))
-            .semantic_anchor("interval.residual")
-            .expect("residual anchor")
-            .semantic_anchor("interval.carrier")
-            .expect("carrier anchor");
+        let residual = ring.input("residual", (1, 1));
         let coefficient = residual.clone().extract_coefficient(0);
         let quarter = Int::evaluate(IntExpr::RoundDiv(
             Box::new(IntExpr::constant(17) - 2),
@@ -116,20 +99,17 @@ mod tests {
             .less_equal(coefficient.clone())
             .to_int()
             .add(coefficient.less_equal(quarter.mul(Int::constant(3))).to_int())
-            .equal(Int::constant(2))
-            .semantic_anchor("interval.result")
-            .expect("decoder anchor");
+            .equal(Int::constant(2));
         let decoder_stage = DslContext::new("decoder-stage")
             .output("residual", residual)
             .expect("residual output")
-            .bool_output("decoded", decoded)
+            .output("decoded", decoded)
             .expect("decoded output")
             .build()
             .expect("decoder graph");
-        let decoder_node = decoder_stage.graph.outputs()["decoded"].value.node;
         let ideal = IdealSpec::new(
             DslContext::new("ideal")
-                .bool_output("result", ring.bool_input("message"))
+                .output("result", ring.bool_input("message"))
                 .expect("ideal output")
                 .build()
                 .expect("ideal graph")
@@ -138,7 +118,7 @@ mod tests {
         .expect("pure ideal");
         let requirement = PurePredicateSpec::new(
             DslContext::new("requirement")
-                .bool_output("valid", ring.bool_input("message"))
+                .output("valid", ring.bool_input("message"))
                 .expect("requirement output")
                 .build()
                 .expect("requirement graph")
@@ -149,7 +129,7 @@ mod tests {
         let comparator_ideal = ring.bool_input("ideal").to_int();
         let comparator = IdealSpec::new(
             DslContext::new("comparator")
-                .bool_output("failure", comparator_actual.equal(comparator_ideal))
+                .output("failure", comparator_actual.equal(comparator_ideal))
                 .expect("comparator output")
                 .build()
                 .expect("comparator graph")
@@ -167,15 +147,11 @@ mod tests {
                     ProtocolStage {
                         id: StageId("stage".to_owned()),
                         graph: stage.graph,
-                        semantic_anchors: stage.anchors,
-                        derivation_attachments: stage.derivation_attachments,
                         bindings: Vec::new(),
                     },
                     ProtocolStage {
                         id: decoder_stage_id.clone(),
                         graph: decoder_stage.graph,
-                        semantic_anchors: decoder_stage.anchors,
-                        derivation_attachments: decoder_stage.derivation_attachments,
                         bindings: Vec::new(),
                     },
                 ],
@@ -193,18 +169,10 @@ mod tests {
                     failure_value: false,
                 }],
             },
-            endpoints: EndpointAnchors {
-                entries: vec![EndpointAnchor {
+            endpoints: EndpointBindings {
+                entries: vec![EndpointBinding {
                     spec: interval_endpoint,
-                    stage: decoder_stage_id.clone(),
-                    semantic_anchor: "interval.result".to_owned(),
-                    semantics: EndpointSemanticBinding::DiamondBoolean {
-                        residual_stage: decoder_stage_id.clone(),
-                        residual_anchor: "interval.residual".to_owned(),
-                        carrier_stage: decoder_stage_id.clone(),
-                        carrier_anchor: "interval.carrier".to_owned(),
-                        message: input.clone(),
-                    },
+                    semantics: EndpointSemanticBinding::DiamondBoolean { message: input.clone() },
                     workflow_output: OutputRef {
                         stage: decoder_stage_id.clone(),
                         output: "decoded".to_owned(),
@@ -214,10 +182,11 @@ mod tests {
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "interval".to_owned(),
-                residual_stage: decoder_stage_id.clone(),
-                residual_output: "residual".to_owned(),
-                decoder_stage: decoder_stage_id.clone(),
-                decoder_node,
+                residual: OutputRef {
+                    stage: decoder_stage_id.clone(),
+                    output: "residual".to_owned(),
+                },
+                endpoint: EndpointSpecId::DiamondBooleanInterval,
                 kind: OperationalDecoderKind::BooleanInterval,
             }],
             endpoint_specs: vec![interval_endpoint],
@@ -272,12 +241,7 @@ mod tests {
         let stage_id = StageId("interval-stage".to_owned());
         let ring = Ring::new(17, 1);
         let matrix_type = ring.matrix_type((1, 1));
-        let residual = ring
-            .input("residual", (1, 1))
-            .semantic_anchor("interval.residual")
-            .expect("residual anchor")
-            .semantic_anchor("interval.carrier")
-            .expect("carrier anchor");
+        let residual = ring.input("residual", (1, 1));
         let coefficient = residual.clone().extract_coefficient(0);
         let quarter = Int::evaluate(IntExpr::RoundDiv(
             Box::new(decoder_modulus - 2),
@@ -288,20 +252,21 @@ mod tests {
             .less_equal(coefficient.clone())
             .to_int()
             .add(coefficient.less_equal(quarter.mul(Int::constant(3))).to_int())
-            .equal(Int::constant(2))
-            .semantic_anchor("interval.result")
-            .expect("decoder anchor");
+            .equal(Int::constant(2));
         let stage = DslContext::new("interval-stage")
+            .output("unrelated-residual", ring.zero((1, 1)))
+            .expect("unrelated residual output")
+            .output("unrelated-result", Bool::constant(false))
+            .expect("unrelated Boolean output")
             .output("residual", residual)
             .expect("residual output")
-            .bool_output("decoded", decoded)
+            .output("decoded", decoded)
             .expect("decoded output")
             .build()
             .expect("interval graph");
-        let decoder_node = stage.graph.outputs()["decoded"].value.node;
         let ideal = IdealSpec::new(
             DslContext::new("interval-ideal")
-                .bool_output("result", ring.bool_input("message"))
+                .output("result", ring.bool_input("message"))
                 .expect("ideal output")
                 .build()
                 .expect("ideal graph")
@@ -317,8 +282,6 @@ mod tests {
                 stages: vec![ProtocolStage {
                     id: stage_id.clone(),
                     graph: stage.graph,
-                    semantic_anchors: stage.anchors,
-                    derivation_attachments: stage.derivation_attachments,
                     bindings: Vec::new(),
                 }],
                 entrypoint: stage_id.clone(),
@@ -334,16 +297,10 @@ mod tests {
                     failure_value: true,
                 }],
             },
-            endpoints: EndpointAnchors {
-                entries: vec![EndpointAnchor {
+            endpoints: EndpointBindings {
+                entries: vec![EndpointBinding {
                     spec: endpoint,
-                    stage: stage_id.clone(),
-                    semantic_anchor: "interval.result".to_owned(),
                     semantics: EndpointSemanticBinding::DiamondBoolean {
-                        residual_stage: stage_id.clone(),
-                        residual_anchor: "interval.residual".to_owned(),
-                        carrier_stage: stage_id.clone(),
-                        carrier_anchor: "interval.carrier".to_owned(),
                         message: message_input.clone(),
                     },
                     workflow_output: OutputRef {
@@ -355,10 +312,8 @@ mod tests {
             },
             operational_decoder_targets: vec![OperationalDecoderTarget {
                 target_id: "boolean-interval".to_owned(),
-                residual_stage: stage_id.clone(),
-                residual_output: "residual".to_owned(),
-                decoder_stage: stage_id.clone(),
-                decoder_node,
+                residual: OutputRef { stage: stage_id.clone(), output: "residual".to_owned() },
+                endpoint: EndpointSpecId::DiamondBooleanInterval,
                 kind: OperationalDecoderKind::BooleanInterval,
             }],
             endpoint_specs: vec![endpoint],
@@ -430,6 +385,81 @@ mod tests {
             threshold_family_bundle(false).validate(),
             Err(BundleValidationError::InvalidOperationalDecoderTarget)
         );
+    }
+
+    #[test]
+    fn endpoint_binding_requires_an_existing_output() {
+        let mut bundle = valid_bundle();
+        bundle.endpoints.entries[0].workflow_output.output = "missing".to_owned();
+        assert_eq!(bundle.validate(), Err(BundleValidationError::MissingEndpointBinding));
+        let mut bundle = valid_bundle();
+        bundle.endpoints.entries[0].workflow_output.stage = StageId("missing".to_owned());
+        assert_eq!(bundle.validate(), Err(BundleValidationError::MissingEndpointBinding));
+    }
+
+    #[test]
+    fn operational_target_requires_a_registered_endpoint_and_residual() {
+        let mut bundle = valid_bundle();
+        bundle.operational_decoder_targets[0].endpoint = EndpointSpecId::ToyThresholdDecode;
+        assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidOperationalDecoderTarget));
+        let mut bundle = valid_bundle();
+        bundle.operational_decoder_targets[0].residual.output = "missing".to_owned();
+        assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidOperationalDecoderTarget));
+        let mut bundle = valid_bundle();
+        bundle.operational_decoder_targets[0].residual.stage = StageId("missing".to_owned());
+        assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidOperationalDecoderTarget));
+    }
+
+    #[test]
+    fn boolean_interval_target_rejects_an_unrelated_same_type_residual() {
+        let mut bundle = boolean_interval_bundle(IntExpr::constant(17));
+        bundle.operational_decoder_targets[0].residual.output = "unrelated-residual".to_owned();
+        assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidOperationalDecoderTarget));
+    }
+
+    #[test]
+    fn boolean_interval_target_rejects_an_unrelated_boolean_endpoint() {
+        let mut bundle = boolean_interval_bundle(IntExpr::constant(17));
+        bundle.endpoints.entries[0].workflow_output.output = "unrelated-result".to_owned();
+        let ComparatorSpec::Equality { endpoints } = &mut bundle.comparator else { unreachable!() };
+        endpoints[0].actual_input = "unrelated-result".to_owned();
+        assert_eq!(
+            bundle.validate(),
+            Err(BundleValidationError::OperationalDecoderTargetKindMismatch)
+        );
+    }
+
+    #[test]
+    fn boolean_endpoint_still_requires_a_boolean_message_contract() {
+        let mut bundle = valid_bundle();
+        bundle.endpoints.entries[0].semantics =
+            EndpointSemanticBinding::DiamondBoolean { message: ProtocolInputId::from("residual") };
+        assert_eq!(bundle.validate(), Err(BundleValidationError::InvalidEndpointSemantics));
+    }
+
+    #[test]
+    fn threshold_target_accepts_a_nonzero_boolean_decoder_port() {
+        let mut bundle = threshold_family_bundle(true);
+        let ring = Ring::new(17, 1);
+        let residuals =
+            Family::pack(vec![ring.zero((1, 2)), ring.zero((1, 2))]).expect("residual family");
+        let second_bit = residuals
+            .at(0)
+            .slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None)
+            .threshold_decode_bools(IntExpr::constant(17), 2)
+            .into_iter()
+            .nth(1)
+            .expect("second decoder output");
+        let stage = DslContext::new("threshold-family-stage")
+            .output("residual", residuals)
+            .expect("residual output")
+            .output("decoded", second_bit)
+            .expect("decoded output")
+            .build()
+            .expect("threshold family graph");
+        assert_eq!(stage.graph.outputs()["decoded"].value.port, mxx_ir_core::Port(1));
+        bundle.workflow.stages[0].graph = stage.graph;
+        assert_eq!(bundle.validate(), Ok(()));
     }
 
     #[test]
@@ -505,10 +535,8 @@ mod tests {
     fn structural_validation_does_not_claim_endpoint_soundness() {
         let mut bundle = valid_bundle();
         bundle.endpoint_specs.push(EndpointSpecId::ToyThresholdDecode);
-        bundle.endpoints.entries.push(EndpointAnchor {
+        bundle.endpoints.entries.push(EndpointBinding {
             spec: EndpointSpecId::ToyThresholdDecode,
-            stage: StageId("stage".to_owned()),
-            semantic_anchor: "decoded-result".to_owned(),
             semantics: EndpointSemanticBinding::ThresholdDecode,
             workflow_output: OutputRef {
                 stage: StageId("stage".to_owned()),

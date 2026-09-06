@@ -16,32 +16,31 @@ actual generated root. All public matrices and the final decomposition are input
 theorem generated_final_root
     (backend : BackendContext) (params : Stage_decrypt.Params) {inputs outputs}
     (hrun : Stage_decrypt.generatedRoot backend params inputs outputs) :
-    ∃ (state : ExactMatrix q n 1 inner) (circuit : ExactMatrix q n 1 ell)
+    ∃ (states : Fin stateCount → ExactMatrix q n 1 inner)
+      (state : ExactMatrix q n 1 inner) (circuit : ExactMatrix q n 1 ell)
       (coefficient : Int),
-      outputs.2.2.2.2.1 = state * inputs.2.2.2.1 -
+      outputs.2.1 = state * inputs.2.2.2.1 -
         (state * inputs.2.2.2.2.1 + (state * inputs.2.2.2.2.2.1 - circuit) *
           inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1) ∧
-      extractCoefficient 0 outputs.2.2.2.2.1 coefficient ∧
-      outputs.2.2.2.2.2.1 =
+      extractCoefficient 0 outputs.2.1 coefficient ∧
+      outputs.1 =
         decide (MxxIR.roundDiv (params.diamond_modulus - 2) 4 ≤ coefficient ∧
           coefficient ≤ 3 * MxxIR.roundDiv (params.diamond_modulus - 2) 4) ∧
-      familyGetStatic outputs.2.2.2.2.2.2.1 0 state := by
-  dsimp only [Stage_decrypt.generatedRoot] at hrun
+      familyGetStatic states 0 state := by
   obtain ⟨rootWitness, h⟩ := hrun
-  rcases rootWitness with ⟨w2, w3, w5, w6, w8, state, w19, w24, w26, w27, w28, w29,
-    w31, w32, w33, w35, w36, w37, w38, w40, w42, w43, w44, w45, w46, w47,
-    w48, w49, w50, w53, w54, w55, w56, w57, w58, w59, w60, w61, w62,
-    w67a, w67b, w67c, w70, circuit, coefficient⟩
-  dsimp only [Stage_decrypt.generatedRoot.body, Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
+  dsimp only [Stage_decrypt.generatedRoot.body, Stage_decrypt.generatedRoot.constraints_0] at h
   have hextract : extractCoefficient 0
-      (state * inputs.2.2.2.1 - (state * inputs.2.2.2.2.1 +
-        (state * inputs.2.2.2.2.2.1 - circuit) *
-          inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1)) coefficient := by
-    tauto
-  have hstate : familyGetStatic w8 0 state := by tauto
+      (rootWitness.w_7_0 * inputs.2.2.2.1 -
+        (rootWitness.w_7_0 * inputs.2.2.2.2.1 +
+        (rootWitness.w_7_0 * inputs.2.2.2.2.2.1 - rootWitness.w_36_0) *
+          inputs.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1)) rootWitness.w_42_0 := by tauto
+  have hstate : familyGetStatic rootWitness.w_6_0 0 rootWitness.w_7_0 := by tauto
   repeat' obtain ⟨_, h⟩ := h
-  refine ⟨state, circuit, coefficient, rfl, hextract, ?_, hstate⟩
+  refine ⟨rootWitness.w_6_0, rootWitness.w_7_0, rootWitness.w_36_0,
+    rootWitness.w_42_0, rfl, hextract, ?_, hstate⟩
   dsimp only
+  have hquarter : -2 + params.diamond_modulus = params.diamond_modulus - 2 := by omega
+  rw [hquarter]
   split_ifs <;> simp_all <;> omega
 
 /-- Local matching encoding premises expose exactly which secret and public-key
@@ -197,9 +196,9 @@ theorem generated_final_decoder
     (backend : BackendContext) (params : Stage_decrypt.Params) {inputs outputs}
     (hq : params.diamond_modulus = (q : Int))
     (hrun : Stage_decrypt.generatedRoot backend params inputs outputs) :
-    outputs.2.2.2.2.2.1 =
-      MxxWe.decoded q ((outputs.2.2.2.2.1 0 0).coeff ⟨0, by decide⟩).val := by
-  obtain ⟨state, circuit, coefficient, _, hextract, hdecode, _⟩ :=
+    outputs.1 =
+      MxxWe.decoded q ((outputs.2.1 0 0).coeff ⟨0, by decide⟩).val := by
+  obtain ⟨states, state, circuit, coefficient, _, hextract, hdecode, _⟩ :=
     generated_final_root backend params hrun
   obtain ⟨index, hindex, hcoeff⟩ := hextract
   have hi : index = ⟨0, by decide⟩ := Fin.ext (by change index.val = 0; omega)

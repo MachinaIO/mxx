@@ -4,7 +4,7 @@
 
 use mxx_ir_core::{
     CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, Graph, GraphOutput,
-    IntExpr, NodeHandle, ParamEnv, RealExpr, SealMap, SubgraphHandle, ValueHandle,
+    IntExpr, NodeHandle, ParamEnv, RealExpr, SubgraphHandle, ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
     graph::with_new_construction_scope,
     node::{
@@ -29,7 +29,7 @@ pub use value::{GraphValue, GraphValueSchema};
 use num_bigint::BigUint;
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ops::{Add, Mul, Neg, Sub},
 };
 use thiserror::Error;
@@ -37,10 +37,7 @@ use thiserror::Error;
 pub use mxx_ir_core::{
     Rational,
     artifact::ArtifactConfidentiality as Confidentiality,
-    protocol::{
-        FrozenDerivationAttachment, FrozenDerivationAttachments, FrozenSemanticAnchors, IdealSpec,
-        PurePredicateSpec,
-    },
+    protocol::{IdealSpec, PurePredicateSpec},
 };
 #[cfg(test)]
 mod bundle_tests;
@@ -95,8 +92,6 @@ pub enum DslError {
     StructuralValidation(#[from] mxx_ir_core::ValidationError),
     #[error(transparent)]
     Specification(#[from] mxx_ir_core::protocol::SpecificationError),
-    #[error("semantic anchor could not be resolved in the frozen graph: {0}")]
-    SemanticAnchorResolution(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -186,7 +181,7 @@ impl Ring {
             Vec::new(),
             vec![WireType::Bool],
         );
-        Bool { value: node.output(0).expect("boolean input"), pending: Pending::default() }
+        Bool { value: node.output(0).expect("boolean input") }
     }
 
     pub fn new(modulus: impl Into<IntExpr>, ring_dimension: impl Into<IntExpr>) -> Self {
@@ -301,7 +296,6 @@ impl Ring {
             value: node.output(0).expect("preimage artifact input"),
             matrix_type,
             max_coefficient_bound,
-            pending: Pending::default(),
         }
     }
 
@@ -363,7 +357,6 @@ impl Ring {
             value: node.output(0).expect("trapdoor artifact input"),
             matrix_type,
             preimage_max_coefficient_bound,
-            pending: Pending::default(),
         }
     }
 
@@ -602,7 +595,7 @@ impl Ring {
     #[track_caller]
     pub fn pack_polynomial_coefficients(&self, bits: Family<Bool>, coefficient_bits: usize) -> Mat {
         let matrix_type = self.matrix_type((1, 1));
-        let pending = bits.pending;
+
         let node = NodeHandle::new(
             NodeKind::PackPolynomialCoefficients {
                 matrix_type: matrix_type.clone(),
@@ -611,7 +604,7 @@ impl Ring {
             vec![bits.values[0].clone()],
             vec![WireType::Matrix(matrix_type.clone())],
         );
-        Mat { value: node.output(0).expect("packed polynomial"), matrix_type, pending }
+        Mat { value: node.output(0).expect("packed polynomial"), matrix_type }
     }
 
     #[track_caller]
@@ -720,7 +713,7 @@ impl Ring {
         } else {
             IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2))).canonicalize()
         };
-        let pending = Pending::merge([key.pending.clone(), tag.pending]);
+
         let mut arguments = vec![key.value];
         arguments.extend(tag.dynamic);
         let wire_type = WireType::SmallMatrix {
@@ -743,7 +736,6 @@ impl Ring {
             value: node.output(0).expect("bounded hash output"),
             matrix_type,
             max_coefficient_bound,
-            pending,
         }
     }
 
@@ -759,7 +751,7 @@ impl Ring {
     ) -> Mat {
         let ty = self.matrix_type(shape);
         let tag = tag.into();
-        let pending = Pending::merge([key.pending.clone(), tag.pending]);
+
         let mut arguments = vec![key.value];
         arguments.extend(tag.dynamic);
         let node = NodeHandle::new(
@@ -774,7 +766,7 @@ impl Ring {
             arguments,
             vec![WireType::Matrix(ty.clone())],
         );
-        Mat { value: node.output(0).expect("hash output"), matrix_type: ty, pending }
+        Mat { value: node.output(0).expect("hash output"), matrix_type: ty }
     }
 
     #[track_caller]
@@ -819,12 +811,10 @@ impl Ring {
             public: Mat {
                 value: node.output(0).expect("public output"),
                 matrix_type: matrix_type.clone(),
-                pending: Pending::default(),
             },
             value: node.output(1).expect("trapdoor output"),
             matrix_type,
             preimage_max_coefficient_bound,
-            pending: Pending::default(),
         }
     }
 
@@ -836,7 +826,7 @@ impl Ring {
             Vec::new(),
             vec![ty],
         );
-        Bytes { value: node.output(0).expect("bytes input"), pending: Pending::default() }
+        Bytes { value: node.output(0).expect("bytes input") }
     }
 
     #[track_caller]
@@ -858,7 +848,7 @@ impl Ring {
             Vec::new(),
             vec![ty],
         );
-        Bytes { value: node.output(0).expect("bytes artifact input"), pending: Pending::default() }
+        Bytes { value: node.output(0).expect("bytes artifact input") }
     }
 }
 
@@ -871,7 +861,6 @@ pub struct HashTag {
     prefix: Vec<u8>,
     components: Vec<HashTagComponent>,
     dynamic: Vec<ValueHandle>,
-    pending: Pending,
 }
 
 impl HashTag {
@@ -888,7 +877,7 @@ impl HashTag {
         self.components.push(HashTagComponent::Decimal(
             index.compile_expression().ok_or(DslError::CompileTimeIndex)?,
         ));
-        self.pending = Pending::merge([std::mem::take(&mut self.pending), index.pending]);
+
         Ok(())
     }
 }
@@ -940,7 +929,6 @@ impl HashTagPart for Int {
                 tag.dynamic.push(self.value);
             }
         }
-        tag.pending = Pending::merge([std::mem::take(&mut tag.pending), self.pending]);
     }
 }
 
@@ -948,7 +936,6 @@ impl HashTagPart for Int {
 pub struct Mat {
     value: ValueHandle,
     matrix_type: MatrixType,
-    pending: Pending,
 }
 
 impl Mat {
@@ -963,18 +950,13 @@ impl Mat {
             Vec::new(),
             vec![wire_type],
         );
-        Self {
-            value: node.output(0).expect("matrix input"),
-            matrix_type,
-            pending: Pending::default(),
-        }
+        Self { value: node.output(0).expect("matrix input"), matrix_type }
     }
 
     fn from_node(kind: NodeKind, arguments: Vec<Mat>, matrix_type: MatrixType) -> Self {
-        let pending = Pending::merge(arguments.iter().map(|value| value.pending.clone()));
         let arguments = arguments.into_iter().map(|value| value.value).collect();
         let node = NodeHandle::new(kind, arguments, vec![WireType::Matrix(matrix_type.clone())]);
-        Self { value: node.output(0).expect("matrix output"), matrix_type, pending }
+        Self { value: node.output(0).expect("matrix output"), matrix_type }
     }
 
     /// Fuses a sum of coefficient-weighted matrix products for execution.
@@ -1018,17 +1000,13 @@ impl Mat {
             columns: rhs.matrix_type.columns.clone(),
             ..self.matrix_type.clone()
         };
-        let pending = Pending::merge([self.pending.clone(), rhs.pending.clone()]);
+
         let node = NodeHandle::new(
             NodeKind::MatrixMulSmallRhs,
             vec![self.value, rhs.value],
             vec![WireType::Matrix(output_type.clone())],
         );
-        Self {
-            value: node.output(0).expect("small RHS multiplication"),
-            matrix_type: output_type,
-            pending,
-        }
+        Self { value: node.output(0).expect("small RHS multiplication"), matrix_type: output_type }
     }
 
     /// Applies the raw negacyclic automorphism `sigma_k: X -> X^k` entrywise.
@@ -1118,7 +1096,7 @@ impl Mat {
             rows: (self.matrix_type.rows.clone() * digit_count.clone()).canonicalize(),
             ..self.matrix_type.clone()
         };
-        let pending = self.pending;
+
         let max_coefficient_bound = if small {
             (base.clone() - IntExpr::constant(1)).canonicalize()
         } else {
@@ -1136,7 +1114,6 @@ impl Mat {
             value: node.output(0).expect("decomposition"),
             matrix_type: ty,
             max_coefficient_bound,
-            pending,
         };
         preimage
     }
@@ -1154,7 +1131,6 @@ impl Mat {
         position: impl Into<IntExpr>,
         canonical_input_exclusive_upper: Option<num_bigint::BigUint>,
     ) -> Int {
-        let pending = self.pending;
         let node = NodeHandle::new(
             NodeKind::ExtractCoefficient {
                 position: position.into(),
@@ -1163,7 +1139,7 @@ impl Mat {
             vec![self.value],
             vec![WireType::Int],
         );
-        Int { value: node.output(0).expect("coefficient"), pending }
+        Int { value: node.output(0).expect("coefficient") }
     }
 
     /// Serializes one polynomial into canonical coefficient bits.
@@ -1195,7 +1171,6 @@ impl Mat {
         plaintext_modulus: impl Into<IntExpr>,
         length: usize,
     ) -> Vec<Int> {
-        let pending = self.pending;
         let node = NodeHandle::new(
             NodeKind::ThresholdDecode {
                 plaintext_modulus: plaintext_modulus.into(),
@@ -1206,10 +1181,7 @@ impl Mat {
             vec![WireType::Int; length],
         );
         (0..length)
-            .map(|port| Int {
-                value: node.output(port as u32).expect("decoded integer"),
-                pending: pending.clone(),
-            })
+            .map(|port| Int { value: node.output(port as u32).expect("decoded integer") })
             .collect()
     }
 
@@ -1219,7 +1191,6 @@ impl Mat {
         plaintext_modulus: impl Into<IntExpr>,
         length: usize,
     ) -> Vec<Bool> {
-        let pending = self.pending;
         let node = NodeHandle::new(
             NodeKind::ThresholdDecode {
                 plaintext_modulus: plaintext_modulus.into(),
@@ -1230,10 +1201,7 @@ impl Mat {
             vec![WireType::Bool; length],
         );
         (0..length)
-            .map(|port| Bool {
-                value: node.output(port as u32).expect("decoded boolean"),
-                pending: pending.clone(),
-            })
+            .map(|port| Bool { value: node.output(port as u32).expect("decoded boolean") })
             .collect()
     }
 
@@ -1316,7 +1284,6 @@ pub struct Preimage {
     value: ValueHandle,
     matrix_type: MatrixType,
     max_coefficient_bound: IntExpr,
-    pending: Pending,
 }
 
 impl Preimage {
@@ -1335,12 +1302,7 @@ impl Preimage {
             Vec::new(),
             vec![wire_type],
         );
-        Self {
-            value: node.output(0).expect("preimage input"),
-            matrix_type,
-            max_coefficient_bound,
-            pending: Pending::default(),
-        }
+        Self { value: node.output(0).expect("preimage input"), matrix_type, max_coefficient_bound }
     }
 
     #[doc(hidden)]
@@ -1363,17 +1325,13 @@ impl Preimage {
             columns: self.matrix_type.columns.clone(),
             ..lhs.matrix_type.clone()
         };
-        let pending = Pending::merge([lhs.pending.clone(), self.pending.clone()]);
+
         let node = NodeHandle::new(
             NodeKind::MatrixMulSmallRhs,
             vec![lhs.value, self.value],
             vec![WireType::Matrix(output_type.clone())],
         );
-        Mat {
-            value: node.output(0).expect("preimage multiplication"),
-            matrix_type: output_type,
-            pending,
-        }
+        Mat { value: node.output(0).expect("preimage multiplication"), matrix_type: output_type }
     }
 }
 
@@ -1383,7 +1341,6 @@ pub struct Trapdoor {
     value: ValueHandle,
     matrix_type: MatrixType,
     preimage_max_coefficient_bound: IntExpr,
-    pending: Pending,
 }
 
 impl Trapdoor {
@@ -1405,7 +1362,7 @@ impl Trapdoor {
         let shape = shape.into_shape();
         let ty =
             MatrixType { rows: shape.rows, columns: shape.columns, ..self.matrix_type.clone() };
-        let pending = Pending::merge([self.pending.clone(), target.pending.clone()]);
+
         let node = NodeHandle::new(
             NodeKind::PreimageSample {
                 matrix_type: ty.clone(),
@@ -1421,142 +1378,16 @@ impl Trapdoor {
             value: node.output(0).expect("preimage"),
             matrix_type: ty,
             max_coefficient_bound: self.preimage_max_coefficient_bound.clone(),
-            pending,
         };
         preimage
     }
 }
 
-#[derive(Clone)]
-#[doc(hidden)]
-pub struct DerivationAttachment {
-    namespace: String,
-    rule: String,
-    roles: Vec<(String, ValueHandle)>,
-}
-
-#[derive(Clone, Default)]
-#[doc(hidden)]
-pub struct Pending {
-    semantic_anchors: BTreeMap<String, Vec<ValueHandle>>,
-    derivation_attachments: Vec<DerivationAttachment>,
-}
-
-impl Pending {
-    #[doc(hidden)]
-    pub fn merge(values: impl IntoIterator<Item = Pending>) -> Self {
-        let mut merged = Self::default();
-        for pending in values {
-            for (name, wires) in pending.semantic_anchors {
-                merged.semantic_anchors.entry(name).or_default().extend(wires);
-            }
-            merged.derivation_attachments.extend(pending.derivation_attachments);
-        }
-        merged
-    }
-
-    fn referenced_values(&self) -> Vec<ValueHandle> {
-        self.semantic_anchors
-            .values()
-            .flatten()
-            .cloned()
-            .chain(
-                self.derivation_attachments
-                    .iter()
-                    .flat_map(|attachment| attachment.roles.iter().map(|(_, wire)| wire.clone())),
-            )
-            .collect()
-    }
-
-    fn remap(&self, map: &SealMap) -> Self {
-        let semantic_anchors = self
-            .semantic_anchors
-            .iter()
-            .map(|(name, wires)| {
-                let wires = wires
-                    .iter()
-                    .map(|wire| map.resolve(wire).cloned().unwrap_or_else(|| wire.clone()))
-                    .collect();
-                (name.clone(), wires)
-            })
-            .collect();
-        let derivation_attachments = self
-            .derivation_attachments
-            .iter()
-            .map(|attachment| DerivationAttachment {
-                namespace: attachment.namespace.clone(),
-                rule: attachment.rule.clone(),
-                roles: attachment
-                    .roles
-                    .iter()
-                    .map(|(role, wire)| {
-                        (role.clone(), map.resolve(wire).cloned().unwrap_or_else(|| wire.clone()))
-                    })
-                    .collect(),
-            })
-            .collect();
-        Self { semantic_anchors, derivation_attachments }
-    }
-
-    fn with_semantic_anchor(mut self, name: String, wires: Vec<ValueHandle>) -> Self {
-        self.semantic_anchors.entry(name).or_default().extend(wires);
-        self
-    }
-
-    fn with_derivation_attachment(mut self, attachment: DerivationAttachment) -> Self {
-        self.derivation_attachments.push(attachment);
-        self
-    }
-}
-
-/// Adds a proof-facing name to a DSL value without changing the executable graph.
-pub trait SemanticAnchor: GraphValue + Sized {
-    fn semantic_anchor(self, name: impl Into<String>) -> Result<Self, DslError> {
-        let schema = self.schema();
-        let wires = self.flatten();
-        let pending = self.pending().with_semantic_anchor(name.into(), wires.clone());
-        Self::from_values(&schema, &wires, pending)
-    }
-}
-
-impl<T: GraphValue> SemanticAnchor for T {}
-
-/// Attaches an owning-crate operational-rule reference without changing the executable graph.
-///
-/// This trait is intentionally hidden from normal DSL documentation.  Reusable gadget and BGG
-/// builders use it mechanically; protocol authors do not supply bounds, identities, or rules.
-#[doc(hidden)]
-pub trait DerivationAttachmentValue: GraphValue + Sized {
-    fn derivation_attachment(
-        self,
-        namespace: impl Into<String>,
-        rule: impl Into<String>,
-        roles: Vec<(String, ValueHandle)>,
-    ) -> Result<Self, DslError> {
-        let schema = self.schema();
-        let wires = self.flatten();
-        let pending = self.pending().with_derivation_attachment(DerivationAttachment {
-            namespace: namespace.into(),
-            rule: rule.into(),
-            roles,
-        });
-        Self::from_values(&schema, &wires, pending)
-    }
-}
-
-impl<T: GraphValue> DerivationAttachmentValue for T {}
-
 pub struct DslContext {
     name: String,
     parameters: Vec<CompileParameter>,
-    outputs: BTreeMap<String, PendingOutput>,
+    outputs: BTreeMap<String, GraphOutput>,
     real_constants: BTreeMap<String, RealExpr>,
-}
-
-struct PendingOutput {
-    value: ValueHandle,
-    pending: Pending,
-    confidentiality: Option<ArtifactConfidentiality>,
 }
 
 impl DslContext {
@@ -1596,7 +1427,7 @@ impl DslContext {
                 .expect("input field")
             })
             .collect::<Vec<_>>();
-        V::from_values(&schema, &values, Pending::default())
+        V::from_values(&schema, &values)
     }
 
     pub fn int_parameter(mut self, name: impl Into<String>) -> Self {
@@ -1622,7 +1453,7 @@ impl DslContext {
             vec![WireType::ConstantInt],
         );
         let expression = node.output(0).expect("evaluated integer expression");
-        Int { value: expression, pending: Pending::default() }.add(Int::constant(0))
+        Int { value: expression }.add(Int::constant(0))
     }
 
     #[track_caller]
@@ -1643,7 +1474,6 @@ impl DslContext {
             values: vec![node.output(0).expect("integer family input")],
             element_schema: IntType,
             count,
-            pending: Pending::default(),
         }
     }
 
@@ -1656,41 +1486,12 @@ impl DslContext {
         Ok(self)
     }
 
-    pub fn bool_output(mut self, name: impl Into<String>, value: Bool) -> Result<Self, DslError> {
-        self.insert_pending_output(name.into(), value.value, value.pending, None)?;
-        Ok(self)
-    }
-
-    pub fn int_output(mut self, name: impl Into<String>, value: Int) -> Result<Self, DslError> {
-        self.insert_pending_output(name.into(), value.value, value.pending, None)?;
-        Ok(self)
-    }
-
-    pub fn bytes_output(mut self, name: impl Into<String>, value: Bytes) -> Result<Self, DslError> {
-        self.insert_pending_output(name.into(), value.value, value.pending, None)?;
-        Ok(self)
-    }
-
     pub fn public_output<V: GraphValue>(
         mut self,
         name: impl Into<String>,
         value: V,
     ) -> Result<Self, DslError> {
         self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Public))?;
-        Ok(self)
-    }
-
-    pub fn public_bytes_output(
-        mut self,
-        name: impl Into<String>,
-        value: Bytes,
-    ) -> Result<Self, DslError> {
-        self.insert_pending_output(
-            name.into(),
-            value.value,
-            value.pending,
-            Some(ArtifactConfidentiality::Public),
-        )?;
         Ok(self)
     }
 
@@ -1708,12 +1509,7 @@ impl DslContext {
         name: impl Into<String>,
         trapdoor: Trapdoor,
     ) -> Result<Self, DslError> {
-        self.insert_pending_output(
-            name.into(),
-            trapdoor.value,
-            trapdoor.pending,
-            Some(ArtifactConfidentiality::Private),
-        )?;
+        self.insert_output(name.into(), trapdoor.value, Some(ArtifactConfidentiality::Private))?;
         Ok(self)
     }
 
@@ -1722,10 +1518,9 @@ impl DslContext {
         name: impl Into<String>,
         trapdoors: Family<Trapdoor>,
     ) -> Result<Self, DslError> {
-        self.insert_pending_output(
+        self.insert_output(
             name.into(),
             trapdoors.values[1].clone(),
-            trapdoors.pending,
             Some(ArtifactConfidentiality::Private),
         )?;
         Ok(self)
@@ -1737,7 +1532,6 @@ impl DslContext {
         value: V,
         confidentiality: Option<ArtifactConfidentiality>,
     ) -> Result<(), DslError> {
-        let pending = value.pending();
         let values = value.flatten();
         if values.is_empty() {
             return Err(DslError::Schema);
@@ -1749,144 +1543,39 @@ impl DslContext {
             return Err(DslError::DuplicateOutput(name.clone()));
         }
         for (name, value) in names.into_iter().zip(values) {
-            self.insert_pending_output(name, value, pending.clone(), confidentiality)?;
+            self.insert_output(name, value, confidentiality)?;
         }
         Ok(())
     }
 
-    pub fn family_output(
-        mut self,
-        name: impl Into<String>,
-        family: Family<Mat>,
-    ) -> Result<Self, DslError> {
-        self.insert_family_output(name.into(), family, None)?;
-        Ok(self)
-    }
-
-    pub fn int_family_output(
-        mut self,
-        name: impl Into<String>,
-        family: Family<Int>,
-    ) -> Result<Self, DslError> {
-        self.insert_pending_output(name.into(), family.values[0].clone(), family.pending, None)?;
-        Ok(self)
-    }
-
-    pub fn bool_family_output(
-        mut self,
-        name: impl Into<String>,
-        family: Family<Bool>,
-    ) -> Result<Self, DslError> {
-        self.insert_pending_output(name.into(), family.values[0].clone(), family.pending, None)?;
-        Ok(self)
-    }
-
-    fn insert_family_output(
-        &mut self,
-        name: String,
-        family: Family<Mat>,
-        confidentiality: Option<ArtifactConfidentiality>,
-    ) -> Result<(), DslError> {
-        self.insert_pending_output(name, family.values[0].clone(), family.pending, confidentiality)
-    }
-
-    fn insert_pending_output(
+    fn insert_output(
         &mut self,
         name: String,
         value: ValueHandle,
-        pending: Pending,
         confidentiality: Option<ArtifactConfidentiality>,
     ) -> Result<(), DslError> {
-        if self
-            .outputs
-            .insert(name.clone(), PendingOutput { value, pending, confidentiality })
-            .is_some()
-        {
+        if self.outputs.insert(name.clone(), GraphOutput { value, confidentiality }).is_some() {
             return Err(DslError::DuplicateOutput(name));
         }
         Ok(())
     }
 
     pub fn build(self) -> Result<BuiltGraph, DslError> {
-        self.build_with_freeze_map().map(|(graph, _)| graph)
-    }
-
-    #[doc(hidden)]
-    pub fn build_with_freeze_map(self) -> Result<(BuiltGraph, mxx_ir_core::FreezeMap), DslError> {
-        let pending = Pending::merge(self.outputs.values().map(|output| output.pending.clone()));
-        let root_scope = mxx_ir_core::current_construction_scope();
-        let retained_roots = pending
-            .referenced_values()
-            .into_iter()
-            .filter(|wire| wire.construction_scope() == root_scope)
-            .collect();
-        let outputs = self
-            .outputs
-            .into_iter()
-            .map(|(name, output)| {
-                (name, GraphOutput { value: output.value, confidentiality: output.confidentiality })
-            })
-            .collect();
-        let (graph, freeze_map) = Graph::freeze(
+        let (graph, _) = Graph::freeze(
             self.name,
             self.parameters,
-            outputs,
-            retained_roots,
+            self.outputs,
+            Vec::new(),
             Vec::new(),
             self.real_constants,
         )?;
         mxx_ir_core::validate_structure(&graph)?;
-        let anchors = pending
-            .semantic_anchors
-            .into_iter()
-            .map(|(name, wires)| {
-                let wires = wires
-                    .iter()
-                    .map(|wire| freeze_map.resolve_unique(wire).cloned())
-                    .collect::<Result<BTreeSet<_>, _>>()?
-                    .into_iter()
-                    .collect();
-                Ok((name, wires))
-            })
-            .collect::<Result<BTreeMap<_, _>, mxx_ir_core::FreezeResolveError>>()
-            .map_err(|error| DslError::SemanticAnchorResolution(error.to_string()))?;
-        let mut attachments = pending
-            .derivation_attachments
-            .into_iter()
-            .map(|attachment| {
-                let roles = attachment
-                    .roles
-                    .into_iter()
-                    .map(|(role, wire)| {
-                        freeze_map.resolve_unique(&wire).cloned().map(|wire| (role, wire))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(FrozenDerivationAttachment {
-                    namespace: attachment.namespace,
-                    rule: attachment.rule,
-                    roles,
-                })
-            })
-            .collect::<Result<Vec<_>, mxx_ir_core::FreezeResolveError>>()
-            .map_err(|error| DslError::SemanticAnchorResolution(error.to_string()))?;
-        attachments.sort();
-        attachments.dedup();
-        Ok((
-            BuiltGraph {
-                graph,
-                anchors: FrozenSemanticAnchors::new(anchors),
-                derivation_attachments: FrozenDerivationAttachments::new(attachments),
-            },
-            freeze_map,
-        ))
+        Ok(BuiltGraph { graph })
     }
 }
 
 pub struct BuiltGraph {
     pub graph: Graph,
-    pub anchors: FrozenSemanticAnchors,
-    #[doc(hidden)]
-    pub derivation_attachments: FrozenDerivationAttachments,
 }
 
 impl BuiltGraph {
@@ -1916,7 +1605,6 @@ pub struct SmallMatrix {
     value: ValueHandle,
     matrix_type: MatrixType,
     max_coefficient_bound: IntExpr,
-    pending: Pending,
 }
 
 impl SmallMatrix {
@@ -1939,7 +1627,6 @@ impl SmallMatrix {
             value: node.output(0).expect("small matrix input"),
             matrix_type,
             max_coefficient_bound,
-            pending: Pending::default(),
         }
     }
 
@@ -2200,9 +1887,9 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_integer_hash_tag_is_an_explicit_argument_and_preserves_pending_metadata() {
+    fn dynamic_integer_hash_tag_is_an_explicit_argument() {
         let ring = Ring::new(17, 8);
-        let row = Int::constant(7).add(Int::constant(0)).semantic_anchor("hash-row").unwrap();
+        let row = Int::constant(7).add(Int::constant(0));
         let mut tag = HashTag::from(b"dynamic-hash/v1:".as_slice());
         tag.push(row);
         let sample = ring.hash_matrix(ring.bytes_input("key", 32), tag, (1, 1));
@@ -2218,41 +1905,38 @@ mod tests {
             .expect("hash sample");
         assert_eq!(hash.arguments().len(), 2);
         assert!(matches!(hash.arguments()[1].wire_type(), WireType::Int));
-        assert_eq!(built.anchors.get("hash-row").expect("dynamic tag anchor").len(), 1);
         built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
-    fn semantic_anchor_resolves_to_the_frozen_output_without_an_ir_node() {
+    fn unused_values_are_not_retained_by_graph_construction() {
         let ring = Ring::new(17, 8);
         let input = ring.input("input", (2, 2));
-        let output = (input.clone() + input).semantic_anchor("result-carrier").unwrap();
-        let built = DslContext::new("anchored-sum").output("sum", output).unwrap().build().unwrap();
-
-        let anchor = built.anchors.get("result-carrier").unwrap();
-        assert_eq!(anchor.len(), 1);
-        assert_eq!(anchor[0].scope, mxx_ir_core::FrozenGraphScopeId::Root);
-        assert_eq!(anchor[0].wire, built.graph.outputs()["sum"].value);
+        let unused = input.clone() + input.clone();
+        let built =
+            DslContext::new("output-roots").output("input", input).unwrap().build().unwrap();
+        assert_eq!(built.graph.root_scope().nodes().len(), 1);
+        assert!(matches!(
+            unused.value_handle().node().kind(),
+            NodeKind::MatrixBinary(MatrixBinaryOp::Add)
+        ));
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
-    fn semantic_anchor_is_remapped_into_a_sealed_loop_body() {
+    fn computed_output_is_preserved_in_a_sealed_loop_body() {
         let ring = Ring::new(17, 8);
         let captured = ring.input("captured", (1, 1));
-        let family = parallel(2, move |_| {
-            (captured.clone() + captured.clone()).semantic_anchor("loop-body-sum")
-        })
-        .unwrap();
-        let built = DslContext::new("anchored-loop")
-            .family_output("values", family)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let [anchor] = built.anchors.get("loop-body-sum").unwrap() else {
-            panic!("one body-template wire must be anchored")
-        };
-        assert!(matches!(anchor.scope, mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }));
+        let family = parallel(2, move |_| Ok(captured.clone() + captured.clone())).unwrap();
+        let built =
+            DslContext::new("computed-loop").output("values", family).unwrap().build().unwrap();
+        assert!(built.graph.scopes().iter().any(|(id, scope)| {
+            matches!(id, mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }) &&
+                scope.nodes().iter().any(|node| {
+                    matches!(node.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add))
+                })
+        }));
+        built.validate(&ParamEnv::default()).unwrap();
     }
 
     #[test]
@@ -2330,7 +2014,7 @@ mod tests {
         let values = context.int_family_input("values", 3);
         let indices = Family::<Int>::pack(vec![Int::constant(2), Int::constant(0)]).unwrap();
         let gathered = parallel(indices.count().clone(), |i| Ok(values.at(indices.at(i)))).unwrap();
-        let built = context.int_family_output("gathered", gathered).unwrap().build().unwrap();
+        let built = context.output("gathered", gathered).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
 
         assert!(
@@ -2410,7 +2094,7 @@ mod tests {
         let values = context.int_family_input("values", 8);
         let indices = parallel(2, |index| Ok(index * 3)).unwrap();
         let gathered = parallel(indices.count().clone(), |i| Ok(values.at(indices.at(i)))).unwrap();
-        let built = context.int_family_output("gathered", gathered).unwrap().build().unwrap();
+        let built = context.output("gathered", gathered).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
 
         let all_nodes =
@@ -2441,7 +2125,7 @@ mod tests {
             Ok(sum)
         })
         .expect("parameterized bit packing");
-        let built = context.int_family_output("packed", packed).unwrap().build().unwrap();
+        let built = context.output("packed", packed).unwrap().build().unwrap();
         let bindings = ParamEnv {
             integers: BTreeMap::from([
                 ("segments".to_owned(), 2.into()),
@@ -2591,7 +2275,7 @@ mod tests {
             select(kinds.at(&i), vec![left.at(&i), right.at(i)])
         })
         .unwrap();
-        let built = context.bool_family_output("outputs", outputs).unwrap().build().unwrap();
+        let built = context.output("outputs", outputs).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
         assert_eq!(
             built
@@ -2686,12 +2370,12 @@ mod tests {
     }
 
     #[test]
-    fn try_define_accepts_a_formal_nonartifact_family() {
+    fn define_accepts_a_formal_nonartifact_family() {
         let ring = Ring::new(17, 8);
         let matrix_type = MatType(ring.matrix_type((1, 1)));
         let family_type =
             FamilyType { element: MatType(ring.matrix_type((1, 1))), count: 2.into() };
-        let subgraph = Subgraph::<(Mat, Family<Mat>), Mat>::try_define(
+        let subgraph = Subgraph::<(Mat, Family<Mat>), Mat>::define(
             "formal-matrix-family",
             (matrix_type.clone(), family_type.clone()),
             |(matrix, family)| Ok(matrix + family.at(0)),
@@ -2714,7 +2398,7 @@ mod tests {
             parallel(state.count().clone(), |i| Ok(state.at(i) + layer))
         })
         .unwrap();
-        let built = context.int_family_output("state", final_state).unwrap().build().unwrap();
+        let built = context.output("state", final_state).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
 
         let sequential = built
@@ -2758,7 +2442,7 @@ mod tests {
             Ok(context.evaluate_int(index.expression()? * IntExpr::Var("width".to_owned()) + 1))
         })
         .unwrap();
-        let built = context.int_family_output("values", values).unwrap().build().unwrap();
+        let built = context.output("values", values).unwrap().build().unwrap();
         built
             .validate(&ParamEnv {
                 integers: BTreeMap::from([("width".to_owned(), 3.into())]),
@@ -2794,17 +2478,17 @@ mod tests {
         let constant_bools = parallel(2, |_| Ok(Bool::constant(true))).unwrap();
 
         let built = context
-            .int_output("all-constant-int", all_constant_int)
+            .output("all-constant-int", all_constant_int)
             .unwrap()
-            .int_output("mixed-int", mixed_int)
+            .output("mixed-int", mixed_int)
             .unwrap()
-            .bool_output("all-constant-bool", all_constant_bool)
+            .output("all-constant-bool", all_constant_bool)
             .unwrap()
-            .bool_output("mixed-bool", mixed_bool)
+            .output("mixed-bool", mixed_bool)
             .unwrap()
-            .int_family_output("constant-ints", constant_ints)
+            .output("constant-ints", constant_ints)
             .unwrap()
-            .bool_family_output("constant-bools", constant_bools)
+            .output("constant-bools", constant_bools)
             .unwrap()
             .build()
             .unwrap();
@@ -2866,7 +2550,7 @@ mod tests {
     fn subgraph_call_carries_canonical_input_exclusive_uppers() {
         let ring = Ring::new(17, 8);
         let matrix = MatType(ring.matrix_type((1, 1)));
-        let subgraph = Subgraph::<Mat, Mat>::define("bounded-matrix", matrix, |value| value)
+        let subgraph = Subgraph::<Mat, Mat>::define("bounded-matrix", matrix, |value| Ok(value))
             .expect("subgraph definition");
         let context = DslContext::new("bounded-subgraph");
         let output = subgraph
@@ -2895,8 +2579,9 @@ mod tests {
 
     #[test]
     fn subgraph_call_rejects_invalid_canonical_input_exclusive_uppers() {
-        let subgraph = Subgraph::<Int, Int>::define("bounded-int-errors", IntType, |value| value)
-            .expect("subgraph definition");
+        let subgraph =
+            Subgraph::<Int, Int>::define("bounded-int-errors", IntType, |value| Ok(value))
+                .expect("subgraph definition");
         assert!(matches!(
             subgraph.call_with_canonical_input_exclusive_uppers(Int::constant(0), Vec::new()),
             Err(DslError::CanonicalInputUpperCount)

@@ -1418,7 +1418,7 @@ mod tests {
         let right = Int::constant(2);
         let sum = left.add(right);
         let built = DslContext::new("estimate-fork-join")
-            .int_output("sum", sum)
+            .output("sum", sum)
             .expect("output")
             .build()
             .expect("build");
@@ -1667,7 +1667,7 @@ mod tests {
         let values =
             parallel(count, |index| Ok(index.add(Int::constant(1)))).expect("parallel map");
         let built = DslContext::new("estimate-parallel")
-            .int_family_output("values", values)
+            .output("values", values)
             .expect("output")
             .build()
             .expect("build");
@@ -1712,7 +1712,7 @@ mod tests {
         })
         .expect("parallel samples");
         let built = DslContext::new("estimate-varying-sampler")
-            .family_output("values", values)
+            .output("values", values)
             .expect("output")
             .build()
             .expect("build");
@@ -1729,7 +1729,7 @@ mod tests {
         let total = iterate(3, Int::constant(0), |_, total| Ok(total.add(increment.clone())))
             .expect("sequential scan");
         let built = DslContext::new("estimate-sequential")
-            .int_output("total", total)
+            .output("total", total)
             .expect("output")
             .build()
             .expect("build");
@@ -1804,7 +1804,7 @@ mod tests {
                 iterate(count, Int::constant(0), |_, total| Ok(total.add(increment.clone())))
                     .expect("sequential scan");
             let built = DslContext::new("estimate-sequential-scaling")
-                .int_output("total", total)
+                .output("total", total)
                 .expect("output")
                 .build()
                 .expect("build");
@@ -1824,9 +1824,10 @@ mod tests {
 
     #[test]
     fn sequential_loop_multiplies_all_nested_invocation_counts() {
-        let increment =
-            Subgraph::<Int, Int>::define("increment", IntType, |value| value.add(Int::constant(1)))
-                .expect("increment subgraph");
+        let increment = Subgraph::<Int, Int>::define("increment", IntType, |value| {
+            Ok(value.add(Int::constant(1)))
+        })
+        .expect("increment subgraph");
         let total = iterate(3, Int::constant(0), |_, total| {
             let direct = increment.call(total)?;
             let values = parallel(2, |_| increment.call(direct.clone()))?;
@@ -1834,7 +1835,7 @@ mod tests {
         })
         .expect("nested sequential scan");
         let built = DslContext::new("estimate-nested-sequential")
-            .int_output("total", total)
+            .output("total", total)
             .expect("output")
             .build()
             .expect("build");

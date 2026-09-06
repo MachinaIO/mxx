@@ -290,7 +290,7 @@ mod tests {
         })
         .expect("parallel family");
         let built = DslContext::new("wee25-parallel-composition")
-            .family_output("roots", roots)
+            .output("roots", roots)
             .expect("family output")
             .build()
             .expect("build");

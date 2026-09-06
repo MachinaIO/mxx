@@ -466,6 +466,20 @@ where
         self.preimage_batch_calls
     }
 
+    /// Fleet resharding must remain device-resident. Explicit host staging is
+    /// reserved for artifact and preimage-target ownership transitions.
+    #[cfg(feature = "gpu")]
+    pub(super) fn matrix_to_active_placement_peer_only(
+        &self,
+        value: &M,
+    ) -> Result<M, PolyBackendError> {
+        let target = self.parameters_for_matrix(value)?;
+        if value.params() == target {
+            return Ok(value.clone());
+        }
+        value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
+    }
+
     pub(super) fn parameters(
         &self,
         matrix_type: &ConcreteMatrixType,

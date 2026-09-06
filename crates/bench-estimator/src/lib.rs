@@ -26,6 +26,9 @@ pub struct NodeMeasurement {
     pub cumulative_wave_seconds: f64,
     /// Number of independent fleet waves needed for the full logical operation.
     pub independent_wave_count: usize,
+    /// Measured scratch for one bounded execution wave, excluding resident inputs.
+    /// This is not the whole-graph runtime peak and is never multiplied by wave count.
+    pub measured_wave_workspace_bytes: u64,
     /// Hypothetical workspace when all independent waves execute concurrently.
     pub workspace_bytes: u64,
 }
@@ -37,6 +40,7 @@ impl Default for NodeMeasurement {
             latency_seconds: 0.0,
             cumulative_wave_seconds: 0.0,
             independent_wave_count: 1,
+            measured_wave_workspace_bytes: 0,
             workspace_bytes: 0,
         }
     }
@@ -130,6 +134,9 @@ pub struct CostReport {
     /// Maximum simultaneous node/fleet-wave parallelism in that unlimited-resource schedule.
     pub maximum_parallelism: usize,
     pub persistent_bytes_over_time: Vec<u64>,
+    /// Maximum measured bounded-wave scratch in this scope, excluding resident inputs.
+    pub measured_wave_workspace_bytes: u64,
+    /// Workspace in the hypothetical unlimited-resource dependency schedule.
     pub workspace_high_water_bytes: u64,
     pub workspace_high_water_by_node: BTreeMap<String, u64>,
     pub transmitted_bytes: u128,
@@ -141,6 +148,7 @@ pub struct CostReport {
     /// Sum of primitive wave counts in this scope, counting each structural node once.
     /// Nested scope invocation counts are reported separately in `per_subgraph`.
     pub chunk_count: usize,
+    /// Peak memory in the hypothetical unlimited-resource dependency schedule.
     pub peak_memory_bytes: u64,
     pub per_subgraph: BTreeMap<String, SubgraphCost>,
     /// Work and total-time costs for nodes explicitly tagged by the graph
@@ -172,7 +180,11 @@ pub struct SubgraphCost {
     pub expanded_workspace_bytes: u64,
     pub output_bytes_per_invocation: u128,
     pub chunk_count_per_invocation: usize,
+    /// Maximum measured bounded-wave scratch in this scope, excluding resident inputs.
+    pub measured_wave_workspace_bytes: u64,
+    /// Workspace in the hypothetical unlimited-resource dependency schedule.
     pub workspace_high_water_bytes: u64,
+    /// Peak memory in the hypothetical unlimited-resource dependency schedule.
     pub peak_memory_bytes: u64,
     pub maximum_parallelism: usize,
 }
@@ -232,6 +244,7 @@ pub fn estimate<B: MeasurementBackend>(
                     expanded_workspace_bytes: cached.expanded_workspace_bytes,
                     output_bytes_per_invocation: cached.output_bytes,
                     chunk_count_per_invocation: cached.chunk_count,
+                    measured_wave_workspace_bytes: cached.measured_wave_workspace_bytes,
                     workspace_high_water_bytes: cached.workspace_high_water_bytes,
                     peak_memory_bytes: cached.peak_memory_bytes,
                     maximum_parallelism: cached.maximum_parallelism,
@@ -547,6 +560,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             }
             let finish = predecessor + measurement.latency_seconds;
             report.critical_path_seconds = report.critical_path_seconds.max(finish);
+            report.measured_wave_workspace_bytes =
+                report.measured_wave_workspace_bytes.max(measurement.measured_wave_workspace_bytes);
             report.expanded_workspace_bytes =
                 report.expanded_workspace_bytes.max(measurement.workspace_bytes);
             report.chunk_count =
@@ -693,6 +708,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         latency_seconds: one.latency_seconds,
                         cumulative_wave_seconds: one.cumulative_wave_seconds * count as f64,
                         independent_wave_count: 1,
+                        measured_wave_workspace_bytes: one.measured_wave_workspace_bytes,
                         workspace_bytes: one.workspace_bytes.saturating_mul(count_u64),
                     },
                     preimage_work * count as f64,
@@ -746,6 +762,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         latency_seconds: one.latency_seconds * count as f64,
                         cumulative_wave_seconds: one.cumulative_wave_seconds * count as f64,
                         independent_wave_count: 1,
+                        measured_wave_workspace_bytes: one.measured_wave_workspace_bytes,
                         workspace_bytes: one.workspace_bytes,
                     },
                     preimage_work * count as f64,
@@ -874,6 +891,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 latency_seconds: report.critical_path_seconds,
                 cumulative_wave_seconds: report.total_time_seconds,
                 independent_wave_count: 1,
+                measured_wave_workspace_bytes: report.measured_wave_workspace_bytes,
                 workspace_bytes: report.workspace_high_water_bytes,
             },
             report.preimage_sampling_work_seconds,
@@ -1289,6 +1307,7 @@ mod tests {
                 latency_seconds: 1.0,
                 cumulative_wave_seconds: 1.0,
                 independent_wave_count: 1,
+                measured_wave_workspace_bytes: 4,
                 workspace_bytes: 4,
             })
         }
@@ -1315,6 +1334,7 @@ mod tests {
                     latency_seconds: 2.0,
                     cumulative_wave_seconds: 2.0,
                     independent_wave_count: 1,
+                    measured_wave_workspace_bytes: 4,
                     workspace_bytes: 4,
                 }
             } else {
@@ -1412,6 +1432,7 @@ mod tests {
                         latency_seconds: 2.0,
                         cumulative_wave_seconds: 2.0,
                         independent_wave_count: 1,
+                        measured_wave_workspace_bytes: 10,
                         workspace_bytes: 10,
                     },
                 ),
@@ -1422,6 +1443,7 @@ mod tests {
                         latency_seconds: 3.0,
                         cumulative_wave_seconds: 3.0,
                         independent_wave_count: 1,
+                        measured_wave_workspace_bytes: 20,
                         workspace_bytes: 20,
                     },
                 ),
@@ -1432,6 +1454,7 @@ mod tests {
                         latency_seconds: 1.0,
                         cumulative_wave_seconds: 1.0,
                         independent_wave_count: 1,
+                        measured_wave_workspace_bytes: 5,
                         workspace_bytes: 5,
                     },
                 ),
@@ -1735,6 +1758,7 @@ mod tests {
                         latency_seconds: 3.0,
                         cumulative_wave_seconds: 21.0,
                         independent_wave_count: 7,
+                        measured_wave_workspace_bytes: 10,
                         workspace_bytes: 70,
                     }
                 } else {
@@ -1745,7 +1769,7 @@ mod tests {
                 0
             }
         }
-        let initial = Ring::new(17, 65536).input("packed", (1, 126_933_919_557_746_796_usize));
+        let initial = Ring::new(17, 65536).input("packed", (1, (1usize << 50)));
         let total = Sequential::range(3)
             .scan(initial.clone(), initial, |_, total, _| {
                 let lanes = Parallel::range(2).try_map_values(total, |_, value| {
@@ -1769,6 +1793,7 @@ mod tests {
         assert_eq!(report.total_time_seconds, 126.0);
         assert_eq!(report.maximum_parallelism, 14);
         assert_eq!(report.workspace_high_water_bytes, 140);
+        assert_eq!(report.measured_wave_workspace_bytes, 10);
         let role = &report.benchmark_roles[&BenchmarkRole::PublicPrfAccumulation];
         assert_eq!(role.work_seconds, 84.0);
         assert_eq!(role.total_time_seconds, 126.0);

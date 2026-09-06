@@ -1,8 +1,3 @@
-// AKY24 iO is temporarily disabled until its full cascade receives end-to-end validation.
-// pub mod aky24;
-// Application modules are disabled until their protocol-specific hard-bound
-// recurrences or certified correctness checkers are available.
-
 /// Common interface for indistinguishability obfuscation schemes.
 pub trait Obfuscation {
     /// User-facing function descriptor accepted by the obfuscator.

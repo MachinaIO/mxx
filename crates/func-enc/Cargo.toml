@@ -7,22 +7,6 @@ description = "Functional encryption constructions for mxx"
 
 [features]
 default = []
-gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu"]
+gpu = []
 
 [dependencies]
-mxx-primitives.workspace = true
-mxx-gadgets.workspace = true
-bigdecimal.workspace = true
-digest.workspace = true
-keccak-asm.workspace = true
-num-bigint.workspace = true
-num-traits.workspace = true
-rand.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
-mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
-mxx-gadgets.workspace = true
-serial_test.workspace = true
-tracing-subscriber.workspace = true

@@ -130,6 +130,7 @@ where
         latency_seconds: seconds,
         cumulative_wave_seconds: seconds,
         independent_wave_count: 1,
+        measured_wave_workspace_bytes: peak.load(Ordering::Acquire).saturating_sub(baseline),
         workspace_bytes: peak.load(Ordering::Acquire).saturating_sub(baseline),
     })
 }

@@ -5,8 +5,10 @@ pub(crate) mod ffi {
         fn exact_basis_validate(dimension: u32, moduli: &[u64]) -> Result<()>;
         #[namespace = "openfhe"]
         type DCRTPoly = openfhe::ffi::DCRTPoly;
+        fn exact_basis_coefficients(input: &DCRTPoly) -> Result<Vec<u8>>;
         #[namespace = "openfhe"]
         type Matrix = openfhe::ffi::Matrix;
+        fn exact_basis_matrix_coefficients(matrix: Pin<&mut Matrix>) -> Result<()>;
         fn exact_basis_p1(
             a: &Matrix,
             b: &Matrix,

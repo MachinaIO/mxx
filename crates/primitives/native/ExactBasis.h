@@ -2,6 +2,8 @@
 #include "openfhe/DCRTPoly.h"
 
 namespace mxx {
+rust::Vec<uint8_t> exact_basis_coefficients(const openfhe::DCRTPoly &input);
+void exact_basis_matrix_coefficients(openfhe::Matrix &matrix);
 void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli);
 std::unique_ptr<openfhe::Matrix> exact_basis_p1(
     const openfhe::Matrix &a, const openfhe::Matrix &b, const openfhe::Matrix &d,

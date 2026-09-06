@@ -4,8 +4,107 @@
 #include "ExactBasis.h"
 #include "openfhe/core/math/nbtheory.h"
 #include "openfhe/core/lattice/trapdoor.h"
+#include <map>
+#include <tuple>
+#include <sstream>
 
 namespace mxx {
+namespace {
+// OpenFHE's process-global transform cache is indexed only by modulus. Two
+// rings sharing a prime can replace each other's tables while a transform is
+// reading them. Keep immutable tables per thread and complete ring identity,
+// and call the existing stateless OpenFHE butterfly implementation directly.
+struct TransformTables {
+    lbcrypto::NativeVector forward, inverse, forward_precon, inverse_precon;
+    lbcrypto::NativeInteger dimension_inverse, dimension_inverse_precon;
+};
+
+void transform_format(lbcrypto::DCRTPoly &polynomial, Format destination) {
+    if (polynomial.GetFormat() == destination) return;
+    const auto dimension = polynomial.GetRingDimension();
+    if (dimension == 1) {
+        for (auto &tower : polynomial.GetAllElements()) tower.OverrideFormat(destination);
+        polynomial.OverrideFormat(destination);
+        return;
+    }
+    using Key = std::tuple<uint32_t, uint64_t, uint64_t>;
+    auto &towers = polynomial.GetAllElements();
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(towers.size()))
+    for (size_t tower_index = 0; tower_index < towers.size(); ++tower_index) {
+        thread_local std::map<Key, TransformTables> tables_by_ring;
+        thread_local size_t cached_coefficients = 0;
+        auto &tower = towers[tower_index];
+        const auto modulus = tower.GetModulus();
+        const auto root = tower.GetRootOfUnity();
+        const Key key(dimension, modulus.ConvertToInt(), root.ConvertToInt());
+        auto found = tables_by_ring.find(key);
+        if (found == tables_by_ring.end()) {
+            // Retain at most 262144 native table words per worker, with at most 64
+            // distinct rings. Larger transforms use a temporary table only.
+            if (tables_by_ring.size() >= 64 || cached_coefficients + dimension > 65536) {
+                tables_by_ring.clear();
+                cached_coefficients = 0;
+            }
+            TransformTables tables{
+                lbcrypto::NativeVector(dimension, modulus), lbcrypto::NativeVector(dimension, modulus),
+                lbcrypto::NativeVector(dimension, modulus), lbcrypto::NativeVector(dimension, modulus),
+                lbcrypto::NativeInteger(dimension).ModInverse(modulus), lbcrypto::NativeInteger(0)};
+            tables.dimension_inverse_precon = tables.dimension_inverse.PrepModMulConst(modulus);
+            const auto inverse_root = root.ModInverse(modulus);
+            const auto mu = modulus.ComputeMu();
+            lbcrypto::NativeInteger forward(1), inverse(1);
+            const auto bits = lbcrypto::GetMSB(dimension - 1);
+            for (uint32_t index = 0; index < dimension; ++index) {
+                const auto reversed = lbcrypto::ReverseBits(index, bits);
+                tables.forward[reversed] = forward;
+                tables.inverse[reversed] = inverse;
+                tables.forward_precon[reversed] = forward.PrepModMulConst(modulus);
+                tables.inverse_precon[reversed] = inverse.PrepModMulConst(modulus);
+                forward.ModMulEq(root, modulus, mu);
+                inverse.ModMulEq(inverse_root, modulus, mu);
+            }
+            found = tables_by_ring.emplace(key, std::move(tables)).first;
+            cached_coefficients += dimension;
+        }
+        const auto &tables = found->second;
+        auto values = tower.GetValues();
+        intnat::NumberTheoreticTransformNat<lbcrypto::NativeVector> transform;
+        if (destination == Format::EVALUATION) {
+            transform.ForwardTransformToBitReverseInPlace(tables.forward, tables.forward_precon, &values);
+        } else {
+            transform.InverseTransformFromBitReverseInPlace(tables.inverse, tables.inverse_precon,
+                tables.dimension_inverse, tables.dimension_inverse_precon, &values);
+        }
+        tower.SetValues(std::move(values), destination);
+        if (dimension > 65536) {
+            tables_by_ring.clear();
+            cached_coefficients = 0;
+        }
+    }
+    polynomial.OverrideFormat(destination);
+}
+}
+
+void exact_basis_matrix_coefficients(openfhe::Matrix &matrix) {
+#pragma omp parallel for collapse(2)
+    for (size_t row = 0; row < matrix.GetRows(); ++row)
+        for (size_t column = 0; column < matrix.GetCols(); ++column)
+            transform_format(matrix(row, column), Format::COEFFICIENT);
+}
+
+rust::Vec<uint8_t> exact_basis_coefficients(const openfhe::DCRTPoly &input) {
+    auto polynomial = input.GetPoly();
+    transform_format(polynomial, Format::COEFFICIENT);
+    const auto interpolated = polynomial.CRTInterpolate();
+    std::stringstream stream;
+    lbcrypto::Serial::Serialize(interpolated.GetValues(), stream, lbcrypto::SerType::BINARY);
+    const auto bytes = stream.str();
+    rust::Vec<uint8_t> output;
+    output.reserve(bytes.size());
+    for (const auto byte : bytes) output.push_back(static_cast<uint8_t>(byte));
+    return output;
+}
+
 void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli) {
     if (moduli.empty()) throw std::invalid_argument("empty exact CRT basis");
     for (size_t index = 0; index < moduli.size(); ++index) {
@@ -103,7 +202,10 @@ void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli
                 p1.HStack(p1Cols[j]);
         }
 
-        p1.SetFormat(Format::EVALUATION);
+#pragma omp parallel for collapse(2)
+        for (size_t row = 0; row < p1.GetRows(); ++row)
+            for (size_t column = 0; column < p1.GetCols(); ++column)
+                transform_format(p1(row, column), Format::EVALUATION);
 
         return std::make_unique<openfhe::Matrix>(std::move(p1));
     }
@@ -145,7 +247,7 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_poly(
     lbcrypto::PolyImpl<lbcrypto::BigVector> large(parameters, format);
     large.SetValues(vector, format);
     lbcrypto::DCRTPoly polynomial(large, parameters);
-    polynomial.SetFormat(Format::EVALUATION);
+    transform_format(polynomial, Format::EVALUATION);
     return std::make_unique<openfhe::DCRTPoly>(std::move(polynomial));
 }
 
@@ -191,21 +293,22 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_sample(
         }
         case 1: {
             lbcrypto::DCRTPoly::DggType generator(sigma);
-            polynomial = lbcrypto::DCRTPoly(generator, parameters, Format::EVALUATION);
+            polynomial = lbcrypto::DCRTPoly(generator, parameters, Format::COEFFICIENT);
             break;
         }
         case 2: {
             lbcrypto::DCRTPoly::BugType generator;
-            polynomial = lbcrypto::DCRTPoly(generator, parameters, Format::EVALUATION);
+            polynomial = lbcrypto::DCRTPoly(generator, parameters, Format::COEFFICIENT);
             break;
         }
         case 3: {
             lbcrypto::DCRTPoly::TugType generator;
-            polynomial = lbcrypto::DCRTPoly(generator, parameters, Format::EVALUATION);
+            polynomial = lbcrypto::DCRTPoly(generator, parameters, Format::COEFFICIENT);
             break;
         }
         default: throw std::invalid_argument("invalid exact CRT sampling distribution");
     }
+    transform_format(polynomial, Format::EVALUATION);
     return std::make_unique<openfhe::DCRTPoly>(std::move(polynomial));
 }
 
@@ -213,7 +316,7 @@ rust::Vec<int64_t> exact_basis_gauss_gq(
     const openfhe::DCRTPoly &syndrome, double c, size_t digits_count,
     int64_t base, double sigma, size_t tower) {
     auto polynomial = syndrome.GetPoly();
-    polynomial.SetFormat(Format::COEFFICIENT);
+    transform_format(polynomial, Format::COEFFICIENT);
     const auto &component = polynomial.GetElementAtIndex(tower);
     const size_t dimension = polynomial.GetRingDimension();
     lbcrypto::DCRTPoly::DggType generator(sigma);

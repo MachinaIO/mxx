@@ -122,6 +122,13 @@ impl PolyParams for DCRTPolyParams {
             .map(|prime| (u64::BITS - prime.leading_zeros()) as usize)
             .max()
             .expect("nonempty selected basis");
+        Self::validate_capability(
+            selected.ring_dimension,
+            selected.crt_depth,
+            selected.crt_bits,
+            selected.base_bits,
+        )
+        .ok()?;
         let last_bits = selected.crt_bits % selected.base_bits as usize;
         selected.decompose_last_mask = (last_bits != 0).then(|| (1u64 << last_bits) - 1);
         selected.moduli = moduli;
@@ -251,6 +258,22 @@ impl DCRTPolyParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_select_modulus_rejects_base_too_wide_for_selected_basis() {
+        let (n, _, bits, _) = crate::env::modulus_conversion_test_parameters();
+        let base_bits = u32::try_from((bits + 2) / 2).unwrap();
+        let narrow = DCRTPolyParams::new(n, 1, bits, 1, None, None);
+        let wide = DCRTPolyParams::new(n, 1, bits + 2, base_bits, None, None);
+        let basis = vec![narrow.to_crt().0[0], wide.to_crt().0[0]];
+        let source = DCRTPolyParams::new(n, 2, bits + 2, base_bits, Some(basis), None);
+
+        assert!(source.select_modulus(narrow.modulus().as_ref()).is_none());
+        let selected = source.select_modulus(wide.modulus().as_ref()).unwrap();
+        assert_eq!(selected.base_bits(), base_bits);
+        assert_eq!(selected.to_crt(), wide.to_crt());
+        assert_eq!(source.select_modulus(source.modulus().as_ref()), Some(source.clone()));
+    }
 
     #[test]
     fn test_params_exact_non_prefix_basis() {

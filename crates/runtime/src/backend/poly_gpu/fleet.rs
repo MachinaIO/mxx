@@ -953,9 +953,8 @@ impl GpuDcrtBackend {
             }
             let local =
                 shard.value.slice_columns(overlap_start - shard_start, overlap_end - shard_start);
-            // Transfer only the requested overlap. Non-peer fleets use the
-            // backend's raw RNS staging transport, without CPU arithmetic.
-            pieces.push(backend.matrix_to_active_placement(&local)?);
+            // Transfer only the requested overlap through device/peer transport.
+            pieces.push(backend.matrix_to_active_placement_peer_only(&local)?);
         }
         let mut pieces = pieces.into_iter();
         let first = pieces.next().expect("requested matrix range must be covered");
@@ -973,7 +972,7 @@ impl GpuDcrtBackend {
             .iter()
             .map(|shard| {
                 let local = shard.value.slice(row_start, row_end, 0, shard.value.col_size());
-                backend.matrix_to_active_placement(&local)
+                backend.matrix_to_active_placement_peer_only(&local)
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter();
@@ -1041,10 +1040,8 @@ impl GpuDcrtBackend {
                 .filter_map(|(device, (device_id, backend))| {
                     let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
                     let local = value.slice_columns(start, end);
-                    Some(backend.matrix_to_active_placement(&local).map(|value| GpuColumnShard {
-                        device_id: *device_id,
-                        global_column_start: start,
-                        value,
+                    Some(backend.matrix_to_active_placement_peer_only(&local).map(|value| {
+                        GpuColumnShard { device_id: *device_id, global_column_start: start, value }
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1373,13 +1370,74 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires at least two GPUs; non-peer devices exercise host transport"]
     #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_nonpeer_range_transport_preserves_values() {
-        let devices = detected_gpu_device_ids();
-        assert!(devices.len() >= 2);
+    fn test_gpu_fleet_preimage_staging_preserves_shards_without_device_gather() {
+        let device = detected_gpu_device_ids()[0];
+        super::super::wait_for_gpu_test_context_quiescence(device);
         let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let mut backend = super::super::gpu_backend_on([parameters.clone()], devices.clone());
+        let mut backend = super::super::gpu_backend_on([parameters.clone()], vec![device]);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 24,
+        };
+        let matrix = backend.devices[0]
+            .1
+            .sample_hash(&ty, rand::random(), b"sharded-preimage-staging")
+            .unwrap();
+        let expected = matrix.to_cpu_staging_bytes();
+        let value = Arc::new(GpuFleetMatrix::new(
+            ty.rows,
+            ty.columns,
+            (0..ty.columns)
+                .step_by(4)
+                .map(|start| GpuColumnShard {
+                    device_id: device,
+                    global_column_start: start,
+                    value: matrix.slice_columns(start, start + 4),
+                })
+                .collect(),
+        ));
+        value.wait_until_ready();
+        backend.fence_released_memory().unwrap();
+        gpu_default_mempool_reset_high_water(device).unwrap();
+        let snapshot_baseline = gpu_default_mempool_usage(device).unwrap().used_current;
+        let snapshot = value.shards()[0].value.to_rns_snapshot();
+        let snapshot_scratch =
+            gpu_default_mempool_usage(device).unwrap().used_high.saturating_sub(snapshot_baseline);
+        drop(snapshot);
+        assert!(snapshot_scratch > 0, "the primitive snapshot unpacks device limbs");
+        gpu_default_mempool_reset_high_water(device).unwrap();
+        let baseline = gpu_default_mempool_usage(device).unwrap().used_current;
+        let (source, bytes) = backend.preimage_target(value).unwrap();
+        let staging_scratch =
+            gpu_default_mempool_usage(device).unwrap().used_high.saturating_sub(baseline);
+        // Raw-RNS serialization has per-limb unpack buffers. Staging six shards
+        // must use at most one shard's measured primitive scratch, never a
+        // full-target gather or six simultaneous snapshots.
+        assert!(
+            staging_scratch <= snapshot_scratch,
+            "staging scratch {staging_scratch} exceeds one-shard bound {snapshot_scratch}"
+        );
+        assert_eq!(bytes.as_slice(), expected.as_slice());
+        assert_eq!(source.row_size(), 2);
+        assert_eq!(source.col_size(), 24);
+        for (start, end) in [(0, 1), (3, 9), (23, 24)] {
+            let loaded = source.load_columns(start, end);
+            assert_eq!(loaded.shards()[0].value, matrix.slice_columns(start, end));
+        }
+        let restored = backend.matrix_from_cpu_staging_bytes(&ty, &bytes).unwrap();
+        assert_eq!(restored.shards()[0].value, matrix);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_range_transport_preserves_values_or_rejects_nonpeer() {
+        let devices = detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let mut backend = super::super::gpu_backend_on([parameters.clone()], devices);
         let ty = ConcreteMatrixType {
             modulus: BigInt::from(parameters.modulus().as_ref().clone()),
             ring_dimension: 32,
@@ -1387,18 +1445,26 @@ mod tests {
             columns: 5,
         };
         let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"transport").unwrap();
-        let destination = backend.devices[1].1.parameters(&ty).unwrap();
-        let host_staging_required = source.copy_to_params_direct(destination).is_none();
-        println!("fleet_range_transport host_staging_required={host_staging_required}");
         let expected = source.slice_columns(1, 4);
         let expected_bytes = expected.to_cpu_staging_bytes();
         let source = GpuFleetMatrix::from_matrix(source);
-        let transferred =
-            GpuDcrtBackend::matrix_piece_on_device(&mut backend.devices[1].1, &source, 1, 4)
-                .unwrap();
-        assert_eq!(transferred.size(), (2, 3));
-        assert_eq!(transferred.params().device_ids(), &[devices[1]]);
-        assert_eq!(transferred.to_cpu_staging_bytes(), expected_bytes);
+        // Always exercise same-device transport. Every additional detected
+        // destination also checks successful peer copies or explicit rejection.
+        backend.devices.par_iter_mut().for_each(|(device, destination_backend)| {
+            let destination = destination_backend.parameters(&ty).unwrap();
+            let host_staging_required =
+                source.shards()[0].value.copy_to_params_direct(destination).is_none();
+            let transferred =
+                GpuDcrtBackend::matrix_piece_on_device(destination_backend, &source, 1, 4);
+            if host_staging_required {
+                assert!(matches!(transferred, Err(PolyBackendError::UnsupportedPlacement)));
+            } else {
+                let transferred = transferred.unwrap();
+                assert_eq!(transferred.size(), (2, 3));
+                assert_eq!(transferred.params().device_ids(), &[*device]);
+                assert_eq!(transferred.to_cpu_staging_bytes(), expected_bytes);
+            }
+        });
     }
 
     #[test]
@@ -2298,9 +2364,51 @@ impl Backend for GpuDcrtBackend {
     ) -> Result<(Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>), Self::Error> {
         let rows = value.rows;
         let columns = value.columns;
-        let gathered = self.gather_matrix(value.as_ref())?;
-        let params = gathered.params().clone();
-        let bytes = Arc::new(gathered.into_cpu_staging_bytes());
+        let first = value.shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
+        let params = first.value.params().clone();
+        let mut metadata = None;
+        let mut payload = Vec::new();
+        // Copy existing shards directly to host, one at a time. Gathering on a
+        // device would temporarily allocate the entire logical target there.
+        // Sequential snapshots bound pinned and device unpack scratch to one
+        // existing shard; raw-RNS serialization allocates temporary u64 limbs.
+        for shard in &value.shards {
+            let snapshot = shard.value.to_rns_snapshot();
+            let current = (snapshot.level(), snapshot.is_ntt(), snapshot.bytes_per_poly());
+            if let Some(expected) = metadata {
+                if current != expected {
+                    return Err(PolyBackendError::InvalidConstantShape);
+                }
+            } else {
+                metadata = Some(current);
+                let length = rows
+                    .checked_mul(columns)
+                    .and_then(|size| size.checked_mul(snapshot.bytes_per_poly()))
+                    .ok_or(PolyBackendError::InvalidInteger)?;
+                payload.resize(length, 0);
+            }
+            let row_bytes = columns * snapshot.bytes_per_poly();
+            let shard_row_bytes = snapshot.ncol() * snapshot.bytes_per_poly();
+            if row_bytes != 0 {
+                payload.par_chunks_mut(row_bytes).enumerate().for_each(|(row, target)| {
+                    let start = shard.global_column_start * snapshot.bytes_per_poly();
+                    target[start..start + shard_row_bytes].copy_from_slice(
+                        &snapshot.bytes()[row * shard_row_bytes..(row + 1) * shard_row_bytes],
+                    );
+                });
+            }
+        }
+        let (level, is_ntt, bytes_per_poly) =
+            metadata.ok_or(PolyBackendError::InvalidConstantShape)?;
+        // Use the primitive raw-RNS staging representation, preserving both
+        // coefficient/evaluation format and the logical row-major layout.
+        let bytes = Arc::new(
+            bincode::encode_to_vec(
+                (1u8, rows, columns, level, is_ntt, bytes_per_poly, payload.as_slice()),
+                bincode::config::standard(),
+            )
+            .map_err(|_| PolyBackendError::InvalidInteger)?,
+        );
         let source = FleetStagedColumnSource { params, rows, columns, bytes: bytes.clone() };
         Ok((Arc::new(source), bytes))
     }

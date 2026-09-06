@@ -1,7 +1,3 @@
-// AKY24 functional encryption is disabled until its raw-mask semantics are
-// specified separately.
-// pub mod aky24;
-
 pub trait FuncEnc {
     type Params;
     type EncKey;

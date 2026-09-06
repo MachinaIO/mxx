@@ -29,7 +29,11 @@ fleets are not modeled. Consequently these resource figures are not a provisioni
 `chunk_count` sums primitive waves within a scope and counts each structural node once;
 nested invocation counts are separate in `per_subgraph`.
 
+`measured_wave_workspace_bytes` retains the largest measured bounded-wave scratch
+without multiplying it by wave count or loop iterations. It excludes resident
+inputs and is not a whole-graph physical peak. This field is reported separately
+from ideal simultaneous-wave workspace.
+
 The GPU log `measured independent GPU fleet waves` records measured fleet latency,
 wave count, complete work, cumulative wave time, and physical wave workspace explicitly.
-Existing B benchmark logs predate this timing correction. No updated B critical path
-or full benchmark result is established until a new benchmark is run.
+Benchmark results must be rerun when their measurement semantics change.

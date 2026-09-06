@@ -126,13 +126,18 @@ pub enum IndexExpr {
     Add(Box<Self>, Box<Self>),
     Subtract(Box<Self>, Box<Self>),
     Multiply(Box<Self>, Box<Self>),
+    /// Exact division, rejecting a nonzero remainder.
     Divide(Box<Self>, Box<Self>),
+    FloorDivide(Box<Self>, Box<Self>),
     Remainder(Box<Self>, Box<Self>),
     Equal(Box<Self>, Box<Self>),
     Less(Box<Self>, Box<Self>),
     LessEqual(Box<Self>, Box<Self>),
     Log2Ceil(Box<Self>),
-    Select { selector: Box<Self>, branches: Vec<Self> },
+    Select {
+        selector: Box<Self>,
+        branches: Vec<Self>,
+    },
 }
 
 impl Serialize for IndexExpr {
@@ -169,14 +174,26 @@ impl IndexExpr {
                 if denominator.is_zero() {
                     return Err(ExprError::DivisionByZero);
                 }
-                Ok(lhs.evaluate(env)? / denominator)
+                let numerator = lhs.evaluate(env)?;
+                let (quotient, remainder) = numerator.div_rem(&denominator);
+                if !remainder.is_zero() {
+                    return Err(ExprError::InexactDivision { numerator, denominator });
+                }
+                Ok(quotient)
+            }
+            Self::FloorDivide(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)?.div_floor(&denominator))
             }
             Self::Remainder(lhs, rhs) => {
                 let denominator = rhs.evaluate(env)?;
                 if denominator.is_zero() {
                     return Err(ExprError::DivisionByZero);
                 }
-                Ok(lhs.evaluate(env)? % denominator)
+                Ok(lhs.evaluate(env)?.mod_floor(&denominator))
             }
             Self::Equal(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? == rhs.evaluate(env)?)),
             Self::Less(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? < rhs.evaluate(env)?)),
@@ -227,11 +244,20 @@ impl IndexExpr {
                 IndexExpr::Multiply(lhs, rhs) => {
                     binary(lhs, rhs, |a, b| a * b, IndexExpr::Multiply)
                 }
-                IndexExpr::Divide(lhs, rhs) => {
-                    binary_checked(lhs, rhs, |a, b| a / b, IndexExpr::Divide)
+                IndexExpr::Divide(lhs, rhs) => binary_checked(
+                    lhs,
+                    rhs,
+                    |a, b| {
+                        let (quotient, remainder) = a.div_rem(&b);
+                        remainder.is_zero().then_some(quotient)
+                    },
+                    IndexExpr::Divide,
+                ),
+                IndexExpr::FloorDivide(lhs, rhs) => {
+                    binary_checked(lhs, rhs, |a, b| Some(a.div_floor(&b)), IndexExpr::FloorDivide)
                 }
                 IndexExpr::Remainder(lhs, rhs) => {
-                    binary_checked(lhs, rhs, |a, b| a % b, IndexExpr::Remainder)
+                    binary_checked(lhs, rhs, |a, b| Some(a.mod_floor(&b)), IndexExpr::Remainder)
                 }
                 IndexExpr::Equal(lhs, rhs) => {
                     binary(lhs, rhs, |a, b| BigInt::from(a == b), IndexExpr::Equal)
@@ -295,14 +321,20 @@ impl IndexExpr {
         fn binary_checked(
             lhs: &IndexExpr,
             rhs: &IndexExpr,
-            operation: impl FnOnce(BigInt, BigInt) -> BigInt,
+            operation: impl FnOnce(BigInt, BigInt) -> Option<BigInt>,
             build: impl FnOnce(Box<IndexExpr>, Box<IndexExpr>) -> IndexExpr,
         ) -> IndexExpr {
             let lhs = fold(lhs);
             let rhs = fold(rhs);
             match (&lhs, &rhs) {
                 (IndexExpr::Constant(lhs), IndexExpr::Constant(rhs)) if !rhs.is_zero() => {
-                    IndexExpr::Constant(operation(lhs.clone(), rhs.clone()))
+                    match operation(lhs.clone(), rhs.clone()) {
+                        Some(value) => IndexExpr::Constant(value),
+                        None => build(
+                            Box::new(IndexExpr::Constant(lhs.clone())),
+                            Box::new(IndexExpr::Constant(rhs.clone())),
+                        ),
+                    }
                 }
                 _ => build(Box::new(lhs), Box::new(rhs)),
             }
@@ -325,6 +357,7 @@ impl IndexExpr {
             Subtract(Box<Repr<'a>>, Box<Repr<'a>>),
             Multiply(Box<Repr<'a>>, Box<Repr<'a>>),
             Divide(Box<Repr<'a>>, Box<Repr<'a>>),
+            FloorDivide(Box<Repr<'a>>, Box<Repr<'a>>),
             Remainder(Box<Repr<'a>>, Box<Repr<'a>>),
             Equal(Box<Repr<'a>>, Box<Repr<'a>>),
             Less(Box<Repr<'a>>, Box<Repr<'a>>),
@@ -347,6 +380,9 @@ impl IndexExpr {
                 }
                 IndexExpr::Divide(lhs, rhs) => {
                     Repr::Divide(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::FloorDivide(lhs, rhs) => {
+                    Repr::FloorDivide(Box::new(repr(lhs)), Box::new(repr(rhs)))
                 }
                 IndexExpr::Remainder(lhs, rhs) => {
                     Repr::Remainder(Box::new(repr(lhs)), Box::new(repr(rhs)))
@@ -394,7 +430,7 @@ impl TryFrom<IntExpr> for IndexExpr {
                 Ok(Self::Divide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
             }
             IntExpr::FloorDiv(lhs, rhs) => {
-                Ok(Self::Divide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+                Ok(Self::FloorDivide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
             }
             IntExpr::Rem(lhs, rhs) => {
                 Ok(Self::Remainder(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
@@ -929,6 +965,48 @@ pub fn euclidean_div_rem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_conversion_preserves_division_and_remainder_semantics() {
+        let env = ParamEnv::default();
+        for numerator in [-5, -4, -3, 0, 3, 4, 5] {
+            for denominator in [-2, 0, 2] {
+                let lhs = Box::new(IntExpr::constant(numerator));
+                let rhs = Box::new(IntExpr::constant(denominator));
+                for expression in [
+                    IntExpr::Div(lhs.clone(), rhs.clone()),
+                    IntExpr::FloorDiv(lhs.clone(), rhs.clone()),
+                    IntExpr::Rem(lhs, rhs),
+                ] {
+                    let expected = expression.evaluate(&env);
+                    let index = IndexExpr::try_from(expression).unwrap();
+                    assert_eq!(index.evaluate(&env), expected);
+                    assert_eq!(index.normalize().evaluate(&env), expected);
+                    let encoded = serde_json::to_vec(&index).unwrap();
+                    let decoded: IndexExpr = serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(decoded.evaluate(&env), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_index_division_preserves_operator_identity_and_errors() {
+        let env = ParamEnv {
+            loop_indices: BTreeMap::from([(0, BigInt::from(-3))]),
+            ..ParamEnv::default()
+        };
+        let lhs = Box::new(IntExpr::LoopIndex(0));
+        let rhs = Box::new(IntExpr::constant(2));
+        let exact = IndexExpr::try_from(IntExpr::Div(lhs.clone(), rhs.clone())).unwrap();
+        let floor = IndexExpr::try_from(IntExpr::FloorDiv(lhs, rhs)).unwrap();
+        assert_ne!(serde_json::to_vec(&exact).unwrap(), serde_json::to_vec(&floor).unwrap());
+        for index in [exact, floor] {
+            let encoded = serde_json::to_vec(&index).unwrap();
+            let decoded: IndexExpr = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.evaluate(&env), index.evaluate(&env));
+        }
+    }
 
     #[test]
     fn exact_division_rejects_remainder() {

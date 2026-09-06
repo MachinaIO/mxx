@@ -906,6 +906,10 @@ impl PolyParams for GpuDCRTPolyParams {
         {
             return None;
         }
+        let crt_bits = moduli.iter().map(|prime| bits_in_u64(*prime)).max()?;
+        if self.base_bits as usize > crt_bits / 2 {
+            return None;
+        }
         Some(Self::new_with_gpu(
             self.ring_dimension,
             moduli,
@@ -1838,6 +1842,30 @@ mod tests {
 
     fn gpu_poly_from_cpu(poly: &DCRTPoly, gpu_params: &GpuDCRTPolyParams) -> GpuDCRTPoly {
         GpuDCRTPoly::from_coeffs(gpu_params, &poly.coeffs())
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_select_modulus_rejects_base_too_wide_for_selected_basis() {
+        let (n, _, bits, _) = crate::env::modulus_conversion_test_parameters();
+        let base_bits = u32::try_from((bits + 2) / 2).unwrap();
+        let narrow = DCRTPolyParams::new(n, 1, bits, 1, None, None);
+        let wide = DCRTPolyParams::new(n, 1, bits + 2, base_bits, None, None);
+        let source = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            vec![narrow.to_crt().0[0], wide.to_crt().0[0]],
+            base_bits,
+            vec![available_gpu_ids()[0]],
+            Some(1),
+            None,
+            None,
+        );
+
+        assert!(source.select_modulus(narrow.modulus().as_ref()).is_none());
+        let selected = source.select_modulus(wide.modulus().as_ref()).unwrap();
+        assert_eq!(selected.base_bits(), base_bits);
+        assert_eq!(selected.to_crt(), wide.to_crt());
+        assert_eq!(selected.execution_owner_id(), source.execution_owner_id());
     }
 
     #[test]

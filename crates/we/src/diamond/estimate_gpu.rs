@@ -309,6 +309,7 @@ impl DiamondGpuMeasurementBackend {
             cumulative_wave_seconds: slowest,
             independent_wave_count: 1,
             workspace_bytes: 0,
+            measured_wave_workspace_bytes: 0,
         })
     }
 

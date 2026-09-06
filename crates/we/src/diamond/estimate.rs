@@ -101,6 +101,7 @@ mod tests {
                 cumulative_wave_seconds: 1.0,
                 independent_wave_count: 1,
                 workspace_bytes: 8,
+                measured_wave_workspace_bytes: 8,
             })
         }
 

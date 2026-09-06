@@ -2907,6 +2907,7 @@ mod tests {
                 [encoding("input")],
                 &mut lowering,
                 &mut encoding_slots,
+                &mut |_| panic!("lookup-only circuit must not request a decomposition"),
             )
             .expect("lookup lowering");
         let built = DslContext::new("lwe-lookup-lowering")
@@ -3041,6 +3042,7 @@ mod tests {
                 [input_encoding],
                 &mut lowering,
                 &mut slots,
+                &mut |_| panic!("lookup-only circuit must not request a decomposition"),
             )
             .expect("lookup lowering")
             .into_iter()

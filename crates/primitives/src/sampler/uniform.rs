@@ -143,6 +143,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_binary_sampling_shared_primes_across_ring_dimensions() {
+        let (dimension, depth, bits, base) = crate::env::modulus_conversion_test_parameters();
+        let larger = DCRTPolyParams::new(dimension, depth, bits, base, None, None);
+        let smaller =
+            DCRTPolyParams::new(dimension / 2, depth, bits, base, Some(larger.to_crt().0), None);
+        std::thread::scope(|scope| {
+            for parameters in [&smaller, &larger] {
+                scope.spawn(move || {
+                    let sampler = DCRTPolyUniformSampler::new();
+                    for _ in 0..100 {
+                        let polynomial = sampler.sample_poly(parameters, &DistType::BitDist);
+                        assert_eq!(
+                            polynomial.to_bool_vec().len(),
+                            parameters.ring_dimension() as usize
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn test_ternary_dist_values() {
         // Test that TernaryDist actually produces values in {-1, 0, 1}
         let params = DCRTPolyParams::default();

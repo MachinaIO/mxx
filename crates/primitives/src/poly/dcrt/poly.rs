@@ -121,7 +121,8 @@ impl Poly for DCRTPoly {
 
     #[inline]
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let poly_encoding = self.ptr_poly.GetCoefficientsBytes();
+        let poly_encoding = super::native::ffi::exact_basis_coefficients(&self.ptr_poly)
+            .expect("exact CRT coefficient export failed");
         let parsed_values = parse_coefficients_bytes(&poly_encoding);
         let coeffs = parsed_values.coefficients;
         let modulus = parsed_values.modulus;

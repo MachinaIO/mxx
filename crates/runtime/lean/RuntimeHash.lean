@@ -22,19 +22,28 @@ def decimalIntegerTag (value : Int) : Blob :=
   let digits := if value.natAbs = 0 then [0] else (Nat.digits 10 value.natAbs).reverse
   (if value < 0 then [45] else []) ++ digits.map (fun digit ↦ UInt8.ofNat (48 + digit))
 
-/-- Byte order agrees with the executor: prefix, signed compile-time integers, decimal
-integers, u64 little-endian integers, and finally signed integer wire operands. -/
-def completeHashTag (tagPrefix : Blob) (integers decimals u64s operands : List Int) : Blob :=
-  tagPrefix ++ integers.flatMap signedIntegerTag ++
-    decimals.flatMap decimalIntegerTag ++
-    u64s.flatMap (fun value ↦ u64LittleEndian value.toNat) ++
-    operands.flatMap signedIntegerTag
+/-- Ordered, typed tag components. The explicit namespace prefix is chosen by the caller. -/
+inductive HashTagComponent where
+  | bytes : Blob → HashTagComponent
+  | integer : Int → HashTagComponent
+  | decimal : Int → HashTagComponent
+  | u64Le : Int → HashTagComponent
+
+def encodeHashTagComponent : HashTagComponent → Blob
+  | .bytes bytes => [0] ++ (u64LittleEndian bytes.length).reverse ++ bytes
+  | .integer value => [1] ++ signedIntegerTag value
+  | .decimal value =>
+    let bytes := decimalIntegerTag value
+    [2] ++ (u64LittleEndian bytes.length).reverse ++ bytes
+  | .u64Le value => [3] ++ u64LittleEndian value.toNat
+
+def completeHashTag (tagPrefix : Blob) (components : List HashTagComponent) : Blob :=
+  tagPrefix ++ components.flatMap encodeHashTagComponent
 
 noncomputable def hashSample {q n rows columns : Nat} (model : HashModel)
-    (tagPrefix : Blob) (integers decimals u64s operands : List Int) (key : ByteArray)
+    (tagPrefix : Blob) (components : List HashTagComponent) (key : ByteArray)
     (output : Mxx.Primitives.ExactMatrix q n rows columns) : Prop :=
-  key.size = 32 ∧ (∀ value ∈ u64s, 0 ≤ value ∧ value < 2 ^ 64) ∧
-  output = model.sample q n rows columns key
-    (completeHashTag tagPrefix integers decimals u64s operands)
+  key.size = 32 ∧ (∀ value, .u64Le value ∈ components → 0 ≤ value ∧ value < 2 ^ 64) ∧
+  output = model.sample q n rows columns key (completeHashTag tagPrefix components)
 
 end MxxRuntime

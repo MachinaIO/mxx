@@ -3394,9 +3394,9 @@ mod tests {
             },
             variant: HashVariant::Decomposed,
             tag_prefix: Vec::new(),
-            tag_expressions: vec![IntExpr::LoopIndex(0)],
-            tag_decimal_expressions: Vec::new(),
-            tag_u64_le_expressions: Vec::new(),
+            tag_components: vec![mxx_ir_core::node::HashTagComponent::Integer(IntExpr::LoopIndex(
+                0,
+            ))],
             base: Some(IntExpr::constant(16_384)),
             digit_count: Some(IntExpr::constant(80)),
         };
@@ -3800,9 +3800,7 @@ mod tests {
             },
             variant: HashVariant::Decomposed,
             tag_prefix,
-            tag_expressions: vec![tag_expression],
-            tag_decimal_expressions: Vec::new(),
-            tag_u64_le_expressions: Vec::new(),
+            tag_components: vec![mxx_ir_core::node::HashTagComponent::Integer(tag_expression)],
             base: Some(IntExpr::constant(16_384)),
             digit_count: Some(IntExpr::constant(80)),
         };
@@ -3849,9 +3847,7 @@ mod tests {
             matrix_type: symbolic,
             variant: HashVariant::Plain,
             tag_prefix: Vec::new(),
-            tag_expressions: Vec::new(),
-            tag_decimal_expressions: Vec::new(),
-            tag_u64_le_expressions: Vec::new(),
+            tag_components: Vec::new(),
             base: None,
             digit_count: None,
         };

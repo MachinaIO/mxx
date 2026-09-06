@@ -366,21 +366,17 @@ pub fn gpu_calibration_operation_identity(
         }
         _ => {}
     }
-    if let NodeKind::HashSample {
-        tag_prefix,
-        tag_expressions,
-        tag_decimal_expressions,
-        tag_u64_le_expressions,
-        ..
-    } = &mut shape_kind
-    {
+    if let NodeKind::HashSample { tag_prefix, tag_components, .. } = &mut shape_kind {
         tag_prefix.fill(0);
-        for expression in tag_expressions
-            .iter_mut()
-            .chain(tag_decimal_expressions.iter_mut())
-            .chain(tag_u64_le_expressions.iter_mut())
-        {
-            *expression = IntExpr::constant(0);
+        for component in tag_components {
+            use mxx_ir_core::node::HashTagComponent;
+            match component {
+                HashTagComponent::Bytes(bytes) => bytes.fill(0),
+                HashTagComponent::Integer(expression) |
+                HashTagComponent::Decimal(expression) |
+                HashTagComponent::U64Le(expression) => *expression = IntExpr::constant(0),
+                HashTagComponent::Operand(_) => {}
+            }
         }
     }
 

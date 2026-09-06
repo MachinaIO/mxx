@@ -1,8 +1,4 @@
 #[cfg(feature = "gpu")]
-use crate::matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix;
-#[cfg(feature = "gpu")]
-use crate::poly::dcrt::gpu::GpuDCRTPolyParams;
-#[cfg(feature = "gpu")]
 pub use crate::sampler::gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler};
 use crate::{
     matrix::{
@@ -21,6 +17,8 @@ use crate::{
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
+#[cfg(feature = "gpu")]
+use gpu::{TrapdoorMatrix, trapdoor_matrix_from_cpu, trapdoor_matrix_to_cpu};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
 use std::{
@@ -38,36 +36,12 @@ pub mod utils;
 pub(crate) const KARNEY_THRESHOLD: f64 = 300.0;
 static SAMPLE_P1_FOR_PERT_MAT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[cfg(feature = "gpu")]
-type TrapdoorMatrix = GpuDCRTPolyMatrix;
 #[cfg(not(feature = "gpu"))]
 type TrapdoorMatrix = DCRTPolyMatrix;
-
-#[cfg(feature = "gpu")]
-fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
-    let (moduli, _, _) = params.to_crt();
-    GpuDCRTPolyParams::new(
-        params.ring_dimension(),
-        moduli,
-        params.base_bits(),
-        Some(params.dropped_moduli()),
-    )
-}
-
-#[cfg(feature = "gpu")]
-fn trapdoor_matrix_from_cpu(params: &DCRTPolyParams, matrix: &DCRTPolyMatrix) -> TrapdoorMatrix {
-    let gpu_params = gpu_params_from_cpu(params);
-    GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, matrix)
-}
 
 #[cfg(not(feature = "gpu"))]
 fn trapdoor_matrix_from_cpu(_params: &DCRTPolyParams, matrix: &DCRTPolyMatrix) -> TrapdoorMatrix {
     matrix.clone()
-}
-
-#[cfg(feature = "gpu")]
-fn trapdoor_matrix_to_cpu(matrix: &TrapdoorMatrix) -> DCRTPolyMatrix {
-    matrix.to_cpu_matrix()
 }
 
 #[cfg(not(feature = "gpu"))]

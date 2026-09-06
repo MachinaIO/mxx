@@ -1,11 +1,15 @@
 use crate::{
     matrix::{
         PolyMatrix, PolyMatrixColumnSource, SmallMatrixError,
+        dcrt_poly::DCRTPolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
     },
     poly::{
         Poly, PolyParams,
-        dcrt::gpu::{GpuDCRTPolyParams, GpuRngSeed},
+        dcrt::{
+            gpu::{GpuDCRTPolyParams, GpuRngSeed},
+            params::DCRTPolyParams,
+        },
     },
     sampler::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler,
@@ -21,6 +25,30 @@ use std::{
 };
 
 const SPECTRAL_CONSTANT: f64 = 1.8;
+
+pub(super) type TrapdoorMatrix = GpuDCRTPolyMatrix;
+
+fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
+    let (moduli, _, _) = params.to_crt();
+    GpuDCRTPolyParams::new(
+        params.ring_dimension(),
+        moduli,
+        params.base_bits(),
+        Some(params.dropped_moduli()),
+    )
+}
+
+pub(super) fn trapdoor_matrix_from_cpu(
+    params: &DCRTPolyParams,
+    matrix: &DCRTPolyMatrix,
+) -> TrapdoorMatrix {
+    let gpu_params = gpu_params_from_cpu(params);
+    GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, matrix)
+}
+
+pub(super) fn trapdoor_matrix_to_cpu(matrix: &TrapdoorMatrix) -> DCRTPolyMatrix {
+    matrix.to_cpu_matrix()
+}
 
 fn preimage_c(base: u32, sigma: f64) -> f64 {
     (base as f64 + 1.0) * sigma
@@ -1029,16 +1057,6 @@ mod tests {
             })
         ));
         params.fence_released_memory();
-    }
-
-    fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
-        let (moduli, _, _) = params.to_crt();
-        GpuDCRTPolyParams::new(
-            params.ring_dimension(),
-            moduli,
-            params.base_bits(),
-            Some(params.dropped_moduli()),
-        )
     }
 
     fn permissive_preimage_bound(params: &GpuDCRTPolyParams) -> BigUint {

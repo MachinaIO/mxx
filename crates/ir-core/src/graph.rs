@@ -1099,8 +1099,29 @@ impl SerializedGraph {
                 ));
             }
         }
-        if !scopes.contains_key(&FrozenGraphScopeId::Root) {
-            return Err(FreezeError::InvalidSerialization("missing root scope".to_owned()));
+        let root = scopes
+            .get(&FrozenGraphScopeId::Root)
+            .ok_or_else(|| FreezeError::InvalidSerialization("missing root scope".to_owned()))?;
+        // Freeze places named outputs first, in name order, followed by retained roots.
+        // Check this redundant wiring once on load, before either representation is used.
+        if root.outputs.len() < self.outputs.len() ||
+            !self.outputs.values().map(|output| output.value).eq(root
+                .outputs
+                .iter()
+                .copied()
+                .take(self.outputs.len()))
+        {
+            return Err(FreezeError::InvalidSerialization(
+                "named outputs do not match the root scope output prefix".to_owned(),
+            ));
+        }
+        for wire in &self.effect_roots {
+            let node = root.node(wire.node).ok_or_else(|| {
+                FreezeError::InvalidSerialization("missing effect root node".to_owned())
+            })?;
+            if node.output_types().get(wire.port.0 as usize).is_none() {
+                return Err(FreezeError::InvalidPort { port: wire.port.0 });
+            }
         }
         Ok(Graph {
             inner: Arc::new(GraphData {
@@ -1171,6 +1192,14 @@ impl SerializedScope {
                 None,
                 None,
             ));
+        }
+        for wire in self.inputs.iter().chain(&self.outputs) {
+            let node = nodes.get(wire.node.0 as usize).ok_or_else(|| {
+                FreezeError::InvalidSerialization("missing scope input or output node".to_owned())
+            })?;
+            if node.output_types().get(wire.port.0 as usize).is_none() {
+                return Err(FreezeError::InvalidPort { port: wire.port.0 });
+            }
         }
         let node_ids = nodes
             .iter()
@@ -1266,6 +1295,63 @@ mod tests {
             spec_hash(&graph, &ParamEnv::default()).unwrap(),
             spec_hash(&decoded, &ParamEnv::default()).unwrap()
         );
+    }
+
+    #[test]
+    fn deserialization_rejects_inconsistent_root_wiring() {
+        let (graph, _) = Graph::freeze(
+            "root-wiring",
+            Vec::new(),
+            BTreeMap::from([
+                ("a".to_owned(), GraphOutput { value: input("a"), confidentiality: None }),
+                ("b".to_owned(), GraphOutput { value: input("b"), confidentiality: None }),
+            ]),
+            vec![input("retained")],
+            vec![input("effect")],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let serialized = graph.serialized();
+        let decoded: Graph =
+            serde_json::from_slice(&serde_json::to_vec(&serialized).unwrap()).unwrap();
+        assert_eq!(decoded, graph);
+
+        let mut swapped = serialized.clone();
+        let a = swapped.outputs["a"].value;
+        let b = swapped.outputs["b"].value;
+        swapped.outputs.get_mut("a").unwrap().value = b;
+        swapped.outputs.get_mut("b").unwrap().value = a;
+        assert!(serde_json::from_slice::<Graph>(&serde_json::to_vec(&swapped).unwrap()).is_err());
+
+        let missing_node = WireRef { node: NodeId(u64::MAX), port: Port(0) };
+        let missing_port = WireRef { node: a.node, port: Port(u32::MAX) };
+        for wire in [missing_node, missing_port] {
+            for location in ["named", "retained", "effect", "input"] {
+                let mut malformed = serialized.clone();
+                let root = &mut malformed
+                    .scopes
+                    .iter_mut()
+                    .find(|entry| entry.id == FrozenGraphScopeId::Root)
+                    .unwrap()
+                    .scope;
+                match location {
+                    "named" => {
+                        // Matching redundant fields must still reference an existing port.
+                        malformed.outputs.get_mut("a").unwrap().value = wire;
+                        root.outputs[0] = wire;
+                    }
+                    "retained" => root.outputs[2] = wire,
+                    "effect" => malformed.effect_roots[0] = wire,
+                    "input" => root.inputs.push(wire),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    serde_json::from_slice::<Graph>(&serde_json::to_vec(&malformed).unwrap())
+                        .is_err(),
+                    "accepted invalid {location} wire {wire:?}",
+                );
+            }
+        }
     }
 
     #[test]

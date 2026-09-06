@@ -41,6 +41,9 @@ pub enum ArtifactPayload {
     TypedBlob(Vec<u8>),
 }
 
+/// Supplies intact payloads from the matching backend codec and schema. Private artifacts
+/// have no manifest content hash; the caller/storage layer must establish integrity before
+/// execution. Corrupt compact matrix payloads can panic during decoding.
 pub trait ArtifactStore {
     type Error: std::error::Error + Send + Sync + 'static;
 

@@ -940,6 +940,12 @@ impl GpuDCRTPolyParams {
         Self::new_with_gpu(ring_dimension, moduli, base_bits, default_gpu_ids, None, dropped_moduli)
     }
 
+    /// Constructs parameters with an explicit GPU placement.
+    ///
+    /// Approximate decomposition (`dropped_moduli > 0`) requires all CRT limbs
+    /// in one partition: use at most one GPU ID, or explicitly set `dnum = 1`.
+    /// Unsupported placements panic before creating a CUDA context. Exact
+    /// decomposition (`dropped_moduli = 0`) retains multi-partition support.
     pub fn new_with_gpu(
         ring_dimension: u32,
         moduli: Vec<u64>,
@@ -960,6 +966,10 @@ impl GpuDCRTPolyParams {
         let modulus = moduli.iter().fold(BigUint::one(), |acc, m| acc * m);
         let dnum =
             dnum.unwrap_or_else(|| if gpu_ids.is_empty() { 1 } else { gpu_ids.len() as u32 });
+        assert!(
+            dropped_moduli == 0 || gpu_ids.len() <= 1 || dnum == 1,
+            "approximate gadget decomposition requires all CRT limbs in one GPU partition: use one GPU ID or dnum = 1"
+        );
         let vram_percent = crate::env::gpu_vram_percent()
             .unwrap_or_else(|error| panic!("invalid GPU VRAM percentage: {error}"));
         let log_n = log2_u32(ring_dimension);
@@ -1670,6 +1680,29 @@ mod tests {
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
     use rand::prelude::*;
+
+    #[test]
+    fn test_gpu_approximate_params_reject_partitioned_placement_before_context_creation() {
+        for dnum in [None, Some(0), Some(2), Some(4)] {
+            // Invalid device IDs prove that validation happens before CUDA setup.
+            // dnum = 0 is resolved to the GPU count by the CUDA constructor.
+            let error = std::panic::catch_unwind(|| {
+                GpuDCRTPolyParams::new_with_gpu(8, vec![97, 113], 3, vec![-1, -2], dnum, Some(1))
+            })
+            .expect_err("partitioned approximate parameters must be rejected");
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied())
+                .expect("panic message");
+            assert!(
+                message.contains(
+                    "approximate gadget decomposition requires all CRT limbs in one GPU partition"
+                ),
+                "unexpected panic: {message}"
+            );
+        }
+    }
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 17, 1, None)

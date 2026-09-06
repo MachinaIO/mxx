@@ -6,6 +6,15 @@ Implement Bernard--Joye, ePrint 2024/909, Section 3.2, followed by the existing
 exact balanced radix decomposition. Keep `base_bits <= crt_bits / 2`.
 The ordered CRT basis retains its full arithmetic modulus. `dropped_moduli = k`
 selects the last `k` moduli as the low part `P`; require `0 <= k < crt_depth`.
+GPU approximate decomposition requires all CRT limbs in one partition.
+`GpuDCRTPolyParams::new_with_gpu` rejects `dropped_moduli > 0` with multiple
+GPU IDs unless `dnum = Some(1)` is explicit, before creating a CUDA context.
+With multiple IDs, both the default `dnum` and `Some(0)` distribute limbs and
+are rejected. `Some(1)` keeps every limb on the first configured GPU; it does
+not distribute a matrix across GPUs. Exact decomposition (`k = 0`) keeps its
+existing placement support. Runtime fleet execution can still distribute
+whole matrices using single-device parameters.
+
 For each coefficient `a`, compute
 
 ```

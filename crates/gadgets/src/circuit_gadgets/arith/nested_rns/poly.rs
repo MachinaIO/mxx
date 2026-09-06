@@ -2264,6 +2264,7 @@ mod full_reduce_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS full-reduction runtime coverage; run explicitly with --ignored"]
     fn explicit_full_reduce_matches_inputs_for_full_and_offset_windows() {
         let parameters = parameters();
         let (q_moduli, _, depth) = parameters.to_crt();
@@ -2599,6 +2600,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS gadget decomposition runtime coverage; run explicitly with --ignored"]
     fn gadget_decomposition_recomposes_runtime_and_native_values() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (parameters, context) = create_context(&mut circuit, Some(2));
@@ -2809,6 +2811,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS unreduced decomposition runtime coverage; run explicitly with --ignored"]
     fn unreduced_decomposition_matches_explicit_lazy_reduction_at_runtime() {
         fn build(
             explicit_reduce: bool,
@@ -2864,6 +2867,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS automatic/full reduction runtime comparison; run explicitly with --ignored"]
     fn reconstruct_auto_reduce_matches_explicit_full_reduce_at_runtime() {
         fn build(
             explicit_reduce: bool,

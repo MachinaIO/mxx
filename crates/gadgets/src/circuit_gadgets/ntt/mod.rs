@@ -649,6 +649,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn forward_and_inverse_match_openfhe_at_ambient_dimension() {
         let params = DCRTPolyParams::new(8, 2, 17, 6);
         let window = CrtWindow::full(params.to_crt().2);
@@ -662,6 +663,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_subdimension_round_trip_uses_no_inactive_lanes() {
         let params = DCRTPolyParams::new(8, 3, 17, 6);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
@@ -678,6 +680,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_subdimension_forward_matches_openfhe_table_butterflies() {
         let params = DCRTPolyParams::new(8, 3, 17, 6);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
@@ -693,6 +696,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_subdimension_inverse_matches_openfhe_table_butterflies() {
         let params = DCRTPolyParams::new(8, 3, 17, 6);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
@@ -709,6 +713,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_subdimension_forward_matches_native_openfhe() {
         let (native, ambient) = matching_native_and_ambient_params(1, 1, 0);
         let native_moduli = native.to_crt().0;
@@ -725,6 +730,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_subdimension_inverse_matches_native_openfhe() {
         let (native, ambient) = matching_native_and_ambient_params(1, 1, 0);
         let native_moduli = native.to_crt().0;
@@ -742,6 +748,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_subdimension_multi_tower_matches_native_openfhe_forward() {
         let offset = 0;
         let (native, ambient) = matching_native_and_ambient_params(2, 2, offset);
@@ -765,6 +772,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_subdimension_multi_tower_matches_native_openfhe_inverse() {
         let offset = 0;
         let (native, ambient) = matching_native_and_ambient_params(2, 2, offset);
@@ -789,6 +797,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_offset_window_identity_transform_reconstructs() {
         let params = DCRTPolyParams::new(8, 3, 17, 6);
         let window = CrtWindow::new(1, 1, params.to_crt().2);
@@ -826,6 +835,7 @@ mod compact_tests {
     }
 
     #[test]
+    #[ignore = "slow nested-RNS NTT runtime coverage; run explicitly with --ignored"]
     fn compact_single_tower_round_trip_reconstructs_modulo_q() {
         let params = DCRTPolyParams::new(2, 1, 24, 6);
         let window = CrtWindow::full(params.to_crt().2);

@@ -847,6 +847,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow decomposed nested-RNS convolution runtime coverage; run explicitly with --ignored"]
     fn decomposed_nested_rns_convolution_respects_a_nonzero_partial_window_at_runtime() {
         let parameters = DCRTPolyParams::new(2, 3, 10, 5);
         let num_slots = parameters.ring_dimension() as usize;

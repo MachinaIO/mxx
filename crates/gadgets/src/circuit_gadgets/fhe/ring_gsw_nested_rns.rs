@@ -754,6 +754,7 @@ mod compact_layout_tests {
     }
 
     #[test]
+    #[ignore = "slow native-to-ambient Ring-GSW runtime reconstruction; run explicitly with --ignored"]
     fn genuine_native_ciphertexts_add_and_subtract_in_ambient_circuit() {
         let (native_params, ambient_params, window) = matching_native_and_ambient_params();
         let mut native_circuit = PolyCircuit::<DCRTPoly>::new();

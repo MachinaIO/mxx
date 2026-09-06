@@ -24,10 +24,10 @@ pub fn parallel<T: GraphValue>(
         scope,
         vec![],
         output.flatten(),
-        &output.pending().referenced_values(),
+        &[],
         CapturePolicy::Lexical { parallel_index: Some(index_slot) },
     )?;
-    let pending = output.pending().remap(&sealed.remap);
+
     let arguments = sealed.captures.iter().map(|capture| capture.outer.clone()).collect();
     let modes = sealed.captures.iter().map(|capture| capture.mode.clone()).collect();
     let types = family_schema.wire_types();
@@ -40,7 +40,7 @@ pub fn parallel<T: GraphValue>(
     let values = (0..types.len())
         .map(|port| node.output(port as u32).expect("parallel output field"))
         .collect::<Vec<_>>();
-    Family::from_values(&family_schema, &values, pending)
+    Family::from_values(&family_schema, &values)
 }
 
 /// Repeatedly computes a new state, returning only the final state.
@@ -76,7 +76,7 @@ pub fn iterate<S: GraphValue>(
         &[],
         CapturePolicy::Lexical { parallel_index: None },
     )?;
-    let pending = Pending::merge([initial.pending(), output.pending().remap(&sealed.remap)]);
+
     let mut arguments = initial.flatten();
     arguments.extend(sealed.captures.iter().map(|capture| capture.outer.clone()));
     let node = NodeHandle::sequential_loop(
@@ -88,7 +88,7 @@ pub fn iterate<S: GraphValue>(
     let values = (0..types.len())
         .map(|port| node.output(port as u32).expect("iterated state field"))
         .collect::<Vec<_>>();
-    S::from_values(&schema, &values, pending)
+    S::from_values(&schema, &values)
 }
 
 /// Selects one same-schema value, applying the selector to every field together.
@@ -101,9 +101,7 @@ pub fn select<T: GraphValue>(selector: impl Into<Int>, candidates: Vec<T>) -> Re
     if types.is_empty() || candidates.iter().any(|value| value.schema() != schema) {
         return Err(DslError::Schema);
     }
-    let pending = Pending::merge(
-        std::iter::once(selector.pending).chain(candidates.iter().map(GraphValue::pending)),
-    );
+
     let flattened = candidates.iter().map(GraphValue::flatten).collect::<Vec<_>>();
     let values = types
         .into_iter()
@@ -120,11 +118,10 @@ pub fn select<T: GraphValue>(selector: impl Into<Int>, candidates: Vec<T>) -> Re
             .expect("selected field")
         })
         .collect::<Vec<_>>();
-    T::from_values(&schema, &values, pending)
+    T::from_values(&schema, &values)
 }
 
 pub(super) fn normalize<T: GraphValue>(value: T) -> Result<T, DslError> {
-    let pending = value.pending();
     let schema = value.schema();
     let values = value.flatten();
     if values.len() != schema.wire_types().len() {
@@ -134,20 +131,15 @@ pub(super) fn normalize<T: GraphValue>(value: T) -> Result<T, DslError> {
         .into_iter()
         .zip(schema.wire_types())
         .map(|(value, expected)| match (value.wire_type(), &expected) {
-            (WireType::ConstantInt, WireType::Int) => {
-                Ok(Int { value, pending: Pending::default() }.add(Int::constant(0)).value)
-            }
+            (WireType::ConstantInt, WireType::Int) => Ok(Int { value }.add(Int::constant(0)).value),
             (WireType::ConstantBool, WireType::Bool) => {
-                Ok(Bool { value, pending: Pending::default() }
-                    .to_int()
-                    .equal(Int::constant(1))
-                    .value)
+                Ok(Bool { value }.to_int().equal(Int::constant(1)).value)
             }
             (actual, expected) if actual == expected => Ok(value),
             _ => Err(DslError::Schema),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    T::from_values(&schema, &normalized, pending)
+    T::from_values(&schema, &normalized)
 }
 
 #[cfg(test)]
@@ -195,68 +187,39 @@ mod tests {
     }
 
     #[test]
-    fn indexed_reads_preserve_index_anchors_and_derivation_roles() {
-        for attachment in [false, true] {
-            for offset in [0, 1] {
-                let ring = Ring::new(17, 8);
-                let source = ring.input_family("source", 3, (1, 1));
-                let output = parallel(2, |i| {
-                    let index = &i + 0;
-                    let index = if attachment {
-                        let role = index.value_handle().clone();
-                        index.derivation_attachment(
-                            "test",
-                            "index",
-                            vec![("index".into(), role)],
-                        )?
-                    } else {
-                        index.semantic_anchor("index")?
-                    };
-                    // The offset also checks annotations on a dependency of the eliminated index.
-                    let index = if offset == 0 { index } else { index + offset };
-                    Ok((source.at(index), source.at(i)))
+    fn indexed_reads_keep_member_placement_without_retaining_index_arithmetic() {
+        for offset in [0, 1] {
+            let ring = Ring::new(17, 8);
+            let source = ring.input_family("source", 3, (1, 1));
+            let output = parallel(2, |i| Ok((source.at(&i + offset), source.at(i)))).unwrap();
+            let built =
+                DslContext::new("indexed-reads").output("result", output).unwrap().build().unwrap();
+            built.validate(&ParamEnv::default()).unwrap();
+            let spec = built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .find_map(|node| match node.kind() {
+                    NodeKind::ParallelLoop(spec) => Some(spec),
+                    _ => None,
                 })
                 .unwrap();
-                let built = DslContext::new("annotated-index")
-                    .output("result", output)
-                    .unwrap()
-                    .build()
-                    .unwrap();
-                built.validate(&ParamEnv::default()).unwrap();
-                let annotated = if attachment {
-                    &built.derivation_attachments.iter().next().unwrap().roles[0].1
-                } else {
-                    &built.anchors.get("index").unwrap()[0]
-                };
-                assert!(matches!(
-                    annotated.scope,
-                    mxx_ir_core::FrozenGraphScopeId::ParallelBody { .. }
-                ));
-                let scope = built.graph.scope(&annotated.scope).unwrap();
-                assert!(matches!(
-                    scope.node(annotated.wire.node).unwrap().kind(),
-                    NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add)
-                ));
+            assert!(spec.input_modes.contains(&mxx_ir_core::node::LoopInputMode::Zip));
+            if offset != 0 {
                 assert!(
-                    scope
-                        .nodes()
-                        .iter()
-                        .any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
+                    spec.input_modes
+                        .contains(&mxx_ir_core::node::LoopInputMode::ZipOffset { offset })
                 );
-                let spec = built
-                    .graph
-                    .root_scope()
-                    .nodes()
-                    .iter()
-                    .find_map(|node| match node.kind() {
-                        NodeKind::ParallelLoop(spec) => Some(spec),
-                        _ => None,
-                    })
-                    .unwrap();
-                // Unannotated reads still use indexed placement in the very same loop.
-                assert!(spec.input_modes.contains(&mxx_ir_core::node::LoopInputMode::Zip));
-                assert!(spec.input_modes.contains(&mxx_ir_core::node::LoopInputMode::Broadcast));
             }
+            assert!(
+                !built
+                    .graph
+                    .scopes()
+                    .values()
+                    .flat_map(|scope| scope.nodes())
+                    .any(|node| matches!(node.kind(), NodeKind::FamilyGetDynamic))
+            );
         }
     }
 

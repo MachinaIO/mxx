@@ -118,21 +118,6 @@ pub trait BooleanLayerGate<T> {
     fn candidates(&self, slot: GateSlot, left: T, right: T) -> Result<[T; 6], DslError>;
 }
 
-/// Optional owner hooks for matrix-valued Boolean evaluation.
-///
-/// The generic gadget does not assign symbolic meaning.  An owning implementation may retain
-/// frozen derivation references on the initial family and each selected lane value; the Rust
-/// operational checker validates and applies those references.
-pub trait BooleanMatrixLayerGate: BooleanLayerGate<Mat> {
-    fn retain_initial_family(&self, family: Family<Mat>) -> Result<Family<Mat>, DslError> {
-        Ok(family)
-    }
-
-    fn retain_selected_value(&self, value: Mat) -> Result<Mat, DslError> {
-        Ok(value)
-    }
-}
-
 pub fn evaluate_boolean_matrix_family<H>(
     params: &BooleanCircuitFamilyParams,
     circuit: BooleanCircuitFamilyInputs,
@@ -140,9 +125,8 @@ pub fn evaluate_boolean_matrix_family<H>(
     handler: H,
 ) -> Result<Family<Mat>, DslError>
 where
-    H: BooleanMatrixLayerGate,
+    H: BooleanLayerGate<Mat>,
 {
-    let preceding = handler.retain_initial_family(preceding)?;
     iterate(params.depth.clone(), preceding, |layer, preceding| {
         let active_count = circuit.active_gate_counts.at(&layer);
         parallel(params.max_layer_width.clone(), |index| {
@@ -156,7 +140,7 @@ where
             let selected = select(kind, candidates.into_iter().collect())?;
             let active = index.less_equal(&active_count - 1);
             let selected = select(active, vec![constant_false, selected])?;
-            handler.retain_selected_value(selected)
+            Ok(selected)
         })
     })
 }
@@ -285,7 +269,7 @@ pub fn boolean_circuit_validity_predicate(
     ]);
     mxx_dsl::PurePredicateSpec::new(
         context
-            .bool_output("valid", bool_all([params_valid, records_valid, output_valid]))?
+            .output("valid", bool_all([params_valid, records_valid, output_valid]))?
             .build()?
             .graph,
     )
@@ -342,7 +326,7 @@ pub fn boolean_circuit_satisfaction_predicate(
     let output = select_boolean_output(&circuit, &final_layer);
     let inputs_valid = reduce_bool_family(input_validity, params.max_layer_width)?;
     mxx_dsl::PurePredicateSpec::new(
-        context.bool_output("satisfied", inputs_valid & output)?.build()?.graph,
+        context.output("satisfied", inputs_valid & output)?.build()?.graph,
     )
     .map_err(Into::into)
 }
@@ -429,7 +413,7 @@ mod tests {
                 .unwrap();
         let output = evaluate_boolean_family(&params, circuit.clone(), inputs).unwrap();
         let selected = select_boolean_output(&circuit, &output);
-        let graph = context.bool_output("result", selected).unwrap().build().unwrap();
+        let graph = context.output("result", selected).unwrap().build().unwrap();
         graph.validate(&bindings()).unwrap();
 
         assert_eq!(

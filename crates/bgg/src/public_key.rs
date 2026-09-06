@@ -2,7 +2,7 @@
 
 use crate::{boolean::BggPublicKeyFamily, encoding::BggSamplerLayout};
 use mxx_dsl::{
-    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Pending, Preimage, Ring,
+    Bytes, DslError, GraphValue, GraphValueSchema, HashTag, Mat, MatType, Preimage, Ring,
 };
 use mxx_ir_core::{IntExpr, ValueHandle, node::IndexRange};
 
@@ -25,21 +25,13 @@ impl GraphValue for BggPublicKeyWire {
         self.matrix.flatten()
     }
 
-    fn pending(&self) -> Pending {
-        self.matrix.pending()
-    }
-
     fn schema(&self) -> Self::Schema {
         BggPublicKeyType { matrix: self.matrix.schema(), reveal_plaintext: self.reveal_plaintext }
     }
 
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         Ok(Self {
-            matrix: Mat::from_values(&schema.matrix, values, pending)?,
+            matrix: Mat::from_values(&schema.matrix, values)?,
             reveal_plaintext: schema.reveal_plaintext,
         })
     }

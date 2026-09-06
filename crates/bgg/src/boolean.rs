@@ -2,12 +2,11 @@
 
 use crate::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire};
 use mxx_dsl::{
-    DerivationAttachmentValue, DslError, Family, GraphValue, GraphValueSchema, Mat, MatType,
-    Pending, iterate, parallel, select,
+    DslError, Family, GraphValue, GraphValueSchema, Mat, MatType, iterate, parallel, select,
 };
 use mxx_gadgets::circuit::{
-    BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanLayerGate,
-    BooleanMatrixLayerGate, GateSlot, evaluate_boolean_matrix_family,
+    BooleanCircuitFamilyInputs, BooleanCircuitFamilyParams, BooleanLayerGate, GateSlot,
+    evaluate_boolean_matrix_family,
 };
 use mxx_ir_core::{ValueHandle, WireType};
 use thiserror::Error;
@@ -38,10 +37,6 @@ impl GraphValue for CircuitEncoding {
         (self.vector.clone(), self.public_key.clone(), self.plaintext.clone()).flatten()
     }
 
-    fn pending(&self) -> Pending {
-        Pending::merge([self.vector.pending(), self.public_key.pending(), self.plaintext.pending()])
-    }
-
     fn schema(&self) -> Self::Schema {
         CircuitEncodingType {
             vector: self.vector.schema(),
@@ -50,15 +45,10 @@ impl GraphValue for CircuitEncoding {
         }
     }
 
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let (vector, public_key, plaintext) = <(Mat, Mat, Mat)>::from_values(
             &(schema.vector.clone(), schema.public_key.clone(), schema.plaintext.clone()),
             values,
-            pending,
         )?;
         Ok(Self { vector, public_key, plaintext })
     }
@@ -88,36 +78,6 @@ pub enum DynamicBooleanBggError {
     PlaintextRequired,
     #[error("dynamic Boolean BGG input families have incompatible counts")]
     FamilyLayout,
-}
-
-fn attach_public_key_signal_group<T: GraphValue>(value: T) -> Result<T, DslError> {
-    let wire = value.flatten().into_iter().next().ok_or(DslError::Schema)?;
-    value.derivation_attachment(
-        "mxx-bgg",
-        "public-key-signal-grouping",
-        vec![("value".to_owned(), wire)],
-    )
-}
-
-/// Retains executable vector/public-key/plaintext family wires for checked analysis.
-fn attach_operational_pairing(family: BggEncodingFamily) -> Result<BggEncodingFamily, DslError> {
-    let values = family.flatten();
-    let [vector, public_key, plaintext] = values.as_slice() else { return Err(DslError::Schema) };
-    family
-        .derivation_attachment(
-            "mxx-bgg",
-            "encoding-family-pairing",
-            vec![
-                ("vector".to_owned(), vector.clone()),
-                ("public-key".to_owned(), public_key.clone()),
-                ("plaintext".to_owned(), plaintext.clone()),
-            ],
-        )?
-        .derivation_attachment(
-            "mxx-bgg",
-            "public-key-signal-grouping",
-            vec![("value".to_owned(), public_key.clone())],
-        )
 }
 
 pub fn evaluate_boolean_public_key_layers(
@@ -155,10 +115,9 @@ pub fn evaluate_boolean_encoding_layers(
         public_key: one_public_key.matrix,
         plaintext: one.plaintext.ok_or(DynamicBooleanBggError::PlaintextRequired)?,
     };
-    let preceding = attach_operational_pairing(preceding)?;
     Ok(iterate(params.depth.clone(), preceding, |layer, preceding| {
         let active_count = circuit.active_gate_counts.at(&layer);
-        let output = parallel(params.max_layer_width.clone(), |slot| {
+        parallel(params.max_layer_width.clone(), |slot| {
             let flat = &layer * &params.max_layer_width + &slot;
             let left = preceding.at(circuit.left_sources.at(&flat));
             let right = preceding.at(circuit.right_sources.at(&flat));
@@ -196,8 +155,7 @@ pub fn evaluate_boolean_encoding_layers(
             )?;
             let active = slot.less_equal(&active_count - 1).to_int();
             select(active, vec![zero, selected])
-        })?;
-        attach_operational_pairing(output)
+        })
     })?)
 }
 
@@ -230,15 +188,6 @@ impl BooleanLayerGate<Mat> for PublicKeyBooleanGate {
             product.matrix,
             xor.matrix,
         ])
-    }
-}
-
-impl BooleanMatrixLayerGate for PublicKeyBooleanGate {
-    fn retain_initial_family(&self, family: Family<Mat>) -> Result<Family<Mat>, DslError> {
-        attach_public_key_signal_group(family)
-    }
-    fn retain_selected_value(&self, value: Mat) -> Result<Mat, DslError> {
-        attach_public_key_signal_group(value)
     }
 }
 
@@ -301,7 +250,7 @@ mod tests {
         )
         .unwrap();
         let public_graph = public_context
-            .family_output("output", public_output.field(|key| key.matrix).unwrap())
+            .output("output", public_output.field(|key| key.matrix).unwrap())
             .unwrap()
             .build()
             .unwrap();
@@ -349,11 +298,11 @@ mod tests {
         .unwrap();
         let encoding_output = encoding_result;
         let encoding_graph = encoding_context
-            .family_output("vector", encoding_output.field(|value| value.vector).unwrap())
+            .output("vector", encoding_output.field(|value| value.vector).unwrap())
             .unwrap()
-            .family_output("public-key", encoding_output.field(|value| value.public_key).unwrap())
+            .output("public-key", encoding_output.field(|value| value.public_key).unwrap())
             .unwrap()
-            .family_output("plaintext", encoding_output.field(|value| value.plaintext).unwrap())
+            .output("plaintext", encoding_output.field(|value| value.plaintext).unwrap())
             .unwrap()
             .build()
             .unwrap();

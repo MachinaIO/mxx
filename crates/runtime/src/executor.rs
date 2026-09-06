@@ -4793,7 +4793,7 @@ mod tests {
             parallel(3, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
                 .expect("range loop");
         let built = DslContext::new("runtime-range")
-            .family_output("values", family)
+            .output("values", family)
             .expect("output")
             .build()
             .expect("build");
@@ -4843,9 +4843,9 @@ mod tests {
         ])
         .expect("expected family");
         let validated = DslContext::new("runtime-staged-family-gather")
-            .family_output("gathered", gathered)
+            .output("gathered", gathered)
             .expect("gathered output")
-            .family_output("expected", expected)
+            .output("expected", expected)
             .expect("expected output")
             .build()
             .expect("build")
@@ -5074,7 +5074,7 @@ mod tests {
         })
         .expect("dynamic hash family");
         let validated = DslContext::new("runtime-dynamic-hash-tags")
-            .family_output("samples", samples)
+            .output("samples", samples)
             .expect("sample output")
             .build()
             .expect("build")
@@ -5747,7 +5747,7 @@ mod tests {
             iterate(3, Int::constant(0), |index, total| Ok(total.add(increments.at(index))))
                 .expect("sequential scan");
         let validated = context
-            .int_output("total", total)
+            .output("total", total)
             .expect("output")
             .build()
             .expect("build")
@@ -5775,7 +5775,7 @@ mod tests {
         let untouched =
             iterate(0, Int::constant(7), |_, state| Ok(state)).expect("empty sequential scan");
         let validated = DslContext::new("runtime-empty-sequential-scan")
-            .int_output("value", untouched)
+            .output("value", untouched)
             .expect("output")
             .build()
             .expect("build")
@@ -5800,7 +5800,7 @@ mod tests {
         })
         .expect("nested sequential and parallel loop");
         let validated = DslContext::new("runtime-nested-sequential-parallel")
-            .int_family_output("state", state)
+            .output("state", state)
             .expect("output")
             .build()
             .expect("build")
@@ -5838,7 +5838,7 @@ mod tests {
         })
         .expect("segmented bit packing");
         let validated = context
-            .int_family_output("packed", packed)
+            .output("packed", packed)
             .expect("output")
             .build()
             .expect("build")
@@ -5930,7 +5930,7 @@ mod tests {
             parallel(0, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
                 .expect("empty range loop");
         let built = DslContext::new("runtime-empty-range")
-            .family_output("values", family)
+            .output("values", family)
             .expect("output")
             .build()
             .expect("build");
@@ -5971,8 +5971,9 @@ mod tests {
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let ty = MatType(ring.matrix_type((1, 1)));
-        let reverse = Subgraph::define("reverse", (ty.clone(), ty), |(left, right)| (right, left))
-            .expect("subgraph");
+        let reverse =
+            Subgraph::define("reverse", (ty.clone(), ty), |(left, right)| Ok((right, left)))
+                .expect("subgraph");
         let one = ring.polynomial([1.into()]);
         let two = ring.polynomial([2.into()]);
         let (actual_two, actual_one) =

@@ -1,7 +1,7 @@
 //! Declarative BGG+ encoding graph values.
 
 use crate::BggPublicKeyWire;
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Preimage, Ring};
+use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Preimage, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr, ValueHandle, WireType,
     node::{ConcatAxis, IndexRange},
@@ -52,13 +52,6 @@ impl GraphValue for BggEncodingWire {
         values
     }
 
-    fn pending(&self) -> Pending {
-        Pending::merge(
-            std::iter::once(self.vector.pending())
-                .chain(self.plaintext.as_ref().map(GraphValue::pending)),
-        )
-    }
-
     fn schema(&self) -> Self::Schema {
         BggEncodingType {
             vector: self.vector.schema(),
@@ -66,22 +59,18 @@ impl GraphValue for BggEncodingWire {
         }
     }
 
-    fn from_values(
-        schema: &Self::Schema,
-        values: &[ValueHandle],
-        pending: Pending,
-    ) -> Result<Self, DslError> {
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let vector_count = schema.vector.wire_types().len();
         let expected = vector_count + usize::from(schema.plaintext.is_some());
         if values.len() != expected {
             return Err(DslError::Schema);
         }
         Ok(Self {
-            vector: Mat::from_values(&schema.vector, &values[..vector_count], pending.clone())?,
+            vector: Mat::from_values(&schema.vector, &values[..vector_count])?,
             plaintext: schema
                 .plaintext
                 .as_ref()
-                .map(|ty| Mat::from_values(ty, &values[vector_count..], pending))
+                .map(|ty| Mat::from_values(ty, &values[vector_count..]))
                 .transpose()?,
         })
     }
@@ -384,7 +373,7 @@ mod tests {
         Subgraph::<(BggEncodingWire, BggEncodingWire), _>::define(
             "bgg-pair-reverse",
             (encoding.clone(), encoding),
-            |(left, right)| (right, left),
+            |(left, right)| Ok((right, left)),
         )
         .expect("BGG typed arguments use distinct flattened input names");
     }

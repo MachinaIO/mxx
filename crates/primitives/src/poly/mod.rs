@@ -32,9 +32,17 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
         0
     }
     /// Inclusive coefficient bound on `A - G D(A)` (ePrint 2024/909, Proposition 1).
-    fn gadget_error_bound(&self) -> BigUint {
+    fn gadget_dropped_moduli(&self, digit_count: Option<usize>) -> Option<usize> {
+        let (_, bits, depth) = self.to_crt();
+        let per_tower = bits.div_ceil(self.base_bits() as usize);
+        let digits = digit_count.unwrap_or_else(|| self.modulus_digits());
+        (digits > 0 && digits.is_multiple_of(per_tower) && digits / per_tower <= depth)
+            .then(|| depth - digits / per_tower)
+    }
+
+    fn gadget_error_bound(&self, digit_count: Option<usize>) -> BigUint {
         let (moduli, _, depth) = self.to_crt();
-        let k = self.dropped_moduli();
+        let k = self.gadget_dropped_moduli(digit_count).expect("valid gadget digit count");
         let low = moduli[depth - k..].iter().fold(BigUint::from(1u8), |p, q| p * q);
         (low / 2u8) * k
     }
@@ -44,17 +52,24 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     /// Given the parameter, return the crt decomposed moduli as array along with the bit size and
     /// depth of these moduli.
     fn to_crt(&self) -> (Vec<u64>, usize, usize);
+    /// Selects an exact nonempty CRT sub-basis, preserving its original order
+    /// and (on accelerators) the shared execution owner.
+    fn select_modulus(&self, modulus: &BigUint) -> Option<Self>;
     #[cfg(feature = "gpu")]
     fn device_ids(&self) -> Vec<i32> {
         vec![0]
     }
     #[cfg(feature = "gpu")]
-    fn params_for_device(&self, _device_id: i32) -> Self {
+    fn params_for_device(&self, _device_id: i32, _related: Option<&Self>) -> Self {
         self.clone()
     }
     /// Waits for releases queued on accelerator release streams.
     /// CPU parameter types leave this as a no-op.
     fn fence_released_memory(&self) {}
+    /// Identity of the live accelerator resource owner, shared by related rings.
+    fn execution_owner_id(&self) -> Option<u64> {
+        None
+    }
     /// Return CRT reconstruction coefficients for each CRT modulus.
     fn reconst_coeffs(&self) -> Vec<BigUint> {
         let (moduli, _, _) = self.to_crt();

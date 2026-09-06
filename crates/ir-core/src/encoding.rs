@@ -12,7 +12,10 @@ use std::{
 };
 use thiserror::Error;
 
-pub const IR_VERSION: u32 = 7;
+// Version 9 adds the serialized `IntExpr::Select` variant.  Bumping the wire
+// format prevents older runtimes from accepting manifests whose integer
+// expressions they cannot decode or evaluate.
+pub const IR_VERSION: u32 = 9;
 
 #[derive(Debug, Error)]
 pub enum EncodingError {
@@ -220,8 +223,8 @@ mod tests {
     fn tiny_graph_canonical_json_and_spec_hash_match_the_pre_streaming_golden() {
         const CANONICAL_JSON: &[u8] = br#"{"effect_roots":[],"name":"tiny-golden","outputs":{"result":{"confidentiality":null,"value":{"node":0,"port":0}}},"parameters":[],"real_constants":{},"scopes":[{"id":{"tag":"Root"},"scope":{"inputs":[],"nodes":[{"arguments":[],"id":0,"kind":{"tag":"ConstantInt","value":"7"},"output_types":[{"tag":"ConstantInt"}]}],"outputs":[{"node":0,"port":0}]}}]}"#;
         const SPEC_HASH: [u8; 32] = [
-            69, 241, 203, 179, 144, 86, 249, 189, 185, 138, 126, 30, 98, 38, 175, 230, 79, 42, 77,
-            71, 17, 7, 190, 41, 62, 149, 232, 73, 39, 5, 100, 217,
+            8, 90, 9, 182, 175, 97, 67, 133, 225, 175, 203, 101, 88, 208, 23, 166, 88, 180, 206,
+            225, 64, 187, 231, 32, 0, 135, 5, 79, 142, 182, 87, 27,
         ];
         let graph = tiny_graph();
 

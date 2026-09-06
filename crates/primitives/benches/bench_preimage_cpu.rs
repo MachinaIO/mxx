@@ -1,4 +1,5 @@
 use mxx_primitives::{
+    matrix::ResidentPolyMatrixColumnSource,
     poly::dcrt::params::DCRTPolyParams,
     sampler::{
         DistType, PolyTrapdoorSampler, PolyUniformSampler, trapdoor::DCRTPolyTrapdoorSampler,
@@ -18,7 +19,7 @@ fn bench_cpu_preimage() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Keep parameters aligned with the GPU benchmark for a fair comparison.
-    let params = DCRTPolyParams::new(16384, 10, 24, 12, None);
+    let params = DCRTPolyParams::new(16384, 10, 24, 12, None, None);
     let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
     let uniform_sampler = DCRTPolyUniformSampler::new();
 
@@ -32,8 +33,9 @@ fn bench_cpu_preimage() {
             &params,
             &trapdoor,
             &public_matrix,
-            &target,
+            &ResidentPolyMatrixColumnSource::new(target),
             BigUint::from(1u8) << PREIMAGE_BOUND_BITS,
+            rand::random(),
         )
         .expect("bounded compact CPU preimage sampling failed");
     let elapsed = start.elapsed();

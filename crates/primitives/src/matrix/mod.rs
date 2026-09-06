@@ -24,6 +24,65 @@ pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {
     fn entry_size(&self) -> usize;
 }
 
+/// A logical full matrix whose columns are materialized on demand.
+///
+/// Implementations may be backed by host staging bytes or persistent storage;
+/// callers must not assume that the complete expanded matrix is resident.
+pub trait PolyMatrixColumnSource<M>: Debug + Send + Sync {
+    fn row_size(&self) -> usize;
+    fn col_size(&self) -> usize;
+
+    /// Expanded storage already resident while a sampling tile is live.
+    /// Host-backed sources return `None`; resident sources expose their owner
+    /// so the sampler includes it in its peak-memory calculation.
+    fn resident_matrix(&self) -> Option<&M> {
+        None
+    }
+
+    /// Global offset of local column zero in the logical matrix.
+    ///
+    /// Column-partitioned backends include this offset when deriving tile
+    /// randomness. GPU sampling is reproducible for the same seed and tile
+    /// schedule; changing tile boundaries can change the sampled preimage.
+    fn global_column_start(&self) -> usize {
+        0
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> M;
+}
+
+/// Owns a resident matrix while presenting it as a logical column source.
+/// Sampling can therefore retain the full logical shape and load only the
+/// requested columns, without exposing an expanded preimage-returning API.
+#[derive(Clone, Debug)]
+pub struct ResidentPolyMatrixColumnSource<M: PolyMatrix> {
+    value: M,
+}
+
+impl<M: PolyMatrix> ResidentPolyMatrixColumnSource<M> {
+    pub fn new(value: M) -> Self {
+        Self { value }
+    }
+}
+
+impl<M: PolyMatrix> PolyMatrixColumnSource<M> for ResidentPolyMatrixColumnSource<M> {
+    fn resident_matrix(&self) -> Option<&M> {
+        Some(&self.value)
+    }
+
+    fn row_size(&self) -> usize {
+        self.value.row_size()
+    }
+
+    fn col_size(&self) -> usize {
+        self.value.col_size()
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> M {
+        self.value.slice_columns(start, end)
+    }
+}
+
 pub trait MatrixElem:
     Sized
     + Clone
@@ -158,6 +217,49 @@ pub trait PolyMatrix:
             .collect()
     }
 
+    /// Applies `sigma_k: X -> X^k` in `Z_q[X]/(X^n + 1)` entrywise.
+    fn ring_automorphism_out_of_place(&self, index: usize) -> Self {
+        let n = self.params().ring_dimension() as usize;
+        assert!(n.is_power_of_two(), "ring automorphism requires a power-of-two ring dimension");
+        assert!(index > 0 && index < 2 * n && index % 2 == 1, "invalid ring automorphism index");
+        let (rows, columns) = self.size();
+        let entries = (0..rows)
+            .into_par_iter()
+            .map(|row| {
+                (0..columns)
+                    .map(|column| {
+                        let mut output = vec![
+                            <<Self as PolyMatrix>::P as Poly>::Elem::zero(
+                                &self.params().modulus(),
+                            );
+                            n
+                        ];
+                        for (source, coefficient) in
+                            self.entry(row, column).coeffs().into_iter().enumerate()
+                        {
+                            let exponent =
+                                ((source as u128 * index as u128) % (2 * n) as u128) as usize;
+                            if exponent < n {
+                                output[exponent] = coefficient;
+                            } else {
+                                output[exponent - n] = -coefficient;
+                            }
+                        }
+                        Self::P::from_coeffs(self.params(), &output)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::from_poly_vec(self.params(), entries)
+    }
+
+    fn ring_automorphism_batch_out_of_place(inputs: Vec<(Arc<Self>, usize)>) -> Vec<Self> {
+        inputs
+            .into_par_iter()
+            .map(|(matrix, index)| matrix.ring_automorphism_out_of_place(index))
+            .collect()
+    }
+
     fn add_in_place(&mut self, rhs: &Self) {
         *self = self.clone() + rhs;
     }
@@ -198,6 +300,17 @@ pub trait PolyMatrix:
     fn to_cpu_staging_bytes(&self) -> Vec<u8> {
         self.clone().into_cpu_staging_bytes()
     }
+    fn from_cpu_staging_columns(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Self {
+        let full = Self::from_cpu_staging_bytes(params, bytes);
+        assert!(start <= end && end <= full.col_size(), "invalid staging column interval");
+        full.slice_columns(start, end)
+    }
+
     fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
         Self::from_compact_bytes(params, bytes)
     }
@@ -326,7 +439,11 @@ pub trait PolyMatrix:
     ///
     /// A matrix of dimension n×(n·log_b(q)), in which each block row is a scaled identity
     /// under the ring modulus.
-    fn gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
+    fn gadget_matrix(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        digit_count: Option<usize>,
+    ) -> Self;
     /// Constructs a compact gadget matrix G_small = I_n ⊗ (1, b, ..., b^{k-1}),
     /// where k = ceil(crt_bits / base_bits) and b = 2^{base_bits}.
     fn small_gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self;
@@ -456,10 +573,9 @@ pub trait PolyMatrix:
             .expect("small_decomposed_identity_chunk_from_scalar row offset overflow");
         full.slice(row_start, row_start + size, 0, size)
     }
-    fn modulus_switch(
-        &self,
-        new_modulus: &<<Self::P as Poly>::Params as PolyParams>::Modulus,
-    ) -> Self;
+    fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self;
+    /// Ordinary ring reduction into an exact destination CRT basis, without scaling.
+    fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),
@@ -664,7 +780,11 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
 pub trait PolyMatrixSmallRhs: PolyMatrix {
     type SmallMatrix: SmallPolyMatrix<Params = <Self::P as Poly>::Params>;
 
-    fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError>;
+    fn gadget_decompose(
+        self,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, SmallMatrixError>;
     fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
 }
 

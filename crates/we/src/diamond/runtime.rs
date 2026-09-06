@@ -392,7 +392,7 @@ mod tests {
     >;
 
     fn runtime() -> TestRuntime {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus: std::sync::Arc<num_bigint::BigUint> = parameters.modulus();
         let trapdoor_sigma = RealExpr::from_f64_exact(4.578).unwrap();
         let gadget_base = BigInt::from(1u64 << parameters.base_bits());

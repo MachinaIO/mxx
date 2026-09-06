@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn tall_arithmetic_matches_row_wise_runtime_formulas() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let digits = parameters.modulus_digits();
         let columns = secret_size * digits;
@@ -1020,7 +1020,7 @@ mod tests {
             matrix_output(&result, "product-public"),
             &left_public
                 .clone()
-                .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&right_public.clone().gadget_decompose(false, None).unwrap())
                 .unwrap()
         );
         for slot in 0..slots {
@@ -1032,7 +1032,9 @@ mod tests {
                 matrix_output(&result, &format!("product-row-{slot}")),
                 &(left_rows[slot]
                     .clone()
-                    .multiply_small_rhs(&right_public.clone().gadget_decompose(false).unwrap())
+                    .multiply_small_rhs(
+                        &right_public.clone().gadget_decompose(false, None).unwrap()
+                    )
                     .unwrap() +
                     right_rows[slot].clone() * left_plaintexts[slot].entry(0, 0))
             );
@@ -1045,7 +1047,7 @@ mod tests {
 
     #[test]
     fn direct_tall_rotation_encoding_matches_the_two_step_matrix_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let digits = parameters.modulus_digits();
         let columns = secret_size * digits;
@@ -1157,21 +1159,21 @@ mod tests {
             matrix_output(&result, "public"),
             &a_forward
                 .clone()
-                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false, None).unwrap())
                 .unwrap()
-                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false, None).unwrap())
                 .unwrap()
         );
         for destination in 0..slots {
             let source = (destination + slots - 1) % slots;
             let step1 = c_forward[destination]
                 .clone()
-                .multiply_small_rhs(&input_public.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&input_public.clone().gadget_decompose(false, None).unwrap())
                 .unwrap() +
                 input_rows[source].clone();
             let expected = step1
                 .clone()
-                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&a_backward.clone().gadget_decompose(false, None).unwrap())
                 .unwrap() +
                 c_backward[source].clone() * plaintexts[source].entry(0, 0);
             assert_eq!(matrix_output(&result, &format!("row-{destination}")), &expected);
@@ -1184,7 +1186,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_uses_master_secret_rows_in_the_bgg_formula() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
@@ -1251,7 +1253,7 @@ mod tests {
             );
         }
         let result = execute_graph(context.build().unwrap(), parameters.clone(), inputs);
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size, None);
         for slot in 0..slots {
             let secret_row = secret_row_values[slot].clone();
             let expected = secret_row.clone() * public_message.clone() -
@@ -1262,7 +1264,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_is_blockwise_for_three_keys_and_uses_one_packed_error() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
@@ -1398,7 +1400,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_blockwise_runtime_matches_identity_and_plaintext_formulas() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let slots = 3;
         let layout = BggSamplerLayout {
@@ -1479,7 +1481,7 @@ mod tests {
             inputs.insert(format!("formula-secret-{slot}"), RuntimeValue::matrix(value.clone()));
         }
         let result = execute_graph(built, parameters.clone(), inputs);
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size, None);
         let identity = DCRTPolyMatrix::identity(&parameters, 1, None);
         for block in 0..3 {
             for slot in 0..slots {
@@ -1501,7 +1503,7 @@ mod tests {
 
     #[test]
     fn tall_sampler_supports_one_key_without_plaintext_blocks() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let slots = 1;
         let layout = BggSamplerLayout {
@@ -1572,7 +1574,7 @@ mod tests {
 
     #[test]
     fn tall_rotation_encoding_artifacts_roundtrip_and_match_cross_row_secrets() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let slots = 4;
         let digits = parameters.modulus_digits();
@@ -1666,7 +1668,7 @@ mod tests {
         .unwrap();
 
         let hash = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new();
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, secret_size, None);
         for offset in [1usize, 3] {
             let key = TallRotationEncodingKey { num_slots: slots as u32, offset: offset as u32 };
             let forward_tag = format!("bgg_tall_rotation_n{slots}_r{offset}_forward");
@@ -1712,7 +1714,7 @@ mod tests {
 
     #[test]
     fn tall_rotation_encoding_public_key_pass_matches_lookup_input() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let secret_size = 2;
         let slots = 4;
         let digits = parameters.modulus_digits();

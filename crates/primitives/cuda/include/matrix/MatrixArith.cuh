@@ -39,6 +39,15 @@ extern "C"
         const GpuMatrix *const *left,
         const GpuMatrix *const *right,
         size_t matrix_count);
+    int gpu_matrix_validate_ring_automorphism(
+        size_t ring_dimension,
+        const size_t *indices,
+        size_t matrix_count);
+    int gpu_matrix_ring_automorphism_batch(
+        GpuMatrix *const *outputs,
+        const GpuMatrix *const *inputs,
+        const size_t *indices,
+        size_t matrix_count);
     int gpu_matrix_mul_accumulate_batch(
         GpuMatrix *const *outputs,
         const GpuMatrix *const *left,

@@ -128,6 +128,9 @@ where
     Ok(NodeMeasurement {
         work_seconds: seconds,
         latency_seconds: seconds,
+        cumulative_wave_seconds: seconds,
+        independent_wave_count: 1,
+        measured_wave_workspace_bytes: peak.load(Ordering::Acquire).saturating_sub(baseline),
         workspace_bytes: peak.load(Ordering::Acquire).saturating_sub(baseline),
     })
 }
@@ -137,12 +140,13 @@ mod tests {
     use super::*;
     use std::{
         convert::Infallible,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     struct Probe {
         bytes: AtomicU64,
         samples: AtomicUsize,
+        observed_high: AtomicBool,
     }
 
     impl MemoryProbe for Probe {
@@ -150,13 +154,21 @@ mod tests {
 
         fn current_bytes(&self) -> Result<u64, Self::Error> {
             self.samples.fetch_add(1, Ordering::AcqRel);
-            Ok(self.bytes.load(Ordering::Acquire))
+            let bytes = self.bytes.load(Ordering::Acquire);
+            if bytes >= 80 {
+                self.observed_high.store(true, Ordering::Release);
+            }
+            Ok(bytes)
         }
     }
 
     #[test]
     fn harness_warms_up_and_averages_the_requested_measurements() {
-        let probe = Probe { bytes: AtomicU64::new(0), samples: AtomicUsize::new(0) };
+        let probe = Probe {
+            bytes: AtomicU64::new(0),
+            samples: AtomicUsize::new(0),
+            observed_high: AtomicBool::new(false),
+        };
         let calls = AtomicUsize::new(0);
         let measurement = measure_operation(
             &MeasurementHarnessConfig {
@@ -175,7 +187,11 @@ mod tests {
 
     #[test]
     fn harness_observes_transient_memory_during_the_operation() {
-        let probe = Probe { bytes: AtomicU64::new(16), samples: AtomicUsize::new(0) };
+        let probe = Probe {
+            bytes: AtomicU64::new(16),
+            samples: AtomicUsize::new(0),
+            observed_high: AtomicBool::new(false),
+        };
         let measurement = measure_operation(
             &MeasurementHarnessConfig {
                 warm_up_iterations: 0,
@@ -185,8 +201,10 @@ mod tests {
             &probe,
             || {
                 probe.bytes.store(80, Ordering::Release);
-                let samples = probe.samples.load(Ordering::Acquire);
-                while probe.samples.load(Ordering::Acquire) == samples {
+                // Wait until the polling thread has observed the elevated allocation before
+                // releasing it.  Synchronizing only with a prior sample permits the operation
+                // to finish before the poller ever sees the transient peak.
+                while !probe.observed_high.load(Ordering::Acquire) {
                     thread::yield_now();
                 }
                 probe.bytes.store(16, Ordering::Release);
@@ -198,7 +216,11 @@ mod tests {
 
     #[test]
     fn harness_rejects_an_empty_measurement() {
-        let probe = Probe { bytes: AtomicU64::new(0), samples: AtomicUsize::new(0) };
+        let probe = Probe {
+            bytes: AtomicU64::new(0),
+            samples: AtomicUsize::new(0),
+            observed_high: AtomicBool::new(false),
+        };
         assert!(matches!(
             measure_operation(
                 &MeasurementHarnessConfig {
@@ -215,7 +237,11 @@ mod tests {
 
     #[test]
     fn batch_harness_invokes_the_complete_representative_batch() {
-        let probe = Probe { bytes: AtomicU64::new(0), samples: AtomicUsize::new(0) };
+        let probe = Probe {
+            bytes: AtomicU64::new(0),
+            samples: AtomicUsize::new(0),
+            observed_high: AtomicBool::new(false),
+        };
         let observed = Mutex::new(Vec::new());
         let measurement = measure_batch_operation(
             &MeasurementHarnessConfig {

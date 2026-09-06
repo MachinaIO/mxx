@@ -193,6 +193,9 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::MatrixMulSmallRhs |
                 NodeKind::MatrixNegate |
                 NodeKind::MatrixScale { .. } |
+                NodeKind::RingAutomorphism { .. } |
+                NodeKind::ModulusSwitch { .. } |
+                NodeKind::ModulusReduce { .. } |
                 NodeKind::Transpose |
                 NodeKind::Tensor |
                 NodeKind::UniformResidueSample { .. } |
@@ -316,10 +319,15 @@ fn int_contains_loop_index(value: &IntExpr) -> bool {
         IntExpr::Sub(left, right) |
         IntExpr::Mul(left, right) |
         IntExpr::Div(left, right) |
+        IntExpr::FloorDiv(left, right) |
+        IntExpr::Rem(left, right) |
         IntExpr::RoundDiv(left, right) => {
             int_contains_loop_index(left) || int_contains_loop_index(right)
         }
         IntExpr::Log2Ceil(value) => int_contains_loop_index(value),
+        IntExpr::Select { selector, branches } => {
+            int_contains_loop_index(selector) || branches.iter().any(int_contains_loop_index)
+        }
         IntExpr::Const(_) | IntExpr::Var(_) => false,
     }
 }

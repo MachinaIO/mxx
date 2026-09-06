@@ -7,10 +7,10 @@ on the crate that owns an abstraction.
 
 ```text
 mxx-runtime              -> mxx-ir-core, mxx-primitives
-mxx-bench-estimator      -> mxx-ir-core, mxx-runtime
+mxx-bench-estimator      -> mxx-ir-core, mxx-runtime; optional mxx-primitives
 mxx-dsl                  -> mxx-ir-core
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
-mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core
+mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
 mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
 mxx-func-enc/io          -> lower layers when their application modules are enabled
 ```

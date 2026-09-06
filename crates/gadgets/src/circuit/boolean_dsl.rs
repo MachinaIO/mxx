@@ -532,7 +532,7 @@ mod tests {
         let validated = mxx_ir_core::validate(&predicate.graph, bindings).unwrap();
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,

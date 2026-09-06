@@ -9,6 +9,59 @@ use bigdecimal::BigDecimal;
 use num_bigint::{BigUint, ToBigInt};
 use num_traits::{FromPrimitive, Zero};
 use rayon::prelude::*;
+use thiserror::Error;
+
+/// Selects the hard coefficient cutoff for a trapdoor-sampled preimage.
+///
+/// This policy applies only to randomized trapdoor preimage sampling. A
+/// deterministic gadget decomposition has a different, exact digit bound and
+/// must not be resolved through this policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TrapdoorPreimageCutoffPolicy {
+    /// Use the sampler's authoritative cutoff for the exact parameters.
+    #[default]
+    Default,
+    /// Use an explicitly selected cutoff, provided it is not below the
+    /// sampler's authoritative cutoff for the exact parameters.
+    Explicit(BigUint),
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum TrapdoorPreimageCutoffError {
+    #[error("invalid trapdoor preimage sampler parameters")]
+    InvalidParameters,
+    #[error("explicit trapdoor preimage cutoff {selected} is below the default {minimum}")]
+    ExplicitBelowDefault { selected: BigUint, minimum: BigUint },
+}
+
+impl TrapdoorPreimageCutoffPolicy {
+    /// Resolves the cutoff for one concrete trapdoor sampler instance.
+    pub fn resolve(
+        &self,
+        ring_dimension: u32,
+        public_rows: usize,
+        modulus_digits: usize,
+        base: u32,
+        sigma: f64,
+    ) -> Result<BigUint, TrapdoorPreimageCutoffError> {
+        if base < 2 {
+            return Err(TrapdoorPreimageCutoffError::InvalidParameters);
+        }
+        let minimum =
+            default_preimage_cutoff(ring_dimension, public_rows, modulus_digits, base, sigma)
+                .ok_or(TrapdoorPreimageCutoffError::InvalidParameters)?;
+        match self {
+            Self::Default => Ok(minimum),
+            Self::Explicit(selected) if selected < &minimum => {
+                Err(TrapdoorPreimageCutoffError::ExplicitBelowDefault {
+                    selected: selected.clone(),
+                    minimum,
+                })
+            }
+            Self::Explicit(selected) => Ok(selected.clone()),
+        }
+    }
+}
 
 /// Returns the authoritative integer cutoff `floor(6.5 * sigma_bound)`.
 ///
@@ -104,5 +157,36 @@ mod tests {
             BigUint::from(29u8)
         );
         assert_eq!(hard_cutoff_from_sigma_bound(&BigDecimal::zero()), BigUint::zero());
+    }
+
+    #[test]
+    fn trapdoor_preimage_cutoff_policy_rejects_values_below_default() {
+        let parameters = (8, 1, 3, 16, 5.0);
+        let minimum = TrapdoorPreimageCutoffPolicy::Default
+            .resolve(parameters.0, parameters.1, parameters.2, parameters.3, parameters.4)
+            .unwrap();
+        assert_eq!(
+            TrapdoorPreimageCutoffPolicy::Explicit(&minimum - BigUint::from(1_u8)).resolve(
+                parameters.0,
+                parameters.1,
+                parameters.2,
+                parameters.3,
+                parameters.4,
+            ),
+            Err(TrapdoorPreimageCutoffError::ExplicitBelowDefault {
+                selected: &minimum - BigUint::from(1_u8),
+                minimum: minimum.clone(),
+            })
+        );
+        assert_eq!(
+            TrapdoorPreimageCutoffPolicy::Explicit(minimum.clone()).resolve(
+                parameters.0,
+                parameters.1,
+                parameters.2,
+                parameters.3,
+                parameters.4,
+            ),
+            Ok(minimum)
+        );
     }
 }

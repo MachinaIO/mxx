@@ -388,6 +388,8 @@ where
         executed_node_count: 0,
         last_release_fence_node_count: 0,
         has_pending_releases: false,
+        execution_started: Instant::now(),
+        last_progress_report: None,
     };
     let inputs = inputs
         .into_iter()
@@ -440,6 +442,13 @@ where
         }
     }
     executor.fence_pending_releases()?;
+    info!(
+        graph = validated.source.name(),
+        host_returned_node_instances = executor.executed_node_count,
+        elapsed_seconds = executor.execution_started.elapsed().as_secs_f64(),
+        gpu_completion = "not_observed",
+        "runtime graph execution returned after output finalization"
+    );
     let result = ExecutionResult {
         outputs: named_outputs,
         production_id,
@@ -464,6 +473,8 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     executed_node_count: usize,
     last_release_fence_node_count: usize,
     has_pending_releases: bool,
+    execution_started: Instant,
+    last_progress_report: Option<Instant>,
 }
 
 struct PreimageProgress {
@@ -573,6 +584,29 @@ where
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
         for (position, handle) in validated_scope.execution_order.iter().enumerate() {
+            // Counts include structural nodes and each instantiated loop-body
+            // node, not coefficients, kernels, or device-completed work. Scope
+            // totals describe the unexpanded template only. Reporting never
+            // fences GPU work and remains independent of release-fence policy.
+            if tracing::enabled!(tracing::Level::INFO) &&
+                self.last_progress_report
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+            {
+                info!(
+                    graph = self.validated.source.name(),
+                    scope = ?scope_id,
+                    next_scope_template_node = position,
+                    scope_template_nodes = validated_scope.execution_order.len(),
+                    batch_instances = envs.len(),
+                    first_instance_path = ?paths.first(),
+                    last_instance_path = ?paths.last(),
+                    host_returned_node_instances = self.executed_node_count,
+                    elapsed_seconds = self.execution_started.elapsed().as_secs_f64(),
+                    gpu_completion = "not_observed",
+                    "runtime graph dispatch progress"
+                );
+                self.last_progress_report = Some(Instant::now());
+            }
             let node = ExecutableNode {
                 id: NodeId(position as u64),
                 kind: handle.kind(),
@@ -1746,7 +1780,6 @@ where
                 {
                     return Err(ExecutionError::PreimagePublicMismatch(node.id));
                 }
-                let target = self.matrix(values, node.args[2])?;
                 let target_type = self.matrix_type(scope_id, path, node.args[2])?;
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let (mut schema, semantic_kind) =
@@ -1760,9 +1793,10 @@ where
                     ));
                 }
                 let (value, sampled) = if let Some(small) = gadget_small {
+                    let target = self.matrix(values, node.args[2])?;
                     if !small &&
                         self.backend
-                            .gadget_error_bound(&target_type)
+                            .gadget_error_bound(&target_type, Some(digit_count))
                             .map_err(Self::backend_error)? !=
                             BigInt::from(0u8)
                     {
@@ -1775,13 +1809,17 @@ where
                         .map_err(Self::backend_error)?;
                     (
                         self.backend
-                            .gadget_decompose(&target, small)
+                            .gadget_decompose(&target, small, Some(digit_count))
                             .map_err(Self::backend_error)?,
                         false,
                     )
                 } else {
                     let secret =
                         secret.as_ref().expect("sampled trapdoor must carry secret material");
+                    let target_source =
+                        self.preimage_source(values, path, node.args[2], &target_type)?;
+                    let randomness_seed =
+                        preimage_request_seed(self.production.execution_nonce, path, wire);
                     self.sample_small_matrix_with_status(
                         path,
                         wire,
@@ -1796,7 +1834,8 @@ where
                                 &schema.max_coefficient_bound,
                                 secret,
                                 &public,
-                                &target,
+                                target_source.as_ref(),
+                                randomness_seed,
                             )
                         },
                     )?
@@ -1830,9 +1869,30 @@ where
                             .to_owned(),
                     });
                 }
-                let output =
-                    self.backend.gadget_decompose(&input, *small).map_err(Self::backend_error)?;
+                let output = self
+                    .backend
+                    .gadget_decompose(&input, *small, Some(digit_count))
+                    .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
+            }
+            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let output = if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
+                    self.backend.modulus_switch(&input, &ty)
+                } else {
+                    self.backend.reduce_modulus(&input, &ty)
+                }
+                .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::RingAutomorphism { index } => {
+                let input = self.matrix(values, node.args[0])?;
+                let index = self.eval_usize(node.id, index, env)?;
+                let output =
+                    self.backend.ring_automorphism(&input, index).map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::ExtractCoefficient { position, .. } => {
                 let input = self.matrix(values, node.args[0])?;
@@ -1876,7 +1936,7 @@ where
                     self.put(values, node.id, port as u32, value);
                 }
             }
-            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+            NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => {
                 let levels = node
                     .args
                     .iter()
@@ -1894,9 +1954,16 @@ where
                         value.evaluate(env).map_err(|error| self.expression_error(node.id, error))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let destination =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let output = self
                     .backend
-                    .crt_recompose(&levels, &plaintext_moduli, &reconstruction_coefficients)
+                    .crt_recompose(
+                        &levels,
+                        &plaintext_moduli,
+                        &reconstruction_coefficients,
+                        &destination,
+                    )
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2268,6 +2335,43 @@ where
         }
     }
 
+    fn preimage_source(
+        &mut self,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
+        path: &[InstantiationFrame],
+        wire: WireRef,
+        matrix_type: &ConcreteMatrixType,
+    ) -> Result<Arc<dyn mxx_primitives::matrix::PolyMatrixColumnSource<B::Matrix>>, ExecutionError>
+    {
+        let value = values.remove(&wire).ok_or(ExecutionError::MissingWire(wire))?;
+        let (source, bytes) = match value {
+            RuntimeValue::HostMatrix { bytes, .. } => {
+                let source = self
+                    .backend
+                    .preimage_target_from_staging(
+                        matrix_type,
+                        matrix_type.rows,
+                        matrix_type.columns,
+                        bytes.clone(),
+                    )
+                    .map_err(Self::backend_error)?;
+                (source, bytes)
+            }
+            other => {
+                let RuntimeValue::Matrix(matrix) = self.materialize_value(other)? else {
+                    return Err(ExecutionError::ValueKind(wire));
+                };
+                self.backend.preimage_target(matrix).map_err(Self::backend_error)?
+            }
+        };
+        let staged = RuntimeValue::HostMatrix { matrix_type: matrix_type.clone(), bytes };
+        if let Some(trace) = &mut self.trace {
+            trace.insert(WireId { instantiation_path: path.to_vec(), wire }, staged.clone());
+        }
+        values.insert(wire, staged);
+        Ok(source)
+    }
+
     fn execute_preimage_batch(
         &mut self,
         scope_id: &FrozenGraphScopeId,
@@ -2299,7 +2403,6 @@ where
             {
                 return Err(ExecutionError::PreimagePublicMismatch(node.id));
             }
-            let target = self.matrix(&mut values[instance], node.args[2])?;
             let wire = WireRef { node: node.id, port: Port(0) };
             let (mut schema, semantic_kind) =
                 self.bounded_matrix_schema(scope_id, &paths[instance], wire)?;
@@ -2309,9 +2412,12 @@ where
                 ));
             }
             if let Some(small) = gadget_small {
+                let target = self.matrix(&mut values[instance], node.args[2])?;
                 let target_type = self.matrix_type(scope_id, &paths[instance], node.args[2])?;
                 if !small &&
-                    self.backend.gadget_error_bound(&target_type).map_err(Self::backend_error)? !=
+                    self.backend
+                        .gadget_error_bound(&target_type, Some(digit_count))
+                        .map_err(Self::backend_error)? !=
                         BigInt::from(0u8)
                 {
                     return Err(ExecutionError::Manifest(
@@ -2321,8 +2427,10 @@ where
                 self.backend
                     .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                     .map_err(Self::backend_error)?;
-                let value =
-                    self.backend.gadget_decompose(&target, small).map_err(Self::backend_error)?;
+                let value = self
+                    .backend
+                    .gadget_decompose(&target, small, Some(digit_count))
+                    .map_err(Self::backend_error)?;
                 self.put(&mut values[instance], node.id, 0, RuntimeValue::small_matrix(value));
                 continue;
             }
@@ -2332,6 +2440,15 @@ where
             schema.max_coefficient_bound = max_coefficient_bound
                 .evaluate(&envs[instance])
                 .map_err(|error| self.expression_error(node.id, error))?;
+            let target_type = self.matrix_type(scope_id, &paths[instance], node.args[2])?;
+            let target = self.preimage_source(
+                &mut values[instance],
+                &paths[instance],
+                node.args[2],
+                &target_type,
+            )?;
+            let randomness_seed =
+                preimage_request_seed(self.production.execution_nonce, &paths[instance], wire);
             pending.push(Pending {
                 instance,
                 placement: placements[instance],
@@ -2346,6 +2463,7 @@ where
                     trapdoor: secret.expect("sampled trapdoor must carry secret material"),
                     public,
                     target,
+                    randomness_seed,
                 },
                 schema,
             });
@@ -2976,7 +3094,13 @@ where
         &mut self,
         value: RuntimeValue<B>,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
-        if let RuntimeValue::LazyArtifact { production, name, index, descriptor } = value {
+        if let RuntimeValue::HostMatrix { matrix_type, bytes } = value {
+            let matrix = self
+                .backend
+                .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
+                .map_err(Self::backend_error)?;
+            Ok(RuntimeValue::matrix(matrix))
+        } else if let RuntimeValue::LazyArtifact { production, name, index, descriptor } = value {
             let key = ArtifactKey { production, name, index };
             let artifact_type = descriptor.artifact_type.clone();
             let payload =
@@ -3525,6 +3649,30 @@ fn append_tag_integer(tag: &mut Vec<u8>, value: &BigInt) {
     tag.extend_from_slice(&bytes);
 }
 
+fn preimage_request_seed(
+    execution_nonce: [u8; 32],
+    path: &[InstantiationFrame],
+    wire: WireRef,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mxx-runtime/preimage-request/v1");
+    hasher.update(execution_nonce);
+    hasher.update((path.len() as u64).to_le_bytes());
+    for frame in path {
+        hasher.update(frame.call.0.to_le_bytes());
+        match frame.loop_index {
+            Some(index) => {
+                hasher.update([1]);
+                hasher.update(index.to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hasher.update(wire.node.0.to_le_bytes());
+    hasher.update(wire.port.0.to_le_bytes());
+    hasher.finalize().into()
+}
+
 fn runtime_inputs_digest<B: Backend>(
     validated: &ValidatedGraph,
     backend: &B,
@@ -3590,6 +3738,13 @@ fn hash_runtime_value<B: Backend>(
         RuntimeValue::TypedBlob(value) => {
             hasher.update([4]);
             hash_sized(hasher, value);
+        }
+        RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            let matrix = backend
+                .matrix_from_cpu_staging_bytes(matrix_type, bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            hasher.update([5]);
+            hash_sized(hasher, &backend.matrix_to_bytes(&matrix));
         }
         RuntimeValue::Matrix(value) => {
             hasher.update([5]);
@@ -3718,7 +3873,10 @@ fn runtime_value_matches_wire_type<B: Backend>(
         (RuntimeValue::Bool(_), ConcreteWireType::ConstantBool | ConcreteWireType::Bool) |
         (RuntimeValue::Bytes(_), ConcreteWireType::Bytes { .. }) |
         (RuntimeValue::TypedBlob(_), ConcreteWireType::TypedBlob { .. }) |
-        (RuntimeValue::Matrix(_), ConcreteWireType::Matrix(_)) |
+        (
+            RuntimeValue::Matrix(_) | RuntimeValue::HostMatrix { .. },
+            ConcreteWireType::Matrix(_),
+        ) |
         (
             RuntimeValue::SmallMatrix(_),
             ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. },
@@ -3787,6 +3945,12 @@ fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
     store: &mut S,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     match value {
+        RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            let matrix = backend
+                .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            Ok(RuntimeValue::matrix(matrix))
+        }
         RuntimeValue::LazyArtifact { production, name, index, descriptor } => {
             let artifact_type = descriptor.artifact_type.clone();
             let payload = store
@@ -4152,6 +4316,72 @@ mod tests {
             unused_probe_operation!(ty, key, tag, gadget_base, digit_count)
         }
 
+        fn ring_automorphism(
+            &mut self,
+            value: &Self::Matrix,
+            index: usize,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, index)
+        }
+
+        fn modulus_switch(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+
+        fn reduce_modulus(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+
+        fn preimage_target(
+            &mut self,
+            value: Arc<Self::Matrix>,
+        ) -> Result<
+            (Arc<dyn mxx_primitives::matrix::PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>),
+            Self::Error,
+        > {
+            unused_probe_operation!(value)
+        }
+
+        fn matrix_from_cpu_staging_bytes(
+            &self,
+            ty: &ConcreteMatrixType,
+            bytes: &[u8],
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, bytes)
+        }
+
+        fn preimage_target_from_staging(
+            &self,
+            ty: &ConcreteMatrixType,
+            rows: usize,
+            columns: usize,
+            bytes: Arc<Vec<u8>>,
+        ) -> Result<
+            Arc<dyn mxx_primitives::matrix::PolyMatrixColumnSource<Self::Matrix>>,
+            Self::Error,
+        > {
+            unused_probe_operation!(ty, rows, columns, bytes)
+        }
+
+        fn validate_preimage_bound(
+            &self,
+            ty: &ConcreteMatrixType,
+            sigma: f64,
+            gadget_base: &BigInt,
+            digit_count: usize,
+            max_coefficient_bound: &BigInt,
+        ) -> Result<(), Self::Error> {
+            unused_probe_operation!(ty, sigma, gadget_base, digit_count, max_coefficient_bound)
+        }
+
         fn sample_trapdoor(
             &mut self,
             ty: &ConcreteMatrixType,
@@ -4171,7 +4401,8 @@ mod tests {
             max_coefficient_bound: &BigInt,
             trapdoor: &Self::Trapdoor,
             public: &Self::Matrix,
-            target: &Self::Matrix,
+            target: &dyn mxx_primitives::matrix::PolyMatrixColumnSource<Self::Matrix>,
+            randomness_seed: [u8; 32],
         ) -> Result<Self::SmallMatrix, Self::Error> {
             unused_probe_operation!(
                 ty,
@@ -4182,6 +4413,7 @@ mod tests {
                 trapdoor,
                 public,
                 target,
+                randomness_seed,
             )
         }
 
@@ -4189,8 +4421,9 @@ mod tests {
             &mut self,
             value: &Self::Matrix,
             small: bool,
+            digit_count: Option<usize>,
         ) -> Result<Self::SmallMatrix, Self::Error> {
-            unused_probe_operation!(value, small)
+            unused_probe_operation!(value, small, digit_count)
         }
 
         fn multiply_small_rhs(
@@ -4232,8 +4465,14 @@ mod tests {
             levels: &[Self::Matrix],
             plaintext_moduli: &[BigInt],
             reconstruction_coefficients: &[BigInt],
+            destination: &ConcreteMatrixType,
         ) -> Result<Self::Matrix, Self::Error> {
-            unused_probe_operation!(levels, plaintext_moduli, reconstruction_coefficients)
+            unused_probe_operation!(
+                levels,
+                plaintext_moduli,
+                reconstruction_coefficients,
+                destination
+            )
         }
 
         fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
@@ -4457,7 +4696,7 @@ mod tests {
 
     #[test]
     fn canonical_polynomial_coefficient_bits_roundtrip_on_cpu() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = parameters.modulus();
         let coefficient_bits = parameters.modulus_bits();
         let ring_dimension = parameters.ring_dimension() as usize;
@@ -4499,7 +4738,7 @@ mod tests {
 
     #[test]
     fn integer_lift_writes_only_the_constant_polynomial_coefficient() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let context = DslContext::new("integer-lift-constant-polynomial");
@@ -4694,7 +4933,7 @@ mod tests {
 
     #[test]
     fn decomposed_hash_executes_as_a_generic_small_rhs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u8) << parameters.base_bits();
@@ -4727,7 +4966,7 @@ mod tests {
 
     #[test]
     fn generic_small_rhs_input_and_artifact_keep_the_compact_runtime_kind() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let lhs = ring.input("lhs", (1, 1));
@@ -4837,7 +5076,7 @@ mod tests {
     #[test]
     #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn trapdoor_families_sample_preimages_and_persist_each_member() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u64 << parameters.base_bits());
@@ -5104,7 +5343,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_preserves_preimage_small_owner_and_relation() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u8) << parameters.base_bits();
@@ -5170,7 +5409,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
             BTreeMap::from([(
                 "increments".to_owned(),
                 RuntimeValue::IndexedFamily(vec![
@@ -5199,7 +5438,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -5225,7 +5464,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -5255,7 +5494,7 @@ mod tests {
             .expect("validation");
         let result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
             BTreeMap::from([(
                 "bits".to_owned(),
                 RuntimeValue::IndexedFamily(
@@ -5359,7 +5598,9 @@ mod tests {
             RuntimeValue::Bool(_) => panic!("empty range output became a bool"),
             RuntimeValue::Bytes(_) => panic!("empty range output became bytes"),
             RuntimeValue::TypedBlob(_) => panic!("empty range output became a blob"),
-            RuntimeValue::Matrix(_) => panic!("empty range output became a matrix"),
+            RuntimeValue::Matrix(_) | RuntimeValue::HostMatrix { .. } => {
+                panic!("empty range output became a matrix")
+            }
             RuntimeValue::SmallMatrix(_) => panic!("empty range output became a small matrix"),
             RuntimeValue::Trapdoor { .. } => panic!("empty range output became a trapdoor"),
             RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. } => {
@@ -5440,7 +5681,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_and_trace_preserve_sampled_execution_exactly() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sample = ring.gaussian((1, 1), 3, 19);
@@ -5482,7 +5723,7 @@ mod tests {
 
     #[test]
     fn resumable_session_reuses_draws_and_rejects_changed_inputs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sampled = DslContext::new("runtime-resumable-sample")
@@ -5609,7 +5850,7 @@ mod tests {
         .expect("freeze")
         .0;
         let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).expect("validation");
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let result = execute(
             &validated,
             &mut cpu_backend([parameters]),
@@ -5658,7 +5899,7 @@ mod tests {
         assert!(matches!(
             execute(
                 &validated,
-                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
                 BTreeMap::new(),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
@@ -5669,7 +5910,7 @@ mod tests {
 
     #[test]
     fn dynamic_family_access_selects_the_runtime_index_and_rejects_out_of_range() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let family = Family::pack(vec![ring.polynomial([10.into()]), ring.polynomial([20.into()])])

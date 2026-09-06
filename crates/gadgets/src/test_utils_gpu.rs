@@ -40,7 +40,7 @@ use std::{collections::BTreeMap, sync::Arc};
 #[test]
 #[serial_test::serial]
 fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
-    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
         GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
@@ -91,7 +91,7 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
 #[test]
 #[serial_test::serial]
 fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
-    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
         GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
@@ -141,7 +141,7 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
 #[test]
 #[serial_test::serial]
 fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
-    let parameters = DCRTPolyParams::new(2, 2, 12, 6, None);
+    let parameters = DCRTPolyParams::new(2, 2, 12, 6, None, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
         GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);
@@ -224,7 +224,7 @@ fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
 fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
     let ring_dimension = 2u32;
     let active_levels = 1usize;
-    let parameters = DCRTPolyParams::new(ring_dimension, active_levels, 10, 5, None);
+    let parameters = DCRTPolyParams::new(ring_dimension, active_levels, 10, 5, None, None);
     let (moduli, _, _) = parameters.to_crt();
     let gpu_parameters =
         GpuDCRTPolyParams::new(parameters.ring_dimension(), moduli, parameters.base_bits(), None);

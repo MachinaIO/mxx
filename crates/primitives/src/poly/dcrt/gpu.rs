@@ -89,6 +89,14 @@ impl GpuRngSeed {
         }
         Self { words }
     }
+
+    pub fn to_bytes(self) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.chunks_exact_mut(8).zip(self.words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -108,9 +116,11 @@ unsafe extern "C" {
         gpu_ids_len: usize,
         stream_pool_size: usize,
         vram_percent: u32,
+        related_context: *const GpuContextOpaque,
         out_ctx: *mut *mut GpuContextOpaque,
     ) -> c_int;
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
+    fn gpu_context_execution_identity(ctx: *const GpuContextOpaque) -> u64;
     fn gpu_context_get_N(ctx: *const GpuContextOpaque, out_n: *mut c_int) -> c_int;
     fn gpu_context_get_vram_budget_bytes(
         ctx: *const GpuContextOpaque,
@@ -261,6 +271,12 @@ unsafe extern "C" {
         right: *const *const GpuMatrixOpaque,
         matrix_count: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_ring_automorphism_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        indices: *const usize,
+        matrix_count: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_mul_accumulate_batch(
         outputs: *const *mut GpuMatrixOpaque,
         left: *const *const GpuMatrixOpaque,
@@ -276,6 +292,13 @@ unsafe extern "C" {
         matrices: *const *const GpuMatrixOpaque,
         scalars: *const *const GpuMatrixOpaque,
         matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_convert_modulus(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        round_scale: c_int,
+        division_inverses: *const u64,
+        inverse_count: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_crt_recompose(
         out: *mut GpuMatrixOpaque,
@@ -765,6 +788,7 @@ fn log2_u32(value: u32) -> u32 {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct DeviceContextCacheKey {
+    execution_owner: u64,
     ring_dimension: u32,
     moduli: Vec<u64>,
     base_bits: u32,
@@ -867,15 +891,62 @@ impl PolyParams for GpuDCRTPolyParams {
         (self.moduli.clone(), self.crt_bits, self.crt_depth)
     }
 
+    fn select_modulus(&self, modulus: &BigUint) -> Option<Self> {
+        if self.dropped_moduli != 0 {
+            return None;
+        }
+        let moduli = self
+            .moduli
+            .iter()
+            .copied()
+            .filter(|prime| modulus % prime == BigUint::from(0u8))
+            .collect::<Vec<_>>();
+        if moduli.is_empty() ||
+            moduli.iter().map(|prime| BigUint::from(*prime)).product::<BigUint>() != *modulus
+        {
+            return None;
+        }
+        let crt_bits = moduli.iter().map(|prime| bits_in_u64(*prime)).max()?;
+        if self.base_bits as usize > crt_bits / 2 {
+            return None;
+        }
+        Some(Self::new_with_gpu(
+            self.ring_dimension,
+            moduli,
+            self.base_bits,
+            self.gpu_ids.clone(),
+            Some(self.dnum),
+            Some(self),
+            None,
+        ))
+    }
+
     fn device_ids(&self) -> Vec<i32> {
         self.gpu_ids.clone()
     }
 
-    fn params_for_device(&self, device_id: i32) -> Self {
-        if self.gpu_ids.as_slice() == [device_id] && self.dnum == 1 {
+    fn params_for_device(&self, device_id: i32, related: Option<&Self>) -> Self {
+        if self.gpu_ids.as_slice() == [device_id] &&
+            self.dnum == 1 &&
+            related.is_none_or(|parameters| {
+                self.ctx.execution_identity() == parameters.ctx.execution_identity()
+            })
+        {
             return self.clone();
         }
-        let ctx = self.single_device_context(device_id);
+        let ctx = if let Some(parameters) = related {
+            assert_eq!(parameters.gpu_ids.as_slice(), [device_id]);
+            Arc::new(GpuContext::create(
+                log2_u32(self.ring_dimension),
+                &self.moduli,
+                &[device_id],
+                1,
+                self.vram_percent,
+                Some(&parameters.ctx),
+            ))
+        } else {
+            self.single_device_context(device_id)
+        };
         Self {
             ring_dimension: self.ring_dimension,
             moduli: self.moduli.clone(),
@@ -894,11 +965,16 @@ impl PolyParams for GpuDCRTPolyParams {
     fn fence_released_memory(&self) {
         self.ctx.fence_released_memory();
     }
+
+    fn execution_owner_id(&self) -> Option<u64> {
+        Some(self.ctx.execution_identity())
+    }
 }
 
 impl GpuDCRTPolyParams {
     fn single_device_context(&self, device_id: i32) -> Arc<GpuContext> {
         let key = DeviceContextCacheKey {
+            execution_owner: self.ctx.execution_identity(),
             ring_dimension: self.ring_dimension,
             moduli: self.moduli.clone(),
             base_bits: self.base_bits,
@@ -915,8 +991,14 @@ impl GpuDCRTPolyParams {
         }
 
         let log_n = log2_u32(self.ring_dimension);
-        let created =
-            Arc::new(GpuContext::create(log_n, &self.moduli, &[device_id], 1, self.vram_percent));
+        let created = Arc::new(GpuContext::create(
+            log_n,
+            &self.moduli,
+            &[device_id],
+            1,
+            self.vram_percent,
+            None,
+        ));
 
         let cache = single_device_context_cache();
         let mut guard = cache.lock().expect("single_device_context_cache mutex poisoned");
@@ -937,7 +1019,15 @@ impl GpuDCRTPolyParams {
         // Default params stay single-device so low-level matrix/poly ops keep the
         // invariant that all limbs of a matrix live on one device.
         let default_gpu_ids = gpu_ids.into_iter().take(1).collect::<Vec<_>>();
-        Self::new_with_gpu(ring_dimension, moduli, base_bits, default_gpu_ids, None, dropped_moduli)
+        Self::new_with_gpu(
+            ring_dimension,
+            moduli,
+            base_bits,
+            default_gpu_ids,
+            None,
+            None,
+            dropped_moduli,
+        )
     }
 
     /// Constructs parameters with an explicit GPU placement.
@@ -952,6 +1042,7 @@ impl GpuDCRTPolyParams {
         base_bits: u32,
         gpu_ids: Vec<i32>,
         dnum: Option<u32>,
+        related: Option<&Self>,
         dropped_moduli: Option<usize>,
     ) -> Self {
         assert!(!moduli.is_empty(), "moduli must not be empty");
@@ -973,7 +1064,14 @@ impl GpuDCRTPolyParams {
         let vram_percent = crate::env::gpu_vram_percent()
             .unwrap_or_else(|error| panic!("invalid GPU VRAM percentage: {error}"));
         let log_n = log2_u32(ring_dimension);
-        let ctx = Arc::new(GpuContext::create(log_n, &moduli, &gpu_ids, dnum, vram_percent));
+        let ctx = Arc::new(GpuContext::create(
+            log_n,
+            &moduli,
+            &gpu_ids,
+            dnum,
+            vram_percent,
+            related.map(|parameters| parameters.ctx.as_ref()),
+        ));
 
         Self {
             ring_dimension,
@@ -1004,6 +1102,10 @@ impl GpuDCRTPolyParams {
 
     pub fn gpu_ids(&self) -> &[i32] {
         &self.gpu_ids
+    }
+
+    pub(crate) fn supports_shared_crt_correction(&self) -> bool {
+        self.gpu_ids.len() <= 1 || self.dnum == 1
     }
 
     pub(crate) fn ctx_raw(&self) -> *mut GpuContextOpaque {
@@ -1085,7 +1187,14 @@ unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
 
 impl GpuContext {
-    fn create(log_n: u32, moduli: &[u64], gpu_ids: &[i32], dnum: u32, vram_percent: u32) -> Self {
+    fn create(
+        log_n: u32,
+        moduli: &[u64],
+        gpu_ids: &[i32],
+        dnum: u32,
+        vram_percent: u32,
+        related: Option<&GpuContext>,
+    ) -> Self {
         info!(
             "{}",
             format!(
@@ -1111,6 +1220,7 @@ impl GpuContext {
                 gpu_ids_len,
                 crate::env::cuda_stream_pool_size(),
                 vram_percent,
+                related.map_or(ptr::null(), |context| context.raw as *const _),
                 &mut ctx_ptr as *mut *mut GpuContextOpaque,
             )
         };
@@ -1139,6 +1249,10 @@ impl GpuContext {
         self.raw
     }
 
+    fn execution_identity(&self) -> u64 {
+        unsafe { gpu_context_execution_identity(self.raw) }
+    }
+
     /// Waits only for releases queued on this context's release streams.
     pub fn fence_released_memory(&self) {
         let status = unsafe { gpu_context_fence_releases(self.raw) };
@@ -1149,7 +1263,7 @@ impl GpuContext {
 impl Drop for GpuContext {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            #[cfg(any(test, feature = "test-gpu-sync"))]
+            #[cfg(feature = "test-gpu-sync")]
             gpu_device_sync();
             unsafe { gpu_context_destroy(self.raw) };
             self.raw = ptr::null_mut();
@@ -1687,7 +1801,15 @@ mod tests {
             // Invalid device IDs prove that validation happens before CUDA setup.
             // dnum = 0 is resolved to the GPU count by the CUDA constructor.
             let error = std::panic::catch_unwind(|| {
-                GpuDCRTPolyParams::new_with_gpu(8, vec![97, 113], 3, vec![-1, -2], dnum, Some(1))
+                GpuDCRTPolyParams::new_with_gpu(
+                    8,
+                    vec![97, 113],
+                    3,
+                    vec![-1, -2],
+                    dnum,
+                    None,
+                    Some(1),
+                )
             })
             .expect_err("partitioned approximate parameters must be rejected");
             let message = error
@@ -1705,7 +1827,7 @@ mod tests {
     }
 
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 17, 1, None)
+        DCRTPolyParams::new(128, 2, 17, 1, None, None)
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
@@ -1720,6 +1842,116 @@ mod tests {
 
     fn gpu_poly_from_cpu(poly: &DCRTPoly, gpu_params: &GpuDCRTPolyParams) -> GpuDCRTPoly {
         GpuDCRTPoly::from_coeffs(gpu_params, &poly.coeffs())
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_select_modulus_rejects_base_too_wide_for_selected_basis() {
+        let (n, _, bits, _) = crate::env::modulus_conversion_test_parameters();
+        let base_bits = u32::try_from((bits + 2) / 2).unwrap();
+        let narrow = DCRTPolyParams::new(n, 1, bits, 1, None, None);
+        let wide = DCRTPolyParams::new(n, 1, bits + 2, base_bits, None, None);
+        let source = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            vec![narrow.to_crt().0[0], wide.to_crt().0[0]],
+            base_bits,
+            vec![available_gpu_ids()[0]],
+            Some(1),
+            None,
+            None,
+        );
+
+        assert!(source.select_modulus(narrow.modulus().as_ref()).is_none());
+        let selected = source.select_modulus(wide.modulus().as_ref()).unwrap();
+        assert_eq!(selected.base_bits(), base_bits);
+        assert_eq!(selected.to_crt(), wide.to_crt());
+        assert_eq!(selected.execution_owner_id(), source.execution_owner_id());
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_related_rings_share_execution_and_preserve_async_lifetimes() {
+        let devices = available_gpu_ids();
+        let device = devices[0];
+        let before = gpu_device_memory_usage(device).unwrap();
+        let source = GpuDCRTPolyParams::new_with_gpu(
+            32,
+            vec![131_009, 130_817, 129_793],
+            2,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let source_state = gpu_device_memory_usage(device).unwrap();
+        assert_eq!(source_state.live_contexts, before.live_contexts + 1);
+        let low = GpuDCRTPolyParams::new_with_gpu(
+            32,
+            vec![131_009, 129_793],
+            2,
+            vec![device],
+            Some(1),
+            Some(&source),
+            None,
+        );
+        let other = GpuDCRTPolyParams::new_with_gpu(
+            32,
+            vec![130_817],
+            2,
+            vec![device],
+            Some(1),
+            Some(&source),
+            None,
+        );
+        assert_eq!(low.ctx.execution_identity(), source.ctx.execution_identity());
+        assert_ne!(low.ctx_raw(), source.ctx_raw());
+        assert_eq!(low.to_crt().0, vec![131_009, 129_793]);
+        let related_state = gpu_device_memory_usage(device).unwrap();
+        assert_eq!(related_state.live_contexts, source_state.live_contexts);
+        assert!(related_state.context_generation >= source_state.context_generation + 2);
+        let independent = GpuDCRTPolyParams::new_with_gpu(
+            32,
+            vec![131_009],
+            2,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        assert_ne!(independent.ctx.execution_identity(), low.ctx.execution_identity());
+        assert_eq!(
+            gpu_device_memory_usage(device).unwrap().live_contexts,
+            source_state.live_contexts + 1
+        );
+        drop(independent);
+
+        let value = rand::rng().random_range(1u32..100);
+        let polynomial = GpuDCRTPoly::from_u32s(&low, &[value]);
+        let product = &polynomial * &polynomial;
+        let other_polynomial = GpuDCRTPoly::from_u32s(&other, &[value]);
+        let other_product = &other_polynomial * &other_polynomial;
+        drop(other_product);
+        drop(other_polynomial);
+        // No test-only device sync runs on context drop. Root-ring constant
+        // releases must not destroy the streams still used by the low ring.
+        drop(source);
+        drop(other);
+        assert_eq!(
+            gpu_device_memory_usage(device).unwrap().live_contexts,
+            source_state.live_contexts
+        );
+        let coefficients = product.coeffs();
+        assert_eq!(coefficients[0].value(), &BigUint::from(value * value));
+        assert!(
+            coefficients
+                .iter()
+                .skip(1)
+                .all(|coefficient| coefficient.value() == &BigUint::from(0u8))
+        );
+        drop(product);
+        drop(polynomial);
+        drop(low);
+        assert_eq!(gpu_device_memory_usage(device).unwrap().live_contexts, before.live_contexts);
     }
 
     #[test]
@@ -1816,7 +2048,7 @@ mod tests {
         if devices.len() < 2 {
             return;
         }
-        let cpu = DCRTPolyParams::new(128, 4, 17, 1, None);
+        let cpu = DCRTPolyParams::new(128, 4, 17, 1, None, None);
         let (moduli, _, _) = cpu.to_crt();
         let params = GpuDCRTPolyParams::new_with_gpu(
             cpu.ring_dimension(),
@@ -1824,6 +2056,7 @@ mod tests {
             cpu.base_bits(),
             devices[..2].to_vec(),
             Some(2),
+            None,
             None,
         );
         assert_ne!(params.dnum as usize, params.crt_depth());

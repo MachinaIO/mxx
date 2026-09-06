@@ -39,7 +39,8 @@ fn bench_gpu_small_rhs() {
 
     let ring_dimension = u32::try_from(ring_dimension).expect("ring dimension exceeds u32");
     let base_bits = u32::try_from(base_bits).expect("base bits exceeds u32");
-    let cpu_params = DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None);
+    let cpu_params =
+        DCRTPolyParams::new(ring_dimension, crt_depth, crt_bits, base_bits, None, None);
     let (moduli, _, _) = cpu_params.to_crt();
     let params =
         GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits(), None);
@@ -59,7 +60,7 @@ fn bench_gpu_small_rhs() {
 
     let end_to_end_start = Instant::now();
     let decomposition_start = Instant::now();
-    let compact = target.gadget_decompose(true).expect("compact gadget decomposition failed");
+    let compact = target.gadget_decompose(true, None).expect("compact gadget decomposition failed");
     compact.wait_until_ready();
     let decomposition_seconds = decomposition_start.elapsed().as_secs_f64();
     let allocation =

@@ -20,6 +20,8 @@ pub struct BggPublicKeyFamily {
 #[derive(Clone)]
 pub struct BggEncodingFamily {
     pub vectors: Family<Mat>,
+    /// Public projections are kept outside each encoding wire.  They are
+    /// supplied by the preprocessing program to legacy family consumers.
     pub public_keys: BggPublicKeyFamily,
     pub plaintexts: Family<Mat>,
 }
@@ -32,6 +34,10 @@ pub enum DynamicBooleanBggError {
     PlaintextRequired,
     #[error("dynamic Boolean BGG input component families have different counts")]
     FamilyLayout,
+    #[error(
+        "dynamic Boolean encoding multiplication requires preprocessing-supplied RHS decompositions"
+    )]
+    MissingRhsDecomposition,
 }
 
 impl BggPublicKeyFamily {
@@ -54,13 +60,14 @@ fn attach_public_key_signal_group<T: GraphValue>(value: T) -> Result<T, DslError
 }
 
 impl BggEncodingFamily {
-    pub fn pack(values: Vec<BggEncodingWire>) -> Result<Self, DynamicBooleanBggError> {
-        if values.iter().any(|value| !value.pubkey.reveal_plaintext || value.plaintext.is_none()) {
+    pub fn pack(
+        values: Vec<BggEncodingWire>,
+        public_keys: BggPublicKeyFamily,
+    ) -> Result<Self, DynamicBooleanBggError> {
+        if values.iter().any(|value| value.plaintext.is_none()) {
             return Err(DynamicBooleanBggError::PlaintextRequired);
         }
         let vectors = Family::pack(values.iter().map(|value| value.vector.clone()).collect())?;
-        let public_keys =
-            BggPublicKeyFamily::pack(values.iter().map(|value| value.pubkey.clone()).collect())?;
         let plaintexts = Family::pack(
             values.into_iter().map(|value| value.plaintext.expect("checked above")).collect(),
         )?;
@@ -106,10 +113,7 @@ impl BggEncodingFamily {
         let plaintexts = self.plaintexts.parallel_gather(indices)?;
         Ok(Self {
             vectors,
-            public_keys: BggPublicKeyFamily {
-                matrices: public_keys,
-                reveal_plaintext: self.public_keys.reveal_plaintext,
-            },
+            public_keys: BggPublicKeyFamily { matrices: public_keys, reveal_plaintext: true },
             plaintexts,
         })
     }
@@ -142,11 +146,13 @@ pub fn evaluate_boolean_encoding_layers(
     circuit: BooleanCircuitFamilyInputs,
     preceding: BggEncodingFamily,
     one: BggEncodingWire,
-    compiler: BggEncodingCompiler,
+    one_public_key: BggPublicKeyWire,
+    _compiler: BggEncodingCompiler,
+    public_key_compiler: BggPublicKeyCompiler,
 ) -> Result<BggEncodingFamily, DynamicBooleanBggError> {
     preceding.validate()?;
     let preceding = preceding.attach_operational_pairing()?;
-    if !one.pubkey.reveal_plaintext || one.plaintext.is_none() {
+    if one.plaintext.is_none() {
         return Err(DynamicBooleanBggError::PlaintextRequired);
     }
     let BooleanCircuitFamilyInputs {
@@ -174,18 +180,33 @@ pub fn evaluate_boolean_encoding_layers(
                 layer_metadata(context, params, &layer, gate_kinds, left_sources, right_sources)?;
             let left = scan_result(preceding.clone().gather(left_indices))?;
             let right = scan_result(preceding.gather(right_indices))?;
-            let one_family = scan_result(repeated_encoding(params, &one))?;
-            let zero =
-                scan_result(encoding_binary(&compiler, &one_family, &one_family, EncodingOp::Sub))?;
-            let not = scan_result(encoding_binary(&compiler, &one_family, &left, EncodingOp::Sub))?;
-            let product = scan_result(encoding_multiply(&compiler, &left, &right))?;
-            let sum = scan_result(encoding_binary(&compiler, &left, &right, EncodingOp::Add))?;
-            let two_product = scan_result(encoding_scalar(
-                &compiler,
-                &product,
-                compiler.public_key.ring.polynomial([2.into()]),
+            let one_family = scan_result(repeated_encoding(params, &one, &one_public_key))?;
+            let zero = scan_result(encoding_binary(
+                &public_key_compiler,
+                &one_family,
+                &one_family,
+                EncodingOp::Sub,
             ))?;
-            let xor = scan_result(encoding_binary(&compiler, &sum, &two_product, EncodingOp::Sub))?;
+            let not = scan_result(encoding_binary(
+                &public_key_compiler,
+                &one_family,
+                &left,
+                EncodingOp::Sub,
+            ))?;
+            let product = scan_result(encoding_multiply(&public_key_compiler, &left, &right))?;
+            let sum =
+                scan_result(encoding_binary(&public_key_compiler, &left, &right, EncodingOp::Add))?;
+            let two_product = scan_result(encoding_scalar(
+                &public_key_compiler,
+                &product,
+                public_key_compiler.ring.polynomial([2.into()]),
+            ))?;
+            let xor = scan_result(encoding_binary(
+                &public_key_compiler,
+                &sum,
+                &two_product,
+                EncodingOp::Sub,
+            ))?;
             let active = Parallel::range(params.max_layer_width.clone()).map_values(|slot| {
                 slot.as_int().less_equal(active_count.clone().sub(Int::constant(1))).to_int()
             })?;
@@ -198,14 +219,6 @@ pub fn evaluate_boolean_encoding_layers(
                 product.vectors.clone(),
                 xor.vectors.clone(),
             ])?;
-            let selected_public_keys = kinds.clone().parallel_select_mats(vec![
-                zero.public_keys.matrices.clone(),
-                one_family.public_keys.matrices.clone(),
-                left.public_keys.matrices.clone(),
-                not.public_keys.matrices.clone(),
-                product.public_keys.matrices.clone(),
-                xor.public_keys.matrices.clone(),
-            ])?;
             let selected_plaintexts = kinds.clone().parallel_select_mats(vec![
                 zero.plaintexts.clone(),
                 one_family.plaintexts.clone(),
@@ -214,16 +227,24 @@ pub fn evaluate_boolean_encoding_layers(
                 product.plaintexts.clone(),
                 xor.plaintexts.clone(),
             ])?;
+            let selected_public_keys = kinds.clone().parallel_select_mats(vec![
+                zero.public_keys.matrices.clone(),
+                one_family.public_keys.matrices.clone(),
+                left.public_keys.matrices.clone(),
+                not.public_keys.matrices.clone(),
+                product.public_keys.matrices.clone(),
+                xor.public_keys.matrices.clone(),
+            ])?;
             let output_vectors = active
                 .clone()
                 .parallel_select_mats(vec![zero.vectors.clone(), selected_vectors.clone()])?;
-            let output_public_keys = active.clone().parallel_select_mats(vec![
-                zero.public_keys.matrices.clone(),
-                selected_public_keys.clone(),
-            ])?;
             let output_plaintexts = active
                 .clone()
                 .parallel_select_mats(vec![zero.plaintexts.clone(), selected_plaintexts.clone()])?;
+            let output_public_keys = active.clone().parallel_select_mats(vec![
+                zero.public_keys.matrices.clone(),
+                selected_public_keys,
+            ])?;
             let output = BggEncodingFamily {
                 vectors: output_vectors,
                 public_keys: BggPublicKeyFamily {
@@ -311,14 +332,15 @@ fn layer_metadata(
 fn repeated_encoding(
     params: &BooleanCircuitFamilyParams,
     one: &BggEncodingWire,
+    one_public_key: &BggPublicKeyWire,
 ) -> Result<BggEncodingFamily, DynamicBooleanBggError> {
     let plaintext = one.plaintext.clone().ok_or(DynamicBooleanBggError::PlaintextRequired)?;
     let vectors =
         Parallel::range(params.max_layer_width.clone()).map_values(|_| one.vector.clone())?;
-    let public_keys = Parallel::range(params.max_layer_width.clone())
-        .map_values(|_| one.pubkey.matrix.clone())?;
     let plaintexts =
         Parallel::range(params.max_layer_width.clone()).map_values(|_| plaintext.clone())?;
+    let public_keys = Parallel::range(params.max_layer_width.clone())
+        .map_values(|_| one_public_key.matrix.clone())?;
     Ok(BggEncodingFamily {
         vectors,
         public_keys: BggPublicKeyFamily { matrices: public_keys, reveal_plaintext: true },
@@ -329,54 +351,10 @@ fn repeated_encoding(
 fn scan_result<T>(result: Result<T, DynamicBooleanBggError>) -> Result<T, DslError> {
     result.map_err(|error| match error {
         DynamicBooleanBggError::Dsl(error) => error,
-        DynamicBooleanBggError::PlaintextRequired | DynamicBooleanBggError::FamilyLayout => {
-            DslError::Schema
-        }
+        DynamicBooleanBggError::PlaintextRequired |
+        DynamicBooleanBggError::FamilyLayout |
+        DynamicBooleanBggError::MissingRhsDecomposition => DslError::Schema,
     })
-}
-
-#[derive(Clone, Copy)]
-enum KeyOp {
-    Add,
-    Sub,
-}
-
-fn key_binary(
-    compiler: &BggPublicKeyCompiler,
-    left: &BggPublicKeyFamily,
-    right: &BggPublicKeyFamily,
-    operation: KeyOp,
-) -> Result<BggPublicKeyFamily, DslError> {
-    let compiler = compiler.clone();
-    let matrices = mxx_dsl::parallel_zip_bundle_result(
-        (left.matrices.clone(), right.matrices.clone()),
-        move |_, (left_matrix, right_matrix)| {
-            let left = BggPublicKeyWire { matrix: left_matrix, reveal_plaintext: true };
-            let right = BggPublicKeyWire { matrix: right_matrix, reveal_plaintext: true };
-            let output = match operation {
-                KeyOp::Add => compiler.add(&left, &right),
-                KeyOp::Sub => compiler.sub(&left, &right),
-            }
-            .matrix;
-            Ok(output)
-        },
-    )?;
-    Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
-}
-
-fn key_scalar(
-    compiler: &BggPublicKeyCompiler,
-    input: &BggPublicKeyFamily,
-    scalar: Mat,
-) -> Result<BggPublicKeyFamily, DslError> {
-    let compiler = compiler.clone();
-    let matrices = input.matrices.clone().parallel_map_values(move |_, matrix| {
-        let output = compiler
-            .small_scalar_mul(&BggPublicKeyWire { matrix, reveal_plaintext: true }, &scalar)
-            .matrix;
-        output
-    })?;
-    Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
 }
 
 #[derive(Clone, Copy)]
@@ -386,7 +364,7 @@ enum EncodingOp {
 }
 
 fn encoding_binary(
-    compiler: &BggEncodingCompiler,
+    compiler: &BggPublicKeyCompiler,
     left: &BggEncodingFamily,
     right: &BggEncodingFamily,
     operation: EncodingOp,
@@ -409,12 +387,8 @@ fn encoding_binary(
                 (left.vectors.clone(), right.vectors.clone()),
                 |_, (left_value, right_value)| Ok(left_value + right_value),
             )?;
-            let public_keys = key_binary(
-                &compiler.public_key,
-                &left.public_keys,
-                &right.public_keys,
-                KeyOp::Add,
-            )?;
+            let public_keys =
+                key_binary(compiler, &left.public_keys, &right.public_keys, KeyOp::Add)?;
             (vectors, public_keys)
         }
         EncodingOp::Sub => {
@@ -422,12 +396,8 @@ fn encoding_binary(
                 (left.vectors.clone(), right.vectors.clone()),
                 |_, (left_value, right_value)| Ok(left_value - right_value),
             )?;
-            let public_keys = key_binary(
-                &compiler.public_key,
-                &left.public_keys,
-                &right.public_keys,
-                KeyOp::Sub,
-            )?;
+            let public_keys =
+                key_binary(compiler, &left.public_keys, &right.public_keys, KeyOp::Sub)?;
             (vectors, public_keys)
         }
     };
@@ -435,14 +405,14 @@ fn encoding_binary(
 }
 
 fn encoding_multiply(
-    compiler: &BggEncodingCompiler,
+    compiler: &BggPublicKeyCompiler,
     left: &BggEncodingFamily,
     right: &BggEncodingFamily,
 ) -> Result<BggEncodingFamily, DynamicBooleanBggError> {
     left.validate()?;
     right.validate()?;
-    let base = compiler.public_key.base.clone();
-    let digits = compiler.public_key.digit_count.clone();
+    let base = compiler.base.clone();
+    let digits = compiler.digit_count.clone();
     let decomposed_right = right
         .public_keys
         .matrices
@@ -460,10 +430,10 @@ fn encoding_multiply(
         (right.vectors.clone(), left.plaintexts.clone()),
         |_, (vector, plaintext)| Ok(vector * plaintext),
     )?;
-    let vectors = mxx_dsl::parallel_zip_bundle_result(
-        (first.clone(), second.clone()),
-        |_, (left_value, right_value)| Ok(left_value + right_value),
-    )?;
+    let vectors =
+        mxx_dsl::parallel_zip_bundle_result((first, second), |_, (left_value, right_value)| {
+            Ok(left_value + right_value)
+        })?;
     let plaintexts = mxx_dsl::parallel_zip_bundle_result(
         (left.plaintexts.clone(), right.plaintexts.clone()),
         |_, (left_value, right_value)| Ok(left_value * right_value),
@@ -475,13 +445,40 @@ fn encoding_multiply(
     })
 }
 
+#[derive(Clone, Copy)]
+enum KeyOp {
+    Add,
+    Sub,
+}
+
+fn key_binary(
+    compiler: &BggPublicKeyCompiler,
+    left: &BggPublicKeyFamily,
+    right: &BggPublicKeyFamily,
+    operation: KeyOp,
+) -> Result<BggPublicKeyFamily, DslError> {
+    let matrices = mxx_dsl::parallel_zip_bundle_result(
+        (left.matrices.clone(), right.matrices.clone()),
+        |_, (left_matrix, right_matrix)| {
+            let left = BggPublicKeyWire { matrix: left_matrix, reveal_plaintext: true };
+            let right = BggPublicKeyWire { matrix: right_matrix, reveal_plaintext: true };
+            Ok(match operation {
+                KeyOp::Add => compiler.add(&left, &right),
+                KeyOp::Sub => compiler.sub(&left, &right),
+            }
+            .matrix)
+        },
+    )?;
+    Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
+}
+
 fn encoding_scalar(
-    compiler: &BggEncodingCompiler,
+    compiler: &BggPublicKeyCompiler,
     input: &BggEncodingFamily,
     scalar: Mat,
 ) -> Result<BggEncodingFamily, DynamicBooleanBggError> {
     input.validate()?;
-    let public_keys = key_scalar(&compiler.public_key, &input.public_keys, scalar.clone())?;
+    let public_keys = key_scalar(compiler, &input.public_keys, scalar.clone())?;
     let vectors = input.vectors.clone().parallel_map_values({
         let scalar = scalar.clone();
         move |_, value| value * scalar
@@ -489,6 +486,19 @@ fn encoding_scalar(
     let plaintexts =
         input.plaintexts.clone().parallel_map_values(move |_, value| value * scalar)?;
     Ok(BggEncodingFamily { vectors, public_keys, plaintexts })
+}
+
+fn key_scalar(
+    compiler: &BggPublicKeyCompiler,
+    input: &BggPublicKeyFamily,
+    scalar: Mat,
+) -> Result<BggPublicKeyFamily, DslError> {
+    let matrices = input.matrices.clone().parallel_map_values(move |_, matrix| {
+        compiler
+            .small_scalar_mul(&BggPublicKeyWire { matrix, reveal_plaintext: true }, &scalar)
+            .matrix
+    })?;
+    Ok(BggPublicKeyFamily { matrices, reveal_plaintext: true })
 }
 
 #[cfg(test)]
@@ -539,7 +549,6 @@ mod tests {
             BooleanCircuitFamilyInputs::protocol_inputs(&encoding_context, &encoding_params);
         let one_encoding = BggEncodingWire {
             vector: ring.input("one-vector", (1, 4)),
-            pubkey: one_key.clone(),
             plaintext: Some(ring.input("one-plaintext", (1, 1))),
         };
         let encoding_inputs = BggEncodingFamily {
@@ -562,15 +571,18 @@ mod tests {
                 (1, 1),
             ),
         };
-        let encoding_output = evaluate_boolean_encoding_layers(
+        let encoding_result = evaluate_boolean_encoding_layers(
             &encoding_context,
             &encoding_params,
             encoding_circuit,
             encoding_inputs,
             one_encoding,
-            BggEncodingCompiler { public_key },
+            one_key,
+            BggEncodingCompiler,
+            public_key,
         )
         .unwrap();
+        let encoding_output = encoding_result;
         let encoding_graph = encoding_context
             .family_output("vector", encoding_output.vectors)
             .unwrap()

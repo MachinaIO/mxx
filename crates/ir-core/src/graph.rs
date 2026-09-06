@@ -49,6 +49,22 @@ static NEXT_CONSTRUCTION_SCOPE: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static CONSTRUCTION_SCOPES: RefCell<Vec<ConstructionScopeId>> =
         const { RefCell::new(Vec::new()) };
+    static CONSTRUCTION_BENCHMARK_ROLE: RefCell<Option<BenchmarkRole>> =
+        const { RefCell::new(None) };
+}
+
+/// Explicit producer-owned role for benchmark accounting.
+///
+/// These tags are construction metadata only: they do not affect graph
+/// execution or canonical graph identities. A producer applies a tag around
+/// the exact operation it wants accounted, and the estimator carries it to
+/// the corresponding cost report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum BenchmarkRole {
+    PublicPrfAccumulation,
+    PublicReadout,
+    EncodingPrfAccumulation,
+    EncodingReadout,
 }
 
 /// Process-local scope marker used only while sealing closure bodies.
@@ -88,6 +104,22 @@ pub fn with_new_construction_scope<T>(f: impl FnOnce(ConstructionScopeId) -> T) 
     output
 }
 
+/// Constructs graph nodes under one explicit benchmark-accounting role.
+pub fn with_benchmark_role<T>(role: BenchmarkRole, f: impl FnOnce() -> T) -> T {
+    struct RestoreRole(Option<BenchmarkRole>);
+    impl Drop for RestoreRole {
+        fn drop(&mut self) {
+            CONSTRUCTION_BENCHMARK_ROLE.with(|current| {
+                *current.borrow_mut() = self.0.take();
+            });
+        }
+    }
+
+    let previous = CONSTRUCTION_BENCHMARK_ROLE.with(|current| current.replace(Some(role)));
+    let _restore = RestoreRole(previous);
+    f()
+}
+
 #[derive(Clone)]
 pub struct NodeHandle(Arc<GraphNode>);
 
@@ -119,6 +151,7 @@ impl NodeHandle {
             source_location,
             construction_scope: scope,
             child,
+            benchmark_role: CONSTRUCTION_BENCHMARK_ROLE.with(|current| *current.borrow()),
         }))
     }
 
@@ -209,6 +242,10 @@ impl NodeHandle {
 
     fn child(&self) -> Option<&StructuralChild> {
         self.0.child.as_ref()
+    }
+
+    pub fn benchmark_role(&self) -> Option<BenchmarkRole> {
+        self.0.benchmark_role
     }
 }
 
@@ -494,6 +531,7 @@ struct GraphNode {
     source_location: Option<SourceLocation>,
     construction_scope: ConstructionScopeId,
     child: Option<StructuralChild>,
+    benchmark_role: Option<BenchmarkRole>,
 }
 
 #[derive(Clone)]

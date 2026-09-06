@@ -25,7 +25,7 @@ where
         let mut chunk_outputs = (0..chunk_len)
             .into_par_iter()
             .map(|offset| {
-                let local_params = params.params_for_device(chunk_device_ids[offset]);
+                let local_params = params.params_for_device(chunk_device_ids[offset], None);
                 f(chunk_start + offset, &local_params)
             })
             .collect::<Vec<_>>();
@@ -69,7 +69,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         gpu_device_sync();
 
-        let cpu_params = DCRTPolyParams::new(4, 6, 18, BASE_BITS, None);
+        let cpu_params = DCRTPolyParams::new(4, 6, 18, BASE_BITS, None, None);
         let (moduli, _, _) = cpu_params.to_crt();
         let gpu_ids = detected_gpu_device_ids();
         assert!(
@@ -82,6 +82,7 @@ mod tests {
             cpu_params.base_bits(),
             gpu_ids.clone(),
             Some(gpu_ids.len() as u32),
+            None,
             None,
         );
         let window = CrtWindow::new(0, 2, cpu_params.to_crt().2);
@@ -107,7 +108,8 @@ mod tests {
             for (p_idx, (actual_slots, expected_slots)) in
                 actual_bytes.into_iter().zip(expected.into_iter()).enumerate()
             {
-                let local_params = gpu_params.params_for_device(gpu_ids[p_idx % gpu_ids.len()]);
+                let local_params =
+                    gpu_params.params_for_device(gpu_ids[p_idx % gpu_ids.len()], None);
                 assert_eq!(actual_slots.len(), expected_slots.len());
                 for (actual_bytes, expected_value) in actual_slots.into_iter().zip(expected_slots) {
                     let actual_poly = GpuDCRTPoly::from_compact_bytes(&local_params, &actual_bytes);

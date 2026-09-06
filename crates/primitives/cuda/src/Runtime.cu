@@ -25,8 +25,10 @@ struct PinnedHostReclaimer
     };
 
     PinnedHostReclaimer()
-        : worker(&PinnedHostReclaimer::run, this)
     {
+        // Start only after every member (including worker-visible flags) has
+        // completed initialization, irrespective of declaration order.
+        worker = std::thread(&PinnedHostReclaimer::run, this);
     }
 
     ~PinnedHostReclaimer()
@@ -229,16 +231,16 @@ namespace
         delete events;
     }
 
-    int fence_release_streams(const GpuContext *ctx)
+    int fence_release_streams(const GpuExecutionOwner *owner)
     {
-        if (!ctx)
+        if (!owner)
         {
             return set_error("invalid GPU context");
         }
-        for (size_t partition = 0; partition < ctx->release_streams_by_partition.size(); ++partition)
+        for (size_t partition = 0; partition < owner->release_streams_by_partition.size(); ++partition)
         {
-            const int device = ctx->gpu_ids[partition];
-            cudaStream_t stream = ctx->release_streams_by_partition[partition];
+            const int device = owner->gpu_ids[partition];
+            cudaStream_t stream = owner->release_streams_by_partition[partition];
             if (!stream)
             {
                 continue;
@@ -248,11 +250,19 @@ namespace
             {
                 return set_error(cudaGetErrorString(err));
             }
-            cudaEvent_t epoch = ctx->release_fence_events_by_partition[partition];
-            err = cudaEventRecord(epoch, stream);
+            cudaEvent_t epoch = nullptr;
+            err = cudaEventCreateWithFlags(&epoch, cudaEventDisableTiming);
+            if (err == cudaSuccess)
+            {
+                err = cudaEventRecord(epoch, stream);
+            }
             if (err == cudaSuccess)
             {
                 err = cudaEventSynchronize(epoch);
+            }
+            if (epoch)
+            {
+                cudaEventDestroy(epoch);
             }
             if (err != cudaSuccess)
             {
@@ -262,13 +272,13 @@ namespace
         return 0;
     }
 
-    int wait_pinned_host_reclaimer(const GpuContext *ctx)
+    int wait_pinned_host_reclaimer(const GpuExecutionOwner *owner)
     {
-        if (!ctx || !ctx->pinned_host_reclaimer)
+        if (!owner || !owner->pinned_host_reclaimer)
         {
             return 0;
         }
-        PinnedHostReclaimer *reclaimer = ctx->pinned_host_reclaimer;
+        PinnedHostReclaimer *reclaimer = owner->pinned_host_reclaimer;
         const int status = reclaimer->wait_idle();
         if (status != 0)
         {
@@ -278,57 +288,51 @@ namespace
         return 0;
     }
 
-    int shutdown_pinned_host_reclaimer(GpuContext *ctx)
+    int shutdown_pinned_host_reclaimer(GpuExecutionOwner *owner)
     {
-        if (!ctx || !ctx->pinned_host_reclaimer)
+        if (!owner || !owner->pinned_host_reclaimer)
         {
             return 0;
         }
-        PinnedHostReclaimer *reclaimer = ctx->pinned_host_reclaimer;
+        PinnedHostReclaimer *reclaimer = owner->pinned_host_reclaimer;
         reclaimer->shutdown();
         const int status = reclaimer->wait_idle();
         if (status != 0)
         {
             const std::string message = reclaimer->failure_message();
             delete reclaimer;
-            ctx->pinned_host_reclaimer = nullptr;
+            owner->pinned_host_reclaimer = nullptr;
             return set_error(message.c_str());
         }
         delete reclaimer;
-        ctx->pinned_host_reclaimer = nullptr;
+        owner->pinned_host_reclaimer = nullptr;
         return 0;
     }
 
-    void destroy_context_streams(GpuContext *ctx)
+    void destroy_context_streams(GpuExecutionOwner *owner)
     {
-        if (!ctx)
+        if (!owner)
         {
             return;
         }
-        const int stream_status = fence_release_streams(ctx);
-        const int reclaimer_status = shutdown_pinned_host_reclaimer(ctx);
+        const int stream_status = fence_release_streams(owner);
+        const int reclaimer_status = shutdown_pinned_host_reclaimer(owner);
         if (stream_status != 0 || reclaimer_status != 0)
         {
             set_error("GPU context release cleanup failed");
         }
-        for (size_t partition = 0; partition < ctx->gpu_ids.size(); ++partition)
+        for (size_t partition = 0; partition < owner->gpu_ids.size(); ++partition)
         {
-            cudaSetDevice(ctx->gpu_ids[partition]);
-            if (partition < ctx->release_streams_by_partition.size() &&
-                ctx->release_streams_by_partition[partition])
+            cudaSetDevice(owner->gpu_ids[partition]);
+            if (partition < owner->release_streams_by_partition.size() &&
+                owner->release_streams_by_partition[partition])
             {
-                cudaStreamDestroy(ctx->release_streams_by_partition[partition]);
-                ctx->release_streams_by_partition[partition] = nullptr;
+                cudaStreamDestroy(owner->release_streams_by_partition[partition]);
+                owner->release_streams_by_partition[partition] = nullptr;
             }
-            if (partition < ctx->release_fence_events_by_partition.size() &&
-                ctx->release_fence_events_by_partition[partition])
+            if (partition < owner->compute_streams_by_partition.size())
             {
-                cudaEventDestroy(ctx->release_fence_events_by_partition[partition]);
-                ctx->release_fence_events_by_partition[partition] = nullptr;
-            }
-            if (partition < ctx->compute_streams_by_partition.size())
-            {
-                for (cudaStream_t &stream : ctx->compute_streams_by_partition[partition])
+                for (cudaStream_t &stream : owner->compute_streams_by_partition[partition])
                 {
                     if (stream)
                     {
@@ -338,9 +342,8 @@ namespace
                 }
             }
         }
-        ctx->release_streams_by_partition.clear();
-        ctx->release_fence_events_by_partition.clear();
-        ctx->compute_streams_by_partition.clear();
+        owner->release_streams_by_partition.clear();
+        owner->compute_streams_by_partition.clear();
     }
 
     bool mod_inverse_u64(uint64_t a, uint64_t modulus, uint64_t &out_inv)
@@ -744,7 +747,7 @@ namespace
         return out;
     }
 
-    void free_ntt_device_constants_entry(GpuNttDeviceConstants &entry)
+    void free_ntt_device_constants_entry(GpuNttDeviceConstants &entry, cudaStream_t release = nullptr)
     {
         if (entry.device < 0)
         {
@@ -754,13 +757,20 @@ namespace
         {
             return;
         }
-        if (entry.twiddle_forward) cudaFree(entry.twiddle_forward);
-        if (entry.twiddle_inverse) cudaFree(entry.twiddle_inverse);
-        if (entry.twiddle_shoup_forward) cudaFree(entry.twiddle_shoup_forward);
-        if (entry.twiddle_shoup_inverse) cudaFree(entry.twiddle_shoup_inverse);
-        if (entry.moduli) cudaFree(entry.moduli);
-        if (entry.n_inv) cudaFree(entry.n_inv);
-        if (entry.n_inv_shoup) cudaFree(entry.n_inv_shoup);
+        void *pointers[] = {entry.twiddle_forward, entry.twiddle_inverse,
+            entry.twiddle_shoup_forward, entry.twiddle_shoup_inverse,
+            entry.moduli, entry.n_inv, entry.n_inv_shoup};
+        for (void *pointer : pointers)
+        {
+            if (pointer)
+            {
+                const cudaError_t status = release ? cudaFreeAsync(pointer, release) : cudaFree(pointer);
+                if (status != cudaSuccess)
+                {
+                    set_error(cudaGetErrorString(status));
+                }
+            }
+        }
         entry.twiddle_forward = nullptr;
         entry.twiddle_inverse = nullptr;
         entry.twiddle_shoup_forward = nullptr;
@@ -770,11 +780,23 @@ namespace
         entry.n_inv_shoup = nullptr;
     }
 
-    void free_ntt_device_constants(std::vector<GpuNttDeviceConstants> &entries)
+    void free_ntt_device_constants(std::vector<GpuNttDeviceConstants> &entries,
+        const GpuExecutionOwner *owner = nullptr)
     {
         for (auto &entry : entries)
         {
-            free_ntt_device_constants_entry(entry);
+            cudaStream_t release = nullptr;
+            if (owner)
+            {
+                auto found = std::find(owner->gpu_ids.begin(), owner->gpu_ids.end(), entry.device);
+                if (found == owner->gpu_ids.end())
+                {
+                    set_error("ring constant device is outside its execution owner");
+                    continue;
+                }
+                release = owner->release_streams_by_partition[found - owner->gpu_ids.begin()];
+            }
+            free_ntt_device_constants_entry(entry, release);
         }
         entries.clear();
     }
@@ -890,6 +912,18 @@ namespace
     }
 }
 
+GpuExecutionOwner::~GpuExecutionOwner()
+{
+    destroy_context_streams(this);
+    if (registered)
+    {
+        for (int device : gpu_ids)
+        {
+            live_context_counts[static_cast<size_t>(device)].fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+}
+
 extern "C" int gpu_set_last_error(const char *msg)
 {
     return set_error(msg);
@@ -907,6 +941,7 @@ extern "C"
         size_t gpu_ids_len,
         size_t stream_pool_size,
         uint32_t vram_percent,
+        const GpuContext *related_context,
         GpuContext **out_ctx)
     {
         GpuContext *gpu_ctx = nullptr;
@@ -945,6 +980,12 @@ extern "C"
             }
 
             validate_gpu_list(gpu_list);
+            if (related_context &&
+                (!related_context->execution || related_context->gpu_ids != gpu_list ||
+                 related_context->execution->vram_percent != vram_percent))
+            {
+                return set_error("related GPU rings must share device placement and VRAM policy");
+            }
             const size_t vram_budget_bytes =
                 minimum_device_memory_budget_bytes(gpu_list, vram_percent);
             configure_default_mempool_release_threshold(gpu_list);
@@ -1029,7 +1070,26 @@ extern "C"
             }
 
             gpu_ctx = new GpuContext();
-            gpu_ctx->pinned_host_reclaimer = new PinnedHostReclaimer();
+            gpu_ctx->execution = related_context ? related_context->execution :
+                std::make_shared<GpuExecutionOwner>();
+            if (!related_context)
+            {
+                static std::atomic<uint64_t> next_identity{1};
+                uint64_t identity = next_identity.load(std::memory_order_relaxed);
+                do
+                {
+                    if (identity == std::numeric_limits<uint64_t>::max())
+                    {
+                        throw std::runtime_error("GPU execution identity space exhausted");
+                    }
+                } while (!next_identity.compare_exchange_weak(identity, identity + 1,
+                    std::memory_order_relaxed));
+                gpu_ctx->execution->identity = identity;
+                gpu_ctx->execution->gpu_ids = gpu_list;
+                gpu_ctx->execution->vram_budget_bytes = vram_budget_bytes;
+                gpu_ctx->execution->vram_percent = vram_percent;
+                gpu_ctx->execution->pinned_host_reclaimer = new PinnedHostReclaimer();
+            }
             gpu_ctx->moduli = std::move(moduli_vec);
             gpu_ctx->ntt_n_inv_by_prime = std::move(n_inv_by_prime);
             gpu_ctx->ntt_root_by_prime = std::move(root_by_prime);
@@ -1039,16 +1099,17 @@ extern "C"
             gpu_ctx->gpu_ids = std::move(gpu_list);
             gpu_ctx->dnum = resolved_dnum;
             gpu_ctx->max_aux_limbs = GPU_RUNTIME_MAX_LIMBS;
-            gpu_ctx->vram_budget_bytes = vram_budget_bytes;
+            gpu_ctx->vram_budget_bytes = gpu_ctx->execution->vram_budget_bytes;
             gpu_ctx->garner_inverse_table = std::move(inverse_table);
             gpu_ctx->limb_gpu_ids = std::move(limb_gpu_ids);
             gpu_ctx->limb_prime_ids = std::move(limb_prime_ids);
             gpu_ctx->limb_types = std::move(limb_types);
             gpu_ctx->limb_coeff_bytes = std::move(limb_coeff_bytes);
             gpu_ctx->decomp_counts_by_partition = std::move(decomp_counts_by_partition);
-            gpu_ctx->compute_streams_by_partition.resize(gpu_ctx->gpu_ids.size());
-            gpu_ctx->release_streams_by_partition.resize(gpu_ctx->gpu_ids.size(), nullptr);
-            gpu_ctx->release_fence_events_by_partition.resize(gpu_ctx->gpu_ids.size(), nullptr);
+            if (!related_context)
+            {
+            gpu_ctx->execution->compute_streams_by_partition.resize(gpu_ctx->gpu_ids.size());
+            gpu_ctx->execution->release_streams_by_partition.resize(gpu_ctx->gpu_ids.size(), nullptr);
             for (size_t partition = 0; partition < gpu_ctx->gpu_ids.size(); ++partition)
             {
                 const int device = gpu_ctx->gpu_ids[partition];
@@ -1057,14 +1118,7 @@ extern "C"
                 {
                     throw std::runtime_error(cudaGetErrorString(err));
                 }
-                err = cudaEventCreateWithFlags(
-                    &gpu_ctx->release_fence_events_by_partition[partition],
-                    cudaEventDisableTiming);
-                if (err != cudaSuccess)
-                {
-                    throw std::runtime_error(cudaGetErrorString(err));
-                }
-                auto &streams = gpu_ctx->compute_streams_by_partition[partition];
+                auto &streams = gpu_ctx->execution->compute_streams_by_partition[partition];
                 streams.resize(stream_pool_size, nullptr);
                 for (cudaStream_t &stream : streams)
                 {
@@ -1075,12 +1129,13 @@ extern "C"
                     }
                 }
                 err = cudaStreamCreateWithFlags(
-                    &gpu_ctx->release_streams_by_partition[partition],
+                    &gpu_ctx->execution->release_streams_by_partition[partition],
                     cudaStreamNonBlocking);
                 if (err != cudaSuccess)
                 {
                     throw std::runtime_error(cudaGetErrorString(err));
                 }
+            }
             }
             gpu_ctx->ntt_device_constants.reserve(gpu_ctx->gpu_ids.size());
             for (int device : gpu_ctx->gpu_ids)
@@ -1114,12 +1169,18 @@ extern "C"
             }
             for (int device : gpu_ctx->gpu_ids)
             {
-                live_context_counts[static_cast<size_t>(device)].fetch_add(
-                    1,
-                    std::memory_order_relaxed);
+                if (!related_context)
+                {
+                    live_context_counts[static_cast<size_t>(device)].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 context_generations[static_cast<size_t>(device)].fetch_add(
                     1,
                     std::memory_order_release);
+            }
+            if (!related_context)
+            {
+                gpu_ctx->execution->registered = true;
             }
             *out_ctx = gpu_ctx;
             return 0;
@@ -1128,7 +1189,6 @@ extern "C"
         {
             if (gpu_ctx)
             {
-                destroy_context_streams(gpu_ctx);
                 free_ntt_device_constants(gpu_ctx->ntt_device_constants);
                 delete gpu_ctx;
             }
@@ -1138,7 +1198,6 @@ extern "C"
         {
             if (gpu_ctx)
             {
-                destroy_context_streams(gpu_ctx);
                 free_ntt_device_constants(gpu_ctx->ntt_device_constants);
                 delete gpu_ctx;
             }
@@ -1153,18 +1212,19 @@ extern "C"
             return;
         }
         const std::vector<int> gpu_ids = ctx->gpu_ids;
-        destroy_context_streams(ctx);
-        free_ntt_device_constants(ctx->ntt_device_constants);
+        free_ntt_device_constants(ctx->ntt_device_constants, ctx->execution.get());
         delete ctx;
         for (int device : gpu_ids)
         {
-            live_context_counts[static_cast<size_t>(device)].fetch_sub(
-                1,
-                std::memory_order_relaxed);
             context_generations[static_cast<size_t>(device)].fetch_add(
                 1,
                 std::memory_order_release);
         }
+    }
+
+    uint64_t gpu_context_execution_identity(const GpuContext *ctx)
+    {
+        return ctx ? ctx->execution->identity : 0;
     }
 
     int gpu_context_fence_releases(const GpuContext *ctx)
@@ -1173,8 +1233,8 @@ extern "C"
         {
             return set_error("invalid gpu_context_fence_releases arguments");
         }
-        const int stream_status = fence_release_streams(ctx);
-        const int reclaimer_status = wait_pinned_host_reclaimer(ctx);
+        const int stream_status = fence_release_streams(ctx->execution.get());
+        const int reclaimer_status = wait_pinned_host_reclaimer(ctx->execution.get());
         if (stream_status != 0)
         {
             return stream_status;
@@ -1189,7 +1249,7 @@ extern "C"
         void *const *ptrs,
         size_t count)
     {
-        if (!ctx || !ctx->pinned_host_reclaimer || device < 0 ||
+        if (!ctx || !ctx->execution->pinned_host_reclaimer || device < 0 ||
             (count != 0 && !ptrs))
         {
             return set_error("invalid gpu_defer_pinned_frees arguments");
@@ -1213,7 +1273,7 @@ extern "C"
         }
         catch (const std::exception &error)
         {
-            ctx->pinned_host_reclaimer->record_uncertain(error.what());
+            ctx->execution->pinned_host_reclaimer->record_uncertain(error.what());
             return set_error(error);
         }
         if (pointers.empty())
@@ -1240,12 +1300,12 @@ extern "C"
                 // destroying an event that could still be in flight.
                 completion = nullptr;
             }
-            ctx->pinned_host_reclaimer->record_uncertain(cudaGetErrorString(error));
+            ctx->execution->pinned_host_reclaimer->record_uncertain(cudaGetErrorString(error));
             return set_error(cudaGetErrorString(error));
         }
 
         const int enqueue_status =
-            ctx->pinned_host_reclaimer->enqueue(device, completion, std::move(pointers));
+            ctx->execution->pinned_host_reclaimer->enqueue(device, completion, std::move(pointers));
         if (enqueue_status != 0)
         {
             // Enqueue retains ownership on success. On failure, the event and

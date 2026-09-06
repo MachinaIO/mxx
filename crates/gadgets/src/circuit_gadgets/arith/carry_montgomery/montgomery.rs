@@ -1052,7 +1052,7 @@ mod tests {
     const LIMB_BIT_SIZE: usize = 3;
 
     fn test_parameters() -> DCRTPolyParams {
-        DCRTPolyParams::new(4, 3, 12, 6, None)
+        DCRTPolyParams::new(4, 3, 12, 6, None, None)
     }
 
     fn execute_polys(

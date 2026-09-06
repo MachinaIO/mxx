@@ -294,8 +294,8 @@ namespace
             cudaSetDevice(device);
 
             cudaStream_t free_stream =
-                partition_idx < mat->ctx->release_streams_by_partition.size()
-                    ? mat->ctx->release_streams_by_partition[partition_idx]
+                partition_idx < mat->ctx->execution->release_streams_by_partition.size()
+                    ? mat->ctx->execution->release_streams_by_partition[partition_idx]
                     : nullptr;
 
             if (free_stream)
@@ -501,7 +501,7 @@ extern "C" int gpu_matrix_create(
             state.stream = nullptr;
             state.write_done = nullptr;
             state.write_done_valid = false;
-            auto &stream_pool = ctx->compute_streams_by_partition[partition_idx];
+            auto &stream_pool = ctx->execution->compute_streams_by_partition[partition_idx];
             if (stream_pool.empty())
             {
                 destroy_matrix_contents(mat);
@@ -509,7 +509,7 @@ extern "C" int gpu_matrix_create(
                 return set_error("empty compute stream pool in gpu_matrix_create");
             }
             const size_t stream_slot =
-                ctx->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
+                ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
                 stream_pool.size();
             state.stream = stream_pool[stream_slot];
             err = cudaEventCreateWithFlags(&state.write_done, cudaEventDisableTiming);
@@ -899,8 +899,8 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
         if (peer_copy_done) cudaEventDestroy(peer_copy_done);
         return set_error(error);
     }
-    if (src->ctx->release_streams_by_partition.empty() ||
-        !src->ctx->release_streams_by_partition[0])
+    if (src->ctx->execution->release_streams_by_partition.empty() ||
+        !src->ctx->execution->release_streams_by_partition[0])
     {
         cudaEventDestroy(peer_copy_done);
         return set_error("missing source release stream in gpu_matrix_copy_peer");
@@ -909,7 +909,7 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     if (error == cudaSuccess)
     {
         error = cudaStreamWaitEvent(
-            src->ctx->release_streams_by_partition[0], peer_copy_done, 0);
+            src->ctx->execution->release_streams_by_partition[0], peer_copy_done, 0);
     }
     if (error != cudaSuccess)
     {

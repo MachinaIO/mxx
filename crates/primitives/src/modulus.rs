@@ -79,8 +79,8 @@ mod tests {
 
     #[test]
     fn centered_representatives_are_preserved() {
-        let source = DCRTPolyParams::new(8, 1, 20, 4, None);
-        let target = DCRTPolyParams::new(8, 2, 20, 4, None);
+        let source = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let target = DCRTPolyParams::new(8, 2, 20, 4, None, None);
         let source_modulus: Arc<BigUint> = source.modulus().into();
         let target_modulus: Arc<BigUint> = target.modulus().into();
         assert!(target_modulus > source_modulus);

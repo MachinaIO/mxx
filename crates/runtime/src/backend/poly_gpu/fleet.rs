@@ -17,7 +17,7 @@ use mxx_ir_core::{
 };
 use mxx_primitives::{
     matrix::{
-        PolyMatrix, PolyMatrixSmallRhs, SmallPolyMatrix,
+        PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallPolyMatrix,
         gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
     },
     poly::{
@@ -78,6 +78,13 @@ fn copy_packed_bits(
             destination[(destination_bit + bit) / 8] |= 1 << ((destination_bit + bit) % 8);
         }
     }
+}
+
+fn preimage_seed_column_start(
+    source_global_column_start: usize,
+    wave_local_start: usize,
+) -> Result<usize, PolyBackendError> {
+    source_global_column_start.checked_add(wave_local_start).ok_or(PolyBackendError::InvalidInteger)
 }
 
 fn fleet_column_ranges(
@@ -279,6 +286,63 @@ impl From<GpuDCRTPolyMatrix> for GpuFleetMatrix {
 }
 
 #[derive(Clone, Debug)]
+struct FleetStagedColumnSource {
+    params: GpuDCRTPolyParams,
+    rows: usize,
+    columns: usize,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl PolyMatrixColumnSource<GpuFleetMatrix> for FleetStagedColumnSource {
+    fn row_size(&self) -> usize {
+        self.rows
+    }
+
+    fn col_size(&self) -> usize {
+        self.columns
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> GpuFleetMatrix {
+        assert!(start <= end && end <= self.columns, "invalid fleet staging column interval");
+        GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::from_cpu_staging_columns(
+            &self.params,
+            self.bytes.as_slice(),
+            start,
+            end,
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OffsetGpuColumnSource {
+    value: GpuDCRTPolyMatrix,
+    global_column_start: usize,
+}
+
+impl PolyMatrixColumnSource<GpuDCRTPolyMatrix> for OffsetGpuColumnSource {
+    fn resident_matrix(&self) -> Option<&GpuDCRTPolyMatrix> {
+        Some(&self.value)
+    }
+
+    fn row_size(&self) -> usize {
+        self.value.row_size()
+    }
+
+    fn col_size(&self) -> usize {
+        self.value.col_size()
+    }
+
+    fn global_column_start(&self) -> usize {
+        self.global_column_start
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> GpuDCRTPolyMatrix {
+        assert!(start <= end && end <= self.value.col_size(), "invalid GPU column interval");
+        self.value.slice_columns(start, end)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct GpuFleetSmallMatrix {
     rows: usize,
     columns: usize,
@@ -444,6 +508,11 @@ impl GpuDcrtBackend {
         self.vram_percent
     }
 
+    /// Concrete resident CRT tower count for an exactly registered ring.
+    pub fn ring_crt_depth(&self, matrix: &ConcreteMatrixType) -> Result<usize, PolyBackendError> {
+        Ok(self.devices[0].1.parameters(matrix)?.crt_depth())
+    }
+
     /// Builds a local representative of a regular gadget's global column range.
     ///
     /// This is used by the estimator's single-device worker. Validation is
@@ -484,6 +553,7 @@ impl GpuDcrtBackend {
             false,
             global_column_start,
             local_columns,
+            Some(digit_count),
         )))
     }
 
@@ -883,6 +953,7 @@ impl GpuDcrtBackend {
             }
             let local =
                 shard.value.slice_columns(overlap_start - shard_start, overlap_end - shard_start);
+            // Transfer only the requested overlap through device/peer transport.
             pieces.push(backend.matrix_to_active_placement_peer_only(&local)?);
         }
         let mut pieces = pieces.into_iter();
@@ -929,49 +1000,6 @@ impl GpuDcrtBackend {
         Ok(replica)
     }
 
-    fn same_layout(left: &GpuFleetMatrix, right: &GpuFleetMatrix) -> bool {
-        left.size() == right.size() &&
-            left.shards.len() == right.shards.len() &&
-            left.shards.iter().zip(&right.shards).all(|(left, right)| {
-                left.device_id == right.device_id &&
-                    left.global_column_start == right.global_column_start &&
-                    left.value.col_size() == right.value.col_size()
-            })
-    }
-
-    fn matrix_has_current_layout(&self, value: &GpuFleetMatrix) -> bool {
-        let ranges = self.column_ranges(value.columns);
-        ranges.len() == value.shards.len() &&
-            ranges.iter().zip(&value.shards).all(|((device, start, end), shard)| {
-                self.devices[*device].0 == shard.device_id &&
-                    *start == shard.global_column_start &&
-                    end - start == shard.value.col_size()
-            })
-    }
-
-    fn repartition_matrix(
-        &mut self,
-        value: &GpuFleetMatrix,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        let ranges = self.column_ranges(value.columns);
-        let mut shards = Vec::with_capacity(ranges.len());
-        for wave in ranges.chunks(self.devices.len()) {
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(Self::matrix_piece_on_device(backend, value, start, end).map(|value| {
-                        GpuColumnShard { device_id: *device_id, global_column_start: start, value }
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            shards.extend(launched);
-        }
-        Ok(GpuFleetMatrix::new(value.rows, value.columns, shards))
-    }
-
     fn gather_matrix(
         &mut self,
         value: &GpuFleetMatrix,
@@ -991,8 +1019,16 @@ impl GpuDcrtBackend {
 
     fn scatter_matrix(
         &mut self,
-        value: &GpuDCRTPolyMatrix,
+        value: GpuDCRTPolyMatrix,
     ) -> Result<GpuFleetMatrix, PolyBackendError> {
+        if !self
+            .active_operation
+            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
+        {
+            // Materialization outside a calibrated operation retains its real
+            // owner. Consumers derive their own operation-specific partition.
+            return Ok(GpuFleetMatrix::from_matrix(value));
+        }
         let (rows, columns) = value.size();
         let ranges = self.column_ranges(columns);
         let mut shards = Vec::with_capacity(ranges.len());
@@ -1235,14 +1271,43 @@ mod tests {
         assert!(backend.column_widths(operation).is_some());
     }
 
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_polynomial_input_without_selected_operation() {
+        let devices = detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 1,
+            columns: 1,
+        };
+        let mut backend = super::super::gpu_backend_on([parameters], devices.clone());
+        let value = ConstantMatrix::Polynomial {
+            coefficients: (0..32)
+                .map(|_| IntExpr::constant(BigInt::from(rand::random::<i16>())))
+                .collect(),
+        };
+        let actual = backend.constant_matrix(&ty, &value, &ParamEnv::default()).unwrap();
+        assert!(backend.active_operation.is_none());
+        assert!(backend.operation_widths.is_empty());
+        assert_eq!(actual.size(), (1, 1));
+        assert_eq!(actual.shards().len(), 1);
+        assert_eq!(actual.shards()[0].device_id, devices[0]);
+        let expected =
+            backend.devices[0].1.constant_matrix(&ty, &value, &ParamEnv::default()).unwrap();
+        assert_eq!(actual.shards()[0].value, expected);
+    }
+
     fn first_bidirectional_peer_pair(
         detected: &[i32],
         parameters: &GpuDCRTPolyParams,
     ) -> Option<[i32; 2]> {
         for (index, &left_device) in detected.iter().enumerate() {
             for &right_device in &detected[index + 1..] {
-                let left_params = parameters.params_for_device(left_device);
-                let right_params = parameters.params_for_device(right_device);
+                let left_params = parameters.params_for_device(left_device, None);
+                let right_params = parameters.params_for_device(right_device, None);
                 let left = GpuDCRTPolyMatrix::zero(&left_params, 1, 1);
                 if left.copy_to_params_direct(&right_params).is_none() {
                     continue;
@@ -1254,6 +1319,152 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_unplanned_materialization_preserves_payloads() {
+        let devices = detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 5,
+        };
+        let mut backend = super::super::gpu_backend_on([parameters], devices);
+        let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"load-input").unwrap();
+        let bytes = backend.devices[0].1.matrix_to_bytes(&source);
+        let staged = source.to_cpu_staging_bytes();
+        let small = backend.devices[0].1.gadget_decompose(&source, false, None).unwrap();
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: ConcreteMatrixType { rows: small.rows(), ..ty.clone() },
+            max_coefficient_bound: BigInt::from(small.max_coefficient_bound().clone()),
+        };
+        let small_bytes = backend.devices[0]
+            .1
+            .small_matrix_to_bytes(&small, &schema, SmallMatrixSemanticKind::Generic)
+            .unwrap();
+        // An operation identity alone is not a derived calibration plan.
+        for operation in [None, Some(rand::random())] {
+            backend.active_operation = operation;
+            assert!(backend.operation_widths.is_empty());
+            for restored in [
+                backend.matrix_from_bytes(&ty, &bytes).unwrap(),
+                backend.matrix_from_cpu_staging_bytes(&ty, &staged).unwrap(),
+                backend.scatter_matrix(source.clone()).unwrap(),
+            ] {
+                assert_eq!(restored.size(), (2, 5));
+                assert_eq!(restored.shards().len(), 1);
+                assert_eq!(restored.shards()[0].value, source);
+            }
+            let restored = backend
+                .small_matrix_from_bytes(&schema, &small_bytes, SmallMatrixSemanticKind::Generic)
+                .unwrap();
+            assert_eq!(restored.shards().len(), 1);
+            assert_eq!(restored.shards()[0].value, small);
+            let invalid = ConcreteMatrixType { columns: 6, ..ty.clone() };
+            assert!(backend.matrix_from_bytes(&invalid, &bytes).is_err());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_preimage_staging_preserves_shards_without_device_gather() {
+        let device = detected_gpu_device_ids()[0];
+        super::super::wait_for_gpu_test_context_quiescence(device);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let mut backend = super::super::gpu_backend_on([parameters.clone()], vec![device]);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 24,
+        };
+        let matrix = backend.devices[0]
+            .1
+            .sample_hash(&ty, rand::random(), b"sharded-preimage-staging")
+            .unwrap();
+        let expected = matrix.to_cpu_staging_bytes();
+        let value = Arc::new(GpuFleetMatrix::new(
+            ty.rows,
+            ty.columns,
+            (0..ty.columns)
+                .step_by(4)
+                .map(|start| GpuColumnShard {
+                    device_id: device,
+                    global_column_start: start,
+                    value: matrix.slice_columns(start, start + 4),
+                })
+                .collect(),
+        ));
+        value.wait_until_ready();
+        backend.fence_released_memory().unwrap();
+        gpu_default_mempool_reset_high_water(device).unwrap();
+        let snapshot_baseline = gpu_default_mempool_usage(device).unwrap().used_current;
+        let snapshot = value.shards()[0].value.to_rns_snapshot();
+        let snapshot_scratch =
+            gpu_default_mempool_usage(device).unwrap().used_high.saturating_sub(snapshot_baseline);
+        drop(snapshot);
+        assert!(snapshot_scratch > 0, "the primitive snapshot unpacks device limbs");
+        gpu_default_mempool_reset_high_water(device).unwrap();
+        let baseline = gpu_default_mempool_usage(device).unwrap().used_current;
+        let (source, bytes) = backend.preimage_target(value).unwrap();
+        let staging_scratch =
+            gpu_default_mempool_usage(device).unwrap().used_high.saturating_sub(baseline);
+        // Raw-RNS serialization has per-limb unpack buffers. Staging six shards
+        // must use at most one shard's measured primitive scratch, never a
+        // full-target gather or six simultaneous snapshots.
+        assert!(
+            staging_scratch <= snapshot_scratch,
+            "staging scratch {staging_scratch} exceeds one-shard bound {snapshot_scratch}"
+        );
+        assert_eq!(bytes.as_slice(), expected.as_slice());
+        assert_eq!(source.row_size(), 2);
+        assert_eq!(source.col_size(), 24);
+        for (start, end) in [(0, 1), (3, 9), (23, 24)] {
+            let loaded = source.load_columns(start, end);
+            assert_eq!(loaded.shards()[0].value, matrix.slice_columns(start, end));
+        }
+        let restored = backend.matrix_from_cpu_staging_bytes(&ty, &bytes).unwrap();
+        assert_eq!(restored.shards()[0].value, matrix);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_range_transport_preserves_values_or_rejects_nonpeer() {
+        let devices = detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let mut backend = super::super::gpu_backend_on([parameters.clone()], devices);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 5,
+        };
+        let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"transport").unwrap();
+        let expected = source.slice_columns(1, 4);
+        let expected_bytes = expected.to_cpu_staging_bytes();
+        let source = GpuFleetMatrix::from_matrix(source);
+        // Always exercise same-device transport. Every additional detected
+        // destination also checks successful peer copies or explicit rejection.
+        backend.devices.par_iter_mut().for_each(|(device, destination_backend)| {
+            let destination = destination_backend.parameters(&ty).unwrap();
+            let host_staging_required =
+                source.shards()[0].value.copy_to_params_direct(destination).is_none();
+            let transferred =
+                GpuDcrtBackend::matrix_piece_on_device(destination_backend, &source, 1, 4);
+            if host_staging_required {
+                assert!(matches!(transferred, Err(PolyBackendError::UnsupportedPlacement)));
+            } else {
+                let transferred = transferred.unwrap();
+                assert_eq!(transferred.size(), (2, 3));
+                assert_eq!(transferred.params().device_ids(), &[*device]);
+                assert_eq!(transferred.to_cpu_staging_bytes(), expected_bytes);
+            }
+        });
     }
 
     #[test]
@@ -1399,7 +1610,7 @@ mod tests {
 
         let digits = parameters.modulus_digits();
         let base = BigInt::from(1u8) << parameters.base_bits();
-        let decomposed = backend.gadget_decompose(&source, false).unwrap();
+        let decomposed = backend.gadget_decompose(&source, false, None).unwrap();
         let schema = ConcreteBoundedMatrixSchema {
             matrix: ConcreteMatrixType { rows: digits, ..source_type.clone() },
             max_coefficient_bound: BigInt::from(
@@ -1413,7 +1624,7 @@ mod tests {
             .small_matrix_from_bytes(&schema, &compact_bytes, SmallMatrixSemanticKind::Generic)
             .unwrap();
         assert_eq!(decoded, decomposed);
-        let alternate = backend.gadget_decompose(&source, true).unwrap();
+        let alternate = backend.gadget_decompose(&source, true, None).unwrap();
         let mut mismatched = decoded.clone();
         mismatched.shards[1].value = alternate.shards[1].value.clone();
         assert!(matches!(
@@ -1479,7 +1690,7 @@ mod tests {
                 .all(|device| { source.shards().iter().any(|shard| shard.device_id == *device) })
         );
 
-        let decomposed = fleet.gadget_decompose(&source, false).unwrap();
+        let decomposed = fleet.gadget_decompose(&source, false, None).unwrap();
         let digits = parameters.modulus_digits();
         let gadget_type = ConcreteMatrixType { rows: 1, columns: digits, ..source_type.clone() };
         let gadget = fleet
@@ -1511,7 +1722,7 @@ mod tests {
         single.select_operation(operation).unwrap();
         let single_source =
             single.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
-        let single_decomposed = single.gadget_decompose(&single_source, false).unwrap();
+        let single_decomposed = single.gadget_decompose(&single_source, false, None).unwrap();
         let single_gadget = single
             .constant_matrix(
                 &gadget_type,
@@ -1774,6 +1985,7 @@ impl Backend for GpuDcrtBackend {
             Identity,
             UnitRow(usize),
             Gadget(bool),
+            SingleColumn,
         }
         let range_constant = match value {
             ConstantMatrix::Zero => Some(RangeConstant::Zero),
@@ -1790,6 +2002,14 @@ impl Backend for GpuDcrtBackend {
                 let base = base.evaluate(env).map_err(|_| PolyBackendError::InvalidInteger)?;
                 self.validate_gadget_layout(ty, &base, ty.columns / ty.rows, *small)?;
                 Some(RangeConstant::Gadget(*small))
+            }
+            _ if ty.columns == 1 &&
+                (self.pending_pilot.is_some() ||
+                    self.active_operation.is_some_and(|operation| {
+                        self.operation_widths.contains_key(&operation)
+                    })) =>
+            {
+                Some(RangeConstant::SingleColumn)
             }
             _ => None,
         };
@@ -1809,7 +2029,8 @@ impl Backend for GpuDcrtBackend {
                         let (_, start, end) =
                             *wave.iter().find(|(owner, _, _)| *owner == device)?;
                         let local_ty = ConcreteMatrixType { columns: end - start, ..ty.clone() };
-                        Some(backend.parameters(&local_ty).map(|params| {
+                        Some((|| {
+                            let params = backend.parameters(&local_ty)?;
                             let value = match range_constant {
                                 RangeConstant::Zero => {
                                     GpuDCRTPolyMatrix::zero(params, ty.rows, end - start)
@@ -1835,22 +2056,29 @@ impl Backend for GpuDcrtBackend {
                                     small,
                                     start,
                                     end - start,
+                                    Some(ty.columns / ty.rows),
                                 ),
+                                RangeConstant::SingleColumn => {
+                                    backend.constant_matrix(&local_ty, value, env)?
+                                }
                             };
-                            GpuColumnShard {
+                            Ok::<_, PolyBackendError>(GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
                                 value,
-                            }
-                        }))
+                            })
+                        })())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 self.commit_column_wave(&mut shards, launched, &mut next_column)?;
             }
             return Ok(GpuFleetMatrix::new(ty.rows, ty.columns, shards));
         }
+        // Non-range constants are already materialized on one device, including
+        // setup inputs created before an operation has selected calibrated widths.
+        // Keep that ownership; consuming operations distribute their needed ranges.
         let full = self.devices[0].1.constant_matrix(ty, value, env)?;
-        self.scatter_matrix(&full)
+        Ok(GpuFleetMatrix::from_matrix(full))
     }
 
     fn add(
@@ -2104,6 +2332,125 @@ impl Backend for GpuDcrtBackend {
         scalar: &BigInt,
     ) -> Result<Self::Matrix, Self::Error> {
         self.unary_columns(value, |backend, value| backend.scale_integer(value, scalar))
+    }
+
+    fn ring_automorphism(
+        &mut self,
+        value: &Self::Matrix,
+        index: usize,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, value| backend.ring_automorphism(value, index))
+    }
+
+    fn modulus_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.modulus_switch(input, destination))
+    }
+
+    fn reduce_modulus(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.reduce_modulus(input, destination))
+    }
+
+    fn preimage_target(
+        &mut self,
+        value: Arc<Self::Matrix>,
+    ) -> Result<(Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>), Self::Error> {
+        let rows = value.rows;
+        let columns = value.columns;
+        let first = value.shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
+        let params = first.value.params().clone();
+        let mut metadata = None;
+        let mut payload = Vec::new();
+        // Copy existing shards directly to host, one at a time. Gathering on a
+        // device would temporarily allocate the entire logical target there.
+        // Sequential snapshots bound pinned and device unpack scratch to one
+        // existing shard; raw-RNS serialization allocates temporary u64 limbs.
+        for shard in &value.shards {
+            let snapshot = shard.value.to_rns_snapshot();
+            let current = (snapshot.level(), snapshot.is_ntt(), snapshot.bytes_per_poly());
+            if let Some(expected) = metadata {
+                if current != expected {
+                    return Err(PolyBackendError::InvalidConstantShape);
+                }
+            } else {
+                metadata = Some(current);
+                let length = rows
+                    .checked_mul(columns)
+                    .and_then(|size| size.checked_mul(snapshot.bytes_per_poly()))
+                    .ok_or(PolyBackendError::InvalidInteger)?;
+                payload.resize(length, 0);
+            }
+            let row_bytes = columns * snapshot.bytes_per_poly();
+            let shard_row_bytes = snapshot.ncol() * snapshot.bytes_per_poly();
+            if row_bytes != 0 {
+                payload.par_chunks_mut(row_bytes).enumerate().for_each(|(row, target)| {
+                    let start = shard.global_column_start * snapshot.bytes_per_poly();
+                    target[start..start + shard_row_bytes].copy_from_slice(
+                        &snapshot.bytes()[row * shard_row_bytes..(row + 1) * shard_row_bytes],
+                    );
+                });
+            }
+        }
+        let (level, is_ntt, bytes_per_poly) =
+            metadata.ok_or(PolyBackendError::InvalidConstantShape)?;
+        // Use the primitive raw-RNS staging representation, preserving both
+        // coefficient/evaluation format and the logical row-major layout.
+        let bytes = Arc::new(
+            bincode::encode_to_vec(
+                (1u8, rows, columns, level, is_ntt, bytes_per_poly, payload.as_slice()),
+                bincode::config::standard(),
+            )
+            .map_err(|_| PolyBackendError::InvalidInteger)?,
+        );
+        let source = FleetStagedColumnSource { params, rows, columns, bytes: bytes.clone() };
+        Ok((Arc::new(source), bytes))
+    }
+
+    fn matrix_from_cpu_staging_bytes(
+        &self,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<Self::Matrix, Self::Error> {
+        let params = self.devices[0].1.parameters(ty)?;
+        Ok(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::from_cpu_staging_bytes(params, bytes)))
+    }
+
+    fn preimage_target_from_staging(
+        &self,
+        ty: &ConcreteMatrixType,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Self::Error> {
+        if rows != ty.rows || columns != ty.columns {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        let params = self.devices[0].1.parameters(ty)?.clone();
+        Ok(Arc::new(FleetStagedColumnSource { params, rows, columns, bytes }))
+    }
+
+    fn validate_preimage_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        max_coefficient_bound: &BigInt,
+    ) -> Result<(), Self::Error> {
+        self.devices[0].1.validate_preimage_bound(
+            ty,
+            sigma,
+            gadget_base,
+            digit_count,
+            max_coefficient_bound,
+        )
     }
 
     fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
@@ -2373,7 +2720,7 @@ impl Backend for GpuDcrtBackend {
             inputs.iter().map(|value| self.gather_matrix(value)).collect::<Result<Vec<_>, _>>()?;
         let refs = gathered.iter().collect::<Vec<_>>();
         let output = self.devices[0].1.concat(&refs, axis)?;
-        self.scatter_matrix(&output)
+        self.scatter_matrix(output)
     }
 
     fn sample_uniform(
@@ -2522,13 +2869,14 @@ impl Backend for GpuDcrtBackend {
                                 end - start,
                                 DistType::FinRingDist,
                             );
-                        source.gadget_decompose(false).map_err(PolyBackendError::from).map(
-                            |value| GpuColumnShard {
+                        source
+                            .gadget_decompose(false, Some(digit_count))
+                            .map_err(PolyBackendError::from)
+                            .map(|value| GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
                                 value,
-                            },
-                        )
+                            })
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2575,13 +2923,14 @@ impl Backend for GpuDcrtBackend {
                                 end - start,
                                 DistType::FinRingDist,
                             );
-                        source.gadget_decompose(true).map_err(PolyBackendError::from).map(|value| {
-                            GpuColumnShard {
+                        source
+                            .gadget_decompose(true, Some(digit_count))
+                            .map_err(PolyBackendError::from)
+                            .map(|value| GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
                                 value,
-                            }
-                        })
+                            })
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2605,7 +2954,7 @@ impl Backend for GpuDcrtBackend {
         for (_, backend) in self.devices.iter().skip(1) {
             values.push(backend.trapdoor_from_bytes(ty, &bytes)?);
         }
-        let public = self.scatter_matrix(&public)?;
+        let public = self.scatter_matrix(public)?;
         Ok((public, GpuFleetTrapdoor { values }))
     }
 
@@ -2618,8 +2967,10 @@ impl Backend for GpuDcrtBackend {
         max_coefficient_bound: &BigInt,
         trapdoor: &Self::Trapdoor,
         public: &Self::Matrix,
-        target: &Self::Matrix,
+        target: &dyn PolyMatrixColumnSource<Self::Matrix>,
+        randomness_seed: [u8; 32],
     ) -> Result<Self::SmallMatrix, Self::Error> {
+        self.validate_preimage_bound(ty, sigma, gadget_base, digit_count, max_coefficient_bound)?;
         if trapdoor.values.len() != self.devices.len() {
             return Err(PolyBackendError::InvalidInteger);
         }
@@ -2627,16 +2978,16 @@ impl Backend for GpuDcrtBackend {
             .map(|device| self.full_matrix_on_device(device, public))
             .collect::<Result<Vec<_>, _>>()?;
         if self.runtime_pilot_is_pending() {
-            target.wait_until_ready();
             trapdoor.wait_until_ready();
             public_replicas.iter().for_each(|replica| replica.wait_until_ready());
         }
         self.restart_runtime_pilot_after_fixed_inputs()
             .map_err(PolyBackendError::GpuCalibration)?;
+        let source_global_column_start = target.global_column_start();
         let mut shards = Vec::new();
         let mut next_column = 0;
-        while next_column < target.columns {
-            let wave = self.next_column_wave(next_column, target.columns);
+        while next_column < target.col_size() {
+            let wave = self.next_column_wave(next_column, target.col_size());
             next_column = wave.last().expect("nonempty GPU wave").2;
             let launched = self
                 .devices
@@ -2645,33 +2996,43 @@ impl Backend for GpuDcrtBackend {
                 .filter_map(|(device, (device_id, backend))| {
                     let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
                     Some(
-                        Self::matrix_piece_on_device(backend, target, start, end)
-                            .and_then(|target| {
-                                let local_ty =
-                                    ConcreteMatrixType { columns: end - start, ..ty.clone() };
-                                backend.sample_preimage(
-                                    &local_ty,
-                                    sigma,
-                                    gadget_base,
-                                    digit_count,
-                                    max_coefficient_bound,
-                                    &trapdoor.values[device],
-                                    &public_replicas[device],
-                                    &target,
-                                )
-                            })
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            }),
+                        Self::matrix_piece_on_device(
+                            backend,
+                            &target.load_columns(start, end),
+                            0,
+                            end - start,
+                        )
+                        .and_then(|target| {
+                            let local_ty =
+                                ConcreteMatrixType { columns: end - start, ..ty.clone() };
+                            let global_column_start =
+                                preimage_seed_column_start(source_global_column_start, start)?;
+                            let target =
+                                OffsetGpuColumnSource { value: target, global_column_start };
+                            backend.sample_preimage(
+                                &local_ty,
+                                sigma,
+                                gadget_base,
+                                digit_count,
+                                max_coefficient_bound,
+                                &trapdoor.values[device],
+                                &public_replicas[device],
+                                &target,
+                                randomness_seed,
+                            )
+                        })
+                        .map(|value| GpuColumnShard {
+                            device_id: *device_id,
+                            global_column_start: start,
+                            value,
+                        }),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             self.commit_column_wave(&mut shards, launched, &mut next_column)?;
         }
         let rows = shards.first().map(|shard| shard.value.rows()).unwrap_or(ty.rows);
-        Ok(GpuFleetSmallMatrix::new(rows, target.columns, shards))
+        Ok(GpuFleetSmallMatrix::new(rows, target.col_size(), shards))
     }
 
     fn validate_gadget_layout(
@@ -2688,6 +3049,7 @@ impl Backend for GpuDcrtBackend {
         &mut self,
         value: &Self::Matrix,
         small: bool,
+        digit_count: Option<usize>,
     ) -> Result<Self::SmallMatrix, Self::Error> {
         self.restart_runtime_pilot_after_matrix_inputs(&[value])?;
         let mut shards = Vec::new();
@@ -2703,7 +3065,7 @@ impl Backend for GpuDcrtBackend {
                     let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
                     Some(
                         Self::matrix_piece_on_device(backend, value, start, end)
-                            .and_then(|piece| backend.gadget_decompose(&piece, small))
+                            .and_then(|piece| backend.gadget_decompose(&piece, small, digit_count))
                             .map(|value| GpuColumnShard {
                                 device_id: *device_id,
                                 global_column_start: start,
@@ -2718,8 +3080,12 @@ impl Backend for GpuDcrtBackend {
         Ok(GpuFleetSmallMatrix::new(rows, value.columns, shards))
     }
 
-    fn gadget_error_bound(&self, ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
-        self.devices[0].1.gadget_error_bound(ty)
+    fn gadget_error_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        digit_count: Option<usize>,
+    ) -> Result<BigInt, Self::Error> {
+        self.devices[0].1.gadget_error_bound(ty, digit_count)
     }
 
     fn multiply_small_rhs(
@@ -2892,23 +3258,13 @@ impl Backend for GpuDcrtBackend {
         levels: &[Self::Matrix],
         plaintext_moduli: &[BigInt],
         reconstruction_coefficients: &[BigInt],
+        destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         self.restart_runtime_pilot_after_matrix_inputs(&levels.iter().collect::<Vec<_>>())?;
-        if levels.iter().any(|level| !self.matrix_has_current_layout(level)) {
-            let normalized = levels
-                .iter()
-                .map(|level| {
-                    if self.matrix_has_current_layout(level) {
-                        Ok(level.clone())
-                    } else {
-                        self.repartition_matrix(level)
-                    }
-                })
-                .collect::<Result<Vec<_>, PolyBackendError>>()?;
-            return self.crt_recompose(&normalized, plaintext_moduli, reconstruction_coefficients);
-        }
         let first = levels.first().ok_or(PolyBackendError::InvalidInteger)?;
-        if levels.iter().any(|level| !Self::same_layout(first, level)) {
+        // Each calibrated wave stages its exact columns independently from
+        // every input's existing shards; pilot widths do not exist yet here.
+        if levels.iter().any(|level| level.size() != first.size()) {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         let mut shards = Vec::new();
@@ -2933,6 +3289,7 @@ impl Backend for GpuDcrtBackend {
                                     &local,
                                     plaintext_moduli,
                                     reconstruction_coefficients,
+                                    destination,
                                 )
                             })
                             .map(|value| GpuColumnShard {
@@ -3028,6 +3385,12 @@ impl Backend for GpuDcrtBackend {
             decode_compact_matrix(bytes)?;
         if rows != ty.rows || columns != ty.columns {
             return Err(PolyBackendError::InvalidInteger);
+        }
+        if !self
+            .active_operation
+            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
+        {
+            return self.devices[0].1.matrix_from_bytes(ty, bytes).map(GpuFleetMatrix::from_matrix);
         }
         let coefficient_bits = usize::from(max_bits);
         let ring_dimension = ty.ring_dimension;
@@ -3168,6 +3531,15 @@ impl Backend for GpuDcrtBackend {
         bytes: &[u8],
         expected_semantic_kind: SmallMatrixSemanticKind,
     ) -> Result<Self::SmallMatrix, Self::Error> {
+        if !self
+            .active_operation
+            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
+        {
+            return self.devices[0]
+                .1
+                .small_matrix_from_bytes(expected_schema, bytes, expected_semantic_kind)
+                .map(GpuFleetSmallMatrix::from_matrix);
+        }
         let (bound, payload) =
             decode_small_matrix_artifact(expected_schema, bytes, expected_semantic_kind)?;
         let rows = expected_schema.matrix.rows;

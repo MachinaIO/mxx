@@ -1695,7 +1695,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn top_level_compiler() -> (DiamondIoCompiler<DCRTPoly>, DiamondIoFunction) {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
@@ -1778,7 +1778,7 @@ mod tests {
             ));
         }
 
-        let parameters = DCRTPolyParams::new(2, 2, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 2, 10, 5, None, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let nested_rns = Arc::new(NestedRnsPolyContext::setup(
             &mut circuit,
@@ -2009,7 +2009,7 @@ mod tests {
 
     #[test]
     fn batched_round_selects_every_branch_and_matches_direct_refresh_runtime() {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
         let modulus: std::sync::Arc<BigUint> = parameters.modulus();
         let digit_count = parameters.modulus_digits();
         let state_columns = 2 * (digit_count + 2);
@@ -2226,7 +2226,7 @@ mod tests {
 
     #[test]
     fn nonzero_mask_rebase_maps_the_related_final_state_to_the_common_key() {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
         let modulus: std::sync::Arc<BigUint> = parameters.modulus();
         let digit_count = parameters.modulus_digits();
         let state_columns = 2 * (digit_count + 2);

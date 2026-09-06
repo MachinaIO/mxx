@@ -58,12 +58,8 @@ impl DCRTPoly {
         parse_coefficients_bytes(&self.eval_bytes()).coefficients
     }
 
-    pub fn modulus_switch(
-        &self,
-        params: &DCRTPolyParams,
-        new_modulus: <DCRTPolyParams as PolyParams>::Modulus,
-    ) -> Self {
-        debug_assert!(new_modulus < params.modulus());
+    pub fn modulus_switch(&self, params: &DCRTPolyParams) -> Self {
+        let new_modulus = params.modulus();
         let coeffs = self.coeffs();
         let new_coeffs = coeffs
             .par_iter()
@@ -76,36 +72,46 @@ impl DCRTPoly {
         let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
         let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
         let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
-        DCRTPoly::new(ffi::DCRTPolyGenFromVec(
-            params.ring_dimension(),
-            params.crt_depth(),
-            params.crt_bits(),
-            values_limbs.as_slice(),
-            limbs_per_int,
-        ))
+        DCRTPoly::new(
+            super::native::ffi::exact_basis_poly(
+                params.ring_dimension(),
+                &params.to_crt().0,
+                values_limbs.as_slice(),
+                limbs_per_int,
+                false,
+            )
+            .expect("exact CRT coefficient import failed"),
+        )
     }
 
     fn poly_gen_from_vec_eval(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
         let limbs_per_int = values.iter().map(|vs| vs.len()).max().unwrap_or(0);
         let values_refs = values.iter().map(|vs| vs.as_slice()).collect::<Vec<_>>();
         let values_limbs = pack_dcrtpoly_u64_limbs_le(&values_refs, limbs_per_int);
-        DCRTPoly::new(ffi::DCRTPolyGenFromEvalVec(
-            params.ring_dimension(),
-            params.crt_depth(),
-            params.crt_bits(),
-            values_limbs.as_slice(),
-            limbs_per_int,
-        ))
+        DCRTPoly::new(
+            super::native::ffi::exact_basis_poly(
+                params.ring_dimension(),
+                &params.to_crt().0,
+                values_limbs.as_slice(),
+                limbs_per_int,
+                true,
+            )
+            .expect("exact CRT evaluation import failed"),
+        )
     }
 
     #[inline]
     fn poly_gen_from_const(params: &DCRTPolyParams, value: &[u64]) -> Self {
-        DCRTPoly::new(ffi::DCRTPolyGenFromConst(
-            params.ring_dimension(),
-            params.crt_depth(),
-            params.crt_bits(),
-            value,
-        ))
+        DCRTPoly::new(
+            super::native::ffi::exact_basis_poly(
+                params.ring_dimension(),
+                &params.to_crt().0,
+                value,
+                value.len(),
+                false,
+            )
+            .expect("exact CRT constant import failed"),
+        )
     }
 }
 
@@ -115,7 +121,8 @@ impl Poly for DCRTPoly {
 
     #[inline]
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let poly_encoding = self.ptr_poly.GetCoefficientsBytes();
+        let poly_encoding = super::native::ffi::exact_basis_coefficients(&self.ptr_poly)
+            .expect("exact CRT coefficient export failed");
         let parsed_values = parse_coefficients_bytes(&poly_encoding);
         let coeffs = parsed_values.coefficients;
         let modulus = parsed_values.modulus;
@@ -624,7 +631,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "constant coefficient does not fit in u64")]
     fn test_const_coeff_u64_panics_when_constant_term_exceeds_u64() {
-        let params = DCRTPolyParams::new(8, 4, 20, 1, None);
+        let params = DCRTPolyParams::new(8, 4, 20, 1, None, None);
         let poly = DCRTPoly::from_biguint_to_constant(&params, BigUint::from(u64::MAX) + 1u32);
         let _ = poly.const_coeff_u64();
     }
@@ -639,7 +646,7 @@ mod tests {
         let x = rng.random_range(12..20);
         let size = rng.random_range(1..20);
         let n = 2_i32.pow(x) as u32;
-        let params = DCRTPolyParams::new(n, size, 51, 2, None);
+        let params = DCRTPolyParams::new(n, size, 51, 2, None, None);
         let q = params.modulus();
         let mut coeffs: Vec<FinRingElem> = Vec::new();
         for _ in 0..n {

@@ -118,10 +118,10 @@ int small_track_consumer(const GpuSmallMatrix *mat, cudaStream_t consumer_stream
     if (!mat || !mat->ctx || !consumer_stream || mat->device < 0)
         return set_error("invalid compact matrix consumer arguments");
     cudaStream_t release_stream = mat->stream;
-    if (!mat->ctx->release_streams_by_partition.empty() &&
-        mat->ctx->release_streams_by_partition.front())
+    if (!mat->ctx->execution->release_streams_by_partition.empty() &&
+        mat->ctx->execution->release_streams_by_partition.front())
     {
-        release_stream = mat->ctx->release_streams_by_partition.front();
+        release_stream = mat->ctx->execution->release_streams_by_partition.front();
     }
     if (!release_stream) return set_error("missing compact matrix release stream");
 
@@ -934,12 +934,12 @@ extern "C" int gpu_small_matrix_create(
     }
     mat->resident_payload_bytes = mat->payload_bytes;
     mat->device = ctx->gpu_ids.front();
-    if (ctx->compute_streams_by_partition.empty() || ctx->compute_streams_by_partition.front().empty())
+    if (ctx->execution->compute_streams_by_partition.empty() || ctx->execution->compute_streams_by_partition.front().empty())
     {
         delete mat;
         return set_error("missing compact matrix stream");
     }
-    mat->stream = ctx->compute_streams_by_partition.front().front();
+    mat->stream = ctx->execution->compute_streams_by_partition.front().front();
     cudaError_t err = cudaSetDevice(mat->device);
     if (err == cudaSuccess)
         err = cudaEventCreateWithFlags(&mat->write_done, cudaEventDisableTiming);
@@ -966,10 +966,10 @@ extern "C" void gpu_small_matrix_destroy(GpuSmallMatrix *mat)
     {
         cudaStream_t release_stream = mat->stream;
         const size_t partition = 0;
-        if (mat->ctx && partition < mat->ctx->release_streams_by_partition.size() &&
-            mat->ctx->release_streams_by_partition[partition])
+        if (mat->ctx && partition < mat->ctx->execution->release_streams_by_partition.size() &&
+            mat->ctx->execution->release_streams_by_partition[partition])
         {
-            release_stream = mat->ctx->release_streams_by_partition[partition];
+            release_stream = mat->ctx->execution->release_streams_by_partition[partition];
             if (mat->write_done_valid) cudaStreamWaitEvent(release_stream, mat->write_done, 0);
         }
         if (mat->owns_payload)

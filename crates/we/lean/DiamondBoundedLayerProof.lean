@@ -196,8 +196,11 @@ theorem generated_bounded_injector_layer
         (lane.val ≤ (layer + 1) * batch → reducePoly q n (row 0 1) =
           if lane.val = 0 then (if message then 1 else 0)
           else reducePoly q n (row 0 0) * (if bits (lane.val - 1) then 1 else 0)) := by
-  rcases hrun with ⟨sourceIndices, sourceStates, digitValue, transitionIndices,
-    selectedTransitions, nextStates, hstateGeometry, hsources, _, hgathers, _, _, hdigitGet,
+  obtain ⟨scopeWitness, facts⟩ := hrun
+  rcases scopeWitness with ⟨sourceIndices, sourceStates, digitValue, transitionIndices,
+    selectedTransitions, nextStates⟩
+  dsimp only [Stage_decrypt.sequential_generatedRoot_8.body] at facts
+  rcases facts with ⟨hstateGeometry, hsources, _, hgathers, _, _, hdigitGet,
     _, hindices, _, htransitions, _, hsteps, hout⟩
   obtain ⟨packedPosition, hpackedPosition, hpackedValue⟩ := hdigitGet
   have hdigitBounds : 0 ≤ digitValue ∧ digitValue < digitBase := by

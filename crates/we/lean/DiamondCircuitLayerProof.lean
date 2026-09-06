@@ -47,10 +47,12 @@ theorem generated_circuit_layer_within
         oneCipher, onePublic, oneMessage, ()) next) :
     CircuitStateWithin secret (factor * B) next := by
   dsimp only [Stage_decrypt.sequential_generatedRoot_67] at hrun
-  rcases hrun with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
+  obtain ⟨scopeWitness, h⟩ := hrun
+  rcases scopeWitness with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
     rightIndices, w18, digits, w20, w21, w23, w24, w25, w26, w28, w29, w30, w31,
     w33, w34, w35, w36, w37, w38, w39, w40, w41, w42, w44, w45, w46, w47,
-    w48, w49, w50, w51, w52, w53, h⟩
+    w48, w49, w50, w51, w52, w53⟩
+  dsimp only [Stage_decrypt.sequential_generatedRoot_67.body] at h
   rcases h with ⟨_, _, _, _, h3, _, h5, _, h6, _, _, _, _, _, _, _, h13,
     _, h14, _, _, _, h18, _, h19, _, h20, _, h21, _, h23, _, h24, _, h25,
     _, h26, _, h28, _, h29, _, h30, _, h31, _, h33, _, h34, _, h35, _, h36,

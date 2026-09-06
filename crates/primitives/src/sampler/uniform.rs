@@ -7,7 +7,6 @@ use crate::{
     sampler::{DistType, PolyUniformSampler, bounds::centered_coefficient_abs},
 };
 use num_bigint::BigUint;
-use openfhe::ffi;
 use rayon::prelude::*;
 
 use crate::poly::dcrt::params::DCRTPolyParams;
@@ -35,12 +34,13 @@ pub struct DCRTPolyUniformSampler {}
 
 impl DCRTPolyUniformSampler {
     fn sample_gaussian_unchecked(&self, params: &DCRTPolyParams, sigma: f64) -> DCRTPoly {
-        let sampled_poly = ffi::DCRTPolyGenFromDgg(
+        let sampled_poly = crate::poly::dcrt::native::ffi::exact_basis_sample(
             params.ring_dimension(),
-            params.crt_depth(),
-            params.crt_bits(),
+            &params.to_crt().0,
+            1,
             sigma,
-        );
+        )
+        .expect("exact CRT Gaussian sampling failed");
         if sampled_poly.is_null() {
             panic!("Attempted to dereference a null pointer");
         }
@@ -66,29 +66,24 @@ impl DCRTPolyUniformSampler {
     }
 
     fn sample_poly_unchecked(&self, params: &DCRTPolyParams, dist: &DistType) -> DCRTPoly {
-        let sampled_poly = match dist {
-            DistType::FinRingDist => ffi::DCRTPolyGenFromDug(
-                params.ring_dimension(),
-                params.crt_depth(),
-                params.crt_bits(),
-            ),
+        let distribution = match dist {
+            DistType::FinRingDist => 0,
             DistType::GaussDist { sigma, max_coefficient_bound: Some(bound) } => {
                 return self.sample_truncated_gaussian_poly(params, *sigma, bound);
             }
             DistType::GaussDist { sigma, max_coefficient_bound: None } => {
                 return self.sample_gaussian_unchecked(params, *sigma);
             }
-            DistType::BitDist => ffi::DCRTPolyGenFromBug(
-                params.ring_dimension(),
-                params.crt_depth(),
-                params.crt_bits(),
-            ),
-            DistType::TernaryDist => ffi::DCRTPolyGenFromTug(
-                params.ring_dimension(),
-                params.crt_depth(),
-                params.crt_bits(),
-            ),
+            DistType::BitDist => 2,
+            DistType::TernaryDist => 3,
         };
+        let sampled_poly = crate::poly::dcrt::native::ffi::exact_basis_sample(
+            params.ring_dimension(),
+            &params.to_crt().0,
+            distribution,
+            0.0,
+        )
+        .expect("exact CRT distribution sampling failed");
         if sampled_poly.is_null() {
             panic!("Attempted to dereference a null pointer");
         }
@@ -148,6 +143,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_binary_sampling_shared_primes_across_ring_dimensions() {
+        let (dimension, depth, bits, base) = crate::env::modulus_conversion_test_parameters();
+        let larger = DCRTPolyParams::new(dimension, depth, bits, base, None, None);
+        let smaller =
+            DCRTPolyParams::new(dimension / 2, depth, bits, base, Some(larger.to_crt().0), None);
+        std::thread::scope(|scope| {
+            for parameters in [&smaller, &larger] {
+                scope.spawn(move || {
+                    let sampler = DCRTPolyUniformSampler::new();
+                    for _ in 0..100 {
+                        let polynomial = sampler.sample_poly(parameters, &DistType::BitDist);
+                        assert_eq!(
+                            polynomial.to_bool_vec().len(),
+                            parameters.ring_dimension() as usize
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn test_ternary_dist_values() {
         // Test that TernaryDist actually produces values in {-1, 0, 1}
         let params = DCRTPolyParams::default();
@@ -199,7 +216,7 @@ mod tests {
 
     #[test]
     fn truncated_gaussian_never_exceeds_the_integer_cutoff() {
-        let params = DCRTPolyParams::new(32, 1, 20, 4, None);
+        let params = DCRTPolyParams::new(32, 1, 20, 4, None, None);
         let cutoff = BigUint::from(2u8);
         let matrix = DCRTPolyUniformSampler::new().sample_uniform(
             &params,

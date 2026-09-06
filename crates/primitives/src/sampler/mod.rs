@@ -1,5 +1,5 @@
 use crate::{
-    matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError},
+    matrix::{PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError},
     poly::Poly,
 };
 use num_bigint::BigUint;
@@ -156,8 +156,9 @@ pub trait PolyTrapdoorSampler {
         params: &<<Self::M as PolyMatrix>::P as Poly>::Params,
         trapdoor: &Self::Trapdoor,
         public_matrix: &Self::M,
-        target: &Self::M,
+        target: &dyn PolyMatrixColumnSource<Self::M>,
         max_coefficient_bound: BigUint,
+        randomness_seed: [u8; 32],
     ) -> Result<<Self::M as PolyMatrixSmallRhs>::SmallMatrix, SmallMatrixError>;
 
     // Given a trapdoor of B, an extension matrix C, a target matrix U, return a preimage D s.t.

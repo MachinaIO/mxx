@@ -58,6 +58,9 @@ pub struct PrimitiveNames {
     pub lift_integer: String,
     pub threshold_decode: String,
     pub crt_recompose: String,
+    pub modulus_switch: String,
+    pub modulus_reduce: String,
+    pub ring_automorphism: String,
     pub pack_polynomial: String,
     pub family_pack: String,
     pub family_get_static: String,
@@ -100,7 +103,10 @@ impl Default for PrimitiveNames {
             extract_coefficient: "MxxRuntime.extractCoefficient".into(),
             lift_integer: "MxxRuntime.liftInteger".into(),
             threshold_decode: "MxxRuntime.thresholdDecode".into(),
-            crt_recompose: "MxxRuntime.crtRecompose".into(),
+            crt_recompose: "MxxRuntime.crtRecomposeLevel".into(),
+            modulus_switch: "MxxRuntime.modulusSwitchRuns".into(),
+            modulus_reduce: "MxxRuntime.modulusReduceRuns".into(),
+            ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
             family_pack: "MxxRuntime.familyPack".into(),
             family_get_static: "MxxRuntime.familyGetStatic".into(),
@@ -193,12 +199,31 @@ pub struct RootBoundary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeProofShape {
+    /// Root scopes use one named record; child scopes retain their existential telescope.
+    pub witness_record: Option<String>,
+    /// Exact root body at one fixed witness, for composing intermediate-node proofs.
+    pub body_relation: Option<String>,
+    /// Emitted value right-hand sides; references name earlier entries or root arguments.
+    pub value_expressions: BTreeMap<String, String>,
+    /// Witness fields (roots) or binders (children), in exact exported order. Pure lets
+    /// are deliberately absent: Lean unfolds them while eliminating `Runs`.
+    pub witnesses: Vec<(String, String)>,
+    /// Positions in the right-associated conjunction contributed by each node,
+    /// including its guards. The final output equation is at `constraint_count`.
+    pub node_constraints: BTreeMap<NodeId, std::ops::Range<usize>>,
+    pub constraint_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeanArtifact {
     pub backend_layouts: Vec<BackendLayout>,
     pub module_name: String,
     pub source: String,
     pub source_map: SourceMap,
     pub root: RootBoundary,
+    pub scope_relations: BTreeMap<FrozenGraphScopeId, String>,
+    pub scope_proofs: BTreeMap<FrozenGraphScopeId, ScopeProofShape>,
     pub digest: [u8; 32],
     pub spec_hash: crate::artifact::SpecHash,
     pub static_node_visits: usize,
@@ -257,10 +282,23 @@ impl LexicalEnv {
             IntExpr::Sub(a, b) => format!("({} - {})", self.expr(a), self.expr(b)),
             IntExpr::Mul(a, b) => format!("({} * {})", self.expr(a), self.expr(b)),
             IntExpr::Div(a, b) => {
-                format!("MxxIR.exactDiv {} {}", self.expr(a), self.expr(b))
+                format!("MxxIR.exactDiv ({}) ({})", self.expr(a), self.expr(b))
             }
-            IntExpr::RoundDiv(a, b) => format!("MxxIR.roundDiv {} {}", self.expr(a), self.expr(b)),
-            IntExpr::Log2Ceil(a) => format!("MxxIR.log2Ceil {}", self.expr(a)),
+            IntExpr::FloorDiv(a, b) => format!("Int.fdiv ({}) ({})", self.expr(a), self.expr(b)),
+            IntExpr::Rem(a, b) => format!("Int.fmod ({}) ({})", self.expr(a), self.expr(b)),
+            IntExpr::Select { selector, branches } => format!(
+                "MxxIR.selectInt ({}) [{}]",
+                self.expr(selector),
+                branches
+                    .iter()
+                    .map(|branch| format!("({})", self.expr(branch)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            IntExpr::RoundDiv(a, b) => {
+                format!("MxxIR.roundDiv ({}) ({})", self.expr(a), self.expr(b))
+            }
+            IntExpr::Log2Ceil(a) => format!("MxxIR.log2Ceil ({})", self.expr(a)),
         }
     }
 
@@ -301,7 +339,26 @@ fn expression_guards(expr: &IntExpr, env: &LexicalEnv) -> Vec<String> {
                 visit(b, env, guards);
                 let numerator = env.expr(a);
                 let denominator = env.expr(b);
-                guards.push(format!("{} ≠ 0 ∧ {} % {} = 0", denominator, numerator, denominator));
+                guards.push(format!("{} ≠ 0", denominator));
+                guards.push(format!("{} % {} = 0", numerator, denominator));
+            }
+            IntExpr::FloorDiv(a, b) | IntExpr::Rem(a, b) => {
+                visit(a, env, guards);
+                visit(b, env, guards);
+                guards.push(format!("({}) ≠ 0", env.expr(b)));
+            }
+            IntExpr::Select { selector, branches } => {
+                visit(selector, env, guards);
+                let selector = env.expr(selector);
+                guards.push(format!("0 ≤ ({selector})"));
+                guards.push(format!("({selector}) < {}", branches.len()));
+                for (index, branch) in branches.iter().enumerate() {
+                    let mut branch_guards = Vec::new();
+                    visit(branch, env, &mut branch_guards);
+                    for guard in branch_guards {
+                        guards.push(format!("(({selector}) = {index} → ({guard}))"));
+                    }
+                }
             }
             IntExpr::RoundDiv(a, b) => {
                 visit(a, env, guards);
@@ -345,9 +402,14 @@ struct Emitter<'a> {
     requires_hash_model: bool,
     layout_environments: BTreeMap<FrozenGraphScopeId, Vec<crate::expr::ParamEnv>>,
     current_wire_types: BTreeMap<String, String>,
+    current_scope_values: Vec<(String, String)>,
     current_referenced_wires: BTreeSet<String>,
     current_anonymous_lets: BTreeSet<String>,
     current_uses_hash_model: bool,
+    current_witnesses: Vec<(String, String)>,
+    current_record: bool,
+    current_value_expressions: BTreeMap<String, String>,
+    scope_proofs: BTreeMap<FrozenGraphScopeId, ScopeProofShape>,
 }
 
 impl<'a> Emitter<'a> {
@@ -390,9 +452,14 @@ impl<'a> Emitter<'a> {
             }),
             layout_environments: BTreeMap::new(),
             current_wire_types: BTreeMap::new(),
+            current_scope_values: Vec::new(),
             current_referenced_wires: BTreeSet::new(),
             current_anonymous_lets: BTreeSet::new(),
             current_uses_hash_model: false,
+            current_witnesses: Vec::new(),
+            current_record: false,
+            current_value_expressions: BTreeMap::new(),
+            scope_proofs: BTreeMap::new(),
             requires_hash_model: graph.scopes().values().any(|scope| {
                 scope.nodes().iter().any(|node| matches!(node.kind(), NodeKind::HashSample { .. }))
             }),
@@ -419,7 +486,7 @@ impl<'a> Emitter<'a> {
             }
         }
         self.source.push_str(&format!(
-            "import MxxIR\nimport {}\n\nset_option maxRecDepth 4096\n\nnamespace {}\n\n",
+            "import MxxIR\nimport {}\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace {}\n\n",
             self.options.runtime_import, self.options.namespace
         ));
         self.emit_params()?;
@@ -547,6 +614,12 @@ impl<'a> Emitter<'a> {
             source: self.source,
             source_map: self.source_map,
             root,
+            scope_relations: self
+                .scopes
+                .iter()
+                .map(|(scope, name)| (scope.clone(), format!("{}.{name}", self.options.namespace)))
+                .collect(),
+            scope_proofs: self.scope_proofs,
             digest: digest_array,
             spec_hash,
             static_node_visits: self.static_node_visits,
@@ -609,7 +682,13 @@ impl<'a> Emitter<'a> {
 
     fn emit_scope(&mut self, scope_id: &FrozenGraphScopeId) -> Result<(), ExportError> {
         self.indent = 1;
+        self.current_witnesses.clear();
+        self.current_value_expressions.clear();
         let scope = self.graph.scope(scope_id).expect("scope key came from graph");
+        self.current_record = matches!(scope_id, FrozenGraphScopeId::Root) ||
+            scope.nodes().iter().any(|node| {
+                matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_))
+            });
         let validated = self.validated.scopes.get(scope_id).expect("validated scope");
         let inputs = scope_input_wires(scope);
         if !matches!(scope_id, FrozenGraphScopeId::Root) {
@@ -656,6 +735,7 @@ impl<'a> Emitter<'a> {
             .map(wire_name)
             .collect();
         self.current_anonymous_lets.clear();
+        self.current_scope_values.clear();
         self.current_uses_hash_model = false;
         let declaration_start = self.source.len();
         // Keep the configuration argument part of the generated relation even for a closed graph;
@@ -688,12 +768,14 @@ impl<'a> Emitter<'a> {
         }
         let mut existentials = Vec::<(String, String)>::new();
         let mut relations = Vec::<String>::new();
+        let mut node_constraints = BTreeMap::new();
         for (position, node) in scope.nodes().iter().enumerate() {
             self.static_node_visits += 1;
             let node_id = NodeId(position as u64);
             let arguments = scope
                 .arguments(node)
                 .ok_or(ExportError::MissingArguments { scope: scope_id.clone(), node: node_id })?;
+            let first_constraint = relations.len();
             self.emit_node(
                 scope_id,
                 scope,
@@ -704,23 +786,49 @@ impl<'a> Emitter<'a> {
                 &mut existentials,
                 &mut relations,
             )?;
+            node_constraints.insert(node_id, first_constraint..relations.len());
             if let Some(slot) = env.take_missing_loop_index() {
                 return Err(ExportError::MissingLoopIndex(slot));
             }
         }
+        self.scope_proofs.insert(
+            scope_id.clone(),
+            ScopeProofShape {
+                witness_record: self.current_record.then(|| {
+                    format!("{}.{}.Witness", self.options.namespace, self.scopes[scope_id])
+                }),
+                body_relation: self
+                    .current_record
+                    .then(|| format!("{}.{}.body", self.options.namespace, self.scopes[scope_id])),
+                value_expressions: self.current_value_expressions.clone(),
+                witnesses: self.current_witnesses.clone(),
+                node_constraints,
+                constraint_count: relations.len(),
+            },
+        );
         let output =
             tuple_expr(&scope.outputs().iter().map(|wire| wire_name(*wire)).collect::<Vec<_>>());
         let conclusion = format!("outputs = {}", output);
-        let body = if relations.is_empty() {
-            conclusion
-        } else {
-            format!("{} ∧ {}", relations.join(" ∧ "), conclusion)
-        };
-        self.source.push_str(&format!(
-            "{}{}\n\n",
-            "  ".repeat(self.indent),
-            indent_continuation(&body, self.indent)
-        ));
+        // Keep both the existential telescope and each conjunction fragment small
+        // during elaboration. Reducible suffix calls preserve the exact right-associated
+        // And proposition and original witness order by definitional equality.
+        let mut constraint_call = conclusion;
+        let mut constraint_definition = String::new();
+        // Include the output equation in the final fragment even for a closed pure scope.
+        let fragment_count = relations.len().max(1).div_ceil(32);
+        for part in (0..fragment_count).rev() {
+            let start = (part * 32).min(relations.len());
+            let end = ((part + 1) * 32).min(relations.len());
+            let body = if start == end {
+                constraint_call
+            } else {
+                format!("{} ∧ {}", relations[start..end].join(" ∧ "), constraint_call)
+            };
+            let (definition, call) = self.scope_constraints(scope_id, &body, &output_ty, part);
+            constraint_definition.push_str(&definition);
+            constraint_call = call;
+        }
+        self.source.push_str(&format!("{}{constraint_call}\n\n", "  ".repeat(self.indent)));
         let loop_binders =
             loop_parameters(self.graph, scope_id, &env.referenced_loop_names.borrow());
         // Scope arity and positional arguments are unchanged; only truly unused names disappear.
@@ -740,8 +848,130 @@ impl<'a> Emitter<'a> {
             input_ty,
             output_ty
         );
-        self.source.insert_str(declaration_start, &final_header);
+        // Large records need projections and recursors, not size or constructor
+        // injectivity theorems; generating the latter dominates Lean elaboration.
+        let record = if self.current_record {
+            let fields = self
+                .current_witnesses
+                .iter()
+                .map(|(name, ty)| format!("  {name} : {ty}\n"))
+                .collect::<String>();
+            format!(
+                "set_option genInjectivity false in\nset_option genSizeOf false in\nstructure {}.Witness where\n{fields}\n",
+                self.scopes[scope_id]
+            )
+        } else {
+            String::new()
+        };
+        if self.current_record {
+            let name = &self.scopes[scope_id];
+            let body_header =
+                final_header.replacen(&format!("def {name} "), &format!("abbrev {name}.body "), 1);
+            let witness_name =
+                if self.current_witnesses.is_empty() { "_witness" } else { "witness" };
+            let body_header = format!(
+                "{}({witness_name} : {name}.Witness) : Prop :=\n",
+                body_header.strip_suffix(": Prop :=\n").expect("scope header")
+            );
+            self.source
+                .insert_str(declaration_start, &(record + &constraint_definition + &body_header));
+            let mut wrapper_header = final_header
+                .replace("(_ : MxxRuntime.HashModel)", "(hashModel : MxxRuntime.HashModel)");
+            let backend = if self.requires_backend { "backend " } else { "" };
+            let hash = if self.requires_hash_model { "hashModel " } else { "" };
+            let input = if inputs.is_empty() { "()" } else { "inputs" };
+            let loop_names = scope_loop_slots(self.graph, scope_id)
+                .into_iter()
+                .map(|slot| format!("i_{slot}"))
+                .collect::<Vec<_>>();
+            if !loop_binders.is_empty() {
+                let named_binders =
+                    loop_names.iter().map(|name| format!(" ({name} : Nat)")).collect::<String>();
+                wrapper_header = wrapper_header.replacen(&loop_binders, &named_binders, 1);
+            }
+            let loop_arguments =
+                loop_names.iter().map(|name| format!("{name} ")).collect::<String>();
+            self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness\n\n"));
+        } else {
+            self.source.insert_str(declaration_start, &(constraint_definition + &final_header));
+        }
         Ok(())
+    }
+
+    fn scope_constraints(
+        &self,
+        scope_id: &FrozenGraphScopeId,
+        body: &str,
+        output_ty: &str,
+        part: usize,
+    ) -> (String, String) {
+        // Quoted parameter fields and string payloads are not local variables. In
+        // particular params.«backend» must not introduce a free backend argument.
+        let mut literal_end = None;
+        let mut escaped = false;
+        let identifiers = body
+            .chars()
+            .map(|character| {
+                if let Some(end) = literal_end {
+                    if escaped {
+                        escaped = false;
+                    } else if end == '"' && character == '\\' {
+                        escaped = true;
+                    } else if character == end {
+                        literal_end = None;
+                    }
+                    ' '
+                } else if character == '«' || character == '"' {
+                    literal_end = Some(if character == '«' { '»' } else { '"' });
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let referenced = identifiers
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .collect::<BTreeSet<_>>();
+        let mut constraint_arguments = Vec::new();
+        if referenced.contains("backend") {
+            constraint_arguments
+                .push(("backend".to_owned(), "MxxRuntime.BackendContext".to_owned()));
+        }
+        if referenced.contains("hashModel") {
+            constraint_arguments.push(("hashModel".to_owned(), "MxxRuntime.HashModel".to_owned()));
+        }
+        if referenced.contains("params") {
+            constraint_arguments.push(("params".to_owned(), "Params".to_owned()));
+        }
+        for slot in scope_loop_slots(self.graph, scope_id) {
+            let name = format!("i_{slot}");
+            if referenced.contains(name.as_str()) {
+                constraint_arguments.push((name, "Nat".to_owned()));
+            }
+        }
+        constraint_arguments.extend(
+            self.current_scope_values
+                .iter()
+                .filter(|(name, _)| referenced.contains(name.as_str()))
+                .cloned(),
+        );
+        constraint_arguments.push(("outputs".to_owned(), output_ty.to_owned()));
+        let constraint_name = format!("{}.constraints_{part}", self.scopes[scope_id]);
+        let constraint_header = constraint_arguments
+            .iter()
+            .map(|(name, ty)| format!("({name} : {ty})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let constraint_call = constraint_arguments
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let constraint_definition = format!(
+            "abbrev {constraint_name} {constraint_header} : Prop :=\n  {}\n\n",
+            indent_continuation(body, 1)
+        );
+        (constraint_definition, format!("{constraint_name} {constraint_call}"))
     }
 
     fn emit_node(
@@ -811,6 +1041,44 @@ impl<'a> Emitter<'a> {
                     ConstantMatrix::Zero => format!("(0 : {ty})"),
                     ConstantMatrix::Identity if matrix.rows == matrix.columns => {
                         format!("(1 : {ty})")
+                    }
+                    ConstantMatrix::UnitRow { index } if matrix.rows == 1 => {
+                        append_expression_guards(index, env, relations);
+                        relations.push(format!("0 ≤ ({})", env.expr(index)));
+                        relations.push(format!("({}) < {}", env.expr(index), matrix.columns));
+                        format!("(MxxRuntime.unitRow ({}) : {ty})", env.expr(index))
+                    }
+                    ConstantMatrix::UnitColumn { index } if matrix.columns == 1 => {
+                        append_expression_guards(index, env, relations);
+                        relations.push(format!("0 ≤ ({})", env.expr(index)));
+                        relations.push(format!("({}) < {}", env.expr(index), matrix.rows));
+                        format!("(MxxRuntime.unitColumn ({}) : {ty})", env.expr(index))
+                    }
+                    ConstantMatrix::PowerOfBase { base, exponent }
+                        if matrix.rows == 1 && matrix.columns == 1 =>
+                    {
+                        append_expression_guards(base, env, relations);
+                        append_expression_guards(exponent, env, relations);
+                        relations.push(format!("0 ≤ ({})", env.expr(exponent)));
+                        relations.push(format!("({}) ≤ 4294967295", env.expr(exponent)));
+                        format!(
+                            "({} (({}) ^ ({}).toNat) : {ty})",
+                            self.options.primitives.lift_integer,
+                            env.expr(base),
+                            env.expr(exponent)
+                        )
+                    }
+                    ConstantMatrix::Rotation { exponent }
+                        if matrix.rows == 1 && matrix.columns == 1 =>
+                    {
+                        append_expression_guards(exponent, env, relations);
+                        relations.push(format!("0 ≤ ({})", env.expr(exponent)));
+                        relations.push(format!(
+                            "({}) < {}",
+                            env.expr(exponent),
+                            matrix.ring_dimension
+                        ));
+                        format!("(MxxRuntime.rotationPolynomial ({}) : {ty})", env.expr(exponent))
                     }
                     ConstantMatrix::Polynomial { coefficients }
                         if matrix.rows == 1 && matrix.columns == 1 =>
@@ -1149,6 +1417,55 @@ impl<'a> Emitter<'a> {
                     ],
                 );
             }
+            NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
+                append_expression_guards(modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let relation = if matches!(kind, NodeKind::ModulusSwitch { .. }) {
+                    &self.options.primitives.modulus_switch
+                } else {
+                    &self.options.primitives.modulus_reduce
+                };
+                relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+            }
+            NodeKind::RingAutomorphism { index } => {
+                append_expression_guards(index, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} ({}) {} {}",
+                    self.options.primitives.ring_automorphism,
+                    env.expr(index),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::CrtRecompose { modulus, plaintext_moduli, reconstruction_coefficients } => {
+                append_expression_guards(modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let mut terms = Vec::new();
+                for (index, (plain, coefficient)) in
+                    plaintext_moduli.iter().zip(reconstruction_coefficients).enumerate()
+                {
+                    append_expression_guards(plain, env, relations);
+                    append_expression_guards(coefficient, env, relations);
+                    relations.push(format!("0 < ({})", env.expr(plain)));
+                    terms.push(format!(
+                        "{} ({}) ({}) {}",
+                        self.options.primitives.crt_recompose,
+                        env.expr(plain),
+                        env.expr(coefficient),
+                        arg(index)?
+                    ));
+                }
+                relations.push(format!(
+                    "{} = {}",
+                    output(0),
+                    terms
+                        .into_iter()
+                        .map(|term| format!("({term})"))
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                ));
+            }
             NodeKind::MatrixMulAccumulate { .. } => {
                 return self.unsupported(
                     scope_id,
@@ -1297,18 +1614,44 @@ impl<'a> Emitter<'a> {
                     output(0)
                 ));
             }
+            NodeKind::LiftIntegerToConstantPolynomial { .. } => {
+                self.let_output(
+                    &output(0),
+                    &format!("{} {}", self.options.primitives.lift_integer, arg(0)?),
+                );
+            }
+            NodeKind::PackPolynomialCoefficients { coefficient_bits, .. } => {
+                append_expression_guards(coefficient_bits, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} ({}) {} {}",
+                    self.options.primitives.pack_polynomial,
+                    env.expr(coefficient_bits),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::Tensor => {
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "MxxRuntime.tensorRuns {} {} {}",
+                    arg(0)?,
+                    arg(1)?,
+                    output(0)
+                ));
+            }
             NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
                 append_expression_guards(plaintext_modulus, env, relations);
                 append_expression_guards(length, env, relations);
                 let count = scope.node(node_id).expect("decoder node").output_types().len();
-                relations.push(format!("{} = {count}", env.expr(length)));
+                relations.push(format!("({}) = {count}", env.expr(length)));
                 for port in 0..count {
                     let name = output(port as u32);
                     let decoded =
                         if *output_bool { format!("{name}_decoded") } else { name.clone() };
                     self.bind_existential(&decoded, "Int");
                     relations.push(format!(
-                        "{} {} {} {port} {} {decoded}",
+                        "{} ({}) ({}) {port} {} {decoded}",
                         self.options.primitives.threshold_decode,
                         env.expr(plaintext_modulus),
                         env.expr(length),
@@ -1319,13 +1662,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            NodeKind::IntToReal |
-            NodeKind::RealBinary(_) |
-            NodeKind::RealSqrt |
-            NodeKind::LiftIntegerToConstantPolynomial { .. } |
-            NodeKind::CrtRecompose { .. } |
-            NodeKind::PackPolynomialCoefficients { .. } |
-            NodeKind::Tensor => {
+            NodeKind::IntToReal | NodeKind::RealBinary(_) | NodeKind::RealSqrt => {
                 return self.unsupported(
                     scope_id,
                     node_id,
@@ -1376,7 +1713,8 @@ impl<'a> Emitter<'a> {
                         )
                     }
                 };
-                relations.push(format!("0 ≤ {} ∧ {} < {}", index, index, family_count));
+                relations.push(format!("0 ≤ {}", index));
+                relations.push(format!("{} < {}", index, family_count));
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
                 relations.push(format!(
                     "{} {} {} {}",
@@ -1391,7 +1729,8 @@ impl<'a> Emitter<'a> {
                 append_expression_guards(count, env, relations);
                 let branches =
                     args.iter().skip(1).map(|wire| wire_name(*wire)).collect::<Vec<_>>().join(", ");
-                relations.push(format!("0 ≤ {} ∧ {} < {}", selector, selector, env.expr(count)));
+                relations.push(format!("0 ≤ {}", selector));
+                relations.push(format!("{} < {}", selector, env.expr(count)));
                 relations.push(format!("{} = {}", env.expr(count), args.len() - 1));
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
                 relations.push(format!(
@@ -1442,6 +1781,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn let_output(&mut self, name: &str, term: &str) {
+        self.current_value_expressions.insert(name.to_owned(), term.to_owned());
         let ty = &self.current_wire_types[name];
         let binder = if self.current_referenced_wires.contains(name) {
             name
@@ -1449,6 +1789,9 @@ impl<'a> Emitter<'a> {
             self.current_anonymous_lets.insert(name.into());
             "_"
         };
+        if binder != "_" {
+            self.current_scope_values.push((name.to_owned(), ty.clone()));
+        }
         self.source
             .push_str(&format!("{}let {binder} : {ty} := {term}\n", "  ".repeat(self.indent)));
     }
@@ -1562,8 +1905,18 @@ impl<'a> Emitter<'a> {
         Ok(layout.clone())
     }
     fn bind_existential(&mut self, name: &str, ty: &str) {
-        self.source.push_str(&format!("{}∃ ({} : {}),\n", "  ".repeat(self.indent), name, ty));
-        self.indent += 1;
+        self.current_value_expressions.insert(
+            name.to_owned(),
+            if self.current_record { format!("witness.{name}") } else { name.to_owned() },
+        );
+        self.current_scope_values.push((name.to_owned(), ty.to_owned()));
+        self.current_witnesses.push((name.to_owned(), ty.to_owned()));
+        if self.current_record {
+            self.source.push_str(&format!("  let {name} := witness.{name}\n"));
+        } else {
+            self.source.push_str(&format!("{}∃ ({} : {}),\n", "  ".repeat(self.indent), name, ty));
+            self.indent += 1;
+        }
     }
     fn output_type(&self, scope: &GraphScope, node: NodeId, port: u32) -> String {
         let wire = WireRef { node, port: crate::types::Port(port) };
@@ -1587,7 +1940,9 @@ impl<'a> Emitter<'a> {
                 (env.expr(&range.start), env.expr(&range.end))
             })
             .unwrap_or_else(|| ("0".into(), extent.to_string()));
-        relations.push(format!("0 ≤ {} ∧ {} < {} ∧ {} ≤ {}", start, start, end, end, extent));
+        relations.push(format!("0 ≤ {}", start));
+        relations.push(format!("{} < {}", start, end));
+        relations.push(format!("{} ≤ {}", end, extent));
         (start, end)
     }
     fn sample_one(
@@ -2061,6 +2416,38 @@ mod tests {
     }
 
     #[test]
+    fn export_supports_integer_expression_semantics() {
+        for (expression, expected) in [
+            (IntExpr::FloorDiv(Box::new(7.into()), Box::new(2.into())), "Int.fdiv (7) (2)"),
+            (IntExpr::Rem(Box::new(7.into()), Box::new(2.into())), "Int.fmod (7) (2)"),
+            (
+                IntExpr::Select { selector: Box::new(0.into()), branches: vec![7.into()] },
+                "MxxIR.selectInt (0) [(7)]",
+            ),
+        ] {
+            let value = NodeHandle::new(
+                NodeKind::EvaluateInt(expression),
+                vec![],
+                vec![WireType::ConstantInt],
+            )
+            .output(0)
+            .unwrap();
+            let (graph, _) = Graph::freeze(
+                "supported-expression",
+                vec![],
+                BTreeMap::from([("value".into(), GraphOutput { value, confidentiality: None })]),
+                vec![],
+                vec![],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+            let artifact = export(&validated, &ExportOptions::default()).unwrap();
+            assert!(artifact.source.contains(expected));
+        }
+    }
+
+    #[test]
     fn export_boundary_preserves_retained_roots_and_output_aliases() {
         let x = scalar_input("source");
         let retained =
@@ -2093,6 +2480,76 @@ mod tests {
         assert_eq!(artifact.root.relation, "Generated.generatedRoot");
         assert_eq!(artifact.root.parameter_type, "Generated.Params");
         assert_eq!(artifact.root.parameters["unit"].root_value.as_deref(), Some("()"));
+    }
+
+    #[test]
+    fn export_refresh_transforms_with_heterogeneous_crt_sources() {
+        let matrix = |modulus| MatrixType {
+            modulus: IntExpr::constant(modulus),
+            ring_dimension: IntExpr::constant(2),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let source = NodeHandle::new(
+            NodeKind::ConstantMatrix {
+                matrix_type: matrix(45),
+                value: ConstantMatrix::Polynomial {
+                    coefficients: vec![IntExpr::constant(44), IntExpr::constant(23)],
+                },
+            },
+            vec![],
+            vec![WireType::Matrix(matrix(45))],
+        )
+        .output(0)
+        .unwrap();
+        let switched = NodeHandle::new(
+            NodeKind::ModulusSwitch { modulus: IntExpr::constant(15) },
+            vec![source.clone()],
+            vec![WireType::Matrix(matrix(15))],
+        )
+        .output(0)
+        .unwrap();
+        let reduced = NodeHandle::new(
+            NodeKind::ModulusReduce { modulus: IntExpr::constant(5) },
+            vec![source],
+            vec![WireType::Matrix(matrix(5))],
+        )
+        .output(0)
+        .unwrap();
+        let conjugate = NodeHandle::new(
+            NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
+            vec![reduced],
+            vec![WireType::Matrix(matrix(5))],
+        )
+        .output(0)
+        .unwrap();
+        let value = NodeHandle::new(
+            NodeKind::CrtRecompose {
+                modulus: IntExpr::constant(45),
+                plaintext_moduli: vec![IntExpr::constant(3), IntExpr::constant(5)],
+                reconstruction_coefficients: vec![IntExpr::constant(10), IntExpr::constant(6)],
+            },
+            vec![switched, conjugate],
+            vec![WireType::Matrix(matrix(45))],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "refresh_transforms",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("modulusSwitchRuns"));
+        assert!(artifact.source.contains("modulusReduceRuns"));
+        assert!(artifact.source.contains("ringAutomorphismRuns"));
+        assert_eq!(artifact.source.matches("crtRecomposeLevel").count(), 2);
+        assert!(artifact.source.contains("abbrev generatedRoot.constraints"));
     }
 
     #[test]
@@ -2132,7 +2589,7 @@ mod tests {
         .unwrap();
         let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
-        assert!(artifact.source.contains("matrixPolynomial [(-3), (MxxIR.exactDiv 8 2)]"));
+        assert!(artifact.source.contains("matrixPolynomial [(-3), (MxxIR.exactDiv (8) (2))]"));
         let normalized = artifact.source.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized.contains("2 ≠ 0 ∧ 8 % 2 = 0"));
     }
@@ -2299,6 +2756,46 @@ mod tests {
         assert!(artifact.source.contains("(_ : Unit)"));
         assert!(artifact.source.contains("scope_zero_input params ()"));
         assert!(artifact.source.contains("(inputs : Int)"));
+    }
+
+    #[test]
+    fn expression_selection_guards_only_the_selected_branch() {
+        let env = LexicalEnv::default();
+        let expression = IntExpr::Select {
+            selector: Box::new(IntExpr::constant(0)),
+            branches: vec![
+                IntExpr::constant(7),
+                IntExpr::FloorDiv(Box::new(IntExpr::constant(-3)), Box::new(IntExpr::constant(0))),
+            ],
+        };
+        assert_eq!(expression.evaluate(&ParamEnv::default()).unwrap(), BigInt::from(7));
+        assert_eq!(
+            expression_guards(&expression, &env),
+            vec!["0 ≤ (0)", "(0) < 2", "((0) = 1 → ((0) ≠ 0))"]
+        );
+        assert!(env.expr(&expression).contains("Int.fdiv"));
+        let value =
+            NodeHandle::new(NodeKind::EvaluateInt(expression), vec![], vec![WireType::ConstantInt])
+                .output(0)
+                .unwrap();
+        let (graph, _) = Graph::freeze(
+            "lazy_select",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        let normalized = artifact.source.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("((0) = 1 → ((0) ≠ 0)) ∧ outputs ="));
+
+        let remainder =
+            IntExpr::Rem(Box::new(IntExpr::constant(3)), Box::new(IntExpr::constant(-2)));
+        assert_eq!(remainder.evaluate(&ParamEnv::default()).unwrap(), BigInt::from(-1));
+        assert_eq!(env.expr(&remainder), "Int.fmod (3) (-2)");
     }
 
     #[test]
@@ -2552,6 +3049,97 @@ mod tests {
     }
 
     #[test]
+    fn export_parenthesizes_nested_integer_helper_arguments() {
+        let c = IntExpr::constant;
+        let expressions = [
+            IntExpr::Div(
+                Box::new(IntExpr::FloorDiv(Box::new(c(8)), Box::new(c(2)))),
+                Box::new(c(2)),
+            ),
+            IntExpr::RoundDiv(
+                Box::new(IntExpr::Rem(Box::new(c(7)), Box::new(c(4)))),
+                Box::new(c(2)),
+            ),
+            IntExpr::Log2Ceil(Box::new(IntExpr::Select {
+                selector: Box::new(c(0)),
+                branches: vec![
+                    IntExpr::FloorDiv(Box::new(c(16)), Box::new(c(2))),
+                    IntExpr::Div(Box::new(c(1)), Box::new(c(0))),
+                ],
+            })),
+        ];
+        let expected = [2, 2, 3];
+        let outputs = expressions
+            .into_iter()
+            .zip(expected)
+            .enumerate()
+            .map(|(index, (expr, expected))| {
+                assert_eq!(expr.evaluate(&ParamEnv::default()).unwrap(), BigInt::from(expected));
+                let value = NodeHandle::new(
+                    NodeKind::EvaluateInt(expr),
+                    vec![],
+                    vec![WireType::ConstantInt],
+                )
+                .output(0)
+                .unwrap();
+                (format!("out{index}"), GraphOutput { value, confidentiality: None })
+            })
+            .collect();
+        let (graph, _) =
+            Graph::freeze("nested_helpers", vec![], outputs, vec![], vec![], BTreeMap::new())
+                .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("MxxIR.exactDiv (Int.fdiv (8) (2)) (2)"));
+        assert!(artifact.source.contains("MxxIR.roundDiv (Int.fmod (7) (4)) (2)"));
+        assert!(artifact.source.contains("MxxIR.log2Ceil (MxxIR.selectInt"));
+    }
+
+    #[test]
+    fn constraint_suffixes_preserve_all_guards_and_ignore_quoted_fields() {
+        let outputs = (0..33)
+            .map(|index| {
+                let value = NodeHandle::new(
+                    NodeKind::EvaluateInt(IntExpr::FloorDiv(
+                        Box::new(IntExpr::constant(index)),
+                        Box::new(IntExpr::Var("backend".into())),
+                    )),
+                    vec![],
+                    vec![WireType::ConstantInt],
+                )
+                .output(0)
+                .unwrap();
+                (format!("out{index:02}"), GraphOutput { value, confidentiality: None })
+            })
+            .collect();
+        let (graph, _) = Graph::freeze(
+            "constraint_suffixes",
+            vec![CompileParameter {
+                name: "backend".into(),
+                kind: crate::graph::CompileParameterKind::Integer,
+            }],
+            outputs,
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let mut bindings = ParamEnv::default();
+        bindings.integers.insert("backend".into(), 1.into());
+        let validated = crate::validate(&graph, &bindings).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert_eq!(artifact.source.matches("(params.«backend») ≠ 0").count(), 33);
+        assert!(artifact.source.contains("abbrev generatedRoot.constraints_1"));
+        assert!(!artifact.source.contains("(backend : MxxRuntime.BackendContext)"));
+        assert_eq!(artifact.scope_relations[&FrozenGraphScopeId::Root], artifact.root.relation);
+        let proof = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
+        assert_eq!(proof.witness_record.as_deref(), Some("Generated.generatedRoot.Witness"));
+        assert_eq!(proof.constraint_count, 33);
+        assert!(proof.witnesses.is_empty());
+        assert_eq!(proof.node_constraints.values().map(|range| range.len()).sum::<usize>(), 33);
+    }
+
+    #[test]
     fn export_emits_exact_division_and_remainder_guards() {
         let expr =
             IntExpr::Div(Box::new(IntExpr::constant(-6)), Box::new(IntExpr::Var("den".into())));
@@ -2575,7 +3163,7 @@ mod tests {
         bindings.integers.insert("den".into(), BigInt::from(3));
         let validated = crate::validate(&graph, &bindings).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
-        assert!(artifact.source.contains("MxxIR.exactDiv -6 params.«den»"));
+        assert!(artifact.source.contains("MxxIR.exactDiv (-6) (params.«den»)"));
         assert!(
             artifact.source.contains("params.«den» ≠ 0") &&
                 artifact.source.contains("-6 % params.«den» = 0")
@@ -2610,6 +3198,74 @@ mod tests {
             export(&validated, &ExportOptions::default()),
             Err(ExportError::ScopeNameCollision(name)) if name == "scope_a_b"
         ));
+    }
+
+    #[test]
+    fn scope_projection_metadata_matches_slice_and_following_node() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(2),
+            rows: IntExpr::constant(2),
+            columns: IntExpr::constant(2),
+        };
+        let input = NodeHandle::new(
+            NodeKind::ConstantMatrix { matrix_type: matrix.clone(), value: ConstantMatrix::Zero },
+            vec![],
+            vec![WireType::Matrix(matrix.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let sliced_type = MatrixType { rows: IntExpr::constant(1), ..matrix };
+        let slice = NodeHandle::new(
+            NodeKind::Slice {
+                rows: Some(IndexRange { start: IntExpr::constant(0), end: IntExpr::constant(1) }),
+                columns: None,
+            },
+            vec![input],
+            vec![WireType::Matrix(sliced_type.clone())],
+        )
+        .output(0)
+        .unwrap();
+        let result = NodeHandle::new(
+            NodeKind::RingAutomorphism { index: IntExpr::constant(1) },
+            vec![slice],
+            vec![WireType::Matrix(sliced_type)],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "slice_projections",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: result, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        let proof = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
+        assert_eq!(proof.node_constraints[&NodeId(1)], 0..7);
+        assert_eq!(proof.node_constraints[&NodeId(2)], 7..8);
+        assert_eq!(proof.body_relation.as_deref(), Some("Generated.generatedRoot.body"));
+        assert_eq!(proof.value_expressions["w_1_0"], "witness.w_1_0");
+        assert_eq!(proof.constraint_count, 8);
+        let projection = |position: usize, last: bool| {
+            format!("h{}{}", ".2".repeat(position), if last { "" } else { ".1" })
+        };
+        let mut fixture = format!(
+            "{}\ntheorem sliceProjectionForward (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2)\n    (h : Generated.generatedRoot params () output) :\n    ∃ sliced transformed : Mxx.Primitives.ExactMatrix 17 2 1 2,\n      MxxRuntime.sliceMatrix (0 : Mxx.Primitives.ExactMatrix 17 2 2 2) 0 1 0 2 sliced ∧\n      MxxRuntime.ringAutomorphismRuns 1 sliced transformed ∧ output = transformed := by\n  obtain ⟨witness, h⟩ := h\n  rcases witness with ⟨sliced, transformed⟩\n  exact ⟨sliced, transformed, {}, {}, {}⟩\n",
+            artifact.source,
+            projection(proof.node_constraints[&NodeId(1)].end - 1, false),
+            projection(proof.node_constraints[&NodeId(2)].start, false),
+            projection(proof.constraint_count, true)
+        );
+        fixture.push_str("\nexample (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2) :\n    Generated.generatedRoot params () output ↔\n    ∃ sliced transformed : Mxx.Primitives.ExactMatrix 17 2 1 2,\n      MxxRuntime.sliceMatrix (0 : Mxx.Primitives.ExactMatrix 17 2 2 2) 0 1 0 2 sliced ∧\n      MxxRuntime.ringAutomorphismRuns 1 sliced transformed ∧ output = transformed := by\n  constructor\n  · exact sliceProjectionForward params output\n  · rintro ⟨sliced, transformed, hs, ht, ho⟩\n    exact ⟨⟨sliced, transformed⟩, by decide, by decide, by decide, by decide, by decide, by decide, hs, ht, ho⟩\n");
+        fixture.push_str("\nexample (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2) :\n    Generated.generatedRoot params () output ↔ ∃ witness, Generated.generatedRoot.body params () output witness := Iff.rfl\n");
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_scope_projections");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("SliceProjections.lean"), fixture).unwrap();
     }
 
     #[test]

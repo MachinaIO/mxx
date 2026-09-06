@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn mixed_public_input_satisfies_the_btvw17_key_equation_at_runtime() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let ring = Ring::new(
             num_bigint::BigInt::from(parameters.modulus().as_ref().clone()),

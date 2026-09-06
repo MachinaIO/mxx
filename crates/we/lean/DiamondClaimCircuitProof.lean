@@ -142,10 +142,12 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
       external.input_5 external.input_6 external.input_0 external.input_1 external.input_2
       external.input_3 external.input_4 rfl hreq
   dsimp only [Stage_decrypt.generatedRoot] at hdec
-  rcases hdec with ⟨w2, w3, w5, w6, w8, state, w19, w24, w26, w27, w28, w29,
+  obtain ⟨rootWitness, h⟩ := hdec
+  rcases rootWitness with ⟨w2, w3, w5, w6, w8, state, w19, w24, w26, w27, w28, w29,
     w31, w32, w33, w35, w36, w37, w38, w40, w42, w43, w44, w45, w46, w47,
     w48, w49, w50, w53, w54, w55, w56, w57, w58, w59, w60, w61, w62,
-    w67a, w67b, w67c, w70, circuit, coefficient, h⟩
+    w67a, w67b, w67c, w70, circuit, coefficient⟩
+  dsimp only [Stage_decrypt.generatedRoot.body, Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
   rcases h with ⟨_, _, _, _, h3, _, h5, _, _, _, _, hstate,
     _, h19, _, h24, _, h26, _, h27, _, h28, _, h29, _, h31, _, h32,
     _, h33, _, h35, _, h36, _, h37, _, h38, h40, _, h42, _, h43, _, h44,
@@ -258,11 +260,13 @@ theorem generated_claim_accepting_ciphertext {hashModel external execution}
     external.input_0 external.input_1 external.input_2 external.input_3
     (state * execution.stage_0.2.2.2.1) w40 1 hone (by simp) hinitial hloop
   dsimp only [Stage_encrypt.generatedRoot] at henc
-  rcases henc with ⟨e0, e1, et1, e2, et2, ebase, etrapdoor, e6, euniform, e8,
+  obtain ⟨rootWitness, eh⟩ := henc
+  rcases rootWitness with ⟨e0, e1, et1, e2, et2, ebase, etrapdoor, e6, euniform, e8,
     epublicInputs, eone, e19, e20, e26, e27, e32, e35, eCircuit, e38, etarget,
     edigits, edecoderTarget, edecoder, e46, e51, e52, e53, e55, ekeyTarget,
     ekey, egadget, eoneTarget, eonePreimage, e65, e66, et66, e67, e68, e69,
-    e70, e71, e72, e73, e74, e75, et75, e76, e77, e78, eh⟩
+    e70, e71, e72, e73, e74, e75, et75, e76, e77, e78⟩
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at eh
   have heoutputs : execution.stage_0.2.2.2.2.1 = epublicInputs ∧
       execution.stage_0.2.2.2.2.2.2.2.2.2.1 = eCircuit := by
     have hh := eh

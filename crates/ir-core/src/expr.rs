@@ -16,8 +16,11 @@ pub enum IntExpr {
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
     Div(Box<Self>, Box<Self>),
+    FloorDiv(Box<Self>, Box<Self>),
+    Rem(Box<Self>, Box<Self>),
     RoundDiv(Box<Self>, Box<Self>),
     Log2Ceil(Box<Self>),
+    Select { selector: Box<Self>, branches: Vec<Self> },
 }
 
 impl Serialize for IntExpr {
@@ -36,8 +39,11 @@ enum IntExprRepr {
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
     Div(Box<Self>, Box<Self>),
+    FloorDiv(Box<Self>, Box<Self>),
+    Rem(Box<Self>, Box<Self>),
     RoundDiv(Box<Self>, Box<Self>),
     Log2Ceil(Box<Self>),
+    Select { selector: Box<Self>, branches: Vec<Self> },
 }
 
 impl From<IntExpr> for IntExprRepr {
@@ -58,10 +64,20 @@ impl From<IntExpr> for IntExprRepr {
             IntExpr::Div(lhs, rhs) => {
                 Self::Div(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
             }
+            IntExpr::FloorDiv(lhs, rhs) => {
+                Self::FloorDiv(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
+            }
+            IntExpr::Rem(lhs, rhs) => {
+                Self::Rem(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
+            }
             IntExpr::RoundDiv(lhs, rhs) => {
                 Self::RoundDiv(Box::new(Self::from(*lhs)), Box::new(Self::from(*rhs)))
             }
             IntExpr::Log2Ceil(value) => Self::Log2Ceil(Box::new(Self::from(*value))),
+            IntExpr::Select { selector, branches } => Self::Select {
+                selector: Box::new(Self::from(*selector)),
+                branches: branches.into_iter().map(Self::from).collect(),
+            },
         }
     }
 }
@@ -95,6 +111,364 @@ pub struct ParamEnv {
     pub loop_indices: BTreeMap<u32, BigInt>,
 }
 
+/// A deterministic, typed index program used by rank-N family operations.
+///
+/// Unlike [`IntExpr`], index programs are normalized structurally rather than
+/// as algebraic polynomials. This keeps axis positions and scoped loop slots
+/// explicit in the frozen IR while still making serialization deterministic.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize)]
+#[serde(tag = "tag", content = "value")]
+pub enum IndexExpr {
+    Axis(usize),
+    Parameter(String),
+    LoopIndex(u32),
+    Constant(#[serde(with = "serde_support::bigint")] BigInt),
+    Add(Box<Self>, Box<Self>),
+    Subtract(Box<Self>, Box<Self>),
+    Multiply(Box<Self>, Box<Self>),
+    /// Exact division, rejecting a nonzero remainder.
+    Divide(Box<Self>, Box<Self>),
+    FloorDivide(Box<Self>, Box<Self>),
+    Remainder(Box<Self>, Box<Self>),
+    Equal(Box<Self>, Box<Self>),
+    Less(Box<Self>, Box<Self>),
+    LessEqual(Box<Self>, Box<Self>),
+    Log2Ceil(Box<Self>),
+    Select {
+        selector: Box<Self>,
+        branches: Vec<Self>,
+    },
+}
+
+impl Serialize for IndexExpr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.normalize().serialize_inner(serializer)
+    }
+}
+
+impl IndexExpr {
+    pub fn constant(value: impl Into<BigInt>) -> Self {
+        Self::Constant(value.into())
+    }
+
+    /// Resolves parameters and loop slots, then folds concrete arithmetic.
+    pub fn evaluate(&self, env: &ParamEnv) -> Result<BigInt, ExprError> {
+        match self {
+            Self::Axis(axis) => Ok(BigInt::from(*axis)),
+            Self::Parameter(name) => env
+                .integers
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ExprError::UnboundVariable(name.clone())),
+            Self::LoopIndex(slot) => env
+                .loop_indices
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| ExprError::UnboundVariable(format!("loop-index[{slot}]"))),
+            Self::Constant(value) => Ok(value.clone()),
+            Self::Add(lhs, rhs) => Ok(lhs.evaluate(env)? + rhs.evaluate(env)?),
+            Self::Subtract(lhs, rhs) => Ok(lhs.evaluate(env)? - rhs.evaluate(env)?),
+            Self::Multiply(lhs, rhs) => Ok(lhs.evaluate(env)? * rhs.evaluate(env)?),
+            Self::Divide(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                let numerator = lhs.evaluate(env)?;
+                let (quotient, remainder) = numerator.div_rem(&denominator);
+                if !remainder.is_zero() {
+                    return Err(ExprError::InexactDivision { numerator, denominator });
+                }
+                Ok(quotient)
+            }
+            Self::FloorDivide(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)?.div_floor(&denominator))
+            }
+            Self::Remainder(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)?.mod_floor(&denominator))
+            }
+            Self::Equal(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? == rhs.evaluate(env)?)),
+            Self::Less(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? < rhs.evaluate(env)?)),
+            Self::LessEqual(lhs, rhs) => Ok(BigInt::from(lhs.evaluate(env)? <= rhs.evaluate(env)?)),
+            Self::Log2Ceil(value) => {
+                let value = value.evaluate(env)?;
+                let value = value.to_biguint().ok_or_else(|| {
+                    ExprError::UnboundVariable("log2ceil argument must be positive".into())
+                })?;
+                if value.is_zero() {
+                    return Err(ExprError::UnboundVariable(
+                        "log2ceil argument must be positive".into(),
+                    ));
+                }
+                let floor = value.bits() - 1;
+                Ok(BigInt::from(if value == (num_bigint::BigUint::one() << floor as usize) {
+                    floor
+                } else {
+                    floor + 1
+                }))
+            }
+            Self::Select { selector, branches } => {
+                let index = selector.evaluate(env)?.to_usize().ok_or_else(|| {
+                    ExprError::UnboundVariable("index selector is not a nonnegative usize".into())
+                })?;
+                branches
+                    .get(index)
+                    .ok_or_else(|| {
+                        ExprError::UnboundVariable("index selector out of range".into())
+                    })?
+                    .evaluate(env)
+            }
+        }
+    }
+
+    /// Performs only fixed structural normalization and constant folding.
+    pub fn normalize(&self) -> Self {
+        fn fold(expr: &IndexExpr) -> IndexExpr {
+            let result = match expr {
+                IndexExpr::Axis(axis) => IndexExpr::Axis(*axis),
+                IndexExpr::Parameter(name) => IndexExpr::Parameter(name.clone()),
+                IndexExpr::LoopIndex(slot) => IndexExpr::LoopIndex(*slot),
+                IndexExpr::Constant(value) => IndexExpr::Constant(value.clone()),
+                IndexExpr::Add(lhs, rhs) => binary(lhs, rhs, |a, b| a + b, IndexExpr::Add),
+                IndexExpr::Subtract(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| a - b, IndexExpr::Subtract)
+                }
+                IndexExpr::Multiply(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| a * b, IndexExpr::Multiply)
+                }
+                IndexExpr::Divide(lhs, rhs) => binary_checked(
+                    lhs,
+                    rhs,
+                    |a, b| {
+                        let (quotient, remainder) = a.div_rem(&b);
+                        remainder.is_zero().then_some(quotient)
+                    },
+                    IndexExpr::Divide,
+                ),
+                IndexExpr::FloorDivide(lhs, rhs) => {
+                    binary_checked(lhs, rhs, |a, b| Some(a.div_floor(&b)), IndexExpr::FloorDivide)
+                }
+                IndexExpr::Remainder(lhs, rhs) => {
+                    binary_checked(lhs, rhs, |a, b| Some(a.mod_floor(&b)), IndexExpr::Remainder)
+                }
+                IndexExpr::Equal(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| BigInt::from(a == b), IndexExpr::Equal)
+                }
+                IndexExpr::Less(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| BigInt::from(a < b), IndexExpr::Less)
+                }
+                IndexExpr::LessEqual(lhs, rhs) => {
+                    binary(lhs, rhs, |a, b| BigInt::from(a <= b), IndexExpr::LessEqual)
+                }
+                IndexExpr::Log2Ceil(value) => {
+                    let value = fold(value);
+                    match &value {
+                        IndexExpr::Constant(value) if value > &BigInt::zero() => {
+                            let bits = value.to_biguint().expect("positive").bits() - 1;
+                            IndexExpr::Constant(BigInt::from(
+                                if value.to_biguint().as_ref() ==
+                                    Some(&(num_bigint::BigUint::one() << bits as usize))
+                                {
+                                    bits
+                                } else {
+                                    bits + 1
+                                },
+                            ))
+                        }
+                        _ => IndexExpr::Log2Ceil(Box::new(value)),
+                    }
+                }
+                IndexExpr::Select { selector, branches } => {
+                    let selector = fold(selector);
+                    let branches = branches.iter().map(fold).collect::<Vec<_>>();
+                    match &selector {
+                        IndexExpr::Constant(index) => index_to_usize(index)
+                            .and_then(|index| branches.get(index))
+                            .cloned()
+                            .unwrap_or(IndexExpr::Select {
+                                selector: Box::new(selector),
+                                branches,
+                            }),
+                        _ => IndexExpr::Select { selector: Box::new(selector), branches },
+                    }
+                }
+            };
+            result
+        }
+        fn binary(
+            lhs: &IndexExpr,
+            rhs: &IndexExpr,
+            operation: impl FnOnce(BigInt, BigInt) -> BigInt,
+            build: impl FnOnce(Box<IndexExpr>, Box<IndexExpr>) -> IndexExpr,
+        ) -> IndexExpr {
+            let lhs = fold(lhs);
+            let rhs = fold(rhs);
+            match (&lhs, &rhs) {
+                (IndexExpr::Constant(lhs), IndexExpr::Constant(rhs)) => {
+                    IndexExpr::Constant(operation(lhs.clone(), rhs.clone()))
+                }
+                _ => build(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+        fn binary_checked(
+            lhs: &IndexExpr,
+            rhs: &IndexExpr,
+            operation: impl FnOnce(BigInt, BigInt) -> Option<BigInt>,
+            build: impl FnOnce(Box<IndexExpr>, Box<IndexExpr>) -> IndexExpr,
+        ) -> IndexExpr {
+            let lhs = fold(lhs);
+            let rhs = fold(rhs);
+            match (&lhs, &rhs) {
+                (IndexExpr::Constant(lhs), IndexExpr::Constant(rhs)) if !rhs.is_zero() => {
+                    match operation(lhs.clone(), rhs.clone()) {
+                        Some(value) => IndexExpr::Constant(value),
+                        None => build(
+                            Box::new(IndexExpr::Constant(lhs.clone())),
+                            Box::new(IndexExpr::Constant(rhs.clone())),
+                        ),
+                    }
+                }
+                _ => build(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+        fn index_to_usize(value: &BigInt) -> Option<usize> {
+            value.to_usize()
+        }
+        fold(self)
+    }
+
+    fn serialize_inner<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(tag = "tag", content = "value")]
+        enum Repr<'a> {
+            Axis(usize),
+            Parameter(&'a str),
+            LoopIndex(u32),
+            Constant(String),
+            Add(Box<Repr<'a>>, Box<Repr<'a>>),
+            Subtract(Box<Repr<'a>>, Box<Repr<'a>>),
+            Multiply(Box<Repr<'a>>, Box<Repr<'a>>),
+            Divide(Box<Repr<'a>>, Box<Repr<'a>>),
+            FloorDivide(Box<Repr<'a>>, Box<Repr<'a>>),
+            Remainder(Box<Repr<'a>>, Box<Repr<'a>>),
+            Equal(Box<Repr<'a>>, Box<Repr<'a>>),
+            Less(Box<Repr<'a>>, Box<Repr<'a>>),
+            LessEqual(Box<Repr<'a>>, Box<Repr<'a>>),
+            Log2Ceil(Box<Repr<'a>>),
+            Select { selector: Box<Repr<'a>>, branches: Vec<Repr<'a>> },
+        }
+        fn repr<'a>(value: &'a IndexExpr) -> Repr<'a> {
+            match value {
+                IndexExpr::Axis(axis) => Repr::Axis(*axis),
+                IndexExpr::Parameter(name) => Repr::Parameter(name),
+                IndexExpr::LoopIndex(slot) => Repr::LoopIndex(*slot),
+                IndexExpr::Constant(value) => Repr::Constant(value.to_string()),
+                IndexExpr::Add(lhs, rhs) => Repr::Add(Box::new(repr(lhs)), Box::new(repr(rhs))),
+                IndexExpr::Subtract(lhs, rhs) => {
+                    Repr::Subtract(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Multiply(lhs, rhs) => {
+                    Repr::Multiply(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Divide(lhs, rhs) => {
+                    Repr::Divide(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::FloorDivide(lhs, rhs) => {
+                    Repr::FloorDivide(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Remainder(lhs, rhs) => {
+                    Repr::Remainder(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Equal(lhs, rhs) => Repr::Equal(Box::new(repr(lhs)), Box::new(repr(rhs))),
+                IndexExpr::Less(lhs, rhs) => Repr::Less(Box::new(repr(lhs)), Box::new(repr(rhs))),
+                IndexExpr::LessEqual(lhs, rhs) => {
+                    Repr::LessEqual(Box::new(repr(lhs)), Box::new(repr(rhs)))
+                }
+                IndexExpr::Log2Ceil(value) => Repr::Log2Ceil(Box::new(repr(value))),
+                IndexExpr::Select { selector, branches } => Repr::Select {
+                    selector: Box::new(repr(selector)),
+                    branches: branches.iter().map(repr).collect(),
+                },
+            }
+        }
+        repr(self).serialize(serializer)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum IndexExprConversionError {
+    #[error("RoundDiv cannot be represented by IndexExpr")]
+    RoundDiv,
+}
+
+impl TryFrom<IntExpr> for IndexExpr {
+    type Error = IndexExprConversionError;
+
+    fn try_from(value: IntExpr) -> Result<Self, Self::Error> {
+        match value {
+            IntExpr::Const(value) => Ok(Self::Constant(value)),
+            IntExpr::Var(name) => Ok(Self::Parameter(name)),
+            IntExpr::LoopIndex(slot) => Ok(Self::LoopIndex(slot)),
+            IntExpr::Add(lhs, rhs) => {
+                Ok(Self::Add(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Sub(lhs, rhs) => {
+                Ok(Self::Subtract(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Mul(lhs, rhs) => {
+                Ok(Self::Multiply(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Div(lhs, rhs) => {
+                Ok(Self::Divide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::FloorDiv(lhs, rhs) => {
+                Ok(Self::FloorDivide(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::Rem(lhs, rhs) => {
+                Ok(Self::Remainder(Box::new((*lhs).try_into()?), Box::new((*rhs).try_into()?)))
+            }
+            IntExpr::RoundDiv(_, _) => Err(IndexExprConversionError::RoundDiv),
+            IntExpr::Log2Ceil(value) => Ok(Self::Log2Ceil(Box::new((*value).try_into()?))),
+            IntExpr::Select { selector, branches } => Ok(Self::Select {
+                selector: Box::new((*selector).try_into()?),
+                branches: branches.into_iter().map(TryInto::try_into).collect::<Result<_, _>>()?,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize)]
+pub struct IndexMap {
+    pub input_indices: Vec<IndexExpr>,
+}
+
+impl Serialize for IndexMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Repr {
+            input_indices: Vec<IndexExpr>,
+        }
+        Repr { input_indices: self.normalize().input_indices }.serialize(serializer)
+    }
+}
+
+impl IndexMap {
+    pub fn new(input_indices: impl Into<Vec<IndexExpr>>) -> Self {
+        Self { input_indices: input_indices.into() }
+    }
+
+    pub fn normalize(&self) -> Self {
+        Self { input_indices: self.input_indices.iter().map(IndexExpr::normalize).collect() }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ExprError {
     #[error("unbound compile variable: {0}")]
@@ -148,6 +522,20 @@ impl IntExpr {
                 }
                 Ok(quotient)
             }
+            Self::FloorDiv(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)?.div_floor(&denominator))
+            }
+            Self::Rem(lhs, rhs) => {
+                let denominator = rhs.evaluate(env)?;
+                if denominator.is_zero() {
+                    return Err(ExprError::DivisionByZero);
+                }
+                Ok(lhs.evaluate(env)?.mod_floor(&denominator))
+            }
             Self::RoundDiv(lhs, rhs) => {
                 let numerator = lhs.evaluate(env)?;
                 let denominator = rhs.evaluate(env)?;
@@ -167,6 +555,17 @@ impl IntExpr {
                 let is_power_of_two = value == (num_bigint::BigUint::one() << floor as usize);
                 Ok(BigInt::from(if is_power_of_two { floor } else { floor + 1 }))
             }
+            Self::Select { selector, branches } => {
+                let index = selector.evaluate(env)?.to_usize().ok_or_else(|| {
+                    ExprError::UnboundVariable("integer selector is not a nonnegative usize".into())
+                })?;
+                branches
+                    .get(index)
+                    .ok_or_else(|| {
+                        ExprError::UnboundVariable("integer selector out of range".into())
+                    })?
+                    .evaluate(env)
+            }
         }
     }
 
@@ -184,10 +583,16 @@ impl IntExpr {
             Self::Sub(lhs, rhs) |
             Self::Mul(lhs, rhs) |
             Self::Div(lhs, rhs) |
+            Self::FloorDiv(lhs, rhs) |
+            Self::Rem(lhs, rhs) |
             Self::RoundDiv(lhs, rhs) => {
                 lhs.contains_variable(variable) || rhs.contains_variable(variable)
             }
             Self::Log2Ceil(value) => value.contains_variable(variable),
+            Self::Select { selector, branches } => {
+                selector.contains_variable(variable) ||
+                    branches.iter().any(|branch| branch.contains_variable(variable))
+            }
         }
     }
 }
@@ -424,8 +829,11 @@ enum Generator {
     Var(String),
     LoopIndex(u32),
     Div(IntExpr, IntExpr),
+    FloorDiv(IntExpr, IntExpr),
+    Rem(IntExpr, IntExpr),
     RoundDiv(IntExpr, IntExpr),
     Log2Ceil(IntExpr),
+    Select { selector: IntExpr, branches: Vec<IntExpr> },
 }
 
 type Monomial = Vec<Generator>;
@@ -445,10 +853,20 @@ impl Polynomial {
             IntExpr::Div(lhs, rhs) => {
                 Self::generator(Generator::Div(lhs.canonicalize(), rhs.canonicalize()))
             }
+            IntExpr::FloorDiv(lhs, rhs) => {
+                Self::generator(Generator::FloorDiv(lhs.canonicalize(), rhs.canonicalize()))
+            }
+            IntExpr::Rem(lhs, rhs) => {
+                Self::generator(Generator::Rem(lhs.canonicalize(), rhs.canonicalize()))
+            }
             IntExpr::RoundDiv(lhs, rhs) => {
                 Self::generator(Generator::RoundDiv(lhs.canonicalize(), rhs.canonicalize()))
             }
             IntExpr::Log2Ceil(value) => Self::generator(Generator::Log2Ceil(value.canonicalize())),
+            IntExpr::Select { selector, branches } => Self::generator(Generator::Select {
+                selector: selector.canonicalize(),
+                branches: branches.iter().map(IntExpr::canonicalize).collect(),
+            }),
         }
     }
 
@@ -523,8 +941,13 @@ impl Generator {
             Self::Var(name) => IntExpr::Var(name),
             Self::LoopIndex(slot) => IntExpr::LoopIndex(slot),
             Self::Div(lhs, rhs) => IntExpr::Div(Box::new(lhs), Box::new(rhs)),
+            Self::FloorDiv(lhs, rhs) => IntExpr::FloorDiv(Box::new(lhs), Box::new(rhs)),
+            Self::Rem(lhs, rhs) => IntExpr::Rem(Box::new(lhs), Box::new(rhs)),
             Self::RoundDiv(lhs, rhs) => IntExpr::RoundDiv(Box::new(lhs), Box::new(rhs)),
             Self::Log2Ceil(value) => IntExpr::Log2Ceil(Box::new(value)),
+            Self::Select { selector, branches } => {
+                IntExpr::Select { selector: Box::new(selector), branches }
+            }
         }
     }
 }
@@ -542,6 +965,48 @@ pub fn euclidean_div_rem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_conversion_preserves_division_and_remainder_semantics() {
+        let env = ParamEnv::default();
+        for numerator in [-5, -4, -3, 0, 3, 4, 5] {
+            for denominator in [-2, 0, 2] {
+                let lhs = Box::new(IntExpr::constant(numerator));
+                let rhs = Box::new(IntExpr::constant(denominator));
+                for expression in [
+                    IntExpr::Div(lhs.clone(), rhs.clone()),
+                    IntExpr::FloorDiv(lhs.clone(), rhs.clone()),
+                    IntExpr::Rem(lhs, rhs),
+                ] {
+                    let expected = expression.evaluate(&env);
+                    let index = IndexExpr::try_from(expression).unwrap();
+                    assert_eq!(index.evaluate(&env), expected);
+                    assert_eq!(index.normalize().evaluate(&env), expected);
+                    let encoded = serde_json::to_vec(&index).unwrap();
+                    let decoded: IndexExpr = serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(decoded.evaluate(&env), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_index_division_preserves_operator_identity_and_errors() {
+        let env = ParamEnv {
+            loop_indices: BTreeMap::from([(0, BigInt::from(-3))]),
+            ..ParamEnv::default()
+        };
+        let lhs = Box::new(IntExpr::LoopIndex(0));
+        let rhs = Box::new(IntExpr::constant(2));
+        let exact = IndexExpr::try_from(IntExpr::Div(lhs.clone(), rhs.clone())).unwrap();
+        let floor = IndexExpr::try_from(IntExpr::FloorDiv(lhs, rhs)).unwrap();
+        assert_ne!(serde_json::to_vec(&exact).unwrap(), serde_json::to_vec(&floor).unwrap());
+        for index in [exact, floor] {
+            let encoded = serde_json::to_vec(&index).unwrap();
+            let decoded: IndexExpr = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.evaluate(&env), index.evaluate(&env));
+        }
+    }
 
     #[test]
     fn exact_division_rejects_remainder() {
@@ -630,5 +1095,85 @@ mod tests {
         for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             assert!(matches!(RealExpr::from_f64_exact(value), Err(ExprError::NonFiniteReal)));
         }
+    }
+
+    #[test]
+    fn index_map_serialization_is_structural_and_normalized() {
+        let map = IndexMap::new(vec![IndexExpr::Add(
+            Box::new(IndexExpr::constant(1)),
+            Box::new(IndexExpr::constant(2)),
+        )]);
+        let encoded = serde_json::to_string(&map).expect("index map encoding");
+        assert!(encoded.contains("\"tag\":\"Constant\""));
+        assert!(encoded.contains("\"value\":\"3\""));
+    }
+
+    #[test]
+    fn index_expr_resolves_parameters_and_scoped_loop_indices() {
+        let expression = IndexExpr::Add(
+            Box::new(IndexExpr::Parameter("stride".into())),
+            Box::new(IndexExpr::LoopIndex(7)),
+        );
+        let env = ParamEnv {
+            integers: BTreeMap::from([("stride".into(), BigInt::from(3))]),
+            reals: BTreeMap::new(),
+            loop_indices: BTreeMap::from([(7, BigInt::from(4))]),
+        };
+        assert_eq!(expression.evaluate(&env).expect("index evaluation"), BigInt::from(7));
+    }
+
+    #[test]
+    fn round_div_conversion_is_rejected_instead_of_truncated() {
+        let expression =
+            IntExpr::RoundDiv(Box::new(IntExpr::constant(7)), Box::new(IntExpr::constant(2)));
+        assert_eq!(IndexExpr::try_from(expression), Err(IndexExprConversionError::RoundDiv));
+    }
+
+    #[test]
+    fn integer_select_round_trips_and_evaluates_the_selected_branch() {
+        let expression = IntExpr::Select {
+            selector: Box::new(IntExpr::LoopIndex(7)),
+            branches: vec![IntExpr::constant(3), IntExpr::constant(11)],
+        };
+        let encoded = serde_json::to_vec(&expression).expect("select expression encoding");
+        let decoded: IntExpr =
+            serde_json::from_slice(&encoded).expect("select expression decoding");
+        let env = ParamEnv {
+            loop_indices: BTreeMap::from([(7, BigInt::from(1))]),
+            ..ParamEnv::default()
+        };
+        assert_eq!(decoded.evaluate(&env).expect("selected branch"), BigInt::from(11));
+    }
+
+    #[test]
+    fn integer_select_rejects_an_out_of_range_selector() {
+        let expression = IntExpr::Select {
+            selector: Box::new(IntExpr::constant(2)),
+            branches: vec![IntExpr::constant(3), IntExpr::constant(11)],
+        };
+        assert!(expression.evaluate(&ParamEnv::default()).is_err());
+    }
+
+    #[test]
+    fn floor_division_and_remainder_support_structural_index_arithmetic() {
+        let numerator = IntExpr::LoopIndex(3);
+        let denominator = IntExpr::constant(25);
+        let quotient =
+            IntExpr::FloorDiv(Box::new(numerator.clone()), Box::new(denominator.clone()));
+        let remainder = IntExpr::Rem(Box::new(numerator), Box::new(denominator));
+        let env = ParamEnv {
+            loop_indices: BTreeMap::from([(3, BigInt::from(63))]),
+            ..ParamEnv::default()
+        };
+        assert_eq!(quotient.evaluate(&env).expect("floor quotient"), BigInt::from(2));
+        assert_eq!(remainder.evaluate(&env).expect("remainder"), BigInt::from(13));
+        assert_eq!(
+            IndexExpr::try_from(quotient).expect("index quotient").evaluate(&env).unwrap(),
+            BigInt::from(2)
+        );
+        assert_eq!(
+            IndexExpr::try_from(remainder).expect("index remainder").evaluate(&env).unwrap(),
+            BigInt::from(13)
+        );
     }
 }

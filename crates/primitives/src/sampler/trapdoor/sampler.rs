@@ -1,6 +1,9 @@
 use super::{DCRTTrapdoor, utils::split_int64_mat_alt_to_elems};
 use crate::{
-    matrix::{CpuSmallMatrix, PolyMatrix, SmallMatrixError, dcrt_poly::DCRTPolyMatrix},
+    matrix::{
+        CpuSmallMatrix, PolyMatrix, PolyMatrixColumnSource, SmallMatrixError,
+        dcrt_poly::DCRTPolyMatrix,
+    },
     openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
     poly::{
@@ -15,7 +18,6 @@ use crate::{
     },
 };
 use num_bigint::BigUint;
-use openfhe::ffi::DCRTGaussSampGqArbBase;
 use rayon::iter::ParallelIterator;
 use std::{
     ops::Range,
@@ -72,7 +74,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         debug!("{}", "uniform sampler created");
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
         debug!("{}", "a_bar generated");
-        let g = DCRTPolyMatrix::gadget_matrix(params, size);
+        let g = DCRTPolyMatrix::gadget_matrix(params, size, None);
         debug!("{}", "gadget matrix generated");
         let a0 = a_bar.concat_columns(&[&DCRTPolyMatrix::identity(params, size, None)]);
         debug!("{}", "a0 generated");
@@ -101,8 +103,9 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
         params: &<<Self::M as PolyMatrix>::P as crate::poly::Poly>::Params,
         trapdoor: &Self::Trapdoor,
         public_matrix: &Self::M,
-        target: &Self::M,
+        target: &dyn PolyMatrixColumnSource<Self::M>,
         max_coefficient_bound: BigUint,
+        _randomness_seed: [u8; 32],
     ) -> Result<CpuSmallMatrix<DCRTPolyMatrix>, SmallMatrixError> {
         if params.dropped_moduli() != 0 {
             return Err(SmallMatrixError::InvalidConfig);
@@ -121,9 +124,10 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
                 minimum,
             });
         }
+        let target = target.load_columns(0, target.col_size());
         loop {
             let candidate =
-                expanded_preimage_candidate(self, params, trapdoor, public_matrix, target);
+                expanded_preimage_candidate(self, params, trapdoor, public_matrix, &target);
             if matrix_within_coefficient_bound(&candidate, &max_coefficient_bound) {
                 return CpuSmallMatrix::new(candidate, max_coefficient_bound);
             }
@@ -288,23 +292,20 @@ pub(crate) fn gauss_samp_gq_arb_base(
     ensure_openfhe_warmup(params);
     let n = params.ring_dimension();
     let depth = params.crt_depth();
-    let k_res_bits = params.crt_bits();
     let k_res_digits = params.modulus_digits() / depth;
     // OpenFHE's GaussSampGqArbBase can race across threads depending on backend state.
     // Keep this FFI call serialized for stability.
     let result = {
         let _guard = GAUSS_SAMP_GQ_ARB_BASE_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        DCRTGaussSampGqArbBase(
+        crate::poly::dcrt::native::ffi::exact_basis_gauss_gq(
             syndrome.get_poly(),
             c,
-            n,
-            depth,
-            k_res_bits,
             k_res_digits,
             base as i64,
             sigma,
             tower_idx,
         )
+        .expect("exact CRT gadget sampling failed")
     };
     debug_assert_eq!(result.len(), n as usize * k_res_digits);
     // let mut matrix = I64Matrix::new_empty(&I64MatrixParams, k_res, n as usize);
@@ -341,20 +342,20 @@ mod test {
             &params,
             decompose_dcrt_gadget(&target.entry(0, 0), 3.0 * SIGMA, &params, 2, SIGMA),
         );
-        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1);
+        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1, None);
         assert_eq!(gadget_vec * decomposed, target);
     }
 
     #[test]
     fn test_decompose_dcrt_gadget_base_8() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let uniform_sampler = DCRTPolyUniformSampler::new();
         let target = uniform_sampler.sample_uniform(&params, 1, 1, DistType::FinRingDist);
         let decomposed = DCRTPolyMatrix::from_poly_vec(
             &params,
             decompose_dcrt_gadget(&target.entry(0, 0), (8.0 + 1.0) * SIGMA, &params, 8, SIGMA),
         );
-        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1);
+        let gadget_vec = DCRTPolyMatrix::gadget_matrix(&params, 1, None);
         assert_eq!(gadget_vec * decomposed, target);
     }
 
@@ -397,8 +398,40 @@ mod test {
             let trapdoor_matrix = trapdoor_r.concat_rows(&[&trapdoor_e, &identity]);
             public_matrix * trapdoor_matrix
         };
-        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size);
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size, None);
         assert_eq!(muled, gadget_matrix);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_preimage_generation_exact_non_prefix_basis() {
+        let (n, depth, bits, base) = crate::env::modulus_conversion_test_parameters();
+        let original = DCRTPolyParams::new(n, depth, bits, base, None, None);
+        let primes = original.to_crt().0;
+        let params = DCRTPolyParams::new(n, 2, bits, base, Some(vec![primes[2], primes[0]]), None);
+        let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (trapdoor, public_matrix) = sampler.trapdoor(&params, 1);
+        let target =
+            DCRTPolyUniformSampler::new().sample_uniform(&params, 1, 2, DistType::FinRingDist);
+        let preimage = sampler
+            .preimage(
+                &params,
+                &trapdoor,
+                &public_matrix,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
+                params.modulus().as_ref() / BigUint::from(2u8),
+                rand::random(),
+            )
+            .expect("exact-basis preimage must satisfy the requested bound");
+        assert_eq!(&public_matrix * preimage.value(), target);
+        assert_eq!(target.entry(0, 0).coeffs()[0].modulus, params.modulus());
+        let coefficients = target.entry(0, 0).coeffs();
+        let reconstructed = DCRTPoly::from_coeffs(&params, &coefficients);
+        assert_eq!(reconstructed, target.entry(0, 0));
+        let gadget = DCRTPolyMatrix::gadget_matrix(&params, 1, None);
+        let identity = DCRTPolyMatrix::identity(&params, params.modulus_digits(), None);
+        let trapdoor_matrix = trapdoor.r_cpu().concat_rows(&[&trapdoor.e_cpu(), &identity]);
+        assert_eq!(public_matrix * trapdoor_matrix, gadget);
     }
 
     #[test]
@@ -434,8 +467,9 @@ mod test {
                 &params,
                 &trapdoor,
                 &public_matrix,
-                &target,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
                 params.modulus().as_ref() / BigUint::from(2u8),
+                rand::random(),
             )
             .expect("permissive bound should accept a preimage");
         let preimage = preimage.value();
@@ -480,8 +514,9 @@ mod test {
                 &params,
                 &trapdoor,
                 &public_matrix,
-                &target,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
                 params.modulus().as_ref() / BigUint::from(2u8),
+                rand::random(),
             )
             .expect("permissive bound should accept a preimage");
         let preimage = preimage.value();
@@ -529,8 +564,9 @@ mod test {
                 &params,
                 &trapdoor,
                 &public_matrix,
-                &target,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
                 params.modulus().as_ref() / BigUint::from(2u8),
+                rand::random(),
             )
             .expect("permissive bound should accept a preimage");
         let preimage = preimage.value();
@@ -577,8 +613,9 @@ mod test {
                 &params,
                 &trapdoor,
                 &public_matrix,
-                &target,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
                 params.modulus().as_ref() / BigUint::from(2u8),
+                rand::random(),
             )
             .expect("permissive bound should accept a preimage");
         let preimage = preimage.value();
@@ -607,7 +644,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_generation_base_8() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let size = 4;
         let target_cols = 6;
         let k = params.modulus_digits();
@@ -625,8 +662,9 @@ mod test {
                 &params,
                 &trapdoor,
                 &public_matrix,
-                &target,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
                 params.modulus().as_ref() / BigUint::from(2u8),
+                rand::random(),
             )
             .expect("permissive bound should accept a preimage");
         let preimage = preimage.value();
@@ -655,7 +693,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_generation_base_1024() {
-        let params = DCRTPolyParams::new(4, 2, 20, 10, None);
+        let params = DCRTPolyParams::new(4, 2, 20, 10, None, None);
         let size = 4;
         let target_cols = 6;
         let k = params.modulus_digits();
@@ -673,8 +711,9 @@ mod test {
                 &params,
                 &trapdoor,
                 &public_matrix,
-                &target,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
                 params.modulus().as_ref() / BigUint::from(2u8),
+                rand::random(),
             )
             .expect("permissive bound should accept a preimage");
         let preimage = preimage.value();
@@ -703,7 +742,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_sampler_parameters_follow_instance_sigma() {
-        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let base = 1u32 << params.base_bits();
         let default_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let larger_sigma = SIGMA * 1.5;
@@ -723,7 +762,7 @@ mod test {
     #[test]
     #[serial_test::serial]
     fn test_preimage_rejects_bound_below_default_cutoff_before_sampling() {
-        let params = DCRTPolyParams::new(4, 2, 17, 2, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 2, None, None);
         let size = 2usize;
         let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, public_matrix) = sampler.trapdoor(&params, size);
@@ -739,7 +778,14 @@ mod test {
         .expect("default preimage cutoff should be computable");
         let requested = &minimum - BigUint::from(1u8);
         assert_eq!(
-            sampler.preimage(&params, &trapdoor, &public_matrix, &target, requested.clone()),
+            sampler.preimage(
+                &params,
+                &trapdoor,
+                &public_matrix,
+                &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
+                requested.clone(),
+                rand::random()
+            ),
             Err(SmallMatrixError::PreimageBoundTooSmall { requested, minimum })
         );
     }
@@ -749,7 +795,7 @@ mod test {
         bound_sigma: Option<f64>,
     ) {
         let size = 2usize;
-        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, sigma);
         let (trapdoor, public_matrix) = trapdoor_sampler.trapdoor(&params, size);
         let uniform_sampler = DCRTPolyUniformSampler::new();
@@ -767,7 +813,14 @@ mod test {
         for sample_idx in 0..4usize {
             let target = uniform_sampler.sample_uniform(&params, size, size, DistType::FinRingDist);
             let preimage = trapdoor_sampler
-                .preimage(&params, &trapdoor, &public_matrix, &target, preimage_bound.clone())
+                .preimage(
+                    &params,
+                    &trapdoor,
+                    &public_matrix,
+                    &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
+                    preimage_bound.clone(),
+                    rand::random(),
+                )
                 .expect("bounded sampler should return a valid preimage");
             assert_eq!(preimage.max_coefficient_bound(), &preimage_bound);
             let preimage = preimage.value();
@@ -813,7 +866,7 @@ mod test {
     #[serial_test::serial]
     fn test_p_hat_coefficients_below_compute_preimage_sigma() {
         let size = 2usize;
-        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None);
+        let params = DCRTPolyParams::new(1 << 10, 5, 51, 17, None, None);
         let trapdoor_sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
         let (trapdoor, _public_matrix) = trapdoor_sampler.trapdoor(&params, size);
 

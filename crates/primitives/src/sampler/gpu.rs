@@ -156,7 +156,7 @@ fn sample_gpu_matrix_native(
     sample_gpu_matrix_with_seed(params, nrow, ncol, dist, random_gpu_rng_seed())
 }
 
-fn sample_gpu_matrix_with_seed(
+pub(crate) fn sample_gpu_matrix_with_seed(
     params: &GpuDCRTPolyParams,
     nrow: usize,
     ncol: usize,
@@ -317,7 +317,7 @@ mod tests {
     use serial_test::serial as sequential;
 
     fn gpu_test_params() -> DCRTPolyParams {
-        DCRTPolyParams::new(128, 2, 16, 8, None)
+        DCRTPolyParams::new(128, 2, 16, 8, None, None)
     }
 
     fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {

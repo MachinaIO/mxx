@@ -171,7 +171,7 @@ impl DiamondGpuMeasurementBackend {
                 *self.device_ids.get(self.backend.active_placement()).ok_or_else(|| {
                     DiamondGpuMeasurementError::Expression("invalid GPU placement".to_owned())
                 })?;
-            let params = self.parameters.params_for_device(device_id);
+            let params = self.parameters.params_for_device(device_id, None);
             let bound = max_coefficient_bound.to_biguint().ok_or_else(|| {
                 DiamondGpuMeasurementError::Expression(
                     "compact matrix coefficient bound is not nonnegative".to_owned(),
@@ -303,7 +303,14 @@ impl DiamondGpuMeasurementBackend {
             slowest = slowest.max(seconds);
         }
         assert!(self.backend.set_active_placement(original));
-        Ok(NodeMeasurement { work_seconds: slowest, latency_seconds: slowest, workspace_bytes: 0 })
+        Ok(NodeMeasurement {
+            work_seconds: slowest,
+            latency_seconds: slowest,
+            cumulative_wave_seconds: slowest,
+            independent_wave_count: 1,
+            workspace_bytes: 0,
+            measured_wave_workspace_bytes: 0,
+        })
     }
 
     fn prepare_inputs(
@@ -712,7 +719,7 @@ impl DiamondGpuMeasurementBackend {
                             .map_err(Self::backend_error)?;
                         return this
                             .backend
-                            .gadget_decompose(&target, false)
+                            .gadget_decompose(&target, false, Some(*digit_count))
                             .map(ReadyOutput::SmallMatrix)
                             .map_err(Self::backend_error);
                     }
@@ -724,6 +731,8 @@ impl DiamondGpuMeasurementBackend {
                         columns: output.columns,
                     };
                     let target = this.matrix(&target_ty)?;
+                    let (target, _) =
+                        this.backend.preimage_target(target).map_err(Self::backend_error)?;
                     let ConcreteWireType::Trapdoor { sigma, gadget_base, digit_count, .. } =
                         &trapdoor_type
                     else {
@@ -741,7 +750,8 @@ impl DiamondGpuMeasurementBackend {
                             &bound,
                             &secret,
                             &public,
-                            &target,
+                            target.as_ref(),
+                            rand::random(),
                         )
                         .map(ReadyOutput::SmallMatrix)
                         .map_err(Self::backend_error)
@@ -767,7 +777,7 @@ impl DiamondGpuMeasurementBackend {
                         .validate_gadget_layout(&input_type, &base, digit_count, *small)
                         .map_err(Self::backend_error)?;
                     this.backend
-                        .gadget_decompose(&input, *small)
+                        .gadget_decompose(&input, *small, Some(digit_count))
                         .map(ReadyOutput::SmallMatrix)
                         .map_err(Self::backend_error)
                 })

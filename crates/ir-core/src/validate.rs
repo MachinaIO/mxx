@@ -690,6 +690,65 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
+        NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
+            require_arity(scope, node, 1)?;
+            let input = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => matrix.clone(),
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "modulus conversion requires an ordinary matrix",
+                    )
+                }
+            };
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::one() ||
+                (&input.modulus % &modulus) != BigInt::zero() ||
+                (matches!(node.kind, NodeKind::ModulusSwitch { .. }) &&
+                    ((&input.modulus % 2u8).is_zero() || (&modulus % 2u8).is_zero()))
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "modulus conversion requires a divisor ring; nearest switching requires odd moduli",
+                );
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]
+        }
+        NodeKind::RingAutomorphism { index } => {
+            require_arity(scope, node, 1)?;
+            // An automorphism is a matrix-level operation.  A typed preimage
+            // carries a relation witness and must be consumed by an explicit
+            // preimage operation before it can enter this path.
+            let input = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => matrix.clone(),
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "ring automorphism requires an ordinary matrix argument",
+                    )
+                }
+            };
+            if !input.ring_dimension.is_power_of_two() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "ring automorphism requires a power-of-two ring dimension",
+                );
+            }
+            let index = index.evaluate(env)?;
+            let upper = BigInt::from(input.ring_dimension) * BigInt::from(2_u8);
+            if index <= BigInt::from(0_u8) || index >= upper || (&index % 2_u8).is_zero() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "ring automorphism index must be odd and lie in 1..2*ring_dimension",
+                );
+            }
+            vec![ConcreteWireType::Matrix(input)]
+        }
         NodeKind::Transpose => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
@@ -968,7 +1027,7 @@ fn validate_node(
             }
             vec![if *output_bool { ConcreteWireType::Bool } else { ConcreteWireType::Int }; count]
         }
-        NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients } => {
+        NodeKind::CrtRecompose { modulus, plaintext_moduli, reconstruction_coefficients } => {
             if node.args.is_empty() ||
                 node.args.len() != plaintext_moduli.len() ||
                 node.args.len() != reconstruction_coefficients.len()
@@ -976,6 +1035,10 @@ fn validate_node(
                 return node_error(scope, node.id, "CRT metadata count does not match inputs");
             }
             let first = matrix_argument(scope, values, node, 0)?;
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::one() {
+                return node_error(scope, node.id, "invalid CRT output modulus");
+            }
             if first.rows != 1 {
                 return node_error(
                     scope,
@@ -984,7 +1047,11 @@ fn validate_node(
                 );
             }
             for index in 1..node.args.len() {
-                if matrix_argument(scope, values, node, index)? != first {
+                let input = matrix_argument(scope, values, node, index)?;
+                if input.rows != first.rows ||
+                    input.columns != first.columns ||
+                    input.ring_dimension != first.ring_dimension
+                {
                     return node_error(
                         scope,
                         node.id,
@@ -992,19 +1059,20 @@ fn validate_node(
                     );
                 }
             }
-            for modulus in plaintext_moduli {
-                let value = modulus.evaluate(env)?;
-                if value <= BigInt::one() || value >= first.modulus {
+            for (index, plaintext) in plaintext_moduli.iter().enumerate() {
+                let value = plaintext.evaluate(env)?;
+                let input = matrix_argument(scope, values, node, index)?;
+                if value <= BigInt::one() || value > input.modulus {
                     return node_error(scope, node.id, "invalid CRT plaintext modulus");
                 }
             }
             for coefficient in reconstruction_coefficients {
                 let value = coefficient.evaluate(env)?;
-                if value.is_negative() || value >= first.modulus {
+                if value.is_negative() || value >= modulus {
                     return node_error(scope, node.id, "invalid CRT reconstruction coefficient");
                 }
             }
-            vec![ConcreteWireType::Matrix(first)]
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..first })]
         }
         NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
             require_arity(scope, node, 1)?;
@@ -1757,6 +1825,20 @@ mod tests {
         .expect("bounded matrix input")
     }
 
+    #[test]
+    fn ring_automorphism_rejects_typed_preimage_input() {
+        let matrix = matrix_type(17, 1, 1);
+        let preimage = bounded_input("preimage", matrix.clone(), 2, true);
+        let automorphism = value(
+            NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
+            vec![preimage],
+            vec![WireType::Matrix(matrix)],
+        );
+        let error = validate(&graph("automorphism-preimage", automorphism), &ParamEnv::default())
+            .expect_err("typed preimages must not enter a ring automorphism");
+        assert_eq!(node_message(error), "ring automorphism requires an ordinary matrix argument");
+    }
+
     fn bounded_artifact_input(
         matrix_type: MatrixType,
         max_coefficient_bound: i64,
@@ -2270,6 +2352,7 @@ mod tests {
         let level = input("level", matrix_type(257, 1, 2));
         let crt = value(
             NodeKind::CrtRecompose {
+                modulus: IntExpr::constant(257),
                 plaintext_moduli: vec![IntExpr::constant(3), IntExpr::constant(5)],
                 reconstruction_coefficients: vec![IntExpr::constant(1)],
             },
@@ -2297,6 +2380,48 @@ mod tests {
                 validate(&graph("invalid-decode", decode), &ParamEnv::default()).unwrap_err()
             )
             .contains("plaintext modulus")
+        );
+    }
+
+    #[test]
+    fn modulus_conversion_validates_divisor_ring_and_preserves_shape() {
+        let original = input("original", matrix_type(105, 2, 3));
+        let switched = value(
+            NodeKind::ModulusSwitch { modulus: IntExpr::constant(15) },
+            vec![original.clone()],
+            vec![WireType::Matrix(matrix_type(15, 2, 3))],
+        );
+        let reduced = value(
+            NodeKind::ModulusReduce { modulus: IntExpr::constant(5) },
+            vec![switched],
+            vec![WireType::Matrix(matrix_type(5, 2, 3))],
+        );
+        assert!(validate(&graph("mixed-rings", reduced), &ParamEnv::default()).is_ok());
+        for (source_modulus, destination_modulus) in [(105, 7), (105, 105)] {
+            let source = input("source", matrix_type(source_modulus, 1, 3));
+            let output = value(
+                NodeKind::ModulusSwitch { modulus: IntExpr::constant(destination_modulus) },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(destination_modulus, 1, 3))],
+            );
+            assert!(validate(&graph("valid-switch", output), &ParamEnv::default()).is_ok());
+        }
+        for (source_modulus, destination_modulus) in [(105, 11), (105, 1), (30, 15), (30, 10)] {
+            let source = input("source", matrix_type(source_modulus, 1, 3));
+            let output = value(
+                NodeKind::ModulusSwitch { modulus: IntExpr::constant(destination_modulus) },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(destination_modulus, 1, 3))],
+            );
+            assert!(validate(&graph("invalid-switch", output), &ParamEnv::default()).is_err());
+        }
+        let mismatched = value(
+            NodeKind::ModulusSwitch { modulus: IntExpr::constant(15) },
+            vec![original],
+            vec![WireType::Matrix(matrix_type(105, 2, 3))],
+        );
+        assert!(
+            validate(&graph("wrong-destination-type", mismatched), &ParamEnv::default()).is_err()
         );
     }
 

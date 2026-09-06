@@ -25,10 +25,12 @@ theorem generated_decrypt_public_layer_runs (backend : BackendContext) (hashMode
     Stage_encrypt.sequential_generatedRoot_32 backend hashModel encryptParams layer
       (current.2.1, activeCounts, kinds, leftSources, rightSources, onePublic, ()) next.2.1 := by
   dsimp only [Stage_decrypt.sequential_generatedRoot_67] at hrun
-  rcases hrun with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
+  obtain ⟨scopeWitness, h⟩ := hrun
+  rcases scopeWitness with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
     rightIndices, w18, digits, w20, w21, w23, w24, w25, w26, w28, w29, w30, w31,
     w33, w34, w35, w36, w37, w38, w39, w40, w41, w42, w44, w45, w46, w47,
-    w48, w49, w50, w51, w52, w53, h⟩
+    w48, w49, w50, w51, w52, w53⟩
+  dsimp only [Stage_decrypt.sequential_generatedRoot_67.body] at h
   rcases h with ⟨han, halt, ha, hw, h3, _, _, _, _, _, h7, _, h9, _, h11, _, _,
     _, _, _, h16, _, h18, _, h19, _, _, _, _, _, _, _, _, _, _,
     _, _, _, _, _, _, _, _, _, _, _, h33, _, h34, _, h35, _, h36,
@@ -36,7 +38,7 @@ theorem generated_decrypt_public_layer_runs (backend : BackendContext) (hashMode
     _, _, _, _, _, _, _, _, _, _, _, _, _, _, hout⟩
   rw [hout]
   have hw' : encryptParams.max_layer_width = (circuitWidth : Int) := hwidth.symm.trans hw
-  refine ⟨addresses, gateKinds, leftIndices, w35, rightIndices, w18, active, w42,
+  refine ⟨⟨addresses, gateKinds, leftIndices, w35, rightIndices, w18, active, w42⟩,
     hw', ?_, hw', h9, hw', h11, hw', h35, hw', h16, hw', h18,
     han, halt, ha, hw', ?_, rfl⟩
   · intro lane
@@ -105,9 +107,9 @@ theorem generated_public_layer_deterministic (backend : BackendContext) (hashMod
       (current, activeCounts, kinds, leftSources, rightSources, one, ()) first)
     (hs : Stage_encrypt.sequential_generatedRoot_32 backend hashModel params layer
       (current, activeCounts, kinds, leftSources, rightSources, one, ()) second) : first = second := by
-  obtain ⟨af, kf, lif, lf, rif, rf, nf, of, _, haf, _, hkf, _, hlif, _, hlf,
+  obtain ⟨⟨af, kf, lif, lf, rif, rf, nf, of⟩, _, haf, _, hkf, _, hlif, _, hlf,
     _, hrif, _, hrf, _, _, hnf, _, hof, houtf⟩ := hf
-  obtain ⟨as', ks, lis, ls, ris, rs, ns, os, _, has, _, hks, _, hlis, _, hls,
+  obtain ⟨⟨as', ks, lis, ls, ris, rs, ns, os⟩, _, has, _, hks, _, hlis, _, hls,
     _, hris, _, hrs, _, _, hns, _, hos, houts⟩ := hs
   have ha : af = as' := funext fun lane ↦ (haf lane).trans (has lane).symm
   subst as'

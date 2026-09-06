@@ -9,7 +9,7 @@ use crate::{
         BggTallEncodingCompiler, BggTallEncodingWire, BggTallPlaintext, TallCompileError,
     },
 };
-use mxx_dsl::{GraphValue, Subgraph};
+use mxx_dsl::{GraphValue, Preimage, Subgraph};
 use mxx_gadgets::{
     Poly,
     circuit::{
@@ -378,6 +378,10 @@ impl PolyCircuitCompiler {
         lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
 
+    /// Compiles encoding arithmetic using only preprocessing-supplied decompositions.
+    /// The provider receives the complete gate instance, including its nested call
+    /// path, for each multiplication or large scalar multiplication. It must return
+    /// the typed RHS (or scalar-times-gadget) decomposition for that operation.
     pub fn compile_encodings_with_lowerings<P, L, S>(
         &self,
         circuit: &PolyCircuit<P>,
@@ -385,14 +389,20 @@ impl PolyCircuitCompiler {
         inputs: impl IntoIterator<Item = BggEncodingWire>,
         lookup: &mut L,
         slots: &mut S,
+        decompositions: &mut dyn FnMut(GateInstance<'_>) -> Result<Preimage, CircuitCompileError>,
     ) -> Result<Vec<BggEncodingWire>, CircuitCompileError>
     where
         P: Poly,
         L: PublicLookupLowering<P, Wire = BggEncodingWire, Error = CircuitCompileError>,
         S: SlotOperationLowering<P, Wire = BggEncodingWire, Error = CircuitCompileError>,
     {
-        let compiler = BggEncodingCompiler { public_key: self.public_key.clone() };
-        let arithmetic = EncodingLowering::<P> { compiler: &compiler, marker: PhantomData };
+        let compiler = BggEncodingCompiler;
+        let arithmetic = EncodingLowering::<P> {
+            compiler: &compiler,
+            ring: self.public_key.ring.clone(),
+            decompositions,
+            marker: PhantomData,
+        };
         let mut lowering = ConfiguredCircuitLowering { arithmetic, lookup, slots };
         lower_circuit(circuit, one, inputs, &mut lowering).map_err(map_lower_error)
     }
@@ -455,10 +465,18 @@ impl PolyCircuitCompiler {
         circuit: &PolyCircuit<P>,
         one: BggEncodingWire,
         inputs: impl IntoIterator<Item = BggEncodingWire>,
+        decompositions: &mut dyn FnMut(GateInstance<'_>) -> Result<Preimage, CircuitCompileError>,
     ) -> Result<Vec<BggEncodingWire>, CircuitCompileError> {
         let mut lookup = NoPublicLookup::default();
         let mut slots = NoSlotOperations::default();
-        self.compile_encodings_with_lowerings(circuit, one, inputs, &mut lookup, &mut slots)
+        self.compile_encodings_with_lowerings(
+            circuit,
+            one,
+            inputs,
+            &mut lookup,
+            &mut slots,
+            decompositions,
+        )
     }
 
     pub fn compile_naive_public_keys<P: Poly>(
@@ -851,6 +869,8 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for PublicKeyLowering<'_, P> {
 
 struct EncodingLowering<'a, P> {
     compiler: &'a BggEncodingCompiler,
+    ring: mxx_dsl::Ring,
+    decompositions: &'a mut dyn FnMut(GateInstance<'_>) -> Result<Preimage, CircuitCompileError>,
     marker: PhantomData<P>,
 }
 
@@ -870,7 +890,10 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodingLowering<'_, P> {
         match operation {
             PolyGateKind::Add => self.compiler.add(lhs, rhs).map_err(Into::into),
             PolyGateKind::Sub => self.compiler.sub(lhs, rhs).map_err(Into::into),
-            PolyGateKind::Mul => self.compiler.mul(lhs, rhs).map_err(Into::into),
+            PolyGateKind::Mul => {
+                let decomposition = (self.decompositions)(gate)?;
+                self.compiler.mul(lhs, rhs, decomposition).map_err(Into::into)
+            }
             _ => unsupported(gate, "non-binary operation"),
         }
     }
@@ -881,11 +904,8 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodingLowering<'_, P> {
         scalar: &[u32],
         _gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
-        let scalar = self
-            .compiler
-            .public_key
-            .ring
-            .polynomial(scalar.iter().copied().map(mxx_ir_core::IntExpr::constant));
+        let scalar =
+            self.ring.polynomial(scalar.iter().copied().map(mxx_ir_core::IntExpr::constant));
         Ok(self.compiler.small_scalar_mul(input, &scalar))
     }
 
@@ -895,14 +915,10 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for EncodingLowering<'_, P> {
         scalar: &[BigUint],
         _gate: GateInstance<'_>,
     ) -> Result<Self::Wire, Self::Error> {
-        let scalar = self.compiler.public_key.ring.polynomial(
-            scalar
-                .iter()
-                .cloned()
-                .map(num_bigint::BigInt::from)
-                .map(mxx_ir_core::IntExpr::constant),
-        );
-        Ok(self.compiler.large_scalar_mul(input, &scalar))
+        let decomposition = (self.decompositions)(_gate)?;
+        let scalar =
+            self.ring.polynomial(scalar.iter().cloned().map(mxx_ir_core::IntExpr::constant));
+        Ok(self.compiler.large_scalar_mul(input, &scalar, decomposition))
     }
 }
 
@@ -940,6 +956,112 @@ mod tests {
         sampler::bounds::default_preimage_cutoff,
     };
     use num_bigint::{BigInt, BigUint};
+
+    #[test]
+    fn circuit_multiplication_consumes_only_supplied_decompositions() {
+        use crate::test_utils::{execute_graph, matrix_output};
+        use mxx_primitives::{
+            matrix::{PolyMatrix, PolyMatrixSmallRhs, dcrt_poly::DCRTPolyMatrix},
+            sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+        };
+        use mxx_runtime::RuntimeValue;
+        use std::collections::{BTreeMap, VecDeque};
+        for dropped in [None, Some(1)] {
+            let parameters = DCRTPolyParams::new(8, 3, 17, 4, None, dropped);
+            let columns = parameters.modulus_digits();
+            let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 8);
+            let compiler = PolyCircuitCompiler {
+                public_key: BggPublicKeyCompiler {
+                    ring: ring.clone(),
+                    base: 16.into(),
+                    digit_count: columns.into(),
+                },
+            };
+            let mut circuit = PolyCircuit::<DCRTPoly>::new();
+            let left = circuit.input(1).as_single_wire();
+            let right = circuit.input(1).as_single_wire();
+            let product = circuit.mul_gate(left, right);
+            let scaled = circuit.large_scalar_mul(product, &[BigUint::from(7u8)]);
+            circuit.output([scaled.as_single_wire()]);
+            let encoding = |name: &str, plaintext| BggEncodingWire {
+                vector: ring.input(name, (1, columns)),
+                plaintext: Some(ring.polynomial([IntExpr::constant(plaintext)])),
+            };
+            let mut supplied = VecDeque::from([
+                ring.preimage_input("rhs-decomposition", (columns, columns), 8),
+                ring.preimage_input("scalar-decomposition", (columns, columns), 8),
+            ]);
+            let output = compiler
+                .compile_encodings(
+                    &circuit,
+                    encoding("one", 1),
+                    [encoding("lhs", 2), encoding("rhs", 3)],
+                    &mut |gate| {
+                        assert!(gate.call_path().is_empty());
+                        Ok(supplied
+                            .pop_front()
+                            .expect("one cached decomposition per multiplication"))
+                    },
+                )
+                .expect("cached circuit compilation")
+                .pop()
+                .unwrap();
+            assert!(supplied.is_empty());
+            let graph = DslContext::new("cached-circuit-arithmetic")
+                .output("vector", output.vector)
+                .unwrap()
+                .output("plaintext", output.plaintext.unwrap())
+                .unwrap()
+                .build()
+                .unwrap();
+            let nodes = graph.graph.root_scope().nodes();
+            assert!(
+                !nodes.iter().any(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
+            );
+            assert_eq!(
+                nodes
+                    .iter()
+                    .filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs))
+                    .count(),
+                2
+            );
+            let sampler = DCRTPolyUniformSampler::new();
+            let lhs = sampler.sample_uniform(&parameters, 1, columns, DistType::FinRingDist);
+            let rhs = sampler.sample_uniform(&parameters, 1, columns, DistType::FinRingDist);
+            let public = sampler.sample_uniform(&parameters, 1, columns, DistType::FinRingDist);
+            let rhs_decomposition = public.gadget_decompose(false, None).unwrap();
+            let scalar = DCRTPoly::from_usize_to_constant(&parameters, 7);
+            let scalar_decomposition = (DCRTPolyMatrix::gadget_matrix(&parameters, 1, None) *
+                scalar)
+                .gadget_decompose(false, None)
+                .unwrap();
+            let expected = (lhs.clone().multiply_small_rhs(&rhs_decomposition).unwrap() +
+                rhs.clone() * DCRTPoly::from_usize_to_constant(&parameters, 2))
+            .multiply_small_rhs(&scalar_decomposition)
+            .unwrap();
+            let result = execute_graph(
+                graph,
+                parameters.clone(),
+                BTreeMap::from([
+                    ("lhs".into(), RuntimeValue::matrix(lhs)),
+                    ("rhs".into(), RuntimeValue::matrix(rhs)),
+                    ("rhs-decomposition".into(), RuntimeValue::small_matrix(rhs_decomposition)),
+                    (
+                        "scalar-decomposition".into(),
+                        RuntimeValue::small_matrix(scalar_decomposition),
+                    ),
+                ]),
+            );
+            assert_eq!(matrix_output(&result, "vector"), &expected);
+            assert_eq!(
+                matrix_output(&result, "plaintext"),
+                &DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_usize_to_constant(&parameters, 42)]
+                )
+            );
+        }
+    }
 
     #[derive(Default)]
     struct RecordingTallLookup {
@@ -1121,7 +1243,7 @@ mod tests {
 
     #[test]
     fn lookup_and_slot_providers_compose_in_one_circuit() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let preimage_max_coefficient_bound = default_preimage_cutoff(
             parameters.ring_dimension(),

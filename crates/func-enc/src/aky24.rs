@@ -576,7 +576,7 @@ where
             .clone();
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let mask_target = target
-            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 mask selector decomposition"))
+            .multiply_small_rhs(selector.gadget_decompose(false, None).expect("AKY24 mask selector decomposition"))
             .expect("AKY24 mask selector product");
         info!(refresh_preimages = refresh_preimages.len(), "AKY24 PRF mask keygen finished");
         (mask_target, refresh_preimages)
@@ -808,7 +808,7 @@ where
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let mask_message = evaluated_encoding
             .vector
-            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 mask selector decomposition"))
+            .multiply_small_rhs(selector.gadget_decompose(false, None).expect("AKY24 mask selector decomposition"))
             .expect("AKY24 mask selector product");
         info!("AKY24 PRF mask dec finished");
         mask_message
@@ -992,7 +992,7 @@ where
         );
         let mut encodings =
             encoding_sampler.sample(&params.poly_params, &bgg_public_keys, &plaintext_inputs);
-        let gadget = M::gadget_matrix(&params.poly_params, params.secret_size());
+        let gadget = M::gadget_matrix(&params.poly_params, params.secret_size(), None);
         let decryption_key_gadget = gadget * &fhe_decryption_key_poly;
         let decryption_key_encodings = encodings[1]
             .encodings()
@@ -1077,7 +1077,7 @@ where
         );
         let selector = g_inverse_identity_selector::<M>(&params.poly_params);
         let preimage_target = evaluated_target
-            .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 target selector decomposition"))
+            .multiply_small_rhs(selector.gadget_decompose(false, None).expect("AKY24 target selector decomposition"))
             .expect("AKY24 target selector product");
         debug!(
             target_rows = preimage_target.row_size(),
@@ -1166,7 +1166,7 @@ where
                 let selector = g_inverse_identity_selector::<M>(&params.poly_params);
                 let evaluated_message = evaluated_encoding
                     .vector
-                    .multiply_small_rhs(selector.gadget_decompose(false).expect("AKY24 message selector decomposition"))
+                    .multiply_small_rhs(selector.gadget_decompose(false, None).expect("AKY24 message selector decomposition"))
                     .expect("AKY24 message selector product");
                 let mask_message = self.dec_prf_mask_encoding(
                     params,
@@ -1649,7 +1649,7 @@ mod tests {
             nested_rns_scale,
             "AKY24 GPU test constructing native and GPU params"
         );
-        let native_poly_params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, base_bits, None);
+        let native_poly_params = DCRTPolyParams::new(ring_dim, active_levels, crt_bits, base_bits, None, None);
         let poly_params = gpu_params_from_cpu(&native_poly_params);
         let q: Arc<BigUint> = poly_params.modulus().into();
         let prf_mask_output_bound = q.as_ref() / 4u32;

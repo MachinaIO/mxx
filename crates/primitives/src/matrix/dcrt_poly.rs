@@ -1,5 +1,5 @@
 use crate::{
-    element::PolyElem,
+    element::{PolyElem, finite_ring::FinRingElem},
     matrix::{
         CpuSmallMatrix, MatrixElem, MatrixParams, PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError,
         cpp_matrix::CppMatrix,
@@ -14,7 +14,7 @@ use crate::{
 use itertools::Itertools;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{ToPrimitive, Zero};
-use openfhe::ffi::{DCRTPolyGadgetVector, MatrixGen, SetMatrixElement};
+use openfhe::ffi::SetMatrixElement;
 use rayon::prelude::*;
 use std::{io::Read, ops::Range, path::Path};
 
@@ -118,9 +118,15 @@ impl PolyMatrix for DCRTPolyMatrix {
         self.tensor(other)
     }
 
-    fn gadget_matrix(params: &<Self::P as Poly>::Params, size: usize) -> Self {
-        let gadget_vector = Self::gadget_vector(params);
-        debug_assert_eq!(gadget_vector.col_size(), params.modulus_digits());
+    fn gadget_matrix(
+        params: &<Self::P as Poly>::Params,
+        size: usize,
+        digit_count: Option<usize>,
+    ) -> Self {
+        let digits = digit_count.unwrap_or_else(|| params.modulus_digits());
+        assert!(params.gadget_dropped_moduli(Some(digits)).is_some());
+        let gadget_vector = Self::gadget_vector(params, digits);
+        debug_assert_eq!(gadget_vector.col_size(), digits);
         gadget_vector.concat_diag(&vec![&gadget_vector; size - 1])
     }
 
@@ -137,36 +143,8 @@ impl PolyMatrix for DCRTPolyMatrix {
     }
 
     fn decompose(&self) -> Self {
-        let base_bits = self.params.base_bits();
-        let log_base_q = self.params.modulus_digits();
-        let new_nrow = self.nrow * log_base_q;
-        let mut new_matrix = Self::new_empty(&self.params, new_nrow, self.ncol);
-        let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<DCRTPoly>> {
-            let nrow = row_offsets.len();
-            let new_nrow = row_offsets.len() * log_base_q;
-            let ncol = col_offsets.len();
-            let entries = self.block_entries(row_offsets, col_offsets);
-            let decomposed_entries: Vec<Vec<Vec<DCRTPoly>>> = parallel_iter!(0..nrow)
-                .map(|i| {
-                    parallel_iter!(0..ncol)
-                        .map(|j| self.dcrt_decompose_poly(&entries[i][j], base_bits))
-                        .collect()
-                })
-                .collect();
-            let out = parallel_iter!(0..new_nrow)
-                .map(|idx| {
-                    let i = idx / log_base_q;
-                    let k = idx % log_base_q;
-
-                    parallel_iter!(0..ncol).map(|j| decomposed_entries[i][j][k].clone()).collect()
-                })
-                .collect();
-            out
-        };
-        new_matrix.replace_entries_with_expand(0..self.nrow, 0..self.ncol, log_base_q, 1, f);
-        new_matrix
+        self.decompose_digits(self.params.modulus_digits())
     }
-
     fn small_decompose(&self) -> Self {
         let base_bits = self.params.base_bits();
         let k = self.params.crt_bits().div_ceil(self.params.base_bits() as usize);
@@ -201,24 +179,50 @@ impl PolyMatrix for DCRTPolyMatrix {
         out
     }
 
-    fn modulus_switch(
-        &self,
-        new_modulus: &<<Self::P as Poly>::Params as PolyParams>::Modulus,
-    ) -> Self {
-        let mut new_matrix = Self::new_empty(&self.params, self.nrow, self.ncol);
+    fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self {
+        assert_eq!(destination.ring_dimension(), self.params.ring_dimension());
+        assert_eq!(
+            self.params.modulus().as_ref() % destination.modulus().as_ref(),
+            BigUint::from(0u8)
+        );
+        let mut new_matrix = Self::new_empty(destination, self.nrow, self.ncol);
         let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<Self::P>> {
             let self_block_polys = self.block_entries(row_offsets, col_offsets);
             self_block_polys
                 .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|poly| poly.modulus_switch(&self.params, new_modulus.clone()))
-                        .collect_vec()
-                })
+                .map(|row| row.iter().map(|poly| poly.modulus_switch(destination)).collect_vec())
                 .collect_vec()
         };
         new_matrix.replace_entries(0..self.nrow, 0..self.ncol, f);
         new_matrix
+    }
+
+    fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self {
+        assert_eq!(destination.ring_dimension(), self.params.ring_dimension());
+        assert_eq!(
+            self.params.modulus().as_ref() % destination.modulus().as_ref(),
+            BigUint::from(0u8)
+        );
+        let polys = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| {
+                        let coefficients = self
+                            .entry(row, column)
+                            .coeffs()
+                            .into_iter()
+                            .map(|coefficient| {
+                                FinRingElem::new(coefficient.value().clone(), destination.modulus())
+                            })
+                            .collect::<Vec<_>>();
+                        DCRTPoly::from_coeffs(destination, &coefficients)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::from_poly_vec(destination, polys)
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
@@ -371,11 +375,28 @@ impl PolyMatrix for DCRTPolyMatrix {
 impl PolyMatrixSmallRhs for DCRTPolyMatrix {
     type SmallMatrix = CpuSmallMatrix<Self>;
 
-    fn gadget_decompose(self, small: bool) -> Result<Self::SmallMatrix, SmallMatrixError> {
+    fn gadget_decompose(
+        self,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, SmallMatrixError> {
         let base = BigUint::from(1u8) << self.params.base_bits();
         let max_coefficient_bound =
             if small { &base - BigUint::from(1u8) } else { (&base + BigUint::from(1u8)) >> 1 };
-        let value = if small { self.small_decompose_owned() } else { self.decompose_owned() };
+        let value = if small {
+            if digit_count.is_some_and(|digits| {
+                digits != self.params.crt_bits().div_ceil(self.params.base_bits() as usize)
+            }) {
+                return Err(SmallMatrixError::InvalidConfig);
+            }
+            self.small_decompose_owned()
+        } else {
+            let digits = digit_count.unwrap_or_else(|| self.params.modulus_digits());
+            self.params
+                .gadget_dropped_moduli(Some(digits))
+                .ok_or(SmallMatrixError::InvalidConfig)?;
+            self.decompose_digits(digits)
+        };
         CpuSmallMatrix::new(value, max_coefficient_bound)
     }
 
@@ -394,13 +415,14 @@ impl DCRTPolyMatrix {
     pub(crate) fn to_cpp_matrix_ptr(&self) -> CppMatrix {
         let nrow = self.nrow;
         let ncol = self.ncol;
-        let mut matrix_ptr = MatrixGen(
+        let mut matrix_ptr = crate::poly::dcrt::native::ffi::exact_basis_matrix(
             self.params.ring_dimension(),
-            self.params.crt_depth(),
-            self.params.crt_bits(),
+            &self.params.to_crt().0,
             nrow,
             ncol,
-        );
+            0,
+        )
+        .expect("exact CRT matrix allocation failed");
         for i in 0..nrow {
             for j in 0..ncol {
                 SetMatrixElement(matrix_ptr.as_mut().unwrap(), i, j, self.entry(i, j).get_poly());
@@ -424,17 +446,48 @@ impl DCRTPolyMatrix {
         DCRTPolyMatrix::from_poly_vec(params, matrix_inner)
     }
 
-    pub(crate) fn gadget_vector(params: &DCRTPolyParams) -> DCRTPolyMatrix {
+    fn decompose_digits(&self, log_base_q: usize) -> Self {
+        let base_bits = self.params.base_bits();
+        let new_nrow = self.nrow * log_base_q;
+        let mut new_matrix = Self::new_empty(&self.params, new_nrow, self.ncol);
+        let f = |row_offsets: Range<usize>, col_offsets: Range<usize>| -> Vec<Vec<DCRTPoly>> {
+            let nrow = row_offsets.len();
+            let new_nrow = row_offsets.len() * log_base_q;
+            let ncol = col_offsets.len();
+            let entries = self.block_entries(row_offsets, col_offsets);
+            let decomposed_entries: Vec<Vec<Vec<DCRTPoly>>> = parallel_iter!(0..nrow)
+                .map(|i| {
+                    parallel_iter!(0..ncol)
+                        .map(|j| self.dcrt_decompose_poly(&entries[i][j], base_bits, log_base_q))
+                        .collect()
+                })
+                .collect();
+            let out = parallel_iter!(0..new_nrow)
+                .map(|idx| {
+                    let i = idx / log_base_q;
+                    let k = idx % log_base_q;
+
+                    parallel_iter!(0..ncol).map(|j| decomposed_entries[i][j][k].clone()).collect()
+                })
+                .collect();
+            out
+        };
+        new_matrix.replace_entries_with_expand(0..self.nrow, 0..self.ncol, log_base_q, 1, f);
+        new_matrix
+    }
+
+    pub(crate) fn gadget_vector(params: &DCRTPolyParams, digit_count: usize) -> DCRTPolyMatrix {
         let base = 1 << params.base_bits();
-        let g_vec_cpp = DCRTPolyGadgetVector(
+        let g_vec_cpp = crate::poly::dcrt::native::ffi::exact_basis_matrix(
             params.ring_dimension(),
-            params.crt_depth(),
-            params.crt_bits(),
+            &params.to_crt().0,
+            1,
             params.crt_bits().div_ceil(params.base_bits() as usize) * params.crt_depth(),
             base,
-        );
+        )
+        .expect("exact CRT gadget construction failed");
         DCRTPolyMatrix::from_cpp_matrix_ptr(params, &CppMatrix::new(g_vec_cpp))
-            .slice_columns(0, params.modulus_digits())
+            .slice_columns(0, digit_count)
     }
 
     fn mod_inverse_u64(value: u64, modulus: u64) -> u64 {
@@ -503,18 +556,25 @@ impl DCRTPolyMatrix {
         residue as u64
     }
 
-    fn dcrt_decompose_poly(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
+    fn dcrt_decompose_poly(
+        &self,
+        poly: &DCRTPoly,
+        base_bits: u32,
+        digit_count: usize,
+    ) -> Vec<DCRTPoly> {
         let (moduli, _, crt_depth) = self.params.to_crt();
         debug_assert_eq!(moduli.len(), crt_depth);
         let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);
-        let log_base_q = self.params.modulus_digits();
+        let log_base_q = digit_count;
         let base = 1i128.checked_shl(base_bits).expect("base_bits must fit in i128 shift");
         let modulus = self.params.modulus();
         let coeffs = poly.coeffs();
         // Section 3.2 of ePrint 2024/909: the same unreduced low-part CRT sum
         // must be subtracted in every retained tower. Independent limb truncation
         // would not have a small residual modulo the full ring modulus.
-        let retained = crt_depth - self.params.dropped_moduli();
+        let dropped_moduli =
+            self.params.gadget_dropped_moduli(Some(digit_count)).expect("validated gadget digits");
+        let retained = crt_depth - dropped_moduli;
         let low_product = moduli[retained..].iter().fold(BigUint::from(1u8), |p, q| p * q);
         let low_weights = moduli[retained..]
             .iter()
@@ -524,7 +584,7 @@ impl DCRTPolyMatrix {
                 (p, BigInt::from(weight), inverse)
             })
             .collect::<Vec<_>>();
-        let corrected = (self.params.dropped_moduli() > 0).then(|| {
+        let corrected = (dropped_moduli > 0).then(|| {
             coeffs
                 .par_iter()
                 .map(|coeff| {
@@ -583,31 +643,36 @@ impl DCRTPolyMatrix {
     }
 
     fn dcrt_small_decompose_poly_unsigned(&self, poly: &DCRTPoly, base_bits: u32) -> Vec<DCRTPoly> {
-        let decomposed = poly.get_poly().Decompose(base_bits);
-        let cpp_decomposed = CppMatrix::new(decomposed);
-        let decompose_last_mask = match self.params.decompose_last_mask() {
-            Some(mask) => mask,
-            None => {
-                return parallel_iter!(0..cpp_decomposed.ncol())
-                    .map(|idx| cpp_decomposed.entry(0, idx))
-                    .collect();
-            }
-        };
-        let decompose_last_mask = BigUint::from(decompose_last_mask);
-        let digits_per_tower = self.params.crt_bits().div_ceil(base_bits as usize);
-        let last_digit_in_tower = digits_per_tower - 1;
-        parallel_iter!(0..cpp_decomposed.ncol())
-            .map(|idx| {
-                let digit_poly = cpp_decomposed.entry(0, idx);
-                if idx % digits_per_tower != last_digit_in_tower {
-                    return digit_poly;
-                }
-                let coeffs = digit_poly
-                    .coeffs()
-                    .into_iter()
-                    .map(|elem| (elem.value() & &decompose_last_mask).to_u64_digits())
+        let (moduli, _, _) = self.params.to_crt();
+        let modulus = self.params.modulus();
+        let digits = self.params.crt_bits().div_ceil(base_bits as usize);
+        let mask = (1u64 << base_bits) - 1;
+        let coefficients = poly.coeffs();
+        // Each output digit preserves the independently truncated residue in
+        // every actual tower. Uniform maximum-width rows match the GPU path;
+        // narrower towers contribute zero after their last digit.
+        (0..digits)
+            .into_par_iter()
+            .map(|digit| {
+                let shift = digit * base_bits as usize;
+                let coefficients = coefficients
+                    .par_iter()
+                    .map(|coefficient| {
+                        let residues = moduli
+                            .iter()
+                            .map(|prime| {
+                                let value = (coefficient.value() % prime).to_u64().unwrap();
+                                if shift >= u64::BITS as usize {
+                                    0
+                                } else {
+                                    (value >> shift) & mask
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        Self::crt_reconstruct_residues(&moduli, &modulus, &residues).to_u64_digits()
+                    })
                     .collect::<Vec<_>>();
-                DCRTPoly::poly_gen_from_vec(&self.params, &coeffs)
+                DCRTPoly::poly_gen_from_vec(&self.params, &coefficients)
             })
             .collect()
     }
@@ -623,7 +688,36 @@ mod tests {
     use super::*;
     use num_bigint::BigUint;
     use rand::{Rng, rng};
-    use std::sync::Arc;
+
+    #[test]
+    fn test_mixed_width_basis_gadget_decomposition_relations() {
+        let narrow = DCRTPolyParams::new(32, 1, 28, 8, None, None);
+        let wide = DCRTPolyParams::new(32, 1, 50, 8, None, None);
+        let primes = vec![narrow.to_crt().0[0], wide.to_crt().0[0]];
+        for ordered in [primes.clone(), vec![primes[1], primes[0]]] {
+            let params = DCRTPolyParams::new(32, 2, 50, 8, Some(ordered.clone()), None);
+            let small = params.select_modulus(narrow.modulus().as_ref()).unwrap();
+            assert_eq!(small.crt_bits(), 28);
+            assert_eq!(small.modulus_digits(), 4);
+            let mut random = rng();
+            let coefficients = (0..32)
+                .map(|_| BigUint::from(random.random::<u128>()) % params.modulus().as_ref())
+                .collect::<Vec<_>>();
+            let matrix = DCRTPolyMatrix::from_poly_vec_row(
+                &params,
+                vec![DCRTPoly::from_biguints(&params, &coefficients)],
+            );
+            assert_eq!(
+                DCRTPolyMatrix::gadget_matrix(&params, 1, None) * matrix.decompose(),
+                matrix
+            );
+            assert_eq!(
+                DCRTPolyMatrix::small_gadget_matrix(&params, 1) * matrix.small_decompose(),
+                matrix
+            );
+            assert_eq!(matrix.small_decompose().row_size(), 7);
+        }
+    }
 
     fn constant_matrix(params: &DCRTPolyParams, rows: &[&[u64]]) -> DCRTPolyMatrix {
         DCRTPolyMatrix::from_poly_vec(
@@ -710,7 +804,7 @@ mod tests {
 
     #[test]
     fn compact_owner_trait_does_not_require_a_full_matrix_field() {
-        let params = DCRTPolyParams::new(4, 2, 17, 2, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 2, None, None);
         let owner = MetadataOnlySmallOwner {
             params: params.clone(),
             rows: 2,
@@ -723,7 +817,7 @@ mod tests {
 
     #[test]
     fn cpu_small_matrix_canonical_coefficients_round_trip_and_reject_invalid_payloads() {
-        let params = DCRTPolyParams::new(8, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(8, 2, 17, 3, None, None);
         let modulus = params.modulus();
         let negative_three =
             DCRTPoly::from_biguint_to_constant(&params, modulus.as_ref() - BigUint::from(3u32));
@@ -833,7 +927,7 @@ mod tests {
 
     #[test]
     fn cpu_small_matrix_constructor_enforces_centered_inclusive_bound() {
-        let params = DCRTPolyParams::new(8, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(8, 2, 17, 3, None, None);
         let modulus = params.modulus();
         let positive_boundary = constant_matrix(&params, &[&[3]]);
         assert!(CpuSmallMatrix::new(positive_boundary, BigUint::from(3u32)).is_ok());
@@ -864,8 +958,8 @@ mod tests {
 
     #[test]
     fn cpu_small_matrix_constructor_rejects_coefficient_modulus_mismatch() {
-        let matrix_params = DCRTPolyParams::new(4, 1, 17, 2, None);
-        let coefficient_params = DCRTPolyParams::new(4, 2, 17, 2, None);
+        let matrix_params = DCRTPolyParams::new(4, 1, 17, 2, None, None);
+        let coefficient_params = DCRTPolyParams::new(4, 2, 17, 2, None, None);
         let foreign_coefficient = DCRTPoly::from_usize_to_constant(&coefficient_params, 1);
         let matrix = DCRTPolyMatrix::from_poly_vec(&matrix_params, vec![vec![foreign_coefficient]]);
 
@@ -877,7 +971,7 @@ mod tests {
 
     #[test]
     fn cpu_small_matrix_metadata_decomposition_and_multiply_are_typed() {
-        let params = DCRTPolyParams::new(4, 2, 17, 2, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 2, None, None);
         let matrix = constant_matrix(&params, &[&[1, 1, 2], &[3, 2, 3]]);
         let owner = CpuSmallMatrix::new(matrix.clone(), BigUint::from(3u32)).unwrap();
         owner.validate_metadata(&params, 2, 3, &BigUint::from(3u32)).unwrap();
@@ -889,7 +983,7 @@ mod tests {
             owner.validate_metadata(&params, 2, 3, &BigUint::from(4u32)),
             Err(SmallMatrixError::BoundMismatch)
         );
-        let other_params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let other_params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         assert_eq!(
             owner.validate_metadata(&other_params, 2, 3, &BigUint::from(3u32)),
             Err(SmallMatrixError::ParameterMismatch)
@@ -899,8 +993,8 @@ mod tests {
             &params,
             vec![vec![DCRTPoly::from_usize_to_constant(&params, 5)]],
         );
-        let regular = source.clone().gadget_decompose(false).unwrap();
-        let small = source.gadget_decompose(true).unwrap();
+        let regular = source.clone().gadget_decompose(false, None).unwrap();
+        let small = source.gadget_decompose(true, None).unwrap();
         assert_eq!(regular.size(), (18, 1));
         assert_eq!(regular.max_coefficient_bound(), &BigUint::from(2u32));
         assert_eq!(small.size(), (9, 1));
@@ -932,7 +1026,7 @@ mod tests {
 
     #[test]
     fn cpu_small_matrix_multiply_round_trip_handles_signed_multicolumn_boundary_values() {
-        let params = DCRTPolyParams::new(4, 2, 17, 2, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 2, None, None);
         let lhs = constant_matrix(&params, &[&[1, 2, 3], &[4, 5, 6]]);
         let rhs = signed_constant_matrix(&params, &[&[255, -255], &[-1, 2], &[0, -255]]);
         let expected = lhs.clone() * rhs.clone();
@@ -960,7 +1054,7 @@ mod tests {
     fn test_matrix_gadget_matrix() {
         let params = DCRTPolyParams::default();
         let size = 3;
-        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size);
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size, None);
         assert_eq!(gadget_matrix.size().0, size);
         assert_eq!(gadget_matrix.size().1, size * params.modulus_bits());
     }
@@ -995,7 +1089,7 @@ mod tests {
         assert_eq!(matrix.size().0, 2);
         assert_eq!(matrix.size().1, 8);
 
-        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, 2);
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, 2, None);
         assert_eq!(gadget_matrix.size().0, 2);
         assert_eq!(gadget_matrix.size().1, 2 * bit_length);
 
@@ -1011,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_matrix_decompose_with_base8() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let digits_length = params.modulus_digits();
 
         // Create a simple 2x8 matrix with some non-zero values
@@ -1040,7 +1134,7 @@ mod tests {
         assert_eq!(matrix.size().0, 2);
         assert_eq!(matrix.size().1, 8);
 
-        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, 2);
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, 2, None);
         assert_eq!(gadget_matrix.size().0, 2);
         assert_eq!(gadget_matrix.size().1, 2 * digits_length);
 
@@ -1076,17 +1170,17 @@ mod tests {
             .map(|value| value.parse().unwrap())
             .unwrap_or(8);
         for dropped in [0, 1, 2] {
-            let params = DCRTPolyParams::new(n, 3, 17, 4, Some(dropped));
+            let params = DCRTPolyParams::new(n, 3, 17, 4, None, Some(dropped));
             let input =
                 DCRTPolyUniformSampler::new().sample_uniform(&params, 2, 3, DistType::FinRingDist);
-            let gadget = DCRTPolyMatrix::gadget_matrix(&params, 2);
+            let gadget = DCRTPolyMatrix::gadget_matrix(&params, 2, None);
             let digits = input.decompose();
             assert_eq!(gadget.size(), (2, 2 * (3 - dropped) * 5));
             assert_eq!(digits.size(), (gadget.col_size(), 3));
             assert!(matrix_within_coefficient_bound(&digits, &BigUint::from(8u8)));
             let restored = &gadget * &digits;
             let residual = &input - &restored;
-            assert!(matrix_within_coefficient_bound(&residual, &params.gadget_error_bound()));
+            assert!(matrix_within_coefficient_bound(&residual, &params.gadget_error_bound(None)));
             if dropped == 0 {
                 assert_eq!(restored, input);
             } else {
@@ -1103,7 +1197,7 @@ mod tests {
                     }
                 }
             }
-            let compact = input.clone().gadget_decompose(false).unwrap();
+            let compact = input.clone().gadget_decompose(false, None).unwrap();
             assert_eq!(gadget.multiply_small_rhs(&compact).unwrap(), restored);
             let chunks = (0..params.modulus_digits())
                 .map(|chunk| input.decompose_chunk(chunk, params.modulus_digits()))
@@ -1113,8 +1207,38 @@ mod tests {
     }
 
     #[test]
+    fn test_matrix_mixed_gadget_counts_preserve_ring_owner() {
+        use crate::sampler::{
+            DistType, PolyUniformSampler, bounds::matrix_within_coefficient_bound,
+            uniform::DCRTPolyUniformSampler,
+        };
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().map(|v| v.parse().unwrap()).unwrap_or(8);
+        let params = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let input =
+            DCRTPolyUniformSampler::new().sample_uniform(&params, 2, 3, DistType::FinRingDist);
+        for digits in [15usize, 10, 5] {
+            let gadget = DCRTPolyMatrix::gadget_matrix(&params, 2, Some(digits));
+            let compact = input.clone().gadget_decompose(false, Some(digits)).unwrap();
+            assert_eq!(gadget.params(), &params);
+            assert_eq!(compact.value().params(), &params);
+            let reconstructed = gadget.multiply_small_rhs(&compact).unwrap();
+            let residual = &input - &reconstructed;
+            assert!(matrix_within_coefficient_bound(
+                &residual,
+                &params.gadget_error_bound(Some(digits))
+            ));
+            if digits == 15 {
+                assert_eq!(reconstructed, input);
+            }
+        }
+        assert!(input.clone().gadget_decompose(false, Some(7)).is_err());
+        assert!(input.gadget_decompose(false, Some(20)).is_err());
+    }
+
+    #[test]
     fn test_matrix_decompose_balanced_odd_for_centered_inputs() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let modulus = params.modulus();
         let x = DCRTPolyMatrix::from_poly_vec(
             &params,
@@ -1133,7 +1257,7 @@ mod tests {
 
     #[test]
     fn test_matrix_decompose_balanced_round_to_even_tie_digits() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let (moduli, _, _) = params.to_crt();
         let digits_per_tower = params.crt_bits().div_ceil(params.base_bits() as usize);
         let x = DCRTPolyMatrix::from_poly_vec(
@@ -1159,7 +1283,7 @@ mod tests {
 
     #[test]
     fn test_matrix_decompose_chunk_matches_full_decompose() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let matrix = DCRTPolyMatrix::from_poly_vec(
             &params,
             vec![
@@ -1185,7 +1309,7 @@ mod tests {
 
     #[test]
     fn test_matrix_small_decompose_chunk_matches_full_small_decompose() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let matrix = DCRTPolyMatrix::from_poly_vec(
             &params,
             vec![
@@ -1238,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_matrix_decompose_with_unaligned_base() {
-        let params = DCRTPolyParams::new(4, 1, 52, 17, None);
+        let params = DCRTPolyParams::new(4, 1, 52, 17, None, None);
         let digits_length = params.modulus_digits();
 
         // Create a simple 2x8 matrix with some non-zero values
@@ -1268,7 +1392,7 @@ mod tests {
         assert_eq!(matrix.size().0, 2);
         assert_eq!(matrix.size().1, 8);
 
-        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, 2);
+        let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, 2, None);
         println!("gadget_matrix {:?}", gadget_matrix);
         assert_eq!(gadget_matrix.size().0, 2);
         assert_eq!(gadget_matrix.size().1, 2 * digits_length);
@@ -1309,7 +1433,7 @@ mod tests {
 
     #[test]
     fn test_matrix_small_rhs_relation() {
-        let params = DCRTPolyParams::new(4, 2, 17, 3, None);
+        let params = DCRTPolyParams::new(4, 2, 17, 3, None, None);
         let n = 2usize;
         let r = 3usize;
 
@@ -1350,7 +1474,8 @@ mod tests {
         let g_small = DCRTPolyMatrix::small_gadget_matrix(&params, n);
         let left = a.clone() * &g_small;
         let expected = a * &b;
-        let actual = left.multiply_small_rhs(&b.clone().gadget_decompose(true).unwrap()).unwrap();
+        let actual =
+            left.multiply_small_rhs(&b.clone().gadget_decompose(true, None).unwrap()).unwrap();
 
         assert_eq!(actual, expected);
     }
@@ -1488,11 +1613,17 @@ mod tests {
         ];
 
         let matrix = DCRTPolyMatrix::from_poly_vec(&params, matrix_vec);
-        let new_modulus = Arc::new(BigUint::from(2u32));
-        let switched = matrix.modulus_switch(&new_modulus);
-
-        // Although the value becomes less than the new modulus, the set modulus is still the same
-        assert_eq!(switched.params.modulus(), params.modulus());
+        let destination = DCRTPolyParams::new(
+            params.ring_dimension(),
+            1,
+            params.crt_bits(),
+            params.base_bits(),
+            None,
+            None,
+        );
+        let new_modulus = destination.modulus();
+        let switched = matrix.modulus_switch(&destination);
+        assert_eq!(switched.params.modulus(), new_modulus);
 
         let new_value00 = value00.modulus_switch(new_modulus.clone());
         let new_value01 = value01.modulus_switch(new_modulus.clone());
@@ -1501,16 +1632,16 @@ mod tests {
 
         let expected_vec = vec![
             vec![
-                DCRTPoly::from_elem_to_constant(&params, &new_value00),
-                DCRTPoly::from_elem_to_constant(&params, &new_value01),
+                DCRTPoly::from_elem_to_constant(&destination, &new_value00),
+                DCRTPoly::from_elem_to_constant(&destination, &new_value01),
             ],
             vec![
-                DCRTPoly::from_elem_to_constant(&params, &new_value10),
-                DCRTPoly::from_elem_to_constant(&params, &new_value11),
+                DCRTPoly::from_elem_to_constant(&destination, &new_value10),
+                DCRTPoly::from_elem_to_constant(&destination, &new_value11),
             ],
         ];
 
-        let expected = DCRTPolyMatrix::from_poly_vec(&params, expected_vec);
+        let expected = DCRTPolyMatrix::from_poly_vec(&destination, expected_vec);
         assert_eq!(switched, expected);
     }
 

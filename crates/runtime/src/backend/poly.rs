@@ -1,4 +1,6 @@
-use super::{Backend, IndexRange, MatrixMulAccumulateRequest, PreimageRequest, SampleRange};
+use super::{
+    Backend, IndexRange, MatrixMulAccumulateRequest, PreimageRequest, PreimageTarget, SampleRange,
+};
 use mxx_ir_core::{
     ParamEnv,
     artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
@@ -7,14 +9,14 @@ use mxx_ir_core::{
 };
 use mxx_primitives::{
     matrix::{
-        PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix,
+        PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix,
         dcrt_poly::DCRTPolyMatrix,
     },
     poly::{Poly, PolyParams, dcrt::params::DCRTPolyParams},
     sampler::{
         DistType, PolyHashSampler, PolyTrapdoorSampler, PolyUniformSampler,
-        hash::DCRTPolyHashSampler, trapdoor::DCRTPolyTrapdoorSampler,
-        uniform::DCRTPolyUniformSampler,
+        bounds::default_preimage_cutoff, hash::DCRTPolyHashSampler,
+        trapdoor::DCRTPolyTrapdoorSampler, uniform::DCRTPolyUniformSampler,
     },
 };
 use num_bigint::{BigInt, BigUint, Sign};
@@ -229,6 +231,8 @@ pub struct RingKey {
 
 #[derive(Debug, Error)]
 pub enum PolyBackendError {
+    #[error("requested preimage bound {requested} is below minimum {minimum}")]
+    PreimageBoundTooSmall { requested: BigInt, minimum: BigInt },
     #[error("no concrete polynomial parameters registered for {0:?}")]
     MissingParameters(RingKey),
     #[error("uniform range [{minimum}, {maximum}] is not supported by existing samplers")]
@@ -310,6 +314,7 @@ where
         request.public.as_ref(),
         request.target.as_ref(),
         max_coefficient_bound,
+        request.randomness_seed,
     )?)
 }
 
@@ -318,6 +323,7 @@ pub(crate) trait CrtRecomposeMatrix: PolyMatrix {
         levels: &[Self],
         plaintext_moduli: &[BigInt],
         reconstruction_coefficients: &[BigInt],
+        destination: &<Self::P as Poly>::Params,
     ) -> Result<Self, PolyBackendError>;
 }
 
@@ -325,22 +331,27 @@ pub(crate) fn crt_recompose_cpu<M: PolyMatrix>(
     levels: &[M],
     plaintext_moduli: &[BigInt],
     reconstruction_coefficients: &[BigInt],
+    parameters: &<M::P as Poly>::Params,
 ) -> Result<M, PolyBackendError> {
     let first = levels.first().ok_or(PolyBackendError::InvalidInteger)?;
     if levels.len() != plaintext_moduli.len() ||
         levels.len() != reconstruction_coefficients.len() ||
-        levels.iter().any(|level| level.size() != first.size()) ||
+        levels.iter().any(|level| {
+            level.size() != first.size() ||
+                level.params().ring_dimension() != parameters.ring_dimension()
+        }) ||
         first.row_size() != 1
     {
         return Err(PolyBackendError::InvalidInteger);
     }
-    let parameters = first.params();
     let modulus: Arc<BigUint> = parameters.modulus().into();
     let q = BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone());
     let mut output = M::zero(parameters, 1, first.col_size());
     for ((level, plaintext_modulus), reconstruction_coefficient) in
         levels.iter().zip(plaintext_moduli).zip(reconstruction_coefficients)
     {
+        let source_modulus: Arc<BigUint> = level.params().modulus().into();
+        let source_modulus = BigInt::from(source_modulus.as_ref().clone());
         let residue = ((reconstruction_coefficient % &q) + &q) % &q;
         let coefficient = M::P::from_biguint_to_constant(
             parameters,
@@ -354,8 +365,9 @@ pub(crate) fn crt_recompose_cpu<M: PolyMatrix>(
                     .into_iter()
                     .map(|value| {
                         let value = BigInt::from_biguint(Sign::Plus, value);
-                        let rounded: BigInt =
-                            ((plaintext_modulus * value + &q / 2) / &q) % plaintext_modulus;
+                        let rounded: BigInt = ((plaintext_modulus * value + &source_modulus / 2) /
+                            &source_modulus) %
+                            plaintext_modulus;
                         rounded.to_biguint().ok_or(PolyBackendError::InvalidInteger)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -372,8 +384,9 @@ impl CrtRecomposeMatrix for DCRTPolyMatrix {
         levels: &[Self],
         plaintext_moduli: &[BigInt],
         reconstruction_coefficients: &[BigInt],
+        destination: &DCRTPolyParams,
     ) -> Result<Self, PolyBackendError> {
-        crt_recompose_cpu(levels, plaintext_moduli, reconstruction_coefficients)
+        crt_recompose_cpu(levels, plaintext_moduli, reconstruction_coefficients, destination)
     }
 }
 
@@ -453,10 +466,8 @@ where
         self.preimage_batch_calls
     }
 
-    /// Copies a complete matrix to the active GPU placement without host
-    /// staging. Fleet-internal resharding uses this strict path so an
-    /// unavailable direct or peer transfer is reported instead of silently
-    /// materializing the matrix in CPU memory.
+    /// Fleet resharding must remain device-resident. Explicit host staging is
+    /// reserved for artifact and preimage-target ownership transitions.
     #[cfg(feature = "gpu")]
     pub(super) fn matrix_to_active_placement_peer_only(
         &self,
@@ -598,6 +609,11 @@ where
         if let Some(copied) = value.copy_to_params_direct(target) {
             return Ok(copied);
         }
+        tracing::debug!(
+            rows = value.row_size(),
+            columns = value.col_size(),
+            "Direct matrix placement unavailable; transferring raw RNS through host staging"
+        );
         let bytes = value.to_cpu_staging_bytes();
         Ok(M::from_cpu_staging_bytes(target, &bytes))
     }
@@ -629,8 +645,12 @@ where
     }
 
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
+        let mut owners = std::collections::BTreeSet::new();
         for placement in &self.parameters {
             for parameters in placement.values() {
+                if parameters.execution_owner_id().is_some_and(|owner| !owners.insert(owner)) {
+                    continue;
+                }
                 parameters.fence_released_memory();
             }
         }
@@ -790,7 +810,7 @@ where
                 if *small {
                     M::small_gadget_matrix(parameters, ty.rows)
                 } else {
-                    M::gadget_matrix(parameters, ty.rows)
+                    M::gadget_matrix(parameters, ty.rows, Some(digit_count))
                 }
             }
             ConstantMatrix::PowerOfBase { base, exponent } if ty.rows == 1 && ty.columns == 1 => {
@@ -928,6 +948,101 @@ where
         Ok(M::multiply_polys_batch_out_of_place(prepared))
     }
 
+    fn ring_automorphism(&mut self, value: &M, index: usize) -> Result<M, Self::Error> {
+        Ok(value.ring_automorphism_out_of_place(index))
+    }
+
+    fn modulus_switch(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+    ) -> Result<M, Self::Error> {
+        Ok(value.modulus_switch(self.parameters(destination)?))
+    }
+
+    fn reduce_modulus(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+    ) -> Result<M, Self::Error> {
+        Ok(value.reduce_modulus(self.parameters(destination)?))
+    }
+
+    fn ring_automorphism_batch(
+        &mut self,
+        inputs: Vec<(Arc<M>, usize)>,
+    ) -> Result<Vec<M>, Self::Error> {
+        Ok(M::ring_automorphism_batch_out_of_place(inputs))
+    }
+
+    fn preimage_target(
+        &mut self,
+        value: Arc<M>,
+    ) -> Result<(Arc<dyn PolyMatrixColumnSource<M>>, Arc<Vec<u8>>), Self::Error> {
+        let rows = value.row_size();
+        let columns = value.col_size();
+        let params = value.params().clone();
+        let bytes = Arc::new(
+            Arc::try_unwrap(value)
+                .map(|value| value.into_cpu_staging_bytes())
+                .unwrap_or_else(|value| value.as_ref().to_cpu_staging_bytes()),
+        );
+        Ok((Arc::new(PreimageTarget::staged(params, rows, columns, bytes.clone())), bytes))
+    }
+
+    fn matrix_from_cpu_staging_bytes(
+        &self,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<M, Self::Error> {
+        Ok(M::from_cpu_staging_bytes(self.parameters(ty)?, bytes))
+    }
+
+    fn preimage_target_from_staging(
+        &self,
+        ty: &ConcreteMatrixType,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<Arc<dyn PolyMatrixColumnSource<M>>, Self::Error> {
+        let params = self.parameters(ty)?.clone();
+        Ok(Arc::new(PreimageTarget::staged(params, rows, columns, bytes)))
+    }
+
+    fn validate_preimage_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        max_coefficient_bound: &BigInt,
+    ) -> Result<(), Self::Error> {
+        let parameters = self.parameters(ty)?;
+        let base = gadget_base.to_u32().ok_or(PolyBackendError::InvalidInteger)?;
+        let public_rows = ty
+            .rows
+            .checked_div(digit_count.checked_add(2).ok_or(PolyBackendError::InvalidInteger)?)
+            .filter(|rows| *rows > 0)
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        let minimum = default_preimage_cutoff(
+            parameters.ring_dimension(),
+            public_rows,
+            parameters.modulus_digits(),
+            base,
+            sigma,
+        )
+        .ok_or(PolyBackendError::InvalidInteger)?;
+        let requested =
+            max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
+        if requested < minimum {
+            return Err(PolyBackendError::PreimageBoundTooSmall {
+                requested: max_coefficient_bound.clone(),
+                minimum: BigInt::from_biguint(Sign::Plus, minimum),
+            });
+        }
+        Ok(())
+    }
+
     fn transpose(&mut self, value: &M) -> Result<M, Self::Error> {
         Ok(value.transpose())
     }
@@ -1033,7 +1148,7 @@ where
             ty.columns,
             DistType::FinRingDist,
         );
-        Ok(source.gadget_decompose(false)?)
+        Ok(source.gadget_decompose(false, Some(digit_count))?)
     }
 
     fn sample_hash_small_decomposed(
@@ -1057,7 +1172,7 @@ where
             ty.columns,
             DistType::FinRingDist,
         );
-        Ok(source.gadget_decompose(true)?)
+        Ok(source.gadget_decompose(true, Some(digit_count))?)
     }
 
     fn validate_gadget_layout(
@@ -1069,7 +1184,12 @@ where
     ) -> Result<(), Self::Error> {
         let parameters = self.parameters(ty)?;
         let (backend_base, backend_digits) = Self::expected_gadget_layout(parameters, small);
-        if gadget_base != &backend_base || digit_count != backend_digits {
+        let valid_digits = if small {
+            digit_count == backend_digits
+        } else {
+            parameters.gadget_dropped_moduli(Some(digit_count)).is_some()
+        };
+        if gadget_base != &backend_base || !valid_digits {
             return Err(PolyBackendError::GadgetLayoutMismatch {
                 declared_base: gadget_base.clone(),
                 declared_digits: digit_count,
@@ -1106,8 +1226,10 @@ where
         max_coefficient_bound: &BigInt,
         trapdoor: &T::Trapdoor,
         public: &M,
-        target: &M,
+        target: &dyn PolyMatrixColumnSource<M>,
+        randomness_seed: [u8; 32],
     ) -> Result<M::SmallMatrix, Self::Error> {
+        self.validate_preimage_bound(ty, sigma, gadget_base, digit_count, max_coefficient_bound)?;
         let parameters = self.parameters(ty)?;
         Self::validate_regular_gadget_layout(parameters, gadget_base, digit_count)?;
         if parameters.dropped_moduli() != 0 {
@@ -1116,7 +1238,14 @@ where
         let max_coefficient_bound =
             max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
         let sampler = T::new(parameters, sigma);
-        Ok(sampler.preimage(parameters, trapdoor, public, target, max_coefficient_bound)?)
+        Ok(sampler.preimage(
+            parameters,
+            trapdoor,
+            public,
+            target,
+            max_coefficient_bound,
+            randomness_seed,
+        )?)
     }
 
     fn sample_preimage_batch(
@@ -1158,12 +1287,23 @@ where
             .collect()
     }
 
-    fn gadget_decompose(&mut self, value: &M, small: bool) -> Result<M::SmallMatrix, Self::Error> {
-        Ok(value.clone().gadget_decompose(small)?)
+    fn gadget_decompose(
+        &mut self,
+        value: &M,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        Ok(value.clone().gadget_decompose(small, digit_count)?)
     }
 
-    fn gadget_error_bound(&self, ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
-        Ok(BigInt::from(self.parameters(ty)?.gadget_error_bound()))
+    fn gadget_error_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        digit_count: Option<usize>,
+    ) -> Result<BigInt, Self::Error> {
+        let parameters = self.parameters(ty)?;
+        parameters.gadget_dropped_moduli(digit_count).ok_or(PolyBackendError::InvalidInteger)?;
+        Ok(BigInt::from(parameters.gadget_error_bound(digit_count)))
     }
 
     fn multiply_small_rhs(&mut self, lhs: &M, rhs: &M::SmallMatrix) -> Result<M, Self::Error> {
@@ -1240,8 +1380,14 @@ where
         levels: &[M],
         plaintext_moduli: &[BigInt],
         reconstruction_coefficients: &[BigInt],
+        destination: &ConcreteMatrixType,
     ) -> Result<M, Self::Error> {
-        M::crt_recompose_levels(levels, plaintext_moduli, reconstruction_coefficients)
+        M::crt_recompose_levels(
+            levels,
+            plaintext_moduli,
+            reconstruction_coefficients,
+            self.parameters(destination)?,
+        )
     }
 
     fn matrix_to_bytes(&self, value: &M) -> Vec<u8> {
@@ -1456,8 +1602,43 @@ mod tests {
     use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
 
     #[test]
+    fn modulus_conversion_uses_registered_exact_destination_rings() {
+        let source = DCRTPolyParams::new(8, 3, 17, 2, None, None);
+        let primes = source.to_crt().0;
+        let low_modulus = BigUint::from(primes[0]) * primes[2];
+        let low = source.select_modulus(&low_modulus).unwrap();
+        let smallest = source.select_modulus(&BigUint::from(primes[2])).unwrap();
+        let ty = |parameters: &DCRTPolyParams| ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 8,
+            rows: 1,
+            columns: 1,
+        };
+        let polynomial = DCRTPoly::from_biguints(
+            &source,
+            &[BigUint::from(3u32), source.modulus().as_ref() - 1u32],
+        );
+        let input = DCRTPolyMatrix::from_poly_vec_row(&source, vec![polynomial]);
+        let mut missing = cpu_backend([source.clone()]);
+        assert!(matches!(
+            missing.modulus_switch(&input, &ty(&low)),
+            Err(PolyBackendError::MissingParameters(_))
+        ));
+        let mut backend = cpu_backend([source.clone(), low.clone(), smallest.clone()]);
+        let switched = backend.modulus_switch(&input, &ty(&low)).unwrap();
+        assert_eq!(switched.params(), &low);
+        assert_eq!(switched, input.modulus_switch(&low));
+        let smaller = backend.modulus_switch(&switched, &ty(&smallest)).unwrap();
+        assert_eq!(smaller.params(), &smallest);
+        assert_eq!(smaller, switched.modulus_switch(&smallest));
+        let reduced = backend.reduce_modulus(&input, &ty(&low)).unwrap();
+        assert_eq!(reduced.entry(0, 0).coeffs_biguints()[0], BigUint::from(3u32));
+        assert_eq!(reduced.entry(0, 0).coeffs_biguints()[1], &low_modulus - 1u32);
+    }
+
+    #[test]
     fn approximate_layout_rejects_exact_trapdoor_sampling() {
-        let parameters = DCRTPolyParams::new(4, 2, 10, 5, Some(1));
+        let parameters = DCRTPolyParams::new(4, 2, 10, 5, None, Some(1));
         let ty = ConcreteMatrixType {
             modulus: BigInt::from(parameters.modulus().as_ref().clone()),
             ring_dimension: 4,
@@ -1475,7 +1656,7 @@ mod tests {
 
     #[test]
     fn coefficient_extraction_returns_a_canonical_index_above_half_modulus() {
-        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
         let modulus = parameters.modulus();
         let residue = modulus.as_ref() - BigUint::from(1u8);
         let value = DCRTPolyMatrix::from_poly_vec_row(
@@ -1492,7 +1673,7 @@ mod tests {
 
     #[test]
     fn decomposed_hash_uses_the_explicit_backend_layout() {
-        let parameters = DCRTPolyParams::new(4, 1, 10, 5, None);
+        let parameters = DCRTPolyParams::new(4, 1, 10, 5, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digits = parameters.modulus_digits();
         let base = BigInt::from(1u8) << parameters.base_bits();
@@ -1515,7 +1696,8 @@ mod tests {
         assert_eq!(decomposed.value(), &plain.decompose());
         assert_eq!(small_decomposed.value(), &plain.small_decompose());
 
-        let gadget = DCRTPolyMatrix::gadget_matrix(decomposed.value().params(), plain_type.rows);
+        let gadget =
+            DCRTPolyMatrix::gadget_matrix(decomposed.value().params(), plain_type.rows, None);
         assert_eq!(
             backend
                 .multiply_small_rhs(&gadget, &decomposed)
@@ -1526,7 +1708,7 @@ mod tests {
 
     #[test]
     fn compact_artifact_codec_keeps_semantics_external_and_rejects_malformed_payloads() {
-        let parameters = DCRTPolyParams::new(4, 1, 16, 8, None);
+        let parameters = DCRTPolyParams::new(4, 1, 16, 8, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let digits = parameters.modulus_digits();
         let base = BigInt::from(1u8) << parameters.base_bits();

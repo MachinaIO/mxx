@@ -15,7 +15,7 @@ const PREIMAGE_BOUND_BITS: usize = 48;
 #[cfg(feature = "gpu")]
 fn bench_gpu_preimage() {
     use mxx_primitives::{
-        matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+        matrix::{ResidentPolyMatrixColumnSource, gpu_dcrt_poly::GpuDCRTPolyMatrix},
         poly::{
             PolyParams,
             dcrt::{
@@ -34,7 +34,7 @@ fn bench_gpu_preimage() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Keep parameters aligned with the CPU benchmark for a fair comparison.
-    let cpu_params = DCRTPolyParams::new(16384, 10, 24, 12, None);
+    let cpu_params = DCRTPolyParams::new(16384, 10, 24, 12, None, None);
     let (moduli, _, _) = cpu_params.to_crt();
     let params =
         GpuDCRTPolyParams::new(cpu_params.ring_dimension(), moduli, cpu_params.base_bits(), None);
@@ -58,8 +58,9 @@ fn bench_gpu_preimage() {
             &params,
             &trapdoor,
             &public_matrix,
-            &target,
+            &ResidentPolyMatrixColumnSource::new(target),
             BigUint::from(1u8) << PREIMAGE_BOUND_BITS,
+            rand::random(),
         )
         .expect("bounded compact GPU preimage sampling failed");
     gpu_device_sync();

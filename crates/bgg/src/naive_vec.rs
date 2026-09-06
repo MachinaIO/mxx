@@ -537,6 +537,7 @@ impl NaiveBggEncodingVecSampler {
                             sampler
                                 .sample(
                                     secret.clone(),
+                                    None,
                                     &[BggPublicKeyWire {
                                         matrix: one_key,
                                         reveal_plaintext: reveal,
@@ -564,6 +565,7 @@ impl NaiveBggEncodingVecSampler {
                                 sampler
                                     .sample(
                                         secret.clone(),
+                                        None,
                                         &[
                                             BggPublicKeyWire {
                                                 matrix: one_key,
@@ -697,7 +699,7 @@ mod tests {
 
     #[test]
     fn runtime_addition_zips_every_component_and_matches_primitives() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
         let ring = Ring::new(
@@ -791,7 +793,7 @@ mod tests {
 
     #[test]
     fn runtime_matrix_multiplication_matches_primitive_decomposition() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let columns = 2 * digit_count;
         let ring = Ring::new(
@@ -842,21 +844,21 @@ mod tests {
             matrix_output(&result, "vector"),
             &vector
                 .clone()
-                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&target.clone().gadget_decompose(false, None).unwrap())
                 .unwrap()
         );
         assert_eq!(
             matrix_output(&result, "public"),
             &public
                 .clone()
-                .multiply_small_rhs(&target.clone().gadget_decompose(false).unwrap())
+                .multiply_small_rhs(&target.clone().gadget_decompose(false, None).unwrap())
                 .unwrap()
         );
         assert!(output.plaintexts.is_none());
     }
     #[test]
     fn naive_sampler_runtime_preserves_tags_and_encoding_formulas() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let layout = concrete_layout(&parameters, 2);
         let key = [47u8; 32];
         let tag = b"naive-bgg-ir";
@@ -908,7 +910,7 @@ mod tests {
             ]),
         );
         let hash_sampler = DCRTPolyHashSampler::<keccak_asm::Keccak256>::new();
-        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension);
+        let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, layout.secret_dimension, None);
         for output in 0..public_keys.len() {
             for slot in 0..2 {
                 let mut slot_tag = tag.to_vec();

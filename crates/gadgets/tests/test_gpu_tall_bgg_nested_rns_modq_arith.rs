@@ -598,7 +598,14 @@ fn selected_cpu_parameters(
     Ok((
         crt_depth,
         log_ring_dimension,
-        DCRTPolyParams::new(ring_dimension, crt_depth, config.crt_modulus_bits, base_bits, None),
+        DCRTPolyParams::new(
+            ring_dimension,
+            crt_depth,
+            config.crt_modulus_bits,
+            base_bits,
+            None,
+            None,
+        ),
     ))
 }
 
@@ -1319,8 +1326,7 @@ fn benchmark_estimation(
         .copied()
         .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
         .collect();
-    let mut backend =
-        GpuNodeMeasurementBackend::new(backends, harness, selected.parameters.to_crt().2);
+    let mut backend = GpuNodeMeasurementBackend::new(backends, harness);
     info!("collecting unique GPU measurement shapes");
     estimate(&preprocessing_graph, &mut backend).map_err(|error| error.to_string())?;
     estimate(&encoding_graph, &mut backend).map_err(|error| error.to_string())?;
@@ -1988,7 +1994,7 @@ fn selected_parameters_produce_exactly_one_candidate() {
 
 #[test]
 fn alternating_transform_oracle_matches_openfhe_and_round_trip() {
-    let parameters = DCRTPolyParams::new(8, 2, 17, 6, None);
+    let parameters = DCRTPolyParams::new(8, 2, 17, 6, None, None);
     let coefficients = (0u64..8).map(|value| BigUint::from(value * value + 3)).collect::<Vec<_>>();
     let expected_forward = DCRTPoly::from_biguints(&parameters, &coefficients).eval_slots();
     assert_eq!(expected_alternating_transforms(&parameters, 2, &coefficients, 1), expected_forward);
@@ -2005,7 +2011,7 @@ fn alternating_transform_oracle_matches_openfhe_and_round_trip() {
 
 #[test]
 fn configured_transform_count_appends_ntt_and_intt_after_multiplication() {
-    let parameters = DCRTPolyParams::new(8, 1, 17, 6, None);
+    let parameters = DCRTPolyParams::new(8, 1, 17, 6, None, None);
     let mut multiplication_only = noiseless_runtime_config();
     multiplication_only.mul_count = 1;
     multiplication_only.ntt_intt_count = 0;
@@ -2086,7 +2092,7 @@ fn candidate_search_excludes_dcrt_depths_smaller_than_the_encoding_depth() {
 
 #[test]
 fn lookup_planning_stats_match_preprocessing_for_repeated_subcircuit() {
-    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+    let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
     let digit_count = parameters.modulus_digits();
     let modulus = BigInt::from(parameters.modulus().as_ref().clone());
     let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
@@ -2338,7 +2344,7 @@ fn test_gpu_tall_bgg_nested_rns_noiseless_encoding_matches_ideal_product() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
     let config = noiseless_runtime_config();
-    let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+    let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
     let selected = prepare_candidate(parameters, &config, 0).expect("small noiseless Tall graphs");
     let device_ids = detected_gpu_device_ids();
     assert!(!device_ids.is_empty(), "at least one CUDA GPU");
@@ -2374,7 +2380,7 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
     let (config, selected) = match requested_mode {
         TallRunMode::ZeroNoise => {
             let config = noiseless_runtime_config();
-            let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+            let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
             let selected =
                 prepare_candidate(parameters, &config, 0).expect("small noiseless Tall graphs");
             (config, selected)
@@ -2393,6 +2399,7 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
                 crt_depth,
                 requested_config.crt_modulus_bits,
                 u32::try_from(requested_config.gadget_base_bits).expect("validated gadget base"),
+                None,
                 None,
             );
             let selected = prepare_candidate(parameters, &requested_config, 0)

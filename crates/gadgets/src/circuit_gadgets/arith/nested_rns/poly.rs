@@ -2198,7 +2198,7 @@ mod full_reduce_tests {
     const SCALE: u64 = 1 << 8;
 
     fn parameters() -> DCRTPolyParams {
-        DCRTPolyParams::new(2, 3, 12, 6, None)
+        DCRTPolyParams::new(2, 3, 12, 6, None, None)
     }
 
     /// Smallest p-basis width supporting the full-reduce test parameters under the default
@@ -2317,7 +2317,7 @@ mod tests {
     const SCALE: u64 = 1 << 8;
 
     fn test_parameters() -> DCRTPolyParams {
-        DCRTPolyParams::new(2, 3, 12, 6, None)
+        DCRTPolyParams::new(2, 3, 12, 6, None, None)
     }
 
     /// Smallest p-basis width supporting the shared test parameters under the default
@@ -2353,7 +2353,7 @@ mod tests {
         p_moduli_bits: usize,
         max_unreduced_muls: usize,
     ) -> (DCRTPolyParams, Arc<NestedRnsPolyContext>) {
-        let parameters = DCRTPolyParams::new(2, 3, 18, 6, None);
+        let parameters = DCRTPolyParams::new(2, 3, 18, 6, None, None);
         let context = Arc::new(NestedRnsPolyContext::setup(
             circuit,
             &parameters,

@@ -4,7 +4,7 @@ use crate::lean::{export_dcrt_layouts, render_backend_context};
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 
 fn render_fixture() -> String {
-    let parameters = DCRTPolyParams::new(2, 1, 10, 5, None);
+    let parameters = DCRTPolyParams::new(2, 1, 10, 5, None, None);
     let layout = export_dcrt_layouts([&parameters]).expect("concrete DCRT layout").remove(0);
     let q = layout.modulus.to_str_radix(10);
     let modulus_list = layout.crt_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
@@ -13,14 +13,14 @@ fn render_fixture() -> String {
     let regular_digits = layout.regular_digit_count;
     let n = layout.ring_dimension;
 
-    let multi_parameters = DCRTPolyParams::new(2, 2, 10, 5, None);
+    let multi_parameters = DCRTPolyParams::new(2, 2, 10, 5, None, None);
     let multi_layout =
         export_dcrt_layouts([&multi_parameters]).expect("multi-tower layout").remove(0);
     let multi_q = multi_layout.modulus.to_string();
-    let approximate_parameters = DCRTPolyParams::new(2, 3, 10, 5, Some(1));
+    let approximate_parameters = DCRTPolyParams::new(2, 3, 10, 5, None, Some(1));
     let approximate_layout = export_dcrt_layouts([&approximate_parameters]).unwrap().remove(0);
     let approximate_q = approximate_layout.modulus.to_string();
-    let approximate_bound = approximate_parameters.gadget_error_bound();
+    let approximate_bound = approximate_parameters.gadget_error_bound(None);
     let context = render_backend_context(
         &[layout.clone(), multi_layout, approximate_layout],
         "GeneratedBackend",

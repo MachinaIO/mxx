@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn two_slot_negacyclic_convolution_matches_the_coefficient_oracle_at_runtime() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let q_modulus = parameters.to_crt().0[0];
         let context = Arc::new(ScalarArithmeticContext { q_modulus });
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn nested_rns_negacyclic_diagonal_matches_the_signed_matrix_diagonal_at_runtime() {
         let num_slots = 4;
-        let parameters = DCRTPolyParams::new(4, 2, 10, 5, None);
+        let parameters = DCRTPolyParams::new(4, 2, 10, 5, None, None);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let context = nested_context(&mut circuit, &parameters, None);
         let window = CrtWindow::full(context.q_moduli_depth);
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn nested_rns_convolution_matches_primitive_polynomial_multiplication_at_runtime() {
         test_nested_rns_convolution_window(
-            DCRTPolyParams::new(4, 2, 10, 5, None),
+            DCRTPolyParams::new(4, 2, 10, 5, None, None),
             CrtWindow::full(2),
         );
     }
@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn nested_rns_convolution_respects_a_nonzero_partial_level_window_at_runtime() {
         test_nested_rns_convolution_window(
-            DCRTPolyParams::new(2, 3, 10, 5, None),
+            DCRTPolyParams::new(2, 3, 10, 5, None, None),
             CrtWindow::new(1, 2, 3),
         );
     }
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     #[ignore = "slow decomposed nested-RNS convolution runtime coverage; run explicitly with --ignored"]
     fn decomposed_nested_rns_convolution_respects_a_nonzero_partial_window_at_runtime() {
-        let parameters = DCRTPolyParams::new(2, 3, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 3, 10, 5, None, None);
         let num_slots = parameters.ring_dimension() as usize;
         let window = CrtWindow::new(1, 2, 3);
         let build = |use_decomposed_helper: bool| {
@@ -980,7 +980,7 @@ mod tests {
     fn sparse_nested_rns_convolution_matches_the_manual_pipeline_without_depth_regression() {
         let num_slots = 2;
         let target_q_index = 1;
-        let parameters = DCRTPolyParams::new(2, 2, 10, 5, None);
+        let parameters = DCRTPolyParams::new(2, 2, 10, 5, None, None);
         let (automatic_context, automatic) =
             build_sparse_convolution(true, &parameters, target_q_index, num_slots);
         let (manual_context, manual) =

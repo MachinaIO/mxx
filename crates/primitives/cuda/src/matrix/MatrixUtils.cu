@@ -392,8 +392,8 @@ int matrix_track_limb_consumer_readonly(
     {
         return set_error("invalid source placement in matrix_track_limb_consumer_readonly");
     }
-    if (limb_id.x >= src->ctx->release_streams_by_partition.size() ||
-        !src->ctx->release_streams_by_partition[limb_id.x])
+    if (limb_id.x >= src->ctx->execution->release_streams_by_partition.size() ||
+        !src->ctx->execution->release_streams_by_partition[limb_id.x])
     {
         return set_error("missing source release stream in matrix_track_limb_consumer_readonly");
     }
@@ -412,7 +412,7 @@ int matrix_track_limb_consumer_readonly(
     if (err == cudaSuccess)
     {
         err = cudaStreamWaitEvent(
-            src->ctx->release_streams_by_partition[limb_id.x],
+            src->ctx->execution->release_streams_by_partition[limb_id.x],
             consumer_done,
             0);
     }

@@ -4,8 +4,12 @@ use mxx_ir_core::{
     node::{ConcatAxis, ConstantMatrix},
     types::ConcreteMatrixType,
 };
+use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnSource};
 use num_bigint::BigInt;
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 
 pub mod poly;
 #[cfg(feature = "gpu")]
@@ -20,7 +24,76 @@ pub struct PreimageRequest<M, T> {
     pub max_coefficient_bound: BigInt,
     pub trapdoor: Arc<T>,
     pub public: Arc<M>,
-    pub target: Arc<M>,
+    pub target: Arc<dyn PolyMatrixColumnSource<M>>,
+    /// Seed for deterministic GPU sampling with a fixed column schedule.
+    pub randomness_seed: [u8; 32],
+}
+
+/// Full logical preimage target whose expanded columns are loaded on demand.
+/// The staged constructor owns host bytes, allowing a GPU owner to be dropped
+/// before sampling while preserving the original matrix dimensions.
+pub struct PreimageTarget<M> {
+    rows: usize,
+    columns: usize,
+    loader: Arc<dyn Fn(usize, usize) -> M + Send + Sync>,
+}
+
+impl<M> Clone for PreimageTarget<M> {
+    fn clone(&self) -> Self {
+        Self { rows: self.rows, columns: self.columns, loader: self.loader.clone() }
+    }
+}
+
+impl<M> Debug for PreimageTarget<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreimageTarget")
+            .field("rows", &self.rows)
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> PreimageTarget<M>
+where
+    M: PolyMatrix + 'static,
+{
+    pub fn staged(
+        params: <M::P as mxx_primitives::poly::Poly>::Params,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Self {
+        let loader = Arc::new(move |start: usize, end: usize| {
+            M::from_cpu_staging_columns(&params, bytes.as_slice(), start, end)
+        });
+        Self { rows, columns, loader }
+    }
+
+    pub fn resident(value: Arc<M>) -> Self {
+        let rows = value.row_size();
+        let columns = value.col_size();
+        let loader = Arc::new(move |start: usize, end: usize| value.slice_columns(start, end));
+        Self { rows, columns, loader }
+    }
+}
+
+impl<M> PolyMatrixColumnSource<M> for PreimageTarget<M>
+where
+    M: PolyMatrix + 'static,
+{
+    fn row_size(&self) -> usize {
+        self.rows
+    }
+
+    fn col_size(&self) -> usize {
+        self.columns
+    }
+
+    fn load_columns(&self, start: usize, end: usize) -> M {
+        assert!(start <= end && end <= self.columns, "invalid preimage target column interval");
+        (self.loader)(start, end)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +115,7 @@ pub struct SampleRange {
 }
 
 pub trait Backend {
-    type Matrix: Clone + Debug + PartialEq + Send + Sync;
+    type Matrix: Clone + Debug + PartialEq + Send + Sync + 'static;
     type SmallMatrix: Clone + Debug + PartialEq + Send + Sync;
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
@@ -236,6 +309,58 @@ pub trait Backend {
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
         inputs.into_iter().map(|(value, scalar)| self.scale_integer(&value, &scalar)).collect()
     }
+    fn ring_automorphism(
+        &mut self,
+        value: &Self::Matrix,
+        index: usize,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn modulus_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+    fn reduce_modulus(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn ring_automorphism_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, usize)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        inputs.into_iter().map(|(value, index)| self.ring_automorphism(&value, index)).collect()
+    }
+
+    fn preimage_target(
+        &mut self,
+        value: Arc<Self::Matrix>,
+    ) -> Result<(Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>), Self::Error>;
+
+    fn matrix_from_cpu_staging_bytes(
+        &self,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn preimage_target_from_staging(
+        &self,
+        ty: &ConcreteMatrixType,
+        rows: usize,
+        columns: usize,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Self::Error>;
+
+    fn validate_preimage_bound(
+        &self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        max_coefficient_bound: &BigInt,
+    ) -> Result<(), Self::Error>;
+
     fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error>;
     fn slice(
         &mut self,
@@ -302,8 +427,10 @@ pub trait Backend {
         max_coefficient_bound: &BigInt,
         trapdoor: &Self::Trapdoor,
         public: &Self::Matrix,
-        target: &Self::Matrix,
+        target: &dyn PolyMatrixColumnSource<Self::Matrix>,
+        randomness_seed: [u8; 32],
     ) -> Result<Self::SmallMatrix, Self::Error>;
+
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>,
@@ -320,6 +447,7 @@ pub trait Backend {
                     request.trapdoor.as_ref(),
                     request.public.as_ref(),
                     request.target.as_ref(),
+                    request.randomness_seed,
                 )
             })
             .collect()
@@ -350,13 +478,18 @@ pub trait Backend {
     }
     /// Inclusive full-modulus reconstruction error for this backend's regular gadget.
     /// Exact non-CRT backends keep the default zero bound.
-    fn gadget_error_bound(&self, _ty: &ConcreteMatrixType) -> Result<BigInt, Self::Error> {
+    fn gadget_error_bound(
+        &self,
+        _ty: &ConcreteMatrixType,
+        _digit_count: Option<usize>,
+    ) -> Result<BigInt, Self::Error> {
         Ok(BigInt::from(0u8))
     }
     fn gadget_decompose(
         &mut self,
         value: &Self::Matrix,
         small: bool,
+        digit_count: Option<usize>,
     ) -> Result<Self::SmallMatrix, Self::Error>;
     fn multiply_small_rhs(
         &mut self,
@@ -385,6 +518,7 @@ pub trait Backend {
         levels: &[Self::Matrix],
         plaintext_moduli: &[BigInt],
         reconstruction_coefficients: &[BigInt],
+        destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
 
     fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8>;
@@ -423,6 +557,11 @@ pub enum RuntimeValue<B: Backend> {
     Bytes(Vec<u8>),
     TypedBlob(Vec<u8>),
     Matrix(Arc<B::Matrix>),
+    /// Host-staged matrix; expanded columns are loaded only when consumed.
+    HostMatrix {
+        matrix_type: ConcreteMatrixType,
+        bytes: Arc<Vec<u8>>,
+    },
     SmallMatrix(Arc<B::SmallMatrix>),
     Trapdoor {
         secret: Option<Arc<B::Trapdoor>>,
@@ -467,6 +606,9 @@ impl<B: Backend> Clone for RuntimeValue<B> {
             Self::Bytes(value) => Self::Bytes(value.clone()),
             Self::TypedBlob(value) => Self::TypedBlob(value.clone()),
             Self::Matrix(value) => Self::Matrix(value.clone()),
+            Self::HostMatrix { matrix_type, bytes } => {
+                Self::HostMatrix { matrix_type: matrix_type.clone(), bytes: bytes.clone() }
+            }
             Self::SmallMatrix(value) => Self::SmallMatrix(value.clone()),
             Self::Trapdoor {
                 secret,
@@ -526,6 +668,7 @@ impl<B: Backend> RuntimeValue<B> {
             Self::IndexedFamily(values) => {
                 values.iter().any(Self::releases_backend_resources_on_drop)
             }
+            Self::HostMatrix { .. } |
             Self::Int(_) |
             Self::Real(_) |
             Self::Bool(_) |

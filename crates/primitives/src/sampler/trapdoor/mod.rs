@@ -13,12 +13,14 @@ use crate::{
     },
     openfhe_guard::ensure_openfhe_warmup,
     parallel_iter,
-    poly::{PolyParams, dcrt::params::DCRTPolyParams},
+    poly::{
+        PolyParams,
+        dcrt::{native::ffi::exact_basis_matrix_coefficients, params::DCRTPolyParams},
+    },
     sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor};
-use openfhe::ffi::{FormatMatrixCoefficient, SampleP1ForPertMat};
 use rayon::iter::ParallelIterator;
 pub use sampler::DCRTPolyTrapdoorSampler;
 use std::{
@@ -305,35 +307,34 @@ fn sample_p1_for_pert_mat(
     padded_ncol: usize,
 ) -> DCRTPolyMatrix {
     ensure_openfhe_warmup(params);
-    let n = params.ring_dimension();
-    let depth = params.crt_depth();
-    let k_res = params.crt_bits();
     debug!("{}", "sample_p1_for_pert_square_mat parameters computed");
     let mut a_mat = a_mat.to_cpp_matrix_ptr();
-    FormatMatrixCoefficient(a_mat.inner.as_mut().unwrap());
+    exact_basis_matrix_coefficients(a_mat.inner.as_mut().unwrap())
+        .expect("A coefficient conversion");
     let mut b_mat = b_mat.to_cpp_matrix_ptr();
-    FormatMatrixCoefficient(b_mat.inner.as_mut().unwrap());
+    exact_basis_matrix_coefficients(b_mat.inner.as_mut().unwrap())
+        .expect("B coefficient conversion");
     let mut d_mat = d_mat.to_cpp_matrix_ptr();
-    FormatMatrixCoefficient(d_mat.inner.as_mut().unwrap());
+    exact_basis_matrix_coefficients(d_mat.inner.as_mut().unwrap())
+        .expect("D coefficient conversion");
     debug!("{}", "a_mat, b_mat, d_mat are converted to cpp matrices");
     let mut tp2_cpp = tp2.to_cpp_matrix_ptr();
-    FormatMatrixCoefficient(tp2_cpp.inner.as_mut().unwrap());
+    exact_basis_matrix_coefficients(tp2_cpp.inner.as_mut().unwrap())
+        .expect("target coefficient conversion");
     drop(tp2);
     let cpp_matrix = {
         let _lock = SAMPLE_P1_FOR_PERT_MAT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        SampleP1ForPertMat(
+        crate::poly::dcrt::native::ffi::exact_basis_p1(
             &a_mat.inner,
             &b_mat.inner,
             &d_mat.inner,
             &tp2_cpp.inner,
-            n,
-            depth,
-            k_res,
             padded_ncol,
             c,
             s,
             dgg_stddev,
         )
+        .expect("exact CRT perturbation sampling failed")
     };
     debug!("{}", "SampleP1ForPertSquareMat called");
     drop(a_mat);

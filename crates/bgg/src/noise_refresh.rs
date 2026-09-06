@@ -447,6 +447,7 @@ impl NaiveBggNoiseRefreshCompiler {
             wide_levels,
             self.crt_plaintext_moduli.clone(),
             self.reconstruction_coefficients.clone(),
+            self.modulus.clone(),
         );
         Ok(Family::pack(
             (0..self.slot_count)
@@ -575,7 +576,7 @@ mod tests {
 
     #[test]
     fn online_runtime_matches_explicit_zero_refresh_oracle() {
-        let parameters = DCRTPolyParams::new(4, 2, 10, 5, None);
+        let parameters = DCRTPolyParams::new(4, 2, 10, 5, None, None);
         let q = parameters.modulus().as_ref().clone();
         let (plaintext_moduli, _, depth) = parameters.to_crt();
         let reconstruction_coefficients = parameters.reconst_coeffs();

@@ -15,6 +15,13 @@ extern "C"
         const uint64_t *reconstruction_residues,
         size_t reconstruction_stride);
 
+    int gpu_matrix_convert_modulus(
+        GpuMatrix *out,
+        const GpuMatrix *source,
+        int round_scale,
+        const uint64_t *division_inverses,
+        size_t inverse_count);
+
 #ifdef __cplusplus
 }
 #endif

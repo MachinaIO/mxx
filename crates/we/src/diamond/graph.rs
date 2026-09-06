@@ -526,8 +526,8 @@ impl DiamondWeProtocolFamily {
             .evaluate(initial_state, witness_digits, transitions)?;
         let states =
             input_evaluation.states.semantic_anchor("diamond.decrypt.input-injector-states")?;
+        let encoding_compiler = BggEncodingCompiler;
         let public_key_compiler = Self::public_key_compiler(&graph_params);
-        let encoding_compiler = BggEncodingCompiler { public_key: public_key_compiler.clone() };
         let public_key_matrices = ring.family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::PUBLIC_KEYS,
@@ -562,13 +562,11 @@ impl DiamondWeProtocolFamily {
         let one_vector = one_preimage.mul_small_rhs(initial_projection_state.clone());
         let k_vector = k_preimage.mul_small_rhs(initial_projection_state.clone());
         let decoder = decoder_preimage.mul_small_rhs(initial_projection_state);
-        let one_public_key_matrix = public_keys.matrices.get_static(0);
         let one_plaintext_matrix = ring.identity(1);
-        let one_encoding = BggEncodingWire {
-            vector: one_vector,
-            pubkey: BggPublicKeyWire { matrix: one_public_key_matrix, reveal_plaintext: true },
-            plaintext: Some(one_plaintext_matrix),
-        };
+        let one_public_key =
+            BggPublicKeyWire { matrix: public_keys.matrices.get_static(0), reveal_plaintext: true };
+        let one_encoding =
+            BggEncodingWire { vector: one_vector, plaintext: Some(one_plaintext_matrix) };
         let zero_encoding = encoding_compiler.sub(&one_encoding, &one_encoding).expect("revealed");
         let witness_preimages = ring.preimage_family_artifact_input(
             encryption.clone(),
@@ -615,7 +613,7 @@ impl DiamondWeProtocolFamily {
             })?;
         let packed_vectors = witness_vectors.parallel_gather(packed_indices.clone())?;
         let packed_public_keys = witness_public_keys.parallel_gather(packed_indices.clone())?;
-        let packed_plaintexts = witness_plaintexts.parallel_gather(packed_indices)?;
+        let packed_plaintexts = witness_plaintexts.parallel_gather(packed_indices.clone())?;
         let active_witness =
             Parallel::range(circuit_params.max_layer_width.clone()).map_values({
                 let instance_width = instance_width.clone();
@@ -634,8 +632,9 @@ impl DiamondWeProtocolFamily {
         let packed_vectors = active_witness
             .clone()
             .parallel_select_mats(vec![active_zero_vectors, packed_vectors])?;
+        let zero_public_key = one_public_key.matrix.clone() - one_public_key.matrix.clone();
         let active_zero_public_keys = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_encoding.pubkey.matrix.clone())?;
+            .map_values(|_| zero_public_key.clone())?;
         let packed_public_keys = active_witness
             .clone()
             .parallel_select_mats(vec![active_zero_public_keys, packed_public_keys])?;
@@ -652,9 +651,9 @@ impl DiamondWeProtocolFamily {
             .clone()
             .parallel_select_mats(vec![instance_zero_vectors, instance_one_vectors])?;
         let instance_zero_public_keys = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_encoding.pubkey.matrix.clone())?;
+            .map_values(|_| zero_public_key.clone())?;
         let instance_one_public_keys = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| one_encoding.pubkey.matrix.clone())?;
+            .map_values(|_| one_public_key.matrix.clone())?;
         let selected_instance_keys = selectors
             .clone()
             .parallel_select_mats(vec![instance_zero_public_keys, instance_one_public_keys])?;
@@ -692,7 +691,9 @@ impl DiamondWeProtocolFamily {
             circuit_data.clone(),
             circuit_inputs,
             one_encoding.clone(),
+            one_public_key,
             encoding_compiler,
+            public_key_compiler,
         )?;
         let circuit_output_index = circuit_data.output_source();
         let circuit_vector = circuit_output_family
@@ -1295,7 +1296,7 @@ mod tests {
             .unwrap();
         let result = execute(
             &graph,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
@@ -1324,7 +1325,7 @@ mod tests {
             let validated = mxx_ir_core::validate(&predicate.graph, bindings).unwrap();
             let result = execute(
                 &validated,
-                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None)]),
+                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
                 BTreeMap::new(),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,

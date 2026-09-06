@@ -5,20 +5,45 @@ pub mod gpu;
 pub mod harness;
 
 use mxx_ir_core::{
-    FrozenGraphScopeId, LivenessSchedule, ParamEnv, ValidatedGraph, encoding,
+    BenchmarkRole, FrozenGraphScopeId, IntExpr, LivenessSchedule, ParamEnv, RealExpr,
+    ValidatedGraph,
+    artifact::ArtifactConfidentiality,
+    encoding,
     node::NodeKind,
     types::{ConcreteWireType, NodeId, WireRef, WireType},
 };
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeMeasurement {
     pub work_seconds: f64,
+    /// Dependency latency: one fleet wave for independently column-separable operations.
     pub latency_seconds: f64,
+    /// Sum of all production fleet wave latencies for the full logical operation.
+    pub cumulative_wave_seconds: f64,
+    /// Number of independent fleet waves needed for the full logical operation.
+    pub independent_wave_count: usize,
+    /// Measured scratch for one bounded execution wave, excluding resident inputs.
+    /// This is not the whole-graph runtime peak and is never multiplied by wave count.
+    pub measured_wave_workspace_bytes: u64,
+    /// Hypothetical workspace when all independent waves execute concurrently.
     pub workspace_bytes: u64,
+}
+
+impl Default for NodeMeasurement {
+    fn default() -> Self {
+        Self {
+            work_seconds: 0.0,
+            latency_seconds: 0.0,
+            cumulative_wave_seconds: 0.0,
+            independent_wave_count: 1,
+            measured_wave_workspace_bytes: 0,
+            workspace_bytes: 0,
+        }
+    }
 }
 
 pub struct MeasurementNode<'a> {
@@ -48,6 +73,48 @@ pub trait MeasurementBackend {
     ) -> Result<NodeMeasurement, Self::Error>;
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64;
+    fn persistent_bytes_for_node(&self, _kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        self.persistent_bytes(wire_type)
+    }
+    /// Bytes that must cross the benchmark's input boundary for this node.
+    /// Backends override this for compact/artifact-backed values whose transport
+    /// representation differs from their resident representation.
+    fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        match kind {
+            NodeKind::Input { artifact: Some(artifact), .. }
+                if artifact.confidentiality == ArtifactConfidentiality::Private =>
+            {
+                0
+            }
+            NodeKind::Input { .. } => self.persistent_bytes_for_node(kind, wire_type),
+            _ => 0,
+        }
+    }
+    /// Deterministic data reusable between invocations (for example a keyed
+    /// hash/cache entry). It is deliberately separate from transmission.
+    fn cache_bytes_for_node(&self, _kind: &NodeKind, _wire_type: &ConcreteWireType) -> u64 {
+        0
+    }
+    /// Persistent storage required for the complete logical output artifact.
+    fn persistent_storage_bytes_for_node(
+        &self,
+        _kind: &NodeKind,
+        wire_type: &ConcreteWireType,
+    ) -> u64 {
+        self.persistent_bytes(wire_type)
+    }
+    /// Resident bytes owned by this output while it is live on the device.
+    fn resident_vram_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        self.persistent_bytes_for_node(kind, wire_type)
+    }
+    /// Bytes emitted by this node, independent of whether the value is kept
+    /// resident or immediately staged to persistent storage.
+    fn output_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        self.persistent_storage_bytes_for_node(kind, wire_type)
+    }
+    fn persistent_alias_argument(&self, _kind: &NodeKind, _output_port: usize) -> Option<usize> {
+        None
+    }
 
     fn loop_index_invariant(&self, _graph: &str, _node: &MeasurementNode<'_>) -> bool {
         true
@@ -57,20 +124,45 @@ pub trait MeasurementBackend {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
     pub total_work_seconds: f64,
+    /// Cumulative measured wave latencies including every logical invocation.
+    /// This work-like sum is distinct from the unlimited-resource critical path.
+    pub total_time_seconds: f64,
     /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
     pub preimage_sampling_work_seconds: f64,
-    /// Earliest completion time when every dependency-ready node can start.
+    /// Earliest completion when all dependency-ready nodes can run concurrently.
     pub critical_path_seconds: f64,
-    /// Maximum sum of active node parallelism in the unlimited-resource DAG schedule.
+    /// Maximum simultaneous node/fleet-wave parallelism in that unlimited-resource schedule.
     pub maximum_parallelism: usize,
-    /// Live persistent bytes sampled after applying the resource changes at
-    /// each distinct event time in the unlimited-resource DAG schedule.
     pub persistent_bytes_over_time: Vec<u64>,
-    /// Maximum sum of workspaces for nodes active at the same event time.
+    /// Maximum measured bounded-wave scratch in this scope, excluding resident inputs.
+    pub measured_wave_workspace_bytes: u64,
+    /// Workspace in the hypothetical unlimited-resource dependency schedule.
     pub workspace_high_water_bytes: u64,
     pub workspace_high_water_by_node: BTreeMap<String, u64>,
+    pub transmitted_bytes: u128,
+    pub cache_bytes: u128,
+    pub persistent_storage_bytes: u128,
+    pub resident_vram_bytes: u64,
+    pub expanded_workspace_bytes: u64,
+    pub output_bytes: u128,
+    /// Sum of primitive wave counts in this scope, counting each structural node once.
+    /// Nested scope invocation counts are reported separately in `per_subgraph`.
+    pub chunk_count: usize,
+    /// Peak memory in the hypothetical unlimited-resource dependency schedule.
     pub peak_memory_bytes: u64,
     pub per_subgraph: BTreeMap<String, SubgraphCost>,
+    /// Work and total-time costs for nodes explicitly tagged by the graph
+    /// producer. Structural nodes are not charged directly; their tagged
+    /// child scopes are propagated with the estimator's invocation factors.
+    #[serde(default)]
+    pub benchmark_roles: BTreeMap<BenchmarkRole, BenchmarkRoleCost>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkRoleCost {
+    pub work_seconds: f64,
+    /// Sum of primitive wave latencies for all role invocations, not DAG completion time.
+    pub total_time_seconds: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,9 +170,21 @@ pub struct SubgraphCost {
     pub invocations: usize,
     pub measured_once: bool,
     pub work_seconds_per_invocation: f64,
+    pub total_time_seconds_per_invocation: f64,
     pub preimage_sampling_work_seconds_per_invocation: f64,
     pub latency_seconds_per_invocation: f64,
+    pub transmitted_bytes_per_invocation: u128,
+    pub cache_bytes_per_invocation: u128,
+    pub persistent_storage_bytes_per_invocation: u128,
+    pub resident_vram_bytes: u64,
+    pub expanded_workspace_bytes: u64,
+    pub output_bytes_per_invocation: u128,
+    pub chunk_count_per_invocation: usize,
+    /// Maximum measured bounded-wave scratch in this scope, excluding resident inputs.
+    pub measured_wave_workspace_bytes: u64,
+    /// Workspace in the hypothetical unlimited-resource dependency schedule.
     pub workspace_high_water_bytes: u64,
+    /// Peak memory in the hypothetical unlimited-resource dependency schedule.
     pub peak_memory_bytes: u64,
     pub maximum_parallelism: usize,
 }
@@ -107,10 +211,12 @@ pub enum EstimateError {
     InvalidPeakMemoryTolerance,
     #[error("measurement backend reports loop-index-dependent cost at {scope:?} node {node:?}")]
     LoopIndexDependentCost { scope: FrozenGraphScopeId, node: NodeId },
+    #[error("logical byte count exceeds u128")]
+    LogicalByteTotalOverflow,
 }
 
-/// Estimates an ideal unlimited-resource DAG schedule. Resource limits belong
-/// in the measured primitive implementation, not in graph-level scheduling.
+/// Estimates an unlimited-resource DAG schedule. GPU fleet limits are reflected
+/// by primitive measurements; they do not impose an additional graph-level cap.
 pub fn estimate<B: MeasurementBackend>(
     validated: &ValidatedGraph,
     backend: &mut B,
@@ -127,9 +233,18 @@ pub fn estimate<B: MeasurementBackend>(
                     invocations: count,
                     measured_once: true,
                     work_seconds_per_invocation: cached.total_work_seconds,
+                    total_time_seconds_per_invocation: cached.total_time_seconds,
                     preimage_sampling_work_seconds_per_invocation: cached
                         .preimage_sampling_work_seconds,
                     latency_seconds_per_invocation: cached.critical_path_seconds,
+                    transmitted_bytes_per_invocation: cached.transmitted_bytes,
+                    cache_bytes_per_invocation: cached.cache_bytes,
+                    persistent_storage_bytes_per_invocation: cached.persistent_storage_bytes,
+                    resident_vram_bytes: cached.resident_vram_bytes,
+                    expanded_workspace_bytes: cached.expanded_workspace_bytes,
+                    output_bytes_per_invocation: cached.output_bytes,
+                    chunk_count_per_invocation: cached.chunk_count,
+                    measured_wave_workspace_bytes: cached.measured_wave_workspace_bytes,
                     workspace_high_water_bytes: cached.workspace_high_water_bytes,
                     peak_memory_bytes: cached.peak_memory_bytes,
                     maximum_parallelism: cached.maximum_parallelism,
@@ -188,6 +303,25 @@ struct Estimator<'a, B: MeasurementBackend> {
     backend: &'a mut B,
     cache: HashMap<CacheKey, CostReport>,
     invocations: BTreeMap<CacheKey, usize>,
+}
+
+fn scale_role_costs(
+    roles: &BTreeMap<BenchmarkRole, BenchmarkRoleCost>,
+    work_factor: usize,
+    time_factor: usize,
+) -> BTreeMap<BenchmarkRole, BenchmarkRoleCost> {
+    roles
+        .iter()
+        .map(|(role, cost)| {
+            (
+                *role,
+                BenchmarkRoleCost {
+                    work_seconds: cost.work_seconds * work_factor as f64,
+                    total_time_seconds: cost.total_time_seconds * time_factor as f64,
+                },
+            )
+        })
+        .collect()
 }
 
 struct ScheduledNode {
@@ -258,18 +392,24 @@ fn push_resource_interval(
 fn aggregate_resources(
     liveness: &LivenessSchedule,
     scheduled: &[ScheduledNode],
+    allocation_roots: &BTreeMap<WireRef, WireRef>,
     report: &mut CostReport,
 ) {
     let mut last_consumer_finish = BTreeMap::<WireRef, f64>::new();
     for node in scheduled {
         for argument in &node.arguments {
             last_consumer_finish
-                .entry(*argument)
+                .entry(*allocation_roots.get(argument).unwrap_or(argument))
                 .and_modify(|finish| *finish = finish.max(node.finish))
                 .or_insert(node.finish);
         }
     }
 
+    let retained_roots = liveness
+        .retained
+        .iter()
+        .map(|wire| *allocation_roots.get(wire).unwrap_or(wire))
+        .collect::<BTreeSet<_>>();
     let mut events = Vec::new();
     for node in scheduled {
         let usage = ResourceUsage {
@@ -281,7 +421,7 @@ fn aggregate_resources(
         push_resource_interval(&mut events, node.start, node.finish, usage);
 
         for (wire, bytes) in &node.outputs {
-            let death = if liveness.retained.contains(wire) {
+            let death = if retained_roots.contains(wire) {
                 report.critical_path_seconds
             } else {
                 last_consumer_finish.get(wire).copied().unwrap_or(node.finish)
@@ -316,6 +456,7 @@ fn aggregate_resources(
         active = active.saturating_sub(endings).saturating_add(starts);
         let sampled = active.saturating_add(instantaneous);
         report.persistent_bytes_over_time.push(sampled.persistent_bytes);
+        report.resident_vram_bytes = report.resident_vram_bytes.max(sampled.persistent_bytes);
         report.workspace_high_water_bytes =
             report.workspace_high_water_bytes.max(sampled.workspace_bytes);
         report.maximum_parallelism = report.maximum_parallelism.max(sampled.parallelism);
@@ -343,6 +484,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         let mut report = CostReport::default();
         let mut completion = BTreeMap::<WireRef, f64>::new();
         let mut scheduled = Vec::with_capacity(plan.execution_order.len());
+        let mut allocation_roots = BTreeMap::<WireRef, WireRef>::new();
 
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
@@ -387,12 +529,73 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 .filter_map(|wire| completion.get(wire))
                 .copied()
                 .fold(0.0, f64::max);
-            let (measurement, preimage_sampling_work, nested_peak, nested_parallelism) =
-                self.node_cost(&node, bindings)?;
+            let (
+                measurement,
+                preimage_sampling_work,
+                nested_peak,
+                nested_parallelism,
+                nested_roles,
+            ) = self.node_cost(&node, bindings)?;
             report.total_work_seconds += measurement.work_seconds;
+            let total_time =
+                self.total_time_for_node(&node, bindings, measurement.cumulative_wave_seconds)?;
+            report.total_time_seconds += total_time;
             report.preimage_sampling_work_seconds += preimage_sampling_work;
+            for (role, role_cost) in nested_roles {
+                let entry = report.benchmark_roles.entry(role).or_default();
+                entry.work_seconds += role_cost.work_seconds;
+                entry.total_time_seconds += role_cost.total_time_seconds;
+            }
+            if let Some(role) = handle.benchmark_role() &&
+                !matches!(
+                    node.kind,
+                    NodeKind::SubgraphCall(_) |
+                        NodeKind::ParallelLoop(_) |
+                        NodeKind::SequentialLoop(_)
+                )
+            {
+                let entry = report.benchmark_roles.entry(role).or_default();
+                entry.work_seconds += measurement.work_seconds;
+                entry.total_time_seconds += total_time;
+            }
             let finish = predecessor + measurement.latency_seconds;
             report.critical_path_seconds = report.critical_path_seconds.max(finish);
+            report.measured_wave_workspace_bytes =
+                report.measured_wave_workspace_bytes.max(measurement.measured_wave_workspace_bytes);
+            report.expanded_workspace_bytes =
+                report.expanded_workspace_bytes.max(measurement.workspace_bytes);
+            report.chunk_count =
+                report.chunk_count.saturating_add(measurement.independent_wave_count);
+            for wire_type in &node.concrete_output_types {
+                report.output_bytes = report
+                    .output_bytes
+                    .checked_add(u128::from(
+                        self.backend.output_bytes_for_node(node.kind, wire_type),
+                    ))
+                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                report.persistent_storage_bytes = report
+                    .persistent_storage_bytes
+                    .checked_add(u128::from(
+                        self.backend.persistent_storage_bytes_for_node(node.kind, wire_type),
+                    ))
+                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+            }
+            if matches!(node.kind, NodeKind::Input { .. }) {
+                for wire_type in &node.concrete_output_types {
+                    report.transmitted_bytes = report
+                        .transmitted_bytes
+                        .checked_add(u128::from(
+                            self.backend.transmitted_bytes_for_node(node.kind, wire_type),
+                        ))
+                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                    report.cache_bytes = report
+                        .cache_bytes
+                        .checked_add(u128::from(
+                            self.backend.cache_bytes_for_node(node.kind, wire_type),
+                        ))
+                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                }
+            }
             report
                 .workspace_high_water_by_node
                 .insert(format!("{:?}#{}", scope_id, id.0), measurement.workspace_bytes);
@@ -400,12 +603,31 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             let mut outputs = Vec::with_capacity(handle.output_types().len());
             for port in 0..handle.output_types().len() {
                 let wire = WireRef { node: id, port: mxx_ir_core::Port(port as u32) };
-                let bytes = plan
-                    .wire_types
-                    .get(&wire)
-                    .map(|wire_type| self.backend.persistent_bytes(wire_type))
-                    .unwrap_or(0);
                 completion.insert(wire, finish);
+                if let Some(root) = self
+                    .backend
+                    .persistent_alias_argument(handle.kind(), port)
+                    .and_then(|argument| arguments.get(argument))
+                    .and_then(|argument| allocation_roots.get(argument))
+                    .copied()
+                {
+                    // Lazy decompositions keep the source allocation alive without duplicating it.
+                    allocation_roots.insert(wire, root);
+                    continue;
+                }
+                allocation_roots.insert(wire, wire);
+                let bytes = if *scope_id != FrozenGraphScopeId::Root &&
+                    matches!(handle.kind(), NodeKind::Input { .. })
+                {
+                    0 // Child input nodes borrow the caller's values.
+                } else {
+                    plan.wire_types
+                        .get(&wire)
+                        .map(|wire_type| {
+                            self.backend.persistent_bytes_for_node(handle.kind(), wire_type)
+                        })
+                        .unwrap_or(0)
+                };
                 outputs.push((wire, bytes));
             }
             scheduled.push(ScheduledNode {
@@ -418,7 +640,7 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 outputs,
             });
         }
-        aggregate_resources(&plan.liveness, &scheduled, &mut report);
+        aggregate_resources(&plan.liveness, &scheduled, &allocation_roots, &mut report);
         Ok(report)
     }
 
@@ -426,7 +648,10 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         &mut self,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
-    ) -> Result<(NodeMeasurement, f64, u64, usize), EstimateError> {
+    ) -> Result<
+        (NodeMeasurement, f64, u64, usize, BTreeMap<BenchmarkRole, BenchmarkRoleCost>),
+        EstimateError,
+    > {
         match node.kind {
             NodeKind::SubgraphCall(call) => {
                 let child = self
@@ -453,27 +678,43 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         EstimateError::Expression("loop count is not usize".to_owned())
                     })?;
                 if count == 0 {
-                    return Ok((NodeMeasurement::default(), 0.0, 0, 0));
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 0, BTreeMap::new()));
                 }
                 let child = self
                     .validated
                     .source
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                if measured_cost_depends_on_loop_slots(
+                    &self.validated.source,
+                    node,
+                    &child,
+                    &[loop_node.index_slot],
+                    bindings,
+                )? {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
-                let (one, preimage_work, peak, parallelism) =
+                let (one, preimage_work, peak, parallelism, roles) =
                     self.cached_child(child, child_bindings)?;
                 let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
                 Ok((
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
                         latency_seconds: one.latency_seconds,
+                        cumulative_wave_seconds: one.cumulative_wave_seconds * count as f64,
+                        independent_wave_count: 1,
+                        measured_wave_workspace_bytes: one.measured_wave_workspace_bytes,
                         workspace_bytes: one.workspace_bytes.saturating_mul(count_u64),
                     },
                     preimage_work * count as f64,
                     peak.saturating_mul(count_u64),
                     parallelism.saturating_mul(count),
+                    scale_role_costs(&roles, count, count),
                 ))
             }
             NodeKind::SequentialLoop(loop_node) => {
@@ -492,26 +733,42 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         EstimateError::Expression("sequential loop count is not usize".to_owned())
                     })?;
                 if count == 0 {
-                    return Ok((NodeMeasurement::default(), 0.0, 0, 0));
+                    return Ok((NodeMeasurement::default(), 0.0, 0, 0, BTreeMap::new()));
                 }
                 let child = self
                     .validated
                     .source
                     .child_scope_id(node.scope, node.id)
                     .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                if measured_cost_depends_on_loop_slots(
+                    &self.validated.source,
+                    node,
+                    &child,
+                    &[loop_node.index_slot],
+                    bindings,
+                )? {
+                    return Err(EstimateError::LoopIndexDependentCost {
+                        scope: node.scope.clone(),
+                        node: node.id,
+                    });
+                }
                 let child_bindings =
                     child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?;
-                let (one, preimage_work, peak, parallelism) =
+                let (one, preimage_work, peak, parallelism, roles) =
                     self.cached_child(child, child_bindings)?;
                 Ok((
                     NodeMeasurement {
                         work_seconds: one.work_seconds * count as f64,
                         latency_seconds: one.latency_seconds * count as f64,
+                        cumulative_wave_seconds: one.cumulative_wave_seconds * count as f64,
+                        independent_wave_count: 1,
+                        measured_wave_workspace_bytes: one.measured_wave_workspace_bytes,
                         workspace_bytes: one.workspace_bytes,
                     },
                     preimage_work * count as f64,
                     peak,
                     parallelism,
+                    scale_role_costs(&roles, count, count),
                 ))
             }
             _ => self
@@ -527,10 +784,88 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                         measurement.latency_seconds > 0.0 ||
                             measurement.work_seconds > 0.0 ||
                             measurement.workspace_bytes > 0,
-                    );
-                    (measurement, preimage_work, 0, parallelism)
+                    )
+                    .saturating_mul(measurement.independent_wave_count);
+                    (measurement, preimage_work, 0, parallelism, BTreeMap::new())
                 })
                 .map_err(|error| EstimateError::Backend(error.to_string())),
+        }
+    }
+
+    /// Critical-path latency is useful for scheduling, but total time must include every
+    /// invocation of nested scopes (and every serialized chunk wave).
+    fn total_time_for_node(
+        &mut self,
+        node: &MeasurementNode<'_>,
+        bindings: &ParamEnv,
+        fallback: f64,
+    ) -> Result<f64, EstimateError> {
+        let child_total = |this: &mut Self,
+                           child: FrozenGraphScopeId,
+                           child_bindings: ParamEnv|
+         -> Result<f64, EstimateError> {
+            let key = CacheKey::new(child.clone(), &child_bindings)?;
+            if let Some(report) = this.cache.get(&key) {
+                return Ok(report.total_time_seconds);
+            }
+            Ok(this.estimate_scope(&child, &child_bindings)?.total_time_seconds)
+        };
+        match node.kind {
+            NodeKind::SubgraphCall(call) => {
+                let child = self
+                    .validated
+                    .source
+                    .child_scope_id(node.scope, node.id)
+                    .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                child_total(self, child, child_bindings(bindings, &call.bindings, None)?)
+            }
+            NodeKind::ParallelLoop(loop_node) => {
+                let count = loop_node
+                    .count
+                    .evaluate(bindings)
+                    .map_err(|error| EstimateError::Expression(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        EstimateError::Expression("sequential loop count is not usize".to_owned())
+                    })?;
+                if count == 0 {
+                    return Ok(0.0);
+                }
+                let child = self
+                    .validated
+                    .source
+                    .child_scope_id(node.scope, node.id)
+                    .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                Ok(child_total(
+                    self,
+                    child,
+                    child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+                )? * count as f64)
+            }
+            NodeKind::SequentialLoop(loop_node) => {
+                let count = loop_node
+                    .count
+                    .evaluate(bindings)
+                    .map_err(|error| EstimateError::Expression(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        EstimateError::Expression("sequential loop count is not usize".to_owned())
+                    })?;
+                if count == 0 {
+                    return Ok(0.0);
+                }
+                let child = self
+                    .validated
+                    .source
+                    .child_scope_id(node.scope, node.id)
+                    .ok_or_else(|| EstimateError::MissingScope(node.scope.clone()))?;
+                Ok(child_total(
+                    self,
+                    child,
+                    child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+                )? * count as f64)
+            }
+            _ => Ok(fallback),
         }
     }
 
@@ -538,7 +873,10 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         &mut self,
         child: FrozenGraphScopeId,
         bindings: ParamEnv,
-    ) -> Result<(NodeMeasurement, f64, u64, usize), EstimateError> {
+    ) -> Result<
+        (NodeMeasurement, f64, u64, usize, BTreeMap<BenchmarkRole, BenchmarkRoleCost>),
+        EstimateError,
+    > {
         let key = CacheKey::new(child.clone(), &bindings)?;
         let report = if let Some(report) = self.cache.get(&key) {
             report.clone()
@@ -551,11 +889,15 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             NodeMeasurement {
                 work_seconds: report.total_work_seconds,
                 latency_seconds: report.critical_path_seconds,
+                cumulative_wave_seconds: report.total_time_seconds,
+                independent_wave_count: 1,
+                measured_wave_workspace_bytes: report.measured_wave_workspace_bytes,
                 workspace_bytes: report.workspace_high_water_bytes,
             },
             report.preimage_sampling_work_seconds,
             report.peak_memory_bytes,
             report.maximum_parallelism,
+            report.benchmark_roles,
         ))
     }
 
@@ -655,6 +997,294 @@ fn child_bindings(
     Ok(child)
 }
 
+fn measured_cost_depends_on_loop_slots(
+    graph: &mxx_ir_core::Graph,
+    owner: &MeasurementNode<'_>,
+    child_scope: &FrozenGraphScopeId,
+    slots: &[u32],
+    bindings: &ParamEnv,
+) -> Result<bool, EstimateError> {
+    if node_cost_inputs_depend_on(owner.kind, owner.output_types, slots, &BTreeSet::new()) {
+        return Ok(true);
+    }
+    let (child_binding_expressions, child_env) = match owner.kind {
+        NodeKind::ParallelLoop(loop_node) => (
+            &loop_node.bindings,
+            child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+        ),
+        NodeKind::SequentialLoop(loop_node) => (
+            &loop_node.bindings,
+            child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+        ),
+        _ => return Ok(false),
+    };
+    let dependent_variables =
+        child_dependent_variables(&BTreeSet::new(), child_binding_expressions, slots);
+    scope_tree_cost_depends_on(graph, child_scope, slots, &dependent_variables, &child_env)
+}
+
+fn scope_tree_cost_depends_on(
+    graph: &mxx_ir_core::Graph,
+    scope_id: &FrozenGraphScopeId,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+    bindings: &ParamEnv,
+) -> Result<bool, EstimateError> {
+    let scope =
+        graph.scope(scope_id).ok_or_else(|| EstimateError::MissingScope(scope_id.clone()))?;
+    for (position, node) in scope.nodes().iter().enumerate() {
+        // A zero-cardinality lexical owner executes no body nodes. Check the
+        // cardinality expression itself for owner dependence, then mirror
+        // node_cost's early zero return before inspecting any body-derived
+        // output type or parameter.
+        match node.kind() {
+            NodeKind::ParallelLoop(loop_node) => {
+                if int_expr_depends_on(&loop_node.count, slots, dependent_variables) {
+                    return Ok(true);
+                }
+                let count = loop_node
+                    .count
+                    .evaluate(bindings)
+                    .map_err(|error| EstimateError::Expression(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        EstimateError::Expression("sequential loop count is not usize".to_owned())
+                    })?;
+                if count == 0 {
+                    continue;
+                }
+            }
+            NodeKind::SequentialLoop(loop_node) => {
+                if int_expr_depends_on(&loop_node.count, slots, dependent_variables) {
+                    return Ok(true);
+                }
+                let count = loop_node
+                    .count
+                    .evaluate(bindings)
+                    .map_err(|error| EstimateError::Expression(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        EstimateError::Expression("sequential loop count is not usize".to_owned())
+                    })?;
+                if count == 0 {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if node_cost_inputs_depend_on(node.kind(), node.output_types(), slots, dependent_variables)
+        {
+            return Ok(true);
+        }
+        let Some(child) = graph.child_scope_id(scope_id, NodeId(position as u64)) else {
+            continue;
+        };
+        let (child_binding_expressions, child_env, child_slots) = match node.kind() {
+            NodeKind::SubgraphCall(call) => {
+                (&call.bindings, child_bindings(bindings, &call.bindings, None)?, &[][..])
+            }
+            NodeKind::ParallelLoop(loop_node) => (
+                &loop_node.bindings,
+                child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+                slots,
+            ),
+            NodeKind::SequentialLoop(loop_node) => (
+                &loop_node.bindings,
+                child_bindings(bindings, &loop_node.bindings, Some((loop_node.index_slot, 0)))?,
+                slots,
+            ),
+            _ => continue,
+        };
+        let child_variables =
+            child_dependent_variables(dependent_variables, child_binding_expressions, slots);
+        if scope_tree_cost_depends_on(graph, &child, child_slots, &child_variables, &child_env)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn node_cost_inputs_depend_on(
+    kind: &NodeKind,
+    output_types: &[WireType],
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    // Every argument type is the output type of either a producer in this
+    // scope or a formal Input node, both of which are visited by the scope
+    // walk. This therefore covers geometry/type changes on both sides of a
+    // measured operation without treating value-only selectors as cost.
+    if output_types
+        .iter()
+        .any(|wire_type| wire_type_depends_on(wire_type, slots, dependent_variables))
+    {
+        return true;
+    }
+    match kind {
+        NodeKind::GadgetTrapdoor { base, .. } => {
+            int_expr_depends_on(base, slots, dependent_variables)
+        }
+        NodeKind::UniformIntervalSample { range, .. } => [&range.minimum, &range.maximum]
+            .into_iter()
+            .any(|expression| int_expr_depends_on(expression, slots, dependent_variables)),
+        NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
+            real_expr_depends_on(sigma, slots, dependent_variables) ||
+                int_expr_depends_on(max_coefficient_bound, slots, dependent_variables)
+        }
+        NodeKind::TrapdoorSample {
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+            ..
+        } => {
+            real_expr_depends_on(sigma, slots, dependent_variables) ||
+                [gadget_base, digit_count, preimage_max_coefficient_bound].into_iter().any(
+                    |expression| int_expr_depends_on(expression, slots, dependent_variables),
+                )
+        }
+        NodeKind::PreimageSample { max_coefficient_bound, .. } => {
+            int_expr_depends_on(max_coefficient_bound, slots, dependent_variables)
+        }
+        NodeKind::GadgetDecompose { base, digit_count, .. } => [base, digit_count]
+            .into_iter()
+            .any(|expression| int_expr_depends_on(expression, slots, dependent_variables)),
+        NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => [plaintext_modulus, length]
+            .into_iter()
+            .any(|expression| int_expr_depends_on(expression, slots, dependent_variables)),
+        NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => {
+            plaintext_moduli
+                .iter()
+                .chain(reconstruction_coefficients)
+                .any(|expression| int_expr_depends_on(expression, slots, dependent_variables))
+        }
+        NodeKind::PackPolynomialCoefficients { coefficient_bits, .. } => {
+            int_expr_depends_on(coefficient_bits, slots, dependent_variables)
+        }
+        NodeKind::ParallelLoop(loop_node) => {
+            int_expr_depends_on(&loop_node.count, slots, dependent_variables)
+        }
+        NodeKind::SequentialLoop(loop_node) => {
+            int_expr_depends_on(&loop_node.count, slots, dependent_variables)
+        }
+        _ => false,
+    }
+}
+
+fn child_dependent_variables(
+    parent: &BTreeSet<String>,
+    bindings: &[(String, mxx_ir_core::IntExpr)],
+    slots: &[u32],
+) -> BTreeSet<String> {
+    let rebound = bindings.iter().map(|(name, _)| name).collect::<BTreeSet<_>>();
+    let mut child =
+        parent.iter().filter(|name| !rebound.contains(name)).cloned().collect::<BTreeSet<_>>();
+    for (name, expression) in bindings {
+        if int_expr_depends_on(expression, slots, parent) {
+            child.insert(name.clone());
+        }
+    }
+    child
+}
+
+fn int_expr_depends_on(
+    expression: &IntExpr,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    match expression {
+        IntExpr::Const(_) => false,
+        IntExpr::Var(name) => dependent_variables.contains(name),
+        IntExpr::LoopIndex(slot) => slots.contains(slot),
+        IntExpr::Add(left, right) |
+        IntExpr::Sub(left, right) |
+        IntExpr::Mul(left, right) |
+        IntExpr::Div(left, right) |
+        IntExpr::FloorDiv(left, right) |
+        IntExpr::Rem(left, right) |
+        IntExpr::RoundDiv(left, right) => {
+            int_expr_depends_on(left, slots, dependent_variables) ||
+                int_expr_depends_on(right, slots, dependent_variables)
+        }
+        IntExpr::Log2Ceil(value) => int_expr_depends_on(value, slots, dependent_variables),
+        IntExpr::Select { selector, branches } => {
+            int_expr_depends_on(selector, slots, dependent_variables) ||
+                branches
+                    .iter()
+                    .any(|branch| int_expr_depends_on(branch, slots, dependent_variables))
+        }
+    }
+}
+
+fn real_expr_depends_on(
+    expression: &RealExpr,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    match expression {
+        RealExpr::Rational(_) | RealExpr::Var(_) => false,
+        RealExpr::FromInt(value) => int_expr_depends_on(value, slots, dependent_variables),
+        RealExpr::Add(left, right) |
+        RealExpr::Sub(left, right) |
+        RealExpr::Mul(left, right) |
+        RealExpr::Div(left, right) => {
+            real_expr_depends_on(left, slots, dependent_variables) ||
+                real_expr_depends_on(right, slots, dependent_variables)
+        }
+        RealExpr::Sqrt(value) => real_expr_depends_on(value, slots, dependent_variables),
+    }
+}
+
+fn matrix_type_depends_on(
+    matrix: &mxx_ir_core::types::MatrixType,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    [&matrix.modulus, &matrix.ring_dimension, &matrix.rows, &matrix.columns]
+        .into_iter()
+        .any(|expression| int_expr_depends_on(expression, slots, dependent_variables))
+}
+
+fn wire_type_depends_on(
+    wire_type: &WireType,
+    slots: &[u32],
+    dependent_variables: &BTreeSet<String>,
+) -> bool {
+    match wire_type {
+        WireType::Bytes { length } => int_expr_depends_on(length, slots, dependent_variables),
+        WireType::Matrix(matrix) => matrix_type_depends_on(matrix, slots, dependent_variables),
+        WireType::SmallMatrix { matrix, max_coefficient_bound } |
+        WireType::Preimage { matrix, max_coefficient_bound } => {
+            matrix_type_depends_on(matrix, slots, dependent_variables) ||
+                int_expr_depends_on(max_coefficient_bound, slots, dependent_variables)
+        }
+        WireType::Trapdoor {
+            matrix,
+            sigma,
+            gadget_base,
+            digit_count,
+            preimage_max_coefficient_bound,
+        } => {
+            matrix_type_depends_on(matrix, slots, dependent_variables) ||
+                real_expr_depends_on(sigma, slots, dependent_variables) ||
+                [gadget_base, digit_count, preimage_max_coefficient_bound].into_iter().any(
+                    |expression| int_expr_depends_on(expression, slots, dependent_variables),
+                )
+        }
+        WireType::IndexedFamily { element, count } => {
+            wire_type_depends_on(element, slots, dependent_variables) ||
+                int_expr_depends_on(count, slots, dependent_variables)
+        }
+        WireType::ConstantInt |
+        WireType::ConstantReal |
+        WireType::ConstantBool |
+        WireType::Int |
+        WireType::Real |
+        WireType::Bool |
+        WireType::TypedBlob { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,7 +1302,14 @@ mod tests {
             _node: &MeasurementNode<'_>,
             _bindings: &ParamEnv,
         ) -> Result<NodeMeasurement, Self::Error> {
-            Ok(NodeMeasurement { work_seconds: 1.0, latency_seconds: 1.0, workspace_bytes: 4 })
+            Ok(NodeMeasurement {
+                work_seconds: 1.0,
+                latency_seconds: 1.0,
+                cumulative_wave_seconds: 1.0,
+                independent_wave_count: 1,
+                measured_wave_workspace_bytes: 4,
+                workspace_bytes: 4,
+            })
         }
 
         fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
@@ -692,7 +1329,14 @@ mod tests {
             _bindings: &ParamEnv,
         ) -> Result<NodeMeasurement, Self::Error> {
             Ok(if matches!(node.kind, NodeKind::IntBinary(_)) {
-                NodeMeasurement { work_seconds: 2.0, latency_seconds: 2.0, workspace_bytes: 4 }
+                NodeMeasurement {
+                    work_seconds: 2.0,
+                    latency_seconds: 2.0,
+                    cumulative_wave_seconds: 2.0,
+                    independent_wave_count: 1,
+                    measured_wave_workspace_bytes: 4,
+                    workspace_bytes: 4,
+                }
             } else {
                 NodeMeasurement::default()
             })
@@ -760,7 +1404,7 @@ mod tests {
         let liveness =
             LivenessSchedule { last_use: BTreeMap::new(), retained: BTreeSet::from([wire(2)]) };
         let mut report = CostReport { critical_path_seconds: 4.0, ..CostReport::default() };
-        aggregate_resources(&liveness, &scheduled, &mut report);
+        aggregate_resources(&liveness, &scheduled, &BTreeMap::new(), &mut report);
 
         assert_eq!(report.maximum_parallelism, 2);
         assert_eq!(report.workspace_high_water_bytes, 30);
@@ -786,6 +1430,9 @@ mod tests {
                     NodeMeasurement {
                         work_seconds: 2.0,
                         latency_seconds: 2.0,
+                        cumulative_wave_seconds: 2.0,
+                        independent_wave_count: 1,
+                        measured_wave_workspace_bytes: 10,
                         workspace_bytes: 10,
                     },
                 ),
@@ -794,12 +1441,22 @@ mod tests {
                     NodeMeasurement {
                         work_seconds: 3.0,
                         latency_seconds: 3.0,
+                        cumulative_wave_seconds: 3.0,
+                        independent_wave_count: 1,
+                        measured_wave_workspace_bytes: 20,
                         workspace_bytes: 20,
                     },
                 ),
                 (
                     NodeId(2),
-                    NodeMeasurement { work_seconds: 1.0, latency_seconds: 1.0, workspace_bytes: 5 },
+                    NodeMeasurement {
+                        work_seconds: 1.0,
+                        latency_seconds: 1.0,
+                        cumulative_wave_seconds: 1.0,
+                        independent_wave_count: 1,
+                        measured_wave_workspace_bytes: 5,
+                        workspace_bytes: 5,
+                    },
                 ),
             ]),
         };
@@ -821,7 +1478,7 @@ mod tests {
         let liveness =
             LivenessSchedule { last_use: BTreeMap::new(), retained: BTreeSet::from([wire(1)]) };
         let mut report = CostReport { critical_path_seconds: 5.0, ..CostReport::default() };
-        aggregate_resources(&liveness, &scheduled, &mut report);
+        aggregate_resources(&liveness, &scheduled, &BTreeMap::new(), &mut report);
 
         assert_eq!(report.maximum_parallelism, 1);
         assert_eq!(report.workspace_high_water_bytes, 20);
@@ -840,7 +1497,7 @@ mod tests {
             retained: BTreeSet::from([wire(1), wire(2)]),
         };
         let mut report = CostReport { critical_path_seconds: 6.0, ..CostReport::default() };
-        aggregate_resources(&liveness, &scheduled, &mut report);
+        aggregate_resources(&liveness, &scheduled, &BTreeMap::new(), &mut report);
 
         assert_eq!(report.persistent_bytes_over_time, vec![8, 24, 24, 0]);
         assert_eq!(report.maximum_parallelism, 2);
@@ -860,7 +1517,7 @@ mod tests {
         let liveness =
             LivenessSchedule { last_use: BTreeMap::new(), retained: BTreeSet::from([wire(0)]) };
         let mut report = CostReport::default();
-        aggregate_resources(&liveness, &scheduled, &mut report);
+        aggregate_resources(&liveness, &scheduled, &BTreeMap::new(), &mut report);
 
         assert_eq!(report.persistent_bytes_over_time, vec![5]);
         assert_eq!(report.workspace_high_water_bytes, 7);
@@ -881,6 +1538,129 @@ mod tests {
         let report = estimate(&validated, &mut UnitBackend).expect("estimate");
         assert_eq!(report.total_work_seconds, 3.0);
         assert_eq!(report.critical_path_seconds, 2.0);
+    }
+
+    #[test]
+    fn private_artifact_inputs_are_local_persistence_not_transport() {
+        let ring = Ring::new(17, 8);
+        let production_id = mxx_ir_core::artifact::ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([7; 32]),
+            execution_nonce: [8; 32],
+        };
+        let private = ring.artifact_input(
+            production_id.clone(),
+            "private-setup-t",
+            (1, 1),
+            mxx_ir_core::artifact::ArtifactConfidentiality::Private,
+        );
+        let built = DslContext::new("estimate-private-artifact")
+            .output("setup-t", private)
+            .expect("output")
+            .build()
+            .expect("build");
+        let mut manifest = mxx_ir_core::artifact::Manifest {
+            ir_version: mxx_ir_core::encoding::IR_VERSION,
+            production_id: production_id.clone(),
+            artifacts: BTreeMap::new(),
+        };
+        manifest.artifacts.insert(
+            "private-setup-t".to_owned(),
+            mxx_ir_core::artifact::ManifestArtifact {
+                artifact_type: mxx_ir_core::artifact::ArtifactType::Matrix(
+                    mxx_ir_core::types::ConcreteMatrixType {
+                        modulus: 17.into(),
+                        ring_dimension: 8,
+                        rows: 1,
+                        columns: 1,
+                    },
+                ),
+                family_count: None,
+                confidentiality: mxx_ir_core::artifact::ArtifactConfidentiality::Private,
+                content_hash: None,
+                layout: None,
+            },
+        );
+        let mut manifests = BTreeMap::new();
+        manifests.insert(production_id, manifest);
+        let validated = built
+            .validate_with_manifests(&ParamEnv::default(), &manifests)
+            .expect("private artifact graph validates");
+        let report = estimate(&validated, &mut UnitBackend).expect("estimate");
+        assert_eq!(report.transmitted_bytes, 0);
+        assert!(report.persistent_storage_bytes > 0);
+    }
+
+    #[test]
+    fn propagates_explicit_benchmark_role_costs_without_scope_name_inference() {
+        let ring = Ring::new(17, 8);
+        let output =
+            mxx_ir_core::graph::with_benchmark_role(BenchmarkRole::PublicPrfAccumulation, || {
+                ring.input("tagged-input", (1, 1)) + ring.identity(1)
+            });
+        let built = DslContext::new("estimate-tagged-role")
+            .output("output", output)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report = estimate(&validated, &mut UnitBackend).expect("estimate");
+        let cost = report
+            .benchmark_roles
+            .get(&BenchmarkRole::PublicPrfAccumulation)
+            .expect("tagged role cost");
+        assert_eq!(cost.work_seconds, 3.0);
+        assert_eq!(cost.total_time_seconds, 3.0);
+        assert!(!report.benchmark_roles.contains_key(&BenchmarkRole::PublicReadout));
+    }
+
+    #[test]
+    fn lazy_decomposition_peak_counts_the_aliased_source_once() {
+        struct AliasBackend;
+
+        impl MeasurementBackend for AliasBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                _node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                Ok(NodeMeasurement::default())
+            }
+
+            fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
+                match wire_type {
+                    ConcreteWireType::Matrix(matrix) |
+                    ConcreteWireType::Preimage { matrix, .. } => {
+                        u64::try_from(matrix.rows * matrix.columns).expect("test matrix size")
+                    }
+                    _ => 0,
+                }
+            }
+
+            fn persistent_alias_argument(
+                &self,
+                kind: &NodeKind,
+                output_port: usize,
+            ) -> Option<usize> {
+                (output_port == 0 && matches!(kind, NodeKind::GadgetDecompose { .. })).then_some(0)
+            }
+        }
+
+        let ring = Ring::new(257, 8);
+        let source = ring.input("source", (1, 4));
+        let decomposition = source.decompose(4, 4);
+        let built = DslContext::new("estimate-lazy-decomposition-alias")
+            .output("decomposition", decomposition)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        let report = estimate(&validated, &mut AliasBackend).expect("estimate");
+
+        assert_eq!(report.peak_memory_bytes, 4);
+        assert_eq!(report.persistent_bytes_over_time, vec![4]);
     }
 
     fn estimate_parallel_integer_loop(count: usize) -> CostReport {
@@ -921,6 +1701,28 @@ mod tests {
     }
 
     #[test]
+    fn parallel_loop_rejects_index_dependent_sampler_cost() {
+        let ring = Ring::new(257, 8);
+        let values = Parallel::range(2)
+            .map_values(|index| {
+                let cutoff =
+                    IntExpr::Add(Box::new(IntExpr::constant(8)), Box::new(index.expression()));
+                ring.gaussian((1, 1), 5, cutoff)
+            })
+            .expect("parallel samples");
+        let built = DslContext::new("estimate-varying-sampler")
+            .family_output("values", values)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).expect("valid");
+        assert!(matches!(
+            estimate(&validated, &mut UnitBackend),
+            Err(EstimateError::LoopIndexDependentCost { .. })
+        ));
+    }
+
+    #[test]
     fn sequential_loop_iterations_extend_latency_without_parallel_memory_multiplication() {
         let total =
             Sequential::range(3)
@@ -937,6 +1739,64 @@ mod tests {
         let report = estimate(&validated, &mut UnitBackend).expect("estimate");
         assert!(report.critical_path_seconds >= 3.0);
         assert_eq!(report.maximum_parallelism, 2);
+    }
+
+    #[test]
+    fn independent_waves_preserve_nested_totals_roles_and_sequential_dependencies() {
+        struct WaveBackend;
+        impl MeasurementBackend for WaveBackend {
+            type Error = Infallible;
+            fn measure(
+                &mut self,
+                _graph: &str,
+                node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                Ok(if matches!(node.kind, NodeKind::MatrixNegate) {
+                    NodeMeasurement {
+                        work_seconds: 14.0,
+                        latency_seconds: 3.0,
+                        cumulative_wave_seconds: 21.0,
+                        independent_wave_count: 7,
+                        measured_wave_workspace_bytes: 10,
+                        workspace_bytes: 70,
+                    }
+                } else {
+                    NodeMeasurement::default()
+                })
+            }
+            fn persistent_bytes(&self, _wire_type: &ConcreteWireType) -> u64 {
+                0
+            }
+        }
+        let initial = Ring::new(17, 65536).input("packed", (1, (1usize << 50)));
+        let total = Sequential::range(3)
+            .scan(initial.clone(), initial, |_, total, _| {
+                let lanes = Parallel::range(2).try_map_values(total, |_, value| {
+                    mxx_ir_core::graph::with_benchmark_role(
+                        BenchmarkRole::PublicPrfAccumulation,
+                        || Ok(-value),
+                    )
+                })?;
+                Ok(lanes.get_static(0))
+            })
+            .unwrap();
+        let built = DslContext::new("nested-independent-waves")
+            .output("total", total)
+            .unwrap()
+            .build()
+            .unwrap();
+        let validated = mxx_ir_core::validate(&built.graph, &ParamEnv::default()).unwrap();
+        let report = estimate(&validated, &mut WaveBackend).unwrap();
+        assert_eq!(report.critical_path_seconds, 9.0);
+        assert_eq!(report.total_work_seconds, 84.0);
+        assert_eq!(report.total_time_seconds, 126.0);
+        assert_eq!(report.maximum_parallelism, 14);
+        assert_eq!(report.workspace_high_water_bytes, 140);
+        assert_eq!(report.measured_wave_workspace_bytes, 10);
+        let role = &report.benchmark_roles[&BenchmarkRole::PublicPrfAccumulation];
+        assert_eq!(role.work_seconds, 84.0);
+        assert_eq!(role.total_time_seconds, 126.0);
     }
 
     #[test]

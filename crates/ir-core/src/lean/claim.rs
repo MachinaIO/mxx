@@ -7,10 +7,30 @@ use std::collections::BTreeSet;
 /// Supported external-input predicates. Recursive families stay symbolic in Lean.
 #[derive(Clone, Debug)]
 pub enum InputContract {
-    IntegerRange { lower: IntExpr, upper: IntExpr },
+    IntegerRange {
+        lower: IntExpr,
+        upper: IntExpr,
+    },
     Boolean,
-    Bytes { length: IntExpr },
-    Family { count: IntExpr, element: Box<InputContract> },
+    /// A scalar polynomial matrix whose value is exactly zero or one.
+    BooleanPolynomial,
+    /// A scalar polynomial equal to a power of the negacyclic indeterminate.
+    /// Exponents in the second half represent negative monomials; the stride
+    /// identifies the actual native subring used by a strided encoding.
+    SignedMonomial {
+        exponent_stride: usize,
+    },
+    /// Boolean scalar polynomials, exactly one selected in each contiguous block.
+    OneHotPolynomialFamily {
+        block_lengths: Vec<usize>,
+    },
+    Bytes {
+        length: IntExpr,
+    },
+    Family {
+        count: IntExpr,
+        element: Box<InputContract>,
+    },
 }
 
 /// A named input or output of a root, identified by its position in `LinkedClaim::roots`.
@@ -55,9 +75,14 @@ pub struct ClaimBackend<'a> {
     pub layouts: &'a [BackendLayout],
 }
 
-/// Shared externals, acyclic graph connections and one Boolean threshold endpoint.
-/// The residual is a scalar polynomial; the conclusion bounds its constant coefficient
-/// relative to the ideal Boolean's configured message center and equates both outputs.
+/// Application-independent endpoint semantics, with the bound in the conclusion only.
+#[derive(Clone, Debug)]
+pub enum Endpoint {
+    BooleanInterval { residual: Port },
+    MatrixApprox { bound: num_bigint::BigUint },
+}
+
+/// Shared externals, acyclic graph connections and one typed endpoint.
 pub struct LinkedClaim<'a> {
     pub roots: Vec<ClaimRoot<'a>>,
     pub externals: Vec<ExternalInput>,
@@ -65,7 +90,7 @@ pub struct LinkedClaim<'a> {
     pub requirements: Vec<Port>,
     pub actual: Port,
     pub ideal: Port,
-    pub residual: Port,
+    pub endpoint: Endpoint,
 }
 
 fn tuple(values: &[String]) -> String {
@@ -101,6 +126,56 @@ fn input_contract_predicate(
             Ok(format!("(({lower} : Int) ≤ {value} ∧ {value} ≤ ({upper} : Int))"))
         }
         (InputContract::Boolean, ConcreteWireType::Bool) => Ok("True".into()),
+        (InputContract::BooleanPolynomial, ConcreteWireType::Matrix(matrix)) => {
+            if !matrix.is_scalar() || matrix.ring_dimension == 0 {
+                return Err("Boolean polynomial contract requires a nonempty scalar matrix".into());
+            }
+            Ok(format!("(({value}) 0 0 = 0 ∨ ({value}) 0 0 = 1)"))
+        }
+        (InputContract::SignedMonomial { exponent_stride }, ConcreteWireType::Matrix(matrix)) => {
+            if !matrix.is_scalar() || matrix.ring_dimension == 0 {
+                return Err("signed monomial contract requires a nonempty scalar matrix".into());
+            }
+            let n = matrix.ring_dimension;
+            if *exponent_stride == 0 || matrix.ring_dimension % exponent_stride != 0 {
+                return Err(
+                    "monomial exponent stride must be positive and divide the ring dimension"
+                        .into(),
+                );
+            }
+            let q = &matrix.modulus;
+            Ok(format!(
+                "(∃ exponent : Fin (2 * ({n} / {exponent_stride})), ({value}) 0 0 = AdjoinRoot.root (Mxx.Primitives.negacyclicModulus {n} (ZMod {q})) ^ ({exponent_stride} * exponent.val))"
+            ))
+        }
+        (
+            InputContract::OneHotPolynomialFamily { block_lengths },
+            ConcreteWireType::IndexedFamily { count, element },
+        ) => {
+            let total = block_lengths
+                .iter()
+                .try_fold(0usize, |sum, length| sum.checked_add(*length))
+                .ok_or("one-hot family size overflows")?;
+            if total != *count || block_lengths.is_empty() || block_lengths.contains(&0) {
+                return Err("one-hot family blocks do not partition its nonempty type".into());
+            }
+            let element_predicate = input_contract_predicate(
+                &InputContract::BooleanPolynomial,
+                element,
+                bindings,
+                &format!("({value} i)"),
+                depth + 1,
+            )?;
+            let mut conditions = vec![format!("(∀ i : Fin {count}, {element_predicate})")];
+            let mut offset = 0;
+            for length in block_lengths {
+                conditions.push(format!(
+                    "(∃ selected : Fin {length}, ∀ i : Fin {length}, ({value} ⟨{offset} + i.val, by omega⟩) 0 0 = if i = selected then 1 else 0)"
+                ));
+                offset += length;
+            }
+            Ok(format!("({})", conditions.join(" ∧ ")))
+        }
         (InputContract::Bytes { length }, ConcreteWireType::Bytes { length: actual }) => {
             let expected = usize::try_from(evaluate(length)?)
                 .map_err(|_| "input contract byte length is not a valid size")?;
@@ -296,7 +371,7 @@ pub fn assemble_claim(
     for (artifact, _) in &entries {
         source.push_str(&format!("import {}\n", artifact.module_name));
     }
-    source.push_str("\nnamespace GeneratedClaim\n\nstructure ExternalInputs where\n");
+    source.push_str("\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\n\nnamespace GeneratedClaim\n\nstructure ExternalInputs where\n");
     for (field, ty) in external_fields {
         source.push_str(&format!("  {field} : {ty}\n"));
     }
@@ -370,6 +445,22 @@ pub fn assemble_claim(
     source.push_str(&format!("\ndef Runs ({hash_binder} : {}) (external : ExternalInputs)\n    (execution : Execution) : Prop :=\n  {}\n", semantics.hash_model_type, conditions.join(" ∧\n  ")));
     let actual = output(claim, &claim.actual)?;
     let ideal = output(claim, &claim.ideal)?;
+    if let Endpoint::MatrixApprox { bound } = &claim.endpoint {
+        let ConcreteWireType::Matrix(matrix) = &actual.wire_type else {
+            return Err("approximation endpoint must be a matrix".into());
+        };
+        if actual.wire_type != ideal.wire_type || actual.lean_type != ideal.lean_type {
+            return Err("approximation endpoint type mismatch".into());
+        }
+        if matrix.ring_dimension == 0 || matrix.rows == 0 || matrix.columns == 0 {
+            return Err("approximation endpoint must be nonempty".into());
+        }
+        let actual_value =
+            project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
+        let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
+        source.push_str(&format!("\n/-- The error witness and its bound are conclusions, never execution premises. -/\ndef CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    Mxx.Primitives.Approx ({actual_value}) ({ideal_value}) {bound}\n\nend GeneratedClaim\n"));
+        return Ok(source);
+    }
     if actual.wire_type != ConcreteWireType::Bool ||
         ideal.wire_type != ConcreteWireType::Bool ||
         actual.lean_type != "Bool" ||
@@ -377,7 +468,10 @@ pub fn assemble_claim(
     {
         return Err("claim endpoint must be Boolean".into());
     }
-    let residual = output(claim, &claim.residual)?;
+    let Endpoint::BooleanInterval { residual: residual_port } = &claim.endpoint else {
+        unreachable!()
+    };
+    let residual = output(claim, residual_port)?;
     let ConcreteWireType::Matrix(matrix) = &residual.wire_type else {
         return Err("residual must be a matrix".into());
     };
@@ -388,13 +482,34 @@ pub fn assemble_claim(
     let ideal_value = project(ideal, &format!("execution.«{}»", entries[claim.ideal.root].1));
     let actual_value = project(actual, &format!("execution.«{}»", entries[claim.actual.root].1));
     let residual_value =
-        project(residual, &format!("execution.«{}»", entries[claim.residual.root].1));
+        project(residual, &format!("execution.«{}»", entries[residual_port.root].1));
     let centered_lift = semantics.centered_lift;
     let message_center = semantics.message_center;
     let decoder_radius = semantics.decoder_radius;
     source.push_str(&format!("\nnoncomputable def observedResidual (execution : Execution) : Int :=\n  {centered_lift} {q}\n    ((({residual_value}) 0 0).coeff ⟨0, by decide⟩ -\n      ({message_center} {q} {ideal_value} : ZMod {q}))\n\n"));
     source.push_str(&format!("/-- The application proof must establish this proposition; no noise premise is assumed. -/\ndef CorrectnessClaim : Prop :=\n  ∀ hashModel external execution, Runs hashModel external execution →\n    (observedResidual execution).natAbs < {decoder_radius} {q} ∧\n    {actual_value} = {ideal_value}\n\nend GeneratedClaim\n"));
     Ok(source)
+}
+
+/// Assemble the final theorem against the mechanically extracted proposition.
+/// The application supplies a declaration name, never the theorem statement or proof text.
+/// Lean must check that declaration at exactly `GeneratedClaim.CorrectnessClaim`.
+pub fn assemble_certificate(proof_module: &str, proof_declaration: &str) -> Result<String, String> {
+    let identifier = |name: &str| -> Result<String, String> {
+        name.split('.')
+            .map(|part| {
+                super::valid_identifier(part)
+                    .map_err(|_| "invalid certificate module or declaration name".to_owned())?;
+                Ok(format!("«{part}»"))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(|parts| parts.join("."))
+    };
+    let module = identifier(proof_module)?;
+    let proof = identifier(proof_declaration)?;
+    Ok(format!(
+        "import Claim\nimport {module}\n\nnamespace GeneratedCertificate\n\ntheorem correctness : GeneratedClaim.CorrectnessClaim :=\n  {proof}\n\n#print axioms correctness\n\nend GeneratedCertificate\n"
+    ))
 }
 
 #[cfg(test)]
@@ -464,7 +579,9 @@ mod tests {
             requirements: vec![],
             actual: Port { root: 0, name: "bit".into() },
             ideal: Port { root: 1, name: "bit".into() },
-            residual: Port { root: 0, name: "residual".into() },
+            endpoint: Endpoint::BooleanInterval {
+                residual: Port { root: 0, name: "residual".into() },
+            },
         }
     }
 
@@ -496,6 +613,97 @@ mod tests {
         assert!(conclusion.contains("(observedResidual execution).natAbs <"));
         assert!(conclusion.contains("execution.«producer»"));
         assert!(conclusion.contains("execution.«ideal»"));
+    }
+
+    #[test]
+    fn matrix_approximation_is_a_conclusion_on_exact_matching_endpoints() {
+        let (graph, artifact) = exported_graph();
+        let mut claim = linked(&graph, &artifact);
+        claim.actual = Port { root: 0, name: "residual".into() };
+        claim.ideal = Port { root: 1, name: "residual".into() };
+        claim.endpoint = Endpoint::MatrixApprox { bound: 7u8.into() };
+        let source = render(&claim).unwrap();
+        let (runs, conclusion) = source.split_once("def CorrectnessClaim").unwrap();
+        assert!(!runs.contains("Mxx.Primitives.Approx"));
+        assert!(conclusion.contains("Mxx.Primitives.Approx"));
+        assert!(conclusion.contains("execution.«producer»"));
+        assert!(conclusion.contains("execution.«ideal»"));
+        assert!(conclusion.contains(") 7"));
+        claim.ideal.name = "bit".into();
+        assert!(render(&claim).unwrap_err().contains("type mismatch"));
+    }
+
+    #[test]
+    fn certificate_fixes_the_proposition_and_rejects_source_injection() {
+        let source = assemble_certificate("Application.Proof", "Application.correctness").unwrap();
+        assert!(source.contains("theorem correctness : GeneratedClaim.CorrectnessClaim"));
+        assert!(source.contains("«Application».«correctness»"));
+        for invalid in ["", "A..B", "A\naxiom bad : False", "A; B"] {
+            assert!(assemble_certificate(invalid, "Proof.correctness").is_err());
+            assert!(assemble_certificate("Proof", invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn polynomial_input_contracts_restrict_values_and_check_scalar_shapes() {
+        let (_, artifact) = exported_graph();
+        let ty = &artifact.root.outputs["residual"].wire_type;
+        let env = ParamEnv::default();
+        let boolean =
+            input_contract_predicate(&InputContract::BooleanPolynomial, ty, &env, "input", 0)
+                .unwrap();
+        assert_eq!(boolean, "((input) 0 0 = 0 ∨ (input) 0 0 = 1)");
+        let monomial = input_contract_predicate(
+            &InputContract::SignedMonomial { exponent_stride: 1 },
+            ty,
+            &env,
+            "input",
+            0,
+        )
+        .unwrap();
+        assert!(monomial.contains("Fin (2 * (2 / 1))"));
+        assert!(monomial.contains("negacyclicModulus 2 (ZMod 17)"));
+        let strided = input_contract_predicate(
+            &InputContract::SignedMonomial { exponent_stride: 2 },
+            ty,
+            &env,
+            "input",
+            0,
+        )
+        .unwrap();
+        assert!(strided.contains("^ (2 * exponent.val)"));
+        for stride in [0, 3] {
+            assert!(
+                input_contract_predicate(
+                    &InputContract::SignedMonomial { exponent_stride: stride },
+                    ty,
+                    &env,
+                    "input",
+                    0
+                )
+                .is_err()
+            );
+        }
+        let ConcreteWireType::Matrix(mut nonscalar) = ty.clone() else { unreachable!() };
+        nonscalar.columns = 2;
+        for contract in
+            [InputContract::BooleanPolynomial, InputContract::SignedMonomial { exponent_stride: 1 }]
+        {
+            assert!(
+                input_contract_predicate(&contract, &ConcreteWireType::Bool, &env, "input", 0)
+                    .is_err()
+            );
+            assert!(
+                input_contract_predicate(
+                    &contract,
+                    &ConcreteWireType::Matrix(nonscalar.clone()),
+                    &env,
+                    "input",
+                    0
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -560,16 +768,16 @@ mod tests {
         });
         assert!(render(&claim).unwrap_err().contains("duplicate"));
         claim.links.pop();
-        claim.links[0].producer = claim.residual.clone();
+        claim.links[0].producer = Port { root: 0, name: "residual".into() };
         assert!(render(&claim).unwrap_err().contains("type mismatch"));
         claim.links[0].producer = claim.ideal.clone();
         assert!(render(&claim).unwrap_err().contains("precede"));
         claim.links.clear();
         claim.externals[0].destinations.push(Port { root: 1, name: "bit".into() });
-        claim.requirements.push(claim.residual.clone());
+        claim.requirements.push(Port { root: 0, name: "residual".into() });
         assert!(render(&claim).unwrap_err().contains("not Boolean"));
         claim.requirements.clear();
-        claim.actual = claim.residual.clone();
+        claim.actual = Port { root: 0, name: "residual".into() };
         assert!(render(&claim).unwrap_err().contains("must be Boolean"));
     }
 

@@ -39,7 +39,10 @@ not in its image. This work does not introduce approximate Gaussian sampling.
 ## API and proof boundary
 
 Pass `Some(k)` as the final argument of `DCRTPolyParams::new` or
-`GpuDCRTPolyParams::new`; `None` selects exact mode. Arithmetic modulus and CRT
+`GpuDCRTPolyParams::new`; `None` selects exact mode. The exact CRT basis
+can be supplied independently through the CPU constructor's preceding
+`moduli: Option<Vec<u64>>` argument. For example, `new(n, depth, bits, base, None,
+Some(k))` uses the generated basis with approximate decomposition. Arithmetic modulus and CRT
 ordering do not change. `PolyParams::modulus_digits()` reports the shortened
 regular gadget digit count, and `gadget_error_bound()` reports the inclusive
 residual bound. For a matrix with `d` rows the gadget has `d * modulus_digits()`

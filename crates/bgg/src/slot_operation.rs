@@ -183,7 +183,7 @@ mod naive {
 
         #[test]
         fn runtime_transfer_and_reduce_match_the_slotwise_primitive_formulas() {
-            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
             let columns = parameters.modulus_digits();
             let ring = Ring::new(
                 BigInt::from(parameters.modulus().as_ref().clone()),
@@ -1320,7 +1320,7 @@ mod artifact {
         }
         #[test]
         fn runtime_preprocessing_and_gate_preimages_satisfy_the_primitive_relations() {
-            let parameters = DCRTPolyParams::new(2, 1, 6, 3, None);
+            let parameters = DCRTPolyParams::new(2, 1, 6, 3, None, None);
             let secret_size = 1usize;
             let trapdoor_sigma = 4.578f64;
             let max_public_rows =
@@ -1430,7 +1430,7 @@ mod artifact {
             let b0 = matrix_output(&result, "b0");
             let b1 = matrix_output(&result, "b1");
             let identity = DCRTPolyMatrix::identity(&parameters, compiler.secret_size, None);
-            let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, compiler.secret_size);
+            let gadget = DCRTPolyMatrix::gadget_matrix(&parameters, compiler.secret_size, None);
             for slot in 0..compiler.slot_count {
                 let secret = matrix_output(&result, &format!("secret_{slot}"));
                 let public = matrix_output(&result, &format!("public_{slot}"));
@@ -2012,7 +2012,7 @@ mod tall {
 
         #[test]
         fn compact_identity_lane_masks_match_explicit_runtime_sequence() {
-            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
             let ring = Ring::new(
                 num_bigint::BigInt::from(parameters.modulus().as_ref().clone()),
                 parameters.ring_dimension() as usize,

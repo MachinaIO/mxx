@@ -3,6 +3,7 @@ import RuntimePrimitives
 namespace MxxRuntime
 
 open Mxx.Primitives
+open scoped BigOperators
 
 noncomputable def matrixAdd {q n r c : Nat} (left right : ExactMatrix q n r c) := left + right
 noncomputable def matrixSub {q n r c : Nat} (left right : ExactMatrix q n r c) := left - right
@@ -168,5 +169,97 @@ def concatDiagonal {q n leftRows leftColumns rightRows rightColumns : Nat}
         0
       else
         right ⟨row.val - leftRows, by omega⟩ ⟨column.val - leftColumns, by omega⟩
+
+/-- Canonical coefficients reconstructed in the quotient by `X^n + 1`. -/
+noncomputable def polynomialOfCoefficients {q n : Nat} (values : Fin n → Int) :
+    ExactPoly q n :=
+  ∑ i : Fin n, (values i : ExactPoly q n) *
+    AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ i.val
+
+theorem polynomialOfCoefficients_coeff {q n : Nat} (hq : 1 < q) (hn : 0 < n)
+    (values : Fin n → Int) (i : Fin n) :
+    (polynomialOfCoefficients (q := q) values).coeff i = (values i : ZMod q) := by
+  letI : Fact (1 < q) := ⟨hq⟩
+  unfold polynomialOfCoefficients
+  rw [Negacyclic.coeff_sum]
+  have hcast (value : Int) : (value : ExactPoly q n) =
+      algebraMap (ZMod q) (ExactPoly q n) (value : ZMod q) := by simp
+  simp_rw [hcast, Negacyclic.coeff_smul, Negacyclic.coeff_root_pow hn]
+  simp
+
+/-- The runtime scales canonical residues and rounds half upward before reduction. -/
+noncomputable def modulusSwitch {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) : ExactMatrix p n rows columns :=
+  fun row column ↦ polynomialOfCoefficients fun i ↦
+    ((Int.ofNat ((input row column).coeff i).val * Int.ofNat p + Int.ofNat (q / 2)) /
+      Int.ofNat q) % Int.ofNat p
+
+noncomputable def modulusSwitchRuns {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
+  1 < p ∧ p ∣ q ∧ q % 2 = 1 ∧ p % 2 = 1 ∧ output = modulusSwitch input
+
+/-- Ordinary reduction uses the canonical representative without scaling. -/
+noncomputable def modulusReduce {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) : ExactMatrix p n rows columns :=
+  fun row column ↦ polynomialOfCoefficients fun i ↦ Int.ofNat ((input row column).coeff i).val
+
+noncomputable def modulusReduceRuns {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
+  1 < p ∧ p ∣ q ∧ output = modulusReduce input
+
+/-- Substitution in the negacyclic quotient incorporates the runtime's wraparound sign. -/
+noncomputable def ringAutomorphism {q n rows columns : Nat} (index : Nat)
+    (input : ExactMatrix q n rows columns) : ExactMatrix q n rows columns :=
+  fun row column ↦ ∑ i : Fin n,
+    (Int.ofNat ((input row column).coeff i).val : ExactPoly q n) *
+      AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ (i.val * index)
+
+noncomputable def ringAutomorphismRuns {q n rows columns : Nat} (index : Int)
+    (input output : ExactMatrix q n rows columns) : Prop :=
+  0 < index ∧ index < 2 * Int.ofNat n ∧ index % 2 = 1 ∧
+  output = ringAutomorphism index.toNat input
+
+/-- One heterogeneous CRT level: round using its own source modulus, reduce to the
+plaintext modulus, lift the canonical digit to the destination, and multiply by the
+reconstruction coefficient. This follows `crt_recompose_cpu` term for term. -/
+noncomputable def crtRecomposeLevel {source destination n columns : Nat}
+    (plaintext coefficient : Int) (input : ExactMatrix source n 1 columns) :
+    ExactMatrix destination n 1 columns :=
+  fun row column ↦ (coefficient : ExactPoly destination n) *
+    polynomialOfCoefficients fun i ↦
+      ((plaintext * Int.ofNat ((input row column).coeff i).val + Int.ofNat (source / 2)) /
+        Int.ofNat source) % plaintext
+
+noncomputable def unitRow {q n columns : Nat} (index : Int) : ExactMatrix q n 1 columns :=
+  fun _ column ↦ if (column.val : Int) = index then 1 else 0
+
+noncomputable def unitColumn {q n rows : Nat} (index : Int) : ExactMatrix q n rows 1 :=
+  fun row _ ↦ if (row.val : Int) = index then 1 else 0
+
+noncomputable def rotationPolynomial {q n : Nat} (exponent : Int) : ExactMatrix q n 1 1 :=
+  fun _ _ ↦ AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ exponent.toNat
+
+noncomputable def liftInteger {q n : Nat} (value : Int) : ExactMatrix q n 1 1 :=
+  fun _ _ ↦ (value : ExactPoly q n)
+
+/-- Tensor layout uses left indices as the outer blocks, matching the runtime. -/
+def tensorRuns {q n r₁ r₂ c₁ c₂ : Nat}
+    (left : ExactMatrix q n r₁ c₁) (right : ExactMatrix q n r₂ c₂)
+    (output : ExactMatrix q n (r₁ * r₂) (c₁ * c₂)) : Prop :=
+  ∀ i₁ i₂ j₁ j₂,
+    output ⟨i₁.val * r₂ + i₂.val, by have := i₁.isLt; have := i₂.isLt; nlinarith⟩
+      ⟨j₁.val * c₂ + j₂.val, by have := j₁.isLt; have := j₂.isLt; nlinarith⟩ = left i₁ j₁ * right i₂ j₂
+
+/-- Packed bits are coefficient-major, little-endian, and must encode canonical residues. -/
+noncomputable def packPolynomial {q n count : Nat} (coefficientBits : Int)
+    (bits : Fin count → Bool) (output : ExactMatrix q n 1 1) : Prop :=
+  0 < coefficientBits ∧ count = n * coefficientBits.toNat ∧
+  ∃ coefficients : Fin n → Nat,
+    (∀ i, coefficients i < q ∧ coefficients i =
+      ∑ bit : Fin coefficientBits.toNat,
+        if h : i.val * coefficientBits.toNat + bit.val < count then
+          if bits ⟨i.val * coefficientBits.toNat + bit.val, h⟩ then 2 ^ bit.val else 0
+        else 0) ∧
+    output = fun _ _ ↦ polynomialOfCoefficients (fun i ↦ Int.ofNat (coefficients i))
 
 end MxxRuntime

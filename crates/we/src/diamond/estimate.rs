@@ -95,7 +95,14 @@ mod tests {
             _node: &MeasurementNode<'_>,
             _bindings: &ParamEnv,
         ) -> Result<NodeMeasurement, Self::Error> {
-            Ok(NodeMeasurement { work_seconds: 1.0, latency_seconds: 1.0, workspace_bytes: 8 })
+            Ok(NodeMeasurement {
+                work_seconds: 1.0,
+                latency_seconds: 1.0,
+                cumulative_wave_seconds: 1.0,
+                independent_wave_count: 1,
+                workspace_bytes: 8,
+                measured_wave_workspace_bytes: 8,
+            })
         }
 
         fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {

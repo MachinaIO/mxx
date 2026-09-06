@@ -30,12 +30,13 @@ impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
         levels: &[Self],
         plaintext_moduli: &[num_bigint::BigInt],
         reconstruction_coefficients: &[num_bigint::BigInt],
+        destination: &GpuDCRTPolyParams,
     ) -> Result<Self, PolyBackendError> {
         let first = levels.first().ok_or(PolyBackendError::InvalidInteger)?;
         if levels.len() != plaintext_moduli.len() ||
             levels.len() != reconstruction_coefficients.len() ||
             levels.iter().any(|level| {
-                level.params() != first.params() ||
+                level.params().ring_dimension() != destination.ring_dimension() ||
                     level.row_size() != 1 ||
                     level.col_size() != first.col_size()
             })
@@ -47,7 +48,7 @@ impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
             .map(|modulus| modulus.to_u64().filter(|modulus| *modulus != 0))
             .collect::<Option<Vec<_>>>()
             .ok_or(PolyBackendError::InvalidInteger)?;
-        let ring_moduli = first.params().moduli();
+        let ring_moduli = destination.moduli();
         let reconstruction_residues = reconstruction_coefficients
             .iter()
             .flat_map(|coefficient| {
@@ -62,6 +63,7 @@ impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
             levels,
             &plaintext_moduli,
             &reconstruction_residues,
+            destination,
         ))
     }
 }
@@ -120,7 +122,12 @@ pub fn gpu_backend_on(
     let placements = device_ids
         .into_iter()
         .map(|device_id| {
-            parameters.iter().map(|parameters| parameters.params_for_device(device_id)).collect()
+            let mut placement = Vec::new();
+            for parameters in &parameters {
+                let local = parameters.params_for_device(device_id, placement.first());
+                placement.push(local);
+            }
+            placement
         })
         .collect();
     GpuDcrtBackend::new(placements)
@@ -145,7 +152,12 @@ where
     let placements = device_ids
         .into_iter()
         .map(|device_id| {
-            parameters.iter().map(|parameters| parameters.params_for_device(device_id)).collect()
+            let mut placement = Vec::new();
+            for parameters in &parameters {
+                let local = parameters.params_for_device(device_id, placement.first());
+                placement.push(local);
+            }
+            placement
         })
         .collect();
     PolyBackend::new_with_placements(placements)
@@ -267,6 +279,7 @@ mod crt_tests {
                 &gpu_levels,
                 &plaintext_moduli,
                 &reconstruction_coefficients,
+                &gpu_parameters,
             )
             .unwrap();
             let snapshot = actual.to_coefficient_rns_snapshot_for_test();
@@ -285,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_gpu_explicit_device_override_controls_placement_count() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let backend = CpuDcrtBackend::new_for_execution_on([parameters], &[17, 23]);
 
         assert_eq!(backend.placement_count(), 2);

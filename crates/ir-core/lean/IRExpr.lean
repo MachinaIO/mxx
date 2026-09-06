@@ -15,4 +15,7 @@ decreasing_by simp_wf; omega
 
 def log2Ceil (value : Int) : Int := Int.ofNat (log2CeilNat value.toNat)
 
+def selectInt (selector : Int) (branches : List Int) : Int :=
+  branches[selector.toNat]?.getD 0
+
 end MxxIR

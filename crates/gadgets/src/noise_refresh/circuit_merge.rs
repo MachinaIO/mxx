@@ -164,7 +164,7 @@ mod graph_tests {
             assert_eq!(gate.gate_type, crate::circuit::PolyGateType::Add);
             assert_eq!(gate.input_gates, vec![input_gates[index], input_gates[3 + index]]);
         }
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let ring = Ring::new(
             IntExpr::constant(BigInt::from(parameters.modulus().as_ref().clone())),
             IntExpr::constant(parameters.ring_dimension()),

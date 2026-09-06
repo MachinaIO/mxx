@@ -764,7 +764,6 @@ impl LweLookupCompiler {
         let output_plaintext = artifacts.output_plaintexts.get(input_index.clone());
         Ok(BggEncodingWire {
             vector: high.mul_small_rhs(c_b.clone()) + input.vector.clone().mul_small_rhs(low),
-            pubkey: self.public_key(artifacts),
             plaintext: Some(output_plaintext),
         })
     }
@@ -1653,10 +1652,6 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupEncodingLowering {
                     .encoding(
                         &BggEncodingWire {
                             vector: input.vectors.get_static(slot_index),
-                            pubkey: BggPublicKeyWire {
-                                matrix: input.pubkeys.get_static(slot_index),
-                                reveal_plaintext: input.pubkey_reveal_plaintext,
-                            },
                             plaintext: Some(plaintexts.get_static(slot_index)),
                         },
                         &self.c_b_by_slot.get_static(slot_index),
@@ -1670,8 +1665,18 @@ impl<P: Poly> PublicLookupLowering<P> for NaiveLweLookupEncodingLowering {
         let mut output_plaintexts = Vec::with_capacity(outputs.len());
         for output in outputs {
             vectors.push(output.vector);
-            public_keys.push(output.pubkey.matrix);
             output_plaintexts.push(output.plaintext.expect("lookup reveals its output"));
+        }
+        // The Naive vector wire still carries the separately materialized
+        // public projection for its decoder-facing API.  It is imported from
+        // the preprocessing artifact; `BggEncodingWire` itself never carries
+        // this projection.
+        for slot in 0..invocation.slots.len() {
+            let artifacts = invocation.slots[slot]
+                .compiler
+                .import_artifacts(&invocation.slots[slot].artifacts)
+                .map_err(|source| lookup_error(gate, source))?;
+            public_keys.push(invocation.slots[slot].compiler.public_key(&artifacts).matrix);
         }
         Ok(NaiveBggEncodingVecWire {
             vectors: Family::pack(vectors)?,
@@ -1745,7 +1750,7 @@ fn lookup_error(gate: GateInstance<'_>, source: LweLookupCompileError) -> Circui
 mod tests {
     use super::*;
     use crate::{
-        BggEncodingCompiler, BggPublicKeyCompiler, BggTallEncodingCompiler,
+        BggPublicKeyCompiler, BggTallEncodingCompiler,
         test_utils::{matrix_output, row},
     };
     use mxx_dsl::{DslContext, parallel_zip_bundle};
@@ -1824,7 +1829,7 @@ mod tests {
 
     #[test]
     fn v1_lookup_artifact_metadata_is_rejected() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let lookup = compiler(
             &parameters,
             LweLookupIdentity {
@@ -1852,7 +1857,7 @@ mod tests {
 
     #[test]
     fn preprocessing_is_one_logical_table_length_parallel_producer() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let lookup = compiler(
             &parameters,
@@ -1942,7 +1947,7 @@ mod tests {
 
     #[test]
     fn shuffled_preprocessing_rows_have_distinct_v2_hashes_and_satisfy_the_lwe_equation() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let table =
             LweLookupTable::new([(2, BigInt::from(5)), (0, BigInt::from(4)), (1, BigInt::from(6))])
@@ -2090,7 +2095,7 @@ mod tests {
 
     #[test]
     fn tall_lookup_shares_one_helper_family_and_matches_every_runtime_row() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let slots = 4;
         let table = LweLookupTable::new([
@@ -2540,7 +2545,7 @@ mod tests {
 
     #[test]
     fn tall_lookup_rejects_hidden_mismatched_and_wrong_width_inputs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digits = parameters.modulus_digits();
         let lookup = compiler(
             &parameters,
@@ -2665,7 +2670,7 @@ mod tests {
 
     #[test]
     fn preprocessing_lowering_reuses_public_table_families_across_lookup_invocations() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
@@ -2757,7 +2762,7 @@ mod tests {
 
     #[test]
     fn naive_preprocessing_lowering_reuses_shared_trapdoors_and_namespaces_artifacts() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
@@ -2819,7 +2824,7 @@ mod tests {
 
     #[test]
     fn circuit_public_lookup_lowers_to_logical_artifact_family_access() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
@@ -2849,15 +2854,13 @@ mod tests {
         )
         .expect("invocation");
         let ring = lookup.ring();
-        let standard = BggEncodingCompiler {
+        let circuit_compiler = crate::PolyCircuitCompiler {
             public_key: BggPublicKeyCompiler {
                 ring: ring.clone(),
                 base: lookup.gadget_base.clone(),
                 digit_count: lookup.digit_count.clone(),
             },
         };
-        let circuit_compiler =
-            crate::PolyCircuitCompiler { public_key: standard.public_key.clone() };
         let public_key = |prefix: &str| BggPublicKeyWire {
             matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
             reveal_plaintext: true,
@@ -2891,10 +2894,6 @@ mod tests {
         );
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, digit_count)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
-                reveal_plaintext: true,
-            },
             plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
         };
         let mut lowering =
@@ -2908,13 +2907,12 @@ mod tests {
                 [encoding("input")],
                 &mut lowering,
                 &mut encoding_slots,
+                &mut |_| panic!("lookup-only circuit must not request a decomposition"),
             )
             .expect("lookup lowering");
         let built = DslContext::new("lwe-lookup-lowering")
             .output("vector", outputs[0].vector.clone())
             .expect("output")
-            .output("public-key", outputs[0].pubkey.matrix.clone())
-            .expect("public key")
             .output("plaintext", outputs[0].plaintext.clone().expect("lookup output plaintext"))
             .expect("plaintext")
             .build()
@@ -2925,7 +2923,7 @@ mod tests {
                 .iter()
                 .filter(|node| matches!(node.kind(), NodeKind::Input { artifact: Some(_), .. }))
                 .count(),
-            4
+            3
         );
         for suffix in ["_low_matrices", "_high_matrices", "_output_plaintexts"] {
             assert!(
@@ -2993,7 +2991,7 @@ mod tests {
 
     #[test]
     fn single_public_lookup_keeps_the_output_signal_in_secret_public_key_gadget_order() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
@@ -3013,8 +3011,6 @@ mod tests {
                 .expect("table"),
         );
         let production_id = ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] };
-        let output_public_key_artifact =
-            LweLookupArtifactNames::for_compiler(&lookup).output_public_key;
         let invocation = LweLookupInvocation::bind(
             lookup.clone(),
             LweLookupArtifacts::for_compiler(production_id.clone(), &lookup),
@@ -3032,10 +3028,6 @@ mod tests {
         };
         let encoding = |prefix: &str| BggEncodingWire {
             vector: ring.input(format!("{prefix}-vector"), (1, digit_count)),
-            pubkey: BggPublicKeyWire {
-                matrix: ring.input(format!("{prefix}-public"), (1, digit_count)),
-                reveal_plaintext: true,
-            },
             plaintext: Some(ring.input(format!("{prefix}-plaintext"), (1, 1))),
         };
         let input_encoding = encoding("input");
@@ -3050,15 +3042,20 @@ mod tests {
                 [input_encoding],
                 &mut lowering,
                 &mut slots,
+                &mut |_| panic!("lookup-only circuit must not request a decomposition"),
             )
             .expect("lookup lowering")
             .into_iter()
             .next()
             .expect("one LUT output");
         let output_plaintext = output.plaintext.clone().expect("lookup output plaintext");
+        let artifacts = LweLookupArtifacts::for_compiler(production_id.clone(), &lookup);
+        let output_public_key_artifact =
+            LweLookupArtifactNames::for_compiler(&lookup).output_public_key;
+        let output_public_key = lookup.public_key(&lookup.import_artifacts(&artifacts).unwrap());
         let secret = ring.input("lookup-secret", (1, 1));
         let gadget = ring.gadget(1, lookup.gadget_base.clone(), lookup.digit_count.clone());
-        let signal = secret.clone() * output.pubkey.matrix.clone() -
+        let signal = secret.clone() * output_public_key.matrix.clone() -
             output_plaintext.clone() * secret.clone() * gadget.clone();
 
         let NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) = signal.value_handle().node().kind()
@@ -3073,10 +3070,10 @@ mod tests {
         };
         assert_eq!(
             left.node().arguments(),
-            [secret.value_handle().clone(), output.pubkey.matrix.value_handle().clone()]
+            [secret.value_handle().clone(), output_public_key.matrix.value_handle().clone()]
         );
         let NodeKind::Input { artifact: Some(artifact), .. } =
-            output.pubkey.matrix.value_handle().node().kind()
+            output_public_key.matrix.value_handle().node().kind()
         else {
             panic!("lookup output public key must be imported from its exact artifact")
         };
@@ -3120,16 +3117,24 @@ mod tests {
         };
         assert_eq!(position, &IntExpr::constant(0));
 
-        DslContext::new("single-lwe-public-lookup-signal")
+        let built = DslContext::new("single-lwe-public-lookup-signal")
             .output("signal", signal)
             .expect("signal output")
             .build()
-            .expect("signal graph");
+            .expect("encoding graph");
+        assert!(
+            built
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .all(|node| { !matches!(node.kind(), NodeKind::GadgetDecompose { .. }) })
+        );
     }
 
     #[test]
     fn naive_lookup_lowerings_build_structural_family_graphs() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None);
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();

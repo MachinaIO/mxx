@@ -48,13 +48,8 @@ pub fn gpu_calibration_environment(
 pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
     matches!(
         kind,
-        NodeKind::ConstantMatrix {
-            value: ConstantMatrix::Zero |
-                ConstantMatrix::Identity |
-                ConstantMatrix::UnitRow { .. } |
-                ConstantMatrix::Gadget { .. },
-            ..
-        } | NodeKind::UniformResidueSample { .. } |
+        NodeKind::ConstantMatrix { .. } |
+            NodeKind::UniformResidueSample { .. } |
             NodeKind::UniformIntervalSample { .. } |
             NodeKind::GaussianSample { .. } |
             NodeKind::HashSample { .. } |
@@ -63,6 +58,9 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
             NodeKind::GadgetDecompose { .. } |
             NodeKind::MatrixScale { .. } |
             NodeKind::MatrixNegate |
+            NodeKind::RingAutomorphism { .. } |
+            NodeKind::ModulusSwitch { .. } |
+            NodeKind::ModulusReduce { .. } |
             NodeKind::MatrixBinary(_) |
             NodeKind::MatrixMulAccumulate { .. } |
             NodeKind::MatrixMulSmallRhs |
@@ -232,7 +230,18 @@ pub fn gpu_calibration_operation_identity(
         }
         NodeKind::GadgetDecompose { .. } |
         NodeKind::MatrixScale { .. } |
+        NodeKind::ModulusSwitch { .. } |
+        NodeKind::ModulusReduce { .. } |
         NodeKind::MatrixNegate => {
+            if let Some(input) = argument_types.first_mut() {
+                one_column(input);
+            }
+            normalize_output(&mut output_types);
+        }
+        NodeKind::RingAutomorphism { index } => {
+            // The automorphism selector changes values but not the GPU kernel shape or cost.
+            // Normalize only this calibration identity; the graph's semantic kind is untouched.
+            *index = IntExpr::constant(1);
             if let Some(input) = argument_types.first_mut() {
                 one_column(input);
             }
@@ -832,6 +841,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full, representative);
+    }
+
+    #[test]
+    fn automorphism_identity_ignores_selector_and_column_count() {
+        let matrix = |columns| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(257u16),
+                ring_dimension: 16,
+                rows: 3,
+                columns,
+            })
+        };
+        let kind = NodeKind::RingAutomorphism { index: IntExpr::constant(3) };
+        let full = gpu_calibration_operation_identity(
+            &kind,
+            &[matrix(29)],
+            &[matrix(29)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(kind, NodeKind::RingAutomorphism { index: IntExpr::constant(3) });
+        let representative = gpu_calibration_operation_identity(
+            &NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
+            &[matrix(1)],
+            &[matrix(1)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(full, representative);
+
+        let different_index = gpu_calibration_operation_identity(
+            &NodeKind::RingAutomorphism { index: IntExpr::constant(5) },
+            &[matrix(29)],
+            &[matrix(29)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(full, different_index);
+
+        let different_shape = gpu_calibration_operation_identity(
+            &kind,
+            &[ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(257u16),
+                ring_dimension: 16,
+                rows: 4,
+                columns: 29,
+            })],
+            &[ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(257u16),
+                ring_dimension: 16,
+                rows: 4,
+                columns: 29,
+            })],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_ne!(full, different_shape);
+    }
+
+    #[test]
+    fn modulus_conversion_identity_preserves_both_rings_and_normalizes_columns() {
+        let matrix = |modulus, columns| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: BigInt::from(modulus),
+                ring_dimension: 32,
+                rows: 2,
+                columns,
+            })
+        };
+        let kind = NodeKind::ModulusSwitch { modulus: IntExpr::constant(15) };
+        let identity = gpu_calibration_operation_identity(
+            &kind,
+            &[matrix(105, 17)],
+            &[matrix(15, 17)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        let one_column = gpu_calibration_operation_identity(
+            &kind,
+            &[matrix(105, 1)],
+            &[matrix(15, 1)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(identity, one_column);
+        let different_source = gpu_calibration_operation_identity(
+            &kind,
+            &[matrix(1155, 17)],
+            &[matrix(15, 17)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_ne!(identity, different_source);
+        let reduced = gpu_calibration_operation_identity(
+            &NodeKind::ModulusReduce { modulus: IntExpr::constant(15) },
+            &[matrix(105, 17)],
+            &[matrix(15, 17)],
+            &ParamEnv::default(),
+        )
+        .unwrap();
+        assert_ne!(identity, reduced);
     }
 
     #[test]

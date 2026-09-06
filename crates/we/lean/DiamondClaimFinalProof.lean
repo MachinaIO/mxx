@@ -12,8 +12,9 @@ namespace DiamondGeneratedProof
 set_option maxRecDepth 8192
 
 theorem generated_claim_ideal {hashModel external execution}
-    (hrun : Runs hashModel external execution) : execution.ideal = external.input_7 :=
-  hrun.2.2.2.2.2.2.1
+    (hrun : Runs hashModel external execution) : execution.ideal = external.input_7 := by
+  obtain ⟨_, h⟩ := hrun.2.2.2.2.2.2.1
+  exact h
 
 /-- The final whole-polynomial estimate supplies the observed residual and operational decoder.
     The numeric gate and estimate are local obligations, not a proof of CorrectnessClaim. -/

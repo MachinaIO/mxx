@@ -66,7 +66,8 @@ theorem generated_runtime_transition_index
         params.diamond_digit_base := by
     rw [Nat.cast_mul, hstateGeometry, hbaseGeometry]
     ring
-  dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_8_10] at hrun
+  dsimp only [Stage_decrypt.parallel_sequential_generatedRoot_8_10,
+    Stage_decrypt.parallel_sequential_generatedRoot_8_10.constraints_0] at hrun
   rw [← hwidth, ← hstateGeometry] at hrun
   convert hrun using 1
   simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul]

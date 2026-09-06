@@ -110,6 +110,13 @@ theorem expansion [Nontrivial R] (hn : 0 < n) (x : Negacyclic n R) :
     exact Fin.elim0 i
   · simp
 
+theorem coeff_sum {α : Type v} [DecidableEq α] (indices : Finset α)
+    (values : α → Negacyclic n R) (i : Fin n) :
+    (∑ j ∈ indices, values j).coeff i = ∑ j ∈ indices, (values j).coeff i := by
+  induction indices using Finset.induction_on with
+  | empty => simp
+  | @insert j indices hj ih => simp only [Finset.sum_insert hj, coeff_add, ih]
+
 @[simp] theorem coeff_neg (x : Negacyclic n R) (i : Fin n) :
     (-x).coeff i = -x.coeff i := by
   unfold coeff

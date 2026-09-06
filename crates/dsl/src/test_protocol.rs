@@ -226,7 +226,7 @@ mod tests {
         );
         assert!(conclusion.contains("execution.«stage_1».2.1 = execution.«ideal»"));
         let decoder = fs::read_to_string(directory.join("Stage_decrypt.lean")).unwrap();
-        assert!(decoder.contains("MxxRuntime.thresholdDecode 2 1 0"));
+        assert!(decoder.contains("MxxRuntime.thresholdDecode (2) (1) 0"));
         assert!(decoder.contains("decide (w_1_0_decoded ≠ 0)"));
     }
 
@@ -266,8 +266,8 @@ mod tests {
         .unwrap();
         assert_eq!(artifact.source.matches("MxxRuntime.thresholdDecode").count(), 4);
         assert_eq!(artifact.source.matches("decide (").count(), 2);
-        assert_eq!(artifact.source.matches("params.«plaintext_modulus» 2 0").count(), 2);
-        assert_eq!(artifact.source.matches("params.«plaintext_modulus» 2 1").count(), 2);
+        assert_eq!(artifact.source.matches("(params.«plaintext_modulus») (2) 0").count(), 2);
+        assert_eq!(artifact.source.matches("(params.«plaintext_modulus») (2) 1").count(), 2);
         assert!(artifact.root.outputs["integer_0"].lean_type == "Int");
         assert!(artifact.root.outputs["boolean_1"].lean_type == "Bool");
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))

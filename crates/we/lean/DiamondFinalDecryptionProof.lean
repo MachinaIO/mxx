@@ -27,10 +27,12 @@ theorem generated_final_root
           coefficient ≤ 3 * MxxIR.roundDiv (params.diamond_modulus - 2) 4) ∧
       familyGetStatic outputs.2.2.2.2.2.2.1 0 state := by
   dsimp only [Stage_decrypt.generatedRoot] at hrun
-  rcases hrun with ⟨w2, w3, w5, w6, w8, state, w19, w24, w26, w27, w28, w29,
+  obtain ⟨rootWitness, h⟩ := hrun
+  rcases rootWitness with ⟨w2, w3, w5, w6, w8, state, w19, w24, w26, w27, w28, w29,
     w31, w32, w33, w35, w36, w37, w38, w40, w42, w43, w44, w45, w46, w47,
     w48, w49, w50, w53, w54, w55, w56, w57, w58, w59, w60, w61, w62,
-    w67a, w67b, w67c, w70, circuit, coefficient, h⟩
+    w67a, w67b, w67c, w70, circuit, coefficient⟩
+  dsimp only [Stage_decrypt.generatedRoot.body, Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
   have hextract : extractCoefficient 0
       (state * inputs.2.2.2.1 - (state * inputs.2.2.2.2.1 +
         (state * inputs.2.2.2.2.2.1 - circuit) *

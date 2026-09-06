@@ -44,11 +44,13 @@ theorem generated_final_public_witness
       outputs.2.2.2.2.2.1 outputs.2.2.2.2.2.2.2.2.1 outputs.2.2.2.2.1
       outputs.2.2.2.2.2.2.2.2.2.1) := by
   dsimp only [Stage_encrypt.generatedRoot] at hrun
-  rcases hrun with ⟨w0, w1, t1, w2, t2, base, trapdoor, w6, uniform, w8, publicInputs,
+  obtain ⟨rootWitness, h⟩ := hrun
+  rcases rootWitness with ⟨w0, w1, t1, w2, t2, base, trapdoor, w6, uniform, w8, publicInputs,
     publicOne, w19, w20, w26, w27, w32, w35, publicCircuit, w38, target, digits,
     decoderTarget, decoder, w46, w51, w52, w53, w55, keyTarget, key, gadget,
     oneTarget, one, w65, w66, t66, w67, w68, w69, w70, w71, w72, w73,
-    w74, w75, t75, w76, w77, w78, h⟩
+    w74, w75, t75, w76, w77, w78⟩
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at h
   have hpublic : publicOne = publicInputs 0 := by
     obtain ⟨i, hi, hv⟩ : familyGetStatic publicInputs 0 publicOne := by tauto
     have hiz : i = 0 := Fin.ext (by change i.val = 0; omega)

@@ -97,8 +97,22 @@ fn test_refresh_parameter_search() {
     let (selected, result) = select_best_profile_result(profile_results.clone())
         .expect("Phase-2 search must produce a candidate");
     if let Some(path) = checkpoint.as_deref() {
-        persist_accepted_phase2_profile(path, &config, &selected, result.candidate)
-            .expect("persist Phase-2 profile");
+        let evidence = if config.noise_model == NoiseSearchModel::WorstCase {
+            Some(
+                Phase2CertificationEvidence::certify(&config, &selected, result.candidate)
+                    .expect("certify exact persisted Phase-2 profile"),
+            )
+        } else {
+            None
+        };
+        persist_accepted_phase2_profile(
+            path,
+            &config,
+            &selected,
+            result.candidate,
+            evidence.as_ref(),
+        )
+        .expect("persist Phase-2 profile");
     }
     config.crt_bits = result.candidate.crt_bits;
     config.base_bits = result.candidate.base_bits;

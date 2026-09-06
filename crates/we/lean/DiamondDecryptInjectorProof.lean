@@ -28,10 +28,12 @@ theorem generated_decrypt_injector_context
           layer (current, packed, inputs.2.2.1, ()) next)
         params.diamond_input_count.toNat initialStates outputs.2.2.2.2.2.2.1 := by
   dsimp only [Stage_decrypt.generatedRoot] at hrun
-  rcases hrun with ⟨w2, w3, w5, w6, w8, state, w19, w24, w26, w27, w28, w29,
+  obtain ⟨rootWitness, h⟩ := hrun
+  rcases rootWitness with ⟨w2, w3, w5, w6, w8, state, w19, w24, w26, w27, w28, w29,
     w31, w32, w33, w35, w36, w37, w38, w40, w42, w43, w44, w45, w46, w47,
     w48, w49, w50, w53, w54, w55, w56, w57, w58, w59, w60, w61, w62,
-    w67a, w67b, w67c, w70, circuit, coefficient, h⟩
+    w67a, w67b, w67c, w70, circuit, coefficient⟩
+  dsimp only [Stage_decrypt.generatedRoot.body, Stage_decrypt.generatedRoot.constraints_0, Stage_decrypt.generatedRoot.constraints_1, Stage_decrypt.generatedRoot.constraints_2] at h
   have hinit : ∀ state : Fin stateCount, Stage_decrypt.parallel_generatedRoot_2 backend params state.val
       inputs.1 (w2 state) := by tauto
   have hindices : ∀ i : Fin witnessSlots, Stage_decrypt.parallel_generatedRoot_3 backend params i.val ()
@@ -41,7 +43,7 @@ theorem generated_decrypt_injector_context
   have hpacking : ∀ i : Fin inputCount, Stage_decrypt.parallel_generatedRoot_6 backend params i.val
       w5 (w6 i) := by tauto
   have hbatch : 0 ≤ params.diamond_batch_bits := by
-    rcases hpacking 0 with ⟨_, _, hbatch, _, _⟩
+    rcases hpacking 0 with ⟨_, hbatch, _, _⟩
     exact hbatch
   have hpacked := generated_packed_raw_witness backend params inputs.2.1 w3 w5 w6
     hraw hindices hprefix hpacking

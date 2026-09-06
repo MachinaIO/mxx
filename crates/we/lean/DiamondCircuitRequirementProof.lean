@@ -43,10 +43,12 @@ theorem generated_circuit_plaintext_equation
             current.2.2.1 left 0 0 + current.2.2.1 right 0 0 -
               2 * (current.2.2.1 left 0 0 * current.2.2.1 right 0 0)].get kind else 0 := by
   dsimp only [Stage_decrypt.sequential_generatedRoot_67] at hrun
-  rcases hrun with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
+  obtain ⟨scopeWitness, h⟩ := hrun
+  rcases scopeWitness with ⟨active, flags, w5, w6, addresses, gateKinds, leftIndices, w13, w14,
     rightIndices, w18, digits, w20, w21, w23, w24, w25, w26, w28, w29, w30, w31,
     w33, w34, w35, w36, w37, w38, w39, w40, w41, w42, w44, w45, w46, w47,
-    w48, w49, w50, w51, w52, w53, h⟩
+    w48, w49, w50, w51, w52, w53⟩
+  dsimp only [Stage_decrypt.sequential_generatedRoot_67.body] at h
   rcases h with ⟨_, _, hactive, _, h3, _, _, _, _, _, h7, _, h9, _, h11, _, _,
     _, _, _, h16, _, _, _, _, _, _, _, _, _, h23, _, _, _, _,
     _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
@@ -154,8 +156,8 @@ theorem generated_circuit_requirement_layer_agrees
     current next activeCounts kinds leftSources rightSources oneCipher onePublic oneMessage
     honeMessage hcircuit
   dsimp only [Requirement_2.sequential_generatedRoot_27] at hrequirement
-  obtain ⟨addresses, gateKinds, leftIndices, leftValues, rightIndices, rightValues,
-    referenceActive, values, _, haddr, _, hkinds, _, hlefts, _, hleftValues, _, hrights,
+  obtain ⟨⟨addresses, gateKinds, leftIndices, leftValues, rightIndices, rightValues,
+    referenceActive, values⟩, _, haddr, _, hkinds, _, hlefts, _, hleftValues, _, hrights,
     _, hrightValues, _, _, hreferenceActive, _, hgates, hout⟩ := hrequirement
   have ha : referenceActive = active := circuit_lookup_unique hreferenceActive hactive
   rw [hout]
@@ -263,8 +265,10 @@ theorem generated_accepting_requirement_plaintext
           requirementParams.depth.toNat initial output →
         output.2.2.1 position 0 0 = 1 := by
   dsimp only [Requirement_2.generatedRoot] at hroot
-  obtain ⟨instanceChecks, witnessChecks, inputChecks, validInputs, witnessIndices,
-    selectedWitnesses, referenceInitial, referenceOutput, selectedIndex, accepted, h⟩ := hroot
+  obtain ⟨rootWitness, h⟩ := hroot
+  rcases rootWitness with ⟨instanceChecks, witnessChecks, inputChecks, validInputs, witnessIndices,
+    selectedWitnesses, referenceInitial, referenceOutput, selectedIndex, accepted⟩
+  dsimp only [Requirement_2.generatedRoot.body, Requirement_2.generatedRoot.constraints_0] at h
   rcases h with ⟨_, _, _, _, _, _, _, _, _, hindices, _, hwitnesses, _, hinitial,
     _, hloop, _, _, hsource, _, _, houtput, hsuccess⟩
   have haccept : accepted = true := by

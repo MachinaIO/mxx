@@ -31,11 +31,13 @@ theorem generated_final_preimages_bounded
     PreimageWithin outputs.2.2.1 params.diamond_preimage_max_coefficient_bound.toNat ∧
     PreimageWithin outputs.2.2.2.1 params.diamond_preimage_max_coefficient_bound.toNat := by
   dsimp only [Stage_encrypt.generatedRoot] at hrun
-  rcases hrun with ⟨w0, w1, t1, w2, t2, base, trapdoor, w6, uniform, w8, publicInputs,
+  obtain ⟨rootWitness, h⟩ := hrun
+  rcases rootWitness with ⟨w0, w1, t1, w2, t2, base, trapdoor, w6, uniform, w8, publicInputs,
     publicOne, w19, w20, w26, w27, w32, w35, publicCircuit, w38, target, digits,
     decoderTarget, decoder, w46, w51, w52, w53, w55, keyTarget, key, gadget,
     oneTarget, one, w65, w66, t66, w67, w68, w69, w70, w71, w72, w73,
-    w74, w75, t75, w76, w77, w78, h⟩
+    w74, w75, t75, w76, w77, w78⟩
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at h
   have hsample (i : Fin basePoolCount) : (t1 i).kind = .sampledSecret := by
     have hr : Stage_encrypt.parallel_generatedRoot_1 backend hashModel params i ()
         (w1 i, t1 i, ()) := by tauto

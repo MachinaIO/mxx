@@ -135,8 +135,11 @@ theorem generated_injector_layer
         row 0 0 = commonSecret * producer.digitSamples samplePosition 0 0 ∧
         outputs lane = row * producer.bases position + error := by
   dsimp only [Stage_decrypt.sequential_generatedRoot_8] at hrun
-  rcases hrun with ⟨sourceIndices, sourceStates, digitValue, transitionIndices,
-    selectedTransitions, nextStates, hstateGeometry, hsources, _, hgathers, _, _, hdigitGet,
+  obtain ⟨scopeWitness, facts⟩ := hrun
+  rcases scopeWitness with ⟨sourceIndices, sourceStates, digitValue, transitionIndices,
+    selectedTransitions, nextStates⟩
+  dsimp only [Stage_decrypt.sequential_generatedRoot_8.body] at facts
+  rcases facts with ⟨hstateGeometry, hsources, _, hgathers, _, _, hdigitGet,
     _, hindices, _, htransitions, _, hsteps, hout⟩
   obtain ⟨packedPosition, hpackedPosition, hpackedValue⟩ := hdigitGet
   have hdigitBounds : 0 ≤ digitValue ∧ digitValue < digitBase := by

@@ -35,11 +35,13 @@ theorem generated_injector_root
             PreimageWithin (outputs.2.2.2.2.2.2.2.1 i)
               params.diamond_preimage_max_coefficient_bound.toNat := by
   dsimp only [Stage_encrypt.generatedRoot] at hrun
-  rcases hrun with ⟨w_0_0, w_1_0, w_1_1, w_2_0, w_2_1, w_3_0, w_4_0, w_6_0, w_7_0, w_8_0, w_9_0, w_10_0,
+  obtain ⟨rootWitness, hrelations⟩ := hrun
+  rcases rootWitness with ⟨w_0_0, w_1_0, w_1_1, w_2_0, w_2_1, w_3_0, w_4_0, w_6_0, w_7_0, w_8_0, w_9_0, w_10_0,
     w_19_0, w_20_0, w_26_0, w_27_0, w_32_0, w_35_0, w_36_0, w_38_0, w_39_0, w_40_0,
     w_44_0, w_45_0, w_46_0, w_51_0, w_52_0, w_53_0, w_55_0, w_58_0, w_59_0, w_60_0,
     w_63_0, w_64_0, w_65_0, w_66_0, w_66_1, w_67_0, w_68_0, w_69_0, w_70_0, w_71_0,
-    w_72_0, w_73_0, w_74_0, w_75_0, w_75_1, w_76_0, w_77_0, w_78_0, hrelations⟩
+    w_72_0, w_73_0, w_74_0, w_75_0, w_75_1, w_76_0, w_77_0, w_78_0⟩
+  dsimp only [Stage_encrypt.generatedRoot.body, Stage_encrypt.generatedRoot.constraints_0, Stage_encrypt.generatedRoot.constraints_1, Stage_encrypt.generatedRoot.constraints_2] at hrelations
   have hwhole := hrelations
   rcases hrelations with ⟨hstateCount, hterminalIndices, _, hbases, _, hterminalBases,
     hterminalBase, _, _, _, _, _, _, _, _, _, _, _, _, _, _,

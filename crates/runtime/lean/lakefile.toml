@@ -16,5 +16,6 @@ roots = [
   "MxxRuntime",
   "RuntimeHash",
   "RuntimeMatrixOps",
+  "RuntimeModulusSwitch",
   "RuntimePrimitives",
 ]

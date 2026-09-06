@@ -494,6 +494,47 @@ impl std::fmt::Display for CandidatePreparationError {
 /// intentionally not part of the search boundary.
 pub fn check_refresh_bundle(
     config: &SearchConfig,
+    candidate: Candidate,
+    prepared: &mut PreparedCandidate,
+) -> Result<bool, String> {
+    let accepted = evaluate_refresh_bundle(config, candidate, prepared)?;
+    if !accepted || config.noise_model == NoiseSearchModel::AverageCase {
+        return Ok(accepted);
+    }
+    if candidate != prepared.candidate {
+        return Err("certificate candidate parameters differ from prepared parameters".into());
+    }
+    let bundle = prepared
+        .bundle
+        .as_ref()
+        .ok_or("worst-case acceptance requires the selected candidate's full PRE/VER bundle")?;
+    let parameters = DCRTPolyParams::new(
+        prepared.ring_dimension as u32,
+        candidate.crt_depth,
+        candidate.crt_bits,
+        candidate.base_bits,
+        None,
+        None,
+    );
+    let rings = bundle.ring_parameters(parameters).map_err(|error| error.to_string())?;
+    let layouts =
+        mxx_runtime::lean::export_dcrt_layouts(&rings).map_err(|error| error.to_string())?;
+    let backend = mxx_runtime::lean::render_backend_context(&layouts, "Backend", "RefreshBackend")
+        .map_err(|error| error.to_string())?;
+    mxx_exponent_lut::lean::certify::certify(
+        bundle,
+        &mxx_ir_core::ParamEnv::default(),
+        &backend,
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/exponent_refresh_certificates"),
+        mxx_exponent_lut::lean::certify::check_timeout().map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("worst-case final certificate rejected: {error}"))?;
+    Ok(true)
+}
+
+fn evaluate_refresh_bundle(
+    config: &SearchConfig,
     _candidate: Candidate,
     prepared: &mut PreparedCandidate,
 ) -> Result<bool, String> {
@@ -1468,6 +1509,57 @@ impl Phase1Checkpoint {
     }
 }
 
+/// Opaque persistence authority. Construction rebuilds the exact selected profile
+/// and completes its full worst-case certificate; mutable prepared snapshots are
+/// never accepted as evidence at this boundary.
+mod phase2_certification {
+    use super::*;
+
+    pub struct Evidence {
+        config: SearchConfig,
+        selected: SelectedSparseLwrProfile,
+        candidate: Candidate,
+    }
+
+    impl Evidence {
+        pub fn certify(
+            config: &SearchConfig,
+            selected: &SelectedSparseLwrProfile,
+            candidate: Candidate,
+        ) -> Result<Self, String> {
+            if config.noise_model != NoiseSearchModel::WorstCase {
+                return Err(
+                    "worst-case certification evidence requires worst-case configuration".into()
+                );
+            }
+            if (selected.tuple.nu, selected.tuple.h, selected.tuple.q_l, selected.tuple.p) !=
+                (selected.universe, selected.weight, selected.q_l, selected.p)
+            {
+                return Err(
+                    "selected profile tuple differs from certified profile parameters".into()
+                );
+            }
+            let mut exact_config = config.clone();
+            exact_config.sparse_lwr_universe = selected.universe;
+            exact_config.sparse_lwr_weight = selected.weight;
+            exact_config.sparse_lwr_modulus = selected.q_l;
+            exact_config.sparse_lwr_output_modulus = selected.p;
+            prepare_candidate(&exact_config, candidate).map_err(|error| error.to_string())?;
+            Ok(Self { config: config.clone(), selected: selected.clone(), candidate })
+        }
+
+        pub fn matches(
+            &self,
+            config: &SearchConfig,
+            selected: &SelectedSparseLwrProfile,
+            candidate: Candidate,
+        ) -> bool {
+            self.config == *config && self.selected == *selected && self.candidate == candidate
+        }
+    }
+}
+pub use phase2_certification::Evidence as Phase2CertificationEvidence;
+
 /// Persist the accepted Phase-2 profile while retaining and revalidating all
 /// Phase-1 evidence. The replacement is written beside the checkpoint and
 /// renamed into place only after complete validation.
@@ -1476,7 +1568,13 @@ pub fn persist_accepted_phase2_profile(
     config: &SearchConfig,
     selected: &SelectedSparseLwrProfile,
     candidate: Candidate,
+    evidence: Option<&Phase2CertificationEvidence>,
 ) -> Result<(), String> {
+    if config.noise_model == NoiseSearchModel::WorstCase &&
+        !evidence.is_some_and(|evidence| evidence.matches(config, selected, candidate))
+    {
+        return Err("worst-case persistence requires certification evidence for the exact candidate/profile/configuration".into());
+    }
     let bytes = fs::read(path).map_err(|error| format!("read Phase-1 checkpoint: {error}"))?;
     let mut checkpoint: Phase1Checkpoint = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse Phase-1 checkpoint: {error}"))?;
@@ -2429,12 +2527,9 @@ fn prepare_candidate_with_digits_inner(
     let mut context = build_candidate_context(config, candidate)?;
     if let Some(selected) = selected_switch_moduli {
         context.switch_moduli = selected.to_vec();
-        return prepare_candidate_from_ring_context(
-            config,
-            &context,
-            fixed_digits,
-            build_full_bundle,
-        );
+        let prepared =
+            prepare_candidate_from_ring_context(config, &context, fixed_digits, build_full_bundle)?;
+        return certify_selected_candidate(config, &context, prepared);
     }
     let mut rejections = Vec::new();
     // Deterministic coarse search: increasing retained width, shared contiguous
@@ -2444,7 +2539,7 @@ fn prepare_candidate_with_digits_inner(
         context.switch_moduli = candidate_switch_moduli(&context.crt_moduli, retained)?;
         match prepare_candidate_from_ring_context(config, &context, fixed_digits, build_full_bundle)
         {
-            Ok(prepared) => return Ok(prepared),
+            Ok(prepared) => return certify_selected_candidate(config, &context, prepared),
             Err(CandidatePreparationError::Infeasible(reason)) => {
                 rejections.push(format!("retained={retained}: {reason}"))
             }
@@ -2455,6 +2550,83 @@ fn prepare_candidate_with_digits_inner(
         "coarse switched-ring scan rejected: {}",
         rejections.join("; ")
     )))
+}
+
+// Rebuild only the selected tuple, using the identical setup, public layout and
+// deterministic search key. Cached profiles also enter through this boundary.
+fn certify_selected_candidate(
+    config: &SearchConfig,
+    context: &CandidatePreparationContext,
+    mut prepared: PreparedCandidate,
+) -> Result<PreparedCandidate, CandidatePreparationError> {
+    if config.noise_model == NoiseSearchModel::AverageCase {
+        return Ok(prepared);
+    }
+    if !evaluate_refresh_bundle(config, context.candidate, &mut prepared)
+        .map_err(CandidatePreparationError::Fatal)?
+    {
+        return Err(CandidatePreparationError::Infeasible(
+            "selected worst-case bounds reject".into(),
+        ));
+    }
+    let expected_report = prepared.production_report.clone();
+    let setup = setup_for_candidate_context(
+        config,
+        context,
+        prepared.mask_base_p_digit_count,
+        prepared.fresh_error_base_p_digit_count,
+    )?;
+    let plaintext = setup.layout.ring().polynomial([BigInt::zero().into()]);
+    let bundle = RefreshParameterSimulationRequest::new(
+        setup,
+        context.profile,
+        context.generated_layout.clone(),
+        [0x4b; 32],
+        RealExpr::from_f64_exact(config.decoder_sigma)
+            .map_err(|error| CandidatePreparationError::Fatal(error.to_string()))?,
+        plaintext,
+        1,
+    )
+    .and_then(|request| request.build())
+    .map_err(|error| CandidatePreparationError::Fatal(format!("selected proof graph: {error}")))?;
+    if let Some(snapshot) = prepared
+        .noise_snapshot
+        .as_ref()
+        .or_else(|| prepared.bundle.as_ref().map(|bundle| bundle.noise_snapshot()))
+    {
+        let full = bundle.noise_snapshot();
+        if snapshot.setup_identity() != full.setup_identity() ||
+            snapshot.authority != full.authority ||
+            snapshot.layout != full.layout ||
+            snapshot.program.id() != full.program.id() ||
+            snapshot.refresh != full.refresh ||
+            snapshot.gate_gains != full.gate_gains ||
+            snapshot.readout_gains != full.readout_gains ||
+            snapshot.initial_state_bound != full.initial_state_bound ||
+            snapshot.initial_state_doubled_variance != full.initial_state_doubled_variance ||
+            snapshot.helper_error_cutoff != full.helper_error_cutoff ||
+            snapshot.helper_doubled_variance != full.helper_doubled_variance ||
+            snapshot.public_input_error_cutoff != full.public_input_error_cutoff ||
+            snapshot.public_input_doubled_variance != full.public_input_doubled_variance ||
+            snapshot.gain_plan != full.gain_plan ||
+            snapshot.family_active_counts != full.family_active_counts
+        {
+            return Err(CandidatePreparationError::Fatal(
+                "selected compact and proof snapshots differ".into(),
+            ));
+        }
+    }
+    prepared.bundle = Some(bundle);
+    evaluate_refresh_bundle(config, context.candidate, &mut prepared)
+        .map_err(CandidatePreparationError::Fatal)?;
+    if prepared.production_report != expected_report {
+        return Err(CandidatePreparationError::Fatal(
+            "selected compact and proof reports differ".into(),
+        ));
+    }
+    check_refresh_bundle(config, context.candidate, &mut prepared)
+        .map_err(CandidatePreparationError::Fatal)?;
+    Ok(prepared)
 }
 
 fn candidate_switch_moduli(
@@ -2573,7 +2745,7 @@ fn prepare_candidate_from_ring_context(
                 .collect::<Result<Vec<_>, _>>()?;
             for (offset, mask_digits) in (first_digits..=last_digits).enumerate() {
                 let accepted = if offset == 0 {
-                    check_refresh_bundle(config, candidate, &mut first_prepared)
+                    evaluate_refresh_bundle(config, candidate, &mut first_prepared)
                         .map_err(CandidatePreparationError::Fatal)?
                 } else {
                     let scan_snapshot =
@@ -2621,7 +2793,7 @@ fn prepare_candidate_from_ring_context(
                         Some(&invariant_routes),
                         pre_refresh.as_ref(),
                     )?;
-                    let checked = check_refresh_bundle(config, candidate, &mut prepared)
+                    let checked = evaluate_refresh_bundle(config, candidate, &mut prepared)
                         .map_err(CandidatePreparationError::Fatal)?;
                     if checked {
                         return Ok(prepared);

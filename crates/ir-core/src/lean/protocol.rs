@@ -274,9 +274,11 @@ pub fn assemble_claim(
             .collect(),
         actual: Port { root: actual_position, name: endpoint.workflow_output.output.clone() },
         ideal: Port { root: ideal_position, name: endpoint.ideal_output.clone() },
-        residual: Port {
-            root: position(&target.residual_stage)?,
-            name: target.residual_output.clone(),
+        endpoint: claim::Endpoint::BooleanInterval {
+            residual: Port {
+                root: position(&target.residual_stage)?,
+                name: target.residual_output.clone(),
+            },
         },
     };
     claim::assemble_claim(&claim, bindings, backend, semantics)

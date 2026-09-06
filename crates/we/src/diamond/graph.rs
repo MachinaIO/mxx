@@ -632,8 +632,7 @@ impl DiamondWeProtocolFamily {
         let packed_vectors = active_witness
             .clone()
             .parallel_select_mats(vec![active_zero_vectors, packed_vectors])?;
-        let zero_public_key =
-            public_keys.matrices.get_static(0).clone() - public_keys.matrices.get_static(0).clone();
+        let zero_public_key = one_public_key.matrix.clone() - one_public_key.matrix.clone();
         let active_zero_public_keys = Parallel::range(circuit_params.max_layer_width.clone())
             .map_values(|_| zero_public_key.clone())?;
         let packed_public_keys = active_witness

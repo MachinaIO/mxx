@@ -1,307 +1,192 @@
 # Declarative graph DSL
 
-Use `mxx-dsl` to describe a computation once, validate its types and parameters, and execute it
-with `mxx-runtime`. It is a Rust embedded DSL: you write ordinary Rust expressions whose values
-build a graph. There is no separate source language to parse.
+## Purpose
 
-This program doubles each matrix in an input family and exposes the resulting family as an output.
-The closure describes one loop body; the graph executes that body for four indices.
+`mxx-dsl` lets a lattice-cryptographic protocol be written once and reused for GPU execution,
+noise simulation, benchmark estimation, and protocol correctness checking. Its purpose is to make
+it mechanically verifiable that these different uses refer to the same protocol.
+
+The shared description records the operations, data dependencies, sampling locations, loop
+structure, and parameters. Execution and analysis consume this common graph, so their correspondence
+can be checked against an explicit computational structure. This makes the connection between an
+executed protocol and its simulated noise or estimated performance part of what the tooling can
+verify.
+
+## High-level idea
+
+Think of a DSL program as a shared plan for a protocol. GPU execution evaluates the operations
+with concrete data; noise simulation follows their effect on noise; benchmark estimation evaluates
+their computational cost. Each use interprets the same plan for its own purpose.
+
+An input in this plan stands for data that will be supplied later. An expression such as
+`y = &x + &x` adds an operation to the plan: add that input to itself and call the resulting
+value `y`. Other expressions can use `y`, connecting their operations to
+its result. Declaring an output identifies which result the completed computation must produce.
+
+Loops describe repeated parts of the plan. `parallel` applies a body independently at each index;
+`iterate` feeds each step's result into the next. A value defined outside a loop is shared by its
+instances. A sampler inside a loop produces a value for each executed instance. These dependencies
+and sampling locations are part of the computation being described.
+
+The DSL is embedded in Rust. Running the Rust construction code assembles the graph; it does not
+yet perform the matrix arithmetic. Compile parameters determine shapes and iteration counts during
+validation. The validated graph can then be executed with input data or consumed by analysis
+tools. Ordinary Rust functions and data structures organize the construction code around this
+distinction.
+
+The guide below follows that process, starting with a complete small graph. The
+[API reference](#api-reference) gives every public operation and its detailed constraints.
+
+## A first graph
+
+This program constructs and validates a graph that doubles a matrix:
 
 ```rust
-use mxx_dsl::{DslContext, Ring, parallel};
+use mxx_dsl::{DslContext, Ring};
 use mxx_ir_core::ParamEnv;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ring = Ring::new(17, 8);
-    let inputs = ring.input_family("inputs", 4, (2, 2));
-    let outputs = parallel(4, |i| {
-        let input = inputs.at(i);
-        Ok(input.clone() + input)
-    })?;
-    let built = DslContext::new("double").output("outputs", outputs)?.build()?;
+    let input = ring.input("input", (2, 2));
+    let doubled = &input + &input;
+    let built = DslContext::new("double")
+        .output("result", doubled)?
+        .build()?;
     built.validate(&ParamEnv::default())?;
     Ok(())
 }
 ```
 
-## Start with values, then choose how to combine them
+`Ring::new(17, 8)` specifies modulus 17 and ring dimension 8. Each entry of the `2 × 2` matrix
+belongs to that ring. `input` names a matrix that will be supplied at execution; `+` creates its
+addition node; `output` names the result to expose.
 
-A DSL value describes a computation. For example, `a + b` builds an addition node; it does not
-add matrices in the Rust process constructing the graph. `Mat`, `Int`, `Bool`, and `Bytes` are
-handles to such values. `SmallMatrix`, `Preimage`, and `Trapdoor` carry the additional type
-information required by their cryptographic operations.
+There are three stages:
 
-Most programs need four operations:
+1. **Construction:** Rust builds a graph of values and their dependencies. Only declared outputs
+   and their dependencies are retained by `build()`.
+2. **Validation:** `validate` resolves compile parameters and checks concrete types, shapes, bounds,
+   and execution planning. This example uses literals, so its `ParamEnv` is empty.
+3. **Execution or analysis:** the runtime evaluates the graph with input data, while simulation
+   and estimation tools interpret its operations for their respective analyses. The program above
+   stops after validation; see [Runtime](runtime.md) for execution and artifact storage.
 
-| What the program needs | What to write |
-| --- | --- |
-| Compute a value | Ordinary arithmetic such as `&a + &b`, or a typed method |
-| Compute the same operation for each index | `parallel(count, |i| ...)`, returning a `Family<T>` |
-| Carry a result into the next step | `iterate(count, initial, |i, state| ...)` |
-| Make a result available to the caller | `DslContext::output(name, value)` |
+## Values and parameters
 
-Rust bindings, tuples, vectors, and records organize the code around those operations. They do not
-need separate DSL declarations. The reference later in this document lists every supported API;
-the following sections explain when to use them.
+A `Mat`, `Int`, `Bool`, or `Bytes` is a handle to a graph value. Expressions such as `&a + &b`
+build computations from those handles. Cloning a handle shares the same value; it does not compute
+or sample it again. `SmallMatrix`, `Preimage`, and `Trapdoor` carry the types and bounds needed by
+cryptographic operations.
 
-### Use a family when the computation needs an index
+Matrices support `+`, `-`, `*`, unary `-`, and scalar multiplication such as `&matrix * 2`.
+Runtime integers support arithmetic and the comparison methods `equal`, `less`, and `less_equal`,
+which return graph Booleans. Booleans support `&`, `|`, `^`, and `!`. Use these methods and operators
+when describing a computation; Rust comparisons and short-circuit operators evaluate Rust values.
+Tuples, vectors, and supported domain records can pass several graph values together using ordinary
+Rust syntax.
 
-`Family<T>` is an ordered collection whose elements all have the same schema. Use it for inputs,
-tables, or results that the graph must read by index. A family count can be a compile expression
-resolved from parameters before execution. The opening example uses `Family<Mat>` because each
-loop instance reads one matrix with `inputs.at(i)`.
+Shapes, loop counts, and sampler parameters must be resolved before execution. They use
+`IntExpr` and `RealExpr`, imported from `mxx_ir_core`. Declare named parameters with
+`int_parameter` or `real_parameter` on the context, and supply their values in `ParamEnv` when
+validating. Literal arguments in the first example are constant compile expressions.
 
-`family.at(index)` returns an element. Its index can be a constant, compile expression, loop index,
-or runtime `Int`. Known static indices are validated before execution; dynamic indices are checked
-at runtime. Negative or out-of-range indices are errors. A loop can read a prefix of a longer
-family; domain operations that require equal lengths check that requirement separately.
+A runtime `Int` can choose which family element to read, but cannot determine a matrix shape or
+loop count. Its value is only available during execution. Also, arithmetic on the two integer
+types has different division rules: `IntExpr` division must be exact, whereas runtime `Int`
+division uses floor division by the absolute divisor. The reference specifies all operators and
+error cases.
 
-An element can also be a tuple or domain record. `Family<CircuitEncoding>`, for example, lets
-`encodings.at(i)` return the vector, public key, and plaintext belonging to the same encoding.
-`Family<Trapdoor>` similarly keeps a public matrix with its private trapdoor. These groupings
-preserve correspondence; they do not prove an algebraic relation between the fields.
+## Families and iteration
 
-### Use Rust containers when the code only needs to group values
+`Family<T>` is an ordered collection of graph values with a common element schema: the same ring,
+shape, bounds, and field structure. Read an element with `.at(index)`. The index may be a constant,
+a loop index, or a runtime integer. Use `parallel` to compute independent elements and `iterate`
+when each step needs the previous result.
 
-A tuple such as `(matrix, flag)` passes two existing values together. A record gives related fields
-names. A Rust `Vec<T>` serves the same purpose when the number of fields is determined while
-constructing the graph. Its `GraphValue` implementation lets it pass through `output`, `iterate`,
-and `Subgraph` without callers unpacking it by hand. It is a convenience for composing Rust code,
-not another collection operation that a DSL user must learn.
-
-For example, this fragment assumes matrices `left` and `right` with matching schemas and a graph
-integer `index`:
-
-```rust
-use mxx_dsl::Family;
-
-let fields = vec![left, right];
-let first = fields[0].clone();       // Rust chooses an existing handle now.
-let table = Family::pack(fields)?;
-let chosen = table.at(index);       // The graph chooses an element during execution.
-```
-
-The distinction matters because the two containers express different requirements:
-
-| | Rust `Vec<T>` | DSL `Family<T>` |
-| --- | --- | --- |
-| Purpose | Pass several fields together | Read or compute elements by index in the graph |
-| Length | A Rust `usize` fixed during construction | A compile expression resolved before execution |
-| Element schemas | May differ; each position has its own schema | Must all agree |
-| Indexing | Rust `usize`; returns an existing handle | `.at(...)`; accepts a graph integer |
-| Graph representation | The fields' individual wires | An indexed family for each element field |
-
-Thus a `Vec<Mat>` can group matrices of different shapes; packing those matrices into a
-`Family<Mat>` fails. A family cannot replace every vector without changing the meaning or
-restricting the values a Rust function can accept. Conversely, use `Family` when the algorithm
-needs symbolic indexing or one reusable loop body. Use tuples or named records for a small,
-fixed group with distinct roles.
-
-### Keep element schemas consistent
-
-A schema describes what is known before execution: the ring, matrix shape, coefficient bounds,
-and the fields of a composite value. `GraphValue` and `GraphValueSchema` make tuples, vectors,
-domain records, and families usable by the same construction functions. Ordinary callers use
-these values directly; domain-library authors implement the traits for new records.
-
-`Family::pack` requires a nonempty collection of same-schema values. A zero-count `parallel` can
-produce a typed empty family. Rings, shapes, bounds, vector lengths, and static record metadata
-must agree across elements. Optional record fields must be present in every element or absent in
-every element. Ragged arrays and iteration-dependent output schemas are unsupported.
-
-The current storage format supports one family dimension. Consequently, a `Family` cannot contain
-another family, even inside a record. A fixed-length Rust vector or tuple can group several fields
-within an element. A complete family can still be the state of `iterate`, a candidate in `select`,
-or an argument to a subgraph: none of these uses adds another family dimension.
-
-`family.field(|record| record.field)` selects an existing field from every element. It also
-supports tuple and vector fields, including reordering and duplication. This is useful when an
-operation needs all public keys from a family of encodings. It preserves the producer and sampling
-identities and adds no computation loop. Use `parallel` when the projection needs arithmetic;
-arithmetic inside `field` is rejected.
-
-## Compute with ordinary expressions
-
-Use arithmetic to describe how output values depend on input values. These operators build graph
-nodes; Rust bindings and borrowing still behave normally.
-
-Matrices support owned or borrowed `+`, `-`, `*`, and unary `-`. Integer/compile-expression scalar
-multiplication uses a scalar constant polynomial and the existing multiplication primitive, such
-as `&matrix * 2` or `2 * &matrix`. Scalar addition has no implicit broadcasting rule.
-Primitive integers on the left of runtime `Int` arithmetic or matrix multiplication use `i32`,
-so unsuffixed literals infer naturally. For other primitive types, put the scalar on the right
-of multiplication or explicitly convert it to a graph integer for integer arithmetic.
-
-Runtime `Int` supports arithmetic operators and borrowed operands. Division rounds down using the
-absolute divisor; remainder is nonnegative modulo the absolute divisor. Division by zero fails at
-runtime. `equal`, `less`, and `less_equal` accept integer literals and borrowed integers;
-Rust comparison operators cannot return a symbolic `Bool`.
-
-Booleans support `&`, `|`, `^`, and `!`, including borrowed operands and Boolean literals. These
-construct Boolean computations without short-circuiting. Rust `&&` and `||` cannot be overloaded
-for graph values. Domain operations that require compiler parameters or preprocessing inputs retain
-explicit method arguments.
-
-### Use compile expressions for shapes and counts
-
-Matrix dimensions and loop counts must be known before execution so the graph can be validated
-and storage planned. `IntExpr` describes those quantities; `RealExpr` describes exact real-valued
-parameters such as a Gaussian sigma. Runtime `Int` describes a value computed during execution.
-This is why an input integer can choose a family element but cannot set the graph's loop count.
-
-Compile expressions support natural owned and borrowed arithmetic. The following fragment assumes
-`start`, `columns`, `rows`, and `variance` are compile expressions:
+The following fragments use the ring from the first example and construct values that can be
+passed to `output`:
 
 ```rust
-let end = &start + &columns;
-let entries = &rows * &columns;
-let sigma = (&variance + 1) / 2;
-```
+use mxx_dsl::{iterate, parallel};
 
-`IntExpr` supports `+`, `-`, `*`, `/`, `%`, unary `-`, and `floor_div`. Its `/` retains
-exact compile-time division: a nonzero remainder is an error. `%` retains floor remainder.
-Cancellation and multiplication by zero preserve errors from partial operations, including during
-canonicalization and serialization; for example, `(1 / 0) * 0` remains an error.
-`RealExpr` supports `+`, `-`, `*`, `/`, and unary `-`; integer/rational conversions remain exact.
-No implicit floating-point conversion is introduced.
-
-## Repeat a computation
-
-Use `parallel` when each result can be computed independently from shared inputs. Use `iterate`
-when a step needs the previous step's result, as in a recurrence or a sequence of circuit layers.
-Both describe one reusable body, even when the count is supplied later through parameters.
-
-This fragment assumes compatible matrix families `left`/`right`, a family-valued `initial` state,
-integer-family `circuit_sources`, and compile expressions `count`, `depth`, and `width`:
-
-```rust
-let products = parallel(count.clone(), |i| {
-    Ok(left.at(&i) * right.at(i))
+let inputs = ring.input_family("inputs", 4, (2, 2));
+let doubled = parallel(4, |i| {
+    let input = inputs.at(i);
+    Ok(&input + &input)
 })?;
-
-let result = iterate(depth, initial, |layer, previous| {
-    parallel(width.clone(), |slot| {
-        let flat = &layer * width.clone() + slot;
-        Ok(previous.at(circuit_sources.at(flat)))
-    })
+let total = iterate(4, ring.zero((2, 2)), |i, accumulated| {
+    Ok(accumulated + inputs.at(i))
 })?;
 ```
 
-`parallel(count, body)` constructs one reusable body, executes independent instances, and returns
-`Family<T>` in index order. `iterate(count, initial, body)` supplies the previous state to each
-instance and returns the final state. A zero-count iteration returns the initial state. The complete
-state schema must remain unchanged. Both bodies return `Result<_, DslError>`; there are no separate
-map, values, bundle, zip, gather, or broadcast interfaces.
+`doubled` is a `Family<Mat>` in index order. `total` is a single `Mat`, the final state of the
+iteration. Both closures return `Result<_, DslError>` and run **once during construction** to
+describe a reusable body. At execution, `parallel` has independent instances; `iterate` passes
+each instance's result to the next. A zero-count `parallel` produces an empty family, and a
+zero-count `iterate` returns its initial state.
 
-Closures run once during graph construction. They do not execute Rust side effects once per runtime
-iteration. Runtime indices are ordinary `Int` values, with compile-time binder provenance retained
-internally. Counts and shapes still use compile expressions resolved by `ParamEnv`; runtime input
-values cannot determine graph structure. `Int::expression()` performs a checked conversion only for
-operations whose metadata must be known before execution, such as static matrix slice bounds.
+Loop bodies can read outer values, as both closures read `inputs`. They can also contain other
+loops. The returned element or state must have the same schema at every index. The current DSL
+supports one family dimension, so a loop cannot return a family inside another family; an
+`iterate` can carry a complete family as its state.
 
-Outer values are read-only lexical dependencies, regardless of whether they are scalars, families,
-records, or artifacts. The DSL derives explicit graph inputs from their uses. Nested closures may
-read ancestor values; a value leaked from a completed child or sibling scope is rejected.
+A family element may contain several fields. For example, `pairs.at(i)` can return a pair of
+values, and `pairs.field(|pair| pair.0)` can project the first field from every pair. Use `parallel` for projections that perform computation. `Family::pack` constructs a
+family from an existing nonempty collection of same-schema values.
 
-## Choose a value with `select`
+## Selection
 
-Use `select` when the choice depends on a graph `Int` or `Bool`. A Rust `if` can choose which graph
-to construct from a Rust condition; it cannot choose based on a value that will only exist during
-execution.
-
-`select(selector, candidates)` selects a same-schema value, including a record or an entire family.
-An integer selects a zero-based candidate; a Boolean selects candidate zero for false or one for
-true. Every leaf of a record uses the identical selector. Empty candidates, schema disagreement,
-and out-of-range selectors are errors.
-
-This is value selection, not a lazy control-flow statement. Do not rely on it to guard an invalid
-array access or to suppress a sampler in an unselected candidate. Runtime artifact materialization
-can remain lazy without providing general lazy branch semantics.
-
-## Decide where randomness is shared
-
-Sampler placement states whether an algorithm reuses one sample or requires a fresh sample for
-each loop instance. Place a sampler outside the body for a shared value, and inside the body for
-independent samples. Cloning a value handle keeps the same sample.
-
-This fragment assumes a `ring`, compatible `inputs`, compile expressions `count` and `bound`,
-and a real compile expression `sigma`:
+Use `select` when a choice depends on a graph value. For example, continuing with `total`:
 
 ```rust
-let shared = ring.gaussian((1, 1), sigma.clone(), bound.clone());
-let outputs = parallel(count, |i| {
-    let independent = ring.gaussian((1, 1), sigma, bound);
-    Ok(inputs.at(i) + shared + independent)
+use mxx_dsl::select;
+
+let enabled = ring.bool_input("enabled");
+let result = select(enabled, vec![ring.zero((2, 2)), total])?;
+```
+
+A Boolean selects the first candidate for false and the second for true. An integer selects a
+zero-based candidate. Candidates must have the same schema; selection can return an entire
+record or family.
+
+Selection does not provide lazy branch execution. Both candidate computations belong to the
+graph, so `select` cannot guard an invalid array access or suppress a sampler in an unselected
+candidate. A Rust `if` instead chooses what graph to construct from a condition known to Rust.
+
+## Sampling
+
+Place a sampler where the algorithm requires a new value. A sampler outside a loop supplies one
+shared value; a sampler inside its body supplies a sample for each executed instance:
+
+```rust
+let shared = ring.gaussian((2, 2), 3, 19);
+let noisy = parallel(4, |i| {
+    let local = ring.gaussian((2, 2), 3, 19);
+    Ok(inputs.at(i) + &shared + local)
 })?;
 ```
 
-The outer Gaussian is one shared sample. The body-local Gaussian is sampled separately for each
-executed instance. Repeated reads of an already-produced value retain that same value. A zero-count
-loop does not execute its local samplers. Structural rewrites must preserve sampler placement and
-sharing; loop fusion and changes to sample scheduling require separate validation. Changed graph
-structure may require regenerated transcripts, artifact identities, and proof artifacts.
+Here each instance reads the same `shared` sample and its own `local` sample. Repeated reads of a
+produced value preserve its identity. A zero-count loop does not execute its local samplers.
+Gaussian and preimage operations require explicit integer coefficient cutoffs; the DSL does not
+infer these from a sigma. The values above are illustrative parameters.
 
-Every Gaussian and preimage sampler requires an integer coefficient cutoff. Parameterized cutoffs
-reference declared integer parameters resolved by `ParamEnv`. The DSL does not infer a cutoff from
-an unresolved real sigma. `SmallMatrix` and `Preimage` retain their different semantics and bounds.
+## Outputs and reusable definitions
 
-Loop-index hash tags preserve the index encoding used by existing sampling programs. Domain builders
-must preserve the distinction between a logical table index and a separate row identifier used in
-hash tags when changing indexing syntax.
+Declare each result with `output`, or use `public_output` and `private_output` when declaring its
+artifact visibility. These methods accept complete graph values, including records and families.
+For values containing both public and secret fields, select the fields appropriate to each output.
+The reference specifies output naming and the trapdoor-specific persistence methods.
 
-## Build a graph with explicit inputs and outputs
+To reuse a graph body at multiple call sites, define a `Subgraph` with an input schema and a
+closure returning `Result<_, DslError>`. `subgraph.call(input)` supplies compatible arguments to
+that definition. As with loops, the body can read outer values, and the DSL records those
+dependencies. Ordinary Rust functions remain available for organizing construction code.
 
-Inputs name the values supplied at execution. Outputs name the results that execution must make
-available. Grouping values in a Rust container does not automatically expose or persist them;
-choosing outputs is a separate step.
-
-`DslContext::input` accepts a complete value schema, including a family of records. Existing typed
-ring input builders remain convenient for primitive inputs. `output`, `public_output`, and
-`private_output` accept complete values. A single leaf retains its supplied name; composite leaves
-use `name.0`, `name.1`, and so on in schema order. Field projections allow applications to retain
-explicit domain artifact names.
-
-Public and secret persistence remains explicit. For trapdoor families, use `public_matrices` for
-the public projection and `private_trapdoor_family_output` for the secret projection; import the
-pair with `trapdoor_family_artifact_input`. Composite values do not erase confidentiality boundaries.
-
-### Reuse a computation with `Subgraph`
-
-Use a subgraph when several call sites share the same computation and input schema. Define its
-body once, then call it with compatible arguments. This gives a library operation an explicit
-interface within the graph.
-
-`Subgraph::define` stores one reusable body and accepts a closure returning `Result<_, DslError>`,
-just like `parallel` and `iterate`. Formal inputs use explicit schemas;
-outer lexical reads are lifted to hidden arguments using the same ancestry rule as iteration.
-Artifact tables passed as formal arguments remain reusable across calls with the same schema.
-Subgraph reuse does not require exposing zip/broadcast details to callers.
-
-### Validate before execution
-
-`build()` freezes the graph and checks structure. `validate(&ParamEnv)` resolves parameters and
-checks concrete types, shapes, bounds, and execution planning. Artifact consumers can additionally
-use `validate_with_manifests`. See [docs/runtime.md](runtime.md) for execution.
-
-### Declare protocol checks on outputs
-
-A computation graph describes what to execute. A protocol declaration adds the output relationships
-that must be checked for that protocol. Keeping those references on the declaration lets ordinary
-arithmetic and loop code work with values alone.
-
-Correctness declarations use core-owned `IdealSpec::new` and `PurePredicateSpec::new`. Their graphs
-must be sampler-free. Protocol endpoints identify executable results with `OutputRef` (stage and
-output name). Each operational decoder target identifies an endpoint and a residual `OutputRef`;
-the decoder is resolved from the endpoint's executable output. Validation checks the referenced
-outputs, their types, and the supported decoder's executable connections and formula. No semantic
-labels, rule attachments, or annotation propagation are part of graph values. Packing a record
-does not itself establish an algebraic relation.
-
-Domain records implement `GraphValue` using their schema, flattened values, and reconstruction from
-those values. Computation and scope conversion carry no separate protocol metadata. Protocol-specific
-proofs remain responsible for algebraic relations beyond the executable decoder checks.
-See [docs/correctness/operational-protocol-inventory.md](correctness/operational-protocol-inventory.md)
-for checking semantics.
+The sections below give the complete API, including artifact inputs, cryptographic operations,
+parameter expressions, and extension traits for domain-library authors. Protocol correctness
+checks are declared separately using graph output references; see
+[Operational protocol inventory](correctness/operational-protocol-inventory.md).
 
 ## API reference
 
@@ -349,7 +234,7 @@ and protocol declarations retain their own APIs; they are not additional DSL con
 | `TrapdoorType { matrix, sigma, gadget_base, digit_count, preimage_max_coefficient_bound }` | Matrix type, `RealExpr` sigma, and three `IntExpr` metadata fields; flattened order is public matrix then secret trapdoor. |
 | `FamilyType { element, count }` | Element schema and `IntExpr` count; one indexed wire per flattened element field. |
 | `(A,)` through `(A, ..., L)` | Graph-value/schema tuples of arity 1 through 12, with fields in tuple order. The unit tuple has no supplied `GraphValue` implementation. |
-| `Vec<T>` / `Vec<T::Schema>` | Rust grouping supported by `GraphValue`: each position contributes its own schema and wires, in vector order. Length is fixed during construction; element schemas may differ. See [Rust containers](#use-rust-containers-when-the-code-only-needs-to-group-values) for why this differs from `Family<T>`. |
+| `Vec<T>` / `Vec<T::Schema>` | Rust grouping supported by `GraphValue`: each position contributes its own schema and wires, in vector order. Length is fixed during construction; element schemas may differ. Rust indexing retrieves existing handles; use `Family<T>` for graph indexing. |
 | `Confidentiality::{Public, Private}` | Alias of core `ArtifactConfidentiality`; controls declared artifact visibility. |
 | `ConcatAxis::{Rows, Columns, Diagonal}` | Row concatenation, column concatenation, or block diagonal construction. |
 
@@ -482,6 +367,16 @@ Primitive Rust integer literals must be converted into `IntExpr` or `Int` before
 Component order and type framing are part of sampled-value identity. Distinct frames and prefixes
 must not be silently substituted when reusing persisted artifacts.
 
+Sampler placement and sharing must be preserved by structural rewrites, including loop fusion and
+sample scheduling. Changes to graph structure may require regenerated transcripts, artifact
+identities, and proof artifacts. Parameterized coefficient cutoffs reference declared integer
+parameters resolved by `ParamEnv`; an unresolved real sigma is not enough to supply a cutoff.
+`SmallMatrix` and `Preimage` retain distinct semantics and bounds.
+
+Loop-index hash tags preserve the index encoding used by sampling programs. Domain builders must
+keep logical table indices distinct from separate row identifiers used in hash tags when changing
+indexing syntax.
+
 ### Matrix and bounded-value operations
 
 Except where stated, matrix operands must have the same ring. Shape checks happen during
@@ -590,6 +485,27 @@ sealing subgraphs, or constructing loop outputs. This permits constant and runti
 the same DSL schema without changing numeric values. An `iterate` body returning a changed schema
 is rejected before sealing. `Subgraph` implements `Clone` by sharing its definition/captures.
 
+Family element schemas must agree in every static property, including vector lengths and domain
+metadata. Optional record fields have fixed presence or absence across all elements. Nested families,
+including records containing families, and ragged or iteration-dependent schemas are unsupported.
+A complete family may still be an iteration state, selection candidate, or subgraph argument.
+
+`at` validates known static indices before execution and dynamic indices at runtime. Negative or
+out-of-range indices are errors. A shorter loop may read a prefix of a longer family; operations
+requiring equal counts validate that separate contract. `field` only selects existing fields,
+including reordering or duplication of tuple/vector fields. It preserves producer and sampling
+identities and rejects arithmetic in the projection.
+
+Loop indices are `Int` values with compile-time binder provenance retained internally.
+`Int::expression()` is a checked conversion for compile-known metadata such as static slice bounds.
+Closures run once during construction; Rust side effects in a closure do not run once per executed
+instance. Outer values are read-only lexical dependencies. Nested bodies may read ancestor values,
+but a value leaked from a completed child or sibling scope is rejected. Subgraph captures follow
+the same rule; artifact tables supplied as formal arguments remain reusable across compatible calls.
+Selection uses the same selector for every field. Empty candidates, schema disagreement, and
+out-of-range selectors are errors. Lazy artifact materialization does not establish lazy branch
+semantics for `select`.
+
 ### Compile expressions accepted by metadata arguments
 
 These are core-owned types imported from `mxx_ir_core`; the DSL consumes them as metadata and
@@ -680,6 +596,12 @@ composite elements because it requires exactly one flattened family wire. Trapdo
 and the secret-family handle identify the secret component. These escape hatches serve reusable
 domain builders, runtime integration, and inspection; their presence does not make arbitrary core
 `NodeKind` values part of the ordinary DSL vocabulary.
+
+Protocol endpoints identify executable results with `OutputRef` (stage and output name).
+Each operational decoder target identifies an endpoint and a residual `OutputRef`; the decoder
+is resolved from the endpoint's executable output. Validation checks the referenced outputs, types,
+and the supported decoder's executable connections and formula. Domain records group related
+values; protocol-specific proofs establish algebraic relations beyond those executable checks.
 
 `IdealSpec::new(graph: Graph)` and `PurePredicateSpec::new(graph: Graph)` return `Result` with core
 `SpecificationError`. Both reject all samplers, including hash sampling, throughout the graph;

@@ -1,9 +1,7 @@
 //! Declarative BGG+ encoding graph values.
 
 use crate::BggPublicKeyWire;
-use mxx_dsl::{
-    DslError, FamilyElement, GraphValue, GraphValueSchema, Mat, MatType, Pending, Preimage, Ring,
-};
+use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType, Pending, Preimage, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr, ValueHandle, WireType,
     node::{ConcatAxis, IndexRange},
@@ -37,13 +35,7 @@ pub struct BggEncodingWire {
     pub plaintext: Option<Mat>,
 }
 
-impl FamilyElement for BggEncodingWire {
-    fn normalize_for_family(self) -> Self {
-        self
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct BggEncodingType {
     pub vector: MatType,
     pub plaintext: Option<MatType>,
@@ -138,7 +130,7 @@ impl BggEncodingCompiler {
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone() + rhs.vector.clone(),
+            vector: &lhs.vector + &rhs.vector,
             plaintext: binary_plaintext(lhs, rhs, |left, right| left + right),
         })
     }
@@ -149,7 +141,7 @@ impl BggEncodingCompiler {
         rhs: &BggEncodingWire,
     ) -> Result<BggEncodingWire, EncodingCompileError> {
         Ok(BggEncodingWire {
-            vector: lhs.vector.clone() - rhs.vector.clone(),
+            vector: &lhs.vector - &rhs.vector,
             plaintext: binary_plaintext(lhs, rhs, |left, right| left - right),
         })
     }
@@ -165,16 +157,15 @@ impl BggEncodingCompiler {
     ) -> Result<BggEncodingWire, EncodingCompileError> {
         let plaintext = lhs.plaintext.clone().ok_or(EncodingCompileError::MissingLeftPlaintext)?;
         Ok(BggEncodingWire {
-            vector: decomposed_rhs.mul_small_rhs(lhs.vector.clone()) +
-                rhs.vector.clone() * plaintext,
+            vector: decomposed_rhs.mul_small_rhs(lhs.vector.clone()) + &rhs.vector * plaintext,
             plaintext: binary_plaintext(lhs, rhs, |left, right| left * right),
         })
     }
 
     pub fn small_scalar_mul(&self, input: &BggEncodingWire, scalar: &Mat) -> BggEncodingWire {
         BggEncodingWire {
-            vector: input.vector.clone() * scalar.clone(),
-            plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
+            vector: &input.vector * scalar,
+            plaintext: input.plaintext.clone().map(|value| value * scalar),
         }
     }
 
@@ -187,7 +178,7 @@ impl BggEncodingCompiler {
     ) -> BggEncodingWire {
         BggEncodingWire {
             vector: decomposed.mul_small_rhs(input.vector.clone()),
-            plaintext: input.plaintext.clone().map(|value| value * scalar.clone()),
+            plaintext: input.plaintext.clone().map(|value| value * scalar),
         }
     }
 

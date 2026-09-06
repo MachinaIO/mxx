@@ -299,7 +299,7 @@ mod tests {
             .unwrap();
         for part in 0..layout.public_parameter_part_count() {
             context = context
-                .output(format!("bottom-{part}"), wires.public_parameters.t_bottom.get_static(part))
+                .output(format!("bottom-{part}"), wires.public_parameters.t_bottom.at(part))
                 .unwrap();
         }
         for digit_row in 0..layout.gadget_rows() {
@@ -309,7 +309,7 @@ mod tests {
                     context = context
                         .output(
                             format!("top-{digit_row}-{part}-{block}"),
-                            wires.public_parameters.t_top[family].get_static(block),
+                            wires.public_parameters.t_top[family].at(block),
                         )
                         .unwrap();
                 }

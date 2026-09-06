@@ -13,7 +13,7 @@ use crate::{
         conv_mul::{NegacyclicConvolutionContext, RingGswConvolution},
     },
 };
-use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph};
+use mxx_dsl::{ConcatAxis, DslContext, Family, GraphValue, Mat, Ring, Subgraph, parallel, select};
 use mxx_ir_core::{IntExpr, ParamEnv, node::IndexRange, validate::ValidatedGraph};
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -182,10 +182,7 @@ impl PublicLookupLowering<DCRTPoly> for RuntimeLowering {
             .map(|(_input, (_row, output))| self.ring.polynomial([IntExpr::constant(output)]))
             .collect::<Vec<_>>();
         if self.wire_size == 1 {
-            return Ok(input
-                .clone()
-                .extract_coefficient(0)
-                .select(branches)
+            return Ok(select(input.clone().extract_coefficient(0), branches)
                 .expect("public LUT branches share one matrix type"));
         }
         Ok(Mat::concat(
@@ -193,12 +190,14 @@ impl PublicLookupLowering<DCRTPoly> for RuntimeLowering {
             (0..self.wire_size)
                 .map(|index| {
                     let range = IndexRange { start: index.into(), end: (index + 1).into() };
-                    input
-                        .clone()
-                        .slice(Some(range.clone()), Some(range))
-                        .extract_coefficient(0)
-                        .select(branches.clone())
-                        .expect("public LUT branches share one matrix type")
+                    select(
+                        input
+                            .clone()
+                            .slice(Some(range.clone()), Some(range))
+                            .extract_coefficient(0),
+                        branches.clone(),
+                    )
+                    .expect("public LUT branches share one matrix type")
                 })
                 .collect(),
         ))
@@ -277,35 +276,14 @@ impl StructuredCircuitLowering<DCRTPoly> for RuntimeLowering {
             ));
         }
         let count = inputs.len();
-        let mut inputs_by_position =
-            (0..input_count).map(|_| Vec::with_capacity(count)).collect::<Vec<_>>();
-        for instance in inputs {
-            for (position, input) in instance.into_iter().enumerate() {
-                inputs_by_position[position].push(input);
-            }
-        }
-        let families = inputs_by_position
-            .into_iter()
-            .map(Family::pack)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
+        let inputs = Family::pack(inputs).map_err(|error| {
+            crate::circuit::CircuitLowerError::GraphStructure(error.to_string())
+        })?;
+        let outputs =
+            parallel(count, |index| definition.call(inputs.at(index))).map_err(|error| {
                 crate::circuit::CircuitLowerError::GraphStructure(error.to_string())
             })?;
-        let definition = definition.clone();
-        let output_families = Family::parallel_zip_many_values(families, move |_, child_inputs| {
-            definition
-                .call(child_inputs)
-                .expect("parallel subgraph inputs preserve the validated definition schema")
-        })
-        .map_err(|error| crate::circuit::CircuitLowerError::GraphStructure(error.to_string()))?;
-        let output_count = output_families.len();
-        let mut outputs = (0..count).map(|_| Vec::with_capacity(output_count)).collect::<Vec<_>>();
-        for family in output_families {
-            for (index, instance) in outputs.iter_mut().enumerate() {
-                instance.push(family.get_static(index));
-            }
-        }
-        Ok(outputs)
+        Ok((0..count).map(|index| outputs.at(index)).collect())
     }
 
     fn call_audited_constant_lut_subgraph_parallel(

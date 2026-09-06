@@ -836,7 +836,8 @@ fn node_kind_and_arguments<const N: usize>(
 ///
 /// The endpoint anchor alone identifies only the final equality.  Closing the operational target
 /// additionally fixes every interior edge and requires the modulus used to construct the interval
-/// to be exactly the residual matrix modulus expression.
+/// to match the residual matrix modulus in the canonical symbolic form. This
+/// comparison does not evaluate rounding, which could hide a different modulus.
 fn boolean_interval_decoder_matches(
     graph: &Graph,
     decoder_node: NodeId,
@@ -899,7 +900,7 @@ fn boolean_interval_decoder_matches(
         upper_coefficient == coefficient &&
         upper_quarter == quarter &&
         position == &IntExpr::constant(0) &&
-        quarter_expression == &expected_quarter &&
+        quarter_expression.canonicalize() == expected_quarter.canonicalize() &&
         matches!(
             node_kind_and_arguments::<0>(graph, two),
             Some((NodeKind::ConstantInt(value), []))
@@ -1261,6 +1262,92 @@ fn trapdoor_wire_contract_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_boolean_interval_matches_canonical_quarter_but_rejects_equal_rounded_forgery() {
+        use crate::{GraphOutput, NodeHandle, ParamEnv, ValueHandle};
+        fn make_graph(quarter: IntExpr) -> Graph {
+            let node = |kind, arguments: Vec<ValueHandle>, ty: WireType| {
+                NodeHandle::new(kind, arguments, vec![ty]).output(0).unwrap()
+            };
+            let ty = WireType::Matrix(matrix_type(1, 1));
+            let residual = node(
+                NodeKind::Input {
+                    name: "residual".to_owned(),
+                    wire_type: ty.clone(),
+                    artifact: None,
+                },
+                Vec::new(),
+                ty,
+            );
+            let coefficient = node(
+                NodeKind::ExtractCoefficient {
+                    position: IntExpr::constant(0),
+                    canonical_input_exclusive_upper: None,
+                },
+                vec![residual.clone()],
+                WireType::Int,
+            );
+            let quarter = node(NodeKind::EvaluateInt(quarter), Vec::new(), WireType::ConstantInt);
+            let lower = node(
+                NodeKind::IntCompare(IntCompareOp::LessEqual),
+                vec![quarter.clone(), coefficient.clone()],
+                WireType::Bool,
+            );
+            let three = node(NodeKind::ConstantInt(3.into()), Vec::new(), WireType::ConstantInt);
+            let upper = node(
+                NodeKind::IntBinary(IntBinaryOp::Multiply),
+                vec![quarter, three],
+                WireType::Int,
+            );
+            let upper = node(
+                NodeKind::IntCompare(IntCompareOp::LessEqual),
+                vec![coefficient, upper],
+                WireType::Bool,
+            );
+            let lower = node(NodeKind::BoolToInt, vec![lower], WireType::Int);
+            let upper = node(NodeKind::BoolToInt, vec![upper], WireType::Int);
+            let sum =
+                node(NodeKind::IntBinary(IntBinaryOp::Add), vec![lower, upper], WireType::Int);
+            let two = node(NodeKind::ConstantInt(2.into()), Vec::new(), WireType::ConstantInt);
+            let decoded =
+                node(NodeKind::IntCompare(IntCompareOp::Equal), vec![sum, two], WireType::Bool);
+            Graph::freeze(
+                "interval",
+                Vec::new(),
+                BTreeMap::from([
+                    ("residual".to_owned(), GraphOutput { value: residual, confidentiality: None }),
+                    ("decoded".to_owned(), GraphOutput { value: decoded, confidentiality: None }),
+                ]),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+            .0
+        }
+        let modulus = matrix_type(1, 1).modulus;
+        let original = IntExpr::RoundDiv(
+            Box::new(IntExpr::Sub(Box::new(modulus.clone()), Box::new(IntExpr::constant(2)))),
+            Box::new(IntExpr::constant(4)),
+        );
+        let canonical = IntExpr::RoundDiv(Box::new(&modulus - 2), Box::new(IntExpr::constant(4)));
+        let forged = IntExpr::RoundDiv(Box::new(&modulus - 1), Box::new(IntExpr::constant(4)));
+        // Distinct moduli can round to the same quarter. Matching their numeric
+        // values would accept a forged interval declaration.
+        assert_eq!(original.evaluate(&ParamEnv::default()), forged.evaluate(&ParamEnv::default()));
+        for (expression, expected) in [(original, true), (canonical, true), (forged, false)] {
+            let graph = make_graph(expression);
+            assert_eq!(
+                boolean_interval_decoder_matches(
+                    &graph,
+                    graph.outputs()["decoded"].value.node,
+                    graph.outputs()["residual"].value
+                ),
+                expected
+            );
+        }
+    }
+
     fn matrix_type(rows: i64, columns: i64) -> MatrixType {
         MatrixType {
             modulus: 17.into(),

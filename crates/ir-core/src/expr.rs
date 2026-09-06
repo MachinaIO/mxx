@@ -1,11 +1,16 @@
 use crate::serde_support;
-use num_bigint::{BigInt, Sign};
+use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, btree_map::Entry};
 use thiserror::Error;
 
+/// Symbolic integer arithmetic evaluated with explicit parameter bindings.
+///
+/// `/` is exact division: evaluation rejects a nonzero remainder or a zero
+/// denominator. `%` is floor remainder, whose sign follows the denominator;
+/// use [`IntExpr::floor_div`] for the corresponding rounded-down quotient.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub enum IntExpr {
@@ -90,6 +95,9 @@ pub struct Rational {
     denominator: BigInt,
 }
 
+/// Exact symbolic real arithmetic. Operators retain the existing expression
+/// tree; integer operands convert to exact rationals without floating-point rounding.
+/// Division by zero is rejected when the expression is evaluated.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub enum RealExpr {
@@ -494,6 +502,12 @@ impl IntExpr {
         Self::Const(value.into())
     }
 
+    /// Constructs division rounded toward negative infinity. A zero denominator
+    /// remains an evaluation error, just as with exact `/` and floor `%`.
+    pub fn floor_div(&self, denominator: impl Into<Self>) -> Self {
+        Self::FloorDiv(Box::new(self.clone()), Box::new(denominator.into())).canonicalize()
+    }
+
     pub fn evaluate(&self, env: &ParamEnv) -> Result<BigInt, ExprError> {
         match self {
             Self::Const(value) => Ok(value.clone()),
@@ -597,6 +611,68 @@ impl IntExpr {
     }
 }
 
+impl From<&IntExpr> for IntExpr {
+    fn from(value: &IntExpr) -> Self {
+        value.clone()
+    }
+}
+
+macro_rules! integer_expression_operator {
+    ($trait:ident, $method:ident, $variant:ident) => {
+        impl<Rhs: Into<IntExpr>> std::ops::$trait<Rhs> for IntExpr {
+            type Output = IntExpr;
+
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                IntExpr::$variant(Box::new(self), Box::new(rhs.into())).canonicalize()
+            }
+        }
+
+        impl<Rhs: Into<IntExpr>> std::ops::$trait<Rhs> for &IntExpr {
+            type Output = IntExpr;
+
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                IntExpr::$variant(Box::new(self.clone()), Box::new(rhs.into())).canonicalize()
+            }
+        }
+    };
+}
+
+// Ordinary arithmetic produces the same canonical symbolic polynomial as
+// explicit Add/Sub/Mul nodes. Borrowed operands remain available to the caller.
+integer_expression_operator!(Add, add, Add);
+integer_expression_operator!(Sub, sub, Sub);
+integer_expression_operator!(Mul, mul, Mul);
+integer_expression_operator!(Div, div, Div);
+integer_expression_operator!(Rem, rem, Rem);
+
+impl std::ops::Neg for IntExpr {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self::constant(0) - self
+    }
+}
+
+impl std::ops::Neg for &IntExpr {
+    type Output = IntExpr;
+
+    fn neg(self) -> Self::Output {
+        IntExpr::constant(0) - self
+    }
+}
+
+macro_rules! integer_expression_from_primitive {
+    ($($primitive:ty),* $(,)?) => {
+        $(impl From<$primitive> for IntExpr {
+            fn from(value: $primitive) -> Self {
+                Self::constant(value)
+            }
+        })*
+    };
+}
+
+integer_expression_from_primitive!(i8, i16, i128, isize, u8, u16, u32, u64, u128);
+
 impl From<i32> for IntExpr {
     fn from(value: i32) -> Self {
         Self::constant(value)
@@ -618,6 +694,24 @@ impl From<usize> for IntExpr {
 impl From<BigInt> for IntExpr {
     fn from(value: BigInt) -> Self {
         Self::Const(value)
+    }
+}
+
+impl From<BigUint> for IntExpr {
+    fn from(value: BigUint) -> Self {
+        Self::Const(value.into())
+    }
+}
+
+impl From<&BigInt> for IntExpr {
+    fn from(value: &BigInt) -> Self {
+        Self::Const(value.clone())
+    }
+}
+
+impl From<&BigUint> for IntExpr {
+    fn from(value: &BigUint) -> Self {
+        Self::Const(value.clone().into())
     }
 }
 
@@ -818,9 +912,102 @@ impl RealExpr {
     }
 }
 
-impl From<i32> for RealExpr {
-    fn from(value: i32) -> Self {
-        Self::from_integer(value)
+impl From<&RealExpr> for RealExpr {
+    fn from(value: &RealExpr) -> Self {
+        value.clone()
+    }
+}
+
+impl From<IntExpr> for RealExpr {
+    fn from(value: IntExpr) -> Self {
+        Self::FromInt(value)
+    }
+}
+
+impl From<&IntExpr> for RealExpr {
+    fn from(value: &IntExpr) -> Self {
+        Self::FromInt(value.clone())
+    }
+}
+
+impl From<Rational> for RealExpr {
+    fn from(value: Rational) -> Self {
+        Self::Rational(value)
+    }
+}
+
+impl From<&Rational> for RealExpr {
+    fn from(value: &Rational) -> Self {
+        Self::Rational(value.clone())
+    }
+}
+
+macro_rules! real_expression_from_integer {
+    ($($integer:ty),* $(,)?) => {
+        $(impl From<$integer> for RealExpr {
+            fn from(value: $integer) -> Self {
+                Self::from_integer(value)
+            }
+        })*
+    };
+}
+
+// Integers convert exactly. Floating-point callers must continue to opt into
+// `from_f64_exact`, which rejects non-finite values and preserves binary64 exactly.
+real_expression_from_integer!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, BigInt, BigUint
+);
+
+impl From<&BigInt> for RealExpr {
+    fn from(value: &BigInt) -> Self {
+        Self::from_integer(value.clone())
+    }
+}
+
+impl From<&BigUint> for RealExpr {
+    fn from(value: &BigUint) -> Self {
+        Self::from_integer(value.clone())
+    }
+}
+
+macro_rules! real_expression_operator {
+    ($trait:ident, $method:ident, $variant:ident) => {
+        impl<Rhs: Into<RealExpr>> std::ops::$trait<Rhs> for RealExpr {
+            type Output = RealExpr;
+
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                RealExpr::$variant(Box::new(self), Box::new(rhs.into()))
+            }
+        }
+
+        impl<Rhs: Into<RealExpr>> std::ops::$trait<Rhs> for &RealExpr {
+            type Output = RealExpr;
+
+            fn $method(self, rhs: Rhs) -> Self::Output {
+                RealExpr::$variant(Box::new(self.clone()), Box::new(rhs.into()))
+            }
+        }
+    };
+}
+
+real_expression_operator!(Add, add, Add);
+real_expression_operator!(Sub, sub, Sub);
+real_expression_operator!(Mul, mul, Mul);
+real_expression_operator!(Div, div, Div);
+
+impl std::ops::Neg for RealExpr {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self::from_integer(0) - self
+    }
+}
+
+impl std::ops::Neg for &RealExpr {
+    type Output = RealExpr;
+
+    fn neg(self) -> Self::Output {
+        RealExpr::from_integer(0) - self
     }
 }
 
@@ -965,6 +1152,134 @@ pub fn euclidean_div_rem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_integer_division_remainder_and_negation_preserve_existing_semantics() {
+        let numerator = IntExpr::Var("numerator".to_owned());
+        let denominator = IntExpr::Var("denominator".to_owned());
+        let quotient = IntExpr::Div(Box::new(numerator.clone()), Box::new(denominator.clone()));
+        let remainder = IntExpr::Rem(Box::new(numerator.clone()), Box::new(denominator.clone()));
+        let floor = IntExpr::FloorDiv(Box::new(numerator.clone()), Box::new(denominator.clone()));
+        let negative = IntExpr::Sub(Box::new(IntExpr::constant(0)), Box::new(numerator.clone()));
+        for (n, d) in [(12, 3), (-12, 3), (12, -3), (-7, 3), (7, -3), (7, 0)] {
+            let env = ParamEnv {
+                integers: BTreeMap::from([
+                    ("numerator".to_owned(), BigInt::from(n)),
+                    ("denominator".to_owned(), BigInt::from(d)),
+                ]),
+                ..ParamEnv::default()
+            };
+            for expression in
+                [&numerator / &denominator, numerator.clone() / denominator.clone(), &numerator / d]
+            {
+                assert_eq!(expression.evaluate(&env), quotient.evaluate(&env));
+            }
+            for expression in
+                [&numerator % &denominator, numerator.clone() % denominator.clone(), &numerator % d]
+            {
+                assert_eq!(expression.evaluate(&env), remainder.evaluate(&env));
+            }
+            assert_eq!(numerator.floor_div(&denominator).evaluate(&env), floor.evaluate(&env));
+            assert_eq!((-&numerator).evaluate(&env), negative.evaluate(&env));
+            assert_eq!((-numerator.clone()).evaluate(&env), negative.evaluate(&env));
+        }
+        assert!(matches!(
+            (IntExpr::constant(7) / 3).evaluate(&ParamEnv::default()),
+            Err(ExprError::InexactDivision { .. })
+        ));
+        assert_eq!(
+            (IntExpr::constant(7) / 0).evaluate(&ParamEnv::default()),
+            Err(ExprError::DivisionByZero)
+        );
+        assert_eq!(
+            (IntExpr::constant(7) % 0).evaluate(&ParamEnv::default()),
+            Err(ExprError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn test_real_operators_preserve_exact_rational_arithmetic() {
+        let left = RealExpr::Var("left".to_owned());
+        let right = RealExpr::Var("right".to_owned());
+        let expected = RealExpr::Div(
+            Box::new(RealExpr::Mul(
+                Box::new(RealExpr::Sub(
+                    Box::new(RealExpr::Add(Box::new(left.clone()), Box::new(right.clone()))),
+                    Box::new(RealExpr::from_integer(2)),
+                )),
+                Box::new(RealExpr::Sub(
+                    Box::new(RealExpr::from_integer(0)),
+                    Box::new(left.clone()),
+                )),
+            )),
+            Box::new(right.clone()),
+        );
+        let expressions = [
+            ((&left + &right) - 2) * (-&left) / &right,
+            ((left.clone() + &right) - 2usize) * (-left.clone()) / right.clone(),
+            ((&left + right.clone()) - RealExpr::from_integer(2)) * (-&left) / &right,
+        ];
+        for (n, d) in [(5, 3), (-7, 2), (0, 1)] {
+            let env = ParamEnv {
+                reals: BTreeMap::from([
+                    ("left".to_owned(), Rational::new(n.into(), d.into()).unwrap()),
+                    ("right".to_owned(), Rational::new((-3).into(), 7.into()).unwrap()),
+                ]),
+                ..ParamEnv::default()
+            };
+            for expression in &expressions {
+                assert_eq!(expression.evaluate_rational(&env), expected.evaluate_rational(&env));
+                assert_eq!(expression.evaluate_f64(&env), expected.evaluate_f64(&env));
+            }
+        }
+        let huge = u128::MAX;
+        let exact = (RealExpr::from(huge) + 1u64).evaluate_rational(&ParamEnv::default()).unwrap();
+        assert_eq!(exact, Rational::from_integer(BigInt::from(huge) + 1));
+        let invalid = &left / 0;
+        let reference = RealExpr::Div(Box::new(left.clone()), Box::new(RealExpr::from_integer(0)));
+        let env = ParamEnv {
+            reals: BTreeMap::from([("left".to_owned(), Rational::from_integer(1.into()))]),
+            ..ParamEnv::default()
+        };
+        assert_eq!(invalid.evaluate_rational(&env), reference.evaluate_rational(&env));
+        assert_eq!(invalid.evaluate_f64(&env), Err(ExprError::DivisionByZero));
+    }
+
+    #[test]
+    fn test_arithmetic_operators_preserve_symbolic_evaluation_and_ownership() {
+        let start = IntExpr::Var("start".to_owned());
+        let columns = IntExpr::Var("columns".to_owned());
+        let expected = IntExpr::Sub(
+            Box::new(IntExpr::Mul(
+                Box::new(IntExpr::Add(Box::new(start.clone()), Box::new(columns.clone()))),
+                Box::new(IntExpr::constant(3)),
+            )),
+            Box::new(columns.clone()),
+        );
+        let expressions = [
+            (&start + &columns) * 3 - &columns,
+            (start.clone() + &columns) * 3usize - columns.clone(),
+            (&start + columns.clone()) * 3u64 - &columns,
+            (start.clone() + columns.clone()) * IntExpr::constant(3) - columns.clone(),
+        ];
+        for (start_value, columns_value) in [(-7, 2), (0, 0), (11, -3)] {
+            let env = ParamEnv {
+                integers: BTreeMap::from([
+                    ("start".to_owned(), BigInt::from(start_value)),
+                    ("columns".to_owned(), BigInt::from(columns_value)),
+                ]),
+                ..ParamEnv::default()
+            };
+            let result = expected.evaluate(&env).unwrap();
+            for expression in &expressions {
+                assert_eq!(expression.evaluate(&env).unwrap(), result);
+                assert_eq!(expression, &expected.canonicalize());
+            }
+        }
+        assert_eq!(&start - &start, IntExpr::constant(0));
+        assert_eq!(&columns * 1u32, columns);
+        assert_eq!(&start + 0i16, start);
+    }
 
     #[test]
     fn index_conversion_preserves_division_and_remainder_semantics() {

@@ -252,7 +252,10 @@ impl TallRotationEncodingCompiler {
         self.validate_secret_rows(&secret_rows)?;
         let gadget =
             self.ring().gadget(self.secret_size, self.gadget_base.clone(), self.digit_count);
-        Ok(secret_rows.parallel_map(move |_, secret| secret * gadget.clone())?)
+        Ok(mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+            let secret = secret_rows.at(&index);
+            Ok(secret * gadget.clone())
+        })?)
     }
 
     pub fn preprocess_anchor_reduce(
@@ -294,9 +297,11 @@ impl TallRotationEncodingCompiler {
         let sigma = self.error_sigma.clone();
         let bound = self.error_max_coefficient_bound.clone();
         let columns = self.gadget_columns();
-        let rows = secret_rows.parallel_zip(transformed, move |_, secret, shifted| {
-            secret * matrix.clone() - shifted +
-                ring.gaussian((1, columns), sigma.clone(), bound.clone())
+        let rows = mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+            let secret = secret_rows.at(&index);
+            let shifted = transformed.at(&index);
+            Ok(secret * matrix.clone() - shifted +
+                ring.gaussian((1, columns), sigma.clone(), bound.clone()))
         })?;
         Ok(TallLinearTransformEncodingWires {
             left_matrix: public.left_matrix.clone(),
@@ -378,36 +383,40 @@ impl TallRotationEncodingCompiler {
             .map_err(|_| TallCompileError::InvalidRotationLayout)?;
         let shifted_forward = rotate_family(&secret_rows, forward_offset, self.slot_count)?;
         let shifted_backward = rotate_family(&secret_rows, backward_offset, self.slot_count)?;
-        let c_forward = secret_rows.clone().parallel_zip(shifted_forward, {
+        let c_forward = {
             let ring = ring.clone();
             let a_forward = public.left_matrix.clone();
             let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted| {
-                current * a_forward.clone() - shifted * gadget.clone() +
+            mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+                let current = secret_rows.at(&index);
+                let shifted = shifted_forward.at(&index);
+                Ok(current * a_forward.clone() - shifted * gadget.clone() +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
                         self.error_max_coefficient_bound.clone(),
-                    )
-            }
-        })?;
-        let c_backward = secret_rows.parallel_zip(shifted_backward, {
+                    ))
+            })
+        }?;
+        let c_backward = {
             let ring = ring.clone();
             let a_backward = public.right_matrix.clone();
             let gadget = gadget.clone();
             let sigma = self.error_sigma.clone();
             let columns = self.gadget_columns();
-            move |_, current, shifted| {
-                current * a_backward.clone() - shifted * gadget.clone() +
+            mxx_dsl::parallel(secret_rows.count().clone(), |index| {
+                let current = secret_rows.at(&index);
+                let shifted = shifted_backward.at(&index);
+                Ok(current * a_backward.clone() - shifted * gadget.clone() +
                     ring.gaussian(
                         (1, columns),
                         sigma.clone(),
                         self.error_max_coefficient_bound.clone(),
-                    )
-            }
-        })?;
+                    ))
+            })
+        }?;
         Ok(TallLinearTransformEncodingWires {
             left_matrix: public.left_matrix.clone(),
             right_matrix: public.right_matrix.clone(),

@@ -1,40 +1,17 @@
 //! Parameterized layered Boolean circuits represented by flattened DSL families.
 
-use mxx_dsl::{
-    Bool, DslContext, DslError, Family, Int, LoopIndex, Mat, Parallel, Sequential,
-    parallel_zip_bundle, parallel_zip_bundle_result,
-};
+use mxx_dsl::{Bool, DslContext, DslError, Family, Int, Mat, iterate, parallel, select};
 use mxx_ir_core::IntExpr;
 
 pub const BOOLEAN_INSTANCE_INPUT: &str = "boolean-instance";
 pub const BOOLEAN_WITNESS_INPUT: &str = "boolean-witness";
 
-fn int_expr_add(left: IntExpr, right: IntExpr) -> IntExpr {
-    IntExpr::Add(Box::new(left), Box::new(right))
-}
-
-fn int_expr_mul(left: IntExpr, right: IntExpr) -> IntExpr {
-    IntExpr::Mul(Box::new(left), Box::new(right))
-}
-
-fn bool_and(left: Bool, right: Bool) -> Bool {
-    left.to_int().mul(right.to_int()).equal(Int::constant(1))
-}
-
-fn bool_or(left: Bool, right: Bool) -> Bool {
-    Int::constant(1).less_equal(left.to_int().add(right.to_int()))
-}
-
-fn bool_value(value: bool) -> Bool {
-    Bool::constant(value).to_int().equal(Int::constant(1))
-}
-
 fn bool_all(values: impl IntoIterator<Item = Bool>) -> Bool {
-    values.into_iter().fold(bool_value(true), bool_and)
+    values.into_iter().fold(Bool::constant(true), |left, right| left & right)
 }
 
 fn bool_exactly_one(values: impl IntoIterator<Item = Bool>) -> Bool {
-    values.into_iter().map(Bool::to_int).fold(Int::constant(0), Int::add).equal(Int::constant(1))
+    values.into_iter().map(Bool::to_int).fold(Int::constant(0), Int::add).equal(1)
 }
 
 /// Symbolic dimensions of the rectangular Boolean-circuit representation.
@@ -83,18 +60,15 @@ impl BooleanCircuitFamilyParams {
     }
 
     pub fn input_width(&self) -> IntExpr {
-        int_expr_add(self.instance_width.clone(), self.witness_width.clone())
+        &self.instance_width + &self.witness_width
     }
 
     pub fn flattened_gate_count(&self) -> IntExpr {
-        int_expr_mul(self.depth.clone(), self.max_layer_width.clone())
+        &self.depth * &self.max_layer_width
     }
 
-    fn flattened_index(&self, layer: &LoopIndex, slot: &LoopIndex) -> IntExpr {
-        int_expr_add(
-            int_expr_mul(layer.expression(), self.max_layer_width.clone()),
-            slot.expression(),
-        )
+    fn flattened_index(&self, layer: &Int, slot: &Int) -> Int {
+        layer * Int::evaluate(self.max_layer_width.clone()) + slot
     }
 }
 
@@ -127,14 +101,14 @@ impl BooleanCircuitFamilyInputs {
     }
 
     pub fn output_source(&self) -> Int {
-        self.output_sources.get(Int::constant(0))
+        self.output_sources.at(0)
     }
 }
 
 #[derive(Clone)]
 pub struct GateSlot {
-    pub layer: LoopIndex,
-    pub index: LoopIndex,
+    pub layer: Int,
+    pub index: Int,
 }
 
 pub trait BooleanLayerGate<T> {
@@ -159,139 +133,84 @@ pub trait BooleanMatrixLayerGate: BooleanLayerGate<Mat> {
     }
 }
 
-fn layer_metadata(
-    context: &DslContext,
-    params: &BooleanCircuitFamilyParams,
-    layer: &LoopIndex,
-    gate_kinds: Family<Int>,
-    left_sources: Family<Int>,
-    right_sources: Family<Int>,
-) -> Result<(Family<Int>, Family<Int>, Family<Int>, Family<Int>), DslError> {
-    let flattened_indices = Parallel::range(params.max_layer_width.clone())
-        .map_values(|slot| context.evaluate_int(params.flattened_index(layer, &slot)))?;
-    let kinds = gate_kinds.parallel_gather(flattened_indices.clone())?;
-    let left_indices = left_sources.parallel_gather(flattened_indices.clone())?;
-    let right_indices = right_sources.parallel_gather(flattened_indices.clone())?;
-    Ok((flattened_indices, kinds, left_indices, right_indices))
-}
-
 pub fn evaluate_boolean_matrix_family<H>(
-    context: &DslContext,
     params: &BooleanCircuitFamilyParams,
     circuit: BooleanCircuitFamilyInputs,
     preceding: Family<Mat>,
     handler: H,
 ) -> Result<Family<Mat>, DslError>
 where
-    H: BooleanMatrixLayerGate + Clone,
+    H: BooleanMatrixLayerGate,
 {
-    let invariants = (
-        circuit.active_gate_counts,
-        (circuit.gate_kinds, (circuit.left_sources, circuit.right_sources)),
-    );
     let preceding = handler.retain_initial_family(preceding)?;
-    Sequential::range(params.depth.clone()).scan(
-        preceding,
-        invariants,
-        |layer, preceding, (active_gate_counts, (gate_kinds, (left_sources, right_sources)))| {
-            let active_count = active_gate_counts.get(layer.as_int());
-            let (_, kinds, left_indices, right_indices) =
-                layer_metadata(context, params, &layer, gate_kinds, left_sources, right_sources)?;
-            let left_values = preceding.clone().parallel_gather(left_indices)?;
-            let right_values = preceding.parallel_gather(right_indices)?;
-            let layer_handler = handler.clone();
-            parallel_zip_bundle_result(
-                (kinds, left_values, right_values),
-                move |index, (kind, left, right)| {
-                    let slot = GateSlot { layer: layer.clone(), index: index.clone() };
-                    let candidates = layer_handler.candidates(slot, left, right)?;
-                    let constant_false = candidates[0].clone();
-                    let selected = kind.select(candidates.into_iter().collect())?;
-                    let active =
-                        index.as_int().less_equal(active_count.clone().sub(Int::constant(1)));
-                    let selected = active.to_int().select(vec![constant_false, selected])?;
-                    layer_handler.retain_selected_value(selected)
-                },
-            )
-        },
-    )
+    iterate(params.depth.clone(), preceding, |layer, preceding| {
+        let active_count = circuit.active_gate_counts.at(&layer);
+        parallel(params.max_layer_width.clone(), |index| {
+            let flat = params.flattened_index(&layer, &index);
+            let kind = circuit.gate_kinds.at(&flat);
+            let left = preceding.at(circuit.left_sources.at(&flat));
+            let right = preceding.at(circuit.right_sources.at(&flat));
+            let slot = GateSlot { layer: layer.clone(), index: index.clone() };
+            let candidates = handler.candidates(slot, left, right)?;
+            let constant_false = candidates[0].clone();
+            let selected = select(kind, candidates.into_iter().collect())?;
+            let active = index.less_equal(&active_count - 1);
+            let selected = select(active, vec![constant_false, selected])?;
+            handler.retain_selected_value(selected)
+        })
+    })
 }
 
 pub fn evaluate_boolean_family(
-    context: &DslContext,
     params: &BooleanCircuitFamilyParams,
     circuit: BooleanCircuitFamilyInputs,
     preceding: Family<Bool>,
 ) -> Result<Family<Bool>, DslError> {
-    let invariants = (
-        circuit.active_gate_counts,
-        (circuit.gate_kinds, (circuit.left_sources, circuit.right_sources)),
-    );
-    Sequential::range(params.depth.clone()).scan(
-        preceding,
-        invariants,
-        |layer, preceding, (active_gate_counts, (gate_kinds, (left_sources, right_sources)))| {
-            let active_count = active_gate_counts.get(layer.as_int());
-            let (_, kinds, left_indices, right_indices) =
-                layer_metadata(context, params, &layer, gate_kinds, left_sources, right_sources)?;
-            let left_values = preceding.clone().parallel_gather(left_indices)?;
-            let right_values = preceding.parallel_gather(right_indices)?;
-            parallel_zip_bundle_result(
-                (kinds, left_values, right_values),
-                move |index, (kind, left, right)| {
-                    let not = left.clone().to_int().equal(Int::constant(0));
-                    let and =
-                        left.clone().to_int().mul(right.clone().to_int()).equal(Int::constant(1));
-                    let xor =
-                        left.clone().to_int().add(right.clone().to_int()).equal(Int::constant(1));
-                    let selected = kind.select_bool(vec![
-                        bool_value(false),
-                        bool_value(true),
-                        left,
-                        not,
-                        and,
-                        xor,
-                    ])?;
-                    index
-                        .as_int()
-                        .less_equal(active_count.clone().sub(Int::constant(1)))
-                        .to_int()
-                        .select_bool(vec![bool_value(false), selected])
-                },
-            )
-        },
-    )
+    iterate(params.depth.clone(), preceding, |layer, preceding| {
+        let active_count = circuit.active_gate_counts.at(&layer);
+        parallel(params.max_layer_width.clone(), |index| {
+            let flat = params.flattened_index(&layer, &index);
+            let kind = circuit.gate_kinds.at(&flat);
+            let left = preceding.at(circuit.left_sources.at(&flat));
+            let right = preceding.at(circuit.right_sources.at(&flat));
+            let not = !&left;
+            let and = &left & &right;
+            let xor = &left ^ right;
+            let selected = select(
+                kind,
+                vec![Bool::constant(false), Bool::constant(true), left, not, and, xor],
+            )?;
+            let active = index.less_equal(&active_count - 1);
+            select(active, vec![Bool::constant(false), selected])
+        })
+    })
 }
 
 pub fn select_boolean_output(
     circuit: &BooleanCircuitFamilyInputs,
     final_layer: &Family<Bool>,
 ) -> Bool {
-    final_layer.get(circuit.output_source())
+    final_layer.at(circuit.output_source())
 }
 
 pub fn select_boolean_matrix_output(
     circuit: &BooleanCircuitFamilyInputs,
     final_layer: &Family<Mat>,
 ) -> Mat {
-    final_layer.get(circuit.output_source())
+    final_layer.at(circuit.output_source())
 }
 
 fn gate_record_valid(kind: Int, left: Int, right: Int, previous_width: Int) -> Bool {
     let zero = Int::constant(0);
-    let left_in_range = bool_and(
-        zero.clone().less_equal(left.clone()),
-        left.clone().less_equal(previous_width.clone().sub(Int::constant(1))),
-    );
-    let right_in_range = bool_and(
-        zero.clone().less_equal(right.clone()),
-        right.clone().less_equal(previous_width.sub(Int::constant(1))),
-    );
+    let left_in_range =
+        zero.clone().less_equal(left.clone()) & left.clone().less_equal(&previous_width - 1);
+    let right_in_range =
+        zero.clone().less_equal(right.clone()) & right.clone().less_equal(previous_width - 1);
     let left_zero = left.equal(zero.clone());
     let right_zero = right.equal(zero);
     bool_exactly_one([
-        bool_all([kind.clone().equal(Int::constant(0)), left_zero.clone(), right_zero.clone()]),
-        bool_all([kind.clone().equal(Int::constant(1)), left_zero, right_zero.clone()]),
+        bool_all([kind.clone().equal(0), left_zero.clone(), right_zero.clone()]),
+        bool_all([kind.clone().equal(1), left_zero, right_zero.clone()]),
         bool_all([kind.clone().equal(Int::constant(2)), left_in_range.clone(), right_zero.clone()]),
         bool_all([kind.clone().equal(Int::constant(3)), left_in_range.clone(), right_zero]),
         bool_all([
@@ -304,9 +223,7 @@ fn gate_record_valid(kind: Int, left: Int, right: Int, previous_width: Int) -> B
 }
 
 fn reduce_bool_family(values: Family<Bool>, count: IntExpr) -> Result<Bool, DslError> {
-    Sequential::range(count).scan(bool_value(true), values, |index, result, values| {
-        Ok(bool_and(result, values.get(index.as_int())))
-    })
+    iterate(count, Bool::constant(true), |index, result| Ok(result & values.at(index)))
 }
 
 /// Builds the authoritative sampler-free well-formedness predicate.
@@ -324,58 +241,40 @@ pub fn boolean_circuit_validity_predicate(
     let input_width = context.evaluate_int(params.input_width());
     let depth = context.evaluate_int(params.depth.clone());
     let max_width = context.evaluate_int(params.max_layer_width.clone());
-    let initial_validity =
-        Parallel::range(params.max_layer_width.clone()).map_values(|_| bool_value(true))?;
-    let invariants = (
-        circuit.active_gate_counts.clone(),
-        (circuit.gate_kinds.clone(), (circuit.left_sources.clone(), circuit.right_sources.clone())),
-    );
-    let (slot_validity, final_active_count) = Sequential::range(params.depth.clone()).scan(
+    let initial_validity = parallel(params.max_layer_width.clone(), |_| Ok(Bool::constant(true)))?;
+    let (slot_validity, final_active_count) = iterate(
+        params.depth.clone(),
         (initial_validity, input_width.clone()),
-        invariants,
-        |layer,
-         (previous_validity, previous_width),
-         (active_gate_counts, (gate_kinds, (left_sources, right_sources)))| {
-            let active_count = active_gate_counts.get(layer.as_int());
-            let (_, kinds, left, right) =
-                layer_metadata(&context, &params, &layer, gate_kinds, left_sources, right_sources)?;
-            let records = parallel_zip_bundle((kinds, left, right), {
-                let active_count = active_count.clone();
-                move |slot, (kind, left, right)| {
-                    let active =
-                        slot.as_int().less_equal(active_count.clone().sub(Int::constant(1)));
-                    active
-                        .to_int()
-                        .select_bool(vec![
-                            bool_all([
-                                kind.clone().equal(Int::constant(0)),
-                                left.clone().equal(Int::constant(0)),
-                                right.clone().equal(Int::constant(0)),
-                            ]),
-                            gate_record_valid(kind, left, right, previous_width.clone()),
-                        ])
-                        .expect("two boolean branches")
-                }
+        |layer, (previous_validity, previous_width)| {
+            let active_count = circuit.active_gate_counts.at(&layer);
+            let active_count_valid = Int::constant(1).less_equal(active_count.clone()) &
+                active_count.clone().less_equal(max_width.clone());
+            let validity = parallel(params.max_layer_width.clone(), |slot| {
+                let flat = params.flattened_index(&layer, &slot);
+                let kind = circuit.gate_kinds.at(&flat);
+                let left = circuit.left_sources.at(&flat);
+                let right = circuit.right_sources.at(&flat);
+                let active = slot.clone().less_equal(&active_count - 1);
+                let record_valid = select(
+                    active,
+                    vec![
+                        bool_all([
+                            kind.clone().equal(0),
+                            left.clone().equal(0),
+                            right.clone().equal(0),
+                        ]),
+                        gate_record_valid(kind, left, right, previous_width.clone()),
+                    ],
+                )?;
+                Ok(bool_all([previous_validity.at(slot), record_valid, active_count_valid.clone()]))
             })?;
-            let active_count_valid = bool_and(
-                Int::constant(1).less_equal(active_count.clone()),
-                active_count.clone().less_equal(max_width.clone()),
-            );
-            let validity = parallel_zip_bundle(
-                (previous_validity, records),
-                move |_, (previous, current)| {
-                    bool_all([previous, current, active_count_valid.clone()])
-                },
-            )?;
             Ok((validity, active_count))
         },
     )?;
     let records_valid = reduce_bool_family(slot_validity, params.max_layer_width.clone())?;
     let output_source = circuit.output_source();
-    let output_valid = bool_and(
-        Int::constant(0).less_equal(output_source.clone()),
-        output_source.less_equal(final_active_count.sub(Int::constant(1))),
-    );
+    let output_valid = Int::constant(0).less_equal(output_source.clone()) &
+        output_source.less_equal(final_active_count - 1);
     let params_valid = bool_all([
         Int::constant(0).less_equal(instance_width),
         Int::constant(0).less_equal(witness_width),
@@ -411,61 +310,39 @@ pub fn boolean_circuit_satisfaction_predicate(
         context.int_family_input(BOOLEAN_INSTANCE_INPUT, params.max_layer_width.clone());
     let encoded_witnesses =
         context.int_family_input(BOOLEAN_WITNESS_INPUT, params.max_layer_width.clone());
-    let canonical_family = |values: Family<Int>, width: Int| {
-        values.parallel_map({
-            move |slot, value| {
-                let active = slot.as_int().less_equal(width.clone().sub(Int::constant(1)));
-                let binary = bool_or(
-                    value.clone().equal(Int::constant(0)),
-                    value.clone().equal(Int::constant(1)),
-                );
-                active
-                    .to_int()
-                    .select_bool(vec![value.equal(Int::constant(0)), binary])
-                    .expect("two boolean branches")
-                    .to_int()
-            }
+    let canonical_family = |values: &Family<Int>, width: &Int| {
+        parallel(params.max_layer_width.clone(), |slot| {
+            let value = values.at(&slot);
+            let active = slot.less_equal(width - 1);
+            let binary = value.clone().equal(0) | value.clone().equal(1);
+            select(active, vec![value.equal(0), binary])
         })
     };
-    let instance_validity = canonical_family(encoded_instances.clone(), instance_width.clone())?;
-    let witness_validity = canonical_family(encoded_witnesses.clone(), witness_width.clone())?;
-    let input_validity =
-        parallel_zip_bundle((instance_validity, witness_validity), |_, (instance, witness)| {
-            instance.mul(witness).equal(Int::constant(1))
-        })?;
-    let input_width = context.evaluate_int(params.input_width());
-    let witness_indices = encoded_instances.clone().parallel_map({
-        let instance_width = instance_width.clone();
-        let input_width = input_width.clone();
-        move |slot, value| {
-            let index = slot.as_int();
-            let witness_active =
-                index.clone().less_equal(input_width.clone().sub(Int::constant(1))).to_int().sub(
-                    index.clone().less_equal(instance_width.clone().sub(Int::constant(1))).to_int(),
-                );
-            witness_active.mul(index.sub(instance_width.clone())).add(value.mul(Int::constant(0)))
-        }
+    let instance_validity = canonical_family(&encoded_instances, &instance_width)?;
+    let witness_validity = canonical_family(&encoded_witnesses, &witness_width)?;
+    let input_validity = parallel(params.max_layer_width.clone(), |index| {
+        Ok(instance_validity.at(&index) & witness_validity.at(index))
     })?;
-    let shifted_witnesses = encoded_witnesses.parallel_gather(witness_indices)?;
-    let inputs = parallel_zip_bundle_result(
-        (encoded_instances, shifted_witnesses),
-        move |slot, (instance, witness)| {
-            let index = slot.as_int();
-            let instance_active =
-                index.clone().less_equal(instance_width.clone().sub(Int::constant(1)));
-            let witness_active = index.less_equal(input_width.clone().sub(Int::constant(1)));
-            let value = instance_active.to_int().select_int(vec![
-                witness_active.to_int().select_int(vec![Int::constant(0), witness])?,
-                instance,
-            ])?;
-            Ok::<_, DslError>(value.equal(Int::constant(1)))
-        },
-    )?;
-    let final_layer = evaluate_boolean_family(&context, &params, circuit.clone(), inputs)?;
+    let input_width = context.evaluate_int(params.input_width());
+    let inputs = parallel(params.max_layer_width.clone(), |index| {
+        let instance = encoded_instances.at(&index);
+        let instance_active = index.clone().less_equal(&instance_width - 1);
+        let input_active = index.clone().less_equal(&input_width - 1);
+        let witness_active = input_active.clone().to_int() - instance_active.clone().to_int();
+        // Inactive lanes read index zero because selection evaluates both candidate values.
+        let witness_index = witness_active * (index - &instance_width);
+        let witness = encoded_witnesses.at(witness_index);
+        let value = select(
+            instance_active,
+            vec![select(input_active, vec![Int::constant(0), witness])?, instance],
+        )?;
+        Ok(value.equal(1))
+    })?;
+    let final_layer = evaluate_boolean_family(&params, circuit.clone(), inputs)?;
     let output = select_boolean_output(&circuit, &final_layer);
     let inputs_valid = reduce_bool_family(input_validity, params.max_layer_width)?;
     mxx_dsl::PurePredicateSpec::new(
-        context.bool_output("satisfied", bool_and(inputs_valid, output))?.build()?.graph,
+        context.bool_output("satisfied", inputs_valid & output)?.build()?.graph,
     )
     .map_err(Into::into)
 }
@@ -542,17 +419,15 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_boolean_evaluation_uses_scan_and_dynamic_flattened_access() {
+    fn symbolic_boolean_evaluation_uses_iteration_and_dynamic_flattened_access() {
         let (context, params) =
             BooleanCircuitFamilyParams::declare(DslContext::new("symbolic-boolean"));
         let circuit = BooleanCircuitFamilyInputs::protocol_inputs(&context, &params);
         let encoded_inputs = context.int_family_input("inputs", params.max_layer_width.clone());
         let inputs =
-            parallel_zip_bundle((encoded_inputs.clone(), encoded_inputs), |_, (value, _)| {
-                value.equal(Int::constant(1))
-            })
-            .unwrap();
-        let output = evaluate_boolean_family(&context, &params, circuit.clone(), inputs).unwrap();
+            parallel(params.max_layer_width.clone(), |index| Ok(encoded_inputs.at(index).equal(1)))
+                .unwrap();
+        let output = evaluate_boolean_family(&params, circuit.clone(), inputs).unwrap();
         let selected = select_boolean_output(&circuit, &output);
         let graph = context.bool_output("result", selected).unwrap().build().unwrap();
         graph.validate(&bindings()).unwrap();

@@ -1,13 +1,13 @@
 use super::{DiamondArtifactNames, DiamondConfigError, DiamondWeConfig};
 use crate::{WitnessEncryptionInterface, WitnessEncryptionProtocolDecl};
 use mxx_bgg::{
-    BggEncodingCompiler, BggEncodingFamily, BggEncodingWire, BggPublicKeyCompiler,
-    BggPublicKeyFamily, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
-    DynamicBooleanBggError, evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
+    BggEncodingCompiler, BggEncodingWire, BggPublicKeyCompiler, BggPublicKeySampler,
+    BggPublicKeyWire, BggSamplerLayout, CircuitEncoding, DynamicBooleanBggError,
+    evaluate_boolean_encoding_layers, evaluate_boolean_public_key_layers,
 };
 use mxx_dsl::{
-    Bool, BuiltGraph, DslContext, DslError, Int, Mat, Parallel, PurePredicateSpec, SemanticAnchor,
-    Sequential, parallel_zip_bundle_result,
+    Bool, BuiltGraph, DslContext, DslError, Int, Mat, PurePredicateSpec, SemanticAnchor, iterate,
+    parallel, select,
 };
 use mxx_gadgets::{
     circuit::{
@@ -99,7 +99,7 @@ fn diamond_parameter_validity_predicate(
     circuit: &BooleanCircuitFamilyParams,
     params: &DiamondGraphParams,
 ) -> Result<PurePredicateSpec, DslError> {
-    let evaluate = |expression| context.evaluate_int(expression);
+    let evaluate = Int::from;
     let modulus = evaluate(params.input.modulus.clone());
     let ring_dimension = evaluate(params.input.ring_dimension.clone());
     let input_count = evaluate(params.input.input_count.clone());
@@ -110,11 +110,8 @@ fn diamond_parameter_validity_predicate(
     let error_bound = evaluate(params.input.error_max_coefficient_bound.clone());
     let preimage_bound = evaluate(params.input.preimage_max_coefficient_bound.clone());
     let witness_width = evaluate(circuit.witness_width.clone());
-    let two_to_batch_bits = Sequential::range(params.input.batch_bits.clone()).scan(
-        Int::constant(1),
-        Int::constant(0),
-        |_, power, _| Ok(power.mul(Int::constant(2))),
-    )?;
+    let two_to_batch_bits =
+        iterate(params.input.batch_bits.clone(), Int::constant(1), |_, power| Ok(power * 2))?;
     let conditions = [
         Int::constant(1).less_equal(modulus),
         Int::constant(1).less_equal(ring_dimension),
@@ -142,18 +139,10 @@ fn padded_witness_public_key_indices(
     max_layer_width: IntExpr,
 ) -> Result<mxx_dsl::Family<Int>, DslError> {
     let witness_end = instance_width.clone().add(Int::evaluate(witness_size).sub(Int::constant(1)));
-    Parallel::range(max_layer_width).map_values(move |slot| {
-        let slot = slot.as_int();
-        let after_instance = instance_width.clone().less_equal(slot.clone()).to_int();
-        let before_end = slot.clone().less_equal(witness_end.clone()).to_int();
-        let output = after_instance
-            .mul(before_end)
-            .select_int(vec![
-                Int::constant(0),
-                slot.sub(instance_width.clone()).add(Int::constant(1)),
-            ])
-            .expect("two public-key indices");
-        output
+    parallel(max_layer_width, |slot| {
+        let active =
+            instance_width.clone().less_equal(&slot) & slot.clone().less_equal(&witness_end);
+        select(active, vec![Int::constant(0), slot - &instance_width + 1])
     })
 }
 
@@ -321,7 +310,7 @@ impl DiamondWeProtocolFamily {
         let message_int = message_input.to_int();
         let message_zero = ring.zero((1, 1));
         let message_one = ring.identity(1);
-        let message = message_int.select(vec![message_zero, message_one])?;
+        let message = select(message_int, vec![message_zero, message_one])?;
         let hash_key = ring.bytes_input(HASH_KEY_INPUT, 32);
         let input_preprocessing =
             DiamondInputInjector::parameterized(graph_params.input.clone()).preprocess(message)?;
@@ -331,16 +320,12 @@ impl DiamondWeProtocolFamily {
             .sample_family(
                 hash_key.clone(),
                 self.tag(b":witness_public_keys"),
-                mxx_ir_core::IntExpr::Add(
-                    Box::new(witness_size.clone()),
-                    Box::new(mxx_ir_core::IntExpr::constant(1)),
-                ),
+                &witness_size + mxx_ir_core::IntExpr::constant(1),
                 graph_params.input.digit_count.clone(),
             )?;
-        let one_public_key =
-            BggPublicKeyWire { matrix: public_keys.matrices.get_static(0), reveal_plaintext: true };
+        let one_public_key = public_keys.at(0);
         let zero_public_key = public_key_compiler.sub(&one_public_key, &one_public_key);
-        let instance_width = context.evaluate_int(circuit_params.instance_width.clone());
+        let instance_width = Int::from(circuit_params.instance_width.clone());
         let witness_end =
             instance_width.clone().add(Int::evaluate(witness_size.clone()).sub(Int::constant(1)));
         let public_indices = padded_witness_public_key_indices(
@@ -348,37 +333,19 @@ impl DiamondWeProtocolFamily {
             witness_size.clone(),
             circuit_params.max_layer_width.clone(),
         )?;
-        let public_candidates = public_keys.matrices.clone().parallel_gather(public_indices)?;
-        let packed_inputs = public_candidates.parallel_map_values({
-            let zero = zero_public_key.matrix.clone();
-            let instance_width = instance_width.clone();
-            move |slot, candidate| {
-                let slot = slot.as_int();
-                let after_instance = instance_width.clone().less_equal(slot.clone()).to_int();
-                let before_end = slot.less_equal(witness_end.clone()).to_int();
-                let in_range = before_end
-                    .select(vec![zero.clone(), candidate])
-                    .expect("matching public-key types");
-                after_instance
-                    .select(vec![zero.clone(), in_range])
-                    .expect("matching public-key types")
-            }
+        let circuit_inputs = parallel(circuit_params.max_layer_width.clone(), |slot| {
+            // Guard the index before the eager family access, including public-input and padding
+            // slots.
+            let candidate = public_keys.at(public_indices.at(&slot));
+            let active_witness =
+                instance_width.clone().less_equal(&slot) & slot.clone().less_equal(&witness_end);
+            let packed = select(active_witness, vec![zero_public_key.clone(), candidate])?;
+            let selected_instance =
+                select(instance.at(&slot), vec![zero_public_key.clone(), one_public_key.clone()])?;
+            let active_instance = slot.less_equal(&instance_width - 1).to_int();
+            select(active_instance, vec![packed, selected_instance])
         })?;
-        let circuit_input_matrices =
-            parallel_zip_bundle_result((instance, packed_inputs), |slot, (bit, packed)| {
-                let index = slot.as_int();
-                let selected_instance = bit
-                    .select(vec![zero_public_key.matrix.clone(), one_public_key.matrix.clone()])
-                    .expect("matching public-key matrix types");
-                let active =
-                    index.clone().less_equal(instance_width.clone().sub(Int::constant(1))).to_int();
-                let selected_source = active.select(vec![packed, selected_instance])?;
-                Ok::<_, DslError>(selected_source)
-            })?;
-        let circuit_inputs =
-            BggPublicKeyFamily { matrices: circuit_input_matrices, reveal_plaintext: true };
         let circuit_output_family = evaluate_boolean_public_key_layers(
-            &context,
             &circuit_params,
             circuit_data.clone(),
             circuit_inputs,
@@ -386,10 +353,11 @@ impl DiamondWeProtocolFamily {
             public_key_compiler.clone(),
         )?;
         let circuit_output_index = circuit_data.output_source();
-        let circuit_output_matrix = circuit_output_family
-            .matrices
-            .get(circuit_output_index.clone())
-            .semantic_anchor("diamond.encrypt.selected-circuit-public-key")?;
+        let circuit_output_matrix =
+            circuit_output_family
+                .at(circuit_output_index.clone())
+                .matrix
+                .semantic_anchor("diamond.encrypt.selected-circuit-public-key")?;
         let circuit_output =
             BggPublicKeyWire { matrix: circuit_output_matrix, reveal_plaintext: true };
 
@@ -401,28 +369,19 @@ impl DiamondWeProtocolFamily {
         let public_columns = graph_params.input.digit_count.clone();
         let state_columns = graph_params.input.state_columns();
         let zero_row = ring.zero((1, public_columns.clone()));
-        let one_difference = one_public_key.matrix.clone() - gadget.clone();
+        let one_difference = &one_public_key.matrix - &gadget;
         let one_target = Mat::concat(ConcatAxis::Rows, vec![one_difference, zero_row]);
-        let projection_trapdoor = input_preprocessing.final_trapdoors.get_static(0);
+        let projection_trapdoor = input_preprocessing.final_trapdoors.at(0);
         let one_trapdoor = projection_trapdoor.clone();
         let one_preimage = one_trapdoor
             .sample_preimage(one_target, (state_columns.clone(), public_columns.clone()));
-        let witness_indices =
-            Parallel::range(witness_size).map_values(|bit| bit.as_int().add(Int::constant(1)))?;
-        let witness_trapdoors =
-            input_preprocessing.final_trapdoors.clone().parallel_gather(witness_indices.clone())?;
-        let witness_public_keys = public_keys.matrices.clone().parallel_gather(witness_indices)?;
-        let witness_targets = witness_public_keys.parallel_map_values({
-            let gadget = gadget.clone();
-            move |_, public_key| {
-                let negated_gadget = -gadget.clone();
-                Mat::concat(ConcatAxis::Rows, vec![public_key, negated_gadget])
-            }
+        let witness_preimages = parallel(witness_size, |bit| {
+            let index = bit + 1;
+            let trapdoor = input_preprocessing.final_trapdoors.at(&index);
+            let public_key = public_keys.at(index).matrix;
+            let target = Mat::concat(ConcatAxis::Rows, vec![public_key, -&gadget]);
+            Ok(trapdoor.sample_preimage(target, (state_columns.clone(), public_columns.clone())))
         })?;
-        let witness_preimages =
-            witness_trapdoors.parallel_zip_mat_values(witness_targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (state_columns.clone(), public_columns.clone()))
-            })?;
 
         let k_public_key_matrix = ring.hash_matrix(
             hash_key.clone(),
@@ -468,7 +427,7 @@ impl DiamondWeProtocolFamily {
             .public_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
             .public_output(DiamondArtifactNames::DECODER_PREIMAGE, decoder_preimage)?
             .public_output(DiamondArtifactNames::R_DECOMPOSED, r_decomposed)?
-            .public_output(DiamondArtifactNames::PUBLIC_KEYS, public_keys.matrices)?
+            .public_output(DiamondArtifactNames::PUBLIC_KEYS, public_keys.field(|key| key.matrix)?)?
             .public_output(DiamondArtifactNames::TRANSITIONS, input_preprocessing.transitions)?
             .public_output(DiamondArtifactNames::WITNESS_PREIMAGES, witness_preimages)?
             .build()?;
@@ -498,22 +457,21 @@ impl DiamondWeProtocolFamily {
         let witness =
             context.int_family_input(BOOLEAN_WITNESS_INPUT, circuit_params.max_layer_width.clone());
         let witness_size = graph_params.input.witness_size();
-        let witness_indices = Parallel::range(witness_size.clone())
-            .map_values(|bit| bit.as_int().add(Int::constant(0)))?;
-        let witness_bits = witness.clone().parallel_gather(witness_indices)?;
-        let witness_digits = witness_bits.clone().parallel_pack_little_endian_bits(
-            graph_params.input.input_count.clone(),
-            graph_params.input.batch_bits.clone(),
-        )?;
+        let witness_digits = parallel(graph_params.input.input_count.clone(), |segment| {
+            let (digit, _) = iterate(
+                graph_params.input.batch_bits.clone(),
+                (Int::constant(0), Int::constant(1)),
+                |bit, (digit, place)| {
+                    let index = &segment * &graph_params.input.batch_bits + bit;
+                    Ok((digit + witness.at(index) * &place, place * 2))
+                },
+            )?;
+            Ok(digit)
+        })?;
         let max_state_count = graph_params.input.max_state_count();
-        let transition_count = IntExpr::Mul(
-            Box::new(graph_params.input.input_count.clone()),
-            Box::new(IntExpr::Mul(
-                Box::new(graph_params.input.digit_base.clone()),
-                Box::new(max_state_count.clone()),
-            )),
-        )
-        .canonicalize();
+        let transition_count = (&graph_params.input.input_count *
+            (&graph_params.input.digit_base * &max_state_count))
+            .canonicalize();
         let transitions = ring.preimage_family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::TRANSITIONS,
@@ -531,12 +489,12 @@ impl DiamondWeProtocolFamily {
         let public_key_matrices = ring.family_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::PUBLIC_KEYS,
-            IntExpr::Add(Box::new(witness_size.clone()), Box::new(IntExpr::constant(1))),
+            (&witness_size + IntExpr::constant(1)).canonicalize(),
             (1, public_columns.clone()),
             ArtifactConfidentiality::Public,
         );
-        let public_keys =
-            BggPublicKeyFamily { matrices: public_key_matrices, reveal_plaintext: true };
+        let public_keys = public_key_matrices
+            .field(|matrix| BggPublicKeyWire { matrix, reveal_plaintext: true })?;
         let one_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::ONE_PREIMAGE,
@@ -558,13 +516,12 @@ impl DiamondWeProtocolFamily {
             preimage_bound.clone(),
             ArtifactConfidentiality::Public,
         );
-        let initial_projection_state = states.get_static(0);
+        let initial_projection_state = states.at(0);
         let one_vector = one_preimage.mul_small_rhs(initial_projection_state.clone());
         let k_vector = k_preimage.mul_small_rhs(initial_projection_state.clone());
         let decoder = decoder_preimage.mul_small_rhs(initial_projection_state);
         let one_plaintext_matrix = ring.identity(1);
-        let one_public_key =
-            BggPublicKeyWire { matrix: public_keys.matrices.get_static(0), reveal_plaintext: true };
+        let one_public_key = public_keys.at(0);
         let one_encoding =
             BggEncodingWire { vector: one_vector, plaintext: Some(one_plaintext_matrix) };
         let zero_encoding = encoding_compiler.sub(&one_encoding, &one_encoding).expect("revealed");
@@ -576,129 +533,49 @@ impl DiamondWeProtocolFamily {
             preimage_bound,
             ArtifactConfidentiality::Public,
         );
-        let witness_state_indices = Parallel::range(witness_size.clone())
-            .map_values(|bit| bit.as_int().add(Int::constant(1)))?;
-        let witness_states = states.parallel_gather(witness_state_indices)?;
-        let witness_vectors = parallel_zip_bundle_result(
-            (witness_states, witness_preimages),
-            |_, (state, preimage)| Ok::<_, DslError>(preimage.mul_small_rhs(state)),
-        )?;
-        let witness_public_indices = Parallel::range(witness_size.clone())
-            .map_values(|bit| bit.as_int().add(Int::constant(1)))?;
-        let witness_public_keys =
-            public_keys.matrices.clone().parallel_gather(witness_public_indices)?;
-        let witness_zero_plaintexts =
-            Parallel::range(witness_size.clone()).map_values(|_| ring.zero((1, 1)))?;
-        let witness_one_plaintexts =
-            Parallel::range(witness_size.clone()).map_values(|_| ring.identity(1))?;
-        let witness_plaintexts = witness_bits
-            .parallel_select_mats(vec![witness_zero_plaintexts, witness_one_plaintexts])?;
-        let instance_width = context.evaluate_int(circuit_params.instance_width.clone());
-        let witness_end =
-            instance_width.clone().add(Int::evaluate(witness_size.clone()).sub(Int::constant(1)));
-        let packed_indices =
-            Parallel::range(circuit_params.max_layer_width.clone()).map_values({
-                let instance_width = instance_width.clone();
-                let witness_end = witness_end.clone();
-                move |slot| {
-                    let slot = slot.as_int();
-                    let after_instance = instance_width.clone().less_equal(slot.clone()).to_int();
-                    let before_end = slot.clone().less_equal(witness_end.clone()).to_int();
-                    let output = after_instance
-                        .mul(before_end)
-                        .select_int(vec![Int::constant(0), slot.sub(instance_width.clone())])
-                        .expect("two witness indices");
-                    output
-                }
-            })?;
-        let packed_vectors = witness_vectors.parallel_gather(packed_indices.clone())?;
-        let packed_public_keys = witness_public_keys.parallel_gather(packed_indices.clone())?;
-        let packed_plaintexts = witness_plaintexts.parallel_gather(packed_indices.clone())?;
-        let active_witness =
-            Parallel::range(circuit_params.max_layer_width.clone()).map_values({
-                let instance_width = instance_width.clone();
-                move |slot| {
-                    let slot = slot.as_int();
-                    let output = instance_width
-                        .clone()
-                        .less_equal(slot.clone())
-                        .to_int()
-                        .mul(slot.less_equal(witness_end.clone()).to_int());
-                    output
-                }
-            })?;
-        let active_zero_vectors = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_encoding.vector.clone())?;
-        let packed_vectors = active_witness
-            .clone()
-            .parallel_select_mats(vec![active_zero_vectors, packed_vectors])?;
-        let zero_public_key = one_public_key.matrix.clone() - one_public_key.matrix.clone();
-        let active_zero_public_keys = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_public_key.clone())?;
-        let packed_public_keys = active_witness
-            .clone()
-            .parallel_select_mats(vec![active_zero_public_keys, packed_public_keys])?;
-        let active_zero_plaintexts = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_encoding.plaintext.clone().expect("revealed"))?;
-        let packed_plaintexts =
-            active_witness.parallel_select_mats(vec![active_zero_plaintexts, packed_plaintexts])?;
-        let selectors = instance;
-        let instance_zero_vectors = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_encoding.vector.clone())?;
-        let instance_one_vectors = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| one_encoding.vector.clone())?;
-        let selected_instance_vectors = selectors
-            .clone()
-            .parallel_select_mats(vec![instance_zero_vectors, instance_one_vectors])?;
-        let instance_zero_public_keys = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_public_key.clone())?;
-        let instance_one_public_keys = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| one_public_key.matrix.clone())?;
-        let selected_instance_keys = selectors
-            .clone()
-            .parallel_select_mats(vec![instance_zero_public_keys, instance_one_public_keys])?;
-        let instance_zero_plaintexts = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| zero_encoding.plaintext.clone().expect("revealed"))?;
-        let instance_one_plaintexts = Parallel::range(circuit_params.max_layer_width.clone())
-            .map_values(|_| one_encoding.plaintext.clone().expect("revealed"))?;
-        let selected_instance_plaintexts = selectors
-            .parallel_select_mats(vec![instance_zero_plaintexts, instance_one_plaintexts])?;
-        let active_instance =
-            Parallel::range(circuit_params.max_layer_width.clone()).map_values(|slot| {
-                let output =
-                    slot.as_int().less_equal(instance_width.clone().sub(Int::constant(1))).to_int();
-                output
-            })?;
-        let circuit_vectors = active_instance
-            .clone()
-            .parallel_select_mats(vec![packed_vectors, selected_instance_vectors])?;
-        let circuit_public_keys = active_instance
-            .clone()
-            .parallel_select_mats(vec![packed_public_keys, selected_instance_keys])?;
-        let circuit_plaintexts = active_instance
-            .parallel_select_mats(vec![packed_plaintexts, selected_instance_plaintexts])?;
-        let circuit_inputs = BggEncodingFamily {
-            vectors: circuit_vectors,
-            public_keys: BggPublicKeyFamily {
-                matrices: circuit_public_keys,
-                reveal_plaintext: true,
-            },
-            plaintexts: circuit_plaintexts,
+        let witness_encodings = parallel(witness_size.clone(), |bit| {
+            Ok(CircuitEncoding {
+                vector: witness_preimages.at(&bit).mul_small_rhs(states.at(&bit + 1)),
+                public_key: public_keys.at(&bit + 1).matrix,
+                plaintext: select(witness.at(bit), vec![ring.zero((1, 1)), ring.identity(1)])?,
+            })
+        })?;
+        let instance_width = Int::from(circuit_params.instance_width.clone());
+        let witness_end = &instance_width + witness_size - 1;
+        let zero = CircuitEncoding {
+            vector: zero_encoding.vector,
+            public_key: &one_public_key.matrix - &one_public_key.matrix,
+            plaintext: zero_encoding.plaintext.expect("revealed"),
         };
+        let one = CircuitEncoding {
+            vector: one_encoding.vector.clone(),
+            public_key: one_public_key.matrix.clone(),
+            plaintext: one_encoding.plaintext.clone().expect("revealed"),
+        };
+        let circuit_inputs = parallel(circuit_params.max_layer_width.clone(), |slot| {
+            let active_witness =
+                instance_width.clone().less_equal(&slot) & slot.clone().less_equal(&witness_end);
+            // Selection is eager: padded slots must gather the valid witness index zero first.
+            let witness_index =
+                select(active_witness.clone(), vec![Int::constant(0), &slot - &instance_width])?;
+            let packed =
+                select(active_witness, vec![zero.clone(), witness_encodings.at(witness_index)])?;
+            let selected_instance = select(instance.at(&slot), vec![zero.clone(), one.clone()])?;
+            let active_instance = slot.less_equal(&instance_width - 1).to_int();
+            select(active_instance, vec![packed, selected_instance])
+        })?;
         let circuit_output_family = evaluate_boolean_encoding_layers(
-            &context,
             &circuit_params,
             circuit_data.clone(),
             circuit_inputs,
             one_encoding.clone(),
             one_public_key,
-            encoding_compiler,
             public_key_compiler,
         )?;
         let circuit_output_index = circuit_data.output_source();
         let circuit_vector = circuit_output_family
-            .vectors
-            .get(circuit_output_index.clone())
+            .at(circuit_output_index.clone())
+            .vector
             .semantic_anchor("diamond.decrypt.selected-circuit-vector")?;
         let r_decomposed = ring.preimage_artifact_input(
             encryption,
@@ -820,12 +697,9 @@ impl DiamondWeProtocolFamily {
         ];
         let parameter = |name: &str| IntExpr::Var(name.to_owned());
         let max_layer_width = parameter(BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER);
-        let flattened_gate_count = IntExpr::Mul(
-            Box::new(parameter(BooleanCircuitFamilyParams::DEPTH_PARAMETER)),
-            Box::new(max_layer_width.clone()),
-        );
-        let max_source =
-            IntExpr::Sub(Box::new(max_layer_width.clone()), Box::new(IntExpr::constant(1)));
+        let flattened_gate_count =
+            parameter(BooleanCircuitFamilyParams::DEPTH_PARAMETER) * &max_layer_width;
+        let max_source = &max_layer_width - IntExpr::constant(1);
         let integer_family =
             |count: IntExpr, lower: IntExpr, upper: IntExpr| InputValueContract::Family {
                 count,
@@ -1082,13 +956,13 @@ impl DiamondWeProtocolFamily {
 fn decode_boolean_interval(noisy_plaintext: Mat, modulus: IntExpr) -> Bool {
     let coefficient = noisy_plaintext.extract_coefficient(0);
     let quarter = Int::evaluate(IntExpr::RoundDiv(
-        Box::new(IntExpr::Sub(Box::new(modulus), Box::new(IntExpr::constant(2)))),
+        Box::new(modulus - IntExpr::constant(2)),
         Box::new(IntExpr::constant(4)),
     ));
     let upper = quarter.clone().mul(Int::constant(3));
     let lower_ok = quarter.less_equal(coefficient.clone());
     let upper_ok = coefficient.less_equal(upper);
-    lower_ok.to_int().add(upper_ok.to_int()).equal(Int::constant(2))
+    lower_ok & upper_ok
 }
 
 #[cfg(test)]

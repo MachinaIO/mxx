@@ -22,8 +22,7 @@ pub fn protocol() -> ProtocolDecl {
     let selector = message.clone().to_int();
     let zero = ring.zero((1, 1));
     let carrier = ring.polynomial([IntExpr::constant(128)]);
-    let encoded = selector
-        .select(vec![zero.clone(), carrier.clone()])
+    let encoded = crate::select(selector, vec![zero.clone(), carrier.clone()])
         .expect("two equally typed encoding branches");
     let ciphertext = encoded.clone() +
         ring.gaussian((1, 1), RealExpr::from_integer(1), IntExpr::Var("cutoff".to_owned()));

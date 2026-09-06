@@ -100,6 +100,8 @@ impl BgvParams {
         Ok(Self { common, plaintext_modulus })
     }
 
+    // For v = r + t*e with centered r, |r| <= floor(t/2) and |e| <= noise.
+    // This converts an unscaled noise bound into a bound on the whole phase.
     fn phase_from_noise(&self, noise: &BigUint) -> BigUint {
         BigUint::from(self.plaintext_modulus / 2) + BigUint::from(self.plaintext_modulus) * noise
     }
@@ -114,6 +116,8 @@ impl BgvParams {
     pub fn can_decrypt(&self, ct: &BgvCiphertext) -> Result<bool, FheError> {
         self.ciphertext_rows(ct)?;
         let parameters = self.common.parameters_at(self.level_of(&ct.components)?)?;
+        // Require |v| < Q/2. phase_from_noise already includes t*noise_bound,
+        // so this is 2*(floor(t/2) + t*noise_bound) < Q; do not multiply by t again.
         Ok(self.phase_from_noise(&ct.noise_bound) * 2u8 < *parameters.modulus())
     }
 

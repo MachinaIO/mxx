@@ -266,6 +266,8 @@ mod tests {
             .private_output("double", scheme.decrypt(&sk, &doubled).unwrap().coefficients())
             .unwrap();
         let mut inputs = BTreeMap::new();
+        // Sample coefficients of m(X) within the declared plaintext bound of 2.
+        // Bind this plaintext to the graph's "message" input; this is not encryption noise.
         let values = (0..n).map(|_| rand::rng().random_range(-2..=2)).collect::<Vec<i64>>();
         inputs.insert("message".into(), int_input(&values));
         // Constants isolate zero/identity/sign behavior; X also exercises the
@@ -296,6 +298,8 @@ mod tests {
                 scheme.decrypt(&sk, &product).unwrap().coefficients(),
             )
             .unwrap();
+        // Encode the multiplier mu(X) = 1 - X in ascending coefficient order.
+        // The external product must decrypt to m(X) * (1 - X) modulo X^N + 1 and q.
         let mut multiplier = vec![0i64; n];
         multiplier[0] = 1;
         multiplier[1] = -1;

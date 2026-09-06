@@ -5883,22 +5883,25 @@ mod tests {
             .expect("build")
             .validate(&ParamEnv::default())
             .expect("validation");
-        let result = execute(
-            &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
-            BTreeMap::new(),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .expect("execution");
-        let RuntimeValue::IndexedFamily(state) = &result.outputs["state"] else {
+        let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("execution");
+        // Integer loop outputs can be staged now that Int is an artifact type.
+        // Resolve the family through the public API before checking its values.
+        let RuntimeValue::IndexedFamily(state) =
+            result.materialize_output("state", &backend, &mut store).expect("materialized family")
+        else {
             panic!("state output is not a family")
         };
+        assert_eq!(state.len(), 2);
         assert!(
             state.iter().all(
                 |value| matches!(value, RuntimeValue::Int(value) if value == &BigInt::from(3))
             )
         );
+        result.cleanup_staged(&mut store).expect("clean staged integer family");
     }
 
     #[test]
@@ -5921,9 +5924,11 @@ mod tests {
             .expect("build")
             .validate(&ParamEnv::default())
             .expect("validation");
-        let result = execute(
+        let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
+            &mut backend,
             BTreeMap::from([(
                 "bits".to_owned(),
                 RuntimeValue::IndexedFamily(
@@ -5933,15 +5938,21 @@ mod tests {
                         .collect(),
                 ),
             )]),
-            &mut MemoryArtifactStore::default(),
+            &mut store,
             SamplingMode::Fresh,
         )
         .expect("execution");
-        let RuntimeValue::IndexedFamily(packed) = &result.outputs["packed"] else {
+        // Integer loop outputs can be staged now that Int is an artifact type.
+        // Resolve the family through the public API before checking its values.
+        let RuntimeValue::IndexedFamily(packed) =
+            result.materialize_output("packed", &backend, &mut store).expect("materialized family")
+        else {
             panic!("packed output is not a family")
         };
+        assert_eq!(packed.len(), 2);
         assert!(matches!(&packed[0], RuntimeValue::Int(value) if value == &BigInt::from(5)));
         assert!(matches!(&packed[1], RuntimeValue::Int(value) if value == &BigInt::from(6)));
+        result.cleanup_staged(&mut store).expect("clean staged integer family");
     }
 
     #[test]

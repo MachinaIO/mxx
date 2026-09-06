@@ -4100,10 +4100,7 @@ mod tests {
         artifact::MemoryArtifactStore,
         backend::poly::{CpuDcrtBackend, cpu_backend},
     };
-    use mxx_dsl::{
-        DslContext, Family, HashTag, Int, MatType, Parallel, Ring, Sequential, Subgraph,
-        parallel_zip,
-    };
+    use mxx_dsl::{DslContext, Family, HashTag, Int, MatType, Ring, Subgraph, iterate, parallel};
     use mxx_ir_core::{
         Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, ValueHandle, WireType,
         artifact::ArtifactConfidentiality,
@@ -4572,10 +4569,12 @@ mod tests {
         let small = ring.small_matrix_input_family("small", 2, (1, 1), 1);
         let preimage = ring.preimage_input_family("preimage", 2, (1, 1), 1);
         let broadcast = ring.small_matrix_input("broadcast", (1, 1), 1);
-        let (small, preimage, broadcast) = parallel_zip((small, preimage), move |_, values| {
-            (values.0, values.1, broadcast.clone())
-        })
-        .expect("parallel small families");
+        let values =
+            parallel(2, |index| Ok((small.at(&index), preimage.at(index), broadcast.clone())))
+                .expect("parallel small families");
+        let small = values.field(|value| value.0).expect("small family");
+        let preimage = values.field(|value| value.1).expect("preimage family");
+        let broadcast = values.field(|value| value.2).expect("broadcast family");
         let validated = DslContext::new("runtime-staged-small-placement")
             .output("small", small)
             .expect("small output")
@@ -4759,7 +4758,7 @@ mod tests {
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let context = DslContext::new("integer-lift-constant-polynomial");
-        let coefficient = context.int_family_input("coefficient", 1).get_static(0);
+        let coefficient = context.int_family_input("coefficient", 1).at(0);
         let lifted = coefficient.lift_to_constant_polynomial(ring.matrix_type((1, 1)));
         let expected = ring.polynomial([IntExpr::constant(-3)]);
         let graph = context
@@ -4790,9 +4789,9 @@ mod tests {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
-        let family = Parallel::range(3)
-            .map(|index| ring.polynomial([index.expression()]))
-            .expect("range loop");
+        let family =
+            parallel(3, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+                .expect("range loop");
         let built = DslContext::new("runtime-range")
             .family_output("values", family)
             .expect("output")
@@ -4833,11 +4832,11 @@ mod tests {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
-        let source = Parallel::range(3)
-            .map(|index| ring.polynomial([index.expression()]))
-            .expect("source range");
+        let source =
+            parallel(3, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+                .expect("source range");
         let indices = Family::pack(vec![Int::constant(2), Int::constant(0)]).expect("indices");
-        let gathered = source.parallel_gather(indices).expect("gather");
+        let gathered = parallel(2, |index| Ok(source.at(indices.at(index)))).expect("gather");
         let expected = Family::pack(vec![
             ring.polynomial([mxx_ir_core::IntExpr::constant(2)]),
             ring.polynomial([mxx_ir_core::IntExpr::constant(0)]),
@@ -5067,11 +5066,11 @@ mod tests {
                 .collect(),
         )
         .expect("row family");
-        let dummy = Family::pack(vec![Int::constant(0); 3]).expect("dummy family");
-        let samples = parallel_zip((rows, dummy), move |_, (row, _)| {
+        let samples = parallel(3, |index| {
+            let row = rows.at(index);
             let mut tag = HashTag::from(b"mxx-bgg/lwe-lookup-low/v2:test:row:".as_slice());
             tag.push(row);
-            ring.hash_matrix(key.clone(), tag, (1, 1))
+            Ok(ring.hash_matrix(key.clone(), tag, (1, 1)))
         })
         .expect("dynamic hash family");
         let validated = DslContext::new("runtime-dynamic-hash-tags")
@@ -5269,42 +5268,35 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let gadget_base = BigInt::from(1u64 << parameters.base_bits());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
-        let trapdoors = Parallel::range(2)
-            .map_values(|_| ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
-            .expect("trapdoor family");
+        let trapdoors = parallel(2, |_| {
+            Ok(ring.sample_trapdoor(1, 5, gadget_base.clone(), digit_count, 1_000_000))
+        })
+        .expect("trapdoor family");
         let public = trapdoors.public_matrices();
-        let swapped_public = Family::pack(vec![public.get_static(1), public.get_static(0)])
-            .expect("swapped public family");
-        let targets = Parallel::range(2)
-            .map(|index| {
-                ring.polynomial([IntExpr::Add(
-                    Box::new(index.expression()),
-                    Box::new(IntExpr::constant(1)),
-                )
-                .canonicalize()])
-            })
-            .expect("targets");
+        let swapped_public =
+            Family::pack(vec![public.at(1), public.at(0)]).expect("swapped public family");
+        let targets = parallel(2, |index| {
+            Ok(index.add(Int::constant(1)).lift_to_constant_polynomial(ring.matrix_type((1, 1))))
+        })
+        .expect("targets");
         let expected_targets = targets.clone();
-        let preimages = trapdoors
-            .clone()
-            .parallel_zip_mat_values(targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (digit_count + 2, 1))
-            })
-            .expect("preimages");
-        let products =
-            parallel_zip((trapdoors.public_matrices(), preimages), |_, (public, preimage)| {
-                preimage.mul_small_rhs(public)
-            })
-            .expect("products");
+        let preimages = parallel(2, |index| {
+            Ok(trapdoors.at(&index).sample_preimage(targets.at(index), (digit_count + 2, 1)))
+        })
+        .expect("preimages");
+        let products = parallel(2, |index| {
+            Ok(preimages.at(&index).mul_small_rhs(trapdoors.at(index).public_matrix()))
+        })
+        .expect("products");
         let static_target = ring.polynomial([3.into()]);
-        let static_trapdoor = trapdoors.get_static(0);
+        let static_trapdoor = trapdoors.at(0);
         let static_public = static_trapdoor.public_matrix();
         let static_product = static_trapdoor
             .sample_preimage(static_target.clone(), (digit_count + 2, 1))
             .mul_small_rhs(static_public.clone());
         let indices = DslContext::new("trapdoor-family-indices").int_family_input("indices", 1);
         let dynamic_target = ring.polynomial([4.into()]);
-        let dynamic_trapdoor = trapdoors.get(indices.get_static(0));
+        let dynamic_trapdoor = trapdoors.at(indices.at(0));
         let dynamic_public = dynamic_trapdoor.public_matrix();
         let dynamic_product = dynamic_trapdoor
             .sample_preimage(dynamic_target.clone(), (digit_count + 2, 1))
@@ -5316,13 +5308,13 @@ mod tests {
             .expect("swapped public family output")
             .private_trapdoor_family_output("trapdoors", trapdoors)
             .expect("private trapdoor family output")
-            .output("product-0", products.get_static(0))
+            .output("product-0", products.at(0))
             .expect("first product")
-            .output("product-1", products.get_static(1))
+            .output("product-1", products.at(1))
             .expect("second product")
-            .output("target-0", expected_targets.get_static(0))
+            .output("target-0", expected_targets.at(0))
             .expect("first target")
-            .output("target-1", expected_targets.get_static(1))
+            .output("target-1", expected_targets.at(1))
             .expect("second target")
             .output("static-product", static_product)
             .expect("static product")
@@ -5336,9 +5328,9 @@ mod tests {
             .expect("static public")
             .output("dynamic-public", dynamic_public)
             .expect("dynamic public")
-            .output("expected-public-0", public.get_static(0))
+            .output("expected-public-0", public.at(0))
             .expect("expected first public")
-            .output("expected-public-1", public.get_static(1))
+            .output("expected-public-1", public.at(1))
             .expect("expected second public")
             .build()
             .expect("build")
@@ -5409,35 +5401,29 @@ mod tests {
             digit_count,
             1_000_000,
         );
-        let imported_targets = Parallel::range(2)
-            .map(|index| {
-                ring.polynomial([IntExpr::Add(
-                    Box::new(index.expression()),
-                    Box::new(IntExpr::constant(1)),
-                )
-                .canonicalize()])
-            })
-            .expect("import targets");
+        let imported_targets = parallel(2, |index| {
+            Ok(index.add(Int::constant(1)).lift_to_constant_polynomial(ring.matrix_type((1, 1))))
+        })
+        .expect("import targets");
         let expected_imported_targets = imported_targets.clone();
-        let imported_preimages = imported
-            .clone()
-            .parallel_zip_mat_values(imported_targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (digit_count + 2, 1))
-            })
-            .expect("imported preimages");
-        let imported_products = parallel_zip(
-            (imported.public_matrices(), imported_preimages),
-            |_, (public, preimage)| preimage.mul_small_rhs(public),
-        )
+        let imported_preimages = parallel(2, |index| {
+            Ok(imported
+                .at(&index)
+                .sample_preimage(imported_targets.at(index), (digit_count + 2, 1)))
+        })
+        .expect("imported preimages");
+        let imported_products = parallel(2, |index| {
+            Ok(imported_preimages.at(&index).mul_small_rhs(imported.at(index).public_matrix()))
+        })
         .expect("imported products");
         let imported_graph = DslContext::new("runtime-imported-trapdoor-family")
-            .output("product-0", imported_products.get_static(0))
+            .output("product-0", imported_products.at(0))
             .expect("first imported product")
-            .output("product-1", imported_products.get_static(1))
+            .output("product-1", imported_products.at(1))
             .expect("second imported product")
-            .output("target-0", expected_imported_targets.get_static(0))
+            .output("target-0", expected_imported_targets.at(0))
             .expect("first imported target")
-            .output("target-1", expected_imported_targets.get_static(1))
+            .output("target-1", expected_imported_targets.at(1))
             .expect("second imported target")
             .build()
             .expect("import build")
@@ -5474,7 +5460,7 @@ mod tests {
             digit_count,
             1_000_000,
         );
-        let scalar_trapdoor = mismatched.get_static(0);
+        let scalar_trapdoor = mismatched.at(0);
         let scalar_mismatch_graph = DslContext::new("runtime-mismatched-scalar-trapdoor")
             .output(
                 "preimage",
@@ -5499,16 +5485,15 @@ mod tests {
             Err(ExecutionError::PreimagePublicMismatch(_))
         ));
 
-        let batch_targets = Parallel::range(2)
-            .map(|index| ring.polynomial([index.expression()]))
-            .expect("mismatched batch targets");
-        let batch_preimages = mismatched
-            .parallel_zip_mat_values(batch_targets, |_, trapdoor, target| {
-                trapdoor.sample_preimage(target, (digit_count + 2, 1))
-            })
-            .expect("mismatched batch preimages");
+        let batch_targets =
+            parallel(2, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+                .expect("mismatched batch targets");
+        let batch_preimages = parallel(2, |index| {
+            Ok(mismatched.at(&index).sample_preimage(batch_targets.at(index), (digit_count + 2, 1)))
+        })
+        .expect("mismatched batch preimages");
         let batch_mismatch_graph = DslContext::new("runtime-mismatched-batch-trapdoor")
-            .output("preimage", batch_preimages.get_static(0))
+            .output("preimage", batch_preimages.at(0))
             .expect("mismatched batch output")
             .build()
             .expect("mismatched batch build")
@@ -5580,14 +5565,187 @@ mod tests {
     }
 
     #[test]
-    fn sequential_scan_carries_each_iteration_output_into_the_next_iteration() {
+    fn test_composite_family_index_selection_and_iteration_keep_fields_aligned() {
+        let context = DslContext::new("runtime-composite-records");
+        let ring = Ring::new(17, 8);
+        let numbers = context.int_family_input("numbers", 3);
+        let flags =
+            Family::pack((0..3).map(|index| ring.bool_input(format!("flag-{index}"))).collect())
+                .expect("boolean fields");
+        let records =
+            parallel(3, |index| Ok((numbers.at(&index), flags.at(index)))).expect("record family");
+        let selection = context.int_family_input("selection", 1).at(0);
+        let selected =
+            mxx_dsl::select(selection.clone(), (0..3).map(|index| records.at(index)).collect())
+                .expect("record selection");
+        let accumulated = iterate(3, records.at(0), |index, state| {
+            mxx_dsl::select(
+                index.clone().equal(selection.clone()).to_int(),
+                vec![state, records.at(index)],
+            )
+        })
+        .expect("record iteration");
+        let untouched = iterate(0, records.at(0), |_, _state| Ok(records.at(2)))
+            .expect("zero record iteration");
+        let expected = (numbers.at(&selection), flags.at(selection));
+        let initial = records.at(0);
+        let validated = context
+            .output("selected-number", selected.0)
+            .unwrap()
+            .output("selected-flag", selected.1)
+            .unwrap()
+            .output("iterated-number", accumulated.0)
+            .unwrap()
+            .output("iterated-flag", accumulated.1)
+            .unwrap()
+            .output("expected-number", expected.0)
+            .unwrap()
+            .output("expected-flag", expected.1)
+            .unwrap()
+            .output("untouched-number", untouched.0)
+            .unwrap()
+            .output("untouched-flag", untouched.1)
+            .unwrap()
+            .output("initial-number", initial.0)
+            .unwrap()
+            .output("initial-flag", initial.1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        for selection in 0..3 {
+            let result = execute(
+                &validated,
+                &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
+                BTreeMap::from([
+                    (
+                        "numbers".to_owned(),
+                        RuntimeValue::IndexedFamily(
+                            [7, 11, 13]
+                                .into_iter()
+                                .map(|value| RuntimeValue::Int(value.into()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "selection".to_owned(),
+                        RuntimeValue::IndexedFamily(vec![RuntimeValue::Int(selection.into())]),
+                    ),
+                    ("flag-0".to_owned(), RuntimeValue::Bool(true)),
+                    ("flag-1".to_owned(), RuntimeValue::Bool(false)),
+                    ("flag-2".to_owned(), RuntimeValue::Bool(true)),
+                ]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+            )
+            .expect("composite execution");
+            for prefix in ["selected", "iterated"] {
+                let (RuntimeValue::Int(actual), RuntimeValue::Int(expected)) = (
+                    &result.outputs[&format!("{prefix}-number")],
+                    &result.outputs["expected-number"],
+                ) else {
+                    panic!("number fields must be integers");
+                };
+                assert_eq!(actual, expected);
+                let (RuntimeValue::Bool(actual), RuntimeValue::Bool(expected)) =
+                    (&result.outputs[&format!("{prefix}-flag")], &result.outputs["expected-flag"])
+                else {
+                    panic!("flag fields must be booleans");
+                };
+                assert_eq!(actual, expected);
+            }
+            let (RuntimeValue::Int(actual), RuntimeValue::Int(expected)) =
+                (&result.outputs["untouched-number"], &result.outputs["initial-number"])
+            else {
+                panic!("number fields must be integers");
+            };
+            assert_eq!(actual, expected);
+            let (RuntimeValue::Bool(actual), RuntimeValue::Bool(expected)) =
+                (&result.outputs["untouched-flag"], &result.outputs["initial-flag"])
+            else {
+                panic!("flag fields must be booleans");
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_lexical_samples_share_outer_draws_and_preserve_each_inner_draw_on_replay() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let shared = ring.uniform_residue((1, 1));
+        let records = parallel(3, |_| Ok((shared.clone(), ring.uniform_residue((1, 1)))))
+            .expect("sample records");
+        let empty = parallel(0, |_| Ok(ring.uniform_residue((1, 1)))).expect("empty sample loop");
+        let mut context = DslContext::new("runtime-lexical-sample-records")
+            .output("shared", shared)
+            .unwrap()
+            .output("empty", empty)
+            .unwrap();
+        for index in 0..3 {
+            let record = records.at(index);
+            context = context
+                .output(format!("outer-{index}"), record.0)
+                .unwrap()
+                .output(format!("inner-{index}"), record.1)
+                .unwrap();
+        }
+        let validated = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+        let mut recorder = crate::transcript::TranscriptRecorder::default();
+        let recorded = execute(
+            &validated,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Record(&mut recorder),
+        )
+        .expect("record lexical samples");
+        assert_eq!(
+            recorder.iter().filter(|(site, _)| site.instantiation_path.is_empty()).count(),
+            1
+        );
+        let inner_indices = recorder
+            .iter()
+            .filter_map(|(site, _)| {
+                site.instantiation_path.last().and_then(|frame| frame.loop_index)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(inner_indices, std::collections::BTreeSet::from([0, 1, 2]));
+        assert_eq!(recorder.iter().count(), 4, "the zero loop must not create a draw");
+        let replayer = recorder.into_replayer();
+        let replayed = execute(
+            &validated,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Replay(&replayer),
+        )
+        .expect("replay lexical samples");
+        for index in 0..3 {
+            assert_eq!(
+                matrix_output(&recorded, &format!("outer-{index}")),
+                matrix_output(&recorded, "shared")
+            );
+            assert_eq!(
+                matrix_output(&recorded, &format!("inner-{index}")),
+                matrix_output(&replayed, &format!("inner-{index}"))
+            );
+            assert_eq!(
+                matrix_output(&replayed, &format!("outer-{index}")),
+                matrix_output(&replayed, "shared")
+            );
+        }
+    }
+
+    #[test]
+    fn iteration_carries_each_output_into_the_next_iteration() {
         let context = DslContext::new("runtime-sequential-scan");
         let increments = context.int_family_input("increments", 3);
-        let total = Sequential::range(3)
-            .scan(Int::constant(0), increments, |index, total, increments| {
-                Ok(total.add(increments.get(index.as_int())))
-            })
-            .expect("sequential scan");
+        let total =
+            iterate(3, Int::constant(0), |index, total| Ok(total.add(increments.at(index))))
+                .expect("sequential scan");
         let validated = context
             .int_output("total", total)
             .expect("output")
@@ -5614,9 +5772,8 @@ mod tests {
             matches!(&result.outputs["total"], RuntimeValue::Int(value) if value == &BigInt::from(6))
         );
 
-        let untouched = Sequential::range(0)
-            .scan(Int::constant(7), Int::constant(99), |_, state, _| Ok(state))
-            .expect("empty sequential scan");
+        let untouched =
+            iterate(0, Int::constant(7), |_, state| Ok(state)).expect("empty sequential scan");
         let validated = DslContext::new("runtime-empty-sequential-scan")
             .int_output("value", untouched)
             .expect("output")
@@ -5638,11 +5795,10 @@ mod tests {
 
         let initial =
             Family::<Int>::pack(vec![Int::constant(0), Int::constant(0)]).expect("initial family");
-        let state = Sequential::range(3)
-            .scan(initial, Int::constant(0), |layer, state, _| {
-                state.parallel_map(|_, value| value.add(layer.as_int()))
-            })
-            .expect("nested sequential and parallel loop");
+        let state = iterate(3, initial, |layer, state| {
+            parallel(2, |index| Ok(state.at(index).add(layer.clone())))
+        })
+        .expect("nested sequential and parallel loop");
         let validated = DslContext::new("runtime-nested-sequential-parallel")
             .int_family_output("state", state)
             .expect("output")
@@ -5672,7 +5828,15 @@ mod tests {
     fn nested_parallel_segment_pack_executes_little_endian_bits() {
         let context = DslContext::new("runtime-segmented-bit-pack");
         let bits = context.int_family_input("bits", 6);
-        let packed = bits.parallel_pack_little_endian_bits(2, 3).expect("segmented bit packing");
+        let packed = parallel(2, |segment| {
+            let (value, _) =
+                iterate(3, (Int::constant(0), Int::constant(1)), |bit, (sum, weight)| {
+                    let index = segment.clone().mul(Int::constant(3)).add(bit);
+                    Ok((sum.add(bits.at(index).mul(weight.clone())), weight.mul(Int::constant(2))))
+                })?;
+            Ok(value)
+        })
+        .expect("segmented bit packing");
         let validated = context
             .int_family_output("packed", packed)
             .expect("output")
@@ -5704,7 +5868,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_zip_many_executes_matrix_batches_in_bounded_waves() {
+    fn parallel_iteration_executes_matrix_batches_in_bounded_waves() {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
@@ -5713,12 +5877,16 @@ mod tests {
                 Family::pack(vec![ring.identity(1), ring.zero((1, 1))]).expect("matrix family")
             })
             .collect::<Vec<_>>();
-        let sums = Family::parallel_zip_many_values(families, |_, inputs| {
-            inputs.into_iter().reduce(|left, right| left + right).expect("non-empty batch")
+        let sums = parallel(2, |index| {
+            Ok(families
+                .iter()
+                .map(|family| family.at(&index))
+                .reduce(|left, right| left + right)
+                .expect("non-empty batch"))
         })
         .expect("parallel zip many");
-        let first_sum = sums.get_static(0);
-        let second_sum = sums.get_static(1);
+        let first_sum = sums.at(0);
+        let second_sum = sums.at(1);
         let built = DslContext::new("runtime-parallel-zip-many")
             .output("first-sum", first_sum)
             .expect("first output")
@@ -5758,9 +5926,9 @@ mod tests {
         let parameters = DCRTPolyParams::default();
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
-        let family = Parallel::range(0)
-            .map(|index| ring.polynomial([index.expression()]))
-            .expect("empty range loop");
+        let family =
+            parallel(0, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+                .expect("empty range loop");
         let built = DslContext::new("runtime-empty-range")
             .family_output("values", family)
             .expect("output")
@@ -5811,11 +5979,15 @@ mod tests {
             reverse.call((one.clone(), two.clone())).expect("subgraph call");
         let left = Family::pack(vec![one.clone(), two.clone()]).expect("left family");
         let right = Family::pack(vec![two.clone(), one.clone()]).expect("right family");
-        let zipped = left.parallel_zip(right.clone(), |_, _left, right| right).expect("zip");
-        let actual_family_zero = zipped.get_static(0);
-        let actual_family_one = zipped.get_static(1);
-        let expected_family_zero = right.get_static(0);
-        let expected_family_one = right.get_static(1);
+        let zipped = parallel(2, |index| {
+            // Both inputs pass through the child, with the second one selected as its first output.
+            reverse.call((left.at(&index), right.at(index))).map(|values| values.0)
+        })
+        .expect("parallel input order");
+        let actual_family_zero = zipped.at(0);
+        let actual_family_one = zipped.at(1);
+        let expected_family_zero = right.at(0);
+        let expected_family_one = right.at(1);
         let built = DslContext::new("runtime-child-input-order")
             .output("actual-one", actual_one)
             .expect("output")
@@ -6103,7 +6275,7 @@ mod tests {
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let family = Family::pack(vec![ring.polynomial([10.into()]), ring.polynomial([20.into()])])
             .expect("family");
-        let selected = family.get(ring.input("index", (1, 1)).extract_coefficient(0));
+        let selected = family.at(ring.input("index", (1, 1)).extract_coefficient(0));
         let validated = DslContext::new("runtime-dynamic-family")
             .output("selected", selected)
             .expect("output")
@@ -6141,5 +6313,164 @@ mod tests {
             ),
             Err(ExecutionError::SelectIndexOutOfRange { index, count: 2, .. }) if index == BigInt::from(2)
         ));
+    }
+    #[test]
+    fn test_natural_boolean_operators_match_rust_truth_tables() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = Ring::new(17, 1);
+        let left = ring.bool_input("left");
+        let right = ring.bool_input("right");
+        let graph = DslContext::new("natural-boolean-operators")
+            .output(
+                "owned",
+                (
+                    left.clone() & right.clone(),
+                    left.clone() | right.clone(),
+                    left.clone() ^ right.clone(),
+                    !left.clone(),
+                ),
+            )
+            .unwrap()
+            .output("borrowed", (&left & &right, &left | &right, &left ^ &right, !&left))
+            .unwrap()
+            .output(
+                "literals",
+                (false | &left, true & right.clone(), &left ^ false, !mxx_dsl::Bool::from(true)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        for (left, right) in [(false, false), (false, true), (true, false), (true, true)] {
+            let result = execute(
+                &graph,
+                &mut cpu_backend([parameters.clone()]),
+                BTreeMap::from([
+                    ("left".to_owned(), RuntimeValue::Bool(left)),
+                    ("right".to_owned(), RuntimeValue::Bool(right)),
+                ]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+            )
+            .unwrap();
+            for (index, expected) in
+                [left & right, left | right, left ^ right, !left].into_iter().enumerate()
+            {
+                assert!(
+                    matches!(result.outputs[&format!("owned.{index}")], RuntimeValue::Bool(actual) if actual == expected)
+                );
+                assert!(
+                    matches!(result.outputs[&format!("borrowed.{index}")], RuntimeValue::Bool(actual) if actual == expected)
+                );
+            }
+            for (index, expected) in [left, right, left, false].into_iter().enumerate() {
+                assert!(
+                    matches!(result.outputs[&format!("literals.{index}")], RuntimeValue::Bool(actual) if actual == expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_natural_matrix_operators_match_polynomial_matrix_primitives() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = Ring::new(
+            BigInt::from(parameters.modulus().as_ref().clone()),
+            parameters.ring_dimension() as usize,
+        );
+        let matrix = ring.input("matrix", (2, 2));
+        let combined = -&matrix + &matrix * 3 + 2 * &matrix - &matrix;
+        let square = &matrix * &matrix;
+        let graph = DslContext::new("natural-matrix-operators")
+            .output("combined", combined)
+            .unwrap()
+            .output("square", square)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut rng = rand::rng();
+        let values = (0..2)
+            .map(|_| {
+                (0..2)
+                    .map(|_| {
+                        let coefficients = (0..parameters.ring_dimension())
+                            .map(|_| num_bigint::BigUint::from(rng.random_range(0..100u32)))
+                            .collect::<Vec<_>>();
+                        DCRTPoly::from_biguints(&parameters, &coefficients)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let input = DCRTPolyMatrix::from_poly_vec(&parameters, values);
+        let expected_combined =
+            input.multiply_poly_out_of_place(&DCRTPoly::from_usize_to_constant(&parameters, 3));
+        let expected_square = input.multiply_out_of_place(&input);
+        let result = execute(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::from([("matrix".to_owned(), RuntimeValue::matrix(input))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        assert_eq!(matrix_output(&result, "combined"), &expected_combined);
+        assert_eq!(matrix_output(&result, "square"), &expected_square);
+    }
+
+    #[test]
+    fn test_natural_integer_operators_preserve_runtime_bigints_and_division() {
+        let context = DslContext::new("natural-integer-operators");
+        let input = context.input::<Int>("integer", mxx_dsl::IntType).unwrap();
+        let graph = context
+            .output("neg-owned", -input.clone())
+            .unwrap()
+            .output("neg-borrowed", -&input)
+            .unwrap()
+            .output("mixed", (7 - &input).add(&input).mul(3).sub(1))
+            .unwrap()
+            .output("equal", input.clone().equal(&input))
+            .unwrap()
+            .output("less", input.clone().less(0))
+            .unwrap()
+            .output("less-equal", input.less_equal(-1))
+            .unwrap()
+            .output("quotient", Int::constant(-7) / -3)
+            .unwrap()
+            .output("remainder", Int::constant(-7) % -3)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let integer = -(BigInt::from(1u8) << 200usize) + BigInt::from(5);
+        let result = execute(
+            &graph,
+            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
+            BTreeMap::from([("integer".to_owned(), RuntimeValue::Int(integer.clone()))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        for name in ["neg-owned", "neg-borrowed"] {
+            assert!(
+                matches!(&result.outputs[name], RuntimeValue::Int(actual) if actual == &-integer.clone())
+            );
+        }
+        assert!(
+            matches!(&result.outputs["mixed"], RuntimeValue::Int(actual) if actual == &BigInt::from(20))
+        );
+        for name in ["equal", "less", "less-equal"] {
+            assert!(matches!(result.outputs[name], RuntimeValue::Bool(true)));
+        }
+        // Runtime integer division uses the absolute divisor, including for negative divisors.
+        assert!(
+            matches!(&result.outputs["quotient"], RuntimeValue::Int(actual) if actual == &BigInt::from((-7i64).div_euclid((-3i64).abs())))
+        );
+        assert!(
+            matches!(&result.outputs["remainder"], RuntimeValue::Int(actual) if actual == &BigInt::from((-7i64).rem_euclid((-3i64).abs())))
+        );
     }
 }

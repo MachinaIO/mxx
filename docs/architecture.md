@@ -53,7 +53,8 @@ semantics, while their mathematical bounds and proofs remain application-owned.
 
 Creates immutable core nodes immediately. It has no symbolic reinterpretation layer.
 The constructed graphs feed core-owned `IdealSpec` and `PurePredicateSpec` validation.
-Indexed `Family` operations create structural parallel loops.
+Indexed `Family<T>` values preserve composite element schemas. `parallel` and `iterate` create
+structural loops; lexical reads become explicit core dependencies with inferred member indexing.
 
 ### `mxx-runtime`
 

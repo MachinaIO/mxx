@@ -11,7 +11,7 @@ mod tests {
         let residuals =
             Family::pack(vec![ring.zero((1, 1)), ring.zero((1, 1))]).expect("residual family");
         let decoder_source =
-            if decoder_uses_residual_lane { residuals.get_static(0) } else { ring.zero((1, 1)) };
+            if decoder_uses_residual_lane { residuals.at(0) } else { ring.zero((1, 1)) };
         let decoder = decoder_source
             .slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None)
             .threshold_decode_bools(IntExpr::constant(17), 1)
@@ -108,7 +108,7 @@ mod tests {
             .expect("carrier anchor");
         let coefficient = residual.clone().extract_coefficient(0);
         let quarter = Int::evaluate(IntExpr::RoundDiv(
-            Box::new(IntExpr::Sub(Box::new(IntExpr::constant(17)), Box::new(IntExpr::constant(2)))),
+            Box::new(IntExpr::constant(17) - 2),
             Box::new(IntExpr::constant(4)),
         ));
         let decoded = quarter
@@ -280,7 +280,7 @@ mod tests {
             .expect("carrier anchor");
         let coefficient = residual.clone().extract_coefficient(0);
         let quarter = Int::evaluate(IntExpr::RoundDiv(
-            Box::new(IntExpr::Sub(Box::new(decoder_modulus), Box::new(IntExpr::constant(2)))),
+            Box::new(decoder_modulus - 2),
             Box::new(IntExpr::constant(4)),
         ));
         let decoded = quarter

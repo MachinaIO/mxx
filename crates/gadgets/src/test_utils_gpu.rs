@@ -16,7 +16,7 @@ use crate::{
     },
     test_utils::{build_circuit_graph, diagonal_matrix},
 };
-use mxx_dsl::{DslContext, Family, Ring};
+use mxx_dsl::{DslContext, Family, Ring, parallel};
 use mxx_ir_core::{ParamEnv, node::NodeKind};
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -100,14 +100,18 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
     let families = (0..4)
         .map(|_| Family::pack(vec![ring.identity(1), ring.zero((1, 1))]).expect("matrix family"))
         .collect::<Vec<_>>();
-    let sums = Family::parallel_zip_many_values(families, |_, inputs| {
-        inputs.into_iter().reduce(|left, right| left + right).expect("non-empty batch")
+    let sums = parallel(2, |index| {
+        Ok(families
+            .iter()
+            .map(|family| family.at(&index))
+            .reduce(|left, right| left + right)
+            .expect("non-empty batch"))
     })
     .expect("parallel matrix batch");
     let built = DslContext::new("gpu-parallel-matrix-batch")
-        .output("first", sums.get_static(0))
+        .output("first", sums.at(0))
         .expect("first output")
-        .output("second", sums.get_static(1))
+        .output("second", sums.at(1))
         .expect("second output")
         .build()
         .expect("build GPU batch graph");

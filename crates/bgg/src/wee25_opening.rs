@@ -191,8 +191,7 @@ impl Wee25CommitmentCompiler {
         let verifier = self.verifier(message_blocks.len(), Some(range.clone()), parameters)?;
         let message = concat_columns(message_blocks[range].to_vec());
         Ok(Wee25VerificationWire {
-            residual: commitment.clone() * verifier -
-                (message - parameters.b.clone() * opening.clone()),
+            residual: commitment * verifier - (message - &parameters.b * opening),
         })
     }
 
@@ -220,7 +219,7 @@ impl Wee25CommitmentCompiler {
             parameters.t_top.len() != self.public_parameter_top_family_count() ||
             parameters.t_top.par_iter().any(|family| {
                 family.count() != &IntExpr::constant(self.public_parameter_block_count()) || {
-                    let element = family.get_static(0);
+                    let element = family.at(0);
                     element.matrix_type() != &part_type
                 }
             }) ||
@@ -254,11 +253,7 @@ impl Wee25CommitmentCompiler {
         let sibling = column / child_count;
         let commitments = (0..self.tree_base)
             .map(|child| {
-                nodes.get_static(self.cache_node_index(
-                    total,
-                    offset + child * child_count,
-                    child_count,
-                ))
+                nodes.at(self.cache_node_index(total, offset + child * child_count, child_count))
             })
             .collect();
         let key = (offset, blocks.len(), sibling);
@@ -312,24 +307,15 @@ impl Wee25CommitmentCompiler {
                         parameters.t_top[digit_row * self.public_parameter_part_count() +
                             column * self.digit_count +
                             digit]
-                            .get_static(message_column)
+                            .at(message_column)
                     })
                     .collect::<Vec<_>>();
                 let scalar = decomposition
                     .clone()
-                    .mul_small_rhs(
-                        self.ring().constant(
-                            (
-                                1,
-                                IntExpr::Mul(
-                                    Box::new(message.matrix_type().rows.clone()),
-                                    Box::new(self.digit_count.into()),
-                                )
-                                .canonicalize(),
-                            ),
-                            ConstantMatrix::UnitRow { index: digit_row.into() },
-                        ),
-                    )
+                    .mul_small_rhs(self.ring().constant(
+                        (1, (&message.matrix_type().rows * self.digit_count).canonicalize()),
+                        ConstantMatrix::UnitRow { index: digit_row.into() },
+                    ))
                     .slice(
                         Some(IndexRange { start: 0.into(), end: 1.into() }),
                         Some(IndexRange {
@@ -361,7 +347,7 @@ impl Wee25CommitmentCompiler {
 
     fn verifier_base(&self, parameters: &Wee25PublicParameterWires, leaf: bool) -> Mat {
         let chunks = (0..self.public_parameter_part_count())
-            .map(|part| parameters.t_bottom.get_static(part))
+            .map(|part| parameters.t_bottom.at(part))
             .collect();
         let bottom = concat_columns(chunks);
         if !leaf {
@@ -467,8 +453,8 @@ mod tests {
             preimage_max_coefficient_bound: 31.into(),
         };
         let parameters = compiler.import_public_parameters(&artifacts).unwrap();
-        let top = parameters.t_top[0].get_static(0);
-        let bottom = parameters.t_bottom.get_static(0);
+        let top = parameters.t_top[0].at(0);
+        let bottom = parameters.t_bottom.at(0);
         let lhs =
             compiler.ring().input("lhs", (compiler.public_columns(), compiler.public_columns()));
         let product = top.clone().mul_small_rhs(lhs);
@@ -885,7 +871,7 @@ mod tests {
             compiler.public_parameter_top_family_count()
         );
         assert!(public.public_parameters.t_top.iter().all(|family| {
-            let element = family.get_static(0);
+            let element = family.at(0);
             element.matrix_type() ==
                 &compiler.matrix_type(compiler.public_columns(), compiler.public_columns()) &&
                 element.max_coefficient_bound() == &1_000_000.into()

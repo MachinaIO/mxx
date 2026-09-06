@@ -632,19 +632,20 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for NaivePublicKeyLowering<P> {
             .public_key
             .ring
             .polynomial(scalar.iter().copied().map(mxx_ir_core::IntExpr::constant));
-        let matrices = input.matrices.clone().parallel_map({
+        let matrices = {
             let compiler = self.compiler.public_key.clone();
             let scalar = scalar.clone();
             let reveal = input.reveal_plaintext;
-            move |_, matrix| {
-                compiler
+            mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+                let matrix = input.matrices.at(&index);
+                Ok(compiler
                     .small_scalar_mul(
                         &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
                         &scalar,
                     )
-                    .matrix
-            }
-        })?;
+                    .matrix)
+            })
+        }?;
         Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: input.reveal_plaintext })
     }
 
@@ -661,19 +662,20 @@ impl<P: Poly> ArithmeticCircuitLowering<P> for NaivePublicKeyLowering<P> {
                 .map(num_bigint::BigInt::from)
                 .map(mxx_ir_core::IntExpr::constant),
         );
-        let matrices = input.matrices.clone().parallel_map({
+        let matrices = {
             let compiler = self.compiler.public_key.clone();
             let scalar = scalar.clone();
             let reveal = input.reveal_plaintext;
-            move |_, matrix| {
-                compiler
+            mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+                let matrix = input.matrices.at(&index);
+                Ok(compiler
                     .large_scalar_mul(
                         &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
                         &scalar,
                     )
-                    .matrix
-            }
-        })?;
+                    .matrix)
+            })
+        }?;
         Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: input.reveal_plaintext })
     }
 }

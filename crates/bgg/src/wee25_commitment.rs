@@ -216,7 +216,6 @@ impl Wee25CommitmentCompiler {
 mod tests {
     use super::*;
     use keccak_asm::Keccak256;
-    use mxx_dsl::Parallel;
     use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
@@ -283,14 +282,13 @@ mod tests {
         let blocks = (0..2)
             .map(|index| ring.input(format!("block-{index}"), (1, compiler.public_columns())))
             .collect::<Vec<_>>();
-        let roots = Parallel::range(2)
-            .map(move |_| {
-                compiler
-                    .commitment_tree(hash_key.clone(), &blocks)
-                    .expect("commitment in parallel body")
-                    .root
-            })
-            .expect("parallel family");
+        let roots = mxx_dsl::parallel(2, |_| {
+            Ok(compiler
+                .commitment_tree(hash_key.clone(), &blocks)
+                .expect("commitment in parallel body")
+                .root)
+        })
+        .expect("parallel family");
         let built = DslContext::new("wee25-parallel-composition")
             .family_output("roots", roots)
             .expect("family output")
@@ -362,9 +360,8 @@ mod tests {
             .unwrap();
         let mut context = DslContext::new("wee25-parity").output("root", tree.root).unwrap();
         for index in 0..compiler.cache_node_count(4) {
-            context = context
-                .output(format!("cache-{index}"), tree.cached_nodes.get_static(index))
-                .unwrap();
+            context =
+                context.output(format!("cache-{index}"), tree.cached_nodes.at(index)).unwrap();
         }
         let built = context.build().unwrap();
         let validated = built.validate(&ParamEnv::default()).unwrap();

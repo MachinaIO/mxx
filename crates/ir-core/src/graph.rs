@@ -1,13 +1,13 @@
 use crate::{
     artifact::ArtifactConfidentiality,
     expr::RealExpr,
-    node::{NodeKind, ParallelLoop, SequentialLoop, SubgraphCall},
+    node::{LoopInputMode, NodeKind, ParallelLoop, SequentialLoop, SubgraphCall},
     types::{NodeId, Port, WireRef, WireType},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -68,22 +68,43 @@ pub enum BenchmarkRole {
 }
 
 /// Process-local scope marker used only while sealing closure bodies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct ConstructionScopeId(u64);
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ConstructionScopeId(Option<Arc<ConstructionScope>>);
+
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct ConstructionScope {
+    id: u64,
+    parent: ConstructionScopeId,
+}
 
 impl ConstructionScopeId {
+    /// Returns whether this scope is the given scope itself or one of its lexical ancestors.
+    pub fn is_ancestor_of(&self, scope: &Self) -> bool {
+        let mut current = Some(scope);
+        while let Some(scope) = current {
+            if self == scope {
+                return true;
+            }
+            current = scope.0.as_ref().map(|scope| &scope.parent);
+        }
+        false
+    }
+
     fn fresh() -> Self {
-        Self(NEXT_CONSTRUCTION_SCOPE.fetch_add(1, Ordering::Relaxed))
+        Self(Some(Arc::new(ConstructionScope {
+            id: NEXT_CONSTRUCTION_SCOPE.fetch_add(1, Ordering::Relaxed),
+            parent: current_construction_scope(),
+        })))
     }
 }
 
 pub fn current_construction_scope() -> ConstructionScopeId {
-    CONSTRUCTION_SCOPES.with(|scopes| scopes.borrow().last().copied().unwrap_or(SelfRoot::ID))
+    CONSTRUCTION_SCOPES.with(|scopes| scopes.borrow().last().cloned().unwrap_or(SelfRoot::ID))
 }
 
 struct SelfRoot;
 impl SelfRoot {
-    const ID: ConstructionScopeId = ConstructionScopeId(0);
+    const ID: ConstructionScopeId = ConstructionScopeId(None);
 }
 
 pub fn with_new_construction_scope<T>(f: impl FnOnce(ConstructionScopeId) -> T) -> T {
@@ -97,7 +118,7 @@ pub fn with_new_construction_scope<T>(f: impl FnOnce(ConstructionScopeId) -> T) 
     }
 
     let scope = ConstructionScopeId::fresh();
-    CONSTRUCTION_SCOPES.with(|scopes| scopes.borrow_mut().push(scope));
+    CONSTRUCTION_SCOPES.with(|scopes| scopes.borrow_mut().push(scope.clone()));
     let guard = PopScope;
     let output = f(scope);
     drop(guard);
@@ -233,7 +254,7 @@ impl NodeHandle {
     }
 
     pub fn construction_scope(&self) -> ConstructionScopeId {
-        self.0.construction_scope
+        self.0.construction_scope.clone()
     }
 
     fn identity(&self) -> NodeIdentity {
@@ -346,17 +367,19 @@ impl SubgraphHandle {
     }
 
     pub fn construction_scope(&self) -> ConstructionScopeId {
-        self.0.scope
+        self.0.scope.clone()
     }
 
     /// Seals a closure body and makes every permitted foreign value an
     /// explicit input. The returned captures are ordered exactly like the
-    /// appended placeholder inputs.
+    /// appended placeholder inputs. Dependencies named in `preserved_values`
+    /// must remain reachable when indexed reads are lowered to member inputs.
     pub fn seal(
         name: impl Into<String>,
         scope: ConstructionScopeId,
         explicit_inputs: Vec<ValueHandle>,
         outputs: Vec<ValueHandle>,
+        preserved_values: &[ValueHandle],
         captures: CapturePolicy,
     ) -> Result<SealedSubgraph, FreezeError> {
         let name = name.into();
@@ -364,8 +387,12 @@ impl SubgraphHandle {
             return Err(FreezeError::ForeignScope { graph: name });
         }
         let mut sealer = ScopeSealer {
-            scope,
+            scope: scope.clone(),
             policy: captures,
+            preserved_values: preserved_values
+                .iter()
+                .map(|value| (value.node.identity(), value.port))
+                .collect(),
             nodes: HashMap::new(),
             captured: Vec::new(),
             capture_inputs: HashMap::new(),
@@ -398,18 +425,18 @@ impl SubgraphHandle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapturePolicy {
     Reject,
-    /// Broadcast scalar values and read-only artifact families into a
-    /// structural child scope.
-    ///
-    /// Arbitrary executable families remain rejected because their member
-    /// dataflow cannot be reconstructed from an opaque family input.
-    BroadcastScalarsAndArtifactFamilies,
+    /// Read values from lexical ancestor scopes. Indexed reads using this
+    /// parallel binder become member inputs rather than whole-family broadcasts.
+    Lexical {
+        parallel_index: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct CapturedValue {
     pub outer: ValueHandle,
     pub placeholder: ValueHandle,
+    pub mode: LoopInputMode,
 }
 
 #[derive(Clone, Debug)]
@@ -433,17 +460,37 @@ impl SealMap {
 struct ScopeSealer {
     scope: ConstructionScopeId,
     policy: CapturePolicy,
+    preserved_values: HashSet<(NodeIdentity, Port)>,
     nodes: HashMap<NodeIdentity, NodeHandle>,
     captured: Vec<CapturedValue>,
-    capture_inputs: HashMap<(NodeIdentity, Port), ValueHandle>,
+    capture_inputs: HashMap<(NodeIdentity, Port, Option<usize>), ValueHandle>,
 }
 
 impl ScopeSealer {
     fn value(&mut self, value: &ValueHandle) -> Result<ValueHandle, FreezeError> {
         if value.construction_scope() != self.scope {
-            return self.capture(value);
+            return self.capture(value, LoopInputMode::Broadcast);
         }
         let identity = value.node.identity();
+        if !self.nodes.contains_key(&identity) {
+            if let CapturePolicy::Lexical { parallel_index: Some(slot) } = self.policy {
+                if matches!(value.node.kind(), NodeKind::FamilyGetDynamic) &&
+                    let [family, index] = value.node.arguments() &&
+                    family.construction_scope() != self.scope &&
+                    let Some(offset) = parallel_index_offset(index, slot, &self.scope) &&
+                    self.can_elide_index(index)
+                {
+                    let mode = if offset == 0 {
+                        LoopInputMode::Zip
+                    } else {
+                        LoopInputMode::ZipOffset { offset }
+                    };
+                    let input = self.capture(family, mode)?;
+                    self.nodes.insert(identity, input.node.clone());
+                    return Ok(input);
+                }
+            }
+        }
         let node = if let Some(node) = self.nodes.get(&identity) {
             node.clone()
         } else {
@@ -458,14 +505,17 @@ impl ScopeSealer {
             let node = if unchanged {
                 value.node.clone()
             } else {
-                NodeHandle::new_in_scope(
-                    self.scope,
+                let mut copied = NodeHandle::new_in_scope(
+                    self.scope.clone(),
                     value.node.kind().clone(),
                     arguments,
                     value.node.output_types().to_vec(),
                     value.node.source_location().cloned(),
                     value.node.0.child.clone(),
-                )
+                );
+                Arc::get_mut(&mut copied.0).expect("new node").benchmark_role =
+                    value.node.benchmark_role();
+                copied
             };
             self.nodes.insert(identity, node.clone());
             node
@@ -473,27 +523,52 @@ impl ScopeSealer {
         node.output(value.port.0).ok_or(FreezeError::InvalidPort { port: value.port.0 })
     }
 
-    fn capture(&mut self, value: &ValueHandle) -> Result<ValueHandle, FreezeError> {
+    fn can_elide_index(&self, value: &ValueHandle) -> bool {
+        !self.preserved_values.contains(&(value.node.identity(), value.port)) &&
+            value.node.arguments().iter().all(|argument| self.can_elide_index(argument))
+    }
+
+    fn capture(
+        &mut self,
+        value: &ValueHandle,
+        mode: LoopInputMode,
+    ) -> Result<ValueHandle, FreezeError> {
         if self.policy == CapturePolicy::Reject {
             return Err(FreezeError::ForeignScope { graph: "subgraph capture".to_owned() });
+        }
+        if !value.construction_scope().is_ancestor_of(&self.scope) {
+            return Err(FreezeError::ForeignScope {
+                graph: "non-ancestor lexical capture".to_owned(),
+            });
         }
         let artifact = match value.node.kind() {
             NodeKind::Input { artifact, .. } => artifact.clone(),
             _ => None,
         };
-        let is_artifact_family = artifact.is_some();
-        if matches!(value.wire_type(), WireType::IndexedFamily { .. }) && !is_artifact_family {
-            return Err(FreezeError::ForeignScope { graph: "parallel family capture".to_owned() });
-        }
-        let key = (value.node.identity(), value.port);
+        let offset = match mode {
+            LoopInputMode::Broadcast => None,
+            LoopInputMode::Zip => Some(0),
+            LoopInputMode::ZipOffset { offset } => Some(offset),
+        };
+        let key = (value.node.identity(), value.port, offset);
         if let Some(input) = self.capture_inputs.get(&key) {
             return Ok(input.clone());
         }
         let name = format!("__capture_{}", self.captured.len());
-        let ty = value.wire_type().clone();
+        let ty = match (mode, value.wire_type()) {
+            (
+                LoopInputMode::Zip | LoopInputMode::ZipOffset { .. },
+                WireType::IndexedFamily { element, .. },
+            ) => *element.clone(),
+            _ => value.wire_type().clone(),
+        };
         let input = NodeHandle::new_in_scope(
-            self.scope,
-            NodeKind::Input { name, wire_type: ty.clone(), artifact },
+            self.scope.clone(),
+            NodeKind::Input {
+                name,
+                wire_type: ty.clone(),
+                artifact: if mode == LoopInputMode::Broadcast { artifact } else { None },
+            },
             Vec::new(),
             vec![ty],
             value.node.source_location().cloned(),
@@ -502,8 +577,63 @@ impl ScopeSealer {
         .output(0)
         .expect("input has one output");
         self.capture_inputs.insert(key, input.clone());
-        self.captured.push(CapturedValue { outer: value.clone(), placeholder: input.clone() });
+        self.captured.push(CapturedValue {
+            outer: value.clone(),
+            placeholder: input.clone(),
+            mode,
+        });
         Ok(input)
+    }
+}
+
+/// Recognize only exact binder reads and nonnegative constant offsets. Other
+/// expressions retain runtime indexing and its bounds checks.
+fn parallel_index_offset(
+    value: &ValueHandle,
+    slot: u32,
+    scope: &ConstructionScopeId,
+) -> Option<usize> {
+    use crate::{IntExpr, node::IntBinaryOp};
+    use num_traits::ToPrimitive;
+
+    fn expression_offset(expression: &IntExpr, slot: u32) -> Option<usize> {
+        match expression {
+            IntExpr::LoopIndex(index) if *index == slot => Some(0),
+            IntExpr::Add(left, right) => {
+                let (index, constant) = match (&**left, &**right) {
+                    (index, IntExpr::Const(constant)) | (IntExpr::Const(constant), index) => {
+                        (index, constant)
+                    }
+                    _ => return None,
+                };
+                expression_offset(index, slot)?.checked_add(constant.to_usize()?)
+            }
+            _ => None,
+        }
+    }
+
+    if &value.construction_scope() != scope {
+        return None;
+    }
+    match value.node.kind() {
+        NodeKind::EvaluateInt(expression) => expression_offset(&expression.canonicalize(), slot),
+        NodeKind::IntBinary(IntBinaryOp::Add) => {
+            let [left, right] = value.node.arguments() else { return None };
+            let constant = |value: &ValueHandle| match value.node.kind() {
+                NodeKind::EvaluateInt(IntExpr::Const(constant)) |
+                NodeKind::ConstantInt(constant)
+                    if &value.construction_scope() == scope =>
+                {
+                    constant.to_usize()
+                }
+                _ => None,
+            };
+            parallel_index_offset(left, slot, scope)
+                .zip(constant(right))
+                .or_else(|| parallel_index_offset(right, slot, scope).zip(constant(left)))
+                .and_then(|(index, constant)| index.checked_add(constant))
+        }
+        _ => None,
     }
 }
 
@@ -931,7 +1061,7 @@ fn freeze_scope(
     let mut roots = outputs.to_vec();
     roots.extend_from_slice(effects);
     roots.extend_from_slice(inputs);
-    let nodes = canonical_postorder(&roots, construction_scope)?;
+    let nodes = canonical_postorder(&roots, construction_scope.clone())?;
     let node_ids = nodes
         .iter()
         .enumerate()
@@ -1185,7 +1315,7 @@ impl SerializedScope {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             nodes.push(NodeHandle::new_in_scope(
-                scope,
+                scope.clone(),
                 node.kind,
                 arguments,
                 node.output_types,
@@ -1245,6 +1375,361 @@ mod tests {
         )
         .output(0)
         .unwrap()
+    }
+
+    fn family_input(name: &str) -> ValueHandle {
+        let ty = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix_type())),
+            count: IntExpr::constant(8),
+        };
+        NodeHandle::new(
+            NodeKind::Input { name: name.to_owned(), wire_type: ty.clone(), artifact: None },
+            Vec::new(),
+            vec![ty],
+        )
+        .output(0)
+        .unwrap()
+    }
+
+    fn indexed(family: &ValueHandle, index: IntExpr) -> ValueHandle {
+        let index = NodeHandle::new(NodeKind::EvaluateInt(index), Vec::new(), vec![WireType::Int])
+            .output(0)
+            .unwrap();
+        NodeHandle::new(
+            NodeKind::FamilyGetDynamic,
+            vec![family.clone(), index],
+            vec![WireType::Matrix(matrix_type())],
+        )
+        .output(0)
+        .unwrap()
+    }
+
+    #[test]
+    fn test_lexical_index_reads_infer_distinct_member_and_broadcast_inputs() {
+        let family = family_input("family");
+        let (scope, direct, duplicate, offset, dynamic, literal_offset) =
+            with_new_construction_scope(|scope| {
+                let binder = NodeHandle::new(
+                    NodeKind::EvaluateInt(IntExpr::LoopIndex(2)),
+                    Vec::new(),
+                    vec![WireType::ConstantInt],
+                )
+                .output(0)
+                .unwrap();
+                let one = NodeHandle::new(
+                    NodeKind::ConstantInt(1.into()),
+                    Vec::new(),
+                    vec![WireType::ConstantInt],
+                )
+                .output(0)
+                .unwrap();
+                let index = NodeHandle::new(
+                    NodeKind::IntBinary(crate::node::IntBinaryOp::Add),
+                    vec![binder, one],
+                    vec![WireType::Int],
+                )
+                .output(0)
+                .unwrap();
+                let literal_offset = NodeHandle::new(
+                    NodeKind::FamilyGetDynamic,
+                    vec![family.clone(), index],
+                    vec![WireType::Matrix(matrix_type())],
+                )
+                .output(0)
+                .unwrap();
+                (
+                    scope,
+                    indexed(&family, IntExpr::LoopIndex(2)),
+                    indexed(&family, IntExpr::LoopIndex(2)),
+                    indexed(
+                        &family,
+                        IntExpr::Add(
+                            Box::new(IntExpr::LoopIndex(2)),
+                            Box::new(IntExpr::constant(1)),
+                        ),
+                    ),
+                    indexed(&family, IntExpr::LoopIndex(1)),
+                    literal_offset,
+                )
+            });
+        let sealed = SubgraphHandle::seal(
+            "indexed",
+            scope,
+            Vec::new(),
+            vec![direct.clone(), duplicate, offset, dynamic, literal_offset],
+            &[],
+            CapturePolicy::Lexical { parallel_index: Some(2) },
+        )
+        .unwrap();
+        assert_eq!(
+            sealed.captures.iter().map(|capture| capture.mode).collect::<Vec<_>>(),
+            vec![
+                LoopInputMode::Zip,
+                LoopInputMode::ZipOffset { offset: 1 },
+                LoopInputMode::Broadcast
+            ]
+        );
+        assert!(sealed.captures.iter().all(|capture| capture.outer == family));
+        assert_eq!(sealed.handle.outputs()[0], sealed.handle.outputs()[1]);
+        assert_eq!(sealed.handle.outputs()[2], sealed.handle.outputs()[4]);
+        assert_eq!(sealed.remap.resolve(&direct), Some(&sealed.handle.outputs()[0]));
+        assert!(matches!(sealed.handle.outputs()[0].node().kind(), NodeKind::Input { .. }));
+        assert!(matches!(sealed.handle.outputs()[3].node().kind(), NodeKind::FamilyGetDynamic));
+        assert!(matches!(sealed.captures[0].placeholder.wire_type(), WireType::Matrix(_)));
+        assert!(matches!(
+            sealed.captures[2].placeholder.wire_type(),
+            WireType::IndexedFamily { .. }
+        ));
+    }
+
+    #[test]
+    fn test_index_lowering_retains_dynamic_bounds_for_negative_offsets() {
+        let family = family_input("family");
+        let (scope, output) = with_new_construction_scope(|scope| {
+            let index =
+                IntExpr::Sub(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(1)));
+            (scope, indexed(&family, index))
+        });
+        let sealed = SubgraphHandle::seal(
+            "negative-offset",
+            scope,
+            Vec::new(),
+            vec![output],
+            &[],
+            CapturePolicy::Lexical { parallel_index: Some(0) },
+        )
+        .unwrap();
+        assert_eq!(sealed.captures.len(), 1);
+        assert_eq!(sealed.captures[0].mode, LoopInputMode::Broadcast);
+        assert!(matches!(sealed.handle.outputs()[0].node().kind(), NodeKind::FamilyGetDynamic));
+    }
+
+    #[test]
+    fn test_empty_indexed_loop_validates_without_reading_a_member() {
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix_type())),
+            count: IntExpr::constant(0),
+        };
+        let family = NodeHandle::new(
+            NodeKind::Input {
+                name: "empty".to_owned(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            Vec::new(),
+            vec![family_type.clone()],
+        )
+        .output(0)
+        .unwrap();
+        let (scope, output) = with_new_construction_scope(|scope| {
+            (
+                scope,
+                indexed(
+                    &family,
+                    IntExpr::Add(Box::new(IntExpr::LoopIndex(0)), Box::new(IntExpr::constant(1))),
+                ),
+            )
+        });
+        let sealed = SubgraphHandle::seal(
+            "empty-body",
+            scope,
+            Vec::new(),
+            vec![output],
+            &[],
+            CapturePolicy::Lexical { parallel_index: Some(0) },
+        )
+        .unwrap();
+        assert_eq!(sealed.captures[0].mode, LoopInputMode::ZipOffset { offset: 1 });
+        let output = NodeHandle::parallel_loop(
+            sealed.handle,
+            sealed.captures.iter().map(|capture| capture.outer.clone()).collect(),
+            vec![family_type],
+            ParallelLoop {
+                count: IntExpr::constant(0),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: Vec::new(),
+                input_modes: sealed.captures.iter().map(|capture| capture.mode).collect(),
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "empty-indexed",
+            Vec::new(),
+            BTreeMap::from([(
+                "output".to_owned(),
+                GraphOutput { value: output, confidentiality: None },
+            )]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        validate(&graph, &ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn test_scope_ancestry_is_lexical_and_includes_the_scope_itself() {
+        let root = current_construction_scope();
+        let (outer, inner) = with_new_construction_scope(|outer| {
+            let inner = with_new_construction_scope(|inner| inner);
+            (outer, inner)
+        });
+        let sibling = with_new_construction_scope(|sibling| sibling);
+        assert!(root.is_ancestor_of(&inner));
+        assert!(outer.is_ancestor_of(&inner));
+        assert!(inner.is_ancestor_of(&inner));
+        assert!(!inner.is_ancestor_of(&outer));
+        assert!(!sibling.is_ancestor_of(&inner));
+        assert!(!outer.is_ancestor_of(&sibling));
+    }
+
+    #[test]
+    fn test_lexical_capture_rejects_escaped_and_sibling_values() {
+        let escaped = with_new_construction_scope(|_| input("escaped"));
+        let scope = with_new_construction_scope(|scope| scope);
+        assert!(matches!(
+            SubgraphHandle::seal(
+                "sibling",
+                scope,
+                Vec::new(),
+                vec![escaped.clone()],
+                &[],
+                CapturePolicy::Lexical { parallel_index: None }
+            ),
+            Err(FreezeError::ForeignScope { .. })
+        ));
+        assert!(matches!(
+            SubgraphHandle::seal(
+                "escaped",
+                current_construction_scope(),
+                Vec::new(),
+                vec![escaped],
+                &[],
+                CapturePolicy::Lexical { parallel_index: None }
+            ),
+            Err(FreezeError::ForeignScope { .. })
+        ));
+    }
+
+    #[test]
+    fn test_index_lowering_does_not_hide_an_escaped_index() {
+        let family = family_input("family");
+        let escaped = with_new_construction_scope(|_| {
+            NodeHandle::new(
+                NodeKind::EvaluateInt(IntExpr::LoopIndex(0)),
+                Vec::new(),
+                vec![WireType::Int],
+            )
+            .output(0)
+            .unwrap()
+        });
+        let (scope, output) = with_new_construction_scope(|scope| {
+            (
+                scope,
+                NodeHandle::new(
+                    NodeKind::FamilyGetDynamic,
+                    vec![family, escaped],
+                    vec![WireType::Matrix(matrix_type())],
+                )
+                .output(0)
+                .unwrap(),
+            )
+        });
+        assert!(matches!(
+            SubgraphHandle::seal(
+                "escaped-index",
+                scope,
+                Vec::new(),
+                vec![output],
+                &[],
+                CapturePolicy::Lexical { parallel_index: Some(0) }
+            ),
+            Err(FreezeError::ForeignScope { .. })
+        ));
+    }
+
+    #[test]
+    fn test_nested_loop_capture_preserves_outer_member_lowering() {
+        let family = family_input("family");
+        let (scope, output, original_member) = with_new_construction_scope(|scope| {
+            let member = indexed(&family, IntExpr::LoopIndex(0));
+            let inner_scope = with_new_construction_scope(|scope| scope);
+            let inner = SubgraphHandle::seal(
+                "inner",
+                inner_scope,
+                Vec::new(),
+                vec![member.clone()],
+                &[],
+                CapturePolicy::Lexical { parallel_index: Some(1) },
+            )
+            .unwrap();
+            assert_eq!(inner.captures[0].mode, LoopInputMode::Broadcast);
+            assert_eq!(inner.captures[0].outer, member);
+            let output = NodeHandle::parallel_loop(
+                inner.handle,
+                inner.captures.iter().map(|capture| capture.outer.clone()).collect(),
+                vec![family.wire_type().clone()],
+                ParallelLoop {
+                    count: IntExpr::constant(8),
+                    minimum_count: 0,
+                    index_slot: 1,
+                    bindings: Vec::new(),
+                    input_modes: vec![LoopInputMode::Broadcast],
+                },
+            )
+            .output(0)
+            .unwrap();
+            (scope, output, member)
+        });
+        let outer = SubgraphHandle::seal(
+            "outer",
+            scope,
+            Vec::new(),
+            vec![output],
+            &[],
+            CapturePolicy::Lexical { parallel_index: Some(0) },
+        )
+        .unwrap();
+        assert_eq!(outer.captures.len(), 1);
+        assert_eq!(outer.captures[0].mode, LoopInputMode::Zip);
+        assert_eq!(outer.captures[0].outer, family);
+        assert_eq!(outer.handle.outputs()[0].node().arguments()[0], outer.captures[0].placeholder);
+        assert_eq!(outer.remap.resolve(&original_member), Some(&outer.captures[0].placeholder));
+    }
+
+    #[test]
+    fn test_lexical_sealing_preserves_benchmark_roles_and_shared_producers() {
+        let source = input("shared");
+        let (scope, value) = with_new_construction_scope(|scope| {
+            (
+                scope,
+                with_benchmark_role(BenchmarkRole::PublicReadout, || {
+                    NodeHandle::new(
+                        NodeKind::MatrixBinary(MatrixBinaryOp::Add),
+                        vec![source.clone(), source.clone()],
+                        vec![source.wire_type().clone()],
+                    )
+                    .output(0)
+                    .unwrap()
+                }),
+            )
+        });
+        let sealed = SubgraphHandle::seal(
+            "sharing",
+            scope,
+            Vec::new(),
+            vec![value],
+            &[],
+            CapturePolicy::Lexical { parallel_index: None },
+        )
+        .unwrap();
+        assert_eq!(sealed.captures.len(), 1);
+        assert_eq!(sealed.captures[0].outer, source);
+        let output = sealed.handle.outputs()[0].node();
+        assert_eq!(output.arguments()[0], output.arguments()[1]);
+        assert_eq!(output.benchmark_role(), Some(BenchmarkRole::PublicReadout));
     }
 
     #[test]

@@ -1008,7 +1008,7 @@ fn validate_node(
         }
         NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
             require_arity(scope, node, 1)?;
-            if !matches!(values.get(&node.args[0]), Some(ConcreteWireType::Int)) {
+            if !is_integer(argument(scope, values, node, 0)?) {
                 return node_error(scope, node.id, "constant-polynomial lift requires an integer");
             }
             let matrix = concrete_matrix(matrix_type, env, scope, node.id)?;
@@ -1346,7 +1346,7 @@ fn validate_structural_boundaries(
                                 LoopInputMode::ZipOffset { offset } => offset,
                                 _ => 0,
                             };
-                            if *count < iterations.saturating_add(offset) {
+                            if iterations > 0 && *count < iterations.saturating_add(offset) {
                                 return node_error(scope_id, node_id, "zipped family is too short");
                             }
                         }
@@ -1975,6 +1975,56 @@ mod tests {
             ValidationError::ParameterConstraint(message) => message,
             other => panic!("expected node validation error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_integer_lift_accepts_a_parallel_binder_and_rejects_nonintegers() {
+        let matrix = matrix_type(17, 1, 1);
+        let (body, scope) = crate::with_new_construction_scope(|scope| {
+            let index = value(
+                NodeKind::EvaluateInt(IntExpr::LoopIndex(0)),
+                Vec::new(),
+                vec![WireType::ConstantInt],
+            );
+            let lifted = value(
+                NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix.clone() },
+                vec![index],
+                vec![WireType::Matrix(matrix.clone())],
+            );
+            (lifted, scope)
+        });
+        let body =
+            crate::SubgraphHandle::new("integer-lift", scope, Vec::new(), vec![body]).unwrap();
+        let output = NodeHandle::parallel_loop(
+            body,
+            Vec::new(),
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Matrix(matrix.clone())),
+                count: IntExpr::constant(2),
+            }],
+            ParallelLoop {
+                count: IntExpr::constant(2),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: Vec::new(),
+                input_modes: Vec::new(),
+            },
+        )
+        .output(0)
+        .unwrap();
+        validate(&graph("binder-lift", output), &ParamEnv::default()).unwrap();
+
+        let invalid = value(
+            NodeKind::LiftIntegerToConstantPolynomial { matrix_type: matrix.clone() },
+            vec![input("matrix", matrix.clone())],
+            vec![WireType::Matrix(matrix)],
+        );
+        assert!(
+            node_message(
+                validate(&graph("noninteger-lift", invalid), &ParamEnv::default()).unwrap_err()
+            )
+            .contains("requires an integer")
+        );
     }
 
     #[test]

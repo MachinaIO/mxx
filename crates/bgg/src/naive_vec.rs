@@ -4,7 +4,7 @@ use crate::{
     BggEncodingSampler, BggPublicKeyCompiler, BggPublicKeyWire, BggSampleError, BggSamplerLayout,
     encoding::same_matrix_type,
 };
-use mxx_dsl::{Bytes, DslError, Family, HashTag, Mat, Parallel, parallel_zip};
+use mxx_dsl::{Bytes, DslError, Family, HashTag, Mat};
 use mxx_ir_core::{IntExpr, node::IndexRange};
 use rayon::prelude::*;
 use thiserror::Error;
@@ -55,10 +55,12 @@ impl NaiveBggVecCompiler {
         }
         let compiler = self.public_key.clone();
         let reveal = input.reveal_plaintext;
-        let matrices = input.matrices.clone().parallel_zip(scalars, move |_, matrix, scalar| {
-            compiler
+        let matrices = mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+            let matrix = input.matrices.at(&index);
+            let scalar = scalars.at(&index);
+            Ok(compiler
                 .large_scalar_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &scalar)
-                .matrix
+                .matrix)
         })?;
         Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: reveal })
     }
@@ -76,33 +78,30 @@ impl NaiveBggVecCompiler {
         }
         let vector_compiler = self.public_key.clone();
         let reveal = input.pubkey_reveal_plaintext;
-        let factors = mxx_dsl::parallel_zip_bundle(
-            (input.pubkeys.clone(), scalars.clone()),
-            move |_, (matrix, scalar)| {
-                vector_compiler.large_scalar_decomposition(
-                    &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
-                    &scalar,
-                )
-            },
-        )?;
-        let vectors = mxx_dsl::parallel_zip_bundle(
-            (input.vectors.clone(), factors),
-            |_, (vector, factor)| factor.mul_small_rhs(vector),
-        )?;
+        let vectors = mxx_dsl::parallel(input.vectors.count().clone(), |index| {
+            let key =
+                BggPublicKeyWire { matrix: input.pubkeys.at(&index), reveal_plaintext: reveal };
+            let factor = vector_compiler.large_scalar_decomposition(&key, &scalars.at(&index));
+            Ok(factor.mul_small_rhs(input.vectors.at(&index)))
+        })?;
         let key_compiler = self.public_key.clone();
-        let pubkeys =
-            input.pubkeys.clone().parallel_zip(scalars.clone(), move |_, matrix, scalar| {
-                key_compiler
-                    .large_scalar_mul(
-                        &BggPublicKeyWire { matrix, reveal_plaintext: reveal },
-                        &scalar,
-                    )
-                    .matrix
-            })?;
+        let pubkeys = mxx_dsl::parallel(input.pubkeys.count().clone(), |index| {
+            let matrix = input.pubkeys.at(&index);
+            let scalar = scalars.at(&index);
+            Ok(key_compiler
+                .large_scalar_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &scalar)
+                .matrix)
+        })?;
         let plaintexts = input
             .plaintexts
             .clone()
-            .map(|values| values.parallel_zip(scalars, |_, value, scalar| value * scalar))
+            .map(|values| {
+                mxx_dsl::parallel(values.count().clone(), |index| {
+                    let value = values.at(&index);
+                    let scalar = scalars.at(&index);
+                    Ok(value * scalar)
+                })
+            })
             .transpose()?;
         Ok(NaiveBggEncodingVecWire {
             vectors,
@@ -120,10 +119,11 @@ impl NaiveBggVecCompiler {
         let compiler = self.public_key.clone();
         let target = target.clone();
         let reveal = input.reveal_plaintext;
-        let matrices = input.matrices.clone().parallel_map(move |_, matrix| {
-            compiler
+        let matrices = mxx_dsl::parallel(input.matrices.count().clone(), |index| {
+            let matrix = input.matrices.at(&index);
+            Ok(compiler
                 .matrix_mul(&BggPublicKeyWire { matrix, reveal_plaintext: reveal }, &target)
-                .matrix
+                .matrix)
         })?;
         Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: reveal })
     }
@@ -188,26 +188,26 @@ impl NaiveBggVecCompiler {
             lhs.plaintexts.clone().ok_or(NaiveVecCompileError::MissingLeftPlaintext)?;
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
-        let decomposed_rhs = rhs
-            .pubkeys
-            .clone()
-            .parallel_map_values(move |_, matrix| matrix.decompose(base.clone(), digits.clone()))?;
-        let first = mxx_dsl::parallel_zip_bundle(
-            (lhs.vectors.clone(), decomposed_rhs),
-            |_, (left, right)| right.mul_small_rhs(left),
-        )?;
-        let second = rhs
-            .vectors
-            .clone()
-            .parallel_zip(lhs_plaintexts, |_, right, plaintext| right * plaintext)?;
-        let vectors = first.parallel_zip(second, |_, left, right| left + right)?;
+        let vectors = mxx_dsl::parallel(lhs.vectors.count().clone(), |index| {
+            let decomposed = rhs.pubkeys.at(&index).decompose(base.clone(), digits.clone());
+            let left = lhs.vectors.at(&index);
+            let right = rhs.vectors.at(&index);
+            let plaintext = lhs_plaintexts.at(&index);
+            Ok(decomposed.mul_small_rhs(left) + right * plaintext)
+        })?;
         let pubkeys =
             self.key_family_binary(lhs, rhs, |compiler, left, right| compiler.mul(left, right))?;
         let plaintexts = lhs
             .plaintexts
             .clone()
             .zip(rhs.plaintexts.clone())
-            .map(|(left, right)| left.parallel_zip(right, |_, left, right| left * right))
+            .map(|(left, right)| {
+                mxx_dsl::parallel(left.count().clone(), |index| {
+                    let left = left.at(&index);
+                    let right = right.at(&index);
+                    Ok(left * right)
+                })
+            })
             .transpose()?;
         Ok(NaiveBggEncodingVecWire {
             vectors,
@@ -242,19 +242,20 @@ impl NaiveBggVecCompiler {
         let base = self.public_key.base.clone();
         let digits = self.public_key.digit_count.clone();
         let decomposed = target.clone().decompose(base, digits);
-        let vectors = input
-            .vectors
-            .clone()
-            .parallel_map(move |_, value| decomposed.clone().mul_small_rhs(value))?;
+        let vectors = mxx_dsl::parallel(input.vectors.count().clone(), |index| {
+            let value = input.vectors.at(&index);
+            Ok(decomposed.clone().mul_small_rhs(value))
+        })?;
         let key_compiler = self.public_key.clone();
         let target_for_keys = target.clone();
-        let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
-            key_compiler
+        let pubkeys = mxx_dsl::parallel(input.pubkeys.count().clone(), |index| {
+            let matrix = input.pubkeys.at(&index);
+            Ok(key_compiler
                 .matrix_mul(
                     &BggPublicKeyWire { matrix, reveal_plaintext: input.pubkey_reveal_plaintext },
                     &target_for_keys,
                 )
-                .matrix
+                .matrix)
         })?;
         Ok(NaiveBggEncodingVecWire {
             vectors,
@@ -284,15 +285,16 @@ impl NaiveBggVecCompiler {
         let reveal = lhs.reveal_plaintext && rhs.reveal_plaintext;
         let left_reveal = lhs.reveal_plaintext;
         let right_reveal = rhs.reveal_plaintext;
-        let matrices =
-            lhs.matrices.clone().parallel_zip(rhs.matrices.clone(), move |_, left, right| {
-                operation(
-                    &compiler,
-                    &BggPublicKeyWire { matrix: left, reveal_plaintext: left_reveal },
-                    &BggPublicKeyWire { matrix: right, reveal_plaintext: right_reveal },
-                )
-                .matrix
-            })?;
+        let matrices = mxx_dsl::parallel(lhs.matrices.count().clone(), |index| {
+            let left = lhs.matrices.at(&index);
+            let right = rhs.matrices.at(&index);
+            Ok(operation(
+                &compiler,
+                &BggPublicKeyWire { matrix: left, reveal_plaintext: left_reveal },
+                &BggPublicKeyWire { matrix: right, reveal_plaintext: right_reveal },
+            )
+            .matrix)
+        })?;
         Ok(NaiveBggPublicKeyVecWire { matrices, reveal_plaintext: reveal })
     }
 
@@ -305,17 +307,22 @@ impl NaiveBggVecCompiler {
         + 'static,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding_pair(lhs, rhs)?;
-        let vectors = lhs
-            .vectors
-            .clone()
-            .parallel_zip(rhs.vectors.clone(), move |_, left, right| vector_op(left, right))?;
+        let vectors = mxx_dsl::parallel(lhs.vectors.count().clone(), |index| {
+            let left = lhs.vectors.at(&index);
+            let right = rhs.vectors.at(&index);
+            Ok(vector_op(left, right))
+        })?;
         let pubkeys = self.key_family_binary(lhs, rhs, key_op)?;
         let plaintexts = lhs
             .plaintexts
             .clone()
             .zip(rhs.plaintexts.clone())
             .map(|(left, right)| {
-                left.parallel_zip(right, move |_, left, right| vector_op(left, right))
+                mxx_dsl::parallel(left.count().clone(), |index| {
+                    let left = left.at(&index);
+                    let right = right.at(&index);
+                    Ok(vector_op(left, right))
+                })
             })
             .transpose()?;
         Ok(NaiveBggEncodingVecWire {
@@ -340,13 +347,15 @@ impl NaiveBggVecCompiler {
         let compiler = self.public_key.clone();
         let left_reveal = lhs.pubkey_reveal_plaintext;
         let right_reveal = rhs.pubkey_reveal_plaintext;
-        lhs.pubkeys.clone().parallel_zip(rhs.pubkeys.clone(), move |_, left, right| {
-            operation(
+        mxx_dsl::parallel(lhs.pubkeys.count().clone(), |index| {
+            let left = lhs.pubkeys.at(&index);
+            let right = rhs.pubkeys.at(&index);
+            Ok(operation(
                 &compiler,
                 &BggPublicKeyWire { matrix: left, reveal_plaintext: left_reveal },
                 &BggPublicKeyWire { matrix: right, reveal_plaintext: right_reveal },
             )
-            .matrix
+            .matrix)
         })
     }
 
@@ -357,51 +366,42 @@ impl NaiveBggVecCompiler {
         large: bool,
     ) -> Result<NaiveBggEncodingVecWire, NaiveVecCompileError> {
         validate_encoding(input)?;
-        let vector_factor = if large {
-            let rows = input.pubkeys.clone().parallel_map_values({
-                let compiler = self.public_key.clone();
-                let scalar = scalar.clone();
-                move |_, matrix| {
-                    compiler.large_scalar_decomposition(
-                        &BggPublicKeyWire {
-                            matrix,
-                            reveal_plaintext: input.pubkey_reveal_plaintext,
-                        },
-                        &scalar,
-                    )
-                }
-            })?;
-            Some(rows)
-        } else {
-            None
-        };
-        let vectors = match vector_factor {
-            Some(factors) => mxx_dsl::parallel_zip_bundle(
-                (input.vectors.clone(), factors),
-                |_, (value, factor)| factor.mul_small_rhs(value),
-            )?,
-            None => {
-                let scalar = scalar.clone();
-                input.vectors.clone().parallel_map(move |_, value| value * scalar.clone())?
+        let vectors = mxx_dsl::parallel(input.vectors.count().clone(), |index| {
+            let value = input.vectors.at(&index);
+            if large {
+                let key = BggPublicKeyWire {
+                    matrix: input.pubkeys.at(&index),
+                    reveal_plaintext: input.pubkey_reveal_plaintext,
+                };
+                let factor = self.public_key.large_scalar_decomposition(&key, scalar);
+                Ok(factor.mul_small_rhs(value))
+            } else {
+                Ok(value * scalar.clone())
             }
-        };
+        })?;
         let compiler = self.public_key.clone();
         let scalar_for_keys = scalar.clone();
         let reveal = input.pubkey_reveal_plaintext;
-        let pubkeys = input.pubkeys.clone().parallel_map(move |_, matrix| {
-            let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
-            if large {
-                compiler.large_scalar_mul(&key, &scalar_for_keys).matrix
-            } else {
-                compiler.small_scalar_mul(&key, &scalar_for_keys).matrix
-            }
+        let pubkeys = mxx_dsl::parallel(input.pubkeys.count().clone(), |index| {
+            let matrix = input.pubkeys.at(&index);
+            Ok({
+                let key = BggPublicKeyWire { matrix, reveal_plaintext: reveal };
+                if large {
+                    compiler.large_scalar_mul(&key, &scalar_for_keys).matrix
+                } else {
+                    compiler.small_scalar_mul(&key, &scalar_for_keys).matrix
+                }
+            })
         })?;
         let plaintexts = input
             .plaintexts
             .clone()
             .map(|values| {
                 let scalar = scalar.clone();
-                values.parallel_map(move |_, value| value * scalar.clone())
+                mxx_dsl::parallel(values.count().clone(), |index| {
+                    let value = values.at(&index);
+                    Ok(value * scalar.clone())
+                })
             })
             .transpose()?;
         Ok(NaiveBggEncodingVecWire {
@@ -461,33 +461,35 @@ impl NaiveBggPublicKeyVecSampler {
                 let packed_count = if output == 0 { 1 } else { 2 };
                 let mut prefix = tag.to_vec();
                 prefix.extend_from_slice(&(output as u64).to_le_bytes());
-                let family = Parallel::range(self.slot_count.clone()).map({
+                let family = {
                     let ring = self.layout.ring();
                     let key = hash_key.clone();
-                    move |slot| {
-                        let mut tag = HashTag::from(prefix.clone());
-                        tag.push(slot);
-                        let packed = ring.hash_matrix(
-                            key.clone(),
-                            tag,
-                            (
-                                self.layout.secret_dimension,
-                                self.layout.public_key_columns() * packed_count,
-                            ),
-                        );
-                        if output == 0 {
-                            packed
-                        } else {
-                            packed.slice(
-                                None,
-                                Some(IndexRange {
-                                    start: self.layout.public_key_columns().into(),
-                                    end: (self.layout.public_key_columns() * 2).into(),
-                                }),
-                            )
-                        }
-                    }
-                })?;
+                    mxx_dsl::parallel(self.slot_count.clone(), |slot| {
+                        Ok({
+                            let mut tag = HashTag::from(prefix.clone());
+                            tag.push(slot);
+                            let packed = ring.hash_matrix(
+                                key.clone(),
+                                tag,
+                                (
+                                    self.layout.secret_dimension,
+                                    self.layout.public_key_columns() * packed_count,
+                                ),
+                            );
+                            if output == 0 {
+                                packed
+                            } else {
+                                packed.slice(
+                                    None,
+                                    Some(IndexRange {
+                                        start: self.layout.public_key_columns().into(),
+                                        end: (self.layout.public_key_columns() * 2).into(),
+                                    }),
+                                )
+                            }
+                        })
+                    })
+                }?;
                 Ok(NaiveBggPublicKeyVecWire { matrices: family, reveal_plaintext: reveal })
             })
             .collect::<Result<Vec<_>, BggSampleError>>()?;
@@ -529,12 +531,13 @@ impl NaiveBggEncodingVecSampler {
         let outputs = (0..public_keys.len())
             .map(|output| {
                 let vectors = if output == 0 {
-                    public_keys[0].matrices.clone().parallel_map({
+                    {
                         let sampler = self.scalar.clone();
                         let secret = secret.clone();
                         let reveal = public_keys[0].reveal_plaintext;
-                        move |_, one_key| {
-                            sampler
+                        mxx_dsl::parallel(public_keys[0].matrices.count().clone(), |index| {
+                            let one_key = public_keys[0].matrices.at(&index);
+                            Ok(sampler
                                 .sample(
                                     secret.clone(),
                                     None,
@@ -546,44 +549,39 @@ impl NaiveBggEncodingVecSampler {
                                 )
                                 .expect("validated scalar sampler")
                                 .remove(0)
-                                .vector
-                        }
-                    })?
+                                .vector)
+                        })
+                    }?
                 } else {
-                    parallel_zip(
-                        (
-                            public_keys[0].matrices.clone(),
-                            public_keys[output].matrices.clone(),
-                            plaintexts[output - 1].clone(),
-                        ),
-                        {
-                            let sampler = self.scalar.clone();
-                            let secret = secret.clone();
-                            let one_reveal = public_keys[0].reveal_plaintext;
-                            let reveal = public_keys[output].reveal_plaintext;
-                            move |_, (one_key, key, plaintext)| {
-                                sampler
-                                    .sample(
-                                        secret.clone(),
-                                        None,
-                                        &[
-                                            BggPublicKeyWire {
-                                                matrix: one_key,
-                                                reveal_plaintext: one_reveal,
-                                            },
-                                            BggPublicKeyWire {
-                                                matrix: key,
-                                                reveal_plaintext: reveal,
-                                            },
-                                        ],
-                                        &[plaintext],
-                                    )
-                                    .expect("validated scalar sampler")
-                                    .remove(1)
-                                    .vector
-                            }
-                        },
-                    )?
+                    {
+                        let sampler = self.scalar.clone();
+                        let secret = secret.clone();
+                        let one_reveal = public_keys[0].reveal_plaintext;
+                        let reveal = public_keys[output].reveal_plaintext;
+                        mxx_dsl::parallel(public_keys[0].matrices.count().clone(), |index| {
+                            let (one_key, key, plaintext) = (
+                                public_keys[0].matrices.at(&index),
+                                public_keys[output].matrices.at(&index),
+                                plaintexts[output - 1].at(&index),
+                            );
+                            Ok(sampler
+                                .sample(
+                                    secret.clone(),
+                                    None,
+                                    &[
+                                        BggPublicKeyWire {
+                                            matrix: one_key,
+                                            reveal_plaintext: one_reveal,
+                                        },
+                                        BggPublicKeyWire { matrix: key, reveal_plaintext: reveal },
+                                    ],
+                                    &[plaintext],
+                                )
+                                .expect("validated scalar sampler")
+                                .remove(1)
+                                .vector)
+                        })
+                    }?
                 };
                 Ok(NaiveBggEncodingVecWire {
                     vectors,
@@ -591,14 +589,13 @@ impl NaiveBggEncodingVecSampler {
                     pubkey_reveal_plaintext: public_keys[output].reveal_plaintext,
                     plaintexts: public_keys[output].reveal_plaintext.then(|| {
                         if output == 0 {
-                            public_keys[0]
-                                .matrices
-                                .clone()
-                                .parallel_map({
-                                    let ring = self.scalar.layout.ring();
-                                    move |_, _| ring.identity(1)
+                            {
+                                let ring = self.scalar.layout.ring();
+                                mxx_dsl::parallel(public_keys[0].matrices.count().clone(), |_| {
+                                    Ok(ring.identity(1))
                                 })
-                                .expect("family")
+                            }
+                            .expect("family")
                         } else {
                             plaintexts[output - 1].clone()
                         }
@@ -741,11 +738,11 @@ mod tests {
         let mut context = DslContext::new("naive-bgg-add-runtime");
         for slot in 0..2 {
             context = context
-                .output(format!("vector-{slot}"), output.vectors.get_static(slot))
+                .output(format!("vector-{slot}"), output.vectors.at(slot))
                 .unwrap()
-                .output(format!("public-{slot}"), output.pubkeys.get_static(slot))
+                .output(format!("public-{slot}"), output.pubkeys.at(slot))
                 .unwrap()
-                .output(format!("plaintext-{slot}"), plaintexts.get_static(slot))
+                .output(format!("plaintext-{slot}"), plaintexts.at(slot))
                 .unwrap();
         }
         let graph = context.build().unwrap();
@@ -816,9 +813,9 @@ mod tests {
         let target = ring.input("target", (2, 1));
         let output = compiler.matrix_mul_encodings(&input, &target).unwrap();
         let graph = DslContext::new("naive-bgg-matrix-mul-runtime")
-            .output("vector", output.vectors.get_static(0))
+            .output("vector", output.vectors.at(0))
             .unwrap()
-            .output("public", output.pubkeys.get_static(0))
+            .output("public", output.pubkeys.at(0))
             .unwrap()
             .build()
             .unwrap();
@@ -886,13 +883,10 @@ mod tests {
                 context = context
                     .output(
                         format!("public-{output}-{slot}"),
-                        public_keys[output].matrices.get_static(slot),
+                        public_keys[output].matrices.at(slot),
                     )
                     .unwrap()
-                    .output(
-                        format!("vector-{output}-{slot}"),
-                        encodings[output].vectors.get_static(slot),
-                    )
+                    .output(format!("vector-{output}-{slot}"), encodings[output].vectors.at(slot))
                     .unwrap();
             }
         }

@@ -6991,6 +6991,11 @@ pub struct RefreshParameterSimulationBundle {
 }
 
 impl RefreshParameterSimulationBundle {
+    /// Returns the frozen noise inputs used by this bundle's simulator.
+    pub fn noise_snapshot(&self) -> &ExponentLutNoiseSnapshot {
+        &self.noise_snapshot
+    }
+
     /// Registers the source ring and every distinct selected decoder ring.
     /// Selection preserves the concrete CRT basis and, on GPUs, execution owner.
     pub fn ring_parameters<P: mxx_primitives::poly::PolyParams>(

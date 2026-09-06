@@ -854,7 +854,33 @@ fn accepted_phase_two_profile_persists_native_q_and_rejects_out_of_grid_tamperin
     assert_eq!(selected_profile.universe, 16384);
     assert_eq!(result.candidate.crt_depth, 28);
     let candidate = result.candidate;
-    persist_accepted_phase2_profile(&path, &config, &selected_profile, candidate).unwrap();
+    assert!(
+        persist_accepted_phase2_profile(&path, &config, &selected_profile, candidate, None)
+            .unwrap_err()
+            .contains("requires certification evidence")
+    );
+    let evidence =
+        Phase2CertificationEvidence::certify(&config, &selected_profile, candidate).unwrap();
+    let mut mismatched = candidate;
+    mismatched.crt_depth += 1;
+    assert!(
+        persist_accepted_phase2_profile(
+            &path,
+            &config,
+            &selected_profile,
+            mismatched,
+            Some(&evidence)
+        )
+        .unwrap_err()
+        .contains("exact candidate/profile/configuration")
+    );
+    assert!(
+        persist_accepted_phase2_profile(&path, &config, &selected, candidate, Some(&evidence))
+            .unwrap_err()
+            .contains("exact candidate/profile/configuration")
+    );
+    persist_accepted_phase2_profile(&path, &config, &selected_profile, candidate, Some(&evidence))
+        .unwrap();
     let checkpoint: Phase1Checkpoint =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     checkpoint.validate(&config).unwrap();

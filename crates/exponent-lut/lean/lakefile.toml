@@ -24,4 +24,4 @@ path = "../../ir-core/lean"
 
 [[lean_lib]]
 name = "MxxExponentLut"
-roots = ["ExponentBounds", "ExponentTransfers", "ExponentRefreshBounds", "ExponentAutomorphism", "ExponentReadout", "ExponentSetup", "ExponentCrt", "ExponentDecomposition", "ExponentProgram", "ExponentReadoutSetup", "ExponentMonomial", "ExponentSparseDecomposition", "ExponentRounding", "ExponentLut", "ExponentPairedSwitch", "ExponentTrace", "ExponentSecret", "ExponentLutFourier"]
+roots = ["ExponentBounds", "ExponentTransfers", "ExponentRefreshBounds", "ExponentAutomorphism", "ExponentReadout", "ExponentSetup", "ExponentCrt", "ExponentDecomposition", "ExponentProgram", "ExponentReadoutSetup", "ExponentMonomial", "ExponentSparseDecomposition", "ExponentRounding", "ExponentLut", "ExponentPairedSwitch", "ExponentTrace", "ExponentSecret", "ExponentLutFourier", "ExponentDecoder", "ExponentRefreshDecode", "ExponentRefreshDigits", "ExponentRefreshNormalize", "ExponentInputSlice", "ExponentNativeProgram", "ExponentReadoutStage", "ExponentReadoutFunction", "ExponentRefreshRoutes", "ExponentRefreshRouteTargets", "ExponentRefreshDecomposition", "ExponentRefreshCrt"]

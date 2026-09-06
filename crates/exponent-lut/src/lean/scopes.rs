@@ -152,7 +152,7 @@ pub(super) fn selector_setup_proofs(
 ) -> (String, usize) {
     use mxx_ir_core::node::{ConcatAxis, ConstantMatrix};
     let mut source = format!(
-        "import {}\nimport ExponentSetup\nimport ExponentDecomposition\n\nnamespace ExponentGeneratedSetup\nopen Mxx.Primitives MxxExponentLut\n\n",
+        "import {}\nimport ExponentSetup\nimport ExponentSecret\nimport ExponentDecomposition\n\nnamespace ExponentGeneratedSetup\nopen Mxx.Primitives MxxExponentLut\n\n",
         artifact.module_name
     );
     let mut count = 0;
@@ -255,6 +255,20 @@ pub(super) fn selector_setup_proofs(
                 let family = projection("output", family_output.tuple_index, root.output_count);
                 let payload = projection("input", payload_input.tuple_index, root.input_count);
                 let concat = root_shape.node_constraints[&secret_wire.node].clone().last().unwrap();
+                let concat_node = root_scope.node(secret_wire.node).unwrap();
+                let small_wire = root_scope.arguments(concat_node).unwrap()[0];
+                let sample_position =
+                    root_shape.node_constraints[&small_wire.node].clone().last().unwrap();
+                source.push_str(&format!(
+                    "theorem root_secret_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {parameter_type}}} {{input : {input_type}}} {{output : {output_type}}}\n    (runs : {root_relation} backend hashModel params input output) :\n    ∃ secret : ErrorMatrix {n} 1 2, reduceMatrix {q} {n} 1 2 secret = ({secret}) ∧\n      (∀ i, ((secret 0 0).coeff i).natAbs ≤ 1) ∧ secret 0 1 = 1 := by\n  obtain ⟨witness, facts⟩ := runs\n  have sample := facts{sample_path}.1\n  have concat := facts{concat_path}.1\n  have outputEquation := facts{output_path}\n  rw [outputEquation]\n  exact augmented_secret_of_sample _ _ _ sample concat (by rfl)\n\n",
+                    parameter_type = root.parameter_type,
+                    input_type = boundary_type(&root.inputs, root.input_count),
+                    output_type = boundary_type(&root.outputs, root.output_count),
+                    root_relation = root.relation,
+                    sample_path = ".2".repeat(sample_position),
+                    concat_path = ".2".repeat(concat),
+                    output_path = ".2".repeat(root_shape.constraint_count),
+                ));
                 let family_fact = root_shape.node_constraints[owner].clone().last().unwrap();
                 source.push_str(&format!(
                     "theorem root_selector_setup_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {parameter_type}}} {{input : {input_type}}} {{output : {output_type}}}\n    (runs : {root_relation} backend hashModel params input output) :\n    ({secret}) 0 1 = 1 ∧\n    ∀ i, ∃ gadget : ExactMatrix {q} {n} 2 {columns}, ∃ error : ErrorMatrix {n} 1 {columns},\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget ∧\n      ({secret}) * (({family}) i) = (({payload}) i 0 0) • (({secret}) * gadget) + reduceMatrix {q} {n} 1 {columns} error ∧\n      CoeffBound error ({cutoff} : Nat) := by\n  obtain ⟨witness, facts⟩ := runs\n  have concat := facts{concat_path}.1\n  have family := facts{family_path}.1\n  have outputEquation := facts{output_path}\n  have augmented := augmented_source_last concat (by rfl)\n  rw [outputEquation]\n  refine ⟨augmented, ?_⟩\n  intro i\n  exact selector_setup_{count} (family i) augmented\n\n",
@@ -381,7 +395,8 @@ pub(super) fn root_decomposition_proofs(
     let witness_tactic = "  obtain ⟨witness, facts⟩ := runs\n";
     let scope = graph.source.root_scope();
     let mut count = 0;
-    for value in root.outputs.values() {
+    for (output_name, value) in &root.outputs {
+        source.push_str(&format!("-- Exported boundary {output_name:?}.\n"));
         let Some(node) = scope.node(value.wire.node) else { continue };
 
         if matches!(node.kind(), NodeKind::ParallelLoop(_)) {

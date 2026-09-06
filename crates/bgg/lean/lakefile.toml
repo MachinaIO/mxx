@@ -1,0 +1,27 @@
+name = "MxxBgg"
+version = "0.1.0"
+defaultTargets = ["MxxBgg"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../primitives/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "MxxPrimitives"
+path = "../../primitives/lean"
+
+[[require]]
+name = "MxxGadgets"
+path = "../../gadgets/lean"
+
+[[lean_lib]]
+name = "MxxBgg"
+roots = [
+  "BggEncoding",
+  "BggMultiplication",
+  "MxxBgg",
+]

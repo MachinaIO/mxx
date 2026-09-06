@@ -1,0 +1,12 @@
+[package]
+name = "mxx-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Indistinguishability obfuscation constructions for mxx"
+
+[features]
+default = []
+gpu = []
+
+[dependencies]

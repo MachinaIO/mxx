@@ -77,14 +77,9 @@ jobs:
         env:
           RUSTFLAGS: -A unused
 
-      - name: Run clippy disk
-        run: cargo +nightly-2026-07-25 clippy --workspace --all-targets --no-default-features --features disk
-        env:
-          RUSTFLAGS: -A unused
-
       - name: Run test
-        run: RUST_TEST_NOCAPTURE=1 cargo test -r --lib -- --test-threads=1
-  
+        run: RUST_TEST_NOCAPTURE=1 cargo test -r --workspace --lib -- --test-threads=1
+
   ci-success:
     name: ci success
     runs-on: ubuntu-latest

@@ -2,6 +2,8 @@
 
 The builder agent must implement the GPU version in accordance with the principles below. Even if the submitted GPU implementation passes all tests, the reviewer agent must additionally review it against these principles to ensure it meets a sufficient quality bar.
 
+Native CUDA sources, CUDA build configuration, and primitive GPU wrappers are owned by `mxx-primitives` under `crates/primitives/cuda/` and `crates/primitives/src/`. Higher-level GPU implementations remain in their owning crate and depend on primitive GPU APIs.
+
 1. Minimize memory transfers (and transfer frequency) between the device and the host.
 2. Minimize synchronization. Avoid `cudaDeviceSynchronize` and `cudaStreamSynchronize` as much as possible. Use `cudaMallocAsync`, `cudaFreeAsync`, and `cudaMemcpyAsync` rather than `cudaMalloc`, `cudaFree`, and `cudaMemcpy`.
 3. Make effective use of streams. Assign separate streams whenever computations can proceed independently, and avoid introducing unnecessary blocking among device threads.

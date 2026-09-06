@@ -1,0 +1,5 @@
+[target.'cfg(target_os = "linux")']
+# OpenFHE is installed in /usr/local/lib by the repository setup. Set the
+# runtime search path on every final workspace binary, including downstream
+# crate tests, examples, and benchmarks.
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib"]

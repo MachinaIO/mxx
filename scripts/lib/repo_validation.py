@@ -58,13 +58,13 @@ def is_gpu_rust_path(path: str) -> bool:
 
 def is_gpu_repeat_validation_trigger(path: str) -> bool:
     normalized = PurePosixPath(path)
-    if normalized.parts and normalized.parts[0] == "cuda":
+    if normalized.parts[:3] == ("crates", "primitives", "cuda"):
         return True
     return (
         is_gpu_rust_path(path)
-        and len(normalized.parts) >= 3
-        and normalized.parts[0] == "src"
-        and normalized.parts[1] in GPU_REPEAT_SOURCE_DIRS
+        and len(normalized.parts) >= 5
+        and normalized.parts[:3] == ("crates", "primitives", "src")
+        and normalized.parts[3] in GPU_REPEAT_SOURCE_DIRS
     )
 
 
@@ -73,8 +73,9 @@ def is_gpu_single_run_validation_trigger(path: str) -> bool:
     return (
         is_gpu_rust_path(path)
         and not is_gpu_repeat_validation_trigger(path)
-        and len(normalized.parts) >= 2
-        and normalized.parts[0] == "src"
+        and len(normalized.parts) >= 4
+        and normalized.parts[0] == "crates"
+        and normalized.parts[2] == "src"
     )
 
 
@@ -118,7 +119,7 @@ def compile_gpu_test_binaries(
 ) -> list[Path]:
     runner = runner or subprocess.run
     completed = runner(
-        ("cargo", "test", "gpu", "-r", "--lib", "--features", "gpu", "--no-run", "--message-format=json"),
+        ("cargo", "test", "gpu", "-r", "--workspace", "--lib", "--features", "gpu", "--no-run", "--message-format=json"),
         cwd=repo_root,
         env=env,
         check=False,
@@ -175,7 +176,7 @@ def maybe_run_gpu_repeat_validation(repo_root: Path, repeat_count: int, log: Tex
     single_run_trigger_paths = gpu_single_run_validation_trigger_paths(edited_paths)
     if not repeat_trigger_paths and not single_run_trigger_paths:
         log.write(
-            "[gpu-repeat] skipped: no edited files under cuda/ or matching *gpu*.rs in the configured validation paths\n"
+            "[gpu-repeat] skipped: no edited files under crates/primitives/cuda/ or matching *gpu*.rs in configured crate source paths\n"
         )
         return 0
 

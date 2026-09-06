@@ -1,0 +1,12 @@
+[package]
+name = "mxx-func-enc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Functional encryption constructions for mxx"
+
+[features]
+default = []
+gpu = []
+
+[dependencies]

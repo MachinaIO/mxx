@@ -1,0 +1,23 @@
+name = "MxxGadgets"
+version = "0.1.0"
+defaultTargets = ["MxxGadgets"]
+
+[leanOptions]
+relaxedAutoImplicit = false
+pp.unicode.fun = true
+
+[[require]]
+name = "mathlib"
+path = "../../primitives/lean/.lake/packages/mathlib"
+
+[[require]]
+name = "MxxPrimitives"
+path = "../../primitives/lean"
+
+[[lean_lib]]
+name = "MxxGadgets"
+roots = [
+  "GadgetsDecomposition",
+  "GadgetsGadgetMatrix",
+  "MxxGadgets",
+]

@@ -33,6 +33,19 @@ pub struct BgvParams {
 #[derive(Clone)]
 pub struct BgvCiphertext {
     pub components: Mat,
+    /// Public invertible multiplier f modulo the plaintext modulus t.
+    /// Under the decryption bound, the centered ciphertext phase v satisfies
+    /// v mod t = f*m mod t, where m is the logical plaintext polynomial.
+    /// Decryption recovers m by multiplying v by f^(-1) modulo t.
+    ///
+    /// Fresh encryption sets f = 1. Multiplication sets f = f_lhs*f_rhs mod t;
+    /// dropping a CRT prime p sets f = f*p^(-1) mod t because modswitch divides
+    /// the phase by p. These updates preserve the intended plaintext semantics.
+    /// Addition requires equal factors; use match_correction_factor to align
+    /// them first. Relinearization and rotations preserve f.
+    ///
+    /// This is graph-construction metadata, not the plaintext modulus or an
+    /// encryption scale. Pass it alongside components across protocol stages.
     pub correction_factor: u64,
     pub noise_bound: BigUint,
 }
@@ -40,6 +53,7 @@ pub struct BgvCiphertext {
 #[derive(Clone, PartialEq)]
 pub struct BgvCiphertextSchema {
     pub components: MatType,
+    /// Retains the plaintext multiplier described by BgvCiphertext::correction_factor.
     pub correction_factor: u64,
     pub noise_bound: BigUint,
 }
@@ -239,6 +253,8 @@ impl BgvParams {
         }
         let inverse = mod_inverse(ct.correction_factor, self.plaintext_modulus)
             .ok_or(FheError::InvalidCorrectionFactor)?;
+        // Scaling components by k = target/f changes v mod t from f*m to
+        // target*m. The logical plaintext stays m, but the noise may grow.
         let scalar = ((target as u128 * inverse as u128) % self.plaintext_modulus as u128) as u64;
         let centered = if scalar > self.plaintext_modulus / 2 {
             BigInt::from(scalar) - BigInt::from(self.plaintext_modulus)
@@ -360,6 +376,8 @@ impl FheScheme for BgvParams {
             phase = phase * &minus_s + row(&ct.components, index);
         }
         let coefficients = utils::extract(&params, &phase)?;
+        // The centered phase reduces to f*m modulo t. Undo the public factor
+        // to recover m even after modulus switching has made f different from 1.
         let inverse = mod_inverse(ct.correction_factor, self.plaintext_modulus)
             .ok_or(FheError::InvalidCorrectionFactor)?;
         Ok(parallel(params.ring_dimension(), |i| {

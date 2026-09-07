@@ -158,6 +158,7 @@ unsafe extern "C" {
         cols: usize,
         format: c_int,
         out_mat: *mut *mut GpuMatrixOpaque,
+        initialize_descriptors: bool,
     ) -> c_int;
     pub(crate) fn gpu_matrix_query_allocation_bytes(
         ctx: *const GpuContextOpaque,
@@ -243,6 +244,38 @@ unsafe extern "C" {
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_transpose(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_tensor(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_tensor_sum_rows(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+        rows: *const usize,
+        offsets: *const usize,
+        group_count: usize,
+        term_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sum_rows(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        rows: *const usize,
+        offsets: *const usize,
+        group_count: usize,
+        term_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_add_row_blocks(
+        out: *mut GpuMatrixOpaque,
+        blocks: *const *const GpuMatrixOpaque,
+        block_count: usize,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_equal(
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
@@ -292,6 +325,19 @@ unsafe extern "C" {
         matrices: *const *const GpuMatrixOpaque,
         scalars: *const *const GpuMatrixOpaque,
         matrix_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_rns_conversion(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        digit_size: usize,
+        plaintext_modulus: u64,
+        scales: *const u64,
+        inverses: *const u64,
+        weights: *const u64,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_centered_rebase(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_convert_modulus(
         out: *mut GpuMatrixOpaque,
@@ -1318,7 +1364,8 @@ impl GpuDCRTPoly {
         let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
         let bytes_len = flat.len().saturating_mul(mem::size_of::<u64>());
         let bytes = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, bytes_len) };
-        let mut mat = GpuDCRTPolyMatrix::new_empty_with_state(params.as_ref(), 1, 1, level, is_ntt);
+        let mut mat =
+            GpuDCRTPolyMatrix::new_empty_with_state(params.as_ref(), 1, 1, level, is_ntt, None);
         mat.load_rns_bytes(bytes, bytes_len, format);
         Self::from_inner(mat)
     }
@@ -1360,6 +1407,34 @@ impl GpuDCRTPoly {
             return;
         }
         self.inner.store_rns_bytes(bytes_out, bytes_out.len(), format);
+    }
+
+    fn residue_values(&self, evaluation: bool) -> Vec<BigUint> {
+        let mut poly =
+            if evaluation { self.ensure_eval_domain() } else { self.ensure_coeff_domain() };
+        let n = poly.params_ref().ring_dimension() as usize;
+        let level = poly.level();
+        let modulus = poly.params_ref().modulus_for_level(level);
+        let reconstruction = poly.params_ref().reconstruct_coeffs_for_level(level);
+        let mut bytes = vec![0u8; (level + 1) * n * mem::size_of::<u64>()];
+        let format = if evaluation { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        poly.store_rns_bytes(&mut bytes, format);
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let value: BigUint = reconstruction
+                    .iter()
+                    .enumerate()
+                    .map(|(limb, factor)| {
+                        let offset = (limb * n + i) * mem::size_of::<u64>();
+                        let residue =
+                            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                        factor * residue
+                    })
+                    .sum();
+                value % &modulus
+            })
+            .collect()
     }
 
     pub(crate) fn ensure_coeff_domain(&self) -> Self {
@@ -1501,9 +1576,16 @@ impl Poly for GpuDCRTPoly {
     }
 
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self {
-        let mut poly = Self::from_biguints(params, slots);
-        poly.ntt_in_place();
-        poly
+        let n = params.ring_dimension() as usize;
+        assert!(slots.len() <= n, "evaluation count exceeds ring dimension");
+        let mut flat = vec![0u64; params.crt_depth() * n];
+        flat.par_chunks_mut(n).zip(params.moduli().par_iter()).for_each(|(limb, &q)| {
+            let modulus = BigUint::from(q);
+            for (output, slot) in limb.iter_mut().zip(slots) {
+                *output = (slot % &modulus).to_u64().expect("CRT residue must fit in u64");
+            }
+        });
+        Self::from_flat(Arc::new(params.clone()), params.crt_depth() - 1, flat, true)
     }
 
     fn from_decomposed(params: &Self::Params, decomposed: &[Self]) -> Self {
@@ -1525,40 +1607,15 @@ impl Poly for GpuDCRTPoly {
     }
 
     fn coeffs(&self) -> Vec<Self::Elem> {
-        let mut poly = self.ensure_coeff_domain();
-        let n = poly.params_ref().ring_dimension() as usize;
-        let level = poly.level();
-        let modulus = poly.params_ref().modulus();
-        let modulus_level = Arc::new(poly.params_ref().modulus_for_level(level));
-        let reconstruct_coeffs = Arc::new(poly.params_ref().reconstruct_coeffs_for_level(level));
-        let expected_len = (level + 1).saturating_mul(n);
-        let expected_bytes = expected_len.saturating_mul(mem::size_of::<u64>());
-        let bytes_per_poly = (level + 1).saturating_mul(n).saturating_mul(mem::size_of::<u64>());
-        let mut bytes = vec![0u8; bytes_per_poly];
-        poly.store_rns_bytes(&mut bytes, GPU_POLY_FORMAT_COEFF);
-        assert!(bytes.len() >= expected_bytes, "RNS byte length underflow in coeff extraction");
-        let mut flat = Vec::with_capacity(expected_len);
-        for limb_bytes in bytes[..expected_bytes].chunks_exact(mem::size_of::<u64>()) {
-            let le: [u8; 8] = limb_bytes.try_into().expect("u64 chunk size mismatch");
-            flat.push(u64::from_le_bytes(le));
-        }
-        debug_assert_eq!(flat.len(), expected_len, "RNS flat length mismatch");
+        let modulus = self.params_ref().modulus();
+        self.residue_values(false)
+            .into_par_iter()
+            .map(|value| FinRingElem::new(value, modulus.clone()))
+            .collect()
+    }
 
-        let mut coeffs = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut acc = BigUint::ZERO;
-            for limb in 0..=level {
-                let residue = flat[limb * n + i];
-                acc += &reconstruct_coeffs[limb] * BigUint::from(residue);
-            }
-            let value = acc % modulus_level.as_ref();
-            assert!(
-                &value < modulus_level.as_ref(),
-                "GPU reconstructed coefficient out of range at index {i}"
-            );
-            coeffs.push(FinRingElem::new(value, modulus.clone()));
-        }
-        coeffs
+    fn evals_biguints(&self) -> Vec<BigUint> {
+        self.residue_values(true)
     }
 
     fn const_zero(params: &Self::Params) -> Self {
@@ -1794,6 +1851,32 @@ mod tests {
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
     use rand::prelude::*;
+
+    #[test]
+    #[sequential]
+    fn test_gpu_dcrtpoly_native_evaluation_roundtrip() {
+        let (n, depth, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let original = DCRTPolyUniformSampler::new().sample_poly(&params, &DistType::FinRingDist);
+        let coefficients = original.coeffs_biguints();
+        let evaluations = original.evals_biguints();
+        let unreduced = evaluations
+            .par_iter()
+            .map(|value| value + params.modulus().as_ref())
+            .collect::<Vec<_>>();
+        let imported = GpuDCRTPoly::from_biguints_eval(&gpu_params, &unreduced);
+        assert!(imported.is_ntt());
+        assert_eq!(imported.evals_biguints(), evaluations);
+        assert_eq!(imported.coeffs_biguints(), coefficients);
+        let forward = GpuDCRTPoly::from_biguints(&gpu_params, &coefficients);
+        assert_eq!(forward.evals_biguints(), evaluations);
+        assert_eq!(
+            GpuDCRTPoly::from_biguints_eval(&gpu_params, &forward.evals_biguints())
+                .coeffs_biguints(),
+            coefficients
+        );
+    }
 
     #[test]
     fn test_gpu_approximate_params_reject_partitioned_placement_before_context_creation() {

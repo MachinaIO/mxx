@@ -241,6 +241,8 @@ pub enum PolyBackendError {
     InvalidConstantShape,
     #[error("integer value cannot be represented in the target ring")]
     InvalidInteger,
+    #[error("CRT basis conversion failed: {0}")]
+    BasisConversion(String),
     #[error("trapdoor deserialization failed")]
     TrapdoorDeserialization,
     #[error(transparent)]
@@ -585,6 +587,45 @@ where
     type Trapdoor = T::Trapdoor;
     type Error = PolyBackendError;
 
+    fn polynomial_from_values(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        values: &[BigInt],
+        evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error> {
+        if ty.rows != 1 || ty.columns != 1 || values.len() != ty.ring_dimension {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let parameters = self.parameters(ty)?;
+        let canonical = values
+            .par_iter()
+            .map(|value| {
+                value.mod_floor(&ty.modulus).to_biguint().ok_or(PolyBackendError::InvalidInteger)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let polynomial = if evaluation {
+            M::P::from_biguints_eval(parameters, &canonical)
+        } else {
+            M::P::from_biguints(parameters, &canonical)
+        };
+        Ok(M::from_poly_vec_row(parameters, vec![polynomial]))
+    }
+
+    fn polynomial_values(
+        &mut self,
+        value: &Self::Matrix,
+        evaluation: bool,
+    ) -> Result<Vec<BigInt>, Self::Error> {
+        self.parameters_for_matrix(value)?;
+        if value.size() != (1, 1) {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let polynomial = value.entry(0, 0);
+        let output =
+            if evaluation { polynomial.evals_biguints() } else { polynomial.coeffs_biguints() };
+        Ok(output.into_par_iter().map(BigInt::from).collect())
+    }
+
     fn placement_count(&self) -> usize {
         self.parameters.len()
     }
@@ -861,6 +902,10 @@ where
         Ok(left.add_out_of_place(right))
     }
 
+    fn add_row_blocks(&mut self, blocks: &[&M], right: &M) -> Result<M, Self::Error> {
+        Ok(right.add_row_blocks_out_of_place(blocks))
+    }
+
     fn add_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
         Ok(M::add_batch_out_of_place(inputs))
     }
@@ -876,7 +921,9 @@ where
     fn multiply(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
         let left_size = left.size();
         let right_size = right.size();
-        Ok(if left_size == (1, 1) {
+        Ok(if left_size.1 == right_size.0 {
+            left.multiply_out_of_place(right)
+        } else if left_size == (1, 1) {
             right.multiply_poly_out_of_place(&left.entry(0, 0))
         } else if right_size == (1, 1) {
             left.multiply_poly_out_of_place(&right.entry(0, 0))
@@ -968,6 +1015,55 @@ where
         Ok(value.reduce_modulus(self.parameters(destination)?))
     }
 
+    fn centered_rebase(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+    ) -> Result<M, Self::Error> {
+        value
+            .centered_rebase(self.parameters(destination)?)
+            .map_err(PolyBackendError::BasisConversion)
+    }
+
+    fn rns_mod_up(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<M, Self::Error> {
+        if value.params().to_crt().0 != source_moduli {
+            return Err(PolyBackendError::BasisConversion(
+                "RNS source tower order disagrees with graph".into(),
+            ));
+        }
+        let output = value
+            .rns_mod_up(self.parameters(destination)?, digit_size, normalize)
+            .map_err(PolyBackendError::BasisConversion)?;
+        if output.row_size() != destination.rows {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        Ok(output)
+    }
+
+    fn rns_mod_down(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: u64,
+    ) -> Result<M, Self::Error> {
+        if value.params().to_crt().0 != source_moduli {
+            return Err(PolyBackendError::BasisConversion(
+                "RNS source tower order disagrees with graph".into(),
+            ));
+        }
+        value
+            .rns_mod_down(self.parameters(destination)?, plaintext_modulus)
+            .map_err(PolyBackendError::BasisConversion)
+    }
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<M>, usize)>,
@@ -1057,6 +1153,19 @@ where
         let rows = rows.cloned().unwrap_or(IndexRange { start: 0, end: row_count });
         let columns = columns.cloned().unwrap_or(IndexRange { start: 0, end: column_count });
         Ok(value.slice(rows.start, rows.end, columns.start, columns.end))
+    }
+
+    fn sum_rows(&mut self, value: &M, rows: &[Vec<usize>]) -> Result<M, Self::Error> {
+        Ok(value.sum_rows(rows))
+    }
+
+    fn tensor_sum_rows(
+        &mut self,
+        left: &M,
+        right: &M,
+        rows: &[Vec<usize>],
+    ) -> Result<M, Self::Error> {
+        Ok(left.tensor_sum_rows(right, rows))
     }
 
     fn tensor(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
@@ -1602,6 +1711,47 @@ mod tests {
     use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
 
     #[test]
+    fn test_polynomial_values_round_trip_and_input_validation() {
+        let read = |name, default| {
+            std::env::var(name).map(|value| value.parse::<usize>().unwrap()).unwrap_or(default)
+        };
+        let n = read("MXX_PRIMITIVE_TEST_RING_DIMENSION", 8) as u32;
+        let depth = read("MXX_PRIMITIVE_TEST_CRT_DEPTH", 2);
+        let bits = read("MXX_PRIMITIVE_TEST_CRT_BITS", 17);
+        let base_bits = read("MXX_PRIMITIVE_TEST_BASE_BITS", 2) as u32;
+        let parameters = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: n as usize,
+            rows: 1,
+            columns: 1,
+        };
+        let input: Vec<BigInt> = (0..n)
+            .map(|index| &ty.modulus * BigInt::from(index) + BigInt::from(index) - 2)
+            .collect::<Vec<_>>();
+        let expected = input.iter().map(|value| value.mod_floor(&ty.modulus)).collect::<Vec<_>>();
+        let mut backend = cpu_backend([parameters.clone()]);
+        let coefficients = backend.polynomial_from_values(&ty, &input, false).unwrap();
+        assert_eq!(backend.polynomial_values(&coefficients, false).unwrap(), expected);
+        let evaluations = backend.polynomial_values(&coefficients, true).unwrap();
+        let reconstructed = backend.polynomial_from_values(&ty, &evaluations, true).unwrap();
+        assert_eq!(reconstructed, coefficients);
+        let from_evaluations = backend.polynomial_from_values(&ty, &input, true).unwrap();
+        assert_eq!(backend.polynomial_values(&from_evaluations, true).unwrap(), expected);
+        assert!(backend.polynomial_from_values(&ty, &input[..input.len() - 1], false).is_err());
+        let matrix = ConcreteMatrixType { rows: 2, ..ty.clone() };
+        assert!(backend.polynomial_from_values(&matrix, &input, true).is_err());
+        assert!(
+            backend.polynomial_values(&DCRTPolyMatrix::zero(&parameters, 2, 1), false).is_err()
+        );
+        let unknown_ring = ConcreteMatrixType { modulus: &ty.modulus + 2, ..ty };
+        assert!(matches!(
+            backend.polynomial_from_values(&unknown_ring, &input, false),
+            Err(PolyBackendError::MissingParameters(_))
+        ));
+    }
+
+    #[test]
     fn modulus_conversion_uses_registered_exact_destination_rings() {
         let source = DCRTPolyParams::new(8, 3, 17, 2, None, None);
         let primes = source.to_crt().0;
@@ -1634,6 +1784,83 @@ mod tests {
         let reduced = backend.reduce_modulus(&input, &ty(&low)).unwrap();
         assert_eq!(reduced.entry(0, 0).coeffs_biguints()[0], BigUint::from(3u32));
         assert_eq!(reduced.entry(0, 0).coeffs_biguints()[1], &low_modulus - 1u32);
+    }
+
+    #[test]
+    fn test_rns_conversion_rejects_wrong_declared_basis_order() {
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let extended = DCRTPolyParams::new(n, 4, 17, 2, None, None);
+        let primes = extended.to_crt().0;
+        let modulus = primes[..3].iter().map(|&p| BigUint::from(p)).product::<BigUint>();
+        let source = extended.select_modulus(&modulus).unwrap();
+        let input = DCRTPolyMatrix::zero(&source, 2, 3);
+        let mut backend = cpu_backend([source.clone(), extended.clone()]);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(extended.modulus().as_ref().clone()),
+            ring_dimension: n as usize,
+            rows: 4,
+            columns: 3,
+        };
+        let mut wrong_basis = source.to_crt().0;
+        wrong_basis.reverse();
+        assert!(matches!(
+            backend.rns_mod_up(&input, &ty, &wrong_basis, 2, true),
+            Err(PolyBackendError::BasisConversion(_))
+        ));
+        let result = backend.rns_mod_up(&input, &ty, &source.to_crt().0, 2, true).unwrap();
+        assert_eq!(result.size(), (4, 3));
+        let output_type = ConcreteMatrixType { modulus: BigInt::from(modulus), ..ty };
+        let mut wrong_basis = primes;
+        wrong_basis.reverse();
+        assert!(matches!(
+            backend.rns_mod_down(&result, &output_type, &wrong_basis, 3),
+            Err(PolyBackendError::BasisConversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_centered_rebase_preserves_small_signed_values_in_unrelated_bases() {
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let source = DCRTPolyParams::new(n, 1, 17, 2, None, None);
+        let destination = DCRTPolyParams::new(n, 2, 19, 2, None, None);
+        let ty = |parameters: &DCRTPolyParams| ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: n as usize,
+            rows: 1,
+            columns: 1,
+        };
+        // Trusted signed constant import is the reference; no CRT reconstruction
+        // occurs in the operation under test.
+        let half = (source.to_crt().0[0] / 2) as i64;
+        let integers = [-half, half, 0, -1];
+        let make = |parameters: &DCRTPolyParams| {
+            let coefficients = integers
+                .iter()
+                .map(|v| {
+                    let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+                    ((BigInt::from(*v) % &modulus + &modulus) % &modulus).to_biguint().unwrap()
+                })
+                .collect::<Vec<_>>();
+            DCRTPolyMatrix::from_poly_vec_row(
+                parameters,
+                vec![DCRTPoly::from_biguints(parameters, &coefficients)],
+            )
+        };
+        let mut backend = cpu_backend([source.clone(), destination.clone()]);
+        let input = make(&source);
+        let rebased = backend.centered_rebase(&input, &ty(&destination)).unwrap();
+        assert_eq!(rebased, make(&destination));
+        assert!(matches!(
+            backend.centered_rebase(&rebased, &ty(&source)),
+            Err(PolyBackendError::BasisConversion(_))
+        ));
+        // A one-limb target smaller than the source exercises negative reduction
+        // when a centered magnitude exceeds the destination prime.
+        let small = DCRTPolyParams::new(n, 1, 10, 2, None, None);
+        let output = input.centered_rebase(&small).unwrap();
+        assert_eq!(output, make(&small));
     }
 
     #[test]

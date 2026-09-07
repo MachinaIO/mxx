@@ -42,7 +42,12 @@ struct GpuMatrix
     {
         int device;
         cudaStream_t stream;
+        // This event is physically owned here and destroyed exactly once.
         cudaEvent_t write_done;
+        // Local state index whose owned event currently dominates this limb.
+        uint32_t completion_owner;
+        // Producer ownership and last event-recording stream can differ.
+        cudaStream_t last_write_stream;
         bool write_done_valid;
     };
     struct SharedLimbBuffer
@@ -66,6 +71,7 @@ struct GpuMatrix
     struct SharedAuxBuffer
     {
         int device;
+        // Non-owning interior view of the corresponding SharedLimbBuffer allocation.
         void **ptr;
         size_t slots_per_poly;
         size_t slots_total;
@@ -73,6 +79,10 @@ struct GpuMatrix
     std::vector<SharedLimbBuffer> shared_limb_buffers;
     std::vector<SharedAuxBuffer> shared_aux_buffers;
     std::vector<std::vector<LimbExecState>> exec_limb_states;
+    // A deferred allocation stays private until its filling kernel is submitted.
+    bool descriptors_initialized = true;
+    // Actual writes invalidate this; reader lifetime joins remain independent.
+    mutable std::atomic<bool> host_observed_writer_ready{false};
 };
 #endif
 

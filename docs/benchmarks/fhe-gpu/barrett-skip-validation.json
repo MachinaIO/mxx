@@ -1,0 +1,632 @@
+{
+  "date_utc": "2026-09-07",
+  "scope": "Current standalone multiplication checkpoint. Below-two target is not met. Ignored tests were not executed. Single physical GPU; no multi-GPU claim.",
+  "snapshot": {
+    "base_commit": "30e0e599e586bd7eb5e62dc41bcc8e7e25626726",
+    "patch_sha256": "94d01daeee72efb8139889b05a46297fd59463e6896864b8939fa7177a058438",
+    "gpu_unit_totals": {
+      "passed": 767,
+      "failed": 0,
+      "ignored": 26
+    },
+    "binaries": {
+      "gpu_bgv_round_trip-26c9477b7914b98b": "eccb9fb50fdee3536df151c8ffb4ec42b1d8788d64386ce02c6a31e8576d0770",
+      "gpu_ring_gsw_round_trip-df47ebe9c0f2384f": "3a755de77f8c572eb36f48246d0edaceb1464af2eaa29e4e643ad0cc9d3eb738",
+      "mxx_primitives-203401fd49222996": "af335885a6056b4fb81c5ea11aec71df80779961c9f72aa11ef91e5c4b29e88c",
+      "mxx_runtime-ce1acd996f6c8a8f": "fff2b43d716a4408c8ceadd62b28810bd39057bb14b8b90faa698f868a89b201"
+    }
+  },
+  "source_files": {
+    "crates/fhe/src/gpu_test_utils.rs": "0acf58266a74874b7bc1f3145e6d3c6498143554245fcf5603df32e7c3cc6ff9",
+    "crates/primitives/cuda/include/Runtime.cuh": "cc3a8f604b3347bdb9ac14a3166f4bd5ba55bff3f62fb930bf94def7977d6972",
+    "crates/primitives/cuda/include/matrix/Matrix.cuh": "16b3d414c27dc15f927ccda07af1781a70b02d3762499933c727f2bf8cbbff93",
+    "crates/primitives/cuda/include/matrix/MatrixArith.cuh": "89b871e546f8680be4bfd61548218a85b8c539a7ac1c4da78ab8548fa3218148",
+    "crates/primitives/cuda/include/matrix/MatrixData.cuh": "b7eac1c643589e43abba98f7539c2f58ad65b4d9db4940beff2a1d2a566f86ca",
+    "crates/primitives/cuda/include/matrix/MatrixUtils.cuh": "56b6e7f7fa1121189210b463f9ba75ded5fe54f99078356232b26a6505a031a2",
+    "crates/primitives/cuda/src/Runtime.cu": "8ede1ace32fd123ba9b5ef2c2d1bb278d89600b0d4016888616839cc7c00c06d",
+    "crates/primitives/cuda/src/matrix/MatrixArith.cu": "025426b9d2fb57df3b0776a30604a8d2d6ffcd6dc9634c3a2265e767db08ce03",
+    "crates/primitives/cuda/src/matrix/MatrixData.cu": "1d39f17bd4a5c3ed108d3bd1b59d1bda528bce9cc96bf8eb1e7f49698220812f",
+    "crates/primitives/cuda/src/matrix/MatrixUtils.cu": "bf11372f615dca0a2f3a0910be75218703efc5499f50bd6e03f4ceff00bb137b",
+    "crates/primitives/src/matrix/gpu_dcrt_poly.rs": "4bcb31f4d609b3adea55760e78b52747d8c092bb8d7e7903d84894075ebd5e2d",
+    "crates/primitives/src/matrix/gpu_rns.rs": "f21b4ccfb995cef20b4c5a1f666e0761b5ede89aa23d34c703842495df401988",
+    "crates/primitives/src/matrix/mod.rs": "075960d7584abe6ef0d3d8fc150448dcb91b7cb007e2c03ade35e546a65c3795",
+    "crates/primitives/src/poly/dcrt/gpu.rs": "ae6d4d8c06202b8edff034a015a1dcf6945045eb028dc9b6a66f1c43cc7c2a3b",
+    "crates/primitives/src/sampler/trapdoor/gpu.rs": "97b232cba0f635325fe13d784dc5337be0e065a0c32531fad117674e3ec13ee6",
+    "crates/runtime/src/backend.rs": "b0a5c2f7c10ed09dae7ed0b739ef6911cd5f64258d20b6fed1db6cd4b5ef6eab",
+    "crates/runtime/src/backend/poly.rs": "6a012e62bdefb1a583ab33b17bef803a0fdd7e7cbeacef4224c0329f9b09c58d",
+    "crates/runtime/src/backend/poly_gpu/fleet.rs": "8946251e929edbd4c461e0d30a012a49794796c65660c80d44679f10fcbb9a37",
+    "crates/runtime/src/executor.rs": "b74d995883de5ad27d97f129aafa0ead82c248f531c5d50e8413218a60351dab",
+    "crates/runtime/src/executor/gpu_plan.rs": "9d43b901a236f8d02281f2a48f375fffba7ff1de408ff3586148fd24e56fc608",
+    "crates/runtime/src/gpu_calibration.rs": "7d6fb55a556602e0250c40b6aecdcf727d6efb68f67df4c3ebe09b03f947d048",
+    "scripts/fhe/pool.py": "c79c274573f26eb0fa2b1b9cf853aed9465b1f214a92ff9ff19da6abfc1b62ef"
+  },
+  "unit_runs": [
+    {
+      "configuration": "cpu",
+      "command": [
+        "cargo",
+        "test",
+        "-r",
+        "--workspace",
+        "--lib",
+        "--no-fail-fast"
+      ],
+      "passed": 579,
+      "failed": 0,
+      "ignored": 24,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-cpu-tests.log",
+      "sha256": "6f473f27485e32715fa2e0b31249159046fa283b999373648bcac83c11bed2df"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_bench_estimator-d93132bffa057038"
+      ],
+      "passed": 47,
+      "failed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_bench_estimator-d93132bffa057038.log",
+      "sha256": "8b39baf2f8d271c36be5bc992129ddb1f5fad1ed8479f8acdd83a9890c555c6d"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_bgg-93a3405f89e56608"
+      ],
+      "passed": 69,
+      "failed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_bgg-93a3405f89e56608.log",
+      "sha256": "585735e9fefcc939ca7e20e8831b9eefec5f6fbba34330dbb3e1ee4fe9dc9258"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_dsl-8d1d7ded134a3f93"
+      ],
+      "passed": 69,
+      "failed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_dsl-8d1d7ded134a3f93.log",
+      "sha256": "ce466871192f5a9a068d54af13d6ca387c6c728201a402a40a2082a5a101cc50"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_fhe-bdeff457a244e09b"
+      ],
+      "passed": 19,
+      "failed": 0,
+      "ignored": 1,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_fhe-bdeff457a244e09b.log",
+      "sha256": "53f66baafae8b313eca0b281de60de30cb17c3c8690fa70286f8f2673b2084f6"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_func_enc-b7773b8807ff1d1e"
+      ],
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_func_enc-b7773b8807ff1d1e.log",
+      "sha256": "df166913f47ff1f04202cae9b31df67ed272d692d99a0023a8117dc3029100dd"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_gadgets-2b909b3ae7d1a8d9"
+      ],
+      "passed": 110,
+      "failed": 0,
+      "ignored": 20,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_gadgets-2b909b3ae7d1a8d9.log",
+      "sha256": "345f55e8354b0e8375fbb0e37660e2f850198ab7dfb37f32d96b68533992481b"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_io-453079e38ed116ce"
+      ],
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_io-453079e38ed116ce.log",
+      "sha256": "df166913f47ff1f04202cae9b31df67ed272d692d99a0023a8117dc3029100dd"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_ir_core-89c041d77625b472"
+      ],
+      "passed": 115,
+      "failed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_ir_core-89c041d77625b472.log",
+      "sha256": "72036fce5059d3c7ca128f35559cffb20c73bc3fe35e45c6fb0000b087d9504c"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_primitives-203401fd49222996"
+      ],
+      "passed": 203,
+      "failed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_primitives-203401fd49222996.log",
+      "sha256": "0267fc959ef1b8831f857c69681ed0994d3b82cb65e89b6d883afc8de18bb8bf"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_runtime-ce1acd996f6c8a8f"
+      ],
+      "passed": 116,
+      "failed": 0,
+      "ignored": 1,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_runtime-ce1acd996f6c8a8f.log",
+      "sha256": "0e6c54a907299d0c780dfdced08152251e8cf0455721310e6688b5f7ced7b2fc"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_we-6bafec11d82565ab"
+      ],
+      "passed": 19,
+      "failed": 0,
+      "ignored": 4,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-all-gpu-mxx_we-6bafec11d82565ab.log",
+      "sha256": "e9367ec009c2e360acbf7f1bd492f52440e76b64e916b9385e3056f9283e1458"
+    }
+  ],
+  "targeted_gpu_checks": [
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "ring_dimension": "8192",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-n8192-1.log",
+      "sha256": "ecccaace6e08eac7e267383b813fb9a34c7fbb35873f3053fb3e3f9a7a4f4d1f"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "ring_dimension": "8192",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-n8192-2.log",
+      "sha256": "f90926d77391aad92e5cd7e22224d63f3e9dd2a59706ef07e1bacf50c3f2e04e"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "ring_dimension": "8192",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-n8192-3.log",
+      "sha256": "2d95d6dd61e6de47dbab485f7d3785ea129621367a5f52fee5b0e9003fe43ce2"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "ring_dimension": "8192",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-n8192-4.log",
+      "sha256": "1ddfc99168a14dcc468ebba58e07af42e831554d87521d7b1edc9c382d75b64a"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "ring_dimension": "8192",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-n8192-5.log",
+      "sha256": "1ddfc99168a14dcc468ebba58e07af42e831554d87521d7b1edc9c382d75b64a"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "ring_dimension": "8192",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-n8192-1.log",
+      "sha256": "1e977ddb4cf1e8804311045e20580b9b1495b9b13cbd74883ab5f3377c89bc19"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "ring_dimension": "8192",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-n8192-2.log",
+      "sha256": "8e5ff40c6fa8bc422c1b3e50e938e08f03ced2e322d3c2b54d8bb08d86e76c48"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "ring_dimension": "8192",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-n8192-3.log",
+      "sha256": "8e867854aa9cdc893c3a77cd4c087215928d95ad7a67ee65138c31a60c070cd7"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "ring_dimension": "8192",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-n8192-4.log",
+      "sha256": "1e977ddb4cf1e8804311045e20580b9b1495b9b13cbd74883ab5f3377c89bc19"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "ring_dimension": "8192",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-n8192-5.log",
+      "sha256": "1e977ddb4cf1e8804311045e20580b9b1495b9b13cbd74883ab5f3377c89bc19"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n8192-1.log",
+      "sha256": "c41e76654f24baa6b623c847e95e428c07281ed8b0b2a2427b5b6d1b7795c9c7"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n8192-2.log",
+      "sha256": "01b6fa4eb26fab4ad70e0087d1d64df0030e7b8eeb9d6051fc148b97c1d8a365"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n8192-3.log",
+      "sha256": "8ea8b054e465ac9033ac1373646b312545ce518024c5f2b91ad2c7789bf2aeb3"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n8192-4.log",
+      "sha256": "e35e2178e08e09f312bb3fa16b6144ff2a016b24bcdecf6a2481d314aef2996a"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n8192-5.log",
+      "sha256": "c62afa2b7a64ee14e7d17d943b868ecbb21dcf004dd5dcd39be4cb8bc7de5ba9"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_random_matches_cpu-n8192-1.log",
+      "sha256": "22e90cd2994fae4d81c858a9be8073c24907797b19246d1fcdc482b245c4e794"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_random_matches_cpu-n8192-2.log",
+      "sha256": "22e90cd2994fae4d81c858a9be8073c24907797b19246d1fcdc482b245c4e794"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_random_matches_cpu-n8192-3.log",
+      "sha256": "0699b6b580c6040625cd345e4bfef55c046001d13f334940edf719c7700a1858"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_random_matches_cpu-n8192-4.log",
+      "sha256": "1602313cff96a7b09032d1408601af10963b966f185f5147f0187aa3c44b3062"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_random_matches_cpu-n8192-5.log",
+      "sha256": "0699b6b580c6040625cd345e4bfef55c046001d13f334940edf719c7700a1858"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_small_matrix_dot_matches_cpu-n8192-1.log",
+      "sha256": "7d2f877776f50315abed991ba4e2d35dd7fe879a7e96ddae3f9f86ce50cf26a8"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_small_matrix_dot_matches_cpu-n8192-2.log",
+      "sha256": "c752726abfb9d312a5fba4574bebfda9681483587c06029972213859098823bb"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_small_matrix_dot_matches_cpu-n8192-3.log",
+      "sha256": "656b6a0f45be4afc043c417eb428e97e826b823a459560288742780138cc51be"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_small_matrix_dot_matches_cpu-n8192-4.log",
+      "sha256": "7d2f877776f50315abed991ba4e2d35dd7fe879a7e96ddae3f9f86ce50cf26a8"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "ring_dimension": "8192",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_small_matrix_dot_matches_cpu-n8192-5.log",
+      "sha256": "262858304aff12d8ff4dcc1f55dda1e8c30249a36ba570c70961dd1eec1e3abc"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "8192",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n8192-1.log",
+      "sha256": "cc0ca50f3e1e6f1808ae0ce2340c235bb6ad45e9a9d33cd424bd9de401fad6fd"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "8192",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n8192-2.log",
+      "sha256": "9fb8b91a3df40beeadea4ba7a0b9693751b00c515f2e28411680b0b9a5e68eb5"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "8192",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n8192-3.log",
+      "sha256": "f02316582543cad12861daa1bfee1f3f6a3f01a967aa41554fc9e4bc4a751ecc"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "8192",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n8192-4.log",
+      "sha256": "cc0ca50f3e1e6f1808ae0ce2340c235bb6ad45e9a9d33cd424bd9de401fad6fd"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "8192",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n8192-5.log",
+      "sha256": "9fb8b91a3df40beeadea4ba7a0b9693751b00c515f2e28411680b0b9a5e68eb5"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "32",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n32-1.log",
+      "sha256": "567cb57f33bed41f69604fe387e19bae94290268f1d7e64d266b779e8f165d4f"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "32",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n32-2.log",
+      "sha256": "95ddd4cc12642cd82ba932940add0bf5c58ab6bc710f6ba70dc0d7ce54f44c72"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "32",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n32-3.log",
+      "sha256": "677321018f461d829256c804b8a16373dd746c0f145f30dec1fcf7ce263a47c9"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "32",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n32-4.log",
+      "sha256": "677321018f461d829256c804b8a16373dd746c0f145f30dec1fcf7ce263a47c9"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "ring_dimension": "32",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_matches_cpu-n32-5.log",
+      "sha256": "95ddd4cc12642cd82ba932940add0bf5c58ab6bc710f6ba70dc0d7ce54f44c72"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "32",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n32-1.log",
+      "sha256": "5ca97f140b589583e6e68bd18ab9e51c2eb31f27625dd1dd605b6a01a31f052f"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "32",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n32-2.log",
+      "sha256": "5ca97f140b589583e6e68bd18ab9e51c2eb31f27625dd1dd605b6a01a31f052f"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "32",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n32-3.log",
+      "sha256": "8a5fdff670b6dc7200c846f9378731753cc84d0c1dd0b5cd0088ca392f7cac42"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "32",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n32-4.log",
+      "sha256": "5ca97f140b589583e6e68bd18ab9e51c2eb31f27625dd1dd605b6a01a31f052f"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_boundary_residues",
+      "ring_dimension": "32",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/test_gpu_matrix_tensor_sum_rows_boundary_residues-n32-5.log",
+      "sha256": "5ca97f140b589583e6e68bd18ab9e51c2eb31f27625dd1dd605b6a01a31f052f"
+    }
+  ],
+  "round_trips": [
+    {
+      "scheme": "bgv",
+      "preset": 54,
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-bgv54-1.log",
+      "sha256": "fc7ab5596ee95903753dd257d813669de6151eddf09988e7fe96ee7a5a410c78"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 36,
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-bgv36-1.log",
+      "sha256": "b9e15ffcf4ec0043684849770da5c8b8a6f06518c2de845c56c6ae5c3a0f13c7"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 54,
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-bgv54-2.log",
+      "sha256": "1c84f60e0ed526e76283b5cabc6e2a49caa5a1b3c4c834dae9d985b0fe407aa8"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 36,
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-bgv36-2.log",
+      "sha256": "60a199ca5782869a25c772dac802cfcffaa40a6dd0f92df9cd5adbca9a06b1bd"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 54,
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-bgv54-3.log",
+      "sha256": "5aeeca4435ad96c5bc47d11fa3e3bb41b89bce832800c727c5cce71d6dc01dc7"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 36,
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-bgv36-3.log",
+      "sha256": "092dcfd294e92b51ddbe5bbba15603fe32344202a474e76b361680aa9a1c3312"
+    },
+    {
+      "scheme": "ring_gsw",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-ring-gsw-1.log",
+      "sha256": "4976994dcaf26688d46522046ddd2eb43e1ee014d0de82e416142e2e7358693e"
+    },
+    {
+      "scheme": "ring_gsw",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-ring-gsw-2.log",
+      "sha256": "7bc5ce3518eccf92ad763dd7274fab6fee351af7a487dbe652a73f20bfa27bbd"
+    },
+    {
+      "scheme": "ring_gsw",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-ring-gsw-3.log",
+      "sha256": "700d3093eac5313ad8f8a025e1664b3851975277009e3ccb8c693000cd30275b"
+    }
+  ],
+  "barrett_harness": {
+    "source": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-check.cu",
+    "source_sha256": "6e51298194416f1933664d7e27320aef77176cd63d1c5af62ceb167275c81a50",
+    "generator": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-generate-barrett-check.py",
+    "runs": [
+      {
+        "iteration": 1,
+        "log": "test_data/fhe-round-trip/optimization/barrett-skip/barrett-harness-runs/1.log",
+        "sha256": "7bbda351a530396836150bfbddd2585971e96d21d87bea3010e35602525c545c",
+        "cases": 1311951,
+        "failures": 0
+      },
+      {
+        "iteration": 2,
+        "log": "test_data/fhe-round-trip/optimization/barrett-skip/barrett-harness-runs/2.log",
+        "sha256": "ebfd21366d6d5ccb4768c0b7c604d5503ec359f68838657cc8c3107b3bb17729",
+        "cases": 1311951,
+        "failures": 0
+      },
+      {
+        "iteration": 3,
+        "log": "test_data/fhe-round-trip/optimization/barrett-skip/barrett-harness-runs/3.log",
+        "sha256": "6c9f25b0d31b4868d6fe3c455152056308e04aa4b8765cda7894ff40faf1d995",
+        "cases": 1311951,
+        "failures": 0
+      },
+      {
+        "iteration": 4,
+        "log": "test_data/fhe-round-trip/optimization/barrett-skip/barrett-harness-runs/4.log",
+        "sha256": "b577e0cff7bf851d99af93f1689cdb1ffe2090d096e290355bf554d8ca43439f",
+        "cases": 1311951,
+        "failures": 0
+      },
+      {
+        "iteration": 5,
+        "log": "test_data/fhe-round-trip/optimization/barrett-skip/barrett-harness-runs/5.log",
+        "sha256": "9db4fa53e497547c6e150c5a1b6364ecf9a9a2ec90e1bc16f84639f967b5b050",
+        "cases": 1311951,
+        "failures": 0
+      }
+    ]
+  },
+  "measurements_sha256": "d8ee75464d6b0bdf822fb6316027bfb280ee73ea7851e3eb750aed915bfcf353",
+  "build_logs": [
+    {
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-build.log",
+      "sha256": "71104ed3de9205d9bf094473255c8259d7ba7ca9204503082a49206f1ac87d81"
+    },
+    {
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-cpu-build.log",
+      "sha256": "652c86f3132f2432c1d8298b8fbab2e14b7134e75de1d7551bf5d1bbfa8ae0c8"
+    },
+    {
+      "log": "test_data/fhe-round-trip/optimization/barrett-skip/mxx-barrett-skip-integration-build.log",
+      "sha256": "30959c691dc4572d9f91399e38f1c3738e29d9b03c539f2cff456b84ced0b6ce"
+    }
+  ]
+}

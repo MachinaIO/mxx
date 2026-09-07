@@ -1,3 +1,6 @@
+#include <cudaTypedefs.h>
+#include <string>
+
 namespace
 {
     enum class BlockOp
@@ -25,17 +28,479 @@ namespace
     constexpr size_t kMatmulMaxGridZ = 65535;
     static_assert(kMatmulTileM > 0 && kMatmulTileN > 0 && kMatmulTileK > 0, "invalid matmul tile size");
     static_assert(kMatmulTileM * kMatmulTileN <= 1024, "matmul tile thread count exceeds CUDA limit");
+    // CUDA copies value arguments into launch-owned parameter storage before
+    // returning. Small metadata therefore needs neither pinned staging nor a
+    // device allocation/reclaimer job. Context construction enforces the limb limit.
+    constexpr size_t kArithMetadataLimbs = GPU_RUNTIME_MAX_LIMBS;
+    struct BlockElementwiseMetadata
+    {
+        const uint8_t * lhs_bases[kArithMetadataLimbs];
+        const uint8_t * rhs_bases[kArithMetadataLimbs];
+        uint8_t * out_bases[kArithMetadataLimbs];
+        size_t lhs_stride_bytes[kArithMetadataLimbs];
+        size_t rhs_stride_bytes[kArithMetadataLimbs];
+        size_t out_stride_bytes[kArithMetadataLimbs];
+        uint8_t lhs_coeff_bytes[kArithMetadataLimbs];
+        uint8_t rhs_coeff_bytes[kArithMetadataLimbs];
+        uint8_t out_coeff_bytes[kArithMetadataLimbs];
+        uint64_t moduli[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(BlockElementwiseMetadata) + 3 * sizeof(size_t) + 2 * sizeof(int) <= 4096,
+                  "arithmetic launch exceeds portable CUDA parameter budget");
+    struct BlockCopyMetadata
+    {
+        const uint8_t * src_bases[kArithMetadataLimbs];
+        uint8_t * dst_bases[kArithMetadataLimbs];
+        size_t src_stride_bytes[kArithMetadataLimbs];
+        size_t dst_stride_bytes[kArithMetadataLimbs];
+        uint8_t src_coeff_bytes[kArithMetadataLimbs];
+        uint8_t dst_coeff_bytes[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(BlockCopyMetadata) + 10 * sizeof(size_t) + 0 * sizeof(int) <= 4096,
+                  "arithmetic launch exceeds portable CUDA parameter budget");
+    struct BlockAddMetadata
+    {
+        const uint8_t * src_bases[kArithMetadataLimbs];
+        uint8_t * dst_bases[kArithMetadataLimbs];
+        size_t src_stride_bytes[kArithMetadataLimbs];
+        size_t dst_stride_bytes[kArithMetadataLimbs];
+        uint8_t src_coeff_bytes[kArithMetadataLimbs];
+        uint8_t dst_coeff_bytes[kArithMetadataLimbs];
+        uint64_t moduli[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(BlockAddMetadata) + 10 * sizeof(size_t) + 0 * sizeof(int) <= 4096,
+                  "arithmetic launch exceeds portable CUDA parameter budget");
+
+    // Small output matrices are coefficient-parallel dots, not spatial GEMMs.
+    // Device-owned descriptors preserve compact limb widths and polynomial strides.
+    struct DescriptorProductMetadata
+    {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *lhs;
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *rhs;
+        GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
+        size_t indices[kArithMetadataLimbs];
+        uint64_t moduli[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(DescriptorProductMetadata) + 5 * sizeof(size_t) <= 4096,
+                  "descriptor product launch exceeds portable CUDA parameter budget");
+
+    struct TransposeMetadata
+    {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source;
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
+        size_t indices[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(TransposeMetadata) + 4 * sizeof(size_t) <= 4096,
+                  "transpose exceeds portable CUDA parameter budget");
+
+    __global__ void transpose_all_limbs_kernel(
+        TransposeMetadata metadata, size_t source_rows, size_t source_cols, size_t count, size_t n)
+    {
+        const size_t limb = blockIdx.z;
+        const auto source = metadata.source[metadata.indices[limb]];
+        const auto out = metadata.out[metadata.indices[limb]];
+        for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             index < count; index += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const size_t poly = index / n;
+            const size_t coefficient = index % n;
+            const size_t source_poly = (poly % source_rows) * source_cols + poly / source_rows;
+            const uint64_t value = matrix_load_limb_u64(
+                source.base, source_poly, coefficient, source.stride, source.width);
+            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width, value);
+        }
+    }
+
+    struct RowSumMetadata
+    {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source;
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
+        size_t indices[kArithMetadataLimbs];
+        uint64_t moduli[kArithMetadataLimbs];
+        size_t rows[32];
+        size_t offsets[17];
+    };
+    static_assert(sizeof(RowSumMetadata) + 3 * sizeof(size_t) <= 4096,
+                  "row sum exceeds portable CUDA parameter budget");
+
+    __global__ void sum_rows_all_limbs_kernel(RowSumMetadata metadata, size_t cols, size_t count, size_t n)
+    {
+        const size_t limb = blockIdx.z;
+        const auto source = metadata.source[metadata.indices[limb]];
+        const auto out = metadata.out[metadata.indices[limb]];
+        for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             index < count; index += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const size_t poly = index / n;
+            const size_t row = poly / cols;
+            const size_t col = poly % cols;
+            const size_t coefficient = index % n;
+            uint64_t sum = 0;
+            for (size_t term = metadata.offsets[row]; term < metadata.offsets[row + 1]; ++term)
+                sum = add_mod_u64(sum, matrix_load_limb_u64(source.base,
+                    metadata.rows[term] * cols + col, coefficient, source.stride, source.width),
+                    metadata.moduli[limb]);
+            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width, sum);
+        }
+    }
+
+    constexpr size_t kRowAddMaxBlocks = 16;
+    struct RowBlockAddMetadata
+    {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *blocks[kRowAddMaxBlocks];
+        size_t rows[kRowAddMaxBlocks];
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *rhs;
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
+        size_t indices[kArithMetadataLimbs];
+        uint64_t moduli[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(RowBlockAddMetadata) + 3 * sizeof(size_t) <= 4096,
+                  "row block add exceeds portable CUDA parameter budget");
+
+    __global__ void add_row_blocks_all_limbs_kernel(
+        RowBlockAddMetadata metadata, size_t cols, size_t count, size_t n)
+    {
+        const size_t limb = blockIdx.z;
+        const size_t descriptor = metadata.indices[limb];
+        const auto rhs = metadata.rhs[descriptor];
+        const auto out = metadata.out[descriptor];
+        for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             index < count; index += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const size_t poly = index / n;
+            const size_t coefficient = index % n;
+            size_t row = poly / cols;
+            size_t block = 0;
+            while (row >= metadata.rows[block]) row -= metadata.rows[block++];
+            const auto lhs = metadata.blocks[block][descriptor];
+            const uint64_t a = matrix_load_limb_u64(lhs.base, row * cols + poly % cols,
+                                                  coefficient, lhs.stride, lhs.width);
+            const uint64_t b = matrix_load_limb_u64(rhs.base, poly, coefficient, rhs.stride, rhs.width);
+            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width,
+                                 add_mod_u64(a, b, metadata.moduli[limb]));
+        }
+    }
+
+    __global__ void small_dot_all_limbs_kernel(
+        DescriptorProductMetadata metadata, size_t rows, size_t inner, size_t cols, size_t n)
+    {
+        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coefficient >= n) return;
+        const size_t limb = blockIdx.z;
+        const auto lhs = metadata.lhs[metadata.indices[limb]];
+        const auto rhs = metadata.rhs[metadata.indices[limb]];
+        const auto out = metadata.out[metadata.indices[limb]];
+        const uint64_t modulus = metadata.moduli[limb];
+        const size_t column = blockIdx.y;
+        for (size_t row = 0; row < rows; ++row)
+        {
+            unsigned __int128 sum = 0;
+            for (size_t k = 0; k < inner; ++k)
+            {
+                const uint64_t a = matrix_load_limb_u64(lhs.base, row * inner + k,
+                    coefficient, lhs.stride, lhs.width);
+                const uint64_t b = matrix_load_limb_u64(rhs.base, k * cols + column,
+                    coefficient, rhs.stride, rhs.width);
+                unsigned __int128 product = static_cast<unsigned __int128>(a) * b;
+                // Usually the entire short dot fits in 128 bits (including the
+                // 36/54-bit CRT bases). Preserve exactness for arbitrary u64 inputs.
+                if (~static_cast<unsigned __int128>(0) - sum < product)
+                {
+                    sum %= modulus;
+                    product %= modulus;
+                }
+                sum += product;
+            }
+            matrix_store_limb_u64(out.base, row * cols + column, coefficient,
+                out.stride, out.width, static_cast<uint64_t>(sum % modulus));
+        }
+    }
+
+    __global__ void tensor_all_limbs_kernel(
+        DescriptorProductMetadata metadata, size_t lhs_cols, size_t rhs_rows,
+        size_t rhs_cols, size_t output_count, size_t n)
+    {
+        const size_t limb = blockIdx.z;
+        const auto lhs = metadata.lhs[metadata.indices[limb]];
+        const auto rhs = metadata.rhs[metadata.indices[limb]];
+        const auto out = metadata.out[metadata.indices[limb]];
+        const size_t output_cols = lhs_cols * rhs_cols;
+        for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             index < output_count; index += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const size_t poly = index / n;
+            const size_t coefficient = index % n;
+            const size_t row = poly / output_cols;
+            const size_t col = poly % output_cols;
+            const size_t left_poly = (row / rhs_rows) * lhs_cols + col / rhs_cols;
+            const size_t right_poly = (row % rhs_rows) * rhs_cols + col % rhs_cols;
+            const uint64_t a = matrix_load_limb_u64(lhs.base, left_poly, coefficient,
+                                                  lhs.stride, lhs.width);
+            const uint64_t b = matrix_load_limb_u64(rhs.base, right_poly, coefficient,
+                                                  rhs.stride, rhs.width);
+            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width,
+                                 mul_mod_u64(a, b, metadata.moduli[limb]));
+        }
+    }
+
+    struct TensorRowSumMetadata
+    {
+        DescriptorProductMetadata product;
+        size_t rows[32];
+        size_t offsets[17];
+        uint8_t *output_base;
+        size_t output_stride;
+        size_t output_offsets[kArithMetadataLimbs];
+        uint8_t output_widths[kArithMetadataLimbs];
+        bool initialize_output_descriptors;
+        GpuBarrettReciprocal reciprocals[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(TensorRowSumMetadata) + 5 * sizeof(size_t) <= 4096,
+                  "tensor row sum exceeds portable CUDA parameter budget");
+
+    template <bool SeparatePolynomials>
+    __global__ void tensor_sum_rows_all_limbs_kernel(
+        TensorRowSumMetadata metadata, size_t lhs_cols, size_t rhs_rows,
+        size_t rhs_cols, size_t poly_count, size_t n)
+    {
+        const size_t limb = blockIdx.z;
+        const size_t descriptor = metadata.product.indices[limb];
+        const auto lhs = metadata.product.lhs[descriptor];
+        const auto rhs = metadata.product.rhs[descriptor];
+        // Deferred output descriptors cannot be read by this launch: another
+        // block may not have written them yet. Arithmetic uses by-value layout.
+        const auto out = metadata.initialize_output_descriptors
+            ? GpuMatrix::SharedLimbBuffer::DeviceDescriptor{
+                metadata.output_base + metadata.output_offsets[limb],
+                metadata.output_stride, metadata.output_widths[limb]}
+            : metadata.product.out[descriptor];
+        if (metadata.initialize_output_descriptors && blockIdx.x == 0 &&
+            blockIdx.y == 0 && threadIdx.x == 0)
+            metadata.product.out[descriptor] = out;
+        const uint64_t modulus = metadata.product.moduli[limb];
+        const auto reciprocal = metadata.reciprocals[limb];
+        const size_t cols = lhs_cols * rhs_cols;
+        const size_t thread = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if constexpr (SeparatePolynomials)
+            if (thread >= n) return;
+        const size_t end = SeparatePolynomials ? poly_count : poly_count * n;
+        const size_t step = SeparatePolynomials ? gridDim.y :
+            static_cast<size_t>(gridDim.x) * blockDim.x;
+        for (size_t work = SeparatePolynomials ? blockIdx.y : thread; work < end; work += step)
+        {
+            const size_t poly = SeparatePolynomials ? work : work / n;
+            const size_t group = poly / cols;
+            const size_t column = poly % cols;
+            const size_t coefficient = SeparatePolynomials ? thread : work % n;
+            unsigned __int128 sum = 0;
+            for (size_t term = metadata.offsets[group]; term < metadata.offsets[group + 1]; ++term)
+            {
+                const size_t row = metadata.rows[term];
+                const uint64_t a = matrix_load_limb_u64(lhs.base,
+                    (row / rhs_rows) * lhs_cols + column / rhs_cols,
+                    coefficient, lhs.stride, lhs.width);
+                const uint64_t b = matrix_load_limb_u64(rhs.base,
+                    (row % rhs_rows) * rhs_cols + column % rhs_cols,
+                    coefficient, rhs.stride, rhs.width);
+                unsigned __int128 product = static_cast<unsigned __int128>(a) * b;
+                // The common short dot needs only one final division. Flush
+                // before a 128-bit carry, as in the generic small-dot kernel.
+                if (~static_cast<unsigned __int128>(0) - sum < product)
+                {
+                    sum = matrix_reduce_barrett_u128(sum, modulus, reciprocal.lo, reciprocal.hi);
+                    product = matrix_reduce_barrett_u128(product, modulus, reciprocal.lo, reciprocal.hi);
+                }
+                sum += product;
+            }
+            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width,
+                                 matrix_reduce_barrett_u128(sum, modulus, reciprocal.lo, reciprocal.hi));
+        }
+    }
+
+    template <bool SeparatePolynomials>
+    int launch_tensor_row_sum_driver(
+        TensorRowSumMetadata &metadata, size_t lhs_cols, size_t rhs_rows,
+        size_t rhs_cols, size_t poly_count, size_t n, dim3 grid, cudaStream_t stream)
+    {
+        thread_local void *launch_entry = nullptr;
+        thread_local void *context_id_entry = nullptr;
+        if (!launch_entry)
+        {
+            const cudaError_t error = cudaGetDriverEntryPointByVersion(
+                "cuLaunchKernel", &launch_entry, 12000, cudaEnableLegacyStream);
+            if (error != cudaSuccess) return set_error(error);
+            if (!launch_entry) return set_error("cuLaunchKernel entry point unavailable");
+        }
+        if (!context_id_entry)
+        {
+            const cudaError_t error = cudaGetDriverEntryPointByVersion(
+                "cuCtxGetId", &context_id_entry, 12000, cudaEnableLegacyStream);
+            if (error != cudaSuccess) return set_error(error);
+            if (!context_id_entry) return set_error("cuCtxGetId entry point unavailable");
+        }
+        unsigned long long context_id = 0;
+        CUresult result = reinterpret_cast<PFN_cuCtxGetId_v12000>(context_id_entry)(
+            nullptr, &context_id);
+        if (result != CUDA_SUCCESS) return set_error("cuCtxGetId failed");
+        // Unlike a context pointer or device ordinal, this ID is unique for the
+        // process lifetime, including after device reset and context recreation.
+        thread_local unsigned long long cached_context_id = 0;
+        thread_local cudaFunction_t function = nullptr;
+        if (!function || cached_context_id != context_id)
+        {
+            cudaFunction_t resolved = nullptr;
+            const cudaError_t error = cudaGetFuncBySymbol(&resolved,
+                reinterpret_cast<const void *>(tensor_sum_rows_all_limbs_kernel<SeparatePolynomials>));
+            if (error != cudaSuccess) return set_error(error);
+            function = resolved;
+            cached_context_id = context_id;
+        }
+        void *arguments[] = {&metadata, &lhs_cols, &rhs_rows, &rhs_cols, &poly_count, &n};
+        result = reinterpret_cast<PFN_cuLaunchKernel_v4000>(launch_entry)(
+            reinterpret_cast<CUfunction>(function), grid.x, grid.y, grid.z,
+            256, 1, 1, 0, reinterpret_cast<CUstream>(stream), arguments, nullptr);
+        if (result != CUDA_SUCCESS)
+        {
+            // An asynchronous error may be reported here. Protect owners before
+            // returning without the normal output and reader completion joins.
+            cudaStreamSynchronize(stream);
+            return set_error(("cuLaunchKernel failed: " + std::to_string(result)).c_str());
+        }
+        return 0;
+    }
+
+    int launch_descriptor_product(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, bool tensor,
+        const size_t *rows = nullptr, const size_t *offsets = nullptr,
+        size_t group_count = 0, size_t term_count = 0)
+    {
+        const size_t limb_count = static_cast<size_t>(lhs->level) + 1;
+        if (limb_count > kArithMetadataLimbs || lhs->ctx->moduli.size() < limb_count)
+            return set_error("invalid descriptor product modulus count");
+        DescriptorProductMetadata metadata{};
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+        if (status != 0) return status;
+        for (size_t limb = 0; limb < limb_count; ++limb)
+        {
+            const dim3 id = lhs->ctx->limb_gpu_ids[limb];
+            if (id.x >= lhs->shared_limb_buffers.size() ||
+                id.x >= rhs->shared_limb_buffers.size() || id.x >= out->shared_limb_buffers.size())
+                return set_error("invalid descriptor product limb partition");
+            const auto &left = lhs->shared_limb_buffers[id.x];
+            const auto &right = rhs->shared_limb_buffers[id.x];
+            const auto &output = out->shared_limb_buffers[id.x];
+            if (!left.device_descriptors || !right.device_descriptors || !output.device_descriptors ||
+                id.y >= left.limb_count || id.y >= right.limb_count || id.y >= output.limb_count ||
+                left.device != right.device || left.device != output.device)
+                return set_error("invalid descriptor product descriptors");
+            if (limb == 0)
+            {
+                device = output.device;
+                metadata.lhs = left.device_descriptors;
+                metadata.rhs = right.device_descriptors;
+                metadata.out = output.device_descriptors;
+                const cudaError_t error = cudaSetDevice(device);
+                if (error != cudaSuccess) return set_error(error);
+            }
+            else if (device != output.device || metadata.lhs != left.device_descriptors ||
+                     metadata.rhs != right.device_descriptors || metadata.out != output.device_descriptors)
+                return set_error("product descriptors span multiple partitions");
+            metadata.indices[limb] = id.y;
+            metadata.moduli[limb] = lhs->ctx->moduli[limb];
+        }
+        // The descriptor partition checks above establish one selected device
+        // for the entire submission. Nested helpers retain all event joins.
+        status = matrix_wait_all_limb_streams(lhs, device, stream, true, true);
+        if (status != 0) return status;
+        status = matrix_wait_all_limb_streams(rhs, device, stream, true, true);
+        if (status != 0) return status;
+        status = matrix_wait_all_limb_streams(out, device, stream, true);
+        if (status != 0) return status;
+        const size_t n = static_cast<size_t>(lhs->ctx->N);
+        if (tensor)
+        {
+            const size_t count = out->rows * out->cols * n;
+            const size_t blocks = count / 256 + (count % 256 != 0);
+            const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
+                            1, static_cast<unsigned int>(limb_count));
+            if (rows)
+            {
+                TensorRowSumMetadata grouped{};
+                grouped.product = metadata;
+                std::copy_n(lhs->ctx->barrett_reciprocals.data(), limb_count, grouped.reciprocals);
+                grouped.initialize_output_descriptors = !out->descriptors_initialized;
+                if (grouped.initialize_output_descriptors)
+                {
+                    const auto &buffer = out->shared_limb_buffers[out->ctx->limb_gpu_ids[0].x];
+                    grouped.output_base = buffer.ptr;
+                    grouped.output_stride = buffer.bytes_per_poly;
+                    for (size_t limb = 0; limb < limb_count; ++limb)
+                    {
+                        const size_t local = metadata.indices[limb];
+                        grouped.output_offsets[limb] = buffer.limb_offsets_bytes[local];
+                        grouped.output_widths[limb] = buffer.limb_coeff_bytes[local];
+                    }
+                }
+                std::copy_n(rows, term_count, grouped.rows);
+                std::copy_n(offsets, group_count + 1, grouped.offsets);
+                const size_t poly_count = out->rows * out->cols;
+                if (n >= 256)
+                {
+                    const dim3 grouped_grid(static_cast<unsigned int>((n + 255) / 256),
+                        static_cast<unsigned int>(std::min(poly_count, size_t{65535})),
+                        static_cast<unsigned int>(limb_count));
+                    status = launch_tensor_row_sum_driver<true>(
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grouped_grid, stream);
+                    if (status != 0) return status;
+                }
+                else
+                {
+                    // Pack tiny polynomials together to retain full thread blocks.
+                    status = launch_tensor_row_sum_driver<false>(
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grid, stream);
+                    if (status != 0) return status;
+                }
+            }
+            else
+            {
+                tensor_all_limbs_kernel<<<grid, 256, 0, stream>>>(
+                    metadata, lhs->cols, rhs->rows, rhs->cols, count, n);
+            }
+        }
+        else
+        {
+            const dim3 grid(static_cast<unsigned int>((n + 255) / 256),
+                            static_cast<unsigned int>(rhs->cols), static_cast<unsigned int>(limb_count));
+            small_dot_all_limbs_kernel<<<grid, 256, 0, stream>>>(
+                metadata, lhs->rows, lhs->cols, rhs->cols, n);
+        }
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        // Descriptor writes and arithmetic share the output completion below.
+        if (rows) out->descriptors_initialized = true;
+        status = matrix_record_all_limb_writes(out, stream, true);
+        if (status != 0)
+        {
+            // No input lifetime join exists yet when output recording fails.
+            cudaStreamSynchronize(stream);
+            return status;
+        }
+        // The output event already covers this kernel. Reuse it for both
+        // producer-stream joins instead of recording two temporary events.
+        const dim3 first = out->ctx->limb_gpu_ids[0];
+        const auto &states = out->exec_limb_states[first.x];
+        const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+        status = matrix_track_all_limb_consumers(lhs, device, stream, completion, true);
+        if (status != 0) return status;
+        status = matrix_track_all_limb_consumers(rhs, device, stream, completion, true);
+        if (status != 0) return status;
+        return 0;
+    }
+
     __global__ void block_elementwise_all_limbs_kernel(
-        const uint8_t *const *lhs_bases,
-        const uint8_t *const *rhs_bases,
-        uint8_t *const *out_bases,
-        const size_t *lhs_stride_bytes,
-        const size_t *rhs_stride_bytes,
-        const size_t *out_stride_bytes,
-        const uint8_t *lhs_coeff_bytes,
-        const uint8_t *rhs_coeff_bytes,
-        const uint8_t *out_coeff_bytes,
-        const uint64_t *moduli,
+        const BlockElementwiseMetadata metadata,
         size_t limb_count,
         size_t poly_count,
         size_t n,
@@ -57,16 +522,16 @@ namespace
         const size_t poly_idx = idx / n;
         const size_t coeff_idx = idx - poly_idx * n;
         const size_t rhs_poly_idx = rhs_is_scalar ? 0 : poly_idx;
-        const size_t lhs_stride = lhs_stride_bytes[limb_idx];
-        const size_t rhs_stride = rhs_stride_bytes[limb_idx];
-        const size_t out_stride = out_stride_bytes[limb_idx];
-        const uint8_t *lhs_base = lhs_bases[limb_idx];
-        const uint8_t *rhs_base = rhs_bases[limb_idx];
-        uint8_t *out_base = out_bases[limb_idx];
-        const uint8_t lhs_bytes = lhs_coeff_bytes[limb_idx];
-        const uint8_t rhs_bytes = rhs_coeff_bytes[limb_idx];
-        const uint8_t out_bytes = out_coeff_bytes[limb_idx];
-        const uint64_t modulus = moduli[limb_idx];
+        const size_t lhs_stride = metadata.lhs_stride_bytes[limb_idx];
+        const size_t rhs_stride = metadata.rhs_stride_bytes[limb_idx];
+        const size_t out_stride = metadata.out_stride_bytes[limb_idx];
+        const uint8_t *lhs_base = metadata.lhs_bases[limb_idx];
+        const uint8_t *rhs_base = metadata.rhs_bases[limb_idx];
+        uint8_t *out_base = metadata.out_bases[limb_idx];
+        const uint8_t lhs_bytes = metadata.lhs_coeff_bytes[limb_idx];
+        const uint8_t rhs_bytes = metadata.rhs_coeff_bytes[limb_idx];
+        const uint8_t out_bytes = metadata.out_coeff_bytes[limb_idx];
+        const uint64_t modulus = metadata.moduli[limb_idx];
 
         const uint64_t a = matrix_load_limb_u64(lhs_base, poly_idx, coeff_idx, lhs_stride, lhs_bytes);
         const uint64_t b = matrix_load_limb_u64(rhs_base, rhs_poly_idx, coeff_idx, rhs_stride, rhs_bytes);
@@ -88,12 +553,7 @@ namespace
     }
 
     __global__ void block_copy_rect_all_limbs_kernel(
-        const uint8_t *const *src_bases,
-        uint8_t *const *dst_bases,
-        const size_t *src_stride_bytes,
-        const size_t *dst_stride_bytes,
-        const uint8_t *src_coeff_bytes,
-        const uint8_t *dst_coeff_bytes,
+        const BlockCopyMetadata metadata,
         size_t limb_count,
         size_t copy_rows,
         size_t copy_cols,
@@ -125,25 +585,19 @@ namespace
         const size_t src_poly_idx = (src_row + local_row) * src_cols + (src_col + local_col);
         const size_t dst_poly_idx = (dst_row + local_row) * dst_cols + (dst_col + local_col);
 
-        const size_t src_stride = src_stride_bytes[limb_idx];
-        const size_t dst_stride = dst_stride_bytes[limb_idx];
-        const uint8_t src_bytes = src_coeff_bytes[limb_idx];
-        const uint8_t dst_bytes = dst_coeff_bytes[limb_idx];
-        const uint8_t *src_base = src_bases[limb_idx];
-        uint8_t *dst_base = dst_bases[limb_idx];
+        const size_t src_stride = metadata.src_stride_bytes[limb_idx];
+        const size_t dst_stride = metadata.dst_stride_bytes[limb_idx];
+        const uint8_t src_bytes = metadata.src_coeff_bytes[limb_idx];
+        const uint8_t dst_bytes = metadata.dst_coeff_bytes[limb_idx];
+        const uint8_t *src_base = metadata.src_bases[limb_idx];
+        uint8_t *dst_base = metadata.dst_bases[limb_idx];
         const uint64_t value =
             matrix_load_limb_u64(src_base, src_poly_idx, coeff_idx, src_stride, src_bytes);
         matrix_store_limb_u64(dst_base, dst_poly_idx, coeff_idx, dst_stride, dst_bytes, value);
     }
 
     __global__ void block_add_rect_all_limbs_kernel(
-        const uint8_t *const *src_bases,
-        uint8_t *const *dst_bases,
-        const size_t *src_stride_bytes,
-        const size_t *dst_stride_bytes,
-        const uint8_t *src_coeff_bytes,
-        const uint8_t *dst_coeff_bytes,
-        const uint64_t *moduli,
+        const BlockAddMetadata metadata,
         size_t limb_count,
         size_t add_rows,
         size_t add_cols,
@@ -175,13 +629,13 @@ namespace
         const size_t src_poly_idx = (src_row + local_row) * src_cols + (src_col + local_col);
         const size_t dst_poly_idx = (dst_row + local_row) * dst_cols + (dst_col + local_col);
 
-        const size_t src_stride = src_stride_bytes[limb_idx];
-        const size_t dst_stride = dst_stride_bytes[limb_idx];
-        const uint8_t src_bytes = src_coeff_bytes[limb_idx];
-        const uint8_t dst_bytes = dst_coeff_bytes[limb_idx];
-        const uint8_t *src_base = src_bases[limb_idx];
-        uint8_t *dst_base = dst_bases[limb_idx];
-        const uint64_t modulus = moduli[limb_idx];
+        const size_t src_stride = metadata.src_stride_bytes[limb_idx];
+        const size_t dst_stride = metadata.dst_stride_bytes[limb_idx];
+        const uint8_t src_bytes = metadata.src_coeff_bytes[limb_idx];
+        const uint8_t dst_bytes = metadata.dst_coeff_bytes[limb_idx];
+        const uint8_t *src_base = metadata.src_bases[limb_idx];
+        uint8_t *dst_base = metadata.dst_bases[limb_idx];
+        const uint64_t modulus = metadata.moduli[limb_idx];
         const uint64_t src_value =
             matrix_load_limb_u64(src_base, src_poly_idx, coeff_idx, src_stride, src_bytes);
         const uint64_t dst_value =
@@ -395,22 +849,24 @@ namespace
 
         const int threads = 256;
         const size_t total = poly_count * n;
+        BlockElementwiseMetadata metadata{};
+        std::copy_n(lhs_bases, limb_count, metadata.lhs_bases);
+        std::copy_n(rhs_bases, limb_count, metadata.rhs_bases);
+        std::copy_n(out_bases, limb_count, metadata.out_bases);
+        std::copy_n(lhs_stride_bytes, limb_count, metadata.lhs_stride_bytes);
+        std::copy_n(rhs_stride_bytes, limb_count, metadata.rhs_stride_bytes);
+        std::copy_n(out_stride_bytes, limb_count, metadata.out_stride_bytes);
+        std::copy_n(lhs_coeff_bytes, limb_count, metadata.lhs_coeff_bytes);
+        std::copy_n(rhs_coeff_bytes, limb_count, metadata.rhs_coeff_bytes);
+        std::copy_n(out_coeff_bytes, limb_count, metadata.out_coeff_bytes);
+        std::copy_n(moduli, limb_count, metadata.moduli);
         const dim3 blocks(
             static_cast<unsigned int>((total + static_cast<size_t>(threads) - 1) /
                                       static_cast<size_t>(threads)),
             1u,
             static_cast<unsigned int>(limb_count));
         block_elementwise_all_limbs_kernel<<<blocks, threads, 0, stream>>>(
-            lhs_bases,
-            rhs_bases,
-            out_bases,
-            lhs_stride_bytes,
-            rhs_stride_bytes,
-            out_stride_bytes,
-            lhs_coeff_bytes,
-            rhs_coeff_bytes,
-            out_coeff_bytes,
-            moduli,
+            metadata,
             limb_count,
             poly_count,
             n,
@@ -555,18 +1011,20 @@ namespace
 
         const int threads = 256;
         const size_t total = copy_rows * copy_cols * n;
+        BlockCopyMetadata metadata{};
+        std::copy_n(src_bases, limb_count, metadata.src_bases);
+        std::copy_n(dst_bases, limb_count, metadata.dst_bases);
+        std::copy_n(src_stride_bytes, limb_count, metadata.src_stride_bytes);
+        std::copy_n(dst_stride_bytes, limb_count, metadata.dst_stride_bytes);
+        std::copy_n(src_coeff_bytes, limb_count, metadata.src_coeff_bytes);
+        std::copy_n(dst_coeff_bytes, limb_count, metadata.dst_coeff_bytes);
         const dim3 blocks(
             static_cast<unsigned int>((total + static_cast<size_t>(threads) - 1) /
                                       static_cast<size_t>(threads)),
             1u,
             static_cast<unsigned int>(limb_count));
         block_copy_rect_all_limbs_kernel<<<blocks, threads, 0, stream>>>(
-            src_bases,
-            dst_bases,
-            src_stride_bytes,
-            dst_stride_bytes,
-            src_coeff_bytes,
-            dst_coeff_bytes,
+            metadata,
             limb_count,
             copy_rows,
             copy_cols,
@@ -621,19 +1079,21 @@ namespace
 
         const int threads = 256;
         const size_t total = add_rows * add_cols * n;
+        BlockAddMetadata metadata{};
+        std::copy_n(src_bases, limb_count, metadata.src_bases);
+        std::copy_n(dst_bases, limb_count, metadata.dst_bases);
+        std::copy_n(src_stride_bytes, limb_count, metadata.src_stride_bytes);
+        std::copy_n(dst_stride_bytes, limb_count, metadata.dst_stride_bytes);
+        std::copy_n(src_coeff_bytes, limb_count, metadata.src_coeff_bytes);
+        std::copy_n(dst_coeff_bytes, limb_count, metadata.dst_coeff_bytes);
+        std::copy_n(moduli, limb_count, metadata.moduli);
         const dim3 blocks(
             static_cast<unsigned int>((total + static_cast<size_t>(threads) - 1) /
                                       static_cast<size_t>(threads)),
             1u,
             static_cast<unsigned int>(limb_count));
         block_add_rect_all_limbs_kernel<<<blocks, threads, 0, stream>>>(
-            src_bases,
-            dst_bases,
-            src_stride_bytes,
-            dst_stride_bytes,
-            src_coeff_bytes,
-            dst_coeff_bytes,
-            moduli,
+            metadata,
             limb_count,
             add_rows,
             add_cols,
@@ -891,12 +1351,12 @@ namespace
         {
             return set_error(err);
         }
-        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream, false, true);
         if (status != 0)
         {
             return status;
         }
-        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream, false, true);
         if (status != 0)
         {
             return status;
@@ -1004,7 +1464,6 @@ namespace
             return set_error("unexpected modulus count in launch_matrix_elementwise_all_limbs");
         }
 
-        std::vector<dim3> active_limb_ids(limb_count);
         std::vector<const uint8_t *> lhs_bases(limb_count, nullptr);
         std::vector<const uint8_t *> rhs_bases(limb_count, nullptr);
         std::vector<uint8_t *> out_bases(limb_count, nullptr);
@@ -1023,7 +1482,6 @@ namespace
         {
             const size_t limb_idx = static_cast<size_t>(limb);
             const dim3 limb_id = limb_map[limb_idx];
-            active_limb_ids[limb_idx] = limb_id;
 
             int lhs_device = -1;
             int rhs_device = -1;
@@ -1101,281 +1559,33 @@ namespace
         {
             return set_error(err);
         }
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream, false, true);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_wait_limb_stream(lhs, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_wait_limb_stream(rhs, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_wait_limb_stream(out, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
+            return status;
         }
-
-        const size_t ptr_bytes = limb_count * sizeof(uint8_t *);
-        const size_t stride_bytes = limb_count * sizeof(size_t);
-        const size_t coeff_bytes_bytes = limb_count * sizeof(uint8_t);
-        const size_t modulus_bytes = limb_count * sizeof(uint64_t);
-        const uint8_t **lhs_bases_device = nullptr;
-        const uint8_t **rhs_bases_device = nullptr;
-        uint8_t **out_bases_device = nullptr;
-        size_t *lhs_stride_bytes_device = nullptr;
-        size_t *rhs_stride_bytes_device = nullptr;
-        size_t *out_stride_bytes_device = nullptr;
-        uint8_t *lhs_coeff_bytes_device = nullptr;
-        uint8_t *rhs_coeff_bytes_device = nullptr;
-        uint8_t *out_coeff_bytes_device = nullptr;
-        uint64_t *moduli_device = nullptr;
-        auto cleanup = [&]()
+        status = matrix_wait_all_limb_streams(rhs, dispatch_device, dispatch_stream, false, true);
+        if (status != 0)
         {
-            if (dispatch_device >= 0)
-            {
-                cudaSetDevice(dispatch_device);
-            }
-            if (moduli_device)
-            {
-                cudaFreeAsync(moduli_device, dispatch_stream);
-                moduli_device = nullptr;
-            }
-            if (out_coeff_bytes_device)
-            {
-                cudaFreeAsync(out_coeff_bytes_device, dispatch_stream);
-                out_coeff_bytes_device = nullptr;
-            }
-            if (rhs_coeff_bytes_device)
-            {
-                cudaFreeAsync(rhs_coeff_bytes_device, dispatch_stream);
-                rhs_coeff_bytes_device = nullptr;
-            }
-            if (lhs_coeff_bytes_device)
-            {
-                cudaFreeAsync(lhs_coeff_bytes_device, dispatch_stream);
-                lhs_coeff_bytes_device = nullptr;
-            }
-            if (out_stride_bytes_device)
-            {
-                cudaFreeAsync(out_stride_bytes_device, dispatch_stream);
-                out_stride_bytes_device = nullptr;
-            }
-            if (rhs_stride_bytes_device)
-            {
-                cudaFreeAsync(rhs_stride_bytes_device, dispatch_stream);
-                rhs_stride_bytes_device = nullptr;
-            }
-            if (lhs_stride_bytes_device)
-            {
-                cudaFreeAsync(lhs_stride_bytes_device, dispatch_stream);
-                lhs_stride_bytes_device = nullptr;
-            }
-            if (out_bases_device)
-            {
-                cudaFreeAsync(out_bases_device, dispatch_stream);
-                out_bases_device = nullptr;
-            }
-            if (rhs_bases_device)
-            {
-                cudaFreeAsync(const_cast<uint8_t **>(rhs_bases_device), dispatch_stream);
-                rhs_bases_device = nullptr;
-            }
-            if (lhs_bases_device)
-            {
-                cudaFreeAsync(const_cast<uint8_t **>(lhs_bases_device), dispatch_stream);
-                lhs_bases_device = nullptr;
-            }
-        };
-
-        err = cudaMallocAsync(reinterpret_cast<void **>(&lhs_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
+            return status;
         }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&rhs_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
+        status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&out_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&lhs_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&rhs_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&out_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&lhs_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&rhs_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&out_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&moduli_device), modulus_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-
-        err = cudaMemcpyAsync(
-            lhs_bases_device,
-            lhs_bases.data(),
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            rhs_bases_device,
-            rhs_bases.data(),
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            out_bases_device,
-            out_bases.data(),
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            lhs_stride_bytes_device,
-            lhs_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            rhs_stride_bytes_device,
-            rhs_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            out_stride_bytes_device,
-            out_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            lhs_coeff_bytes_device,
-            lhs_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            rhs_coeff_bytes_device,
-            rhs_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            out_coeff_bytes_device,
-            out_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            moduli_device,
-            moduli.data(),
-            modulus_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
+            return status;
         }
 
         status = launch_block_kernel_all_limbs(
-            lhs_bases_device,
-            rhs_bases_device,
-            out_bases_device,
-            lhs_stride_bytes_device,
-            rhs_stride_bytes_device,
-            out_stride_bytes_device,
-            lhs_coeff_bytes_device,
-            rhs_coeff_bytes_device,
-            out_coeff_bytes_device,
-            moduli_device,
+            lhs_bases.data(),
+            rhs_bases.data(),
+            out_bases.data(),
+            lhs_stride_bytes.data(),
+            rhs_stride_bytes.data(),
+            out_stride_bytes.data(),
+            lhs_coeff_bytes.data(),
+            rhs_coeff_bytes.data(),
+            out_coeff_bytes.data(),
+            moduli.data(),
             limb_count,
             count,
             n,
@@ -1384,34 +1594,25 @@ namespace
             0);
         if (status != 0)
         {
-            cleanup();
             return status;
         }
 
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_track_all_limb_consumers(lhs, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_track_limb_consumer(lhs, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
-            status = matrix_track_limb_consumer(rhs, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
-            status = matrix_record_limb_write(out, limb_id, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
+            return status;
+        }
+        status = matrix_track_all_limb_consumers(rhs, dispatch_device, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_record_all_limb_writes(out, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
         }
 
-        cleanup();
         return 0;
     }
 
@@ -1452,7 +1653,6 @@ namespace
             return set_error("unexpected modulus count in launch_matrix_scalar_mul_all_limbs");
         }
 
-        std::vector<dim3> active_limb_ids(limb_count);
         std::vector<const uint8_t *> lhs_bases(limb_count, nullptr);
         std::vector<const uint8_t *> scalar_bases(limb_count, nullptr);
         std::vector<uint8_t *> out_bases(limb_count, nullptr);
@@ -1471,7 +1671,6 @@ namespace
         {
             const size_t limb_idx = static_cast<size_t>(limb);
             const dim3 limb_id = limb_map[limb_idx];
-            active_limb_ids[limb_idx] = limb_id;
 
             int lhs_device = -1;
             int out_device = -1;
@@ -1563,281 +1762,33 @@ namespace
         {
             return set_error(err);
         }
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream, false, true);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_wait_limb_stream(lhs, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_wait_limb_stream(scalar, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_wait_limb_stream(out, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
+            return status;
         }
-
-        const size_t ptr_bytes = limb_count * sizeof(uint8_t *);
-        const size_t stride_bytes = limb_count * sizeof(size_t);
-        const size_t coeff_bytes_bytes = limb_count * sizeof(uint8_t);
-        const size_t modulus_bytes = limb_count * sizeof(uint64_t);
-        const uint8_t **lhs_bases_device = nullptr;
-        const uint8_t **scalar_bases_device = nullptr;
-        uint8_t **out_bases_device = nullptr;
-        size_t *lhs_stride_bytes_device = nullptr;
-        size_t *scalar_stride_bytes_device = nullptr;
-        size_t *out_stride_bytes_device = nullptr;
-        uint8_t *lhs_coeff_bytes_device = nullptr;
-        uint8_t *scalar_coeff_bytes_device = nullptr;
-        uint8_t *out_coeff_bytes_device = nullptr;
-        uint64_t *moduli_device = nullptr;
-        auto cleanup = [&]()
+        status = matrix_wait_all_limb_streams(scalar, dispatch_device, dispatch_stream, false, true);
+        if (status != 0)
         {
-            if (dispatch_device >= 0)
-            {
-                cudaSetDevice(dispatch_device);
-            }
-            if (moduli_device)
-            {
-                cudaFreeAsync(moduli_device, dispatch_stream);
-                moduli_device = nullptr;
-            }
-            if (out_coeff_bytes_device)
-            {
-                cudaFreeAsync(out_coeff_bytes_device, dispatch_stream);
-                out_coeff_bytes_device = nullptr;
-            }
-            if (scalar_coeff_bytes_device)
-            {
-                cudaFreeAsync(scalar_coeff_bytes_device, dispatch_stream);
-                scalar_coeff_bytes_device = nullptr;
-            }
-            if (lhs_coeff_bytes_device)
-            {
-                cudaFreeAsync(lhs_coeff_bytes_device, dispatch_stream);
-                lhs_coeff_bytes_device = nullptr;
-            }
-            if (out_stride_bytes_device)
-            {
-                cudaFreeAsync(out_stride_bytes_device, dispatch_stream);
-                out_stride_bytes_device = nullptr;
-            }
-            if (scalar_stride_bytes_device)
-            {
-                cudaFreeAsync(scalar_stride_bytes_device, dispatch_stream);
-                scalar_stride_bytes_device = nullptr;
-            }
-            if (lhs_stride_bytes_device)
-            {
-                cudaFreeAsync(lhs_stride_bytes_device, dispatch_stream);
-                lhs_stride_bytes_device = nullptr;
-            }
-            if (out_bases_device)
-            {
-                cudaFreeAsync(out_bases_device, dispatch_stream);
-                out_bases_device = nullptr;
-            }
-            if (scalar_bases_device)
-            {
-                cudaFreeAsync(const_cast<uint8_t **>(scalar_bases_device), dispatch_stream);
-                scalar_bases_device = nullptr;
-            }
-            if (lhs_bases_device)
-            {
-                cudaFreeAsync(const_cast<uint8_t **>(lhs_bases_device), dispatch_stream);
-                lhs_bases_device = nullptr;
-            }
-        };
-
-        err = cudaMallocAsync(reinterpret_cast<void **>(&lhs_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
+            return status;
         }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&scalar_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
+        status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&out_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&lhs_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&scalar_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&out_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&lhs_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&scalar_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&out_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&moduli_device), modulus_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-
-        err = cudaMemcpyAsync(
-            lhs_bases_device,
-            lhs_bases.data(),
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            scalar_bases_device,
-            scalar_bases.data(),
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            out_bases_device,
-            out_bases.data(),
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            lhs_stride_bytes_device,
-            lhs_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            scalar_stride_bytes_device,
-            scalar_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            out_stride_bytes_device,
-            out_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            lhs_coeff_bytes_device,
-            lhs_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            scalar_coeff_bytes_device,
-            scalar_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            out_coeff_bytes_device,
-            out_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            moduli_device,
-            moduli.data(),
-            modulus_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
+            return status;
         }
 
         status = launch_block_kernel_all_limbs(
-            lhs_bases_device,
-            scalar_bases_device,
-            out_bases_device,
-            lhs_stride_bytes_device,
-            scalar_stride_bytes_device,
-            out_stride_bytes_device,
-            lhs_coeff_bytes_device,
-            scalar_coeff_bytes_device,
-            out_coeff_bytes_device,
-            moduli_device,
+            lhs_bases.data(),
+            scalar_bases.data(),
+            out_bases.data(),
+            lhs_stride_bytes.data(),
+            scalar_stride_bytes.data(),
+            out_stride_bytes.data(),
+            lhs_coeff_bytes.data(),
+            scalar_coeff_bytes.data(),
+            out_coeff_bytes.data(),
+            moduli.data(),
             limb_count,
             count,
             n,
@@ -1846,34 +1797,25 @@ namespace
             1);
         if (status != 0)
         {
-            cleanup();
             return status;
         }
 
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_track_all_limb_consumers(lhs, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_track_limb_consumer(lhs, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
-            status = matrix_track_limb_consumer(scalar, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
-            status = matrix_record_limb_write(out, limb_id, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
+            return status;
+        }
+        status = matrix_track_all_limb_consumers(scalar, dispatch_device, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
+        }
+        status = matrix_record_all_limb_writes(out, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
         }
 
-        cleanup();
         return 0;
     }
 
@@ -1916,7 +1858,6 @@ namespace
             return set_error("unexpected limb mapping size in launch_copy_for_all_limbs");
         }
 
-        std::vector<dim3> active_limb_ids(limb_count);
         std::vector<const uint8_t *> src_bases(limb_count, nullptr);
         std::vector<uint8_t *> dst_bases(limb_count, nullptr);
         std::vector<size_t> src_stride_bytes(limb_count, 0);
@@ -1931,7 +1872,6 @@ namespace
         {
             const size_t limb_idx = static_cast<size_t>(limb);
             const dim3 limb_id = limb_map[limb_idx];
-            active_limb_ids[limb_idx] = limb_id;
 
             int src_device = -1;
             int dst_device = -1;
@@ -1998,233 +1938,24 @@ namespace
         {
             return set_error(err);
         }
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream, false, true);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_wait_limb_stream(src, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_wait_limb_stream(out, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
+            return status;
         }
-
-        const size_t ptr_bytes = limb_count * sizeof(uint8_t *);
-        const size_t stride_bytes = limb_count * sizeof(size_t);
-        const size_t coeff_bytes_bytes = limb_count * sizeof(uint8_t);
-        const uint8_t **src_bases_device = nullptr;
-        uint8_t **dst_bases_device = nullptr;
-        size_t *src_stride_bytes_device = nullptr;
-        size_t *dst_stride_bytes_device = nullptr;
-        uint8_t *src_coeff_bytes_device = nullptr;
-        uint8_t *dst_coeff_bytes_device = nullptr;
-        std::vector<void *> pinned_metadata;
-        pinned_metadata.reserve(6);
-        auto allocate_pinned_metadata = [&](const void *source, size_t bytes, void **out_ptr) {
-            if (!source || bytes == 0 || !out_ptr)
-            {
-                return cudaErrorInvalidValue;
-            }
-            *out_ptr = nullptr;
-            cudaError_t allocation_status =
-                cudaHostAlloc(out_ptr, bytes, cudaHostAllocPortable);
-            if (allocation_status == cudaSuccess)
-            {
-                std::memcpy(*out_ptr, source, bytes);
-                pinned_metadata.push_back(*out_ptr);
-            }
-            return allocation_status;
-        };
-        auto cleanup = [&]()
+        status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            if (dispatch_device >= 0)
-            {
-                cudaSetDevice(dispatch_device);
-            }
-            if (dst_coeff_bytes_device)
-            {
-                cudaFreeAsync(dst_coeff_bytes_device, dispatch_stream);
-                dst_coeff_bytes_device = nullptr;
-            }
-            if (src_coeff_bytes_device)
-            {
-                cudaFreeAsync(src_coeff_bytes_device, dispatch_stream);
-                src_coeff_bytes_device = nullptr;
-            }
-            if (dst_stride_bytes_device)
-            {
-                cudaFreeAsync(dst_stride_bytes_device, dispatch_stream);
-                dst_stride_bytes_device = nullptr;
-            }
-            if (src_stride_bytes_device)
-            {
-                cudaFreeAsync(src_stride_bytes_device, dispatch_stream);
-                src_stride_bytes_device = nullptr;
-            }
-            if (dst_bases_device)
-            {
-                cudaFreeAsync(dst_bases_device, dispatch_stream);
-                dst_bases_device = nullptr;
-            }
-            if (src_bases_device)
-            {
-                cudaFreeAsync(const_cast<uint8_t **>(src_bases_device), dispatch_stream);
-                src_bases_device = nullptr;
-            }
-            if (!pinned_metadata.empty())
-            {
-                (void)gpu_defer_pinned_frees(
-                    src->ctx,
-                    dispatch_device,
-                    dispatch_stream,
-                    pinned_metadata.data(),
-                    pinned_metadata.size());
-                pinned_metadata.clear();
-            }
-        };
-
-        err = cudaMallocAsync(reinterpret_cast<void **>(&src_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&src_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&src_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-
-        void *pinned_src_bases = nullptr;
-        void *pinned_dst_bases = nullptr;
-        void *pinned_src_strides = nullptr;
-        void *pinned_dst_strides = nullptr;
-        void *pinned_src_widths = nullptr;
-        void *pinned_dst_widths = nullptr;
-        err = allocate_pinned_metadata(src_bases.data(), ptr_bytes, &pinned_src_bases);
-        if (err == cudaSuccess)
-            err = allocate_pinned_metadata(dst_bases.data(), ptr_bytes, &pinned_dst_bases);
-        if (err == cudaSuccess)
-            err = allocate_pinned_metadata(
-                src_stride_bytes.data(), stride_bytes, &pinned_src_strides);
-        if (err == cudaSuccess)
-            err = allocate_pinned_metadata(
-                dst_stride_bytes.data(), stride_bytes, &pinned_dst_strides);
-        if (err == cudaSuccess)
-            err = allocate_pinned_metadata(
-                src_coeff_bytes.data(), coeff_bytes_bytes, &pinned_src_widths);
-        if (err == cudaSuccess)
-            err = allocate_pinned_metadata(
-                dst_coeff_bytes.data(), coeff_bytes_bytes, &pinned_dst_widths);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-
-        err = cudaMemcpyAsync(
-            src_bases_device,
-            pinned_src_bases,
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            dst_bases_device,
-            pinned_dst_bases,
-            ptr_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            src_stride_bytes_device,
-            pinned_src_strides,
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            dst_stride_bytes_device,
-            pinned_dst_strides,
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            src_coeff_bytes_device,
-            pinned_src_widths,
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            dst_coeff_bytes_device,
-            pinned_dst_widths,
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
+            return status;
         }
 
         status = launch_copy_kernel_all_limbs(
-            src_bases_device,
-            dst_bases_device,
-            src_stride_bytes_device,
-            dst_stride_bytes_device,
-            src_coeff_bytes_device,
-            dst_coeff_bytes_device,
+            src_bases.data(),
+            dst_bases.data(),
+            src_stride_bytes.data(),
+            dst_stride_bytes.data(),
+            src_coeff_bytes.data(),
+            dst_coeff_bytes.data(),
             limb_count,
             n,
             src_cols,
@@ -2238,28 +1969,20 @@ namespace
             dispatch_stream);
         if (status != 0)
         {
-            cleanup();
             return status;
         }
 
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_track_all_limb_consumers(src, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_track_limb_consumer(src, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
-            status = matrix_record_limb_write(out, limb_id, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
+            return status;
+        }
+        status = matrix_record_all_limb_writes(out, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
         }
 
-        cleanup();
         return 0;
     }
 
@@ -2306,7 +2029,6 @@ namespace
             return set_error("unexpected modulus count in launch_add_block_for_all_limbs");
         }
 
-        std::vector<dim3> active_limb_ids(limb_count);
         std::vector<const uint8_t *> src_bases(limb_count, nullptr);
         std::vector<uint8_t *> dst_bases(limb_count, nullptr);
         std::vector<size_t> src_stride_bytes(limb_count, 0);
@@ -2322,7 +2044,6 @@ namespace
         {
             const size_t limb_idx = static_cast<size_t>(limb);
             const dim3 limb_id = limb_map[limb_idx];
-            active_limb_ids[limb_idx] = limb_id;
 
             int src_device = -1;
             int dst_device = -1;
@@ -2390,189 +2111,25 @@ namespace
         {
             return set_error(err);
         }
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream, false, true);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_wait_limb_stream(src, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
-            status = matrix_wait_limb_stream(out, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                return status;
-            }
+            return status;
         }
-
-        const size_t ptr_bytes = limb_count * sizeof(uint8_t *);
-        const size_t stride_bytes = limb_count * sizeof(size_t);
-        const size_t coeff_bytes_bytes = limb_count * sizeof(uint8_t);
-        const size_t modulus_bytes = limb_count * sizeof(uint64_t);
-        const uint8_t **src_bases_device = nullptr;
-        uint8_t **dst_bases_device = nullptr;
-        size_t *src_stride_bytes_device = nullptr;
-        size_t *dst_stride_bytes_device = nullptr;
-        uint8_t *src_coeff_bytes_device = nullptr;
-        uint8_t *dst_coeff_bytes_device = nullptr;
-        uint64_t *moduli_device = nullptr;
-        auto cleanup = [&]()
+        status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            if (dispatch_device >= 0)
-            {
-                cudaSetDevice(dispatch_device);
-            }
-            if (moduli_device)
-            {
-                cudaFreeAsync(moduli_device, dispatch_stream);
-                moduli_device = nullptr;
-            }
-            if (dst_coeff_bytes_device)
-            {
-                cudaFreeAsync(dst_coeff_bytes_device, dispatch_stream);
-                dst_coeff_bytes_device = nullptr;
-            }
-            if (src_coeff_bytes_device)
-            {
-                cudaFreeAsync(src_coeff_bytes_device, dispatch_stream);
-                src_coeff_bytes_device = nullptr;
-            }
-            if (dst_stride_bytes_device)
-            {
-                cudaFreeAsync(dst_stride_bytes_device, dispatch_stream);
-                dst_stride_bytes_device = nullptr;
-            }
-            if (src_stride_bytes_device)
-            {
-                cudaFreeAsync(src_stride_bytes_device, dispatch_stream);
-                src_stride_bytes_device = nullptr;
-            }
-            if (dst_bases_device)
-            {
-                cudaFreeAsync(dst_bases_device, dispatch_stream);
-                dst_bases_device = nullptr;
-            }
-            if (src_bases_device)
-            {
-                cudaFreeAsync(const_cast<uint8_t **>(src_bases_device), dispatch_stream);
-                src_bases_device = nullptr;
-            }
-        };
-
-        err = cudaMallocAsync(reinterpret_cast<void **>(&src_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_bases_device), ptr_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&src_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_stride_bytes_device), stride_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&src_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_coeff_bytes_device), coeff_bytes_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMallocAsync(reinterpret_cast<void **>(&moduli_device), modulus_bytes, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-
-        err = cudaMemcpyAsync(src_bases_device, src_bases.data(), ptr_bytes, cudaMemcpyHostToDevice, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(dst_bases_device, dst_bases.data(), ptr_bytes, cudaMemcpyHostToDevice, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            src_stride_bytes_device,
-            src_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            dst_stride_bytes_device,
-            dst_stride_bytes.data(),
-            stride_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            src_coeff_bytes_device,
-            src_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(
-            dst_coeff_bytes_device,
-            dst_coeff_bytes.data(),
-            coeff_bytes_bytes,
-            cudaMemcpyHostToDevice,
-            dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
-        }
-        err = cudaMemcpyAsync(moduli_device, moduli.data(), modulus_bytes, cudaMemcpyHostToDevice, dispatch_stream);
-        if (err != cudaSuccess)
-        {
-            cleanup();
-            return set_error(err);
+            return status;
         }
 
         status = launch_add_block_kernel_all_limbs(
-            src_bases_device,
-            dst_bases_device,
-            src_stride_bytes_device,
-            dst_stride_bytes_device,
-            src_coeff_bytes_device,
-            dst_coeff_bytes_device,
-            moduli_device,
+            src_bases.data(),
+            dst_bases.data(),
+            src_stride_bytes.data(),
+            dst_stride_bytes.data(),
+            src_coeff_bytes.data(),
+            dst_coeff_bytes.data(),
+            moduli.data(),
             limb_count,
             n,
             src_cols,
@@ -2586,28 +2143,20 @@ namespace
             dispatch_stream);
         if (status != 0)
         {
-            cleanup();
             return status;
         }
 
-        for (size_t limb_idx = 0; limb_idx < limb_count; ++limb_idx)
+        status = matrix_track_all_limb_consumers(src, dispatch_device, dispatch_stream);
+        if (status != 0)
         {
-            const dim3 limb_id = active_limb_ids[limb_idx];
-            status = matrix_track_limb_consumer(src, limb_id, dispatch_device, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
-            status = matrix_record_limb_write(out, limb_id, dispatch_stream);
-            if (status != 0)
-            {
-                cleanup();
-                return status;
-            }
+            return status;
+        }
+        status = matrix_record_all_limb_writes(out, dispatch_stream);
+        if (status != 0)
+        {
+            return status;
         }
 
-        cleanup();
         return 0;
     }
 
@@ -2661,12 +2210,12 @@ namespace
         // A write to lhs may have been dispatched on a temporary work stream
         // (for example compact deserialization), so its ordinary limb stream
         // is not necessarily ordered after the latest write event.
-        status = matrix_wait_limb_stream(lhs, limb_id, lhs_device, stream);
+        status = matrix_wait_limb_stream(lhs, limb_id, lhs_device, stream, false, true);
         if (status != 0)
         {
             return status;
         }
-        status = matrix_wait_limb_stream(rhs, limb_id, lhs_device, stream);
+        status = matrix_wait_limb_stream(rhs, limb_id, lhs_device, stream, false, true);
         if (status != 0)
         {
             return status;
@@ -2952,8 +2501,291 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     return 0;
 }
 
+extern "C" int gpu_matrix_transpose(GpuMatrix *out, const GpuMatrix *source)
+{
+    if (!out || !source || out == source || !source->ctx || out->ctx != source->ctx ||
+        source->level < 0 || out->level != source->level || out->format != source->format ||
+        out->rows != source->cols || out->cols != source->rows)
+        return set_error("invalid gpu_matrix_transpose arguments");
+    if (source->rows == 0 || source->cols == 0 || source->ctx->N <= 0) return 0;
+    const size_t n = static_cast<size_t>(source->ctx->N);
+    const size_t limb_count = static_cast<size_t>(source->level) + 1;
+    if (limb_count > kArithMetadataLimbs || source->ctx->limb_gpu_ids.size() < limb_count ||
+        source->rows > std::numeric_limits<size_t>::max() / source->cols ||
+        source->rows * source->cols > std::numeric_limits<size_t>::max() / n)
+        return set_error("transpose shape overflow or invalid basis");
+    TransposeMetadata metadata{};
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 id = source->ctx->limb_gpu_ids[limb];
+        if (id.x >= source->shared_limb_buffers.size() || id.x >= out->shared_limb_buffers.size())
+            return set_error("invalid transpose partition");
+        const auto &input = source->shared_limb_buffers[id.x];
+        const auto &output = out->shared_limb_buffers[id.x];
+        if (!input.device_descriptors || !output.device_descriptors || id.y >= input.limb_count ||
+            id.y >= output.limb_count || input.device != output.device)
+            return set_error("invalid transpose descriptors");
+        if (limb == 0)
+        {
+            device = output.device;
+            metadata.source = input.device_descriptors;
+            metadata.out = output.device_descriptors;
+            const cudaError_t error = cudaSetDevice(device);
+            if (error != cudaSuccess) return set_error(error);
+        }
+        else if (device != output.device || metadata.source != input.device_descriptors ||
+                 metadata.out != output.device_descriptors)
+            return set_error("transpose descriptors span partitions");
+        metadata.indices[limb] = id.y;
+    }
+    status = matrix_wait_all_limb_streams(source, device, stream, false, true);
+    if (status != 0) return status;
+    status = matrix_wait_all_limb_streams(out, device, stream);
+    if (status != 0) return status;
+    const size_t count = source->rows * source->cols * n;
+    const size_t blocks = count / 256 + (count % 256 != 0);
+    const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
+                    1, static_cast<unsigned int>(limb_count));
+    transpose_all_limbs_kernel<<<grid, 256, 0, stream>>>(
+        metadata, source->rows, source->cols, count, n);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    status = matrix_track_all_limb_consumers(source, device, stream);
+    if (status != 0) return status;
+    return matrix_record_all_limb_writes(out, stream);
+}
+
+extern "C" int gpu_matrix_sum_rows(
+    GpuMatrix *out, const GpuMatrix *source, const size_t *rows, const size_t *offsets,
+    size_t group_count, size_t term_count)
+{
+    if (!out || !source || !source->ctx || out->ctx != source->ctx || source->level < 0 ||
+        out->level != source->level || out->format != source->format ||
+        out->rows != group_count || out->cols != source->cols || !rows || !offsets ||
+        group_count == 0 || group_count > 16 || term_count == 0 || term_count > 32 ||
+        offsets[0] != 0 || offsets[group_count] != term_count)
+        return set_error("invalid gpu_matrix_sum_rows arguments");
+    RowSumMetadata metadata{};
+    for (size_t group = 0; group < group_count; ++group)
+    {
+        if (offsets[group] >= offsets[group + 1] || offsets[group + 1] > term_count)
+            return set_error("invalid row sum group offsets");
+        metadata.offsets[group] = offsets[group];
+    }
+    metadata.offsets[group_count] = term_count;
+    for (size_t term = 0; term < term_count; ++term)
+    {
+        if (rows[term] >= source->rows) return set_error("row sum input index out of bounds");
+        metadata.rows[term] = rows[term];
+    }
+    if (source->cols == 0 || source->ctx->N <= 0) return 0;
+    const size_t n = static_cast<size_t>(source->ctx->N);
+    const size_t limb_count = static_cast<size_t>(source->level) + 1;
+    if (limb_count > kArithMetadataLimbs || source->ctx->limb_gpu_ids.size() < limb_count ||
+        source->ctx->moduli.size() < limb_count || out->rows > std::numeric_limits<size_t>::max() / out->cols ||
+        out->rows * out->cols > std::numeric_limits<size_t>::max() / n)
+        return set_error("row sum shape overflow or invalid basis");
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 id = source->ctx->limb_gpu_ids[limb];
+        if (id.x >= source->shared_limb_buffers.size() || id.x >= out->shared_limb_buffers.size())
+            return set_error("invalid row sum partition");
+        const auto &input = source->shared_limb_buffers[id.x];
+        const auto &output = out->shared_limb_buffers[id.x];
+        if (!input.device_descriptors || !output.device_descriptors || id.y >= input.limb_count ||
+            id.y >= output.limb_count || input.device != output.device)
+            return set_error("invalid row sum descriptors");
+        if (limb == 0)
+        {
+            device = output.device;
+            metadata.source = input.device_descriptors;
+            metadata.out = output.device_descriptors;
+            const cudaError_t error = cudaSetDevice(device);
+            if (error != cudaSuccess) return set_error(error);
+        }
+        else if (device != output.device || metadata.source != input.device_descriptors ||
+                 metadata.out != output.device_descriptors)
+            return set_error("row sum descriptors span partitions");
+        metadata.indices[limb] = id.y;
+        metadata.moduli[limb] = source->ctx->moduli[limb];
+    }
+    status = matrix_wait_all_limb_streams(source, device, stream, false, true);
+    if (status != 0) return status;
+    status = matrix_wait_all_limb_streams(out, device, stream);
+    if (status != 0) return status;
+    const size_t count = out->rows * out->cols * n;
+    const size_t blocks = count / 256 + (count % 256 != 0);
+    const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
+                    1, static_cast<unsigned int>(limb_count));
+    sum_rows_all_limbs_kernel<<<grid, 256, 0, stream>>>(metadata, source->cols, count, n);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    status = matrix_track_all_limb_consumers(source, device, stream);
+    if (status != 0) return status;
+    return matrix_record_all_limb_writes(out, stream);
+}
+
+extern "C" int gpu_matrix_add_row_blocks(
+    GpuMatrix *out, const GpuMatrix *const *lhs_blocks, size_t block_count, const GpuMatrix *rhs)
+{
+    if (!out || !rhs || !rhs->ctx || !lhs_blocks || block_count == 0 || block_count > kRowAddMaxBlocks ||
+        out->ctx != rhs->ctx || out->level != rhs->level || rhs->level < 0 ||
+        out->rows != rhs->rows || out->cols != rhs->cols || rhs->format != GPU_POLY_FORMAT_EVAL)
+        return set_error("invalid gpu_matrix_add_row_blocks arguments");
+    RowBlockAddMetadata metadata{};
+    size_t total_rows = 0;
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        const auto *matrix = lhs_blocks[block];
+        if (!matrix || matrix->ctx != rhs->ctx || matrix->level != rhs->level ||
+            matrix->format != GPU_POLY_FORMAT_EVAL || matrix->cols != rhs->cols ||
+            matrix->rows > std::numeric_limits<size_t>::max() - total_rows)
+            return set_error("invalid row block input");
+        metadata.rows[block] = matrix->rows;
+        total_rows += matrix->rows;
+    }
+    if (total_rows != rhs->rows) return set_error("row block sum differs from output rows");
+    if (rhs->rows == 0 || rhs->cols == 0 || rhs->ctx->N <= 0)
+    {
+        out->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+    const size_t n = static_cast<size_t>(rhs->ctx->N);
+    const size_t limb_count = static_cast<size_t>(rhs->level) + 1;
+    if (limb_count > kArithMetadataLimbs || rhs->ctx->limb_gpu_ids.size() < limb_count ||
+        rhs->ctx->moduli.size() < limb_count || rhs->rows > std::numeric_limits<size_t>::max() / rhs->cols ||
+        rhs->rows * rhs->cols > std::numeric_limits<size_t>::max() / n)
+        return set_error("invalid row block add shape or basis");
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    // Gather one descriptor pointer per matrix. Limb pointers/strides are
+    // resolved by the GPU; each matrix retains its readiness dependency.
+    auto prepare = [&](const GpuMatrix *matrix,
+                       const GpuMatrix::SharedLimbBuffer::DeviceDescriptor **descriptors) -> int {
+        for (size_t limb = 0; limb < limb_count; ++limb)
+        {
+            const dim3 id = rhs->ctx->limb_gpu_ids[limb];
+            if (id.x >= matrix->shared_limb_buffers.size()) return set_error("invalid row block partition");
+            const auto &buffer = matrix->shared_limb_buffers[id.x];
+            if (!buffer.device_descriptors || id.y >= buffer.limb_count)
+                return set_error("missing row block descriptors");
+            if (device < 0)
+            {
+                device = buffer.device;
+                const cudaError_t error = cudaSetDevice(device);
+                if (error != cudaSuccess) return set_error(error);
+            }
+            if (device != buffer.device) return set_error("row blocks must share a device");
+            if (limb == 0) *descriptors = buffer.device_descriptors;
+            else if (*descriptors != buffer.device_descriptors)
+                return set_error("row block descriptors span partitions");
+        }
+        return matrix_wait_all_limb_streams(matrix, device, stream, false, matrix != out);
+    };
+    status = prepare(out, &metadata.out);
+    if (status != 0) return status;
+    status = prepare(rhs, &metadata.rhs);
+    if (status != 0) return status;
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        if (metadata.rows[block] == 0) continue;
+        status = prepare(lhs_blocks[block], &metadata.blocks[block]);
+        if (status != 0) return status;
+    }
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        metadata.indices[limb] = rhs->ctx->limb_gpu_ids[limb].y;
+        metadata.moduli[limb] = rhs->ctx->moduli[limb];
+    }
+    const size_t count = rhs->rows * rhs->cols * n;
+    const size_t blocks = count / 256 + (count % 256 != 0);
+    const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
+                    1, static_cast<unsigned int>(limb_count));
+    add_row_blocks_all_limbs_kernel<<<grid, 256, 0, stream>>>(metadata, rhs->cols, count, n);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        if (metadata.rows[block] == 0) continue;
+        status = matrix_track_all_limb_consumers(lhs_blocks[block], device, stream);
+        if (status != 0) return status;
+    }
+    status = matrix_track_all_limb_consumers(rhs, device, stream);
+    if (status != 0) return status;
+    status = matrix_record_all_limb_writes(out, stream);
+    if (status != 0) return status;
+    out->format = GPU_POLY_FORMAT_EVAL;
+    return 0;
+}
+
+extern "C" int gpu_matrix_tensor_sum_rows(
+    GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
+    const size_t *rows, const size_t *offsets, size_t group_count, size_t term_count)
+{
+    if (!out || !lhs || !rhs || !lhs->ctx || out->ctx != lhs->ctx || rhs->ctx != lhs->ctx ||
+        lhs->level < 0 || out->level != lhs->level || rhs->level != lhs->level ||
+        lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL ||
+        out->format != GPU_POLY_FORMAT_EVAL || !rows || !offsets ||
+        group_count == 0 || group_count > 16 || term_count == 0 || term_count > 32 ||
+        offsets[0] != 0 || offsets[group_count] != term_count)
+        return set_error("invalid gpu_matrix_tensor_sum_rows arguments");
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    if ((rhs->rows != 0 && lhs->rows > maximum / rhs->rows) ||
+        (rhs->cols != 0 && lhs->cols > maximum / rhs->cols) ||
+        out->rows != group_count || out->cols != lhs->cols * rhs->cols)
+        return set_error("invalid tensor row sum shape");
+    for (size_t group = 0; group < group_count; ++group)
+        if (offsets[group] >= offsets[group + 1] || offsets[group + 1] > term_count)
+            return set_error("invalid tensor row sum offsets");
+    for (size_t term = 0; term < term_count; ++term)
+        if (rows[term] >= lhs->rows * rhs->rows)
+            return set_error("tensor row sum index out of bounds");
+    if (out->cols == 0 || lhs->ctx->N <= 0) return 0;
+    const size_t n = static_cast<size_t>(lhs->ctx->N);
+    if (out->rows > maximum / out->cols || out->rows * out->cols > maximum / n ||
+        lhs->ctx->limb_gpu_ids.size() <= static_cast<size_t>(lhs->level))
+        return set_error("tensor row sum size overflow or invalid limb mapping");
+    return launch_descriptor_product(out, lhs, rhs, true, rows, offsets, group_count, term_count);
+}
+
+extern "C" int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)
+{
+    if (!out || !lhs || !rhs || !lhs->ctx || out->ctx != lhs->ctx || rhs->ctx != lhs->ctx ||
+        lhs->level < 0 || out->level != lhs->level || rhs->level != lhs->level ||
+        lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL)
+        return set_error("invalid gpu_matrix_tensor arguments");
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    if ((rhs->rows != 0 && lhs->rows > maximum / rhs->rows) ||
+        (rhs->cols != 0 && lhs->cols > maximum / rhs->cols) ||
+        out->rows != lhs->rows * rhs->rows || out->cols != lhs->cols * rhs->cols)
+        return set_error("invalid gpu_matrix_tensor output shape");
+    if (out->rows == 0 || out->cols == 0 || lhs->ctx->N <= 0)
+    {
+        out->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+    const size_t n = static_cast<size_t>(lhs->ctx->N);
+    if (out->rows > maximum / out->cols || out->rows * out->cols > maximum / n ||
+        lhs->ctx->limb_gpu_ids.size() <= static_cast<size_t>(lhs->level))
+        return set_error("gpu_matrix_tensor shape overflow or invalid limb mapping");
+    const int status = launch_descriptor_product(out, lhs, rhs, true);
+    if (status == 0) out->format = GPU_POLY_FORMAT_EVAL;
+    return status;
+}
+
 extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !lhs || !rhs)
     {
         return set_error("invalid gpu_matrix_mul arguments");
@@ -2995,6 +2827,14 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     if (limb_map.size() < static_cast<size_t>(level + 1))
     {
         return set_error("unexpected limb mapping size in gpu_matrix_mul");
+    }
+
+    if (lhs->rows > 0 && lhs->rows <= 4 && rhs->cols > 0 && rhs->cols <= 4 &&
+        lhs->cols > 0 && lhs->cols <= 16)
+    {
+        const int status = launch_descriptor_product(out, lhs, rhs, false);
+        if (status == 0) out->format = GPU_POLY_FORMAT_EVAL;
+        return status;
     }
 
     int status = 0;

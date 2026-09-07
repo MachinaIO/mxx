@@ -15,6 +15,13 @@ extern "C"
         const uint64_t *reconstruction_residues,
         size_t reconstruction_stride);
 
+    int gpu_matrix_rns_conversion(
+        GpuMatrix *out, const GpuMatrix *source, size_t digit_size,
+        uint64_t plaintext_modulus, const uint64_t *scales,
+        const uint64_t *inverses, const uint64_t *weights);
+
+    int gpu_matrix_centered_rebase(GpuMatrix *out, const GpuMatrix *source);
+
     int gpu_matrix_convert_modulus(
         GpuMatrix *out,
         const GpuMatrix *source,

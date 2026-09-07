@@ -8,6 +8,12 @@ extern "C"
 #endif
 
     int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
+    int gpu_matrix_transpose(GpuMatrix *out, const GpuMatrix *source);
+    int gpu_matrix_sum_rows(
+        GpuMatrix *out, const GpuMatrix *source, const size_t *rows, const size_t *offsets,
+        size_t group_count, size_t term_count);
+    int gpu_matrix_add_row_blocks(
+        GpuMatrix *out, const GpuMatrix *const *lhs_blocks, size_t block_count, const GpuMatrix *rhs);
     int gpu_matrix_add_block(
         GpuMatrix *out,
         const GpuMatrix *src,
@@ -19,6 +25,10 @@ extern "C"
         size_t cols);
     int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
     int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
+    int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
+    int gpu_matrix_tensor_sum_rows(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
+        const size_t *rows, const size_t *offsets, size_t group_count, size_t term_count);
     int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int *out_equal);
     int gpu_matrix_mul_scalar(
         GpuMatrix *out,

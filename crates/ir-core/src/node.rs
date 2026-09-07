@@ -79,6 +79,23 @@ pub enum NodeKind {
     ModulusReduce {
         modulus: IntExpr,
     },
+    /// Re-encodes centered residues from a single native CRT limb.
+    CenteredRebase {
+        modulus: IntExpr,
+    },
+    /// Fused centered CRT digit extension into a multiple modulus.
+    RnsModUp {
+        modulus: IntExpr,
+        source_moduli: Vec<u64>,
+        digit_size: usize,
+        normalize: bool,
+    },
+    /// Fused BGV plaintext-preserving removal of the auxiliary CRT basis.
+    RnsModDown {
+        modulus: IntExpr,
+        source_moduli: Vec<u64>,
+        plaintext_modulus: IntExpr,
+    },
     Transpose,
     Slice {
         rows: Option<IndexRange>,
@@ -156,6 +173,15 @@ pub enum NodeKind {
     PackPolynomialCoefficients {
         matrix_type: crate::types::MatrixType,
         coefficient_bits: IntExpr,
+    },
+    /// Imports runtime coefficients or native evaluation slots into a scalar polynomial.
+    PolynomialFromValues {
+        matrix_type: crate::types::MatrixType,
+        evaluation: bool,
+    },
+    /// Exports a scalar polynomial as canonical coefficients or native evaluation slots.
+    PolynomialValues {
+        evaluation: bool,
     },
     SubgraphCall(SubgraphCall),
     ParallelLoop(ParallelLoop),

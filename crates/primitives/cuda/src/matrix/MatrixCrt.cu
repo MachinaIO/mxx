@@ -187,6 +187,29 @@ namespace
         uint64_t moduli[kCrtMaxLimbs];
     };
 
+    __global__ void centered_rebase_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source,
+        CrtOutputMetadata output, uint64_t source_modulus,
+        size_t coefficient_count, size_t ring_dimension)
+    {
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index >= coefficient_count * output.limb_count) return;
+        const size_t limb = index / coefficient_count;
+        const size_t position = index % coefficient_count;
+        const size_t poly = position / ring_dimension;
+        const size_t coefficient = position % ring_dimension;
+        const auto input = source[0];
+        const uint64_t residue = matrix_load_limb_u64(input.base, poly, coefficient,
+            input.stride, input.width) % source_modulus;
+        const uint64_t modulus = output.moduli[limb];
+        // Keep the magnitude unsigned, including for source moduli above INT64_MAX.
+        const bool negative = residue > source_modulus / 2;
+        const uint64_t magnitude = (negative ? source_modulus - residue : residue) % modulus;
+        const uint64_t value = negative && magnitude != 0 ? modulus - magnitude : magnitude;
+        const auto target = output.descriptors[limb];
+        matrix_store_limb_u64(target.base, poly, coefficient, target.stride, target.width, value);
+    }
+
     __global__ void crt_recompose_kernel(
         const CrtLevelMetadata *levels, const CrtOutputMetadata *output,
         size_t level_count, size_t coefficient_count, size_t ring_dimension)
@@ -362,7 +385,7 @@ extern "C" int gpu_matrix_convert_modulus(
         const dim3 id = source->ctx->limb_gpu_ids[limb];
         if (id.x != 0 || id.y != limb)
             return set_error("unsupported source CRT limb placement");
-        status = matrix_wait_limb_stream(source, id, output.device, stream);
+        status = matrix_wait_limb_stream(source, id, output.device, stream, false, true);
         if (status != 0) return status;
     }
     for (size_t limb = 0; limb < target_count; ++limb)
@@ -409,6 +432,66 @@ extern "C" int gpu_matrix_convert_modulus(
     {
         const int deferred = gpu_defer_pinned_frees(out->ctx, output.device, stream, pinned.data(), pinned.size());
         if (status == 0) status = deferred;
+    }
+    return status;
+}
+
+extern "C" int gpu_matrix_centered_rebase(GpuMatrix *out, const GpuMatrix *source)
+{
+    if (!out || !source || !out->ctx || !source->ctx ||
+        out->ctx->execution != source->ctx->execution || out->ctx->N != source->ctx->N ||
+        source->level != 0 || source->ctx->moduli.size() != 1 || out->level < 0 ||
+        source->rows != out->rows || source->cols != out->cols ||
+        source->format != GPU_POLY_FORMAT_COEFF || out->format != GPU_POLY_FORMAT_COEFF ||
+        source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1)
+        return set_error("centered rebase requires colocated single-limb coefficients and matching execution");
+    const size_t target_count = static_cast<size_t>(out->level) + 1;
+    if (target_count > kCrtMaxLimbs || target_count > out->ctx->moduli.size())
+        return set_error("invalid centered rebase destination basis");
+    const auto &input = source->shared_limb_buffers[0];
+    const auto &output = out->shared_limb_buffers[0];
+    if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
+        input.limb_count != 1 || output.limb_count < target_count)
+        return set_error("centered rebase requires colocated device descriptors");
+    if (!out->rows || !out->cols || out->rows > std::numeric_limits<size_t>::max() / out->cols ||
+        out->rows * out->cols > std::numeric_limits<size_t>::max() / static_cast<size_t>(out->ctx->N))
+        return set_error("centered rebase shape overflow");
+    const size_t coefficient_count = out->rows * out->cols * static_cast<size_t>(out->ctx->N);
+    if (coefficient_count > std::numeric_limits<size_t>::max() / target_count)
+        return set_error("centered rebase coefficient count overflow");
+    const size_t count = coefficient_count * target_count;
+    const size_t blocks = count / 128 + (count % 128 != 0);
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("centered rebase exceeds CUDA grid capacity");
+    cudaError_t error = cudaSetDevice(output.device);
+    if (error != cudaSuccess) return set_error(error);
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[0], output.device, stream, false, true);
+    if (status != 0) return status;
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        status = matrix_wait_limb_stream(out, out->ctx->limb_gpu_ids[limb], output.device, stream);
+        if (status != 0) return status;
+    }
+    CrtOutputMetadata metadata{};
+    metadata.descriptors = output.device_descriptors;
+    metadata.limb_count = target_count;
+    std::copy_n(out->ctx->moduli.begin(), target_count, metadata.moduli);
+    centered_rebase_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
+        input.device_descriptors, metadata, source->ctx->moduli[0],
+        coefficient_count, static_cast<size_t>(out->ctx->N));
+    error = cudaGetLastError();
+    if (error != cudaSuccess) status = set_error(error);
+    // The temporary INTT source can be dropped immediately after this call.
+    const int tracked = matrix_track_limb_consumer_readonly(source,
+        source->ctx->limb_gpu_ids[0], output.device, stream);
+    if (status == 0) status = tracked;
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        const int recorded = matrix_record_limb_write(out, out->ctx->limb_gpu_ids[limb], stream);
+        if (status == 0) status = recorded;
     }
     return status;
 }
@@ -520,6 +603,255 @@ extern "C" int gpu_matrix_crt_recompose(
         const int released = gpu_defer_pinned_frees(out->ctx, target.device, stream,
             pinned.data(), pinned.size());
         if (status == 0) status = released;
+    }
+    return status;
+}
+
+namespace
+{
+    // By-value launch parameters avoid pinned allocation and host metadata
+    // transfers. CUDA copies these arguments before the launch returns.
+    struct RnsLaunchMetadata
+    {
+        size_t source_count;
+        size_t target_count;
+        size_t digit_size;
+        size_t group_count;
+        size_t retained[kCrtMaxLimbs];
+        uint64_t source_moduli[kCrtMaxLimbs];
+        uint64_t target_moduli[kCrtMaxLimbs];
+        uint64_t scales[kCrtMaxLimbs];
+        uint64_t inverses[kCrtMaxLimbs];
+        uint64_t plaintext_modulus;
+    };
+    static_assert(sizeof(RnsLaunchMetadata) + sizeof(void *) < 4096,
+        "RNS setup arguments must fit the baseline CUDA kernel argument limit");
+
+    struct RnsConversionMetadata
+    {
+        RnsLaunchMetadata plan;
+        uint64_t weights[kCrtMaxLimbs * kCrtMaxLimbs];
+    };
+
+    __global__ void rns_setup_kernel(RnsConversionMetadata *metadata, RnsLaunchMetadata plan)
+    {
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index == 0) metadata->plan = plan;
+        if (index >= plan.source_count * plan.target_count) return;
+        const size_t input = index / plan.target_count;
+        const size_t target = index % plan.target_count;
+        const bool down = plan.plaintext_modulus != 0;
+        const uint64_t modulus = plan.target_moduli[target];
+        uint64_t weight = down && plan.scales[input] == 0 ? 0 : 1;
+        const size_t begin = down ? 0 : (input / plan.digit_size) * plan.digit_size;
+        const size_t end = down ? plan.source_count : min(plan.source_count, begin + plan.digit_size);
+        for (size_t limb = begin; limb < end && weight != 0; ++limb)
+        {
+            // Zero scales mark Q limbs retained by ModDown; P is their complement.
+            if (limb != input && (!down || plan.scales[limb] != 0))
+                weight = mul_mod_u64(weight, plan.source_moduli[limb] % modulus, modulus);
+        }
+        metadata->weights[input * kCrtMaxLimbs + target] = weight;
+    }
+
+    __device__ __forceinline__ void rns_convert_coefficient(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source,
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *target,
+        const RnsLaunchMetadata &plan, const uint64_t *weights, size_t weight_stride,
+        size_t coefficient_count, size_t ring_dimension, bool mod_down)
+    {
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index >= coefficient_count * plan.target_count * plan.group_count) return;
+        const size_t position = index % coefficient_count;
+        const size_t limb = (index / coefficient_count) % plan.target_count;
+        const size_t group = index / coefficient_count / plan.target_count;
+        const size_t poly = position / ring_dimension;
+        const size_t coefficient = position % ring_dimension;
+        const uint64_t modulus = plan.target_moduli[limb];
+        const size_t begin = mod_down ? 0 : group * plan.digit_size;
+        const size_t end = mod_down ? plan.source_count :
+            min(plan.source_count, begin + plan.digit_size);
+        uint64_t sum = 0;
+        for (size_t input_limb = begin; input_limb < end; ++input_limb)
+        {
+            const uint64_t weight = weights[input_limb * weight_stride + limb];
+            if (weight == 0) continue;
+            const auto input = source[input_limb];
+            const uint64_t source_modulus = plan.source_moduli[input_limb];
+            const uint64_t residue = mul_mod_u64(matrix_load_limb_u64(input.base, poly,
+                coefficient, input.stride, input.width) % source_modulus,
+                plan.scales[input_limb], source_modulus);
+            const bool negative = residue > source_modulus / 2;
+            const uint64_t magnitude = (negative ? source_modulus - residue : residue) % modulus;
+            const uint64_t centered = negative && magnitude != 0 ? modulus - magnitude : magnitude;
+            sum = add_mod_u64(sum, mul_mod_u64(centered, weight, modulus), modulus);
+        }
+        if (mod_down)
+        {
+            const auto input = source[plan.retained[limb]];
+            const uint64_t residue = matrix_load_limb_u64(input.base, poly, coefficient,
+                input.stride, input.width) % modulus;
+            sum = mul_mod_u64(add_mod_u64(residue,
+                mul_mod_u64(plan.plaintext_modulus % modulus, sum, modulus), modulus),
+                plan.inverses[limb], modulus);
+        }
+        const auto output = target[limb];
+        const size_t output_poly = group * (coefficient_count / ring_dimension) + poly;
+        matrix_store_limb_u64(output.base, output_poly, coefficient,
+            output.stride, output.width, sum);
+    }
+    struct RnsCompactMetadata
+    {
+        RnsLaunchMetadata plan;
+        uint64_t weights[64];
+    };
+    static_assert(sizeof(RnsCompactMetadata) + 2 * sizeof(void *) + 2 * sizeof(size_t) + sizeof(bool) <= 4096,
+                  "compact RNS launch exceeds portable CUDA parameter budget");
+
+    __global__ void rns_compact_conversion_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source,
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *target,
+        RnsCompactMetadata metadata, size_t count, size_t dimension, bool down)
+    {
+        rns_convert_coefficient(source, target, metadata.plan, metadata.weights,
+                                metadata.plan.target_count, count, dimension, down);
+    }
+
+    __global__ void rns_conversion_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source,
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *target,
+        const RnsConversionMetadata *metadata, size_t count, size_t dimension, bool down)
+    {
+        rns_convert_coefficient(source, target, metadata->plan, metadata->weights,
+                                kCrtMaxLimbs, count, dimension, down);
+    }
+
+}
+
+extern "C" int gpu_matrix_rns_conversion(
+    GpuMatrix *out, const GpuMatrix *source, size_t digit_size,
+    uint64_t plaintext_modulus, const uint64_t *scales,
+    const uint64_t *inverses, const uint64_t *weights)
+{
+    const bool mod_down = plaintext_modulus != 0;
+    if (plaintext_modulus == 1) return set_error("RNS ModDown plaintext modulus must be at least two");
+    if (!out || !source || !out->ctx || !source->ctx ||
+        out->ctx->execution != source->ctx->execution || out->ctx->N != source->ctx->N ||
+        out->format != GPU_POLY_FORMAT_COEFF || source->format != GPU_POLY_FORMAT_COEFF ||
+        out->level < 0 || source->level < 0 || !scales || !inverses ||
+        digit_size == 0 || source->cols != out->cols ||
+        source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1)
+        return set_error("invalid fused RNS conversion layout");
+    const size_t source_count = static_cast<size_t>(source->level) + 1;
+    const size_t target_count = static_cast<size_t>(out->level) + 1;
+    const size_t groups = mod_down ? 1 : source_count / digit_size + (source_count % digit_size != 0);
+    if (source_count > kCrtMaxLimbs || target_count > kCrtMaxLimbs ||
+        source_count != source->ctx->moduli.size() || target_count != out->ctx->moduli.size() ||
+        source->rows > std::numeric_limits<size_t>::max() / groups || out->rows != source->rows * groups)
+        return set_error("invalid fused RNS conversion basis or shape");
+    RnsLaunchMetadata metadata{};
+    metadata.source_count = source_count;
+    metadata.target_count = target_count;
+    metadata.digit_size = digit_size;
+    metadata.group_count = groups;
+    metadata.plaintext_modulus = plaintext_modulus;
+    for (size_t limb = 0; limb < source_count; ++limb)
+    {
+        metadata.source_moduli[limb] = source->ctx->moduli[limb];
+        metadata.scales[limb] = scales[limb];
+    }
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        metadata.target_moduli[limb] = out->ctx->moduli[limb];
+        metadata.inverses[limb] = inverses[limb];
+        if (mod_down)
+        {
+            size_t retained = 0;
+            while (retained < source_count && source->ctx->moduli[retained] != out->ctx->moduli[limb]) ++retained;
+            if (retained == source_count) return set_error("ModDown target must be a source subset");
+            metadata.retained[limb] = retained;
+        }
+    }
+    const auto &input = source->shared_limb_buffers[0];
+    const auto &output = out->shared_limb_buffers[0];
+    if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
+        input.limb_count < source_count || output.limb_count < target_count)
+        return set_error("fused RNS conversion requires colocated descriptors");
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    cudaError_t error = cudaSetDevice(output.device);
+    if (error != cudaSuccess) return set_error(error);
+    for (size_t limb = 0; limb < source_count; ++limb)
+    {
+        const dim3 id = source->ctx->limb_gpu_ids[limb];
+        if (id.x != 0 || id.y != limb) return set_error("unsupported source RNS limb placement");
+    }
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        const dim3 id = out->ctx->limb_gpu_ids[limb];
+        if (id.x != 0 || id.y != limb) return set_error("unsupported target RNS limb placement");
+    }
+    status = matrix_wait_all_limb_streams(source, output.device, stream, false, true);
+    if (status != 0) return status;
+    status = matrix_wait_all_limb_streams(out, output.device, stream);
+    if (status != 0) return status;
+    const size_t dimension = static_cast<size_t>(source->ctx->N);
+    if (source->rows == 0 || source->cols == 0 ||
+        source->rows > std::numeric_limits<size_t>::max() / source->cols ||
+        source->rows * source->cols > std::numeric_limits<size_t>::max() / dimension)
+        return set_error("fused RNS conversion shape overflow");
+    const size_t count = source->rows * source->cols * dimension;
+    if (count > std::numeric_limits<size_t>::max() / target_count / groups)
+        return set_error("fused RNS conversion grid overflow");
+    const size_t total = count * target_count * groups;
+    const size_t blocks = total / 128 + (total % 128 != 0);
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("fused RNS conversion exceeds CUDA grid capacity");
+    RnsConversionMetadata *device_metadata = nullptr;
+    if (source_count * target_count <= 64)
+    {
+        if (!weights) return set_error("missing compact RNS weights");
+        RnsCompactMetadata compact{};
+        compact.plan = metadata;
+        std::copy_n(weights, source_count * target_count, compact.weights);
+        rns_compact_conversion_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
+            input.device_descriptors, output.device_descriptors, compact, count, dimension, mod_down);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) status = set_error(error);
+    }
+    else
+    {
+        error = cudaMallocAsync(reinterpret_cast<void **>(&device_metadata), sizeof(RnsConversionMetadata), stream);
+        if (error != cudaSuccess) return set_error(error);
+        const size_t setup_count = source_count * target_count;
+        const size_t setup_blocks = setup_count / 128 + (setup_count % 128 != 0);
+        rns_setup_kernel<<<static_cast<int>(setup_blocks), 128, 0, stream>>>(device_metadata, metadata);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) status = set_error(error);
+        if (status == 0)
+        {
+            rns_conversion_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
+                input.device_descriptors, output.device_descriptors, device_metadata, count, dimension, mod_down);
+            error = cudaGetLastError();
+            if (error != cudaSuccess) status = set_error(error);
+        }
+    }
+    if (status == 0)
+    {
+        // All source limbs share this partition's allocation/release stream.
+        // One readonly consumer fence protects the complete buffer without
+        // mutating a coefficient input shared by concurrent host readers.
+        const int tracked = matrix_track_limb_consumer_readonly(
+            source, source->ctx->limb_gpu_ids[0], output.device, stream);
+        if (status == 0) status = tracked;
+        const int recorded = matrix_record_all_limb_writes(out, stream);
+        if (status == 0) status = recorded;
+    }
+    if (device_metadata)
+    {
+        error = cudaFreeAsync(device_metadata, stream);
+        if (status == 0 && error != cudaSuccess) status = set_error(error);
     }
     return status;
 }

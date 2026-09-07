@@ -60,8 +60,13 @@ pub struct PrimitiveNames {
     pub crt_recompose: String,
     pub modulus_switch: String,
     pub modulus_reduce: String,
+    pub centered_rebase: String,
+    pub rns_mod_up: String,
+    pub rns_mod_down: String,
     pub ring_automorphism: String,
     pub pack_polynomial: String,
+    pub polynomial_from_values: String,
+    pub polynomial_values: String,
     pub family_pack: String,
     pub family_get_static: String,
     pub family_get_dynamic: String,
@@ -106,8 +111,13 @@ impl Default for PrimitiveNames {
             crt_recompose: "MxxRuntime.crtRecomposeLevel".into(),
             modulus_switch: "MxxRuntime.modulusSwitchRuns".into(),
             modulus_reduce: "MxxRuntime.modulusReduceRuns".into(),
+            centered_rebase: "MxxRuntime.centeredRebaseRuns".into(),
+            rns_mod_up: "MxxRuntime.rnsModUpRuns".into(),
+            rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
             ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
+            polynomial_from_values: "MxxRuntime.polynomialFromValues".into(),
+            polynomial_values: "MxxRuntime.polynomialValues".into(),
             family_pack: "MxxRuntime.familyPack".into(),
             family_get_static: "MxxRuntime.familyGetStatic".into(),
             family_get_dynamic: "MxxRuntime.familyGetDynamic".into(),
@@ -1408,15 +1418,47 @@ impl<'a> Emitter<'a> {
                     &["hashModel".into(), prefix, format!("[{components}]"), key],
                 );
             }
-            NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
+            NodeKind::ModulusSwitch { modulus } |
+            NodeKind::ModulusReduce { modulus } |
+            NodeKind::CenteredRebase { modulus } => {
                 append_expression_guards(modulus, env, relations);
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
                 let relation = if matches!(kind, NodeKind::ModulusSwitch { .. }) {
                     &self.options.primitives.modulus_switch
+                } else if matches!(kind, NodeKind::CenteredRebase { .. }) {
+                    &self.options.primitives.centered_rebase
                 } else {
                     &self.options.primitives.modulus_reduce
                 };
                 relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+            }
+            NodeKind::RnsModUp { modulus, source_moduli, digit_size, normalize } => {
+                append_expression_guards(modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let basis = source_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+                relations.push(format!(
+                    "{} [{}] {} {} {} {}",
+                    self.options.primitives.rns_mod_up,
+                    basis,
+                    digit_size,
+                    normalize,
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::RnsModDown { modulus, source_moduli, plaintext_modulus } => {
+                append_expression_guards(modulus, env, relations);
+                append_expression_guards(plaintext_modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let basis = source_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+                relations.push(format!(
+                    "{} [{}] ({}) {} {}",
+                    self.options.primitives.rns_mod_down,
+                    basis,
+                    env.expr(plaintext_modulus),
+                    arg(0)?,
+                    output(0)
+                ));
             }
             NodeKind::RingAutomorphism { index } => {
                 append_expression_guards(index, env, relations);
@@ -1618,6 +1660,26 @@ impl<'a> Emitter<'a> {
                     "{} ({}) {} {}",
                     self.options.primitives.pack_polynomial,
                     env.expr(coefficient_bits),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::PolynomialFromValues { evaluation, .. } => {
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} {} {} {}",
+                    self.options.primitives.polynomial_from_values,
+                    evaluation,
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::PolynomialValues { evaluation } => {
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} {} {} {}",
+                    self.options.primitives.polynomial_values,
+                    evaluation,
                     arg(0)?,
                     output(0)
                 ));
@@ -2520,6 +2582,13 @@ mod tests {
         )
         .output(0)
         .unwrap();
+        let reduced = NodeHandle::new(
+            NodeKind::CenteredRebase { modulus: IntExpr::constant(5) },
+            vec![reduced],
+            vec![WireType::Matrix(matrix(5))],
+        )
+        .output(0)
+        .unwrap();
         let conjugate = NodeHandle::new(
             NodeKind::RingAutomorphism { index: IntExpr::constant(3) },
             vec![reduced],
@@ -2551,9 +2620,63 @@ mod tests {
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("modulusSwitchRuns"));
         assert!(artifact.source.contains("modulusReduceRuns"));
+        assert!(artifact.source.contains("centeredRebaseRuns"));
         assert!(artifact.source.contains("ringAutomorphismRuns"));
         assert_eq!(artifact.source.matches("crtRecomposeLevel").count(), 2);
         assert!(artifact.source.contains("abbrev generatedRoot.constraints"));
+    }
+
+    #[test]
+    fn test_export_rns_conversions_preserves_basis_and_normalization() {
+        let matrix = |modulus| MatrixType {
+            modulus: IntExpr::constant(modulus),
+            ring_dimension: IntExpr::constant(8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let source = NodeHandle::new(
+            NodeKind::ConstantMatrix { matrix_type: matrix(17), value: ConstantMatrix::Zero },
+            vec![],
+            vec![WireType::Matrix(matrix(17))],
+        )
+        .output(0)
+        .unwrap();
+        let lifted = NodeHandle::new(
+            NodeKind::RnsModUp {
+                modulus: IntExpr::constant(17 * 97),
+                source_moduli: vec![17],
+                digit_size: 1,
+                normalize: false,
+            },
+            vec![source],
+            vec![WireType::Matrix(matrix(17 * 97))],
+        )
+        .output(0)
+        .unwrap();
+        let value = NodeHandle::new(
+            NodeKind::RnsModDown {
+                modulus: IntExpr::constant(17),
+                source_moduli: vec![17, 97],
+                plaintext_modulus: IntExpr::constant(2),
+            },
+            vec![lifted],
+            vec![WireType::Matrix(matrix(17))],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "rns_conversions",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("rnsModUpRuns [17] 1 false"));
+        assert!(artifact.source.contains("rnsModDownRuns [17, 97] (2)"));
     }
 
     #[test]

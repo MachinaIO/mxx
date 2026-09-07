@@ -58,6 +58,40 @@ impl DCRTPoly {
         parse_coefficients_bytes(&self.eval_bytes()).coefficients
     }
 
+    pub(crate) fn convert_basis(
+        &self,
+        params: &DCRTPolyParams,
+        centered: bool,
+    ) -> Result<Self, String> {
+        super::native::ffi::exact_basis_convert(&self.ptr_poly, &params.to_crt().0, centered)
+            .map(Self::new)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn rns_convert(
+        &self,
+        params: &DCRTPolyParams,
+        digit_size: usize,
+        normalize: bool,
+        plaintext_modulus: u64,
+    ) -> Result<Vec<Self>, String> {
+        let result = super::native::ffi::exact_basis_rns(
+            &self.ptr_poly,
+            &params.to_crt().0,
+            digit_size,
+            normalize,
+            plaintext_modulus,
+        )
+        .map_err(|error| error.to_string())?;
+        (0..ffi::GetMatrixRows(&result))
+            .map(|row| {
+                super::native::ffi::exact_basis_matrix_entry(&result, row, 0)
+                    .map(Self::new)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
     pub fn modulus_switch(&self, params: &DCRTPolyParams) -> Self {
         let new_modulus = params.modulus();
         let coeffs = self.coeffs();
@@ -66,6 +100,14 @@ impl DCRTPoly {
             .map(|coeff| coeff.modulus_switch(new_modulus.clone()))
             .collect::<Vec<FinRingElem>>();
         DCRTPoly::from_coeffs(params, &new_coeffs)
+    }
+
+    /// Apply OpenFHE BGV ModReduce, dropping the trailing CRT prime.
+    /// The plaintext modulus must be at least two and coprime to that prime.
+    pub fn bgv_mod_reduce(&self, plaintext_modulus: u64) -> Result<Self, String> {
+        super::native::ffi::exact_basis_bgv_mod_reduce(&self.ptr_poly, plaintext_modulus)
+            .map(Self::new)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn poly_gen_from_vec(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
@@ -161,8 +203,12 @@ impl Poly for DCRTPoly {
     }
 
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self {
-        let values: Vec<Vec<u64>> = slots.iter().map(|slot| slot.to_u64_digits()).collect();
+        let values: Vec<Vec<u64>> = slots.par_iter().map(|slot| slot.to_u64_digits()).collect();
         Self::poly_gen_from_vec_eval(params, &values)
+    }
+
+    fn evals_biguints(&self) -> Vec<BigUint> {
+        self.eval_slots()
     }
 
     fn from_decomposed(params: &DCRTPolyParams, decomposed: &[Self]) -> Self {
@@ -611,6 +657,25 @@ mod tests {
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
     use rand::prelude::*;
+
+    #[test]
+    fn test_dcrtpoly_native_evaluation_roundtrip() {
+        let (n, depth, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
+        let original = DCRTPolyUniformSampler::new().sample_poly(&params, &DistType::FinRingDist);
+        let evaluations = original.evals_biguints();
+        let unreduced = evaluations
+            .par_iter()
+            .map(|value| value + params.modulus().as_ref())
+            .collect::<Vec<_>>();
+        let imported = DCRTPoly::from_biguints_eval(&params, &unreduced);
+        assert_eq!(imported.evals_biguints(), evaluations);
+        assert_eq!(imported.coeffs_biguints(), original.coeffs_biguints());
+        assert_eq!(
+            DCRTPoly::from_biguints(&params, &imported.coeffs_biguints()).evals_biguints(),
+            evaluations
+        );
+    }
 
     #[test]
     fn test_const_coeff_u64_extracts_constant_term() {

@@ -1091,6 +1091,19 @@ extern "C"
                 gpu_ctx->execution->pinned_host_reclaimer = new PinnedHostReclaimer();
             }
             gpu_ctx->moduli = std::move(moduli_vec);
+            gpu_ctx->barrett_reciprocals.reserve(gpu_ctx->moduli.size());
+            for (const uint64_t modulus : gpu_ctx->moduli)
+            {
+                unsigned __int128 reciprocal = 0;
+                if (modulus > 1 && modulus < (uint64_t{1} << 63))
+                {
+                    const unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
+                    // floor(2^128/q), without representing 2^128 itself.
+                    reciprocal = maximum / modulus + (maximum % modulus == modulus - 1);
+                }
+                gpu_ctx->barrett_reciprocals.push_back({
+                    static_cast<uint64_t>(reciprocal), static_cast<uint64_t>(reciprocal >> 64)});
+            }
             gpu_ctx->ntt_n_inv_by_prime = std::move(n_inv_by_prime);
             gpu_ctx->ntt_root_by_prime = std::move(root_by_prime);
             gpu_ctx->ntt_inv_root_by_prime = std::move(inv_root_by_prime);

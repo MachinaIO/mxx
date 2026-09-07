@@ -1141,15 +1141,14 @@ mod tests {
             .unwrap()
             .validate(&ParamEnv::default())
             .unwrap();
-        let result = execute(
-            &graph,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
-            BTreeMap::new(),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let RuntimeValue::IndexedFamily(indices) = &result.outputs["indices"] else {
+        let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let RuntimeValue::IndexedFamily(indices) =
+            result.materialize_output("indices", &backend, &mut store).unwrap()
+        else {
             panic!("indices output must be an integer family")
         };
         let actual = indices
@@ -1160,6 +1159,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, vec![0.into(), 1.into(), 0.into(), 0.into()]);
+        result.cleanup_staged(&mut store).unwrap();
     }
 
     #[test]

@@ -170,11 +170,59 @@ def concatDiagonal {q n leftRows leftColumns rightRows rightColumns : Nat}
       else
         right ⟨row.val - leftRows, by omega⟩ ⟨column.val - leftColumns, by omega⟩
 
+/-- Reverse exactly `bits` low bits, matching the native NTT evaluation-slot order. -/
+def nttBitReverse (bits index : Nat) : Nat :=
+  ∑ bit ∈ Finset.range bits, (index / 2 ^ bit % 2) * 2 ^ (bits - 1 - bit)
+
+/-- A canonical primitive root with the order used by the native negacyclic transform. -/
+def nttPrimitiveRoot (q n root : Nat) : Prop :=
+  0 < root ∧ root < q ∧ root ^ (2 * n) % q = 1 ∧
+  ∀ exponent : Nat, 0 < exponent → exponent < 2 * n → root ^ exponent % q ≠ 1
+
+/-- Evaluate at odd powers of `root`, writing evaluations in bit-reversed order.
+Both sides are reduced, so inverse inputs may use noncanonical integer representatives. -/
+def nttEvaluations {n : Nat} (q bits root : Nat)
+    (coefficients evaluations : Fin n → Int) : Prop :=
+  ∀ index : Fin n, ∃ slot : Fin n,
+    slot.val = nttBitReverse bits index.val ∧
+    evaluations slot % (q : Int) =
+      (∑ coefficient : Fin n,
+        coefficients coefficient * (root : Int) ^ ((2 * index.val + 1) * coefficient.val)) %
+        (q : Int)
+
+/-- Native negacyclic NTT semantics, including CRT rings with distinct prime limbs. Each
+prime limb chooses its smallest primitive `2*n`-th root; `root` is their canonical CRT lift.
+Forward maps coefficients to bit-reversed evaluations; inverse reverses that same relation.
+In either direction the returned integers are canonical residues modulo the full modulus. -/
+def polynomialNttRuns {n : Nat} (q : Nat) (inverse : Bool)
+    (input output : Fin n → Int) : Prop :=
+  1 < q ∧
+  (∀ prime : Nat, prime.Prime → ¬ (prime * prime) ∣ q) ∧
+  ∃ bits root : Nat, n = 2 ^ bits ∧ root < q ∧
+    (∀ prime : Nat, prime.Prime → prime ∣ q →
+      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime) ∧
+      ∀ candidate : Nat, nttPrimitiveRoot prime n candidate → root % prime ≤ candidate) ∧
+    (∀ index, 0 ≤ output index ∧ output index < (q : Int)) ∧
+    (if inverse then nttEvaluations q bits root output input
+     else nttEvaluations q bits root input output)
+
 /-- Canonical coefficients reconstructed in the quotient by `X^n + 1`. -/
 noncomputable def polynomialOfCoefficients {q n : Nat} (values : Fin n → Int) :
     ExactPoly q n :=
   ∑ i : Fin n, (values i : ExactPoly q n) *
     AdjoinRoot.root (negacyclicModulus n (ZMod q)) ^ i.val
+
+/-- Runtime import reduces arbitrary integers; evaluation imports use the native inverse NTT. -/
+noncomputable def polynomialFromValues {q n : Nat} (evaluation : Bool)
+    (input : Fin n → Int) (output : ExactMatrix q n 1 1) : Prop :=
+  if evaluation then polynomialNttRuns q true input (fun i ↦ ((output 0 0).coeff i).val)
+  else output = fun _ _ ↦ polynomialOfCoefficients input
+
+/-- Runtime export returns canonical residues, in coefficient or native evaluation order. -/
+noncomputable def polynomialValues {q n : Nat} (evaluation : Bool)
+    (input : ExactMatrix q n 1 1) (output : Fin n → Int) : Prop :=
+  if evaluation then polynomialNttRuns q false (fun i ↦ ((input 0 0).coeff i).val) output
+  else ∀ i, output i = ((input 0 0).coeff i).val
 
 theorem polynomialOfCoefficients_coeff {q n : Nat} (hq : 1 < q) (hn : 0 < n)
     (values : Fin n → Int) (i : Fin n) :
@@ -206,6 +254,70 @@ noncomputable def modulusReduce {q p n rows columns : Nat}
 noncomputable def modulusReduceRuns {q p n rows columns : Nat}
     (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
   1 < p ∧ p ∣ q ∧ output = modulusReduce input
+
+/-- Centered representatives are re-encoded without requiring a divisor ring. -/
+noncomputable def centeredRebase {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) : ExactMatrix p n rows columns :=
+  fun row column ↦ polynomialOfCoefficients fun i ↦
+    let u := ((input row column).coeff i).val
+    if u ≤ q / 2 then Int.ofNat u else Int.ofNat u - Int.ofNat q
+
+noncomputable def centeredRebaseRuns {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
+  1 < p ∧ output = centeredRebase input
+
+/-- The inverse is taken in the native residue ring, before centered lifting. -/
+noncomputable def rnsInverse (modulus : Nat) (value : Int) : Int :=
+  Int.ofNat (((value : ZMod modulus)⁻¹).val)
+
+noncomputable def rnsCentered (modulus : Nat) (value : Int) : Int :=
+  let residue := value % Int.ofNat modulus
+  if residue ≤ Int.ofNat (modulus / 2) then residue else residue - Int.ofNat modulus
+
+/-- One contiguous CRT digit, using the same unreduced centered sum as the backend. -/
+noncomputable def rnsDigit (basis : List Nat) (digitSize digit : Nat)
+    (normalize : Bool) (value : Int) : Int :=
+  let group := (basis.drop (digit * digitSize)).take digitSize
+  let digitModulus := group.prod
+  (group.map fun prime ↦
+    let factor := digitModulus / prime
+    let normalization := if normalize then rnsInverse prime (basis.prod / digitModulus) else 1
+    Int.ofNat factor * rnsCentered prime
+      (value * rnsInverse prime factor * normalization)).sum
+
+/-- Group-major row stacking fixes both the CRT formula and the digit layout. -/
+noncomputable def rnsModUpRuns {q p n rows columns outputRows : Nat}
+    (basis : List Nat) (digitSize : Nat) (normalize : Bool)
+    (input : ExactMatrix q n rows columns)
+    (output : ExactMatrix p n outputRows columns) : Prop :=
+  basis.prod = q ∧ basis ≠ [] ∧ basis.Pairwise Nat.Coprime ∧
+  (∀ prime ∈ basis, 2 < prime ∧ (2 * n) ∣ (prime - 1)) ∧
+  0 < digitSize ∧ 1 < p ∧ q ∣ p ∧
+  outputRows = rows * ((basis.length + digitSize - 1) / digitSize) ∧
+  ∀ (digit : Fin ((basis.length + digitSize - 1) / digitSize))
+    (row : Fin rows) (outRow : Fin outputRows) (column : Fin columns),
+    outRow.val = digit.val * rows + row.val →
+    output outRow column = polynomialOfCoefficients (fun i ↦
+      rnsDigit basis digitSize digit.val normalize
+        (Int.ofNat ((input row column).coeff i).val))
+
+/-- The dropped basis computes the centered BGV correction without exact CRT reduction. -/
+noncomputable def rnsModDownRuns {q p n rows columns : Nat}
+    (basis : List Nat) (plaintext : Int)
+    (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
+  let dropped := basis.filter (fun prime ↦ p % prime != 0)
+  let auxiliary := dropped.prod
+  basis.prod = q ∧ basis ≠ [] ∧ basis.Pairwise Nat.Coprime ∧
+  (∀ prime ∈ basis, 2 < prime ∧ (2 * n) ∣ (prime - 1)) ∧
+  1 < p ∧ p < q ∧ p * auxiliary = q ∧ 2 ≤ plaintext ∧
+  Int.gcd plaintext (Int.ofNat auxiliary) = 1 ∧
+  ∀ row column, output row column = polynomialOfCoefficients (fun i ↦
+    let value := Int.ofNat ((input row column).coeff i).val
+    let correction := (dropped.map fun prime ↦
+      let factor := auxiliary / prime
+      Int.ofNat factor * rnsCentered prime
+        (-value * rnsInverse prime plaintext * rnsInverse prime factor)).sum
+    (value + plaintext * correction) * rnsInverse p auxiliary)
 
 /-- Substitution in the negacyclic quotient incorporates the runtime's wraparound sign. -/
 noncomputable def ringAutomorphism {q n rows columns : Nat} (index : Nat)

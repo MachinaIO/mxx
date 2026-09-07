@@ -17,7 +17,7 @@ use super::element::PolyElem;
 
 pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
     type Modulus: Debug + Clone + Into<Arc<BigUint>>;
-    /// Returns the modulus value `q` used for polynomial coefficients in the ring `Z_q[x]/(x^n -
+    /// Returns the modulus value `q` used for polynomial coefficients in the ring `Z_q[x]/(x^n +
     /// 1)`.
     fn modulus(&self) -> Self::Modulus;
     /// A size of the base value used for a gadget vector and decomposition, i.e., `base =
@@ -47,7 +47,7 @@ pub trait PolyParams: Clone + Debug + PartialEq + Eq + Send + Sync {
         (low / 2u8) * k
     }
     /// Returns the integer `n` that specifies the size of the polynomial ring used in this
-    /// polynomial. Specifically, this is the degree parameter for the ring `Z_q[x]/(x^n - 1)`.
+    /// polynomial. Specifically, this is the degree parameter for the ring `Z_q[x]/(x^n + 1)`.
     fn ring_dimension(&self) -> u32;
     /// Given the parameter, return the crt decomposed moduli as array along with the bit size and
     /// depth of these moduli.
@@ -131,7 +131,10 @@ pub trait Poly:
     fn from_coeffs(params: &Self::Params, coeffs: &[Self::Elem]) -> Self;
     fn from_u32s(params: &Self::Params, coeffs: &[u32]) -> Self;
     fn from_biguints(params: &Self::Params, coeffs: &[BigUint]) -> Self;
+    /// Import evaluations in native bit-reversed NTT order, reducing modulo the ring modulus.
     fn from_biguints_eval(params: &Self::Params, slots: &[BigUint]) -> Self;
+    /// Export evaluations in the same native bit-reversed NTT order as `from_biguints_eval`.
+    fn evals_biguints(&self) -> Vec<BigUint>;
     fn from_biguints_eval_single_mod(
         params: &Self::Params,
         crt_idx: usize,

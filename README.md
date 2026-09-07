@@ -15,6 +15,7 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 | `mxx-bench-estimator` | Validated-graph cost and memory composition. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
+| `mxx-fhe` | DSL-based Ring Regev/Ring-GSW and leveled BGV, SIMD, rotations, and ciphertext noise tracking. |
 | `mxx-we` | Witness-encryption interfaces and parameterized dynamic-circuit Diamond WE. |
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
 
@@ -26,6 +27,117 @@ ordinary untruncated distributions separately.
 
 See `docs/architecture.md`, `docs/dsl.md`, `docs/ir-core.md`, `docs/runtime.md`, and
 `docs/correctness/operational-protocol-inventory.md`.
+
+## FHE graphs
+
+`mxx-fhe` constructs cryptographic graphs; its methods do not encrypt eagerly.
+Key generation, sampling, polynomial arithmetic, and decryption execute when
+`mxx-runtime` runs the validated graph. CPU and GPU backends use the same FHE DSL.
+Bootstrapping is not implemented.
+
+| API | Representation and behavior |
+| --- | --- |
+| `FheCommonParams` | Existing `DCRTPolyParams`, binary/ternary secret interval, Gaussian sigma, and coefficient cutoff. Level zero keeps the first CRT prime; higher levels keep longer prefixes. |
+| `FheScheme` | Shared `keygen`, `encrypt`, `decrypt`, `add`, and `mul` graph builders, with scheme-specific plaintext, multiplication operand, and evaluation-key types. |
+| `RingGswParams` | `new(common, scale, plaintext_bound)`; scalar polynomial `Mat` plaintexts in the ciphertext ring R_q. Regev ciphertexts have separate a/b parts with phase `b - s*a = scale*m + e`. |
+| `RingCiphertext` | Shared storage for Regev and GSW aliases, with a/b parts and public noise/plaintext bounds. GSW encrypts an unscaled gadget diagonal; its external product multiplies a Regev plaintext by the GSW polynomial. |
+| `BgvParams` | `new(common, plaintext_modulus)`; messages are `Family<Int>` with 1 to N SIMD slots modulo t. Supports addition, multiplication with relinearization, CRT modulus switching, SIMD, and rotations. |
+| `BgvCiphertext` | Components are descending coefficients in `-s`: `(a,b)` for ordinary ciphertexts or three rows before relinearization. `correction_factor` tracks the plaintext multiplier modulo t, while `noise_bound` tracks coefficient noise. |
+
+Ring Regev's plaintext ring and ciphertext ring have the same modulus q.
+The scale and declared centered coefficient bound restrict which plaintexts can
+be recovered under noise; negative decoded coefficients are returned as canonical
+residues modulo q. BGV instead decrypts modulo its separate plaintext modulus t.
+For BGV multiplication, `mul` takes a relinearization key; alternatively,
+`mul_unrelinearized` and `relinearize` expose the two steps explicitly.
+
+BGV uses SIMD by default and requires a prime t with `t = 1 mod 2N`.
+Call `encrypt(&key, &slots)` directly; `decrypt(&secret, &ciphertext)` returns
+all N slots. Inputs with 1 to N integers fill successive slots, and unused slots
+are zero. A single integer occupies slot zero without broadcasting. Returning
+all slots preserves values moved into initially unused positions by rotations,
+without storing an input length in the ciphertext.
+
+Slots are interpreted as evaluation values in the plaintext ring R_t. Internal
+encoding uses the native inverse NTT modulo t, centers and lifts the resulting
+coefficients into R_Q, and uses the native evaluation representation for
+ciphertext arithmetic. The t-to-Q coefficient lift is necessary; copying
+R_t evaluation values directly into R_Q would change the message polynomial.
+Encoding and decoding are internal details, so callers need no separate steps.
+Slots occupy two rows of N/2 entries.
+`rotate_rows` rotates both rows (positive offsets move entries left), and
+`swap_rows` exchanges them. Nontrivial rotations and row swaps need their
+respective evaluation keys at the ciphertext's level. CRT modulus switching
+operates on residues without reconstructing whole ciphertext coefficients.
+
+BGV uses hybrid RNS key switching (ePrint 2021/204, Appendix B.2.3), including
+relinearization, rotations, and row swaps. `BgvParams::new(common, t, None)`
+selects approximately three CRT digits and a disjoint 60-bit auxiliary basis P
+large enough to cover the largest digit. Pass `Some(BgvHybridParams {
+digit_size, auxiliary_primes })` to specify the partition width and P explicitly.
+Evaluation keys are 2-by-ceil((level+1)/digit_size) matrices over Q_level*P;
+use `key_switch_parameters(level)` when importing them. Ciphertexts remain over
+Q_level, and switching preserves their correction factor. Parameter security
+must be assessed at Q*P, including the secret-dependent evaluation keys.
+
+The evaluator normalizes CRT digits, approximately extends them to QP, multiplies
+the evaluation key, and removes P with the BGV correction `(S+t*U)/P`, where
+`U = -S/t mod P`. Dedicated `RnsModUp` and `RnsModDown` nodes execute fused
+CPU/CUDA primitives: inverse-transform each input once, accumulate centered CRT
+terms in coefficient form, and forward-transform each output digit once.
+Normalization factors and division inverses are cached per worker and basis;
+GPU coefficients stay on the device. CUDA computes cofactor weights once per
+conversion using a setup kernel, without a host metadata allocation or upload. The GPU conversion batches all entries, digits, and destination
+limbs in one coefficient kernel, with stream-ordered temporary lifetimes.
+The tracked added noise is
+bounded by `ceil((N*error_cutoff*sum_j(alpha_j*floor(Q_j/2)) +
+(N+1)*k*floor(P/2))/P)`, where alpha_j is the number of primes in digit j and k is
+the number of auxiliary primes. This includes approximate-extension error.
+
+For manual CPU key-switch timing, run
+`FHE_TEST_RING_DIMENSION=1024 cargo test -r -p mxx-fhe --lib test_cpu_key_switch_evaluation_timing -- --ignored --nocapture`.
+The fixture uses production evaluation with pre-generated keys and inputs,
+excludes key generation and graph construction, warms up once, and records
+20 execution-plus-output-materialization samples (`FHE_BENCH_REPEATS` overrides
+the count). Other `FHE_TEST_*` variables control the test parameters.
+
+To execute a graph:
+
+1. Construct a `DslContext`, declare inputs, and use the FHE methods to build
+   encryption, evaluation, and decryption nodes. Mark secrets and decoded values
+   as private outputs.
+2. Build and validate the graph with a `ParamEnv`. Register the exact ordered
+   ciphertext CRT bases with the runtime backend. For BGV,
+   `runtime_parameters()` supplies all ciphertext, hybrid, single-prime, and
+   plaintext rings in their exact tower order.
+3. Call runtime `execute` with inputs, a backend, a `MemoryArtifactStore`, and a
+   sampling mode. Materialize lazy family outputs before inspecting their values.
+
+Noise bounds propagate with each ciphertext through evaluation. `can_decrypt`
+checks a conservative sufficient correctness condition; it does not measure
+secret runtime values. Declared input bounds and compatible keys remain caller
+obligations. DSL schemas retain public metadata, but a matrix artifact alone does
+not contain correction factors or bounds: carry those alongside components when
+connecting separate protocol stages. Artifacts remain in memory or are passed as
+direct runtime inputs.
+
+Start with the runtime unit tests in `crates/fhe/src/ring_gsw.rs` and
+`crates/fhe/src/bgv.rs` for slot arithmetic, measured noise, and
+staged evaluation. `crates/fhe/src/tests_gpu.rs` executes the production graphs
+on GPU, including a public evaluator that receives no secret key. The design
+and formulas are documented in `docs/plans/fhe.md`.
+
+```sh
+cargo test -r -p mxx-fhe --lib
+cargo test -r -p mxx-fhe --lib --features gpu test_gpu_fhe
+```
+
+Run GPU tests outside the sandbox on a CUDA-capable machine. The unit-test toy
+parameters are configurable through `FHE_TEST_RING_DIMENSION`,
+`FHE_TEST_CRT_DEPTH`, `FHE_TEST_CRT_BITS`, `FHE_TEST_BASE_BITS`, `FHE_TEST_SIGMA`,
+and `FHE_TEST_ERROR_CUTOFF`; parameter changes must preserve decoding margins
+and each test's batching requirements. Defaults are correctness fixtures, not
+security parameter recommendations.
 
 ## Diamond iO and AKY24 iO implementations
 

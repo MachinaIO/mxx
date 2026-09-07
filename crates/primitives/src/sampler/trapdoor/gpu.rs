@@ -797,6 +797,7 @@ mod tests {
             total_ncol,
             p1.level(),
             p1.is_ntt(),
+            None,
         );
         debug_assert!(p1.col_size() >= total_ncol, "p1 must include target columns");
         debug_assert!(p2.col_size() >= total_ncol, "p2 must include target columns");

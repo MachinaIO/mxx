@@ -1,0 +1,224 @@
+{
+  "date_utc": "2026-09-07",
+  "scope": "All non-ignored workspace library unit tests in CPU and GPU configurations. Ignored tests excluded by user request.",
+  "gpu_coverage": "One physical GPU. Tests returning early without another GPU do not establish peer or cross-device coverage.",
+  "source": {
+    "base_commit": "ebcc9b374594527ce05c36e9783bb14c6e2283e4",
+    "source_files": {
+      "Cargo.lock": "455375dc3b4d53c99708c49c35ce09744849a7d206a9756452e90dfb79a68597",
+      "crates/fhe/Cargo.toml": "9cbf6545f8fd0902191a05a49e1761d46b6856af889b16fb3899f9dd8277b7fc",
+      "crates/fhe/src/bgv.rs": "46eda3cfab25f6cd7595180d73663d96317a17e9fbf20b53e015bd1008643816",
+      "crates/fhe/src/gpu_test_utils.rs": "97a40fca0134caedc70bdff87c0fc5631a5f540e5ee93312027f52674b13972d",
+      "crates/fhe/src/tests_gpu.rs": "c00545ba9fb0b3dd919e8da7d189320870c49383828f21acb0f6327e856d32f2",
+      "crates/fhe/src/utils.rs": "81ba0de435b7c2eaeec494e1c48062b64f9aed7f35f227a7ff0fc37cfcd4ed03",
+      "crates/fhe/tests/gpu_bgv_round_trip.rs": "b9d796a04400ab683b8a0be0e80261cf7b68e4e2ec53bc7026ecc63a69e3fad6",
+      "crates/fhe/tests/gpu_ring_gsw_round_trip.rs": "bcfac43804b65c60e9ac821fe5b2e5ad9a2c41257b78d5c3236ac9f311484170",
+      "crates/fhe/tests/gpu_utils.rs": "6a43d6382e149112532eb79d45f227f7b8b137ec73a8e1c0b26f189e6aa29496",
+      "crates/fhe/tests/utils.rs": "debec89efe61e9c549f304e0955f794a114337bc7aa87d972691dd5710953b42",
+      "crates/ir-core/src/encoding.rs": "420666786459b8a7317b43c8e6932a88313504cd4103382e008c1eea57694673",
+      "crates/ir-core/src/graph.rs": "5dbd56b4a6c01e6acbed271c512a41adab2285ec16e6f8521df6c4648f1986d6",
+      "crates/primitives/cuda/include/matrix/Matrix.cuh": "95e3785aec725481a21e11c270155f5dcf7566f2655c507883e51f3b4e477896",
+      "crates/primitives/cuda/include/matrix/MatrixArith.cuh": "c1ac614cfbee74469b7eac57f7ba122dd81e8a26f5dbcbfc8cfadfeb84279c7c",
+      "crates/primitives/cuda/include/matrix/MatrixCrt.cuh": "0145660bb0d6e307c31d81dcd464b5fa428e00a4e1ef0e0b8880b5c7fc74f2f8",
+      "crates/primitives/cuda/include/matrix/MatrixUtils.cuh": "e730afb688b8d00b987f36ba4e8fe25c8d4529385fd9eaf593597bdbdd6a6a30",
+      "crates/primitives/cuda/src/matrix/MatrixArith.cu": "db6950c410a65ace98872d934ba1aea4e1086afc0d969b6ec20bbecc9db10e1f",
+      "crates/primitives/cuda/src/matrix/MatrixCrt.cu": "cbed742cd37fe327716105b8139dee39b0ad682d048b03ae56c41c41a3ce3e77",
+      "crates/primitives/cuda/src/matrix/MatrixData.cu": "acd3015472b2989ce0abf360251f62a573d045d5ab00e61ba4559602996fef94",
+      "crates/primitives/cuda/src/matrix/MatrixNTT.cu": "1257aac7e7f83f0585dd62facd8cba3b9a99efe7345dfaa19b063e2bd541736d",
+      "crates/primitives/cuda/src/matrix/MatrixNTTBatch.cu": "e844ac51c4a9dbd11778f6e6f9e9754aff03005fbb4016e59cdf4888b68a71f3",
+      "crates/primitives/cuda/src/matrix/MatrixUtils.cu": "87c77ba2b442028b3aef2197dbcb378c709703425729263eda215bdc07da2389",
+      "crates/primitives/native/ExactBasis.cc": "f4aa4f7de7e52a90fee0f1906183b5dcd701f8e877aa855e28b599d0eb0d30ca",
+      "crates/primitives/src/matrix/gpu_dcrt_poly.rs": "91692b354a02356a8abbcbc2c9adb384012a5e08af1e3a26f1d1dc9641cc95c6",
+      "crates/primitives/src/matrix/gpu_rns.rs": "077b23fa22780c19ee1919c6237b204d4804e73b96bcb78bc8bb011d97cf1b40",
+      "crates/primitives/src/matrix/mod.rs": "083a96e05fd6d08b7246c50c7b5aa05296e19aea484e1d92fccb423377fc84c6",
+      "crates/primitives/src/poly/dcrt/gpu.rs": "6484a0eadfabd5a84a82f1e9931a26a503ccc9cf8410fad797c44dcf85bbc7d9",
+      "crates/primitives/src/sampler/trapdoor/sampler.rs": "cac2c6f0cc2d8b0e4a8d7481fc49c56cab7094fe3345bdbab8f4b2f6de2e019d",
+      "crates/runtime/src/backend.rs": "fda8210e26118d5b3cd91f38b09bf0c7f0a81fb37ae90f1e0f1a87ee49afc0dd",
+      "crates/runtime/src/backend/poly.rs": "f78c12bac0a1bd40f908829eddd8c0462cb9687d13a518c7291f1d13b09fc8de",
+      "crates/runtime/src/backend/poly_gpu.rs": "82ebe6afa4529dda0d6abeaca9fa829a0f8f667560ce344d6d7cd9750f73f3f1",
+      "crates/runtime/src/backend/poly_gpu/fleet.rs": "f701d2dc7485dd610eb103788eb1c1ca33015facfd3af5ed425f41a0aa7d8c57",
+      "crates/runtime/src/executor.rs": "7d6ff7e6aa43b9b4908d3822ce54e759776913c08824dcf5484bffacdb387320",
+      "crates/runtime/src/executor/gpu_plan.rs": "0b46d3db1985349d6843f47c172eeea9aadc375525f77632c2e2318723f07e7f",
+      "crates/runtime/src/executor/plan_cache.rs": "ef2c057be210914293afc503ebfa6ee9f1c30cacbeb1c9ac8b6e2883784c8818",
+      "crates/runtime/src/gpu_calibration.rs": "a0f4221c6ea31fd9cb7d7019aa3c865f3ad59b90bdcf635f96024f1ca0da4838",
+      "crates/we/src/diamond/graph.rs": "d66ee8d6a2c8ef1c68416b51ab1c90aa7e20ccddfdd71960ac36a5d4791e62e2"
+    },
+    "executables": {
+      "target/release/deps/gpu_bgv_round_trip-26c9477b7914b98b": "55feade802005907c7be200f82d408757ca2fd6849a5398dec6536e77b226f59",
+      "target/release/deps/gpu_ring_gsw_round_trip-df47ebe9c0f2384f": "00e8e356482552b7c6dd4f8737cb84de6fef7b82e3c67d389388590a1e9a341b",
+      "target/release/deps/mxx_primitives-203401fd49222996": "6094682305a1d0d19d3b64597cb6320911f2b1bcb388cd1b5375314e6e51fe47",
+      "target/release/deps/mxx_runtime-ce1acd996f6c8a8f": "11bbdfeb646ce7ac40104248a7e50b98539b0d6ddaa9556174529f4690d06bb1"
+    },
+    "gpu": "NVIDIA GeForce RTX 4080 SUPER, GPU-f1006e1c-3739-7004-3ba4-33d546a72345, 580.173.02"
+  },
+  "unit_runs": [
+    {
+      "configuration": "cpu",
+      "command": [
+        "cargo",
+        "test",
+        "-r",
+        "--workspace",
+        "--lib",
+        "--no-fail-fast"
+      ],
+      "passed": 578,
+      "ignored": 24,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-complete-cpu-unit-tests.log",
+      "sha256": "a0d860a89b98f6e6592133cb7a41db9f3c3f947257354a91fc65ad6d1187dbf0"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_bench_estimator-d93132bffa057038"
+      ],
+      "passed": 47,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_bench_estimator-d93132bffa057038.log",
+      "sha256": "4234218a119abb3729470829300ade03a9ef75216364382faea19c7323ede33f"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_bgg-93a3405f89e56608"
+      ],
+      "passed": 69,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_bgg-93a3405f89e56608.log",
+      "sha256": "a98889fa1c12fe6211502e2bae9c188604b626159f3f8233f4d22f37ec934641"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_dsl-8d1d7ded134a3f93"
+      ],
+      "passed": 69,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_dsl-8d1d7ded134a3f93.log",
+      "sha256": "a2b5ee48d55eb41fcf4861f08eb9eb79411e0397411066f00a52c302934d3439"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_fhe-bdeff457a244e09b"
+      ],
+      "passed": 19,
+      "ignored": 1,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_fhe-bdeff457a244e09b.log",
+      "sha256": "595cef727020c9c0be7653101c41315b72e90e643c2cddc7e9285af72e1072db"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_func_enc-b7773b8807ff1d1e"
+      ],
+      "passed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_func_enc-b7773b8807ff1d1e.log",
+      "sha256": "df166913f47ff1f04202cae9b31df67ed272d692d99a0023a8117dc3029100dd"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_gadgets-2b909b3ae7d1a8d9"
+      ],
+      "passed": 110,
+      "ignored": 20,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_gadgets-2b909b3ae7d1a8d9.log",
+      "sha256": "992ad3c0cdf311d98425a74256b550c7643a1213482a8a848811fe2224e7d34e"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_io-453079e38ed116ce"
+      ],
+      "passed": 0,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_io-453079e38ed116ce.log",
+      "sha256": "df166913f47ff1f04202cae9b31df67ed272d692d99a0023a8117dc3029100dd"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_ir_core-89c041d77625b472"
+      ],
+      "passed": 115,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_ir_core-89c041d77625b472.log",
+      "sha256": "c839e589c82dd707e04f34dbce12bcacc6a8d29dff6ade848c125b1a24d30794"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_primitives-203401fd49222996"
+      ],
+      "passed": 199,
+      "ignored": 0,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_primitives-203401fd49222996.log",
+      "sha256": "1f938a22c3896e2b7447f54b2e1581f53c441f0224e904270596c8d010ba2f92"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_runtime-ce1acd996f6c8a8f"
+      ],
+      "passed": 114,
+      "ignored": 1,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_runtime-ce1acd996f6c8a8f.log",
+      "sha256": "df7389c42898b95a5e94bbffd894de32ffae041416cc8d693ff18eb31db19f4b"
+    },
+    {
+      "configuration": "gpu",
+      "command": [
+        "target/release/deps/mxx_we-6bafec11d82565ab"
+      ],
+      "passed": 19,
+      "ignored": 4,
+      "log": "test_data/fhe-round-trip/optimization/final/mxx-all-gpu-mxx_we-6bafec11d82565ab.log",
+      "sha256": "675cbb7d944a98d625889f51a732f7d6db8d251417746e0ca2e85a6dfaca162a"
+    }
+  ],
+  "python_unit_tests": {
+    "passed": 7,
+    "log": "test_data/fhe-round-trip/optimization/final/mxx-all-python-tests.log",
+    "sha256": "74c03fc16fde9a2dfeff03db0ec8f472a5a8dfed04e9e982a912b4b7f64faee3"
+  },
+  "gpu_oracles": {
+    "runs": 85,
+    "failures": 0,
+    "log": "test_data/fhe-round-trip/optimization/final/mxx-complete-unit-checks.log",
+    "sha256": "9fd4c2f28dc567b2a20b182c99dca938e05d0dc42ed0ec3079e513b2dee04578"
+  },
+  "gpu_lifetimes": {
+    "tests": [
+      "poly::dcrt::gpu::tests::test_gpu_related_rings_share_execution_and_preserve_async_lifetimes",
+      "backend::poly_gpu::fleet::tests::test_gpu_fleet_resident_operands_preserve_owners_and_inputs",
+      "matrix::gpu_dcrt_poly::tests::test_gpu_matrix_transpose_random_shapes_and_lifetimes"
+    ],
+    "runs_per_test": 300,
+    "failures": 0,
+    "log": "test_data/fhe-round-trip/optimization/final/mxx-complete-lifetime-stress.log",
+    "sha256": "e089787a177c78a8549edc1e5566415f0c94e312c0178d7a0918ccad6241ce48"
+  },
+  "measurements": {
+    "docs/benchmarks/fhe-gpu/measurements.json": "1d1b72f8fed7fb18ae22bdafb10706dc0f85cece5b0a284a1a478bdd2fe3eeaf",
+    "docs/benchmarks/fhe-gpu/timings.csv": "7e93cd6cc9d9d247d7b7360cf747c1b665575c28dfe301b5963ad127f198bdb8",
+    "docs/benchmarks/fhe-gpu/inputs.json": "86d2d9753d35d160861050456ead839852407aa62a34a9257faf5b1e1c980668"
+  },
+  "benchmark_environment": {
+    "FHE_BENCH_REPEATS": "100",
+    "FHE_TEST_ESTIMATOR_MODE": "rough",
+    "FHE_TEST_SECURITY_BITS": "0",
+    "FHE_TEST_MANIFEST": "Per-preset manifest recorded in inputs.json; unset for Ring-GSW."
+  },
+  "measurement_tools": {
+    "scripts/fhe/pool.py": "389664c4f852c1b1ed0c889958146eba3274f4076e0d4fb885d68523f0cdd9c8",
+    "scripts/fhe/summarize.py": "2e8e5bde955968253f642cb20c87e2973573308db8d9fe7338b26af76c2c7dea",
+    "scripts/fhe/phantom_gpu_bgv.cu": "9a5d061dc0fe43a9c6bb63f807baee2a49a9376afe036e477c86b0bd4f38a640",
+    "scripts/fhe/build_phantom_gpu.sh": "644933e0fb27aaca56515cabcb7f35bb7c991fe724cd2cb17a0bd293d3cf12d0"
+  },
+  "phantom": {
+    "revision": "1f4a198443b3af77118e51f53d5b8f332154b875",
+    "executable_sha256": "6169f4be2b15b6646285b4000d54f7c33f0598731c0614825a0e62298c99a79d"
+  }
+}

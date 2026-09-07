@@ -303,4 +303,145 @@ mod tests {
 
         assert_eq!(backend.placement_count(), 2);
     }
+
+    #[test]
+    fn test_gpu_execute_preserves_events_across_calls_and_release_policies() {
+        use super::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_backend_on};
+        use crate::{
+            ExecutionConfig, MemoryArtifactStore, RuntimeValue, execute_with_config,
+            gpu_calibration::{
+                GpuColumnWidths, gpu_calibration_operation_identity,
+                gpu_operation_is_column_separable_for_types,
+            },
+            transcript::SamplingMode,
+        };
+        use mxx_dsl::{DslContext, Ring};
+        use mxx_ir_core::ParamEnv;
+        use mxx_primitives::poly::PolyParams;
+        use std::{collections::BTreeMap, num::NonZeroUsize};
+
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let ring = Ring::new(parameters.modulus().as_ref().clone(), 32);
+        let generate = DslContext::new("async-release-input")
+            .output("matrix", ring.uniform_residue((2, 3)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let input = ring.input("matrix", (2, 3));
+        // Algebraic round trips exercise released temporaries without constructing
+        // a separate arithmetic oracle or retaining intermediate GPU owners.
+        let producer = DslContext::new("async-release-producer")
+            .output("matrix", (&input + &input) - &input)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let consumer = DslContext::new("async-release-consumer")
+            .output("matrix", -(-input))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = gpu_backend_on([parameters], [detected_gpu_device_ids()[0]]);
+        for graph in [&generate, &producer, &consumer] {
+            let scope = graph.source.root_scope();
+            let validated = graph.root_scope();
+            for node in &validated.execution_order {
+                let arguments = scope
+                    .arguments(node)
+                    .unwrap()
+                    .iter()
+                    .map(|wire| validated.wire_types[wire].clone())
+                    .collect::<Vec<_>>();
+                if !gpu_operation_is_column_separable_for_types(node.kind(), &arguments) {
+                    continue;
+                }
+                let outputs = (0..node.output_types().len())
+                    .map(|port| {
+                        let wire = scope.wire_ref(&node.output(port as u32).unwrap()).unwrap();
+                        validated.wire_types[&wire].clone()
+                    })
+                    .collect::<Vec<_>>();
+                let identity = gpu_calibration_operation_identity(
+                    node.kind(),
+                    &arguments,
+                    &outputs,
+                    &graph.bindings,
+                )
+                .unwrap();
+                backend.set_column_widths_for_operation(
+                    identity,
+                    GpuColumnWidths { gpu0: 3, nonzero: None },
+                );
+            }
+        }
+        for release_fence_interval in [None, NonZeroUsize::new(1)] {
+            let config = ExecutionConfig { release_fence_interval, ..ExecutionConfig::default() };
+            for _ in 0..5 {
+                let mut store = MemoryArtifactStore::default();
+                let mut generated = execute_with_config(
+                    &generate,
+                    &mut backend,
+                    BTreeMap::new(),
+                    &mut store,
+                    SamplingMode::Fresh,
+                    config,
+                )
+                .unwrap();
+                let sample = generated.outputs.remove("matrix").unwrap();
+                let RuntimeValue::Matrix(matrix) = &sample else { panic!("resident matrix") };
+                let expected = backend.matrix_to_bytes(matrix);
+                drop(generated);
+                let mut produced = execute_with_config(
+                    &producer,
+                    &mut backend,
+                    BTreeMap::from([("matrix".into(), sample)]),
+                    &mut store,
+                    SamplingMode::Fresh,
+                    config,
+                )
+                .unwrap();
+                assert!(produced.artifact_handles.is_empty());
+                let intermediate = produced.outputs.remove("matrix").unwrap();
+                drop(produced);
+                // No wait between producer and consumer; the input map transfers
+                // the last intermediate owner into the next execute invocation.
+                let mut consumed = execute_with_config(
+                    &consumer,
+                    &mut backend,
+                    BTreeMap::from([("matrix".into(), intermediate)]),
+                    &mut store,
+                    SamplingMode::Fresh,
+                    config,
+                )
+                .unwrap();
+                let RuntimeValue::Matrix(output) = consumed.outputs.remove("matrix").unwrap()
+                else {
+                    panic!("resident output")
+                };
+                drop(consumed);
+                drop(store);
+                output.wait_until_ready();
+                assert_eq!(backend.matrix_to_bytes(&output), expected);
+            }
+        }
+        // Context teardown must also own pending releases when a caller discards
+        // a result without explicitly waiting for its completion.
+        let mut store = MemoryArtifactStore::default();
+        let discarded = execute_with_config(
+            &generate,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        drop(discarded);
+        drop(backend);
+    }
 }

@@ -13,6 +13,7 @@ use crate::{
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireRef, WireType},
 };
 use num_bigint::BigInt;
+use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -690,7 +691,9 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
-        NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
+        NodeKind::ModulusSwitch { modulus } |
+        NodeKind::ModulusReduce { modulus } |
+        NodeKind::CenteredRebase { modulus } => {
             require_arity(scope, node, 1)?;
             let input = match argument(scope, values, node, 0)? {
                 ConcreteWireType::Matrix(matrix) => matrix.clone(),
@@ -704,7 +707,8 @@ fn validate_node(
             };
             let modulus = modulus.evaluate(env)?;
             if modulus <= BigInt::one() ||
-                (&input.modulus % &modulus) != BigInt::zero() ||
+                (!matches!(node.kind, NodeKind::CenteredRebase { .. }) &&
+                    (&input.modulus % &modulus) != BigInt::zero()) ||
                 (matches!(node.kind, NodeKind::ModulusSwitch { .. }) &&
                     ((&input.modulus % 2u8).is_zero() || (&modulus % 2u8).is_zero()))
             {
@@ -715,6 +719,78 @@ fn validate_node(
                 );
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]
+        }
+        NodeKind::RnsModUp { modulus, source_moduli, .. } |
+        NodeKind::RnsModDown { modulus, source_moduli, .. } => {
+            require_arity(scope, node, 1)?;
+            let input = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => matrix.clone(),
+                _ => {
+                    return node_error(scope, node.id, "RNS conversion requires an ordinary matrix")
+                }
+            };
+            let modulus = modulus.evaluate(env)?;
+            let mut product = BigInt::one();
+            for prime in source_moduli {
+                if *prime <= 2 ||
+                    (*prime - 1) as u128 % (2 * input.ring_dimension as u128) != 0 ||
+                    !product.gcd(&BigInt::from(*prime)).is_one()
+                {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "RNS basis requires distinct coprime NTT-compatible odd moduli",
+                    );
+                }
+                product *= *prime;
+            }
+            if source_moduli.is_empty() || product != input.modulus || modulus <= BigInt::one() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "RNS basis product must equal the input modulus and destination must exceed one",
+                );
+            }
+            let mut rows = input.rows;
+            match &node.kind {
+                NodeKind::RnsModUp { digit_size, .. } => {
+                    if *digit_size == 0 || (&modulus % &product) != BigInt::zero() {
+                        return node_error(
+                            scope,
+                            node.id,
+                            "RNS ModUp requires nonzero digit size and a multiple destination modulus",
+                        );
+                    }
+                    rows = rows.checked_mul(source_moduli.len().div_ceil(*digit_size)).ok_or_else(
+                        || ValidationError::Node {
+                            scope: scope.clone(),
+                            node: node.id,
+                            message: "RNS ModUp row count overflows".into(),
+                        },
+                    )?;
+                }
+                NodeKind::RnsModDown { plaintext_modulus, .. } => {
+                    let plain = plaintext_modulus.evaluate(env)?;
+                    if modulus >= product ||
+                        (&product % &modulus) != BigInt::zero() ||
+                        plain < BigInt::from(2u8) ||
+                        !plain.gcd(&(&product / &modulus)).is_one() ||
+                        source_moduli
+                            .iter()
+                            .filter(|prime| (&modulus % **prime).is_zero())
+                            .fold(BigInt::one(), |product, prime| product * prime) !=
+                            modulus
+                    {
+                        return node_error(
+                            scope,
+                            node.id,
+                            "RNS ModDown requires a proper CRT-subset divisor and plaintext modulus coprime to the dropped basis",
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, rows, ..input })]
         }
         NodeKind::RingAutomorphism { index } => {
             require_arity(scope, node, 1)?;
@@ -1080,6 +1156,44 @@ fn validate_node(
                 }
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..first })]
+        }
+        NodeKind::PolynomialFromValues { matrix_type, .. } => {
+            require_arity(scope, node, 1)?;
+            let ring = concrete_matrix(matrix_type, env, scope, node.id)?;
+            if !ring.is_scalar() ||
+                ring.modulus <= BigInt::one() ||
+                ring.ring_dimension < 2 ||
+                !ring.ring_dimension.is_power_of_two()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "polynomial import requires a scalar negacyclic ring",
+                );
+            }
+            match argument(scope, values, node, 0)? {
+                ConcreteWireType::IndexedFamily { element, count }
+                    if is_integer(element) && *count == ring.ring_dimension => {}
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "polynomial import requires exactly N integer values",
+                    )
+                }
+            }
+            vec![ConcreteWireType::Matrix(ring)]
+        }
+        NodeKind::PolynomialValues { .. } => {
+            require_arity(scope, node, 1)?;
+            let ring = matrix_argument(scope, values, node, 0)?;
+            if !ring.is_scalar() {
+                return node_error(scope, node.id, "polynomial export requires a scalar matrix");
+            }
+            vec![ConcreteWireType::IndexedFamily {
+                element: Box::new(ConcreteWireType::Int),
+                count: ring.ring_dimension,
+            }]
         }
         NodeKind::PackPolynomialCoefficients { matrix_type, coefficient_bits } => {
             require_arity(scope, node, 1)?;
@@ -2436,6 +2550,66 @@ mod tests {
             )
             .contains("plaintext modulus")
         );
+    }
+
+    #[test]
+    fn test_rns_mod_up_checks_basis_and_stacked_shape() {
+        for (basis, digit_size, destination, rows, valid) in [
+            (vec![17, 97], 1, 17 * 97 * 113, 4, true),
+            (vec![17, 97], 2, 17 * 97 * 113, 2, true),
+            (vec![17, 97], 1, 17 * 97 * 113, 2, false),
+            (vec![17, 97], 0, 17 * 97 * 113, 2, false),
+            (vec![17, 17], 1, 17 * 97 * 113, 4, false),
+            (vec![17, 97], 1, 113, 4, false),
+        ] {
+            let result = value(
+                NodeKind::RnsModUp {
+                    modulus: IntExpr::constant(destination),
+                    source_moduli: basis,
+                    digit_size,
+                    normalize: true,
+                },
+                vec![input("source", matrix_type(17 * 97, 2, 3))],
+                vec![WireType::Matrix(matrix_type(destination, rows, 3))],
+            );
+            assert_eq!(validate(&graph("mod-up", result), &ParamEnv::default()).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn test_rns_mod_down_checks_destination_and_plaintext() {
+        for (destination, plaintext, valid) in [
+            (17, 2, true),
+            (97, 17, false),
+            (17, 97, false),
+            (17, 1, false),
+            (17 * 97, 2, false),
+            (113, 2, false),
+        ] {
+            let result = value(
+                NodeKind::RnsModDown {
+                    modulus: IntExpr::constant(destination),
+                    source_moduli: vec![17, 97],
+                    plaintext_modulus: IntExpr::constant(plaintext),
+                },
+                vec![input("source", matrix_type(17 * 97, 2, 3))],
+                vec![WireType::Matrix(matrix_type(destination, 2, 3))],
+            );
+            assert_eq!(validate(&graph("mod-down", result), &ParamEnv::default()).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn test_centered_rebase_validates_destination_and_preserves_shape() {
+        for (modulus, valid) in [(13, true), (257, true), (1, false), (0, false)] {
+            let source = input("source", matrix_type(17, 2, 3));
+            let rebased = value(
+                NodeKind::CenteredRebase { modulus: IntExpr::constant(modulus) },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(modulus, 2, 3))],
+            );
+            assert_eq!(validate(&graph("rebase", rebased), &ParamEnv::default()).is_ok(), valid);
+        }
     }
 
     #[test]

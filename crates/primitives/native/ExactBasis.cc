@@ -85,11 +85,45 @@ void transform_format(lbcrypto::DCRTPoly &polynomial, Format destination) {
 }
 }
 
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_matrix_entry(
+    const openfhe::Matrix &matrix, size_t row, size_t column) {
+    if (row >= matrix.GetRows() || column >= matrix.GetCols())
+        throw std::invalid_argument("matrix entry out of bounds");
+    // Upstream GetMatrixElement performs CRT interpolation and switches format
+    // through process-global NTT caches. Matrix entries already have exact
+    // residues: preserve their basis, roots, and format by copying directly.
+    return std::make_unique<openfhe::DCRTPoly>(lbcrypto::DCRTPoly(matrix(row, column)));
+}
+
 void exact_basis_matrix_coefficients(openfhe::Matrix &matrix) {
 #pragma omp parallel for collapse(2)
     for (size_t row = 0; row < matrix.GetRows(); ++row)
         for (size_t column = 0; column < matrix.GetCols(); ++column)
             transform_format(matrix(row, column), Format::COEFFICIENT);
+}
+
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_bgv_mod_reduce(
+    const openfhe::DCRTPoly &input, uint64_t plaintext_modulus) {
+    auto polynomial = input.GetPoly();
+    if (polynomial.GetNumOfElements() < 2 || plaintext_modulus < 2)
+        throw std::invalid_argument("BGV ModReduce requires two CRT limbs and plaintext modulus >= 2");
+    const auto format = polynomial.GetFormat();
+    // Use the thread-local transforms above instead of OpenFHE's global cache.
+    transform_format(polynomial, Format::COEFFICIENT);
+    const lbcrypto::NativeInteger t(plaintext_modulus);
+    const auto p = polynomial.GetAllElements().back().GetModulus();
+    const auto negative_inverse = p - t.Mod(p).ModInverse(p);
+    std::vector<lbcrypto::NativeInteger> t_precon, p_inverse, p_inverse_precon;
+    for (size_t index = 0; index + 1 < polynomial.GetNumOfElements(); ++index) {
+        const auto q = polynomial.GetElementAtIndex(index).GetModulus();
+        t_precon.push_back(t.Mod(q).PrepModMulConst(q));
+        p_inverse.push_back(p.Mod(q).ModInverse(q));
+        p_inverse_precon.push_back(p_inverse.back().PrepModMulConst(q));
+    }
+    polynomial.ModReduce(t, t_precon, negative_inverse,
+        negative_inverse.PrepModMulConst(p), p_inverse, p_inverse_precon);
+    transform_format(polynomial, format);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(polynomial));
 }
 
 rust::Vec<uint8_t> exact_basis_coefficients(const openfhe::DCRTPoly &input) {
@@ -134,7 +168,7 @@ void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli
 
         lbcrypto::DCRTPoly::DggType dgg(dggStddev);
 
-        auto zero_alloc = lbcrypto::DCRTPoly::Allocator(params, Format::EVALUATION);
+        auto zero_alloc = lbcrypto::DCRTPoly::Allocator(params, Format::COEFFICIENT);
 
         lbcrypto::Matrix<lbcrypto::Field2n> AF([&]()
                                                { return lbcrypto::Field2n(n, Format::EVALUATION, true); }, d, d);
@@ -187,20 +221,29 @@ void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli
                                                                      { return 0; }, n * 2 * d, ncol);
         lbcrypto::LatticeGaussSampUtility<lbcrypto::DCRTPoly>::SampleMat(AF, BF, DF, c, dgg, p1ZVector);
 
-        lbcrypto::Matrix<lbcrypto::DCRTPoly> p1(zero_alloc, 1, 1);
-        std::vector<lbcrypto::Matrix<lbcrypto::DCRTPoly>> p1Cols(ncol);
-#pragma omp parallel for if (ncol > 1)
-        for (long jL = 0; jL < static_cast<long>(ncol); ++jL)
-        {
-            size_t j = static_cast<size_t>(jL);
-            p1Cols[j] = lbcrypto::SplitInt64IntoElements<lbcrypto::DCRTPoly>(p1ZVector->ExtractCol(j), n, params);
-        }
-        if (ncol > 0)
-        {
-            p1 = p1Cols[0];
-            for (size_t j = 1; j < ncol; ++j)
-                p1.HStack(p1Cols[j]);
-        }
+        lbcrypto::Matrix<lbcrypto::DCRTPoly> p1(zero_alloc, 2 * d, ncol);
+#pragma omp parallel for collapse(2)
+        for (size_t row = 0; row < 2 * d; ++row)
+            for (size_t column = 0; column < ncol; ++column) {
+                // Upstream signed-vector assignment assumes |x| < q. Gaussian
+                // samples need not satisfy that for a small CRT prime. Reduce
+                // the original magnitude before forming its negative residue;
+                // reducing an already-underflowed q - |x| would be incorrect.
+                for (auto &tower : p1(row, column).GetAllElements()) {
+                    const auto modulus = tower.GetModulus();
+                    const uint64_t q = modulus.ConvertToInt();
+                    lbcrypto::NativeVector values(n, modulus);
+                    for (size_t coefficient = 0; coefficient < n; ++coefficient) {
+                        const int64_t x = (*p1ZVector)(row * n + coefficient, column);
+                        // Unsigned negation also handles INT64_MIN exactly.
+                        const uint64_t magnitude = x < 0 ?
+                            uint64_t{0} - static_cast<uint64_t>(x) : static_cast<uint64_t>(x);
+                        const uint64_t residue = magnitude % q;
+                        values[coefficient] = x < 0 && residue != 0 ? q - residue : residue;
+                    }
+                    tower.SetValues(std::move(values), Format::COEFFICIENT);
+                }
+            }
 
 #pragma omp parallel for collapse(2)
         for (size_t row = 0; row < p1.GetRows(); ++row)
@@ -223,6 +266,173 @@ std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters_for_basis(
     return std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::BigInteger>>(
         2 * dimension, primes, roots);
 }
+}
+
+namespace {
+struct RnsPlan {
+    std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters;
+    std::vector<std::vector<size_t>> groups;
+    std::vector<uint64_t> scales, weights, inverses;
+    std::vector<size_t> retained;
+};
+uint64_t rns_mul(uint64_t a, uint64_t b, uint64_t modulus) {
+    return static_cast<uint64_t>((static_cast<unsigned __int128>(a) * b) % modulus);
+}
+uint64_t rns_inverse(uint64_t a, uint64_t modulus) {
+    return lbcrypto::NativeInteger(a).ModInverse(lbcrypto::NativeInteger(modulus)).ConvertToInt();
+}
+}
+
+std::unique_ptr<openfhe::Matrix> exact_basis_rns(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> moduli,
+    size_t digit_size, bool normalize, uint64_t plaintext_modulus) {
+    auto source = input.GetPoly();
+    const auto dimension = source.GetRingDimension();
+    const bool down = plaintext_modulus != 0;
+    std::vector<uint64_t> primes;
+    for (const auto &tower : source.GetAllElements()) primes.push_back(tower.GetModulus().ConvertToInt());
+    if (moduli.empty() || (!down && digit_size == 0) || (down && plaintext_modulus < 2))
+        throw std::invalid_argument("invalid RNS conversion parameters");
+    using Key = std::tuple<uint32_t, std::vector<uint64_t>, std::vector<uint64_t>, size_t, bool, uint64_t>;
+    const Key key(dimension, primes, std::vector<uint64_t>(moduli.begin(), moduli.end()), digit_size, normalize, plaintext_modulus);
+    thread_local std::map<Key, RnsPlan> plans;
+    auto found = plans.find(key);
+    if (found == plans.end()) {
+        RnsPlan plan;
+        plan.parameters = parameters_for_basis(dimension, moduli);
+        plan.scales.resize(primes.size());
+        plan.weights.resize(primes.size() * moduli.size());
+        if (down) {
+            if (moduli.size() >= primes.size()) throw std::invalid_argument("RNS ModDown needs a strict subset");
+            plan.groups.resize(1);
+            for (size_t i = 0; i < primes.size(); ++i)
+                if (std::find(moduli.begin(), moduli.end(), primes[i]) == moduli.end()) plan.groups[0].push_back(i);
+            for (const auto q : moduli) {
+                auto position = std::find(primes.begin(), primes.end(), q);
+                if (position == primes.end()) throw std::invalid_argument("RNS ModDown destination is not a subset");
+                plan.retained.push_back(position - primes.begin());
+                uint64_t product = 1;
+                for (const auto i : plan.groups[0]) product = rns_mul(product, primes[i] % q, q);
+                plan.inverses.push_back(rns_inverse(product, q));
+            }
+        } else {
+            for (const auto q : primes)
+                if (std::find(moduli.begin(), moduli.end(), q) == moduli.end()) throw std::invalid_argument("RNS ModUp destination must contain source");
+            plan.groups.resize(1 + (primes.size() - 1) / digit_size);
+            for (size_t i = 0; i < primes.size(); ++i) plan.groups[i / digit_size].push_back(i);
+        }
+        for (const auto &group : plan.groups) {
+            for (const auto i : group) {
+                const uint64_t p = primes[i];
+                uint64_t product = 1;
+                for (const auto j : group) if (i != j) product = rns_mul(product, primes[j] % p, p);
+                if (!down && normalize)
+                    for (size_t j = 0; j < primes.size(); ++j)
+                        if (std::find(group.begin(), group.end(), j) == group.end()) product = rns_mul(product, primes[j] % p, p);
+                plan.scales[i] = rns_inverse(product, p);
+                if (down) plan.scales[i] = rns_mul(plan.scales[i], p - rns_inverse(plaintext_modulus % p, p), p);
+                for (size_t target = 0; target < moduli.size(); ++target) {
+                    const uint64_t q = moduli[target];
+                    uint64_t weight = 1;
+                    for (const auto j : group) if (i != j) weight = rns_mul(weight, primes[j] % q, q);
+                    plan.weights[i * moduli.size() + target] = weight;
+                }
+            }
+        }
+        // Bound cache retention per Rayon worker without shared transform/cache locks.
+        if (plans.size() >= 32) plans.clear();
+        found = plans.emplace(key, std::move(plan)).first;
+    }
+    const auto &plan = found->second;
+    transform_format(source, Format::COEFFICIENT);
+    auto allocator = lbcrypto::DCRTPoly::Allocator(plan.parameters, Format::COEFFICIENT);
+    openfhe::Matrix result(allocator, plan.groups.size(), 1);
+    // Convert once per source tower. No full-CRT coefficient reconstruction is used.
+    std::vector<std::vector<uint64_t>> scaled(primes.size());
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(primes.size()))
+    for (size_t i = 0; i < primes.size(); ++i) {
+        if (!plan.scales[i]) continue;
+        scaled[i].resize(dimension);
+        const auto &values = source.GetElementAtIndex(i).GetValues();
+        for (size_t k = 0; k < dimension; ++k) scaled[i][k] = rns_mul(values[k].ConvertToInt(), plan.scales[i], primes[i]);
+    }
+#pragma omp parallel for collapse(2) num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(plan.groups.size() * moduli.size()))
+    for (size_t group = 0; group < plan.groups.size(); ++group) {
+        for (size_t target = 0; target < moduli.size(); ++target) {
+            const uint64_t q = moduli[target];
+            lbcrypto::NativeVector values(dimension, lbcrypto::NativeInteger(q));
+            for (size_t k = 0; k < dimension; ++k) {
+                uint64_t sum = 0;
+                for (const auto i : plan.groups[group]) {
+                    const uint64_t u = scaled[i][k], p = primes[i];
+                    const uint64_t magnitude = (u <= p / 2 ? u : p - u) % q;
+                    const uint64_t centered = u <= p / 2 || magnitude == 0 ? magnitude : q - magnitude;
+                    const auto contribution = rns_mul(centered, plan.weights[i * moduli.size() + target], q);
+                    sum = static_cast<uint64_t>((static_cast<unsigned __int128>(sum) + contribution) % q);
+                }
+                if (down) {
+                    const auto retained = source.GetElementAtIndex(plan.retained[target]).GetValues()[k].ConvertToInt();
+                    sum = rns_mul(sum, plaintext_modulus % q, q);
+                    sum = static_cast<uint64_t>((static_cast<unsigned __int128>(sum) + retained) % q);
+                    sum = rns_mul(sum, plan.inverses[target], q);
+                }
+                values[k] = sum;
+            }
+            result(group, 0).GetAllElements()[target].SetValues(std::move(values), Format::COEFFICIENT);
+        }
+    }
+
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(plan.groups.size()))
+    for (size_t group = 0; group < plan.groups.size(); ++group) transform_format(result(group, 0), Format::EVALUATION);
+    return std::make_unique<openfhe::Matrix>(std::move(result));
+}
+
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_convert(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> moduli, bool centered) {
+    auto source = input.GetPoly();
+    const auto dimension = source.GetRingDimension();
+    std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters;
+    std::vector<size_t> selected;
+    if (centered) {
+        parameters = parameters_for_basis(dimension, moduli);
+    } else {
+        std::vector<lbcrypto::NativeInteger> primes, roots;
+        for (const auto modulus : moduli) {
+            size_t index = 0;
+            const auto &towers = source.GetAllElements();
+            while (index < towers.size() && towers[index].GetModulus().ConvertToInt() != modulus)
+                ++index;
+            if (index == towers.size()) throw std::invalid_argument("destination is not a source CRT subset");
+            selected.push_back(index);
+            primes.push_back(towers[index].GetModulus());
+            roots.push_back(towers[index].GetRootOfUnity());
+        }
+        parameters = std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::BigInteger>>(
+            2 * dimension, primes, roots);
+    }
+    if (centered && source.GetNumOfElements() != 1)
+        throw std::invalid_argument("centered rebase requires one source CRT limb");
+    if (centered) transform_format(source, Format::COEFFICIENT);
+    lbcrypto::DCRTPoly output(parameters, source.GetFormat(), true);
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(moduli.size()))
+    for (size_t index = 0; index < moduli.size(); ++index) {
+        if (centered) {
+            const auto &tower = source.GetElementAtIndex(0);
+            const uint64_t p = tower.GetModulus().ConvertToInt(), q = moduli[index];
+            lbcrypto::NativeVector values(dimension, lbcrypto::NativeInteger(q));
+            for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+                const uint64_t u = tower.GetValues()[coefficient].ConvertToInt();
+                const uint64_t magnitude = (u <= p / 2 ? u : p - u) % q;
+                values[coefficient] = u <= p / 2 || magnitude == 0 ? magnitude : q - magnitude;
+            }
+            output.GetAllElements()[index].SetValues(std::move(values), Format::COEFFICIENT);
+        } else {
+            // Copy the native tower verbatim, preserving its root and NTT format.
+            output.SetElementAtIndex(index, source.GetElementAtIndex(selected[index]));
+        }
+    }
+    if (centered) transform_format(output, Format::EVALUATION);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(output));
 }
 
 std::unique_ptr<openfhe::DCRTPoly> exact_basis_poly(

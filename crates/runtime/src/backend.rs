@@ -120,6 +120,21 @@ pub trait Backend {
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Imports one polynomial from coefficient or native evaluation values.
+    fn polynomial_from_values(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        values: &[BigInt],
+        evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    /// Exports one scalar polynomial in coefficient or native evaluation order.
+    fn polynomial_values(
+        &mut self,
+        value: &Self::Matrix,
+        evaluation: bool,
+    ) -> Result<Vec<BigInt>, Self::Error>;
+
     /// Selects the setup-time GPU calibration for the next primitive. CPU and
     /// non-fleet backends ignore this hook.
     fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
@@ -238,6 +253,14 @@ pub trait Backend {
         left: &Self::Matrix,
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn add_row_blocks(
+        &mut self,
+        blocks: &[&Self::Matrix],
+        right: &Self::Matrix,
+    ) -> Result<Self::Matrix, Self::Error> {
+        let left = self.concat(blocks, ConcatAxis::Rows)?;
+        self.add(&left, right)
+    }
     fn add_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
@@ -326,6 +349,29 @@ pub trait Backend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
 
+    fn centered_rebase(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn rns_mod_up(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    fn rns_mod_down(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error>;
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, usize)>,
@@ -368,6 +414,42 @@ pub trait Backend {
         rows: Option<&IndexRange>,
         columns: Option<&IndexRange>,
     ) -> Result<Self::Matrix, Self::Error>;
+    /// Sums each nonempty group of source rows into one output row.
+    /// Indices must be in bounds; repeated indices retain their multiplicity.
+    fn sum_rows(
+        &mut self,
+        value: &Self::Matrix,
+        rows: &[Vec<usize>],
+    ) -> Result<Self::Matrix, Self::Error> {
+        if rows.is_empty() {
+            return self.slice(value, Some(&IndexRange { start: 0, end: 0 }), None);
+        }
+        let output = rows
+            .iter()
+            .map(|group| {
+                let (first, rest) = group.split_first().expect("row sum group must be nonempty");
+                let mut sum =
+                    self.slice(value, Some(&IndexRange { start: *first, end: first + 1 }), None)?;
+                for row in rest {
+                    let term =
+                        self.slice(value, Some(&IndexRange { start: *row, end: row + 1 }), None)?;
+                    sum = self.add(&sum, &term)?;
+                }
+                Ok(sum)
+            })
+            .collect::<Result<Vec<_>, Self::Error>>()?;
+        self.concat(&output.iter().collect::<Vec<_>>(), ConcatAxis::Rows)
+    }
+    /// Sum selected tensor-product rows without requiring a materialized tensor.
+    fn tensor_sum_rows(
+        &mut self,
+        left: &Self::Matrix,
+        right: &Self::Matrix,
+        rows: &[Vec<usize>],
+    ) -> Result<Self::Matrix, Self::Error> {
+        let tensor = self.tensor(left, right)?;
+        self.sum_rows(&tensor, rows)
+    }
     fn tensor(
         &mut self,
         left: &Self::Matrix,

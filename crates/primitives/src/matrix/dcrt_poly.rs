@@ -1,5 +1,5 @@
 use crate::{
-    element::{PolyElem, finite_ring::FinRingElem},
+    element::PolyElem,
     matrix::{
         CpuSmallMatrix, MatrixElem, MatrixParams, PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError,
         cpp_matrix::CppMatrix,
@@ -209,20 +209,110 @@ impl PolyMatrix for DCRTPolyMatrix {
                 (0..self.ncol)
                     .into_par_iter()
                     .map(|column| {
-                        let coefficients = self
-                            .entry(row, column)
-                            .coeffs()
-                            .into_iter()
-                            .map(|coefficient| {
-                                FinRingElem::new(coefficient.value().clone(), destination.modulus())
-                            })
-                            .collect::<Vec<_>>();
-                        DCRTPoly::from_coeffs(destination, &coefficients)
+                        self.entry(row, column)
+                            .convert_basis(destination, false)
+                            .expect("exact CRT tower projection failed")
                     })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         Self::from_poly_vec(destination, polys)
+    }
+
+    fn centered_rebase(&self, destination: &DCRTPolyParams) -> Result<Self, String> {
+        if destination.ring_dimension() != self.params.ring_dimension() ||
+            self.params.to_crt().0.len() != 1
+        {
+            return Err(
+                "centered rebase requires matching dimensions and one source CRT limb".into()
+            );
+        }
+        let polys = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| self.entry(row, column).convert_basis(destination, true))
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self::from_poly_vec(destination, polys))
+    }
+
+    fn rns_mod_up(
+        &self,
+        destination: &DCRTPolyParams,
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self, String> {
+        let source = self.params.to_crt().0;
+        let target = destination.to_crt().0;
+        if digit_size == 0 ||
+            self.params.ring_dimension() != destination.ring_dimension() ||
+            source.iter().any(|q| !target.contains(q))
+        {
+            return Err("RNS ModUp requires a nonzero digit size and a destination containing the source basis in the same ring".into());
+        }
+        let digits = source.len().div_ceil(digit_size);
+        let output_rows = self.nrow.checked_mul(digits).ok_or("RNS output row count overflow")?;
+        if self.nrow == 0 || self.ncol == 0 {
+            return Ok(Self::zero(destination, output_rows, self.ncol));
+        }
+        let converted = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| {
+                        self.entry(row, column).rns_convert(destination, digit_size, normalize, 0)
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let polys = (0..output_rows)
+            .into_par_iter()
+            .map(|row| {
+                converted[row % self.nrow]
+                    .par_iter()
+                    .map(|entry| entry[row / self.nrow].clone())
+                    .collect()
+            })
+            .collect();
+        Ok(Self::from_poly_vec(destination, polys))
+    }
+
+    fn rns_mod_down(
+        &self,
+        destination: &DCRTPolyParams,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String> {
+        let source = self.params.to_crt().0;
+        let target = destination.to_crt().0;
+        if plaintext_modulus < 2 ||
+            self.params.ring_dimension() != destination.ring_dimension() ||
+            target.len() >= source.len() ||
+            target.iter().any(|q| !source.contains(q)) ||
+            source.iter().any(|p| !target.contains(p) && plaintext_modulus % p == 0)
+        {
+            return Err("RNS ModDown requires plaintext modulus >= 2 and a strict destination subset in the same ring".into());
+        }
+        if self.nrow == 0 || self.ncol == 0 {
+            return Ok(Self::zero(destination, self.nrow, self.ncol));
+        }
+        let polys = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| {
+                        self.entry(row, column)
+                            .rns_convert(destination, 0, false, plaintext_modulus)
+                            .map(|mut polys| polys.remove(0))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self::from_poly_vec(destination, polys))
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
@@ -688,6 +778,81 @@ mod tests {
     use super::*;
     use num_bigint::BigUint;
     use rand::{Rng, rng};
+
+    #[test]
+    fn test_matrix_rns_fused_matches_centered_rebase() {
+        use crate::{
+            sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+            utils::mod_inverse_biguints,
+        };
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().map(|v| v.parse().unwrap()).unwrap_or(8);
+        let all = DCRTPolyParams::new(n, 5, 17, 4, None, None);
+        let primes = all.to_crt().0;
+        let source_primes = vec![primes[2], primes[0], primes[1]];
+        let source = DCRTPolyParams::new(n, 3, 17, 4, Some(source_primes.clone()), None);
+        let target =
+            DCRTPolyParams::new(n, 5, 17, 4, Some(primes.iter().rev().copied().collect()), None);
+        let input =
+            DCRTPolyUniformSampler::new().sample_uniform(&source, 2, 3, DistType::FinRingDist);
+        for digit_size in [1, 2, 3, 4] {
+            for normalize in [false, true] {
+                let expected = source_primes
+                    .chunks(digit_size)
+                    .map(|group| {
+                        let product = group.iter().map(|p| BigUint::from(*p)).product::<BigUint>();
+                        let mut sum = DCRTPolyMatrix::zero(&target, 2, 3);
+                        for prime in group {
+                            let limb = source.select_modulus(&BigUint::from(*prime)).unwrap();
+                            let cofactor = &product / prime;
+                            let scaling = if normalize {
+                                &cofactor * (source.modulus().as_ref() / &product)
+                            } else {
+                                cofactor.clone()
+                            };
+                            let inverse =
+                                mod_inverse_biguints(&scaling, &BigUint::from(*prime)).unwrap();
+                            let projected = input.reduce_modulus(&limb) *
+                                &DCRTPoly::from_biguint_to_constant(&limb, inverse);
+                            sum = sum +
+                                projected.centered_rebase(&target).unwrap() *
+                                    &DCRTPoly::from_biguint_to_constant(&target, cofactor);
+                        }
+                        sum
+                    })
+                    .collect::<Vec<_>>();
+                let stacked = expected[0].concat_rows(&expected[1..].iter().collect::<Vec<_>>());
+                assert_eq!(input.rns_mod_up(&target, digit_size, normalize).unwrap(), stacked);
+            }
+        }
+        let extended =
+            DCRTPolyUniformSampler::new().sample_uniform(&target, 2, 3, DistType::FinRingDist);
+        let t = BigUint::from(3u64);
+        let p = target.modulus().as_ref() / source.modulus().as_ref();
+        let mut correction = DCRTPolyMatrix::zero(&source, 2, 3);
+        for prime in target.to_crt().0.into_iter().filter(|q| !source_primes.contains(q)) {
+            let modulus = BigUint::from(prime);
+            let limb = target.select_modulus(&modulus).unwrap();
+            let cofactor = &p / prime;
+            let inverse = mod_inverse_biguints(&(&t * &cofactor), &modulus).unwrap();
+            let scaled = extended.reduce_modulus(&limb) *
+                &DCRTPoly::from_biguint_to_constant(&limb, &modulus - inverse);
+            correction = correction +
+                scaled.centered_rebase(&source).unwrap() *
+                    &DCRTPoly::from_biguint_to_constant(&source, cofactor);
+        }
+        let expected = (extended.reduce_modulus(&source) +
+            correction * &DCRTPoly::from_biguint_to_constant(&source, t)) *
+            &DCRTPoly::from_biguint_to_constant(
+                &source,
+                mod_inverse_biguints(&p, source.modulus().as_ref()).unwrap(),
+            );
+        assert_eq!(extended.rns_mod_down(&source, 3).unwrap(), expected);
+        assert!(input.rns_mod_up(&target, 0, false).is_err());
+        assert!(extended.rns_mod_down(&target, 3).is_err());
+        assert!(extended.rns_mod_down(&source, 1).is_err());
+        assert!(extended.rns_mod_down(&source, primes[3]).is_err());
+    }
 
     #[test]
     fn test_mixed_width_basis_gadget_decomposition_relations() {

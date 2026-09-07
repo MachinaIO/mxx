@@ -14,10 +14,59 @@ use mxx_ir_core::{
 use mxx_primitives::poly::dcrt::gpu::GpuDeviceIdentity;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
     fmt,
     sync::{Arc, RwLock},
 };
+
+struct OperationIdentityCacheEntry {
+    kind: NodeKind,
+    arguments: Vec<ConcreteWireType>,
+    outputs: Vec<ConcreteWireType>,
+    bindings: ParamEnv,
+    identity: [u8; 32],
+}
+
+/// Row-block addition has a different allocation footprint from ordinary Add.
+/// Preserve the ordered layout, including empty blocks and the native kernel's
+/// block-count fallback boundary, instead of sharing Add's measured profile.
+pub fn gpu_row_block_add_operation_identity(
+    add_identity: [u8; 32],
+    blocks: &[ConcreteMatrixType],
+) -> Result<[u8; 32], String> {
+    encoding::hash_canonical(&("mxx-runtime/gpu-row-block-add/v1", add_identity, blocks))
+        .map_err(|error| error.to_string())
+}
+
+/// Sparse row sums have their own kernel and temporary allocation footprint.
+pub fn gpu_sum_rows_operation_identity(
+    source: &ConcreteMatrixType,
+    output: &ConcreteMatrixType,
+    rows: &[Vec<usize>],
+) -> Result<[u8; 32], String> {
+    encoding::hash_canonical(&("mxx-runtime/gpu-sum-rows/v1", source, output, rows))
+        .map_err(|error| error.to_string())
+}
+
+/// Tensor row sums consume both operand layouts and use an independent pilot.
+pub fn gpu_tensor_sum_rows_operation_identity(
+    left: &ConcreteMatrixType,
+    right: &ConcreteMatrixType,
+    output: &ConcreteMatrixType,
+    rows: &[Vec<usize>],
+) -> Result<[u8; 32], String> {
+    encoding::hash_canonical(&("mxx-runtime/gpu-tensor-sum-rows/v1", left, right, output, rows))
+        .map_err(|error| error.to_string())
+}
+
+thread_local! {
+    // Cache only public operation metadata, never backend state or measured widths.
+    // Full input equality makes reuse independent of graph mutation and node IDs.
+    // A bounded thread-local cache avoids serializing concurrent graph execution.
+    static OPERATION_IDENTITIES: RefCell<VecDeque<OperationIdentityCacheEntry>> =
+        const { RefCell::new(VecDeque::new()) };
+}
 
 /// Canonical identity for the homogeneous-fleet memory policy used by both
 /// estimator pilots and runtime preflight. Device ordinals are intentionally
@@ -61,6 +110,9 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
             NodeKind::RingAutomorphism { .. } |
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredRebase { .. } |
+            NodeKind::RnsModUp { .. } |
+            NodeKind::RnsModDown { .. } |
             NodeKind::MatrixBinary(_) |
             NodeKind::MatrixMulAccumulate { .. } |
             NodeKind::MatrixMulSmallRhs |
@@ -147,6 +199,21 @@ pub fn gpu_calibration_operation_identity(
     concrete_output_types: &[ConcreteWireType],
     bindings: &ParamEnv,
 ) -> Result<[u8; 32], String> {
+    if let Some(identity) = OPERATION_IDENTITIES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let position = cache.iter().position(|entry| {
+            entry.kind == *kind &&
+                entry.arguments == concrete_argument_types &&
+                entry.outputs == concrete_output_types &&
+                entry.bindings == *bindings
+        })?;
+        let entry = cache.remove(position).expect("cached operation position");
+        let identity = entry.identity;
+        cache.push_back(entry);
+        Some(identity)
+    }) {
+        return Ok(identity);
+    }
     #[derive(Serialize)]
     struct OperationIdentity<'a> {
         kind: &'a NodeKind,
@@ -232,6 +299,9 @@ pub fn gpu_calibration_operation_identity(
         NodeKind::MatrixScale { .. } |
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
+        NodeKind::CenteredRebase { .. } |
+        NodeKind::RnsModUp { .. } |
+        NodeKind::RnsModDown { .. } |
         NodeKind::MatrixNegate => {
             if let Some(input) = argument_types.first_mut() {
                 one_column(input);
@@ -380,13 +450,27 @@ pub fn gpu_calibration_operation_identity(
         }
     }
 
-    encoding::hash_canonical(&OperationIdentity {
+    let identity = encoding::hash_canonical(&OperationIdentity {
         kind: &shape_kind,
         concrete_argument_types: &argument_types,
         concrete_output_types: &output_types,
         bindings: &shape_bindings,
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    OPERATION_IDENTITIES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() == 64 {
+            cache.pop_front();
+        }
+        cache.push_back(OperationIdentityCacheEntry {
+            kind: kind.clone(),
+            arguments: concrete_argument_types.to_vec(),
+            outputs: concrete_output_types.to_vec(),
+            bindings: bindings.clone(),
+            identity,
+        });
+    });
+    Ok(identity)
 }
 
 /// Exact identity of a calibrated operation in a particular GPU environment.
@@ -785,6 +869,81 @@ mod tests {
     use mxx_ir_core::types::ConcreteMatrixType;
     use num_bigint::BigInt;
 
+    #[test]
+    fn sum_rows_identity_preserves_order_and_duplicate_terms() {
+        let source = ConcreteMatrixType {
+            modulus: BigInt::from(97),
+            ring_dimension: 8,
+            rows: 4,
+            columns: 1,
+        };
+        let output = ConcreteMatrixType { rows: 2, ..source.clone() };
+        let identity =
+            gpu_sum_rows_operation_identity(&source, &output, &[vec![0], vec![1, 2]]).unwrap();
+        assert_ne!(
+            identity,
+            gpu_sum_rows_operation_identity(&source, &output, &[vec![1, 2], vec![0]]).unwrap()
+        );
+        assert_ne!(
+            identity,
+            gpu_sum_rows_operation_identity(&source, &output, &[vec![0], vec![1, 1, 2]]).unwrap()
+        );
+    }
+
+    #[test]
+    fn tensor_sum_rows_identity_preserves_both_operand_layouts() {
+        let left = ConcreteMatrixType {
+            modulus: BigInt::from(97),
+            ring_dimension: 8,
+            rows: 2,
+            columns: 1,
+        };
+        let right = ConcreteMatrixType { rows: 3, ..left.clone() };
+        let source = ConcreteMatrixType { rows: 6, ..left.clone() };
+        let output = ConcreteMatrixType { rows: 1, ..left.clone() };
+        let rows = [vec![0, 2]];
+        let identity =
+            gpu_tensor_sum_rows_operation_identity(&left, &right, &output, &rows).unwrap();
+        assert_ne!(
+            identity,
+            gpu_tensor_sum_rows_operation_identity(&right, &left, &output, &rows).unwrap()
+        );
+        assert_ne!(
+            identity,
+            gpu_tensor_sum_rows_operation_identity(&left, &right, &output, &[vec![2, 0]]).unwrap()
+        );
+        assert_ne!(identity, gpu_sum_rows_operation_identity(&source, &output, &rows).unwrap());
+    }
+
+    #[test]
+    fn row_block_add_identity_separates_layouts_and_native_fallback() {
+        let block = ConcreteMatrixType {
+            modulus: BigInt::from(97),
+            ring_dimension: 8,
+            rows: 1,
+            columns: 3,
+        };
+        let base = [7; 32];
+        let native = gpu_row_block_add_operation_identity(base, &vec![block.clone(); 16]).unwrap();
+        let fallback =
+            gpu_row_block_add_operation_identity(base, &vec![block.clone(); 17]).unwrap();
+        assert_ne!(native, fallback);
+        assert_ne!(native, base);
+        let tall = ConcreteMatrixType { rows: 2, ..block.clone() };
+        let forward =
+            gpu_row_block_add_operation_identity(base, &[block.clone(), tall.clone()]).unwrap();
+        let reversed = gpu_row_block_add_operation_identity(base, &[tall, block.clone()]).unwrap();
+        assert_ne!(forward, reversed);
+        assert_ne!(
+            forward,
+            gpu_row_block_add_operation_identity(
+                [8; 32],
+                &[block.clone(), ConcreteMatrixType { rows: 2, ..block }]
+            )
+            .unwrap()
+        );
+    }
+
     fn calibration(pilot_columns: usize, pilot_peak_bytes: u64) -> GpuDeviceCalibration {
         GpuDeviceCalibration::from_pilot(pilot_columns, pilot_peak_bytes).unwrap()
     }
@@ -837,6 +996,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full, representative);
+    }
+
+    #[test]
+    fn operation_identity_cache_preserves_parameter_changes_and_eviction() {
+        let kind = NodeKind::MatrixNegate;
+        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
+            modulus: BigInt::from(257),
+            ring_dimension: 16,
+            rows: 2,
+            columns: 4,
+        });
+        let types = [matrix];
+        OPERATION_IDENTITIES.with(|cache| cache.borrow_mut().clear());
+        let identities = (0..70)
+            .map(|parameter| {
+                let bindings = ParamEnv {
+                    integers: [("parameter".to_owned(), BigInt::from(parameter))].into(),
+                    ..ParamEnv::default()
+                };
+                let identity =
+                    gpu_calibration_operation_identity(&kind, &types, &types, &bindings).unwrap();
+                assert_eq!(
+                    identity,
+                    gpu_calibration_operation_identity(&kind, &types, &types, &bindings).unwrap()
+                );
+                (bindings, identity)
+            })
+            .collect::<Vec<_>>();
+        assert!(identities.windows(2).all(|pair| pair[0].1 != pair[1].1));
+        OPERATION_IDENTITIES.with(|cache| assert_eq!(cache.borrow().len(), 64));
+        // Old entries were evicted; recomputation must retain canonical identity.
+        for (bindings, identity) in identities {
+            assert_eq!(
+                identity,
+                gpu_calibration_operation_identity(&kind, &types, &types, &bindings).unwrap()
+            );
+        }
     }
 
     #[test]

@@ -140,6 +140,37 @@ pub trait PolyMatrix:
     fn add_out_of_place(&self, rhs: &Self) -> Self {
         self.clone() + rhs
     }
+    /// Sums selected source rows into each output row, allowing repeated indices.
+    /// Each group must be nonempty and every index must be in bounds.
+    fn sum_rows(&self, rows: &[Vec<usize>]) -> Self {
+        let (source_rows, cols) = self.size();
+        assert!(
+            rows.iter()
+                .all(|group| !group.is_empty() && group.iter().all(|&row| row < source_rows)),
+            "row sums require nonempty groups of valid row indices"
+        );
+        let mut sums = rows
+            .par_iter()
+            .map(|group| {
+                let mut sum = self.slice(group[0], group[0] + 1, 0, cols);
+                for &row in &group[1..] {
+                    sum = sum.add_out_of_place(&self.slice(row, row + 1, 0, cols));
+                }
+                sum
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        match sums.next() {
+            Some(first) => first.concat_rows_owned(sums.collect()),
+            None => self.slice(0, 0, 0, cols),
+        }
+    }
+
+    /// Adds vertically stacked blocks without requiring a concatenated input.
+    fn add_row_blocks_out_of_place(&self, blocks: &[&Self]) -> Self {
+        let (first, rest) = blocks.split_first().expect("nonempty row blocks");
+        first.concat_rows(rest).add_out_of_place(self)
+    }
     fn add_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
         inputs.into_par_iter().map(|(left, right)| left.add_out_of_place(&right)).collect()
     }
@@ -408,6 +439,11 @@ pub trait PolyMatrix:
         self.concat_diag(&refs)
     }
     fn tensor(&self, other: &Self) -> Self;
+    /// Sums selected rows of the tensor product, retaining order and multiplicity.
+    /// Every group must be nonempty and indices must fit the tensor's row count.
+    fn tensor_sum_rows(&self, rhs: &Self, rows: &[Vec<usize>]) -> Self {
+        self.tensor(rhs).sum_rows(rows)
+    }
     fn unit_column_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {
         Self::scaled_unit_column_vector(params, size, index, Self::P::const_one(params))
     }
@@ -576,6 +612,28 @@ pub trait PolyMatrix:
     fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Ordinary ring reduction into an exact destination CRT basis, without scaling.
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
+    /// Transfers a single source limb's centered coefficients to a new CRT basis.
+    fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Fused centered RNS ModUp, with contiguous digits stacked in group-major row order.
+    /// The destination must contain every source prime. For a source group Q_j,
+    /// the result is sum_i (Q_j/q_i) * centered(x_i / (Q_j/q_i) mod q_i).
+    /// With normalization, x_i is additionally divided by Q/Q_j modulo q_i.
+    /// This is the approximate sum of centered CRT terms, not a canonical lift.
+    fn rns_mod_up(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        digit_size: usize,
+        normalize: bool,
+    ) -> Result<Self, String>;
+    /// Fused BGV RNS ModDown, dropping the source limbs absent from destination.
+    /// For the product P of dropped primes, returns (x + t*U)/P modulo the
+    /// destination, where U is the centered CRT-term extension of -x/t from P.
+    /// The destination must be a strict subset and t must be invertible modulo P.
+    fn rns_mod_down(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String>;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),

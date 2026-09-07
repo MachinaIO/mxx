@@ -1,0 +1,22 @@
+[
+  {
+    "preset": 54,
+    "mxx": "test_data/fhe-round-trip/bgv/1788783121707008659-2409465.json",
+    "phantom": "test_data/fhe-round-trip/optimization/writer-ready/single-shard/normal/phantom-54.json",
+    "manifest": "test_data/fhe-round-trip/phantom/mxx-phantom-54.json",
+    "mxx_log": "test_data/fhe-round-trip/optimization/writer-ready/single-shard/normal/mxx-54.log",
+    "manifest_sha256": "3d44fcab3521e1a8769376a84b6575ca41ea5690de818178a752cef7877e9643",
+    "binary_sha256": "9f4c43bc506a24bd07d3842d7c70301968de1b4affad2b49929a3f52aa85c39b",
+    "phantom_binary_sha256": "6169f4be2b15b6646285b4000d54f7c33f0598731c0614825a0e62298c99a79d"
+  },
+  {
+    "preset": 36,
+    "mxx": "test_data/fhe-round-trip/bgv/1788783199356788962-2411173.json",
+    "phantom": "test_data/fhe-round-trip/optimization/writer-ready/single-shard/normal/phantom-36.json",
+    "manifest": "test_data/fhe-round-trip/phantom/mxx-phantom-36.json",
+    "mxx_log": "test_data/fhe-round-trip/optimization/writer-ready/single-shard/normal/mxx-36.log",
+    "manifest_sha256": "3d69f97c86e201cbfa8fcbf320d5a4c86b1df9d691745047a67f9f06ca20812a",
+    "binary_sha256": "9f4c43bc506a24bd07d3842d7c70301968de1b4affad2b49929a3f52aa85c39b",
+    "phantom_binary_sha256": "6169f4be2b15b6646285b4000d54f7c33f0598731c0614825a0e62298c99a79d"
+  }
+]

@@ -103,9 +103,18 @@ pub fn configure_widths(backend: &mut GpuDcrtBackend, graph: &mxx_ir_core::Valid
             [&mxx_ir_core::types::WireRef { node, port: mxx_ir_core::types::Port(0) }]
             .matrix_type()
             .unwrap();
-        let identity = mxx_runtime::gpu_calibration::gpu_sum_rows_operation_identity(
-            source, output, &plan.rows,
-        )
+        let identity = if let Some([left, right]) = plan.tensor_operands {
+            mxx_runtime::gpu_calibration::gpu_tensor_sum_rows_operation_identity(
+                validated.wire_types[&left].matrix_type().unwrap(),
+                validated.wire_types[&right].matrix_type().unwrap(),
+                output,
+                &plan.rows,
+            )
+        } else {
+            mxx_runtime::gpu_calibration::gpu_sum_rows_operation_identity(
+                source, output, &plan.rows,
+            )
+        }
         .unwrap();
         let width = output.columns.max(1);
         widths.entry(identity).and_modify(|old| *old = (*old).max(width)).or_insert(width);

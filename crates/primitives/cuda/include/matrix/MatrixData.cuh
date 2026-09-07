@@ -29,7 +29,8 @@ extern "C"
         size_t rows,
         size_t cols,
         int format,
-        GpuMatrix **out);
+        GpuMatrix **out,
+        bool initialize_descriptors = true);
     void gpu_matrix_destroy(GpuMatrix *mat);
     int gpu_matrix_wait(const GpuMatrix *mat);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);

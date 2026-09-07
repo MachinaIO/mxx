@@ -65,6 +65,10 @@ def main():
                 values[f"{library}_median_seconds"] = statistics.median(raw)
                 values[f"{library}_mean_seconds"] = statistics.mean(raw)
             values["median_ratio"] = values["mxx_median_seconds"] / values["phantom_median_seconds"]
+        multiplication = group["operations"].get("multiply")
+        group["multiply_below_two"] = (
+            multiplication["median_ratio"] < 2 if multiplication is not None else None
+        )
         group["multiply_relinearize_below_two"] = group["operations"]["multiply_relinearize"]["median_ratio"] < 2
     ring = []
     for path in args.ring_gsw:

@@ -439,6 +439,11 @@ pub trait PolyMatrix:
         self.concat_diag(&refs)
     }
     fn tensor(&self, other: &Self) -> Self;
+    /// Sums selected rows of the tensor product, retaining order and multiplicity.
+    /// Every group must be nonempty and indices must fit the tensor's row count.
+    fn tensor_sum_rows(&self, rhs: &Self, rows: &[Vec<usize>]) -> Self {
+        self.tensor(rhs).sum_rows(rows)
+    }
     fn unit_column_vector(params: &<Self::P as Poly>::Params, size: usize, index: usize) -> Self {
         Self::scaled_unit_column_vector(params, size, index, Self::P::const_one(params))
     }

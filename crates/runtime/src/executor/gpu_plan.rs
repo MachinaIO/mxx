@@ -2,7 +2,7 @@ use super::RootBlockAliases;
 use crate::gpu_calibration::{
     gpu_calibration_operation_identity, gpu_operation_is_column_separable,
     gpu_operation_is_column_separable_for_types, gpu_row_block_add_operation_identity,
-    gpu_sum_rows_operation_identity,
+    gpu_sum_rows_operation_identity, gpu_tensor_sum_rows_operation_identity,
 };
 use mxx_ir_core::{
     ValidatedGraph,
@@ -60,6 +60,15 @@ pub(super) fn prepare(validated: &ValidatedGraph, mut plan: RootBlockAliases) ->
                 let output = checked.wire_types[&WireRef { node: id, port: Port(0) }]
                     .matrix_type()
                     .expect("ordinary row sum output");
+                if let Some([left, right]) = row_sum.tensor_operands {
+                    return gpu_tensor_sum_rows_operation_identity(
+                        checked.wire_types[&left].matrix_type().expect("tensor left"),
+                        checked.wire_types[&right].matrix_type().expect("tensor right"),
+                        output,
+                        &row_sum.rows,
+                    )
+                    .map(Some);
+                }
                 return gpu_sum_rows_operation_identity(source, output, &row_sum.rows).map(Some);
             }
             if let (Some(operation), Some((concat, _))) = (operation, plan.adds.get(&id)) {
@@ -105,7 +114,19 @@ mod tests {
             vec![ring.input("first", (1, 2)), ring.input("second", (2, 2))],
         );
         let add = blocks + ring.input("right", (3, 2));
+        let tensor = ring.input("lhs", (2, 1)).tensor(ring.input("rhs", (2, 1)));
+        let tensor_row = |index: usize| {
+            tensor
+                .clone()
+                .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+        };
+        let tensor_sum = Mat::concat(
+            ConcatAxis::Rows,
+            vec![tensor_row(0), tensor_row(1) + tensor_row(2), tensor_row(3)],
+        );
         let graph = DslContext::new("cached-fused-calibration")
+            .output("tensor_sum", tensor_sum)
+            .unwrap()
             .output("sums", sums)
             .unwrap()
             .output("add", add)
@@ -117,7 +138,8 @@ mod tests {
         let plan = super::super::root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
         let reused = super::super::root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
         assert!(std::sync::Arc::ptr_eq(&plan, &reused));
-        assert_eq!(plan.row_sums.len(), 1);
+        assert_eq!(plan.row_sums.len(), 2);
+        assert_eq!(plan.row_sums.values().filter(|sum| sum.tensor_operands.is_some()).count(), 1);
         assert_eq!(plan.adds.len(), 1);
         let scope = graph.source.scope(&FrozenGraphScopeId::Root).unwrap();
         let checked = graph.root_scope();
@@ -148,11 +170,20 @@ mod tests {
             };
             if let Some(sum) = plan.row_sums.get(id) {
                 expected = Some(
-                    gpu_sum_rows_operation_identity(
-                        checked.wire_types[&sum.source].matrix_type().unwrap(),
-                        outputs[0].matrix_type().unwrap(),
-                        &sum.rows,
-                    )
+                    if let Some([left, right]) = sum.tensor_operands {
+                        gpu_tensor_sum_rows_operation_identity(
+                            checked.wire_types[&left].matrix_type().unwrap(),
+                            checked.wire_types[&right].matrix_type().unwrap(),
+                            outputs[0].matrix_type().unwrap(),
+                            &sum.rows,
+                        )
+                    } else {
+                        gpu_sum_rows_operation_identity(
+                            checked.wire_types[&sum.source].matrix_type().unwrap(),
+                            outputs[0].matrix_type().unwrap(),
+                            &sum.rows,
+                        )
+                    }
                     .unwrap(),
                 );
             } else if let Some((concat, _)) = plan.adds.get(id) {

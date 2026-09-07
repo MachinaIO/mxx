@@ -144,7 +144,7 @@ impl GpuDCRTPolyMatrix {
         let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
         let input = coefficients.as_ref().unwrap_or(self);
         let mut output =
-            Self::new_empty_with_state(destination, rows, self.ncol, target.len() - 1, false);
+            Self::new_empty_with_state(destination, rows, self.ncol, target.len() - 1, false, None);
         let status = unsafe {
             gpu_matrix_rns_conversion(
                 output.raw,

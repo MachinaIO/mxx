@@ -1159,6 +1159,15 @@ where
         Ok(value.sum_rows(rows))
     }
 
+    fn tensor_sum_rows(
+        &mut self,
+        left: &M,
+        right: &M,
+        rows: &[Vec<usize>],
+    ) -> Result<M, Self::Error> {
+        Ok(left.tensor_sum_rows(right, rows))
+    }
+
     fn tensor(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
         Ok(left.tensor(right))
     }

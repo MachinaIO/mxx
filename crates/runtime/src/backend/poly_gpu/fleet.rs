@@ -2862,6 +2862,55 @@ impl Backend for GpuDcrtBackend {
         Ok(GpuFleetMatrix::new(rows, columns, shards))
     }
 
+    fn tensor_sum_rows(
+        &mut self,
+        left: &Self::Matrix,
+        right: &Self::Matrix,
+        groups: &[Vec<usize>],
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
+        let rows = groups.len();
+        let columns =
+            left.columns.checked_mul(right.columns).ok_or(PolyBackendError::InvalidInteger)?;
+        let mut shards = Vec::new();
+        let mut next_column = 0;
+        while next_column < columns {
+            let wave = self.next_column_wave(next_column, columns);
+            next_column = wave.last().expect("nonempty GPU wave").2;
+            let single_wave = self.devices.len() == 1 && wave == [(0, 0, columns)];
+            let launched = self.launch_column_wave(&wave, columns, |backend, start, end| {
+                if single_wave {
+                    let left = Self::matrix_operand_on_device(backend, left, 0, left.columns)?;
+                    let right = Self::matrix_operand_on_device(backend, right, 0, right.columns)?;
+                    return backend.tensor_sum_rows(&left, &right, groups);
+                }
+                let pieces = tensor_column_segments(start, end, right.columns)
+                    .into_iter()
+                    .map(|(left_column, right_start, right_end)| {
+                        let left = Self::matrix_operand_on_device(
+                            backend,
+                            left,
+                            left_column,
+                            left_column + 1,
+                        )?;
+                        let right =
+                            Self::matrix_operand_on_device(backend, right, right_start, right_end)?;
+                        backend.tensor_sum_rows(&left, &right, groups)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut pieces = pieces.into_iter();
+                let first = pieces.next().expect("nonempty tensor range");
+                Ok(if pieces.len() == 0 {
+                    first
+                } else {
+                    first.concat_columns_owned(pieces.collect())
+                })
+            })?;
+            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
+        }
+        Ok(GpuFleetMatrix::new(rows, columns, shards))
+    }
+
     fn concat(
         &mut self,
         inputs: &[&Self::Matrix],

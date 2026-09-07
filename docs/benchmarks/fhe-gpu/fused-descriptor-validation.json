@@ -1,0 +1,265 @@
+{
+  "base_commit": "30e0e599e586bd7eb5e62dc41bcc8e7e25626726",
+  "patch_sha256": "47c1af72767c84a32fb3ac636999d9cf45af5876209615b1066b93b30ec006c6",
+  "gpu_unit_totals": {
+    "passed": 766,
+    "failed": 0,
+    "ignored": 26
+  },
+  "targeted_checks": [
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-1.log",
+      "sha256": "2c066d4eaf9796294ca18dd087bdd16d084a26e89271b04e7e6de1ed9e09c4cd"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-2.log",
+      "sha256": "fb08c52e4712eb78b4edb1feb2b35031de28dd6d53dca55155bc7eb6aa8d326c"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-3.log",
+      "sha256": "a6580be986bd68f3f02155e33dd8e76c642876ecc548fa9e1f4840e844941421"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-4.log",
+      "sha256": "d75df1016635fb16439c80e09e4ec712679901abe2f36e2fd31bf87316d201a3"
+    },
+    {
+      "test": "test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_descriptor_products_join_concurrent_readers_before_source_reuse-5.log",
+      "sha256": "d75df1016635fb16439c80e09e4ec712679901abe2f36e2fd31bf87316d201a3"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-1.log",
+      "sha256": "6ad6906033e4a61e16fd5947d4870f94e3d473dfd3a0cb4a9aa65642d40e16a3"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-2.log",
+      "sha256": "0ed10dc68787038cc8c4099b76694713ba51d3bd1482ba703fdd54f328e5852f"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-3.log",
+      "sha256": "f8fe553d31a183aa2011bf86b89c61804049587353e4c2a5251d21c168eb577a"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-4.log",
+      "sha256": "6ad6906033e4a61e16fd5947d4870f94e3d473dfd3a0cb4a9aa65642d40e16a3"
+    },
+    {
+      "test": "test_gpu_reader_completion_orders_reused_writer_and_peer_destination",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_reader_completion_orders_reused_writer_and_peer_destination-5.log",
+      "sha256": "6ad6906033e4a61e16fd5947d4870f94e3d473dfd3a0cb4a9aa65642d40e16a3"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_sum_rows_matches_cpu-1.log",
+      "sha256": "8a44f25b5018c430a3234724199b43511bffc978c812ee27a723a293d589b528"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_sum_rows_matches_cpu-2.log",
+      "sha256": "367c3ae1341243d4dd6dfbc6b0ca99fd047ab25301ad14873e03f2514d7e58a7"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_sum_rows_matches_cpu-3.log",
+      "sha256": "d6b0d93038a4dd10c94b073513d3e6c01f4fc2d70f61c74f2afd9b1352dc6dd6"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_sum_rows_matches_cpu-4.log",
+      "sha256": "cd4398032d79d8987b6c4895fdaabb1e06b66072399aff994e200b7707fdf8f0"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_sum_rows_matches_cpu",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_sum_rows_matches_cpu-5.log",
+      "sha256": "12aedaba40317e2c5641a0736308c084bfb84ff74481b269aca20cc4066eb52a"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_random_matches_cpu-1.log",
+      "sha256": "7f7e38de0640ca759b267e2f51eddfe12f96a0fa186d6f6804eab0faa43a29f9"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_random_matches_cpu-2.log",
+      "sha256": "e8ed16a700cf5489718b94a1183a40860314d3e1d2e7266cc50d6482c5f0c647"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_random_matches_cpu-3.log",
+      "sha256": "214dac1789f32a55ecd94a3d78893710a613db9336c16e44ef3af9a9f8a6f576"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_random_matches_cpu-4.log",
+      "sha256": "e8ed16a700cf5489718b94a1183a40860314d3e1d2e7266cc50d6482c5f0c647"
+    },
+    {
+      "test": "test_gpu_matrix_tensor_random_matches_cpu",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_matrix_tensor_random_matches_cpu-5.log",
+      "sha256": "7f7e38de0640ca759b267e2f51eddfe12f96a0fa186d6f6804eab0faa43a29f9"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_small_matrix_dot_matches_cpu-1.log",
+      "sha256": "1c5db1606de956154b41d3c786908d8b712929759d5240d49691c2675deadf56"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_small_matrix_dot_matches_cpu-2.log",
+      "sha256": "fa90116e31ec7c6c8b435db2a4fe76c2a067d33c1f643721ec9964f30b07ac9b"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_small_matrix_dot_matches_cpu-3.log",
+      "sha256": "05d298b2dd01f31d85bde20222190b533c79b393fb4378a63802916c7bc10b3e"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "iteration": 4,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_small_matrix_dot_matches_cpu-4.log",
+      "sha256": "41db66f9cd353ae1c1a9606f6b0f803c30f922185faab8e641de6c7d6ce1f8cc"
+    },
+    {
+      "test": "test_gpu_small_matrix_dot_matches_cpu",
+      "iteration": 5,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/test_gpu_small_matrix_dot_matches_cpu-5.log",
+      "sha256": "41db66f9cd353ae1c1a9606f6b0f803c30f922185faab8e641de6c7d6ce1f8cc"
+    }
+  ],
+  "binaries": {
+    "gpu_bgv_round_trip-26c9477b7914b98b": "e44e2184b434883d53c9268d7457a9f499089360d34b995067ece053040a2de9",
+    "gpu_ring_gsw_round_trip-df47ebe9c0f2384f": "f0f8e03e6ccc08e433dcb329d1d3a85d5e0bfcf5dc2e311982cb0ab913eae2d1",
+    "mxx_primitives-203401fd49222996": "b886ed912a0ebab844727351637e18d9c942108220d220674fab8380dda23f6c",
+    "mxx_runtime-ce1acd996f6c8a8f": "7976d4be5f811c9ce8038d2439a1151763db74ef7cfedec797624ac13526c677"
+  },
+  "source_patch": "test_data/fhe-round-trip/optimization/fused-descriptor/source.patch",
+  "scope": "Descriptor-init fusion checkpoint before subsequent executor and Barrett changes. Ignored tests excluded; one physical GPU only.",
+  "round_trips": [
+    {
+      "scheme": "bgv",
+      "preset": 54,
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-bgv54-1.log",
+      "sha256": "693a05b93949e52e7e4ba28559fcab35085e57b2f6e47a6bda655e6f8ce53d37"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 36,
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-bgv36-1.log",
+      "sha256": "3f13ed2bc20e905f1c4a14fb0ab61c6cd59c2bd02c61e82183336ea2b21ef649"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 54,
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-bgv54-2.log",
+      "sha256": "243b526625a43643aae43d4e30dda7439c4093c66777369d15fefe49e8ab5db7"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 36,
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-bgv36-2.log",
+      "sha256": "9babfc327f29720a9b83796c8e97a6d2643df248ece249abf9d36313ad2a0ab2"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 54,
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-bgv54-3.log",
+      "sha256": "db5574e5c4f7f4787aca99f59cf7604de9adb4bcd66be3f2befb3d15ba02ea56"
+    },
+    {
+      "scheme": "bgv",
+      "preset": 36,
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-bgv36-3.log",
+      "sha256": "99e86ac8ade5ce36f15c6988fc5d17a81901d05b6f6e32db37c772477516f081"
+    },
+    {
+      "scheme": "ring_gsw",
+      "iteration": 1,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-ring-gsw-1.log",
+      "sha256": "a53447c44f7133089be383b0e119076c03ad637ff66dee61dbe5b5e01d2863a0"
+    },
+    {
+      "scheme": "ring_gsw",
+      "iteration": 2,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-ring-gsw-2.log",
+      "sha256": "2c7ffbf4e0190279ea243f4746f3ea6ed71b24abf8673346f39a2f0ac6a7e970"
+    },
+    {
+      "scheme": "ring_gsw",
+      "iteration": 3,
+      "exit_code": 0,
+      "log": "test_data/fhe-round-trip/optimization/fused-descriptor/mxx-fused-descriptor-ring-gsw-3.log",
+      "sha256": "5386b2bf52cb15bc0172090ee0bcd53f414bf21a660f5a532b4f0d299e5cc9d5"
+    }
+  ]
+}

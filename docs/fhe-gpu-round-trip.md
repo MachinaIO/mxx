@@ -543,3 +543,72 @@ unit tests passed. The Python suite passed 7 tests, GPU operation oracles passed
 Both feature builds were warning-free. The source and executable hashes,
 per-binary counts, commands, and log hashes are recorded in
 [docs/benchmarks/fhe-gpu/validation.json](benchmarks/fhe-gpu/validation.json).
+
+## Standalone BGV multiplication checkpoint (2026-09-07)
+
+The working tree reduces allocation and dispatch overhead for BGV multiplication through generic matrix operations. It adds no BGV-specific backend primitive and preserves the validated graph and its artifact semantics.
+
+### Implementation
+
+- **Tensor row sums.** The runtime recognizes a Tensor whose consumers are all covered by one eligible row-sum plan. It captures both operands at the original Tensor position and evaluates the selected tensor rows directly, avoiding the materialized tensor and separate row-sum allocation. Traced execution, an exported or retained tensor, mixed consumers, and multiple plans sharing the tensor retain the original tensor boundary. Argument materialization order, original node progress and liveness processing, and output staging remain intact. See [runtime planning and dispatch](../crates/runtime/src/executor.rs), [generic matrix interface](../crates/primitives/src/matrix/mod.rs), and [CUDA arithmetic](../crates/primitives/cuda/src/matrix/MatrixArith.cu).
+- **Independent calibration.** The fused operation has its own canonical identity covering both operand types, output type, and ordered row groups. The FHE test helper registers explicit output-column capacities for that identity. Production calibration does not borrow another operation's measured profile. See [calibration identities](../crates/runtime/src/gpu_calibration.rs), [cached operation preparation](../crates/runtime/src/executor/gpu_plan.rs), and [GPU fixture calibration](../crates/fhe/src/gpu_test_utils.rs).
+- **One allocation for data and auxiliary storage.** Each matrix partition allocates its coefficient data, aligned auxiliary pointer slots, and device descriptors together. The data buffer owns the allocation; the auxiliary pointer is a non-owning interior view. Accounting includes alignment padding, while peer copies retain the logical coefficient-data size and exclude auxiliary pointers. Existing completion dependencies protect the single asynchronous free. See [matrix allocation and destruction](../crates/primitives/cuda/src/matrix/MatrixData.cu).
+- **Less repeated host work.** The guarded root plan stores resolved argument WireRefs. Singleton execution borrows batch metadata instead of allocating singleton vectors and cloning parameter bindings; its calibration dispatch also avoids allocating group/index vectors. Private scratch production identity is initialized only when a streamed family is registered, once per execution. Public production identity remains unchanged. See [executor](../crates/runtime/src/executor.rs).
+- **Reuse of an existing completion event.** The grouped arithmetic path can supply its already-recorded output completion to consumer tracking, avoiding redundant temporary event records. Source producer-stream joins and source lifetime protection remain in place; this does not introduce a matrix allocation cache. See [consumer tracking](../crates/primitives/cuda/src/matrix/MatrixUtils.cu) and [grouped arithmetic dispatch](../crates/primitives/cuda/src/matrix/MatrixArith.cu).
+
+### NTT scope
+
+The ordinary matrix NTT path at ring dimension 8192 uses two fused kernel launches per transform. This behavior predates the changes summarized above. The separate batched NTT implementation has not been converted to that fused path. Standalone multiplication starts and finishes in evaluation representation and performs **zero NTTs**; its improvements must not be attributed to NTT fusion. See [ordinary NTT](../crates/primitives/cuda/src/matrix/MatrixNTT.cu) and [batched NTT](../crates/primitives/cuda/src/matrix/MatrixNTTBatch.cu).
+
+### Validation and measurements
+
+The current CPU unit suite passed 579 tests (24 ignored), and the GPU-feature unit suite passed 766 tests (26 ignored). Ignored tests were not executed. Both workspace library build configurations and both GPU integration binaries built without warnings. Three targeted GPU arithmetic/lifetime tests each passed 300 consecutive executions (900 total, no failures). Six BGV round trips and three Ring-GSW round trips passed. This is single-GPU validation; tests that require another device do not establish multi-GPU coverage.
+
+Runtime regressions cover optimized versus traced execution, exported and retained tensor outputs, mixed consumers, and the primitive oracle. Calibration regressions cover both operand layouts and ordered row groups. Existing staging and replay tests cover lazy scratch identity initialization.
+
+The table pools three runs of 100 samples per operation and preset, without excluding samples. Both libraries used the same RTX 4080 SUPER (UUID `GPU-f1006e1c-3739-7004-3ba4-33d546a72345`, driver 580.173.02). The measurement remains a complete operation, including production execution, output retrieval, and output-event completion for mxx. Diagnostic profiling instrumentation is absent from the reported binaries. All times below are seconds.
+
+| Preset | Previous mxx multiply | Current mxx multiply | Current Phantom multiply | Current ratio |
+| --- | ---: | ---: | ---: | ---: |
+| 54-bit limbs | 0.000096056 | 0.000061837 | 0.000010490 | 5.895x |
+| 36-bit limbs | 0.000090045 | 0.000062568 | 0.000010680 | 5.858x |
+
+Standalone multiplication is approximately 31–36% faster than the previous checkpoint, but the below-2x target is **not met**. The fused arithmetic and combined allocation reduce the standalone path from four kernels and four asynchronous allocations to two kernels and one allocation. Remaining host dispatch and CUDA API overhead require further work; these measurements do not establish a precise causal breakdown. In particular, profiled intervals starting at a preceding cleanup event must not be labeled exact executor CPU time.
+
+The matched manifests retain the existing modulus/distribution checks. HE Standard classical-128 table classification and the model-labeled estimator `rough` result (QP approximately 94 bits with ADPS16) remain separate assessments; the latter is not a claim that the former classification is invalid.
+
+[Raw samples and pooled results](benchmarks/fhe-gpu/standalone-measurements.json), [explicit pooling inputs](benchmarks/fhe-gpu/standalone-inputs.json), and [source, binary, and validation hashes](benchmarks/fhe-gpu/standalone-validation.json) identify this working-tree checkpoint relative to base commit `30e0e599e586bd7eb5e62dc41bcc8e7e25626726`. Its 39 CSV rows are appended to [the existing timing history](benchmarks/fhe-gpu/timings.csv); earlier snapshot evidence is retained. Local raw logs and the source patch are under `test_data/fhe-round-trip/optimization/standalone-shared-event/`.
+
+### Descriptor initialization fused into tensor row sums
+
+A subsequent checkpoint initializes a fresh tensor-row-sum output's persistent device descriptors inside its arithmetic kernel, reducing the evaluation-domain multiplication path from two kernels to one. Every arithmetic thread uses output layout passed by value, so it never reads a descriptor another block is still initializing. One thread per active limb writes the persistent descriptor for later operations. Allocation completion and all input/output lifetime dependencies remain intact. Empty outputs and unfused operations retain ordinary initialization.
+
+This checkpoint passed 766 ordinary GPU-feature unit tests (26 ignored, not executed), 25 repeated targeted GPU checks, six BGV round trips, and three Ring-GSW round trips. Both library build configurations and the integration binaries built without warnings. The targeted oracle also applies a downstream transpose, covering descriptor use by the next GPU operation.
+
+| Preset | mxx multiply median (seconds) | Phantom median (seconds) | Ratio |
+| --- | ---: | ---: | ---: |
+| 54-bit limbs | 0.000059994 | 0.000010470 | 5.730x |
+| 36-bit limbs | 0.000056752 | 0.000010720 | 5.294x |
+
+Each median pools 300 samples, using fresh reference runs on the same physical GPU and the same manifests and timing boundary. The below-2x standalone target remains unmet. Removing repeated device-selection calls alone did not demonstrate a consistent improvement across presets; the values above include both that removal and descriptor initialization fusion.
+
+[Samples](benchmarks/fhe-gpu/fused-descriptor-measurements.json), [inputs](benchmarks/fhe-gpu/fused-descriptor-inputs.json), and [validation snapshot](benchmarks/fhe-gpu/fused-descriptor-validation.json) identify this checkpoint before the subsequent executor and Barrett-reduction work. Its 39 rows are appended to the timing history. The source patch and raw logs are retained locally in `test_data/fhe-round-trip/optimization/fused-descriptor/`.
+
+### Current standalone checkpoint: cached structural skips and Barrett reduction
+
+The root execution plan now omits runs of already-eliminated nodes only when they have no capture or output action and every argument is provably absent. It preserves input materialization, live-source release points, output staging and original structural counts. Traced execution, INFO progress reporting and configured release fences retain the original walk. A standalone tensor-row-sum graph represents all nine original nodes while visiting four dispatch positions.
+
+The fused kernel also reduces 128-bit sums using a per-context reciprocal for `1 < q < 2^63`; wider moduli retain native remainder. The reciprocal quotient underestimates the true quotient by at most one, so one conditional subtraction recovers the exact remainder. Reciprocals are calculated during context initialization, not on each execution. Accumulation and overflow flushing retain their original bounds.
+
+The current source passed 579 ordinary CPU library tests and 767 ordinary GPU-feature library tests, with zero failures. The 24 CPU and 26 GPU ignored tests were not executed. Forty targeted GPU checks passed, including coefficient-domain conversion, empty/fallback paths, canonical boundary residues and downstream transpose. A temporary CUDA harness compiled the exact production reducer and compared 6,559,755 boundary/random full-width cases against host `unsigned __int128` remainder across five independent runs, with zero mismatches. All six BGV and three Ring-GSW round trips passed; both library build configurations and the integration binaries built without warnings.
+
+| Preset | mxx multiply median (seconds) | Phantom median (seconds) | Ratio |
+| --- | ---: | ---: | ---: |
+| 54-bit limbs | 0.000059808 | 0.000010490 | 5.701x |
+| 36-bit limbs | 0.000056978 | 0.000010691 | 5.329x |
+
+These are fresh matched 300-sample medians on the same physical GPU. They retain the earlier approximately 37% reduction from the baseline, but do **not** demonstrate an additional end-to-end improvement over the descriptor-fusion checkpoint. The standalone below-2x target remains open; reduced kernel arithmetic must not be equated with reduced complete-operation latency.
+
+[Current samples](benchmarks/fhe-gpu/barrett-skip-measurements.json), [inputs](benchmarks/fhe-gpu/barrett-skip-inputs.json), and [validation evidence](benchmarks/fhe-gpu/barrett-skip-validation.json) identify the measured source and binaries. The timing history contains 39 additional validated rows for this checkpoint. Raw logs, the exact source patch and the temporary arithmetic harness are retained locally under `test_data/fhe-round-trip/optimization/barrett-skip/`.
+
+The history also retains 30 rows from the intermediate device-selection-only comparison. Its explicit inputs and pooled results are under `test_data/fhe-round-trip/optimization/device-selection/`; that comparison reused the preceding checkpoint's matched Phantom samples.

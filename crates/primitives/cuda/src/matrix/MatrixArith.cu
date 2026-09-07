@@ -74,7 +74,7 @@ namespace
     {
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *lhs;
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *rhs;
-        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
+        GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
         size_t indices[kArithMetadataLimbs];
         uint64_t moduli[kArithMetadataLimbs];
     };
@@ -240,7 +240,84 @@ namespace
         }
     }
 
-    int launch_descriptor_product(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, bool tensor)
+    struct TensorRowSumMetadata
+    {
+        DescriptorProductMetadata product;
+        size_t rows[32];
+        size_t offsets[17];
+        uint8_t *output_base;
+        size_t output_stride;
+        size_t output_offsets[kArithMetadataLimbs];
+        uint8_t output_widths[kArithMetadataLimbs];
+        bool initialize_output_descriptors;
+        GpuBarrettReciprocal reciprocals[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(TensorRowSumMetadata) + 5 * sizeof(size_t) <= 4096,
+                  "tensor row sum exceeds portable CUDA parameter budget");
+
+    template <bool SeparatePolynomials>
+    __global__ void tensor_sum_rows_all_limbs_kernel(
+        TensorRowSumMetadata metadata, size_t lhs_cols, size_t rhs_rows,
+        size_t rhs_cols, size_t poly_count, size_t n)
+    {
+        const size_t limb = blockIdx.z;
+        const size_t descriptor = metadata.product.indices[limb];
+        const auto lhs = metadata.product.lhs[descriptor];
+        const auto rhs = metadata.product.rhs[descriptor];
+        // Deferred output descriptors cannot be read by this launch: another
+        // block may not have written them yet. Arithmetic uses by-value layout.
+        const auto out = metadata.initialize_output_descriptors
+            ? GpuMatrix::SharedLimbBuffer::DeviceDescriptor{
+                metadata.output_base + metadata.output_offsets[limb],
+                metadata.output_stride, metadata.output_widths[limb]}
+            : metadata.product.out[descriptor];
+        if (metadata.initialize_output_descriptors && blockIdx.x == 0 &&
+            blockIdx.y == 0 && threadIdx.x == 0)
+            metadata.product.out[descriptor] = out;
+        const uint64_t modulus = metadata.product.moduli[limb];
+        const auto reciprocal = metadata.reciprocals[limb];
+        const size_t cols = lhs_cols * rhs_cols;
+        const size_t thread = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if constexpr (SeparatePolynomials)
+            if (thread >= n) return;
+        const size_t end = SeparatePolynomials ? poly_count : poly_count * n;
+        const size_t step = SeparatePolynomials ? gridDim.y :
+            static_cast<size_t>(gridDim.x) * blockDim.x;
+        for (size_t work = SeparatePolynomials ? blockIdx.y : thread; work < end; work += step)
+        {
+            const size_t poly = SeparatePolynomials ? work : work / n;
+            const size_t group = poly / cols;
+            const size_t column = poly % cols;
+            const size_t coefficient = SeparatePolynomials ? thread : work % n;
+            unsigned __int128 sum = 0;
+            for (size_t term = metadata.offsets[group]; term < metadata.offsets[group + 1]; ++term)
+            {
+                const size_t row = metadata.rows[term];
+                const uint64_t a = matrix_load_limb_u64(lhs.base,
+                    (row / rhs_rows) * lhs_cols + column / rhs_cols,
+                    coefficient, lhs.stride, lhs.width);
+                const uint64_t b = matrix_load_limb_u64(rhs.base,
+                    (row % rhs_rows) * rhs_cols + column % rhs_cols,
+                    coefficient, rhs.stride, rhs.width);
+                unsigned __int128 product = static_cast<unsigned __int128>(a) * b;
+                // The common short dot needs only one final division. Flush
+                // before a 128-bit carry, as in the generic small-dot kernel.
+                if (~static_cast<unsigned __int128>(0) - sum < product)
+                {
+                    sum = matrix_reduce_barrett_u128(sum, modulus, reciprocal.lo, reciprocal.hi);
+                    product = matrix_reduce_barrett_u128(product, modulus, reciprocal.lo, reciprocal.hi);
+                }
+                sum += product;
+            }
+            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width,
+                                 matrix_reduce_barrett_u128(sum, modulus, reciprocal.lo, reciprocal.hi));
+        }
+    }
+
+    int launch_descriptor_product(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, bool tensor,
+        const size_t *rows = nullptr, const size_t *offsets = nullptr,
+        size_t group_count = 0, size_t term_count = 0)
     {
         const size_t limb_count = static_cast<size_t>(lhs->level) + 1;
         if (limb_count > kArithMetadataLimbs || lhs->ctx->moduli.size() < limb_count)
@@ -278,11 +355,13 @@ namespace
             metadata.indices[limb] = id.y;
             metadata.moduli[limb] = lhs->ctx->moduli[limb];
         }
-        status = matrix_wait_all_limb_streams(lhs, device, stream);
+        // The descriptor partition checks above establish one selected device
+        // for the entire submission. Nested helpers retain all event joins.
+        status = matrix_wait_all_limb_streams(lhs, device, stream, true);
         if (status != 0) return status;
-        status = matrix_wait_all_limb_streams(rhs, device, stream);
+        status = matrix_wait_all_limb_streams(rhs, device, stream, true);
         if (status != 0) return status;
-        status = matrix_wait_all_limb_streams(out, device, stream);
+        status = matrix_wait_all_limb_streams(out, device, stream, true);
         if (status != 0) return status;
         const size_t n = static_cast<size_t>(lhs->ctx->N);
         if (tensor)
@@ -291,8 +370,47 @@ namespace
             const size_t blocks = count / 256 + (count % 256 != 0);
             const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
                             1, static_cast<unsigned int>(limb_count));
-            tensor_all_limbs_kernel<<<grid, 256, 0, stream>>>(
-                metadata, lhs->cols, rhs->rows, rhs->cols, count, n);
+            if (rows)
+            {
+                TensorRowSumMetadata grouped{};
+                grouped.product = metadata;
+                std::copy_n(lhs->ctx->barrett_reciprocals.data(), limb_count, grouped.reciprocals);
+                grouped.initialize_output_descriptors = !out->descriptors_initialized;
+                if (grouped.initialize_output_descriptors)
+                {
+                    const auto &buffer = out->shared_limb_buffers[out->ctx->limb_gpu_ids[0].x];
+                    grouped.output_base = buffer.ptr;
+                    grouped.output_stride = buffer.bytes_per_poly;
+                    for (size_t limb = 0; limb < limb_count; ++limb)
+                    {
+                        const size_t local = metadata.indices[limb];
+                        grouped.output_offsets[limb] = buffer.limb_offsets_bytes[local];
+                        grouped.output_widths[limb] = buffer.limb_coeff_bytes[local];
+                    }
+                }
+                std::copy_n(rows, term_count, grouped.rows);
+                std::copy_n(offsets, group_count + 1, grouped.offsets);
+                const size_t poly_count = out->rows * out->cols;
+                if (n >= 256)
+                {
+                    const dim3 grouped_grid(static_cast<unsigned int>((n + 255) / 256),
+                        static_cast<unsigned int>(std::min(poly_count, size_t{65535})),
+                        static_cast<unsigned int>(limb_count));
+                    tensor_sum_rows_all_limbs_kernel<true><<<grouped_grid, 256, 0, stream>>>(
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n);
+                }
+                else
+                {
+                    // Pack tiny polynomials together to retain full thread blocks.
+                    tensor_sum_rows_all_limbs_kernel<false><<<grid, 256, 0, stream>>>(
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n);
+                }
+            }
+            else
+            {
+                tensor_all_limbs_kernel<<<grid, 256, 0, stream>>>(
+                    metadata, lhs->cols, rhs->rows, rhs->cols, count, n);
+            }
         }
         else
         {
@@ -303,11 +421,23 @@ namespace
         }
         const cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) return set_error(error);
-        status = matrix_track_all_limb_consumers(lhs, device, stream);
+        // Descriptor writes and arithmetic share the output completion below.
+        if (rows) out->descriptors_initialized = true;
+        status = matrix_record_all_limb_writes(out, stream, true);
+        if (status != 0)
+        {
+            // No input lifetime join exists yet when output recording fails.
+            cudaStreamSynchronize(stream);
+            return status;
+        }
+        // The output event already covers this kernel. Reuse it for both
+        // producer-stream joins instead of recording two temporary events.
+        const dim3 first = out->ctx->limb_gpu_ids[0];
+        const auto &states = out->exec_limb_states[first.x];
+        const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+        status = matrix_track_all_limb_consumers(lhs, device, stream, completion, true);
         if (status != 0) return status;
-        status = matrix_track_all_limb_consumers(rhs, device, stream);
-        if (status != 0) return status;
-        status = matrix_record_all_limb_writes(out, stream);
+        status = matrix_track_all_limb_consumers(rhs, device, stream, completion, true);
         if (status != 0) return status;
         return 0;
     }
@@ -2539,6 +2669,36 @@ extern "C" int gpu_matrix_add_row_blocks(
     if (status != 0) return status;
     out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
+}
+
+extern "C" int gpu_matrix_tensor_sum_rows(
+    GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
+    const size_t *rows, const size_t *offsets, size_t group_count, size_t term_count)
+{
+    if (!out || !lhs || !rhs || !lhs->ctx || out->ctx != lhs->ctx || rhs->ctx != lhs->ctx ||
+        lhs->level < 0 || out->level != lhs->level || rhs->level != lhs->level ||
+        lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL ||
+        out->format != GPU_POLY_FORMAT_EVAL || !rows || !offsets ||
+        group_count == 0 || group_count > 16 || term_count == 0 || term_count > 32 ||
+        offsets[0] != 0 || offsets[group_count] != term_count)
+        return set_error("invalid gpu_matrix_tensor_sum_rows arguments");
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    if ((rhs->rows != 0 && lhs->rows > maximum / rhs->rows) ||
+        (rhs->cols != 0 && lhs->cols > maximum / rhs->cols) ||
+        out->rows != group_count || out->cols != lhs->cols * rhs->cols)
+        return set_error("invalid tensor row sum shape");
+    for (size_t group = 0; group < group_count; ++group)
+        if (offsets[group] >= offsets[group + 1] || offsets[group + 1] > term_count)
+            return set_error("invalid tensor row sum offsets");
+    for (size_t term = 0; term < term_count; ++term)
+        if (rows[term] >= lhs->rows * rhs->rows)
+            return set_error("tensor row sum index out of bounds");
+    if (out->cols == 0 || lhs->ctx->N <= 0) return 0;
+    const size_t n = static_cast<size_t>(lhs->ctx->N);
+    if (out->rows > maximum / out->cols || out->rows * out->cols > maximum / n ||
+        lhs->ctx->limb_gpu_ids.size() <= static_cast<size_t>(lhs->level))
+        return set_error("tensor row sum size overflow or invalid limb mapping");
+    return launch_descriptor_product(out, lhs, rhs, true, rows, offsets, group_count, term_count);
 }
 
 extern "C" int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)

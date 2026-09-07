@@ -55,6 +55,8 @@ namespace
         size_t aux_slots_per_poly;
         size_t aux_slots_total;
         size_t aux_bytes;
+        size_t aux_offset;
+        size_t allocation_bytes;
         std::vector<uint8_t> limb_coeff_bytes;
         std::vector<size_t> limb_offsets_bytes;
     };
@@ -214,6 +216,18 @@ namespace
                     return set_error("matrix device descriptor allocation overflow");
                 }
 
+                // Aux pointer slots and device descriptors share the data allocation.
+                // Keep data_bytes logical: peer copies must never copy aux pointers.
+                constexpr size_t aux_alignment = std::max(
+                    alignof(void *), alignof(GpuMatrix::SharedLimbBuffer::DeviceDescriptor));
+                const size_t padding =
+                    (aux_alignment - partition.data_bytes % aux_alignment) % aux_alignment;
+                if (!checked_add_size(partition.data_bytes, padding, &partition.aux_offset) ||
+                    !checked_add_size(partition.aux_offset, partition.aux_bytes,
+                                      &partition.allocation_bytes) ||
+                    !checked_add_size(partition.aux_bytes, padding, &partition.aux_bytes))
+                    return set_error("combined matrix allocation overflow");
+
                 size_t partition_event_count = 0;
                 size_t partition_event_bytes = 0;
                 if (!checked_add_size(
@@ -268,26 +282,13 @@ namespace
         {
             return;
         }
-        const size_t partition_count =
-            std::max(mat->shared_limb_buffers.size(), mat->shared_aux_buffers.size());
+        const size_t partition_count = mat->shared_limb_buffers.size();
         for (size_t partition_idx = 0; partition_idx < partition_count; ++partition_idx)
         {
-            uint8_t *limb_ptr = nullptr;
-            int limb_device = -1;
-            if (partition_idx < mat->shared_limb_buffers.size())
-            {
-                limb_ptr = mat->shared_limb_buffers[partition_idx].ptr;
-                limb_device = mat->shared_limb_buffers[partition_idx].device;
-            }
-            void **aux_ptr = nullptr;
-            int aux_device = -1;
-            if (partition_idx < mat->shared_aux_buffers.size())
-            {
-                aux_ptr = mat->shared_aux_buffers[partition_idx].ptr;
-                aux_device = mat->shared_aux_buffers[partition_idx].device;
-            }
-            int device = limb_device >= 0 ? limb_device : aux_device;
-            if (device < 0 || (!limb_ptr && !aux_ptr))
+            // The limb buffer owns the allocation; aux is an aligned interior view.
+            uint8_t *limb_ptr = mat->shared_limb_buffers[partition_idx].ptr;
+            const int device = mat->shared_limb_buffers[partition_idx].device;
+            if (device < 0 || !limb_ptr)
             {
                 continue;
             }
@@ -336,10 +337,6 @@ namespace
                     {
                         cudaFreeAsync(limb_ptr, free_stream);
                     }
-                    if (aux_ptr)
-                    {
-                        cudaFreeAsync(aux_ptr, free_stream);
-                    }
                     async_free_queued = true;
                 }
                 if (!dependency_ok && !async_free_queued)
@@ -349,11 +346,6 @@ namespace
                         cudaFree(limb_ptr);
                         limb_ptr = nullptr;
                     }
-                    if (aux_ptr)
-                    {
-                        cudaFree(aux_ptr);
-                        aux_ptr = nullptr;
-                    }
                 }
             }
             else
@@ -361,10 +353,6 @@ namespace
                 if (limb_ptr)
                 {
                     cudaFree(limb_ptr);
-                }
-                if (aux_ptr)
-                {
-                    cudaFree(aux_ptr);
                 }
             }
             if (partition_idx < mat->shared_limb_buffers.size())
@@ -460,7 +448,8 @@ extern "C" int gpu_matrix_create(
     size_t rows,
     size_t cols,
     int format,
-    GpuMatrix **out)
+    GpuMatrix **out,
+    bool initialize_descriptors)
 {
     if (!ctx || !out)
     {
@@ -476,6 +465,7 @@ extern "C" int gpu_matrix_create(
     }
 
     auto *mat = new GpuMatrix{ctx, rows, cols, level, plan.format, {}, {}, {}};
+    mat->descriptors_initialized = initialize_descriptors || plan.count == 0;
     const size_t partition_count = plan.partitions.size();
     mat->shared_limb_buffers.resize(partition_count);
     mat->shared_aux_buffers.resize(partition_count);
@@ -575,7 +565,7 @@ extern "C" int gpu_matrix_create(
         uint8_t *base = nullptr;
         err = cudaMallocAsync(
             reinterpret_cast<void **>(&base),
-            partition.data_bytes,
+            partition.allocation_bytes,
             alloc_stream);
         if (err != cudaSuccess)
         {
@@ -584,16 +574,7 @@ extern "C" int gpu_matrix_create(
             return set_error(err);
         }
 
-        void **aux_base = nullptr;
-        err = cudaMallocAsync(&aux_base, partition.aux_bytes, alloc_stream);
-        if (err != cudaSuccess)
-        {
-            const cudaError_t allocation_error = err;
-            cudaFreeAsync(base, alloc_stream);
-            destroy_matrix_contents(mat);
-            delete mat;
-            return set_error(allocation_error);
-        }
+        auto **aux_base = reinterpret_cast<void **>(base + partition.aux_offset);
 
         auto *device_descriptors = reinterpret_cast<GpuMatrix::SharedLimbBuffer::DeviceDescriptor *>(
             reinterpret_cast<uint8_t *>(aux_base) +
@@ -602,7 +583,7 @@ extern "C" int gpu_matrix_create(
         descriptor_init.base = base;
         descriptor_init.stride = partition.bytes_per_poly;
         descriptor_init.count = partition.local_limb_count;
-        for (size_t limb_idx = 0; limb_idx < partition.local_limb_count; ++limb_idx)
+        for (size_t limb_idx = 0; initialize_descriptors && limb_idx < partition.local_limb_count; ++limb_idx)
         {
             descriptor_init.offsets[limb_idx] = partition.limb_offsets_bytes[limb_idx];
             descriptor_init.widths[limb_idx] = partition.limb_coeff_bytes[limb_idx];
@@ -631,13 +612,15 @@ extern "C" int gpu_matrix_create(
             delete mat;
             return set_error(failure);
         };
-        initialize_device_descriptors<<<1, static_cast<unsigned int>(partition.local_limb_count), 0, alloc_stream>>>(
-            device_descriptors, descriptor_init);
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
+        if (initialize_descriptors)
         {
-            return fail_after_descriptor_enqueue(err);
+            initialize_device_descriptors<<<1, static_cast<unsigned int>(partition.local_limb_count), 0, alloc_stream>>>(
+                device_descriptors, descriptor_init);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) return fail_after_descriptor_enqueue(err);
         }
+        // Even deferred descriptors require the allocation completion below:
+        // unwinding before the filling kernel must still free after allocation.
 
         if (shared_stream)
         {

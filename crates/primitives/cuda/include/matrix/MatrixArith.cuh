@@ -26,6 +26,9 @@ extern "C"
     int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
     int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
     int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
+    int gpu_matrix_tensor_sum_rows(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
+        const size_t *rows, const size_t *offsets, size_t group_count, size_t term_count);
     int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int *out_equal);
     int gpu_matrix_mul_scalar(
         GpuMatrix *out,

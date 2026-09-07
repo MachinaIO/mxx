@@ -49,6 +49,17 @@ pub fn gpu_sum_rows_operation_identity(
         .map_err(|error| error.to_string())
 }
 
+/// Tensor row sums consume both operand layouts and use an independent pilot.
+pub fn gpu_tensor_sum_rows_operation_identity(
+    left: &ConcreteMatrixType,
+    right: &ConcreteMatrixType,
+    output: &ConcreteMatrixType,
+    rows: &[Vec<usize>],
+) -> Result<[u8; 32], String> {
+    encoding::hash_canonical(&("mxx-runtime/gpu-tensor-sum-rows/v1", left, right, output, rows))
+        .map_err(|error| error.to_string())
+}
+
 thread_local! {
     // Cache only public operation metadata, never backend state or measured widths.
     // Full input equality makes reuse independent of graph mutation and node IDs.
@@ -877,6 +888,31 @@ mod tests {
             identity,
             gpu_sum_rows_operation_identity(&source, &output, &[vec![0], vec![1, 1, 2]]).unwrap()
         );
+    }
+
+    #[test]
+    fn tensor_sum_rows_identity_preserves_both_operand_layouts() {
+        let left = ConcreteMatrixType {
+            modulus: BigInt::from(97),
+            ring_dimension: 8,
+            rows: 2,
+            columns: 1,
+        };
+        let right = ConcreteMatrixType { rows: 3, ..left.clone() };
+        let source = ConcreteMatrixType { rows: 6, ..left.clone() };
+        let output = ConcreteMatrixType { rows: 1, ..left.clone() };
+        let rows = [vec![0, 2]];
+        let identity =
+            gpu_tensor_sum_rows_operation_identity(&left, &right, &output, &rows).unwrap();
+        assert_ne!(
+            identity,
+            gpu_tensor_sum_rows_operation_identity(&right, &left, &output, &rows).unwrap()
+        );
+        assert_ne!(
+            identity,
+            gpu_tensor_sum_rows_operation_identity(&left, &right, &output, &[vec![2, 0]]).unwrap()
+        );
+        assert_ne!(identity, gpu_sum_rows_operation_identity(&source, &output, &rows).unwrap());
     }
 
     #[test]

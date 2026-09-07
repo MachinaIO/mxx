@@ -71,6 +71,7 @@ struct GpuMatrix
     struct SharedAuxBuffer
     {
         int device;
+        // Non-owning interior view of the corresponding SharedLimbBuffer allocation.
         void **ptr;
         size_t slots_per_poly;
         size_t slots_total;
@@ -78,6 +79,8 @@ struct GpuMatrix
     std::vector<SharedLimbBuffer> shared_limb_buffers;
     std::vector<SharedAuxBuffer> shared_aux_buffers;
     std::vector<std::vector<LimbExecState>> exec_limb_states;
+    // A deferred allocation stays private until its filling kernel is submitted.
+    bool descriptors_initialized = true;
 };
 #endif
 

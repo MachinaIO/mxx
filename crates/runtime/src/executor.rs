@@ -87,6 +87,8 @@ pub struct ExecutionResult<B: Backend> {
 /// execution remain intact. Aliases are installed before concat input release.
 #[derive(Default)]
 struct RootBlockAliases {
+    arguments: Vec<Vec<WireRef>>,
+    absent_run_ends: Vec<usize>,
     #[cfg(feature = "gpu")]
     calibration: gpu_plan::Operations,
     concats: BTreeMap<NodeId, Vec<(WireRef, WireRef)>>,
@@ -98,12 +100,27 @@ struct RootBlockAliases {
     row_sum_captures: BTreeMap<NodeId, Vec<NodeId>>,
 }
 
+impl RootBlockAliases {
+    fn absent_run_end(
+        &self,
+        position: usize,
+        release_interval: Option<NonZeroUsize>,
+        report_progress: bool,
+    ) -> Option<usize> {
+        if release_interval.is_some() || report_progress {
+            return None;
+        }
+        self.absent_run_ends.get(position).copied().filter(|end| *end > position)
+    }
+}
+
 /// Recognized runtime row sums, exposed for explicit calibration setup.
 /// The original graph must already have passed validation.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct RootRowSumPlan {
     pub source: WireRef,
+    pub tensor_operands: Option<[WireRef; 2]>,
     pub rows: Vec<Vec<usize>>,
     interiors: BTreeSet<NodeId>,
 }
@@ -215,6 +232,7 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
                 output.node,
                 RootRowSumPlan {
                     source: source.expect("nonempty row groups have a source"),
+                    tensor_operands: None,
                     rows: groups,
                     interiors,
                 },
@@ -283,6 +301,7 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
                     *consumer,
                     RootRowSumPlan {
                         source: wire,
+                        tensor_operands: None,
                         rows: vec![vec![start]],
                         interiors: BTreeSet::new(),
                     },
@@ -323,6 +342,35 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
         plans.remove(&parent);
         plans.extend(children);
     }
+    // A single row-sum consumer can read tensor products directly. Keep the
+    // tensor boundary whenever another plan or observable consumer needs it.
+    let sources = plans.values().map(|plan| plan.source).collect::<Vec<_>>();
+    for plan in plans.values_mut() {
+        let source = plan.source;
+        if sources.iter().filter(|wire| **wire == source).count() != 1 ||
+            checked.liveness.retained.contains(&source) ||
+            scope.outputs().contains(&source) ||
+            !matches!(
+                scope.node(source.node).expect("validated source").kind(),
+                NodeKind::Tensor
+            ) ||
+            !uses
+                .get(&source)
+                .is_some_and(|users| users.iter().all(|user| plan.interiors.contains(user)))
+        {
+            continue;
+        }
+        let arguments = scope.arguments(scope.node(source.node).unwrap()).unwrap();
+        if arguments.len() != 2 ||
+            arguments.iter().any(|wire| {
+                !matches!(checked.wire_types.get(wire), Some(ConcreteWireType::Matrix(_)))
+            })
+        {
+            continue;
+        }
+        plan.tensor_operands = Some([arguments[0], arguments[1]]);
+        plan.interiors.insert(source.node);
+    }
     plans
 }
 
@@ -346,6 +394,11 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
     let mut plan = RootBlockAliases::default();
     let scope = validated.source.scope(&FrozenGraphScopeId::Root).expect("validated root");
     let checked = validated.root_scope();
+    plan.arguments = checked
+        .execution_order
+        .iter()
+        .map(|node| scope.arguments(node).expect("validated arguments"))
+        .collect();
     plan.row_sums = root_row_sum_plans(validated);
     let mut reserved = BTreeSet::new();
     for (output, row_sum) in &plan.row_sums {
@@ -445,6 +498,38 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
             plan.concats.insert(wire.node, aliases);
         }
     }
+    // Omit only bookkeeping for wires which no dispatch action can insert.
+    // In particular, do not move captures or last-use releases of live sources.
+    let absent = plan
+        .row_sum_interiors
+        .iter()
+        .filter_map(|id| {
+            let wire = WireRef { node: *id, port: Port(0) };
+            (!plan.row_sums.contains_key(id) &&
+                !plan.adds.contains_key(id) &&
+                !plan.slices.contains(id) &&
+                !checked.liveness.retained.contains(&wire) &&
+                !scope.outputs().contains(&wire) &&
+                checked.execution_order[id.0 as usize].output_types().len() == 1)
+                .then_some(wire)
+        })
+        .collect::<BTreeSet<_>>();
+    plan.absent_run_ends = (0..checked.execution_order.len()).collect();
+    let mut run_end = checked.execution_order.len();
+    for position in (0..checked.execution_order.len()).rev() {
+        let id = NodeId(position as u64);
+        let wire = WireRef { node: id, port: Port(0) };
+        let empty = absent.contains(&wire) &&
+            !plan.row_sum_captures.contains_key(&id) &&
+            !plan.concats.contains_key(&id) &&
+            !plan.add_concats.contains(&id) &&
+            plan.arguments[position].iter().all(|argument| absent.contains(argument));
+        if empty {
+            plan.absent_run_ends[position] = run_end;
+        } else {
+            run_end = position;
+        }
+    }
     plan
 }
 
@@ -525,7 +610,7 @@ struct InstanceResult<B: Backend> {
 struct ExecutableNode<'a> {
     id: NodeId,
     kind: &'a NodeKind,
-    args: Vec<WireRef>,
+    args: &'a [WireRef],
 }
 
 #[derive(Debug, Error)]
@@ -750,7 +835,6 @@ where
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
-    let scratch_production = scratch_production_id(&production, rand::random());
     let mut executor = Executor {
         validated,
         backend,
@@ -760,7 +844,7 @@ where
         session,
         config,
         production,
-        scratch_production,
+        scratch_production: None,
         staged_families: BTreeMap::new(),
         preimage_progress: config.preimage_progress.map(PreimageProgress::new),
         executed_node_count: 0,
@@ -847,7 +931,7 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     session: Option<ProductionId>,
     config: ExecutionConfig,
     production: ProductionId,
-    scratch_production: ProductionId,
+    scratch_production: Option<ProductionId>,
     staged_families: BTreeMap<(ProductionId, String), ManifestArtifact>,
     preimage_progress: Option<PreimageProgress>,
     executed_node_count: usize,
@@ -931,10 +1015,10 @@ where
     ) -> Result<InstanceResult<B>, ExecutionError> {
         self.execute_instances_batch(
             scope_id,
-            vec![env.clone()],
-            vec![path],
-            vec![inputs],
-            vec![placement],
+            std::slice::from_ref(env),
+            &[path],
+            &[inputs],
+            &[placement],
         )
         .map(|mut instances| instances.pop().expect("single execution returns one instance"))
     }
@@ -942,10 +1026,10 @@ where
     fn execute_instances_batch(
         &mut self,
         scope_id: &FrozenGraphScopeId,
-        envs: Vec<ParamEnv>,
-        paths: Vec<Vec<InstantiationFrame>>,
-        inputs: Vec<BTreeMap<String, RuntimeValue<B>>>,
-        placements: Vec<usize>,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        inputs: &[BTreeMap<String, RuntimeValue<B>>],
+        placements: &[usize],
     ) -> Result<Vec<InstanceResult<B>>, ExecutionError> {
         debug_assert_eq!(envs.len(), paths.len());
         debug_assert_eq!(envs.len(), inputs.len());
@@ -969,9 +1053,25 @@ where
         let mut add_blocks = (0..envs.len())
             .map(|_| BTreeMap::<NodeId, Vec<Arc<B::Matrix>>>::new())
             .collect::<Vec<_>>();
-        let mut row_sum_sources =
-            (0..envs.len()).map(|_| BTreeMap::<NodeId, Arc<B::Matrix>>::new()).collect::<Vec<_>>();
-        for (position, handle) in validated_scope.execution_order.iter().enumerate() {
+        let mut row_sum_sources = (0..envs.len())
+            .map(|_| BTreeMap::<NodeId, (Arc<B::Matrix>, Option<Arc<B::Matrix>>)>::new())
+            .collect::<Vec<_>>();
+        let mut position = 0;
+        while position < validated_scope.execution_order.len() {
+            if let Some(end) = block_aliases.absent_run_end(
+                position,
+                self.config.release_fence_interval,
+                tracing::enabled!(tracing::Level::INFO),
+            ) {
+                // These nodes have no values, actions, or live arguments. Keep
+                // their structural count without visiting their empty dispatch.
+                self.executed_node_count = self
+                    .executed_node_count
+                    .saturating_add((end - position).saturating_mul(envs.len()));
+                position = end;
+                continue;
+            }
+            let handle = &validated_scope.execution_order[position];
             // Counts include structural nodes and each instantiated loop-body
             // node, not coefficients, kernels, or device-completed work. Scope
             // totals describe the unexpanded template only. Reporting never
@@ -995,10 +1095,18 @@ where
                 );
                 self.last_progress_report = Some(Instant::now());
             }
+            let dynamic_arguments;
+            let arguments = if let Some(arguments) = block_aliases.arguments.get(position) {
+                arguments.as_slice()
+            } else {
+                dynamic_arguments =
+                    scope.arguments(handle).expect("validated node belongs to its scope");
+                dynamic_arguments.as_slice()
+            };
             let node = ExecutableNode {
                 id: NodeId(position as u64),
                 kind: handle.kind(),
-                args: scope.arguments(handle).expect("validated node belongs to its scope"),
+                args: arguments,
             };
             let aliased = block_aliases.slices.contains(&node.id) ||
                 block_aliases.concats.contains_key(&node.id) ||
@@ -1008,9 +1116,17 @@ where
                 for index in 0..envs.len() {
                     self.set_placement(placements[index])?;
                     for output in outputs {
-                        let source = block_aliases.row_sums[output].source;
-                        let matrix = self.matrix(&mut values[index], source)?;
-                        row_sum_sources[index].insert(*output, matrix);
+                        let row_sum = &block_aliases.row_sums[output];
+                        let matrices = if let Some([left, right]) = row_sum.tensor_operands {
+                            // Materialize in the original Tensor argument order,
+                            // before its unchanged liveness releases either input.
+                            let left = self.matrix(&mut values[index], left)?;
+                            let right = self.matrix(&mut values[index], right)?;
+                            (left, Some(right))
+                        } else {
+                            (self.matrix(&mut values[index], row_sum.source)?, None)
+                        };
+                        row_sum_sources[index].insert(*output, matrices);
                     }
                 }
             }
@@ -1046,13 +1162,24 @@ where
                     }
                 }
             }
+            // A singleton dispatch needs neither an index vector nor an outer
+            // group allocation. Dynamic child calibration retains its grouping.
+            let mut singleton_operation = None;
+            let mut all_instances = |operation: Option<[u8; 32]>| {
+                if envs.len() == 1 {
+                    singleton_operation = Some(operation);
+                    Vec::new()
+                } else {
+                    vec![(operation, (0..envs.len()).collect::<Vec<_>>())]
+                }
+            };
             #[cfg(feature = "gpu")]
             let calibration_groups = if aliased {
                 Vec::new()
             } else if scope_id == &FrozenGraphScopeId::Root && self.trace.is_none() {
                 let operation =
                     block_aliases.calibration[&node.id].clone().map_err(ExecutionError::Backend)?;
-                vec![(operation, (0..envs.len()).collect())]
+                all_instances(operation)
             } else if scope_id == &FrozenGraphScopeId::Root &&
                 crate::gpu_calibration::gpu_operation_is_column_separable(node.kind)
             {
@@ -1088,7 +1215,7 @@ where
                     })
                     .transpose()
                     .map_err(ExecutionError::Backend)?;
-                vec![(operation, (0..envs.len()).collect())]
+                all_instances(operation)
             } else if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
                 let declared_argument_types = node
                     .args
@@ -1112,35 +1239,43 @@ where
                     node.kind,
                     &declared_argument_types,
                     handle.output_types(),
-                    &envs,
+                    envs,
                 )
                 .map_err(ExecutionError::Backend)?
             } else {
-                vec![(None, (0..envs.len()).collect())]
+                all_instances(None)
             };
             #[cfg(not(feature = "gpu"))]
             let calibration_groups: Vec<(Option<[u8; 32]>, Vec<usize>)> =
-                if aliased { Vec::new() } else { vec![(None, (0..envs.len()).collect())] };
+                if aliased { Vec::new() } else { all_instances(None) };
 
-            for (operation, indices) in calibration_groups {
+            for (operation, indices) in
+                singleton_operation.iter().map(|operation| (*operation, &[0usize][..])).chain(
+                    calibration_groups
+                        .iter()
+                        .map(|(operation, indices)| (*operation, indices.as_slice())),
+                )
+            {
                 if let Some(operation) = operation {
                     self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
                 }
                 if let Some(row_sum) = block_aliases.row_sums.get(&node.id) {
-                    for index in indices {
+                    for &index in indices {
                         self.set_placement(placements[index])?;
-                        let source = row_sum_sources[index]
+                        let (source, right) = row_sum_sources[index]
                             .remove(&node.id)
                             .expect("row sum source survives until concat");
-                        let output = self
-                            .backend
-                            .sum_rows(&source, &row_sum.rows)
-                            .map_err(Self::backend_error)?;
+                        let output = if let Some(right) = right {
+                            self.backend.tensor_sum_rows(&source, &right, &row_sum.rows)
+                        } else {
+                            self.backend.sum_rows(&source, &row_sum.rows)
+                        }
+                        .map_err(Self::backend_error)?;
                         self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(output));
                         self.has_pending_releases = true;
                     }
                 } else if let Some((concat, right)) = block_aliases.adds.get(&node.id) {
-                    for index in indices {
+                    for &index in indices {
                         self.set_placement(placements[index])?;
                         let right = self.matrix(&mut values[index], *right)?;
                         let blocks = add_blocks[index]
@@ -1158,24 +1293,24 @@ where
                 {
                     self.execute_preimage_batch(
                         scope_id,
-                        &envs,
-                        &paths,
-                        &placements,
+                        envs,
+                        paths,
+                        placements,
                         &node,
                         &mut values,
-                        &indices,
+                        indices,
                     )?;
                 } else if indices.len() > 1 &&
                     self.execute_parallel_matrix_node_by_placement(
-                        &placements,
-                        &envs,
+                        placements,
+                        envs,
                         &node,
                         &mut values,
-                        &indices,
+                        indices,
                     )?
                 {
                 } else if matches!(node.kind, NodeKind::Select { .. }) {
-                    for index in indices {
+                    for &index in indices {
                         self.set_placement(placements[index])?;
                         self.execute_select(
                             &envs[index],
@@ -1186,7 +1321,7 @@ where
                         )?;
                     }
                 } else {
-                    for index in indices {
+                    for &index in indices {
                         self.set_placement(placements[index])?;
                         self.execute_node(
                             scope_id,
@@ -1210,7 +1345,7 @@ where
                         );
                     }
                 }
-                for argument in &node.args {
+                for argument in node.args {
                     if schedule.last_use.get(argument) == Some(&position) &&
                         !schedule.retained.contains(argument)
                     {
@@ -1237,6 +1372,7 @@ where
                     "execution progress checkpoint"
                 );
             }
+            position += 1;
         }
         let mut instances = Vec::with_capacity(values.len());
         for (index, mut instance_values) in values.into_iter().enumerate() {
@@ -1635,8 +1771,15 @@ where
             content_hash: None,
             layout: Some("runtime/staged-family-v1".to_owned()),
         };
-        self.staged_families
-            .insert((self.scratch_production.clone(), name.clone()), descriptor.clone());
+        // Scratch identity is private to streamed families. Ordinary resident
+        // executions need neither its random nonce nor its domain-separated hash.
+        // Initialize at registration so even an empty returned family owns the
+        // same identity as every other scratch artifact in this execution.
+        let production = &self.production;
+        let scratch = self
+            .scratch_production
+            .get_or_insert_with(|| scratch_production_id(production, rand::random()));
+        self.staged_families.insert((scratch.clone(), name.clone()), descriptor.clone());
         Ok(Some((name, descriptor)))
     }
 
@@ -2689,11 +2832,14 @@ where
                         }
                         let instances = self.execute_instances_batch(
                             &child_id,
-                            child_envs,
-                            child_paths,
-                            child_inputs,
-                            child_placements.clone(),
+                            &child_envs,
+                            &child_paths,
+                            &child_inputs,
+                            &child_placements,
                         )?;
+                        // Match the owned-call lifetime: release child inputs
+                        // before serializing this wave's returned outputs.
+                        drop(child_inputs);
                         for (offset, instance) in instances.into_iter().enumerate() {
                             self.set_placement(child_placements[offset])?;
                             for (port, value) in instance.outputs.into_iter().enumerate() {
@@ -2703,7 +2849,7 @@ where
                                     self.artifact_store
                                         .store(
                                             ArtifactKey {
-                                                production: self.scratch_production.clone(),
+                                                production: self.scratch_production.as_ref().expect("staged descriptor initializes scratch identity").clone(),
                                                 name: name.clone(),
                                                 index: Some(wave_start + offset),
                                             },
@@ -2722,7 +2868,11 @@ where
                     for (port, family) in families.into_iter().enumerate() {
                         let value = match &staged[port] {
                             Some((name, descriptor)) => RuntimeValue::StagedArtifactFamily {
-                                production: self.scratch_production.clone(),
+                                production: self
+                                    .scratch_production
+                                    .as_ref()
+                                    .expect("staged descriptor initializes scratch identity")
+                                    .clone(),
                                 name: name.clone(),
                                 descriptor: descriptor.clone(),
                             },
@@ -4114,7 +4264,7 @@ where
             name
         });
         names
-            .zip(&node.args)
+            .zip(node.args)
             .map(|(name, wire)| Ok((name.clone(), self.value(values, *wire)?)))
             .collect()
     }
@@ -4140,7 +4290,7 @@ where
             return Err(ExecutionError::ValueKind(WireRef { node: node.id, port: Port(0) }));
         }
         names
-            .zip(&node.args)
+            .zip(node.args)
             .zip(modes)
             .zip(broadcast_inputs)
             .map(|(((name, wire), mode), broadcast)| {
@@ -4778,6 +4928,16 @@ mod tests {
         assert_eq!(plan.row_sums.len(), 1);
         assert_eq!(plan.row_sums.values().next().unwrap().rows, vec![vec![0], vec![1, 2], vec![3]]);
         assert!(plan.concats.is_empty());
+        let source = plan.row_sums.values().next().unwrap().source;
+        for (position, arguments) in plan.arguments.iter().enumerate() {
+            if arguments.contains(&source) {
+                assert_eq!(
+                    plan.absent_run_end(position, None, false),
+                    None,
+                    "materialized source consumers retain their original release points"
+                );
+            }
+        }
         assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).row_sums.is_empty());
         let matrices = [1u8, 3, 5, 7].map(|value| {
             DCRTPolyMatrix::from_poly_vec_row(
@@ -4803,6 +4963,116 @@ mod tests {
         let middle = &matrices[1] + &matrices[2];
         let expected = matrices[0].concat_rows(&[&middle, &matrices[3]]);
         assert_eq!(matrix_output(&optimized, "sum"), &expected);
+    }
+
+    #[test]
+    fn tensor_row_sum_fusion_preserves_trace_and_observable_tensor_boundaries() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let scalar = |value: u8| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+            )
+        };
+        let left = scalar(2).concat_rows(&[&scalar(3)]);
+        let right = scalar(5).concat_rows(&[&scalar(7)]);
+        let expected = left.tensor(&right).sum_rows(&[vec![0], vec![1, 2], vec![3]]);
+        let mut backend = cpu_backend([parameters.clone()]);
+        for boundary in 0..4 {
+            let ring = Ring::new(modulus.clone(), 8usize);
+            let tensor = ring.input("left", (2, 1)).tensor(ring.input("right", (2, 1)));
+            let row = |index: usize| {
+                tensor
+                    .clone()
+                    .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+            };
+            let sum = Mat::concat(ConcatAxis::Rows, vec![row(0), row(1) + row(2), row(3)]);
+            let mut context =
+                DslContext::new("tensor-row-sum-boundaries").output("sum", sum).unwrap();
+            if boundary == 1 {
+                context = context.output("tensor", tensor.clone()).unwrap();
+            } else if boundary == 2 {
+                context = context.output("other", tensor.clone() + tensor.clone()).unwrap();
+            }
+            let mut graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            if boundary == 3 {
+                let checked = graph.scopes.get_mut(&FrozenGraphScopeId::Root).unwrap();
+                let index = checked
+                    .execution_order
+                    .iter()
+                    .position(|node| matches!(node.kind(), NodeKind::Tensor))
+                    .unwrap();
+                checked
+                    .liveness
+                    .retained
+                    .insert(WireRef { node: NodeId(index as u64), port: Port(0) });
+            }
+            let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+            assert_eq!(
+                plan.row_sums.values().filter(|sum| sum.tensor_operands.is_some()).count(),
+                usize::from(boundary == 0)
+            );
+            assert!(
+                root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).row_sums.is_empty()
+            );
+            let node_count = graph.root_scope().execution_order.len();
+            let mut position = 0;
+            let mut visited = 0;
+            let mut represented = 0;
+            while position < node_count {
+                let end = plan.absent_run_end(position, None, false).unwrap_or(position + 1);
+                if end == position + 1 && plan.absent_run_end(position, None, false).is_none() {
+                    visited += 1;
+                }
+                represented += end - position;
+                position = end;
+            }
+            assert_eq!(represented, node_count, "all original structural nodes remain counted");
+            if boundary == 0 {
+                assert_eq!(node_count, 9);
+                assert_eq!(visited, 4, "inputs, tensor capture, and fused output remain visited");
+            }
+            for position in 0..node_count {
+                assert_eq!(plan.absent_run_end(position, NonZeroUsize::new(1), false), None);
+                assert_eq!(plan.absent_run_end(position, None, true), None);
+                let traced = root_block_aliases(&graph, &FrozenGraphScopeId::Root, true);
+                assert_eq!(traced.absent_run_end(position, None, false), None);
+            }
+            for capture in plan.row_sum_captures.keys() {
+                assert_eq!(plan.absent_run_end(capture.0 as usize, None, false), None);
+            }
+            let inputs = BTreeMap::from([
+                ("left".to_owned(), RuntimeValue::matrix(left.clone())),
+                ("right".to_owned(), RuntimeValue::matrix(right.clone())),
+            ]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let fenced = execute_with_config(
+                &graph,
+                &mut backend,
+                inputs.clone(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    release_fence_interval: NonZeroUsize::new(1),
+                    ..ExecutionConfig::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(matrix_output(&fenced, "sum"), &expected);
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            assert_eq!(matrix_output(&optimized, "sum"), &expected);
+            for name in reference.outputs.keys() {
+                assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
+            }
+        }
     }
 
     #[test]

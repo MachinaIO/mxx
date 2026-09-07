@@ -440,6 +440,16 @@ pub trait Backend {
             .collect::<Result<Vec<_>, Self::Error>>()?;
         self.concat(&output.iter().collect::<Vec<_>>(), ConcatAxis::Rows)
     }
+    /// Sum selected tensor-product rows without requiring a materialized tensor.
+    fn tensor_sum_rows(
+        &mut self,
+        left: &Self::Matrix,
+        right: &Self::Matrix,
+        rows: &[Vec<usize>],
+    ) -> Result<Self::Matrix, Self::Error> {
+        let tensor = self.tensor(left, right)?;
+        self.sum_rows(&tensor, rows)
+    }
     fn tensor(
         &mut self,
         left: &Self::Matrix,

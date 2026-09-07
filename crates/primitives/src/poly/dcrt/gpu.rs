@@ -158,6 +158,7 @@ unsafe extern "C" {
         cols: usize,
         format: c_int,
         out_mat: *mut *mut GpuMatrixOpaque,
+        initialize_descriptors: bool,
     ) -> c_int;
     pub(crate) fn gpu_matrix_query_allocation_bytes(
         ctx: *const GpuContextOpaque,
@@ -251,6 +252,15 @@ unsafe extern "C" {
         out: *mut GpuMatrixOpaque,
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_tensor_sum_rows(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+        rows: *const usize,
+        offsets: *const usize,
+        group_count: usize,
+        term_count: usize,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sum_rows(
         out: *mut GpuMatrixOpaque,
@@ -1354,7 +1364,8 @@ impl GpuDCRTPoly {
         let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
         let bytes_len = flat.len().saturating_mul(mem::size_of::<u64>());
         let bytes = unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, bytes_len) };
-        let mut mat = GpuDCRTPolyMatrix::new_empty_with_state(params.as_ref(), 1, 1, level, is_ntt);
+        let mut mat =
+            GpuDCRTPolyMatrix::new_empty_with_state(params.as_ref(), 1, 1, level, is_ntt, None);
         mat.load_rns_bytes(bytes, bytes_len, format);
         Self::from_inner(mat)
     }

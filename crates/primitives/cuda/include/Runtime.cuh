@@ -122,9 +122,16 @@ struct GpuExecutionOwner
     ~GpuExecutionOwner();
 };
 
+struct GpuBarrettReciprocal
+{
+    uint64_t lo;
+    uint64_t hi;
+};
+
 struct GpuContext
 {
     std::vector<uint64_t> moduli;
+    std::vector<GpuBarrettReciprocal> barrett_reciprocals;
     std::vector<uint64_t> ntt_n_inv_by_prime;
     std::vector<uint64_t> ntt_root_by_prime;
     std::vector<uint64_t> ntt_inv_root_by_prime;

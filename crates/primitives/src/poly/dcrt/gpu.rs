@@ -466,7 +466,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
-    pub(crate) fn gpu_matrix_intt_out_of_place_batch(
+    pub(crate) fn gpu_matrix_intt_batch(
         outputs: *const *mut GpuMatrixOpaque,
         inputs: *const *const GpuMatrixOpaque,
         matrix_count: usize,
@@ -512,7 +512,8 @@ unsafe extern "C" {
         payload_len: usize,
     ) -> c_int;
     pub(crate) fn gpu_small_matrix_decompose_base(
-        src: *const GpuMatrixOpaque,
+        sources: *const *const GpuMatrixOpaque,
+        block_count: usize,
         base_bits: u32,
         small_mode: c_int,
         max_coefficient_bound: *const u64,
@@ -535,8 +536,9 @@ unsafe extern "C" {
         accepted_out: *mut i32,
     ) -> c_int;
     pub(crate) fn gpu_matrix_mul_small_rhs(
-        out: *mut GpuMatrixOpaque,
-        lhs_eval: *const GpuMatrixOpaque,
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        block_count: usize,
         rhs_small: *const GpuSmallMatrixOpaque,
         residency_budget_bytes: usize,
         allocation_report: *mut GpuSmallMatrixAllocationReportRaw,

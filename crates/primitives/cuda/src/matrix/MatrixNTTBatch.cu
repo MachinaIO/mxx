@@ -8,6 +8,15 @@ namespace
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *outputs[kNttBatchMatrices];
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *inputs[kNttBatchMatrices];
         uint32_t indices[GPU_RUNTIME_MAX_LIMBS];
+        size_t limb_count;
+        bool out_of_place;
+        __device__ size_t limb(size_t index) const { return index % limb_count; }
+        __device__ auto output(size_t index) const {
+            return outputs[index / limb_count][indices[limb(index)]];
+        }
+        __device__ auto input(size_t index) const {
+            return out_of_place ? inputs[index / limb_count][indices[limb(index)]] : output(index);
+        }
     };
     static_assert(sizeof(MatrixNttBatchDescriptors) + 128 < 4096, "bounded batch NTT kernel arguments");
 
@@ -290,6 +299,8 @@ int run_matrix_transform_batch(
     {
         const size_t count = std::min(kNttBatchMatrices, matrix_count - offset);
         MatrixNttBatchDescriptors layout{};
+        layout.limb_count = limb_count;
+        layout.out_of_place = sources != nullptr;
         for (size_t limb = 0; limb < limb_count; ++limb)
             layout.indices[limb] = limb_ids[limb].y;
         for (size_t local = 0; local < count; ++local)
@@ -298,91 +309,115 @@ int run_matrix_transform_batch(
             if (sources)
                 layout.inputs[local] = sources[offset + local]->shared_limb_buffers[partition].device_descriptors;
         }
-        const dim3 coefficient_grid(
-            (n + kTransformThreads - 1) / kTransformThreads,
-            static_cast<uint32_t>(poly_count),
-            static_cast<uint32_t>(count * limb_count));
-        if (forward)
+        if (n <= 16 * kFusedNttCoefficients)
         {
-            batch_ntt_twist_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
-                layout,
-                twiddles,
-                twiddle_shoup,
-                constants.moduli,
-                limb_count,
-                n,
-                poly_count);
-            error = cudaGetLastError();
-            if (error == cudaSuccess)
+            // Forward DIF emits the same bit-reversed evaluation order that
+            // inverse DIT consumes. Share the scalar butterflies and fuse the
+            // out-of-place inverse load into the local stage.
+            int status = 0;
+            if (forward)
+            {
+                if (n > kFusedNttCoefficients)
+                    status = launch_fused_top_stages<true>(layout, constants, count * limb_count, n, poly_count, stream);
+                if (status == 0)
+                    status = launch_fused_local_stages<true>(layout, constants, count * limb_count, n, poly_count, stream);
+            }
+            else
+            {
+                status = launch_fused_local_stages<false>(layout, constants, count * limb_count, n, poly_count, stream);
+                if (status == 0 && n > kFusedNttCoefficients)
+                    status = launch_fused_top_stages<false>(layout, constants, count * limb_count, n, poly_count, stream);
+            }
+            if (status != 0) return status;
+        }
+        else
+        {
+            const dim3 coefficient_grid(
+                (n + kTransformThreads - 1) / kTransformThreads,
+                static_cast<uint32_t>(poly_count),
+                static_cast<uint32_t>(count * limb_count));
+            if (forward)
+            {
+                batch_ntt_twist_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
+                    layout,
+                    twiddles,
+                    twiddle_shoup,
+                    constants.moduli,
+                    limb_count,
+                    n,
+                    poly_count);
+                error = cudaGetLastError();
+                if (error == cudaSuccess)
+                {
+                    batch_ntt_bit_reverse_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
+                        layout,
+                        limb_count, n, log_n, poly_count);
+                    error = cudaGetLastError();
+                }
+                if (error != cudaSuccess)
+                {
+                    return set_error(error);
+                }
+            }
+            const dim3 stage_grid(
+                (n / 2 + kTransformThreads - 1) / kTransformThreads,
+                static_cast<uint32_t>(poly_count),
+                static_cast<uint32_t>(count * limb_count));
+            uint32_t first_length = 2;
+            if (sources)
+            {
+                batch_ntt_first_stage_out_of_place_kernel<<<
+                    stage_grid, kTransformThreads, 0, stream>>>(
+                    layout,
+                    constants.moduli,
+                    limb_count,
+                    n,
+                    poly_count);
+                error = cudaGetLastError();
+                if (error != cudaSuccess)
+                {
+                    return set_error(error);
+                }
+                first_length = 4;
+            }
+            for (uint32_t len = first_length; len <= n; len <<= 1)
+            {
+                batch_ntt_stage_kernel<<<stage_grid, kTransformThreads, 0, stream>>>(
+                    layout,
+                    twiddles,
+                    twiddle_shoup,
+                    constants.moduli,
+                    limb_count, n, len, poly_count);
+                error = cudaGetLastError();
+                if (error != cudaSuccess)
+                {
+                    return set_error(error);
+                }
+            }
+            if (forward)
             {
                 batch_ntt_bit_reverse_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
                     layout,
                     limb_count, n, log_n, poly_count);
-                error = cudaGetLastError();
             }
-            if (error != cudaSuccess)
+            else
             {
-                return set_error(error);
+                batch_ntt_scale_twist_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
+                    layout,
+                    twiddles,
+                    twiddle_shoup,
+                    constants.moduli,
+                    constants.n_inv,
+                    constants.n_inv_shoup,
+                    limb_count,
+                    n,
+                    poly_count);
             }
-        }
-        const dim3 stage_grid(
-            (n / 2 + kTransformThreads - 1) / kTransformThreads,
-            static_cast<uint32_t>(poly_count),
-            static_cast<uint32_t>(count * limb_count));
-        uint32_t first_length = 2;
-        if (sources)
-        {
-            batch_ntt_first_stage_out_of_place_kernel<<<
-                stage_grid, kTransformThreads, 0, stream>>>(
-                layout,
-                constants.moduli,
-                limb_count,
-                n,
-                poly_count);
             error = cudaGetLastError();
             if (error != cudaSuccess)
             {
                 return set_error(error);
             }
-            first_length = 4;
-        }
-        for (uint32_t len = first_length; len <= n; len <<= 1)
-        {
-            batch_ntt_stage_kernel<<<stage_grid, kTransformThreads, 0, stream>>>(
-                layout,
-                twiddles,
-                twiddle_shoup,
-                constants.moduli,
-                limb_count, n, len, poly_count);
-            error = cudaGetLastError();
-            if (error != cudaSuccess)
-            {
-                return set_error(error);
-            }
-        }
-        if (forward)
-        {
-            batch_ntt_bit_reverse_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
-                layout,
-                limb_count, n, log_n, poly_count);
-        }
-        else
-        {
-            batch_ntt_scale_twist_kernel<<<coefficient_grid, kTransformThreads, 0, stream>>>(
-                layout,
-                twiddles,
-                twiddle_shoup,
-                constants.moduli,
-                constants.n_inv,
-                constants.n_inv_shoup,
-                limb_count,
-                n,
-                poly_count);
-        }
-        error = cudaGetLastError();
-        if (error != cudaSuccess)
-        {
-            return set_error(error);
         }
         for (size_t matrix_index = offset; matrix_index < offset + count; ++matrix_index)
         {
@@ -411,7 +446,7 @@ int run_matrix_transform_batch(
 }
 }
 
-extern "C" int gpu_matrix_intt_out_of_place_batch(
+extern "C" int gpu_matrix_intt_batch(
     GpuMatrix *const *outputs,
     const GpuMatrix *const *inputs,
     size_t matrix_count)

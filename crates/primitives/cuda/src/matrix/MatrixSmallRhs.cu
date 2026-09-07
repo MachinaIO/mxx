@@ -113,7 +113,7 @@ cudaError_t small_fence_stream_with_event(cudaStream_t stream)
     return sync_err;
 }
 
-int small_track_consumer(const GpuSmallMatrix *mat, cudaStream_t consumer_stream)
+int small_track_consumer(const GpuSmallMatrix *mat, cudaStream_t consumer_stream, cudaEvent_t completion)
 {
     if (!mat || !mat->ctx || !consumer_stream || mat->device < 0)
         return set_error("invalid compact matrix consumer arguments");
@@ -127,31 +127,14 @@ int small_track_consumer(const GpuSmallMatrix *mat, cudaStream_t consumer_stream
 
     cudaError_t err = cudaSetDevice(mat->device);
     if (err != cudaSuccess) return set_error(err);
-    cudaEvent_t consumer_done = nullptr;
-    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
+    // The caller retains this dominating completion until the release wait
+    // is enqueued. Reuse it without creating or destroying another event.
+    if (!completion) return set_error("missing compact consumer completion");
+    err = cudaStreamWaitEvent(release_stream, completion, 0);
+    if (err == cudaSuccess && mat->stream != consumer_stream && mat->stream != release_stream)
+        err = cudaStreamWaitEvent(mat->stream, completion, 0);
     if (err != cudaSuccess)
-    {
         (void)small_fence_stream_with_event(consumer_stream);
-        return set_error(err);
-    }
-    err = cudaEventRecord(consumer_done, consumer_stream);
-    if (err != cudaSuccess)
-    {
-        cudaEventDestroy(consumer_done);
-        (void)small_fence_stream_with_event(consumer_stream);
-        return set_error(err);
-    }
-    err = cudaStreamWaitEvent(release_stream, consumer_done, 0);
-    if (err != cudaSuccess)
-    {
-        const cudaError_t fence_err = cudaEventSynchronize(consumer_done);
-        if (fence_err == cudaSuccess)
-            cudaEventDestroy(consumer_done);
-        else
-            (void)small_fence_stream_with_event(consumer_stream);
-        return set_error(err);
-    }
-    err = cudaEventDestroy(consumer_done);
     return err == cudaSuccess ? 0 : set_error(err);
 }
 
@@ -207,8 +190,25 @@ __device__ __forceinline__ void compact_store_signed(
     }
 }
 
+// One descriptor per owned row block, bounded independently of matrix size.
+constexpr size_t kCompactRowBlocks = 32;
+struct CompactRowBlocks
+{
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *inputs[kCompactRowBlocks];
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *outputs[kCompactRowBlocks];
+    size_t ends[kCompactRowBlocks];
+    __device__ size_t locate(size_t &row) const
+    {
+        size_t block = 0;
+        while (row >= ends[block]) ++block;
+        if (block) row -= ends[block - 1];
+        return block;
+    }
+};
+static_assert(sizeof(CompactRowBlocks) < 1024, "bounded compact block metadata");
+
 __global__ void compact_decompose_kernel(
-    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *src_descriptors,
+    CompactRowBlocks blocks,
     const uint64_t *src_moduli,
     uint8_t *dst,
     size_t src_rows,
@@ -228,9 +228,11 @@ __global__ void compact_decompose_kernel(
     const size_t source_limb = small ? 0 : slot / digits;
     const size_t digit_idx = slot % digits;
     const uint64_t modulus = src_moduli[source_limb];
-    const auto descriptor = src_descriptors[source_limb];
+    size_t local_row = poly / src_cols;
+    const size_t block = blocks.locate(local_row);
+    const auto descriptor = blocks.inputs[block][source_limb];
     const uint64_t residue = matrix_load_limb_u64(
-        descriptor.base, poly, coeff, descriptor.stride, descriptor.width);
+        descriptor.base, local_row * src_cols + poly % src_cols, coeff, descriptor.stride, descriptor.width);
     int64_t digit = 0;
     if (balanced)
     {
@@ -465,8 +467,7 @@ __global__ void compact_rhs_dif_suffix_kernel(
 
 template <class Word>
 __global__ void compact_accumulate_kernel(
-    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *lhs_descriptors,
-    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out_descriptors,
+    CompactRowBlocks blocks,
     const uint64_t *moduli,
     size_t limb_offset,
     const Word *workspace,
@@ -483,12 +484,13 @@ __global__ void compact_accumulate_kernel(
     const size_t coeff = idx % n;
     const size_t q = idx / n;
     const size_t c = q % out_cols;
-    const size_t row = (q / out_cols) % rows;
+    size_t row = (q / out_cols) % rows;
     const size_t local = q / (rows * out_cols);
     const size_t global = limb_offset + local;
     const uint64_t modulus = moduli[global];
-    const auto lhs_descriptor = lhs_descriptors[global];
-    const auto out_descriptor = out_descriptors[global];
+    const size_t block = blocks.locate(row);
+    const auto lhs_descriptor = blocks.inputs[block][global];
+    const auto out_descriptor = blocks.outputs[block][global];
     uint64_t acc = 0;
     if (lazy_reduce)
     {
@@ -1008,7 +1010,7 @@ extern "C" int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *
         cudaMemcpyDeviceToDevice, out->stream);
     if (err != cudaSuccess) return set_error(err);
     if (small_record(out, out->stream) != 0) return 1;
-    return small_track_consumer(src, out->stream);
+    return small_track_consumer(src, out->stream, out->write_done);
 }
 
 extern "C" int gpu_small_matrix_copy_columns(
@@ -1032,7 +1034,7 @@ extern "C" int gpu_small_matrix_copy_columns(
         out->cols * column_bytes, out->rows, cudaMemcpyDeviceToDevice, out->stream);
     if (err != cudaSuccess) return set_error(err);
     if (small_record(out, out->stream) != 0) return 1;
-    return small_track_consumer(src, out->stream);
+    return small_track_consumer(src, out->stream, out->write_done);
 }
 
 extern "C" int gpu_small_matrix_view_columns(
@@ -1122,7 +1124,8 @@ extern "C" int gpu_small_matrix_store_coefficients(
 }
 
 extern "C" int gpu_small_matrix_decompose_base(
-    const GpuMatrix *src,
+    const GpuMatrix *const *sources,
+    size_t block_count,
     uint32_t base_bits,
     int small_mode,
     const uint64_t *max_coefficient_bound,
@@ -1130,6 +1133,9 @@ extern "C" int gpu_small_matrix_decompose_base(
     GpuSmallMatrix *out,
     size_t dropped_moduli)
 {
+    if (!sources || block_count == 0 || block_count > kCompactRowBlocks)
+        return set_error("invalid compact decomposition blocks");
+    const GpuMatrix *src = sources[0];
     if (!src || !out || !src->ctx || src->ctx != out->ctx || !max_coefficient_bound ||
         bound_word_count == 0 || base_bits == 0 || base_bits >= 63 ||
         (small_mode != 0 && small_mode != 1) || src->format != GPU_POLY_FORMAT_COEFF)
@@ -1137,6 +1143,17 @@ extern "C" int gpu_small_matrix_decompose_base(
     const size_t limbs = static_cast<size_t>(src->level + 1);
     if (src->level < 0 || limbs == 0 || limbs > kMaxSmallLimbCount || src->ctx->limb_gpu_ids.size() < limbs)
         return set_error("invalid compact decomposition level");
+    CompactRowBlocks blocks{};
+    size_t rows = 0;
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        const auto *source = sources[block];
+        if (!source || source->ctx != src->ctx || source->level != src->level ||
+            source->format != GPU_POLY_FORMAT_COEFF || source->cols != src->cols ||
+            !small_add_size(rows, source->rows, &rows))
+            return set_error("incompatible compact decomposition block");
+        blocks.ends[block] = rows;
+    }
     uint32_t crt_bits = 0;
     for (size_t limb = 0; limb < limbs; ++limb)
         crt_bits = std::max(crt_bits, bit_width_u64(src->ctx->moduli[limb]));
@@ -1144,7 +1161,7 @@ extern "C" int gpu_small_matrix_decompose_base(
     const bool small = small_mode != 0;
     if (dropped_moduli >= limbs) return set_error("invalid dropped_moduli");
     size_t expected_rows = 0;
-    if (!small_mul_size(src->rows, digits, &expected_rows) ||
+    if (!small_mul_size(rows, digits, &expected_rows) ||
         (!small && !small_mul_size(expected_rows, limbs - dropped_moduli, &expected_rows)))
         return set_error("compact decomposition shape overflow");
     const uint64_t base = uint64_t{1} << base_bits;
@@ -1159,19 +1176,24 @@ extern "C" int gpu_small_matrix_decompose_base(
         return set_error("compact decomposition bound metadata mismatch");
     cudaStream_t stream = out->stream;
     size_t dispatch_slot = std::numeric_limits<size_t>::max();
-    for (size_t limb = 0; limb < limbs; ++limb)
+    for (size_t block = 0; block < block_count; ++block)
     {
-        const dim3 id = src->ctx->limb_gpu_ids[limb];
-        int limb_device = -1;
-        if (matrix_limb_device(src, id, &limb_device) != 0 || limb_device != out->device ||
-            id.x >= src->shared_limb_buffers.size() ||
-            !src->shared_limb_buffers[id.x].device_descriptors ||
-            id.y >= src->shared_limb_buffers[id.x].limb_count)
-            return set_error("compact decomposition requires one device");
-        if (limb == 0) dispatch_slot = static_cast<size_t>(id.x);
-        else if (id.x != dispatch_slot)
-            return set_error("compact decomposition requires one device");
-        if (matrix_wait_limb_stream(src, id, out->device, stream) != 0) return 1;
+        const auto *source = sources[block];
+        for (size_t limb = 0; limb < limbs; ++limb)
+        {
+            const dim3 id = source->ctx->limb_gpu_ids[limb];
+            int limb_device = -1;
+            if (matrix_limb_device(source, id, &limb_device) != 0 || limb_device != out->device ||
+                id.x >= source->shared_limb_buffers.size() ||
+                !source->shared_limb_buffers[id.x].device_descriptors ||
+                id.y >= source->shared_limb_buffers[id.x].limb_count)
+                return set_error("compact decomposition requires one device");
+            if (limb == 0) dispatch_slot = static_cast<size_t>(id.x);
+            else if (id.x != dispatch_slot)
+                return set_error("compact decomposition requires one device");
+        }
+        if (matrix_wait_all_limb_streams(source, out->device, stream, true, true) != 0) return 1;
+        blocks.inputs[block] = source->shared_limb_buffers[dispatch_slot].device_descriptors;
     }
     if (dispatch_slot >= src->ctx->ntt_device_constants.size())
         return set_error("missing compact decomposition constants");
@@ -1179,28 +1201,27 @@ extern "C" int gpu_small_matrix_decompose_base(
     if (constants.device != out->device || constants.limb_count < limbs || !constants.moduli)
         return set_error("invalid compact decomposition constants");
     size_t poly_count = 0;
-    if (!small_mul_size(src->rows, src->cols, &poly_count))
+    if (!small_mul_size(rows, src->cols, &poly_count))
         return set_error("compact decomposition polynomial count overflow");
     const size_t slots = digits * (small ? 1 : limbs - dropped_moduli);
     const dim3 grid((out->n + kSmallThreads - 1) / kSmallThreads,
                     static_cast<uint32_t>(poly_count), static_cast<uint32_t>(slots));
     compact_decompose_kernel<<<grid, kSmallThreads, 0, stream>>>(
-        src->shared_limb_buffers[dispatch_slot].device_descriptors, constants.moduli, out->payload,
-        src->rows, src->cols, out->rows, out->n, digits, out->magnitude_bytes, base_bits, !small, small);
-    cudaError_t err = cudaGetLastError();
-    if (err == cudaSuccess)
+        blocks, constants.moduli, out->payload,
+        rows, src->cols, out->rows, out->n, digits, out->magnitude_bytes, base_bits, !small, small);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess || small_record(out, stream) != 0)
     {
-        for (size_t limb = 0; limb < limbs; ++limb)
-        {
-            if (matrix_track_limb_consumer_readonly(src, src->ctx->limb_gpu_ids[limb], out->device, stream) != 0)
-            {
-                err = cudaErrorInvalidResourceHandle;
-                break;
-            }
-        }
+        (void)small_fence_stream_with_event(stream);
+        return err != cudaSuccess ? set_error(err) : 1;
     }
-    if (err != cudaSuccess) return set_error(err);
-    return small_record(out, stream);
+    for (size_t block = 0; block < block_count; ++block)
+        if (matrix_track_all_limb_consumers(sources[block], out->device, stream, out->write_done, true, true) != 0)
+        {
+            (void)small_fence_stream_with_event(stream);
+            return 1;
+        }
+    return 0;
 }
 
 extern "C" int gpu_small_matrix_prepare_preimage_hard_cutoff(GpuSmallMatrix *mat)
@@ -1264,7 +1285,7 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         if (limb == 0) dispatch_slot = static_cast<size_t>(id.x);
         else if (static_cast<size_t>(id.x) != dispatch_slot)
             return set_error("compact tile active CRT limbs span devices");
-        if (id.y != limb || matrix_wait_limb_stream(src, id, dst->device, dst->stream) != 0)
+        if (id.y != limb || matrix_wait_limb_stream(src, id, dst->device, dst->stream, true, true) != 0)
             return set_error("invalid compact tile active CRT limb");
     }
     if (dispatch_slot >= src->shared_limb_buffers.size() ||
@@ -1341,12 +1362,17 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
 }
 
 extern "C" int gpu_matrix_mul_small_rhs(
-    GpuMatrix *out,
-    const GpuMatrix *lhs_eval,
+    GpuMatrix *const *outputs,
+    const GpuMatrix *const *inputs,
+    size_t block_count,
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
     GpuSmallMatrixAllocationReport *allocation_report)
 {
+    if (!outputs || !inputs || block_count == 0 || block_count > kCompactRowBlocks)
+        return set_error("invalid compact multiplication blocks");
+    GpuMatrix *out = outputs[0];
+    const GpuMatrix *lhs_eval = inputs[0];
     if (!out || !lhs_eval || !rhs_small || !out->ctx || out->ctx != lhs_eval->ctx || out->ctx != rhs_small->ctx ||
         lhs_eval->format != GPU_POLY_FORMAT_EVAL || out->format != GPU_POLY_FORMAT_EVAL ||
         lhs_eval->cols != rhs_small->rows || out->rows != lhs_eval->rows || out->cols != rhs_small->cols ||
@@ -1357,46 +1383,65 @@ extern "C" int gpu_matrix_mul_small_rhs(
         out->ctx->limb_gpu_ids.size() < limbs || out->ctx->N < 2 ||
         !is_power_of_two_u32(static_cast<uint32_t>(out->ctx->N)))
         return set_error("invalid compact RHS multiplication level");
+    CompactRowBlocks blocks{};
+    size_t rows = 0;
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        const auto *left = inputs[block];
+        const auto *output = outputs[block];
+        if (!left || !output || left->ctx != lhs_eval->ctx || output->ctx != out->ctx ||
+            left->level != lhs_eval->level || output->level != out->level ||
+            left->format != GPU_POLY_FORMAT_EVAL || output->format != GPU_POLY_FORMAT_EVAL ||
+            left->cols != lhs_eval->cols || output->cols != out->cols || output->rows != left->rows ||
+            !small_add_size(rows, left->rows, &rows))
+            return set_error("incompatible compact multiplication block");
+        blocks.ends[block] = rows;
+    }
     if (small_set_device(rhs_small) != 0) return 1;
     cudaStream_t stream = nullptr;
     int dispatch_device = -1;
     size_t dispatch_slot = std::numeric_limits<size_t>::max();
-    for (size_t limb = 0; limb < limbs; ++limb)
+    for (size_t block = 0; block < block_count; ++block)
     {
-        const dim3 id = out->ctx->limb_gpu_ids[limb];
-        if (id.x >= out->shared_limb_buffers.size())
-            return set_error("invalid compact multiplication limb partition");
-        int lhs_device = -1;
-        int out_device = -1;
-        size_t lhs_stride = 0;
-        size_t out_stride = 0;
-        uint8_t lhs_width = 0;
-        uint8_t out_width = 0;
-        if (matrix_limb_device(lhs_eval, id, &lhs_device) != 0 || matrix_limb_device(out, id, &out_device) != 0 ||
-            lhs_device != rhs_small->device || out_device != rhs_small->device ||
-            id.y >= lhs_eval->shared_limb_buffers[id.x].limb_count ||
-            id.y >= out->shared_limb_buffers[id.x].limb_count ||
-            !lhs_eval->shared_limb_buffers[id.x].device_descriptors ||
-            !out->shared_limb_buffers[id.x].device_descriptors ||
-            !matrix_limb_metadata_by_id(lhs_eval, id, &lhs_stride, &lhs_width) ||
-            !matrix_limb_metadata_by_id(out, id, &out_stride, &out_width))
-            return set_error("compact RHS multiplication requires one placement");
-        if (limb == 0)
+        const auto *lhs_eval = inputs[block];
+        auto *out = outputs[block];
+        for (size_t limb = 0; limb < limbs; ++limb)
         {
-            dispatch_device = out_device;
-            dispatch_slot = static_cast<size_t>(id.x);
-            if (matrix_limb_stream(out, id, &stream) != 0) return 1;
+            const dim3 id = out->ctx->limb_gpu_ids[limb];
+            if (id.x >= out->shared_limb_buffers.size())
+                return set_error("invalid compact multiplication limb partition");
+            int lhs_device = -1;
+            int out_device = -1;
+            size_t lhs_stride = 0;
+            size_t out_stride = 0;
+            uint8_t lhs_width = 0;
+            uint8_t out_width = 0;
+            if (matrix_limb_device(lhs_eval, id, &lhs_device) != 0 || matrix_limb_device(out, id, &out_device) != 0 ||
+                lhs_device != rhs_small->device || out_device != rhs_small->device ||
+                id.y >= lhs_eval->shared_limb_buffers[id.x].limb_count ||
+                id.y >= out->shared_limb_buffers[id.x].limb_count ||
+                !lhs_eval->shared_limb_buffers[id.x].device_descriptors ||
+                !out->shared_limb_buffers[id.x].device_descriptors ||
+                !matrix_limb_metadata_by_id(lhs_eval, id, &lhs_stride, &lhs_width) ||
+                !matrix_limb_metadata_by_id(out, id, &out_stride, &out_width))
+                return set_error("compact RHS multiplication requires one placement");
+            if (block == 0 && limb == 0)
+            {
+                dispatch_device = out_device;
+                dispatch_slot = static_cast<size_t>(id.x);
+                if (matrix_limb_stream(out, id, &stream) != 0) return 1;
+            }
+            else if (out_device != dispatch_device)
+                return set_error("compact RHS multiplication requires one device");
         }
-        else if (out_device != dispatch_device)
-            return set_error("compact RHS multiplication requires one device");
-        if (matrix_wait_limb_stream(lhs_eval, id, rhs_small->device, stream) != 0 ||
-            matrix_wait_limb_stream(out, id, rhs_small->device, stream) != 0)
-            return 1;
+        if (matrix_wait_all_limb_streams(lhs_eval, rhs_small->device, stream, true, true) != 0 ||
+            matrix_wait_all_limb_streams(out, rhs_small->device, stream, true) != 0) return 1;
+        blocks.inputs[block] = lhs_eval->shared_limb_buffers[dispatch_slot].device_descriptors;
+        blocks.outputs[block] = out->shared_limb_buffers[dispatch_slot].device_descriptors;
     }
     if (!stream) return set_error("missing compact multiplication stream");
     if (small_wait(rhs_small, stream) != 0) return 1;
     const size_t n = rhs_small->n;
-    const size_t rows = lhs_eval->rows;
     const size_t inner = lhs_eval->cols;
     const size_t cols = rhs_small->cols;
     if (dispatch_slot >= out->ctx->ntt_device_constants.size())
@@ -1406,10 +1451,6 @@ extern "C" int gpu_matrix_mul_small_rhs(
         constants.limb_count < limbs || !constants.twiddle_forward ||
         !constants.twiddle_shoup_forward || !constants.moduli)
         return set_error("missing compact multiplication NTT constants");
-    const auto *lhs_descriptors = lhs_eval->shared_limb_buffers[dispatch_slot].device_descriptors;
-    const auto *out_descriptors = out->shared_limb_buffers[dispatch_slot].device_descriptors;
-    if (!lhs_descriptors || !out_descriptors)
-        return set_error("missing compact multiplication matrix descriptors");
 
     struct LimbGroup
     {
@@ -1467,17 +1508,21 @@ extern "C" int gpu_matrix_mul_small_rhs(
         if (failure == cudaSuccess) failure = cleanup_err;
         return set_error(failure);
     };
-    GpuMatrixAllocationBytes lhs_allocation{};
-    GpuMatrixAllocationBytes output_allocation{};
-    if (gpu_matrix_query_allocation_bytes(
-            lhs_eval->ctx, lhs_eval->level, lhs_eval->rows, lhs_eval->cols,
-            lhs_eval->format, &lhs_allocation) != 0 ||
-        gpu_matrix_query_allocation_bytes(
-            out->ctx, out->level, out->rows, out->cols,
-            out->format, &output_allocation) != 0)
-        return 1;
-    const size_t lhs_eval_bytes = lhs_allocation.total_bytes;
-    const size_t full_output_bytes = output_allocation.total_bytes;
+    size_t lhs_eval_bytes = 0;
+    size_t full_output_bytes = 0;
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        GpuMatrixAllocationBytes lhs_allocation{}, output_allocation{};
+        const auto *left = inputs[block];
+        const auto *output = outputs[block];
+        if (gpu_matrix_query_allocation_bytes(left->ctx, left->level, left->rows, left->cols,
+                left->format, &lhs_allocation) != 0 ||
+            gpu_matrix_query_allocation_bytes(output->ctx, output->level, output->rows, output->cols,
+                output->format, &output_allocation) != 0 ||
+            !small_add_size(lhs_eval_bytes, lhs_allocation.total_bytes, &lhs_eval_bytes) ||
+            !small_add_size(full_output_bytes, output_allocation.total_bytes, &full_output_bytes))
+            return set_error("compact block allocation overflow");
+    }
     size_t workspace_words_per_limb = 0;
     size_t workspace_u32_words = 0;
     size_t workspace_u64_words = 0;
@@ -1612,11 +1657,11 @@ extern "C" int gpu_matrix_mul_small_rhs(
                 if (!small_mul_size(group.limb_count, poly_count, &butterflies) ||
                     !small_mul_size(butterflies, n / 2, &butterflies))
                     return fail(cudaErrorInvalidConfiguration);
-                const size_t blocks =
+                const size_t grid_blocks =
                     (butterflies + kSmallThreads - 1) / kSmallThreads;
-                if (blocks > std::numeric_limits<uint32_t>::max())
+                if (grid_blocks > std::numeric_limits<uint32_t>::max())
                     return fail(cudaErrorInvalidConfiguration);
-                const dim3 grid(static_cast<uint32_t>(blocks));
+                const dim3 grid(static_cast<uint32_t>(grid_blocks));
                 if (group.narrow)
                 {
                     uint32_t *group_workspace =
@@ -1679,16 +1724,16 @@ extern "C" int gpu_matrix_mul_small_rhs(
                 !small_mul_size(output_words, cols, &output_words) ||
                 !small_mul_size(output_words, n, &output_words))
                 return fail(cudaErrorInvalidConfiguration);
-            const size_t blocks = (output_words + kSmallThreads - 1) / kSmallThreads;
-            if (blocks > std::numeric_limits<uint32_t>::max())
+            const size_t grid_blocks = (output_words + kSmallThreads - 1) / kSmallThreads;
+            if (grid_blocks > std::numeric_limits<uint32_t>::max())
                 return fail(cudaErrorInvalidConfiguration);
-            const dim3 grid(static_cast<uint32_t>(blocks));
+            const dim3 grid(static_cast<uint32_t>(grid_blocks));
             if (group.narrow)
             {
                 const uint32_t *group_workspace =
                     workspace_u32 + group.typed_limb_offset * workspace_words_per_limb;
                 compact_accumulate_kernel<<<grid, kSmallThreads, 0, stream>>>(
-                    lhs_descriptors, out_descriptors, constants.moduli,
+                    blocks, constants.moduli,
                     group.limb_offset, group_workspace, group.limb_count,
                     rows, inner, cols, n, lazy_reduce);
             }
@@ -1697,7 +1742,7 @@ extern "C" int gpu_matrix_mul_small_rhs(
                 const uint64_t *group_workspace =
                     workspace_u64 + group.typed_limb_offset * workspace_words_per_limb;
                 compact_accumulate_kernel<<<grid, kSmallThreads, 0, stream>>>(
-                    lhs_descriptors, out_descriptors, constants.moduli,
+                    blocks, constants.moduli,
                     group.limb_offset, group_workspace, group.limb_count,
                     rows, inner, cols, n, lazy_reduce);
             }
@@ -1706,13 +1751,17 @@ extern "C" int gpu_matrix_mul_small_rhs(
         }
     }
     if (err != cudaSuccess) return fail(err);
-    for (size_t limb = 0; limb < limbs; ++limb)
-    {
-        if (matrix_track_limb_consumer_readonly(lhs_eval, out->ctx->limb_gpu_ids[limb], rhs_small->device, stream) != 0 ||
-            matrix_record_limb_write(out, out->ctx->limb_gpu_ids[limb], stream) != 0)
+    for (size_t block = 0; block < block_count; ++block)
+        if (matrix_record_all_limb_writes(outputs[block], stream, true) != 0)
             return fail(cudaErrorInvalidResourceHandle);
-    }
-    if (small_track_consumer(rhs_small, stream) != 0) return fail(cudaErrorInvalidResourceHandle);
+    const dim3 first = out->ctx->limb_gpu_ids[0];
+    const auto &states = out->exec_limb_states[first.x];
+    const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+    for (size_t block = 0; block < block_count; ++block)
+        if (matrix_track_all_limb_consumers(inputs[block], rhs_small->device, stream, completion, true, true) != 0)
+            return fail(cudaErrorInvalidResourceHandle);
+    if (small_track_consumer(rhs_small, stream, completion) != 0)
+        return fail(cudaErrorInvalidResourceHandle);
     const cudaError_t cleanup_err = release();
     if (cleanup_err != cudaSuccess) return set_error(cleanup_err);
     return 0;

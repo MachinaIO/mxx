@@ -20,7 +20,7 @@ pub(super) fn prepare(validated: &ValidatedGraph, mut plan: RootBlockAliases) ->
         let id = NodeId(position as u64);
         if plan.slices.contains(&id) ||
             plan.concats.contains_key(&id) ||
-            plan.add_concats.contains(&id) ||
+            plan.row_block_concats.contains(&id) ||
             plan.row_sum_interiors.contains(&id)
         {
             continue;

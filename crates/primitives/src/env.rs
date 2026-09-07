@@ -47,6 +47,13 @@ pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
     positive_usize("MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS", 64)
 }
 
+/// Repetitions of paired compact-operation library measurements. Each sample
+/// includes submission and result completion; setup and validation are separate.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn compact_operation_test_repeats() -> usize {
+    positive_usize("MXX_PRIMITIVE_TEST_REPEATS", 3).unwrap()
+}
+
 #[cfg(test)]
 pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
     // Small unit-test defaults; overrides permit the same production path to

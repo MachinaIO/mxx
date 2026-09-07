@@ -1,3 +1,6 @@
+#include <cudaTypedefs.h>
+#include <string>
+
 namespace
 {
     enum class BlockOp
@@ -314,6 +317,58 @@ namespace
         }
     }
 
+    template <bool SeparatePolynomials>
+    int launch_tensor_row_sum_driver(
+        TensorRowSumMetadata &metadata, size_t lhs_cols, size_t rhs_rows,
+        size_t rhs_cols, size_t poly_count, size_t n, dim3 grid, cudaStream_t stream)
+    {
+        thread_local void *launch_entry = nullptr;
+        thread_local void *context_id_entry = nullptr;
+        if (!launch_entry)
+        {
+            const cudaError_t error = cudaGetDriverEntryPointByVersion(
+                "cuLaunchKernel", &launch_entry, 12000, cudaEnableLegacyStream);
+            if (error != cudaSuccess) return set_error(error);
+            if (!launch_entry) return set_error("cuLaunchKernel entry point unavailable");
+        }
+        if (!context_id_entry)
+        {
+            const cudaError_t error = cudaGetDriverEntryPointByVersion(
+                "cuCtxGetId", &context_id_entry, 12000, cudaEnableLegacyStream);
+            if (error != cudaSuccess) return set_error(error);
+            if (!context_id_entry) return set_error("cuCtxGetId entry point unavailable");
+        }
+        unsigned long long context_id = 0;
+        CUresult result = reinterpret_cast<PFN_cuCtxGetId_v12000>(context_id_entry)(
+            nullptr, &context_id);
+        if (result != CUDA_SUCCESS) return set_error("cuCtxGetId failed");
+        // Unlike a context pointer or device ordinal, this ID is unique for the
+        // process lifetime, including after device reset and context recreation.
+        thread_local unsigned long long cached_context_id = 0;
+        thread_local cudaFunction_t function = nullptr;
+        if (!function || cached_context_id != context_id)
+        {
+            cudaFunction_t resolved = nullptr;
+            const cudaError_t error = cudaGetFuncBySymbol(&resolved,
+                reinterpret_cast<const void *>(tensor_sum_rows_all_limbs_kernel<SeparatePolynomials>));
+            if (error != cudaSuccess) return set_error(error);
+            function = resolved;
+            cached_context_id = context_id;
+        }
+        void *arguments[] = {&metadata, &lhs_cols, &rhs_rows, &rhs_cols, &poly_count, &n};
+        result = reinterpret_cast<PFN_cuLaunchKernel_v4000>(launch_entry)(
+            reinterpret_cast<CUfunction>(function), grid.x, grid.y, grid.z,
+            256, 1, 1, 0, reinterpret_cast<CUstream>(stream), arguments, nullptr);
+        if (result != CUDA_SUCCESS)
+        {
+            // An asynchronous error may be reported here. Protect owners before
+            // returning without the normal output and reader completion joins.
+            cudaStreamSynchronize(stream);
+            return set_error(("cuLaunchKernel failed: " + std::to_string(result)).c_str());
+        }
+        return 0;
+    }
+
     int launch_descriptor_product(
         GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, bool tensor,
         const size_t *rows = nullptr, const size_t *offsets = nullptr,
@@ -357,9 +412,9 @@ namespace
         }
         // The descriptor partition checks above establish one selected device
         // for the entire submission. Nested helpers retain all event joins.
-        status = matrix_wait_all_limb_streams(lhs, device, stream, true);
+        status = matrix_wait_all_limb_streams(lhs, device, stream, true, true);
         if (status != 0) return status;
-        status = matrix_wait_all_limb_streams(rhs, device, stream, true);
+        status = matrix_wait_all_limb_streams(rhs, device, stream, true, true);
         if (status != 0) return status;
         status = matrix_wait_all_limb_streams(out, device, stream, true);
         if (status != 0) return status;
@@ -396,14 +451,16 @@ namespace
                     const dim3 grouped_grid(static_cast<unsigned int>((n + 255) / 256),
                         static_cast<unsigned int>(std::min(poly_count, size_t{65535})),
                         static_cast<unsigned int>(limb_count));
-                    tensor_sum_rows_all_limbs_kernel<true><<<grouped_grid, 256, 0, stream>>>(
-                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n);
+                    status = launch_tensor_row_sum_driver<true>(
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grouped_grid, stream);
+                    if (status != 0) return status;
                 }
                 else
                 {
                     // Pack tiny polynomials together to retain full thread blocks.
-                    tensor_sum_rows_all_limbs_kernel<false><<<grid, 256, 0, stream>>>(
-                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n);
+                    status = launch_tensor_row_sum_driver<false>(
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grid, stream);
+                    if (status != 0) return status;
                 }
             }
             else
@@ -1294,12 +1351,12 @@ namespace
         {
             return set_error(err);
         }
-        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream);
+        status = matrix_wait_limb_stream(lhs, limb_id, out_device, stream, false, true);
         if (status != 0)
         {
             return status;
         }
-        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream, false, true);
         if (status != 0)
         {
             return status;
@@ -1502,12 +1559,12 @@ namespace
         {
             return set_error(err);
         }
-        status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream);
+        status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream, false, true);
         if (status != 0)
         {
             return status;
         }
-        status = matrix_wait_all_limb_streams(rhs, dispatch_device, dispatch_stream);
+        status = matrix_wait_all_limb_streams(rhs, dispatch_device, dispatch_stream, false, true);
         if (status != 0)
         {
             return status;
@@ -1705,12 +1762,12 @@ namespace
         {
             return set_error(err);
         }
-        status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream);
+        status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream, false, true);
         if (status != 0)
         {
             return status;
         }
-        status = matrix_wait_all_limb_streams(scalar, dispatch_device, dispatch_stream);
+        status = matrix_wait_all_limb_streams(scalar, dispatch_device, dispatch_stream, false, true);
         if (status != 0)
         {
             return status;
@@ -1881,7 +1938,7 @@ namespace
         {
             return set_error(err);
         }
-        status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream);
+        status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream, false, true);
         if (status != 0)
         {
             return status;
@@ -2054,7 +2111,7 @@ namespace
         {
             return set_error(err);
         }
-        status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream);
+        status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream, false, true);
         if (status != 0)
         {
             return status;
@@ -2153,12 +2210,12 @@ namespace
         // A write to lhs may have been dispatched on a temporary work stream
         // (for example compact deserialization), so its ordinary limb stream
         // is not necessarily ordered after the latest write event.
-        status = matrix_wait_limb_stream(lhs, limb_id, lhs_device, stream);
+        status = matrix_wait_limb_stream(lhs, limb_id, lhs_device, stream, false, true);
         if (status != 0)
         {
             return status;
         }
-        status = matrix_wait_limb_stream(rhs, limb_id, lhs_device, stream);
+        status = matrix_wait_limb_stream(rhs, limb_id, lhs_device, stream, false, true);
         if (status != 0)
         {
             return status;
@@ -2485,7 +2542,7 @@ extern "C" int gpu_matrix_transpose(GpuMatrix *out, const GpuMatrix *source)
             return set_error("transpose descriptors span partitions");
         metadata.indices[limb] = id.y;
     }
-    status = matrix_wait_all_limb_streams(source, device, stream);
+    status = matrix_wait_all_limb_streams(source, device, stream, false, true);
     if (status != 0) return status;
     status = matrix_wait_all_limb_streams(out, device, stream);
     if (status != 0) return status;
@@ -2560,7 +2617,7 @@ extern "C" int gpu_matrix_sum_rows(
         metadata.indices[limb] = id.y;
         metadata.moduli[limb] = source->ctx->moduli[limb];
     }
-    status = matrix_wait_all_limb_streams(source, device, stream);
+    status = matrix_wait_all_limb_streams(source, device, stream, false, true);
     if (status != 0) return status;
     status = matrix_wait_all_limb_streams(out, device, stream);
     if (status != 0) return status;
@@ -2633,7 +2690,7 @@ extern "C" int gpu_matrix_add_row_blocks(
             else if (*descriptors != buffer.device_descriptors)
                 return set_error("row block descriptors span partitions");
         }
-        return matrix_wait_all_limb_streams(matrix, device, stream);
+        return matrix_wait_all_limb_streams(matrix, device, stream, false, matrix != out);
     };
     status = prepare(out, &metadata.out);
     if (status != 0) return status;
@@ -2728,6 +2785,7 @@ extern "C" int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const Gpu
 
 extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !lhs || !rhs)
     {
         return set_error("invalid gpu_matrix_mul arguments");

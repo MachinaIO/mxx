@@ -722,6 +722,7 @@ extern "C" int gpu_matrix_wait(const GpuMatrix *mat)
             }
         }
     }
+    mat->host_observed_writer_ready.store(true, std::memory_order_release);
     return 0;
 }
 
@@ -816,6 +817,7 @@ extern "C" int gpu_matrix_copy_block(
 
 extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied)
 {
+    if (dst) dst->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!dst || !src || !out_copied || !dst->ctx || !src->ctx)
     {
         return set_error("invalid gpu_matrix_copy_peer arguments");

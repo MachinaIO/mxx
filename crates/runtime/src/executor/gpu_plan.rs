@@ -100,6 +100,87 @@ mod tests {
     };
 
     #[test]
+    #[serial_test::serial]
+    fn test_gpu_resident_row_sum_dispatch_releases_input_owners() {
+        use crate::{
+            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend, execute,
+            gpu_calibration::GpuColumnWidths, transcript::SamplingMode,
+        };
+        use mxx_primitives::{
+            matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+            poly::{
+                PolyParams,
+                dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
+            },
+            sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().expect("ring dimension"))
+            .unwrap_or(32);
+        let parameters = DCRTPolyParams::new(n, 4, 54, 8, None, None);
+        let ring = Ring::new(parameters.modulus().as_ref().clone(), n as usize);
+        let gpu_parameters = GpuDCRTPolyParams::new(n, parameters.to_crt().0, 8, None);
+        let mut backend = gpu_backend([gpu_parameters.clone()]);
+        for (left_columns, right_columns) in [(1, 1), (3, 2)] {
+            let tensor = ring
+                .input("left", (2, left_columns))
+                .tensor(ring.input("right", (2, right_columns)));
+            let row = |index: usize| {
+                tensor
+                    .clone()
+                    .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+            };
+            let output = Mat::concat(ConcatAxis::Rows, vec![row(0), row(1) + row(2), row(3)]);
+            let graph = DslContext::new("resident-row-sum-lifetime")
+                .output("out", output)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let plan = super::super::root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+            let (node, _) = plan.input_row_sum.as_ref().expect("resident dispatch plan");
+            let operation = plan.calibration[node].as_ref().unwrap().unwrap();
+            backend.set_column_widths_for_operation(
+                operation,
+                GpuColumnWidths { gpu0: left_columns * right_columns, nonzero: None },
+            );
+            let sampler = DCRTPolyUniformSampler::new();
+            let left = sampler.sample_uniform(&parameters, 2, left_columns, DistType::FinRingDist);
+            let right =
+                sampler.sample_uniform(&parameters, 2, right_columns, DistType::FinRingDist);
+            let expected = left.tensor(&right).sum_rows(&[vec![0], vec![1, 2], vec![3]]);
+            // No GPU input owners survive execute, and no host wait precedes it.
+            let inputs = BTreeMap::from([
+                (
+                    "left".into(),
+                    RuntimeValue::matrix(
+                        GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &left).into(),
+                    ),
+                ),
+                (
+                    "right".into(),
+                    RuntimeValue::matrix(
+                        GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &right).into(),
+                    ),
+                ),
+            ]);
+            let mut store = MemoryArtifactStore::default();
+            let mut result =
+                execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
+            let RuntimeValue::Matrix(output) =
+                result.materialize_output("out", &backend, &mut store).unwrap()
+            else {
+                panic!("matrix output")
+            };
+            assert_eq!(output.shards().len(), 1);
+            let transposed = output.shards()[0].value.transpose();
+            drop(result);
+            assert_eq!(transposed.to_cpu_matrix(), expected.transpose());
+        }
+    }
+
+    #[test]
     fn root_cached_calibration_matches_direct_fused_identities() {
         let ring = Ring::new(97u64, 8usize);
         let source = ring.input("source", (4, 2));

@@ -391,6 +391,7 @@ static int gpu_matrix_sample_distribution_impl(
     size_t full_ncol,
     size_t col_offset)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out)
     {
         return set_error("invalid gpu_matrix_sample_distribution arguments");

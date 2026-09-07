@@ -413,6 +413,7 @@ static int gpu_matrix_fill_sparse_constant_columns_impl(
     size_t global_column_start,
     bool identity)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !out->ctx || out->level < 0)
         return set_error("invalid ranged constant output");
     if ((identity && out->rows != total_columns) || (!identity && out->rows != 1) ||
@@ -491,6 +492,7 @@ static int gpu_matrix_fill_gadget_columns_impl(
     size_t global_column_start,
     size_t dropped_moduli)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out)
     {
         return set_error("invalid gpu_matrix_fill_gadget arguments");

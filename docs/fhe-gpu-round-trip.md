@@ -629,3 +629,44 @@ The changes did not establish a consistent improvement: the medians moved approx
 The candidate passed 579 CPU unit tests, 40 targeted primitive GPU checks, five fleet GPU checks, six BGV round trips, and three Ring-GSW round trips. The primitive checks covered four/five active limbs, 36/54/60-bit residues, N=32/N=8192, and existing lifetime cases. Fleet checks covered complete and partitioned waves. Ignored tests were not run, and the full GPU workspace unit suite was not rerun for this rejected candidate.
 
 [Explicit pooling inputs](benchmarks/fhe-gpu/compact-launch-experiment-inputs.json), [all samples and pooled measurements](benchmarks/fhe-gpu/compact-launch-experiment-measurements.json), and [candidate source/binary hashes and validation scope](benchmarks/fhe-gpu/compact-launch-experiment-validation.json) preserve the experiment. Its 39 rows are appended to [the timing history](benchmarks/fhe-gpu/timings.csv); they describe the rejected candidate, not the restored implementation. The unapplied source patch and raw logs are retained locally under `test_data/fhe-round-trip/optimization/compact-launch/`.
+
+### Resident input dispatch checkpoint
+
+The executor now dispatches a whole root directly when its existing fusion plan reduces it to resident matrix inputs and one row-sum operation (including tensor row sums). This removes per-node value maps, captures and temporary matrix-owner clones for that case. It preserves the original graph identity, calibration operation, input placement, output persistence and total structural node count. Traced execution, progress logging, configured release fences, lazy/staged inputs and graphs with other producers keep their ordinary dispatch. Resident output retrieval also keeps the existing matrix owner in place instead of cloning and reinserting it into the output map. These are generic runtime changes; no BGV-specific primitive is added.
+
+A temporary diagnostic alternated ordinary and direct dispatch within one process, using the same ciphertexts and CUDA implementation. Four warmups preceded 200 measurements in the order ordinary/direct/direct/ordinary, giving 100 samples per path and 50 balanced blocks. Every sample retained the existing full execute/output retrieval/result-event-wait timer and output equality check; an independent counter verified the requested dispatch path. Both presets favored direct dispatch in 48 of 50 blocks:
+
+| Preset | Ordinary dispatch median (seconds) | Direct dispatch median (seconds) | Median balanced-block ratio |
+| --- | ---: | ---: | ---: |
+| bgv-54 | 0.000057824 | 0.000049298 | 0.8517 |
+| bgv-36 | 0.0000632845 | 0.000053531 | 0.8505 |
+
+This establishes an approximately 15% improvement from shortening host dispatch. The later output-retrieval change is excluded from that attribution. The diagnostic controls and logging were removed before building the normal implementation. [All diagnostic samples and paired blocks](benchmarks/fhe-gpu/resident-dispatch-diagnostic.json) retain the experiment.
+
+Fresh, uninstrumented runs of the normal implementation (including resident output retrieval) and PhantomFHE used 100 samples per operation and preset on the same RTX 4080 SUPER, UUID `GPU-f1006e1c-3739-7004-3ba4-33d546a72345`:
+
+| Preset | mxx multiply median (seconds) | PhantomFHE multiply median (seconds) | Ratio |
+| --- | ---: | ---: | ---: |
+| bgv-54 | 0.000047685 | 0.000010600 | 4.499x |
+| bgv-36 | 0.000052424 | 0.000010650 | 4.922x |
+
+The standalone below-2x objective remains **unmet**. The table is one fresh run per preset, not a claim that run-to-run variation has disappeared. Exact Q/P/t, manifests, device identity, sampler differences and security models are checked or recorded by the existing comparison scripts. [Pooling inputs](benchmarks/fhe-gpu/resident-dispatch-inputs.json), [all normal samples](benchmarks/fhe-gpu/resident-dispatch-measurements.json) and [source/binary hashes and validation](benchmarks/fhe-gpu/resident-dispatch-validation.json) identify this intermediate checkpoint. Ten validated rows are appended to [the timing history](benchmarks/fhe-gpu/timings.csv).
+
+Current validation comprises warning-free CPU and GPU workspace library compilation, 69 CPU runtime unit tests, three consecutive GPU lifetime tests at each of N=32 and N=8192, and two normal BGV round trips. The GPU test transfers the last input owners into `execute`, materializes the resident output, queues a transpose without a host wait, drops the producer output, and compares against the existing CPU tensor/row-sum operations. Single-column and multi-column inputs are covered. Ignored tests were not executed. The final 300-consecutive-run stability gate remains pending until the sufficiently optimized final implementation; these screening runs do not replace it.
+
+An earlier candidate compressed tensor-row launch metadata and packed single-column row indices. A matched-process, three-path comparison did not establish an end-to-end gain, so those changes were reverted. At this checkpoint the primitive files exactly matched the preceding writer-ready candidate; the measured improvement above must not be attributed to compact launch arguments, NTT changes or fewer GPU kernels.
+
+### Single-shard serialization checkpoint
+
+Fleet serialization now returns the existing canonical shard encoding when one shard covers the matrix. Construction already guarantees its global shape and coverage. This removes redundant decoding, per-coefficient bit copying and re-encoding without changing the byte format or the multiplication timer. The preceding experimental driver-launch implementation remains in this checkpoint; source and binary hashes identify the complete candidate.
+
+A diagnostic alternated ordinary fleet serialization and existing shard serialization after each timed multiplication. Every output matched the ordinary canonical reference. Grouping each multiplication by the preceding serialization, after excluding four initial samples, gave 50 samples per mode: median multiplication latency was 52.1935 microseconds after ordinary serialization and 23.3845 microseconds after shard serialization. All 25 balanced blocks favored shard serialization. Serialization itself took medians of 11.3038 milliseconds and 0.2130 milliseconds respectively. Thus work outside the timer materially affected the next measurement; this result is not a multiplication-kernel speedup. The internal driver mechanism responsible for this sensitivity is not established. [All diagnostic samples](benchmarks/fhe-gpu/single-shard-diagnostic.json) preserve the comparison.
+
+Normal binaries with the unchanged timing contract produced these fresh 100-sample medians on the same RTX 4080 SUPER and existing manifests:
+
+| Preset | mxx multiply (seconds) | PhantomFHE multiply (seconds) | Ratio |
+| --- | ---: | ---: | ---: |
+| bgv-54 | 0.000019502 | 0.000010520 | 1.854x |
+| bgv-36 | 0.0000197725 | 0.0000108505 | 1.822x |
+
+Both normal runs are below 2x. On the unchanged source, the final input-owner dispatch test and concurrent-reader lifetime test each passed 300 consecutive process runs at N=8192 (600 passes, zero failures). CPU and GPU workspace library compilation were warning-free, 69 CPU runtime tests passed, two existing GPU ownership/materialization tests passed three consecutive runs each, and both normal BGV round trips passed. Ignored tests were not executed. These measurements establish the observed comparison on the recorded device and parameters, not a universal latency guarantee. [Inputs](benchmarks/fhe-gpu/single-shard-inputs.json), [normal samples](benchmarks/fhe-gpu/single-shard-measurements.json), and [source hashes and validation scope](benchmarks/fhe-gpu/single-shard-validation.json) record the evidence. Ten verified rows were appended to the timing history.

@@ -711,6 +711,7 @@ extern "C" int gpu_matrix_load_rns_batch(
     int format,
     GpuEventSet **out_events)
 {
+    if (mat) mat->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!mat || !out_events)
     {
         return set_error("invalid gpu_matrix_load_rns_batch arguments");
@@ -1005,7 +1006,7 @@ extern "C" int gpu_matrix_store_rns_batch(
         {
             return set_error(err);
         }
-        status = matrix_wait_limb_stream(mat, limb_id, device, stream);
+        status = matrix_wait_limb_stream(mat, limb_id, device, stream, false, true);
         if (status != 0)
         {
             return status;
@@ -1171,7 +1172,7 @@ extern "C" int gpu_matrix_store_const_coeff_batch(
         {
             return set_error(err);
         }
-        status = matrix_wait_limb_stream(mat, limb_id, device, stream);
+        status = matrix_wait_limb_stream(mat, limb_id, device, stream, false, true);
         if (status != 0)
         {
             return status;
@@ -1453,7 +1454,7 @@ extern "C" int gpu_poly_store_compact_bytes(
             poly,
             limb_map[limb],
             common_device,
-            work_stream);
+            work_stream, false, true);
         if (wait_status != 0)
         {
             release();

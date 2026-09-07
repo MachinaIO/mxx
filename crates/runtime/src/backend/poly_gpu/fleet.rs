@@ -3643,6 +3643,11 @@ impl Backend for GpuDcrtBackend {
     }
 
     fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
+        // Construction guarantees that a lone shard covers the whole matrix.
+        // Its canonical encoding already has the global shape and bit width.
+        if let [shard] = value.shards.as_slice() {
+            return shard.value.to_compact_bytes();
+        }
         let decoded = value
             .shards
             .iter()

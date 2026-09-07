@@ -385,7 +385,7 @@ extern "C" int gpu_matrix_convert_modulus(
         const dim3 id = source->ctx->limb_gpu_ids[limb];
         if (id.x != 0 || id.y != limb)
             return set_error("unsupported source CRT limb placement");
-        status = matrix_wait_limb_stream(source, id, output.device, stream);
+        status = matrix_wait_limb_stream(source, id, output.device, stream, false, true);
         if (status != 0) return status;
     }
     for (size_t limb = 0; limb < target_count; ++limb)
@@ -468,7 +468,7 @@ extern "C" int gpu_matrix_centered_rebase(GpuMatrix *out, const GpuMatrix *sourc
     cudaStream_t stream = nullptr;
     int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
     if (status != 0) return status;
-    status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[0], output.device, stream);
+    status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[0], output.device, stream, false, true);
     if (status != 0) return status;
     for (size_t limb = 0; limb < target_count; ++limb)
     {
@@ -792,7 +792,7 @@ extern "C" int gpu_matrix_rns_conversion(
         const dim3 id = out->ctx->limb_gpu_ids[limb];
         if (id.x != 0 || id.y != limb) return set_error("unsupported target RNS limb placement");
     }
-    status = matrix_wait_all_limb_streams(source, output.device, stream);
+    status = matrix_wait_all_limb_streams(source, output.device, stream, false, true);
     if (status != 0) return status;
     status = matrix_wait_all_limb_streams(out, output.device, stream);
     if (status != 0) return status;

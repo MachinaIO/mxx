@@ -261,8 +261,10 @@ int matrix_wait_limb_stream(
     const dim3 &limb_id,
     int consumer_device,
     cudaStream_t consumer_stream,
-    bool device_already_selected)
+    bool device_already_selected, bool read_only)
 {
+    if (src && !read_only)
+        src->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
     {
         return set_error("invalid matrix_wait_limb_stream arguments");
@@ -287,6 +289,8 @@ int matrix_wait_limb_stream(
     {
         return set_error(err);
     }
+    if (read_only && src->host_observed_writer_ready.load(std::memory_order_acquire))
+        return 0;
     // Stream order already covers this event when its latest record was on
     // the consumer itself. The owning state->stream alone cannot establish it.
     if (completion.last_write_stream == consumer_stream)
@@ -459,6 +463,7 @@ int matrix_track_limb_consumer_readonly(
 int matrix_record_limb_write(
     GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream, bool device_already_selected)
 {
+    if (dst) dst->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!dst || !dst->ctx)
     {
         return set_error("invalid matrix_record_limb_write arguments");
@@ -540,8 +545,10 @@ namespace
 
 int matrix_wait_all_limb_streams(
     const GpuMatrix *src, int consumer_device, cudaStream_t consumer_stream,
-    bool device_already_selected)
+    bool device_already_selected, bool read_only)
 {
+    if (src && !read_only)
+        src->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!matrix_has_active_limb_states(src) || consumer_device < 0 || !consumer_stream)
         return set_error("invalid matrix_wait_all_limb_streams arguments");
     const auto &ids = src->ctx->limb_gpu_ids;
@@ -558,7 +565,7 @@ int matrix_wait_all_limb_streams(
             seen_completions |= bit;
         }
         const int status = matrix_wait_limb_stream(
-            src, id, consumer_device, consumer_stream, device_already_selected);
+            src, id, consumer_device, consumer_stream, device_already_selected, read_only);
         if (status != 0) return status;
     }
     return 0;
@@ -594,6 +601,7 @@ int matrix_track_all_limb_consumers(
 int matrix_record_all_limb_writes(
     GpuMatrix *dst, cudaStream_t stream, bool device_already_selected)
 {
+    if (dst) dst->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!matrix_has_active_limb_states(dst))
         return set_error("invalid matrix_record_all_limb_writes arguments");
     const auto &ids = dst->ctx->limb_gpu_ids;

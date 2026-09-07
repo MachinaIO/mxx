@@ -98,6 +98,8 @@ struct RootBlockAliases {
     row_sums: BTreeMap<NodeId, RootRowSumPlan>,
     row_sum_interiors: BTreeSet<NodeId>,
     row_sum_captures: BTreeMap<NodeId, Vec<NodeId>>,
+    // A whole root composed only of resident inputs and one fused row sum.
+    input_row_sum: Option<(NodeId, Vec<String>)>,
 }
 
 impl RootBlockAliases {
@@ -530,6 +532,33 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
             run_end = position;
         }
     }
+    if let [output] = scope.outputs() {
+        if let Some(row_sum) = plan.row_sums.get(&output.node) {
+            let operands = row_sum
+                .tensor_operands
+                .as_ref()
+                .map_or(std::slice::from_ref(&row_sum.source), |operands| operands.as_slice());
+            let names = operands
+                .iter()
+                .map(|wire| match scope.node(wire.node)?.kind() {
+                    NodeKind::Input { name, artifact: None, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            // No other producer, artifact load, or observable intermediate may
+            // disappear when dispatching the already-fused operation directly.
+            if names.is_some() &&
+                checked.execution_order.iter().enumerate().all(|(index, _)| {
+                    let id = NodeId(index as u64);
+                    id == output.node ||
+                        row_sum.interiors.contains(&id) ||
+                        operands.iter().any(|wire| wire.node == id)
+                })
+            {
+                plan.input_row_sum = names.map(|names| (output.node, names));
+            }
+        }
+    }
     plan
 }
 
@@ -555,12 +584,14 @@ impl<B: Backend> ExecutionResult<B> {
     ) -> Result<&RuntimeValue<B>, ExecutionError> {
         let value = self
             .outputs
-            .get(name)
-            .cloned()
+            .get_mut(name)
             .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?;
-        let value = materialize_runtime_value(value, backend, store)?;
-        self.outputs.insert(name.to_owned(), value);
-        Ok(&self.outputs[name])
+        // Resident matrices already are the materialized output. In particular,
+        // keep their owners in place instead of cloning and reinserting them.
+        if !matches!(value, RuntimeValue::Matrix(_) | RuntimeValue::SmallMatrix(_)) {
+            *value = materialize_runtime_value(value.clone(), backend, store)?;
+        }
+        Ok(value)
     }
 
     /// Deletes ephemeral streamed families returned by this execution.
@@ -1045,6 +1076,45 @@ where
         })?;
         let schedule = &validated_scope.liveness;
         let block_aliases = root_block_aliases(self.validated, scope_id, self.trace.is_some());
+        if envs.len() == 1 &&
+            self.config.release_fence_interval.is_none() &&
+            !tracing::enabled!(tracing::Level::INFO)
+        {
+            if let Some((node, names)) = &block_aliases.input_row_sum {
+                // Lazy, staged, missing and non-matrix inputs retain the ordinary
+                // dispatch path and its materialization/error ordering.
+                let matrices = names
+                    .iter()
+                    .map(|name| match inputs[0].get(name) {
+                        Some(RuntimeValue::Matrix(matrix)) => Some(matrix.as_ref()),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(matrices) = matrices {
+                    #[cfg(feature = "gpu")]
+                    if let Some(operation) =
+                        block_aliases.calibration[node].clone().map_err(ExecutionError::Backend)?
+                    {
+                        self.backend
+                            .select_gpu_operation(operation)
+                            .map_err(Self::backend_error)?;
+                    }
+                    self.set_placement(placements[0])?;
+                    let row_sum = &block_aliases.row_sums[node];
+                    let output = if let [left, right] = matrices.as_slice() {
+                        self.backend.tensor_sum_rows(left, right, &row_sum.rows)
+                    } else {
+                        self.backend.sum_rows(matrices[0], &row_sum.rows)
+                    }
+                    .map_err(Self::backend_error)?;
+                    self.executed_node_count = self
+                        .executed_node_count
+                        .saturating_add(validated_scope.execution_order.len());
+                    self.has_pending_releases = true;
+                    return Ok(vec![InstanceResult { outputs: vec![RuntimeValue::matrix(output)] }]);
+                }
+            }
+        }
         let mut values = (0..envs.len())
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
@@ -5018,6 +5088,7 @@ mod tests {
             assert!(
                 root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).row_sums.is_empty()
             );
+            assert_eq!(plan.input_row_sum.is_some(), boundary == 0);
             let node_count = graph.root_scope().execution_order.len();
             let mut position = 0;
             let mut visited = 0;

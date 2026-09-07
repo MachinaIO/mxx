@@ -4705,36 +4705,42 @@ mod tests {
         let c = random_cpu_matrix(&params, 2, 1, &mut random);
         let groups = vec![vec![0], vec![1, 2], vec![3]];
         let expected = [a.tensor(&b).sum_rows(&groups), a.tensor(&c).sum_rows(&groups)];
-        let mut source = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &a);
-        let operands = [
-            GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &b),
-            GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &c),
-        ];
-        let stride = rns_bytes_len(&gpu_params);
-        let mut replacement = vec![0u8; stride * 2];
-        operands[0].store_rns_bytes(&mut replacement, stride, GPU_POLY_FORMAT_EVAL);
-        let barrier = std::sync::Barrier::new(2);
-        let outputs = std::thread::scope(|scope| {
-            let handles = operands
-                .iter()
-                .map(|right| {
-                    let source = &source;
-                    let groups = &groups;
-                    let barrier = &barrier;
-                    scope.spawn(move || {
-                        barrier.wait();
-                        source.tensor_sum_rows(right, groups)
+        for host_waited in [false, true] {
+            let mut source = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &a);
+            let operands = [
+                GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &b),
+                GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &c),
+            ];
+            let stride = rns_bytes_len(&gpu_params);
+            let mut replacement = vec![0u8; stride * 2];
+            operands[0].store_rns_bytes(&mut replacement, stride, GPU_POLY_FORMAT_EVAL);
+            if host_waited {
+                source.wait_until_ready();
+                operands.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
+            }
+            let barrier = std::sync::Barrier::new(2);
+            let outputs = std::thread::scope(|scope| {
+                let handles = operands
+                    .iter()
+                    .map(|right| {
+                        let source = &source;
+                        let groups = &groups;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            source.tensor_sum_rows(right, groups)
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
-        });
-        // Host workers have submitted their work, but neither result has been
-        // observed. The source producer must join BOTH reader streams first.
-        source.load_rns_bytes(&replacement, stride, GPU_POLY_FORMAT_EVAL);
-        drop((source, operands));
-        for (output, expected) in outputs.into_iter().zip(expected) {
-            assert_eq!(output.to_cpu_matrix(), expected);
+                    .collect::<Vec<_>>();
+                handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+            });
+            // Host workers have submitted their work, but neither result has been
+            // observed. The source producer must join BOTH reader streams first.
+            source.load_rns_bytes(&replacement, stride, GPU_POLY_FORMAT_EVAL);
+            drop((source, operands));
+            for (output, expected) in outputs.into_iter().zip(&expected) {
+                assert_eq!(&output.to_cpu_matrix(), expected);
+            }
         }
     }
 
@@ -4771,6 +4777,88 @@ mod tests {
             drop((operand, replacement));
             assert_eq!(read.to_cpu_matrix(), &a + &b);
             assert_eq!(destination.to_cpu_matrix(), c);
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_host_observed_inputs_invalidate_before_writes() {
+        let (n, _, _, _) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, 4, 54, 8, None, None);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let mut random = rng();
+        let a = random_cpu_matrix(&params, 2, 2, &mut random);
+        let b = random_cpu_matrix(&params, 2, 2, &mut random);
+        let c = random_cpu_matrix(&params, 2, 1, &mut random);
+        let groups = vec![vec![0], vec![1, 2], vec![3]];
+        let partial = b.slice(0, 1, 0, 2).concat_rows(&[&a.slice(1, 2, 0, 2)]);
+        let sum = &a + &b;
+        let difference = &a - &b;
+        let replacement = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &b);
+        let right = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &c);
+        let stride = rns_bytes_len(&gpu_params);
+        let mut bytes = vec![0; stride * 4];
+        replacement.store_rns_bytes(&mut bytes, stride, GPU_POLY_FORMAT_EVAL);
+        right.wait_until_ready();
+        let right_coeff = right.clone().into_coeff_domain();
+        right_coeff.wait_until_ready();
+        for operation in ["rns", "partial", "ntt", "intt", "peer", "clone", "add", "sub"] {
+            let mut source = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &a);
+            if operation == "ntt" {
+                source = source.into_coeff_domain();
+            }
+            source.wait_until_ready();
+            let expected = match operation {
+                "rns" => {
+                    source.load_rns_bytes(&bytes, stride, GPU_POLY_FORMAT_EVAL);
+                    &b
+                }
+                "partial" => {
+                    source.copy_block_from(&replacement, 0, 0, 0, 0, 1, 2);
+                    &partial
+                }
+                "ntt" => {
+                    source.ntt_all_in_place();
+                    &a
+                }
+                "intt" => {
+                    source.intt_all_in_place();
+                    &a
+                }
+                "peer" => {
+                    // Exercise reusable destination invalidation through the
+                    // native peer-copy entry point on this test's one GPU.
+                    let mut copied = 0;
+                    let status =
+                        unsafe { gpu_matrix_copy_peer(source.raw, replacement.raw, &mut copied) };
+                    check_status(status, "overwrite host-observed destination");
+                    assert_eq!(copied, 1);
+                    &b
+                }
+                "add" => {
+                    source.add_in_place(&replacement);
+                    &sum
+                }
+                "sub" => {
+                    source.sub_in_place(&replacement);
+                    &difference
+                }
+                "clone" => {
+                    source = source.clone();
+                    &a
+                }
+                _ => unreachable!(),
+            };
+            // No host wait is allowed between the mutation/clone and this
+            // consumer; its event dependencies must cover the new contents.
+            let operand = if operation == "intt" { &right_coeff } else { &right };
+            let output = source.tensor_sum_rows(operand, &groups);
+            drop(source);
+            assert_eq!(
+                output.to_cpu_matrix(),
+                expected.tensor(&c).sum_rows(&groups),
+                "{operation}"
+            );
         }
     }
 

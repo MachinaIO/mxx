@@ -2169,6 +2169,7 @@ extern "C" int gpu_matrix_mul_vertical_pair(
     const GpuMatrix *bottom,
     const GpuMatrix *rhs)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !top || !bottom || !rhs)
     {
         return set_error("invalid gpu_matrix_mul_vertical_pair arguments");
@@ -2361,6 +2362,7 @@ extern "C" int gpu_matrix_preimage_residual(
     const GpuMatrix *p1,
     const GpuMatrix *p2)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !target || !public_matrix || !p1 || !p2)
     {
         return set_error("invalid gpu_matrix_preimage_residual arguments");
@@ -3502,6 +3504,7 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
     GpuRngSeed seed,
     GpuMatrix *out)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!cache || !tp2 || !out)
     {
         return set_error("invalid gpu_matrix_sample_p1_full_cached arguments");
@@ -3951,6 +3954,7 @@ extern "C" int gpu_matrix_sample_p1_full(
     GpuRngSeed seed,
     GpuMatrix *out)
 {
+    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!a_mat || !b_mat || !d_mat || !tp2 || !out)
     {
         return set_error("invalid gpu_matrix_sample_p1_full arguments");

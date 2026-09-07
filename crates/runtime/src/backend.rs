@@ -578,6 +578,22 @@ pub trait Backend {
         lhs: &Self::Matrix,
         rhs: &Self::SmallMatrix,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn gadget_decompose_row_blocks(
+        &mut self,
+        blocks: &[&Self::Matrix],
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        let value = self.concat(blocks, ConcatAxis::Rows)?;
+        self.gadget_decompose(&value, small, digit_count)
+    }
+    fn multiply_small_rhs_row_blocks(
+        &mut self,
+        blocks: &[&Self::Matrix],
+        rhs: &Self::SmallMatrix,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        blocks.iter().map(|block| self.multiply_small_rhs(block, rhs)).collect()
+    }
     fn extract_coefficient(
         &mut self,
         value: &Self::Matrix,

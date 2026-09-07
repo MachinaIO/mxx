@@ -1419,6 +1419,25 @@ where
         Ok(lhs.multiply_small_rhs(rhs)?)
     }
 
+    fn gadget_decompose_row_blocks(
+        &mut self,
+        blocks: &[&M],
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        Ok(M::gadget_decompose_row_blocks(
+            blocks.par_iter().map(|block| (*block).clone()).collect(),
+            small,
+            digit_count,
+        )?)
+    }
+    fn multiply_small_rhs_row_blocks(
+        &mut self,
+        blocks: &[&M],
+        rhs: &M::SmallMatrix,
+    ) -> Result<Vec<M>, Self::Error> {
+        Ok(M::multiply_small_rhs_row_blocks(blocks, rhs)?)
+    }
     fn extract_coefficient(&mut self, value: &M, position: usize) -> Result<BigInt, Self::Error> {
         self.parameters_for_matrix(value)?;
         let residue = value

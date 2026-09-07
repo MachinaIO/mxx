@@ -53,7 +53,8 @@ int gpu_small_matrix_store_coefficients(
     uint8_t *payload,
     size_t payload_len);
 int gpu_small_matrix_decompose_base(
-    const GpuMatrix *src,
+    const GpuMatrix *const *sources,
+    size_t block_count,
     uint32_t base_bits,
     int small_mode,
     const uint64_t *max_coefficient_bound,
@@ -72,8 +73,9 @@ int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
     size_t bound_word_count,
     int32_t *accepted_out);
 int gpu_matrix_mul_small_rhs(
-    GpuMatrix *out,
-    const GpuMatrix *lhs_eval,
+    GpuMatrix *const *outputs,
+    const GpuMatrix *const *inputs,
+    size_t block_count,
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
     GpuSmallMatrixAllocationReport *allocation_report);

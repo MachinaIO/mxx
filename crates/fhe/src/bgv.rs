@@ -116,6 +116,11 @@ impl BgvParams {
         hybrid: Option<BgvHybridParams>,
     ) -> Result<Self, FheError> {
         common.validate()?;
+        if BigUint::from(plaintext_modulus) >= *common.parameters_at(0)?.modulus() {
+            return Err(FheError::InvalidParameters(
+                "plaintext modulus must be smaller than every supported ciphertext modulus",
+            ));
+        }
         if plaintext_modulus < 2 ||
             common
                 .ring
@@ -739,6 +744,35 @@ mod tests {
     use num_integer::Integer;
     use num_traits::Signed;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_bgv_rejects_plaintext_modulus_larger_than_level_zero() {
+        let common = common();
+        let first = common.ring.to_crt().0[0];
+        // Use a batching-compatible prime distinct from every ciphertext limb:
+        // the former coprimality and SIMD checks both accepted this space.
+        let order = 2 * u64::from(common.ring.ring_dimension());
+        let too_large = (1..)
+            .map(|step| first + step * order)
+            .find(|candidate| is_prime(*candidate) && !common.ring.to_crt().0.contains(candidate))
+            .unwrap();
+        assert!(matches!(
+            BgvParams::new(common.clone(), too_large, None),
+            Err(FheError::InvalidParameters(
+                "plaintext modulus must be smaller than every supported ciphertext modulus"
+            ))
+        ));
+        assert!(BgvParams::new(common.clone(), first, None).is_err());
+        let plaintext =
+            (1..).map(|step| step * order + 1).find(|candidate| is_prime(*candidate)).unwrap();
+        let valid = BgvParams::new(common, plaintext, None).unwrap();
+        for level in 0..valid.common.ring.crt_depth() {
+            assert!(
+                BigUint::from(valid.plaintext_modulus) <
+                    *valid.common.parameters_at(level).unwrap().modulus()
+            );
+        }
+    }
 
     #[test]
     fn test_bgv_hybrid_multilimb_partitions_and_noise() {

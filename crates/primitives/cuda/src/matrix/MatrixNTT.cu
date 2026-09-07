@@ -6,6 +6,9 @@ namespace
     {
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors;
         uint32_t indices[GPU_RUNTIME_MAX_LIMBS];
+        __device__ size_t limb(size_t index) const { return index; }
+        __device__ auto output(size_t index) const { return descriptors[indices[index]]; }
+        __device__ auto input(size_t index) const { return output(index); }
     };
     static_assert(sizeof(MatrixNttDescriptorView) < 1024, "bounded NTT kernel arguments");
 
@@ -329,9 +332,9 @@ namespace
     // architecture-specific shared-memory opt-in and leaves room for occupancy.
     constexpr uint32_t kFusedNttCoefficients = 1024;
 
-    template <bool Forward>
+    template <bool Forward, typename Layout>
     __global__ void ntt_fused_local_stages_kernel(
-        MatrixNttDescriptorView layout,
+        Layout layout,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
         const uint64_t *moduli,
@@ -342,8 +345,9 @@ namespace
         size_t poly_offset)
     {
         extern __shared__ uint64_t values[];
-        const size_t limb = blockIdx.z;
-        const auto descriptor = layout.descriptors[layout.indices[limb]];
+        const size_t limb = layout.limb(blockIdx.z);
+        const auto descriptor = layout.output(blockIdx.z);
+        const auto source = layout.input(blockIdx.z);
         const size_t poly = poly_offset + blockIdx.y;
         const uint32_t first = blockIdx.x * tile_size;
         const uint64_t modulus = moduli[limb];
@@ -351,7 +355,7 @@ namespace
         for (uint32_t index = threadIdx.x; index < tile_size; index += blockDim.x)
         {
             uint64_t value = matrix_load_limb_u64(
-                descriptor.base, poly, first + index, descriptor.stride, descriptor.width);
+                source.base, poly, first + index, source.stride, source.width);
             if constexpr (Forward)
             {
                 // A whole transform fits in this block only when there were no
@@ -422,9 +426,9 @@ namespace
         }
     }
 
-    template <bool Forward>
+    template <bool Forward, typename Layout>
     int launch_fused_local_stages(
-        MatrixNttDescriptorView layout,
+        Layout layout,
         const GpuNttDeviceConstants &constants,
         size_t limb_count,
         uint32_t n,
@@ -452,9 +456,9 @@ namespace
     // Each warp subgroup owns values separated by one shared-memory tile.
     // XOR shuffles therefore realize precisely the remaining high DIF/DIT
     // butterfly stages, including the transform boundary twist/normalization.
-    template <bool Forward, uint32_t Width>
+    template <bool Forward, uint32_t Width, typename Layout>
     __global__ void ntt_fused_top_stages_kernel(
-        MatrixNttDescriptorView layout,
+        Layout layout,
         const uint64_t *twiddles,
         const uint64_t *twiddle_shoup,
         const uint64_t *moduli,
@@ -467,9 +471,9 @@ namespace
         const uint32_t lane = thread % Width;
         const uint32_t column = thread / Width;
         const uint32_t coefficient = column + lane * kFusedNttCoefficients;
-        const size_t limb = blockIdx.z;
+        const size_t limb = layout.limb(blockIdx.z);
         const size_t poly = poly_offset + blockIdx.y;
-        const auto descriptor = layout.descriptors[layout.indices[limb]];
+        const auto descriptor = layout.output(blockIdx.z);
         const uint64_t modulus = moduli[limb];
         const size_t twiddle_base = limb * static_cast<size_t>(n);
         uint64_t value = matrix_load_limb_u64(
@@ -517,9 +521,9 @@ namespace
             descriptor.base, poly, coefficient, descriptor.stride, descriptor.width, value);
     }
 
-    template <bool Forward>
+    template <bool Forward, typename Layout>
     int launch_fused_top_stages(
-        MatrixNttDescriptorView layout,
+        Layout layout,
         const GpuNttDeviceConstants &constants,
         size_t limb_count,
         uint32_t n,

@@ -844,6 +844,21 @@ pub trait PolyMatrixSmallRhs: PolyMatrix {
         digit_count: Option<usize>,
     ) -> Result<Self::SmallMatrix, SmallMatrixError>;
     fn multiply_small_rhs(&self, rhs: &Self::SmallMatrix) -> Result<Self, SmallMatrixError>;
+    fn gadget_decompose_row_blocks(
+        blocks: Vec<Self>,
+        small: bool,
+        digit_count: Option<usize>,
+    ) -> Result<Self::SmallMatrix, SmallMatrixError> {
+        let mut blocks = blocks.into_iter();
+        let first = blocks.next().ok_or(SmallMatrixError::ShapeMismatch)?;
+        first.concat_rows_owned(blocks.collect()).gadget_decompose(small, digit_count)
+    }
+    fn multiply_small_rhs_row_blocks(
+        blocks: &[&Self],
+        rhs: &Self::SmallMatrix,
+    ) -> Result<Vec<Self>, SmallMatrixError> {
+        blocks.par_iter().map(|block| block.multiply_small_rhs(rhs)).collect()
+    }
 }
 
 impl<M> SmallPolyMatrix for CpuSmallMatrix<M>

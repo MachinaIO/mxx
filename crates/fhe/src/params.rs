@@ -42,6 +42,17 @@ impl FheCommonParams {
                 "Gaussian cutoff must be below half the ring modulus",
             ));
         }
+        // A valid full basis does not imply that its ordered prefixes support
+        // the configured gadget base. Accumulate one owned prefix in order.
+        let mut prefix = BigUint::from(1u8);
+        for prime in self.ring.to_crt().0 {
+            prefix *= prime;
+            if self.ring.select_modulus(&prefix).is_none() {
+                return Err(FheError::InvalidParameters(
+                    "every ordered CRT prefix must support the configured gadget base",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -80,5 +91,33 @@ impl FheCommonParams {
                 .expect("validated finite sigma"),
             IntExpr::constant(BigInt::from(self.error_cutoff.clone())),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_common_rejects_unusable_ordered_crt_prefix() {
+        let mut common = crate::utils::common();
+        let n = common.ring.ring_dimension();
+        let narrow = DCRTPolyParams::new(n, 1, 18, 1, None, None);
+        let wide = DCRTPolyParams::new(n, 1, 20, 10, None, None);
+        let mut primes = vec![narrow.to_crt().0[0], wide.to_crt().0[0]];
+        common.ring = DCRTPolyParams::try_new(n, 2, 20, 10, Some(primes.clone()), None).unwrap();
+        assert!(common.parameters_at(0).is_err());
+        assert!(matches!(
+            common.validate(),
+            Err(FheError::InvalidParameters(
+                "every ordered CRT prefix must support the configured gadget base"
+            ))
+        ));
+        primes.reverse();
+        common.ring = DCRTPolyParams::try_new(n, 2, 20, 10, Some(primes), None).unwrap();
+        common.validate().unwrap();
+        for level in 0..common.ring.crt_depth() {
+            common.parameters_at(level).unwrap();
+        }
     }
 }

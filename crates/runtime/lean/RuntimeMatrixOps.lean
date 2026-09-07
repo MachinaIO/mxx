@@ -174,7 +174,7 @@ def concatDiagonal {q n leftRows leftColumns rightRows rightColumns : Nat}
 def nttBitReverse (bits index : Nat) : Nat :=
   ∑ bit ∈ Finset.range bits, (index / 2 ^ bit % 2) * 2 ^ (bits - 1 - bit)
 
-/-- A canonical primitive root with the order used by the native negacyclic transform. -/
+/-- A primitive root with the order used by the native negacyclic transform. -/
 def nttPrimitiveRoot (q n root : Nat) : Prop :=
   0 < root ∧ root < q ∧ root ^ (2 * n) % q = 1 ∧
   ∀ exponent : Nat, 0 < exponent → exponent < 2 * n → root ^ exponent % q ≠ 1
@@ -190,8 +190,10 @@ def nttEvaluations {n : Nat} (q bits root : Nat)
         coefficients coefficient * (root : Int) ^ ((2 * index.val + 1) * coefficient.val)) %
         (q : Int)
 
-/-- Native negacyclic NTT semantics, including CRT rings with distinct prime limbs. Each
-prime limb chooses its smallest primitive `2*n`-th root; `root` is their canonical CRT lift.
+/-- Native negacyclic NTT semantics, including CRT rings with distinct prime limbs.
+`root` witnesses the CRT lift of the registered native primitive roots. The relation
+permits any such roots: native root selection is not numerical minimization. This
+is a relation over admissible transforms, not a claim that root selection is unique.
 Forward maps coefficients to bit-reversed evaluations; inverse reverses that same relation.
 In either direction the returned integers are canonical residues modulo the full modulus. -/
 def polynomialNttRuns {n : Nat} (q : Nat) (inverse : Bool)
@@ -200,11 +202,24 @@ def polynomialNttRuns {n : Nat} (q : Nat) (inverse : Bool)
   (∀ prime : Nat, prime.Prime → ¬ (prime * prime) ∣ q) ∧
   ∃ bits root : Nat, n = 2 ^ bits ∧ root < q ∧
     (∀ prime : Nat, prime.Prime → prime ∣ q →
-      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime) ∧
-      ∀ candidate : Nat, nttPrimitiveRoot prime n candidate → root % prime ≤ candidate) ∧
+      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime)) ∧
     (∀ index, 0 ≤ output index ∧ output index < (q : Int)) ∧
     (if inverse then nttEvaluations q bits root output input
      else nttEvaluations q bits root input output)
+
+/-- Registered native roots need not be the least primitive roots. This constructor
+keeps that choice explicit in proofs without adding an unsupported ordering premise. -/
+theorem polynomialNttRuns_of_nativeRoot {n q bits root : Nat} {inverse : Bool}
+    {input output : Fin n → Int}
+    (hq : 1 < q) (hsquarefree : ∀ prime : Nat, prime.Prime → ¬ (prime * prime) ∣ q)
+    (hn : n = 2 ^ bits) (hroot : root < q)
+    (hlimbs : ∀ prime : Nat, prime.Prime → prime ∣ q →
+      (2 * n) ∣ (prime - 1) ∧ nttPrimitiveRoot prime n (root % prime))
+    (hcanonical : ∀ index, 0 ≤ output index ∧ output index < (q : Int))
+    (hevaluation : if inverse then nttEvaluations q bits root output input
+      else nttEvaluations q bits root input output) :
+    polynomialNttRuns q inverse input output :=
+  ⟨hq, hsquarefree, bits, root, hn, hroot, hlimbs, hcanonical, hevaluation⟩
 
 /-- Canonical coefficients reconstructed in the quotient by `X^n + 1`. -/
 noncomputable def polynomialOfCoefficients {q n : Nat} (values : Fin n → Int) :

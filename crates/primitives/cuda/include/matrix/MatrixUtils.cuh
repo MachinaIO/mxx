@@ -40,13 +40,14 @@ int matrix_track_limb_consumer(
     cudaStream_t consumer_stream,
     cudaEvent_t completion = nullptr, bool device_already_selected = false);
 // Register a read-only consumer without modifying the source's producer event.
-// The source release stream waits on a per-consumer event, so concurrent
-// consumers can safely share a const/Arc-owned matrix.
+// Source release and reuse streams wait on consumer completion. The writer
+// event stays unchanged, so independent readers can share a const/Arc owner.
 int matrix_track_limb_consumer_readonly(
     const GpuMatrix *src,
     const dim3 &limb_id,
     int consumer_device,
-    cudaStream_t consumer_stream);
+    cudaStream_t consumer_stream,
+    cudaEvent_t completion = nullptr, bool device_already_selected = false);
 int matrix_record_limb_write(
     GpuMatrix *dst, const dim3 &limb_id, cudaStream_t stream,
     bool device_already_selected = false);
@@ -57,7 +58,8 @@ int matrix_wait_all_limb_streams(
     bool device_already_selected = false, bool read_only = false);
 int matrix_track_all_limb_consumers(
     const GpuMatrix *src, int consumer_device, cudaStream_t consumer_stream,
-    cudaEvent_t completion = nullptr, bool device_already_selected = false);
+    cudaEvent_t completion = nullptr, bool device_already_selected = false,
+    bool read_only = false);
 int matrix_record_all_limb_writes(
     GpuMatrix *dst, cudaStream_t stream, bool device_already_selected = false);
 bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr);

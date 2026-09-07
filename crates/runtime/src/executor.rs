@@ -93,8 +93,10 @@ struct RootBlockAliases {
     calibration: gpu_plan::Operations,
     concats: BTreeMap<NodeId, Vec<(WireRef, WireRef)>>,
     slices: BTreeSet<NodeId>,
-    add_concats: BTreeSet<NodeId>,
+    row_block_concats: BTreeSet<NodeId>,
     adds: BTreeMap<NodeId, (NodeId, WireRef)>,
+    decompositions: BTreeMap<NodeId, NodeId>,
+    compact_products: BTreeMap<NodeId, (NodeId, WireRef, Vec<Vec<WireRef>>)>,
     row_sums: BTreeMap<NodeId, RootRowSumPlan>,
     row_sum_interiors: BTreeSet<NodeId>,
     row_sum_captures: BTreeMap<NodeId, Vec<NodeId>>,
@@ -451,6 +453,62 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
             let add = &checked.execution_order[consumer];
             let args = scope.arguments(add).expect("validated add arguments");
             let output = WireRef { node: NodeId(consumer as u64), port: Port(0) };
+            if blocks.len() <= 32 &&
+                matches!(add.kind(), NodeKind::GadgetDecompose { .. }) &&
+                args == [wire]
+            {
+                plan.row_block_concats.insert(wire.node);
+                plan.decompositions.insert(output.node, wire.node);
+                continue;
+            }
+            if blocks.len() <= 32 &&
+                matches!(add.kind(), NodeKind::MatrixMulSmallRhs) &&
+                args.len() == 2 &&
+                args[0] == wire &&
+                !checked.liveness.retained.contains(&output) &&
+                !scope.outputs().contains(&output)
+            {
+                let Some(ConcreteWireType::Matrix(product_type)) = checked.wire_types.get(&output)
+                else {
+                    continue
+                };
+                let mut aliases = vec![Vec::new(); blocks.len()];
+                let mut covered = true;
+                for user in users.get(&output).into_iter().flatten() {
+                    let slice = &checked.execution_order[*user];
+                    let NodeKind::Slice { rows, columns } = slice.kind() else {
+                        covered = false;
+                        break
+                    };
+                    let range = |range: &mxx_ir_core::node::IndexRange| {
+                        Some((
+                            range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                            range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                        ))
+                    };
+                    let rows = rows.as_ref().map_or(Some((0, product_type.rows)), range);
+                    let columns = columns.as_ref().map_or(Some((0, product_type.columns)), range);
+                    let Some(block) =
+                        blocks.iter().position(|(start, end, _)| rows == Some((*start, *end)))
+                    else {
+                        covered = false;
+                        break
+                    };
+                    if columns != Some((0, product_type.columns)) ||
+                        reserved.contains(&NodeId(*user as u64))
+                    {
+                        covered = false;
+                        break;
+                    }
+                    aliases[block].push(WireRef { node: NodeId(*user as u64), port: Port(0) });
+                }
+                if covered && aliases.iter().all(|aliases| !aliases.is_empty()) {
+                    plan.row_block_concats.insert(wire.node);
+                    plan.slices.extend(aliases.iter().flatten().map(|wire| wire.node));
+                    plan.compact_products.insert(output.node, (wire.node, args[1], aliases));
+                    continue;
+                }
+            }
             if matches!(add.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add)) &&
                 args.len() == 2 &&
                 args[0] == wire &&
@@ -458,7 +516,7 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
                 checked.wire_types.get(&args[1]) == checked.wire_types.get(&wire) &&
                 checked.wire_types.get(&output) == checked.wire_types.get(&wire)
             {
-                plan.add_concats.insert(wire.node);
+                plan.row_block_concats.insert(wire.node);
                 plan.adds.insert(output.node, (wire.node, args[1]));
                 continue;
             }
@@ -524,7 +582,7 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
         let empty = absent.contains(&wire) &&
             !plan.row_sum_captures.contains_key(&id) &&
             !plan.concats.contains_key(&id) &&
-            !plan.add_concats.contains(&id) &&
+            !plan.row_block_concats.contains(&id) &&
             plan.arguments[position].iter().all(|argument| absent.contains(argument));
         if empty {
             plan.absent_run_ends[position] = run_end;
@@ -1118,9 +1176,9 @@ where
         let mut values = (0..envs.len())
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
-        // Own concat blocks until their sole Add consumer executes, even when
+        // Own concat blocks until their sole block-aware consumer executes, even when
         // the unchanged liveness schedule releases the original input wires.
-        let mut add_blocks = (0..envs.len())
+        let mut row_blocks = (0..envs.len())
             .map(|_| BTreeMap::<NodeId, Vec<Arc<B::Matrix>>>::new())
             .collect::<Vec<_>>();
         let mut row_sum_sources = (0..envs.len())
@@ -1180,7 +1238,7 @@ where
             };
             let aliased = block_aliases.slices.contains(&node.id) ||
                 block_aliases.concats.contains_key(&node.id) ||
-                block_aliases.add_concats.contains(&node.id) ||
+                block_aliases.row_block_concats.contains(&node.id) ||
                 block_aliases.row_sum_interiors.contains(&node.id);
             if let Some(outputs) = block_aliases.row_sum_captures.get(&node.id) {
                 for index in 0..envs.len() {
@@ -1200,7 +1258,7 @@ where
                     }
                 }
             }
-            if block_aliases.add_concats.contains(&node.id) {
+            if block_aliases.row_block_concats.contains(&node.id) {
                 for index in 0..envs.len() {
                     self.set_placement(placements[index])?;
                     let matrices = node
@@ -1208,7 +1266,7 @@ where
                         .iter()
                         .map(|argument| self.matrix(&mut values[index], *argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    add_blocks[index].insert(node.id, matrices);
+                    row_blocks[index].insert(node.id, matrices);
                 }
             }
             if let Some(aliases) = block_aliases.concats.get(&node.id) {
@@ -1344,11 +1402,66 @@ where
                         self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(output));
                         self.has_pending_releases = true;
                     }
+                } else if let Some(concat) = block_aliases.decompositions.get(&node.id) {
+                    let NodeKind::GadgetDecompose { base, small, digit_count } = &node.kind else {
+                        unreachable!()
+                    };
+                    for &index in indices {
+                        self.set_placement(placements[index])?;
+                        let input_type = self.matrix_type(scope_id, &paths[index], node.args[0])?;
+                        let base = base
+                            .evaluate(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        let digits = self.eval_usize(node.id, digit_count, &envs[index])?;
+                        self.backend
+                            .validate_gadget_layout(&input_type, &base, digits, *small)
+                            .map_err(Self::backend_error)?;
+                        let blocks =
+                            row_blocks[index].remove(concat).expect("decomposition block owners");
+                        let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        let output = self
+                            .backend
+                            .gadget_decompose_row_blocks(&references, *small, Some(digits))
+                            .map_err(Self::backend_error)?;
+                        self.put(
+                            &mut values[index],
+                            node.id,
+                            0,
+                            RuntimeValue::small_matrix(output),
+                        );
+                        self.has_pending_releases = true;
+                    }
+                } else if let Some((concat, rhs, aliases)) =
+                    block_aliases.compact_products.get(&node.id)
+                {
+                    for &index in indices {
+                        self.set_placement(placements[index])?;
+                        let rhs = self.small_matrix(&mut values[index], *rhs)?;
+                        let blocks =
+                            row_blocks[index].remove(concat).expect("compact product block owners");
+                        let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        let outputs = self
+                            .backend
+                            .multiply_small_rhs_row_blocks(&references, &rhs)
+                            .map_err(Self::backend_error)?;
+                        for (output, aliases) in outputs.into_iter().zip(aliases) {
+                            let value = RuntimeValue::matrix(output);
+                            for alias in aliases {
+                                self.put(
+                                    &mut values[index],
+                                    alias.node,
+                                    alias.port.0,
+                                    value.clone(),
+                                );
+                            }
+                        }
+                        self.has_pending_releases = true;
+                    }
                 } else if let Some((concat, right)) = block_aliases.adds.get(&node.id) {
                     for &index in indices {
                         self.set_placement(placements[index])?;
                         let right = self.matrix(&mut values[index], *right)?;
-                        let blocks = add_blocks[index]
+                        let blocks = row_blocks[index]
                             .remove(concat)
                             .expect("fused concat blocks survive until Add");
                         let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
@@ -5318,7 +5431,7 @@ mod tests {
             let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
             let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
             assert_eq!(plan.adds.len(), usize::from(!retain_concat));
-            assert_eq!(plan.add_concats.len(), usize::from(!retain_concat));
+            assert_eq!(plan.row_block_concats.len(), usize::from(!retain_concat));
             assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).adds.is_empty());
 
             let first_matrix = DCRTPolyMatrix::from_poly_vec_row(
@@ -5348,6 +5461,84 @@ mod tests {
                     matrix_output(&optimized, "joined"),
                     matrix_output(&reference, "joined")
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_block_plans_preserve_observable_boundaries() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        for retained in [false, true] {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let ring = Ring::new(parameters.modulus().as_ref().clone(), 8usize);
+            let digits = parameters.modulus_digits();
+            let input = Mat::concat(
+                ConcatAxis::Rows,
+                vec![ring.input("a", (1, 3)), ring.input("b", (2, 3))],
+            );
+            let left = Mat::concat(
+                ConcatAxis::Rows,
+                vec![ring.input("x", (1, 3 * digits)), ring.input("y", (2, 3 * digits))],
+            );
+            let product = input.clone().decompose(16, digits).mul_small_rhs(left.clone());
+            let first =
+                product.clone().slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+            let second =
+                product.clone().slice(Some(IndexRange { start: 1.into(), end: 3.into() }), None);
+            let mut context = DslContext::new("compact-block-boundaries")
+                .output("first", first)
+                .unwrap()
+                .output("second", second)
+                .unwrap();
+            if retained {
+                context = context
+                    .output("input", input)
+                    .unwrap()
+                    .output("left", left)
+                    .unwrap()
+                    .output("product", product)
+                    .unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+            assert_eq!(plan.decompositions.len(), usize::from(!retained));
+            assert_eq!(plan.compact_products.len(), usize::from(!retained));
+            let traced = root_block_aliases(&graph, &FrozenGraphScopeId::Root, true);
+            assert!(traced.decompositions.is_empty() && traced.compact_products.is_empty());
+            let matrix = |rows, columns| {
+                DCRTPolyMatrix::from_poly_vec(
+                    &parameters,
+                    (0..rows)
+                        .map(|_| {
+                            (0..columns)
+                                .map(|_| {
+                                    DCRTPoly::from_biguints(
+                                        &parameters,
+                                        &[rand::random::<u16>().into()],
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                )
+            };
+            let inputs = BTreeMap::from([
+                ("a".into(), RuntimeValue::matrix(matrix(1, 3))),
+                ("b".into(), RuntimeValue::matrix(matrix(2, 3))),
+                ("x".into(), RuntimeValue::matrix(matrix(1, 3 * digits))),
+                ("y".into(), RuntimeValue::matrix(matrix(2, 3 * digits))),
+            ]);
+            let mut backend = cpu_backend([parameters]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            for name in ["first", "second"] {
+                assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
             }
         }
     }

@@ -402,7 +402,8 @@ int matrix_track_limb_consumer_readonly(
     const GpuMatrix *src,
     const dim3 &limb_id,
     int consumer_device,
-    cudaStream_t consumer_stream)
+    cudaStream_t consumer_stream,
+    cudaEvent_t completion, bool device_already_selected)
 {
     if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
     {
@@ -426,16 +427,16 @@ int matrix_track_limb_consumer_readonly(
         return set_error("missing source release stream in matrix_track_limb_consumer_readonly");
     }
 
-    cudaError_t err = cudaSetDevice(consumer_device);
+    cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(consumer_device);
     if (err != cudaSuccess)
     {
         return set_error(err);
     }
-    cudaEvent_t consumer_done = nullptr;
-    err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
-    if (err == cudaSuccess)
+    cudaEvent_t consumer_done = completion;
+    if (!consumer_done)
     {
-        err = cudaEventRecord(consumer_done, consumer_stream);
+        err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
+        if (err == cudaSuccess) err = cudaEventRecord(consumer_done, consumer_stream);
     }
     if (err == cudaSuccess)
     {
@@ -444,7 +445,15 @@ int matrix_track_limb_consumer_readonly(
             consumer_done,
             0);
     }
-    const cudaError_t destroy_err = consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
+    if (err == cudaSuccess && state->stream != consumer_stream &&
+        state->stream != src->ctx->execution->release_streams_by_partition[limb_id.x])
+    {
+        // Writes reuse the allocation on its producer stream. Join the read
+        // there as well as on release, but leave write_done untouched: other
+        // read-only consumers still wait only for the original input writer.
+        err = cudaStreamWaitEvent(state->stream, consumer_done, 0);
+    }
+    const cudaError_t destroy_err = !completion && consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
     if (err == cudaSuccess)
     {
         err = destroy_err;
@@ -573,11 +582,36 @@ int matrix_wait_all_limb_streams(
 
 int matrix_track_all_limb_consumers(
     const GpuMatrix *src, int consumer_device, cudaStream_t consumer_stream,
-    cudaEvent_t completion, bool device_already_selected)
+    cudaEvent_t completion, bool device_already_selected, bool read_only)
 {
     if (!matrix_has_active_limb_states(src) || consumer_device < 0 || !consumer_stream)
         return set_error("invalid matrix_track_all_limb_consumers arguments");
     const auto &ids = src->ctx->limb_gpu_ids;
+    if (read_only)
+    {
+        // Const readers join allocation release without rewriting producer
+        // events or serializing independent consumer streams. Each partition
+        // owns one release stream; distinct producer streams must also join.
+        unsigned int partitions[GPU_RUNTIME_MAX_LIMBS];
+        cudaStream_t streams[GPU_RUNTIME_MAX_LIMBS];
+        size_t partition_count = 0;
+        for (int limb = 0; limb <= src->level; ++limb)
+        {
+            const auto id = ids[static_cast<size_t>(limb)];
+            const auto *state = matrix_limb_state_const(src, id, "missing read-only limb state");
+            if (!state) return 1;
+            bool seen = false;
+            for (size_t index = 0; index < partition_count; ++index)
+                if (partitions[index] == id.x && streams[index] == state->stream) seen = true;
+            if (seen) continue;
+            const int status = matrix_track_limb_consumer_readonly(
+                src, id, consumer_device, consumer_stream, completion, device_already_selected);
+            if (status != 0) return status;
+            streams[partition_count] = state->stream;
+            partitions[partition_count++] = id.x;
+        }
+        return 0;
+    }
     if (!matrix_has_uniform_limb_producer(src))
     {
         for (int limb = 0; limb <= src->level; ++limb)

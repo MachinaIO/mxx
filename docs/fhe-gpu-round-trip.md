@@ -612,3 +612,20 @@ These are fresh matched 300-sample medians on the same physical GPU. They retain
 [Current samples](benchmarks/fhe-gpu/barrett-skip-measurements.json), [inputs](benchmarks/fhe-gpu/barrett-skip-inputs.json), and [validation evidence](benchmarks/fhe-gpu/barrett-skip-validation.json) identify the measured source and binaries. The timing history contains 39 additional validated rows for this checkpoint. Raw logs, the exact source patch and the temporary arithmetic harness are retained locally under `test_data/fhe-round-trip/optimization/barrett-skip/`.
 
 The history also retains 30 rows from the intermediate device-selection-only comparison. Its explicit inputs and pooled results are under `test_data/fhe-round-trip/optimization/device-selection/`; that comparison reused the preceding checkpoint's matched Phantom samples.
+
+### Rejected experiment: compact launch metadata and direct fleet dispatch
+
+An experiment on base `02466f4b467b750a114e4b2beb9dc88981845e18` reduced the fused tensor-row-sum kernel arguments from 3,104 to 640 bytes for up to four active CRT limbs. It also bypassed water-filling and intermediate wave vectors for a calibrated, full-width operation on one GPU. Pilots, partitioned operations, and all synchronization/lifetime dependencies retained their existing behavior.
+
+Three fresh runs per preset and library, each with 100 samples, produced the following standalone multiplication medians on the same RTX 4080 SUPER and manifests:
+
+| Preset | Base mxx (seconds) | Experiment mxx (seconds) | Fresh PhantomFHE (seconds) | Experiment / PhantomFHE |
+| --- | ---: | ---: | ---: | ---: |
+| bgv-54 | 0.0000598075 | 0.0000586705 | 0.0000104695 | 5.604x |
+| bgv-36 | 0.0000569775 | 0.0000592670 | 0.0000107305 | 5.523x |
+
+The changes did not establish a consistent improvement: the medians moved approximately -1.9% and +4.0% against the earlier base measurements. This was not an interleaved A/B experiment, and the two changes were measured together, so neither individual causality nor a definitive regression is established. Both implementation changes were reverted; the current standalone implementation remains the base checkpoint. The below-2x objective remains unmet.
+
+The candidate passed 579 CPU unit tests, 40 targeted primitive GPU checks, five fleet GPU checks, six BGV round trips, and three Ring-GSW round trips. The primitive checks covered four/five active limbs, 36/54/60-bit residues, N=32/N=8192, and existing lifetime cases. Fleet checks covered complete and partitioned waves. Ignored tests were not run, and the full GPU workspace unit suite was not rerun for this rejected candidate.
+
+[Explicit pooling inputs](benchmarks/fhe-gpu/compact-launch-experiment-inputs.json), [all samples and pooled measurements](benchmarks/fhe-gpu/compact-launch-experiment-measurements.json), and [candidate source/binary hashes and validation scope](benchmarks/fhe-gpu/compact-launch-experiment-validation.json) preserve the experiment. Its 39 rows are appended to [the timing history](benchmarks/fhe-gpu/timings.csv); they describe the rejected candidate, not the restored implementation. The unapplied source patch and raw logs are retained locally under `test_data/fhe-round-trip/optimization/compact-launch/`.

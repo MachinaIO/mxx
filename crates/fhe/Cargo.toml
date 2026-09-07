@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Ring-GSW and leveled BGV graph builders for the mxx DSL"
+autotests = false
+
+[[test]]
+name = "gpu_bgv_round_trip"
+required-features = ["gpu"]
+
+[[test]]
+name = "gpu_ring_gsw_round_trip"
+required-features = ["gpu"]
 
 [features]
 default = []
@@ -19,6 +28,8 @@ num-traits.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+bigdecimal.workspace = true
+sha2.workspace = true
 mxx-runtime.workspace = true
 rand.workspace = true
 serde_json.workspace = true

@@ -253,6 +253,14 @@ pub trait Backend {
         left: &Self::Matrix,
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn add_row_blocks(
+        &mut self,
+        blocks: &[&Self::Matrix],
+        right: &Self::Matrix,
+    ) -> Result<Self::Matrix, Self::Error> {
+        let left = self.concat(blocks, ConcatAxis::Rows)?;
+        self.add(&left, right)
+    }
     fn add_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
@@ -406,6 +414,32 @@ pub trait Backend {
         rows: Option<&IndexRange>,
         columns: Option<&IndexRange>,
     ) -> Result<Self::Matrix, Self::Error>;
+    /// Sums each nonempty group of source rows into one output row.
+    /// Indices must be in bounds; repeated indices retain their multiplicity.
+    fn sum_rows(
+        &mut self,
+        value: &Self::Matrix,
+        rows: &[Vec<usize>],
+    ) -> Result<Self::Matrix, Self::Error> {
+        if rows.is_empty() {
+            return self.slice(value, Some(&IndexRange { start: 0, end: 0 }), None);
+        }
+        let output = rows
+            .iter()
+            .map(|group| {
+                let (first, rest) = group.split_first().expect("row sum group must be nonempty");
+                let mut sum =
+                    self.slice(value, Some(&IndexRange { start: *first, end: first + 1 }), None)?;
+                for row in rest {
+                    let term =
+                        self.slice(value, Some(&IndexRange { start: *row, end: row + 1 }), None)?;
+                    sum = self.add(&sum, &term)?;
+                }
+                Ok(sum)
+            })
+            .collect::<Result<Vec<_>, Self::Error>>()?;
+        self.concat(&output.iter().collect::<Vec<_>>(), ConcatAxis::Rows)
+    }
     fn tensor(
         &mut self,
         left: &Self::Matrix,

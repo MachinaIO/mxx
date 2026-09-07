@@ -37,6 +37,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt,
     sync::{
@@ -961,6 +962,26 @@ impl GpuDcrtBackend {
         Ok(first.concat_columns_owned(pieces.collect()))
     }
 
+    fn matrix_operand_on_device<'a>(
+        backend: &mut DeviceBackend,
+        value: &'a GpuFleetMatrix,
+        start: usize,
+        end: usize,
+    ) -> Result<Cow<'a, GpuDCRTPolyMatrix>, PolyBackendError> {
+        // Read-only operations may borrow a complete resident shard. The caller
+        // retains its owner through dispatch and primitives record consumer
+        // events, so an additional owned copy is unnecessary. Partial ranges
+        // and transfers still use independently owned materializations.
+        if let Some(shard) = value.shards.iter().find(|shard| {
+            shard.global_column_start == start &&
+                shard.global_column_start + shard.value.col_size() == end &&
+                backend.matrix_is_on_active_placement(&shard.value)
+        }) {
+            return Ok(Cow::Borrowed(&shard.value));
+        }
+        Self::matrix_piece_on_device(backend, value, start, end).map(Cow::Owned)
+    }
+
     fn matrix_rows_on_device(
         backend: &mut DeviceBackend,
         value: &GpuFleetMatrix,
@@ -1161,19 +1182,56 @@ impl GpuDcrtBackend {
             .into_iter()
             .map(|(left_column, right_start, right_end)| {
                 let left =
-                    Self::matrix_piece_on_device(backend, left, left_column, left_column + 1)?;
-                let right = Self::matrix_piece_on_device(backend, right, right_start, right_end)?;
+                    Self::matrix_operand_on_device(backend, left, left_column, left_column + 1)?;
+                let right = Self::matrix_operand_on_device(backend, right, right_start, right_end)?;
                 backend.tensor(&left, &right)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut pieces = pieces.into_iter();
         let first = pieces.next().expect("nonempty tensor measurement range");
-        let value = first.concat_columns_owned(pieces.collect());
+        let value =
+            if pieces.len() == 0 { first } else { first.concat_columns_owned(pieces.collect()) };
         Ok(GpuFleetMatrix::new(
             rows,
             end - start,
             vec![GpuColumnShard { device_id: *device_id, global_column_start: 0, value }],
         ))
+    }
+
+    fn launch_column_wave(
+        &mut self,
+        wave: &[(usize, usize, usize)],
+        columns: usize,
+        operation: impl Fn(
+            &mut DeviceBackend,
+            usize,
+            usize,
+        ) -> Result<GpuDCRTPolyMatrix, PolyBackendError>
+        + Sync,
+    ) -> Result<Vec<GpuColumnShard<GpuDCRTPolyMatrix>>, PolyBackendError> {
+        // A calibrated full-width wave on one device has only one work item.
+        // Execute it on the calling thread without handing it to the Rayon pool.
+        if self.devices.len() == 1 && wave == [(0, 0, columns)] {
+            let (device_id, backend) = &mut self.devices[0];
+            let value = operation(backend, 0, columns)?;
+            return Ok(vec![GpuColumnShard {
+                device_id: *device_id,
+                global_column_start: 0,
+                value,
+            }]);
+        }
+        self.devices
+            .par_iter_mut()
+            .enumerate()
+            .filter_map(|(device, (device_id, backend))| {
+                let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
+                Some(operation(backend, start, end).map(|value| GpuColumnShard {
+                    device_id: *device_id,
+                    global_column_start: start,
+                    value,
+                }))
+            })
+            .collect()
     }
 
     fn unary_columns(
@@ -1191,23 +1249,11 @@ impl GpuDcrtBackend {
         while next_column < value.columns {
             let wave = self.next_column_wave(next_column, value.columns);
             next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(
-                        Self::matrix_piece_on_device(backend, value, start, end)
-                            .and_then(|piece| operation(backend, &piece))
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            }),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let launched =
+                self.launch_column_wave(&wave, value.columns, |backend, start, end| {
+                    let piece = Self::matrix_operand_on_device(backend, value, start, end)?;
+                    operation(backend, &piece)
+                })?;
             self.commit_column_wave(&mut shards, launched, &mut next_column)?;
         }
         let rows = shards.first().map_or(value.rows, |shard| shard.value.row_size());
@@ -1234,26 +1280,12 @@ impl GpuDcrtBackend {
         while next_column < left.columns {
             let wave = self.next_column_wave(next_column, left.columns);
             next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(
-                        Self::matrix_piece_on_device(backend, left, start, end)
-                            .and_then(|left| {
-                                Self::matrix_piece_on_device(backend, right, start, end)
-                                    .and_then(|right| operation(backend, &left, &right))
-                            })
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            }),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let launched =
+                self.launch_column_wave(&wave, left.columns, |backend, start, end| {
+                    let left = Self::matrix_operand_on_device(backend, left, start, end)?;
+                    let right = Self::matrix_operand_on_device(backend, right, start, end)?;
+                    operation(backend, &left, &right)
+                })?;
             self.commit_column_wave(&mut shards, launched, &mut next_column)?;
         }
         Ok(GpuFleetMatrix::new(left.rows, left.columns, shards))
@@ -1270,6 +1302,76 @@ mod tests {
     fn assert_profile_created(backend: &GpuDcrtBackend, operation: &[u8; 32]) {
         assert!(backend.operation_profiles.contains_key(operation));
         assert!(backend.column_widths(operation).is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_resident_operands_preserve_owners_and_inputs() {
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let mut backend =
+            super::super::gpu_backend_on([parameters.clone()], [detected_gpu_device_ids()[0]]);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 2,
+        };
+        let left = GpuFleetMatrix::from_matrix(
+            backend.devices[0].1.sample_hash(&ty, rand::random(), b"borrowed-left").unwrap(),
+        );
+        let right = GpuFleetMatrix::from_matrix(
+            backend.devices[0].1.sample_hash(&ty, rand::random(), b"borrowed-right").unwrap(),
+        );
+        let expected_left = backend.matrix_to_bytes(&left);
+        let expected_right = backend.matrix_to_bytes(&right);
+        assert!(matches!(
+            GpuDcrtBackend::matrix_operand_on_device(&mut backend.devices[0].1, &left, 0, 2)
+                .unwrap(),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            GpuDcrtBackend::matrix_operand_on_device(&mut backend.devices[0].1, &left, 0, 1)
+                .unwrap(),
+            Cow::Owned(_)
+        ));
+        let expected =
+            backend.devices[0].1.multiply(&left.shards[0].value, &right.shards[0].value).unwrap();
+        let expected = backend.matrix_to_bytes(&GpuFleetMatrix::from_matrix(expected));
+        let operation = [61; 32];
+        backend
+            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 2, nonzero: None });
+        backend.select_operation(operation).unwrap();
+        let product = backend.multiply(&left, &right).unwrap();
+        let sum = backend.add(&left, &right).unwrap();
+        let recovered = backend.sub(&sum, &right).unwrap();
+        let negative = backend.negate(&recovered).unwrap();
+        let recovered = backend.negate(&negative).unwrap();
+        let upper = backend.slice(&left, Some(&IndexRange { start: 0, end: 1 }), None).unwrap();
+        let lower = backend.slice(&left, Some(&IndexRange { start: 1, end: 2 }), None).unwrap();
+        let rejoined = backend.concat(&[&upper, &lower], ConcatAxis::Rows).unwrap();
+        let left_column =
+            backend.slice(&left, None, Some(&IndexRange { start: 0, end: 1 })).unwrap();
+        let right_column =
+            backend.slice(&right, None, Some(&IndexRange { start: 0, end: 1 })).unwrap();
+        let expected_tensor = left_column.shards[0].value.tensor(&right_column.shards[0].value);
+        let expected_tensor =
+            backend.matrix_to_bytes(&GpuFleetMatrix::from_matrix(expected_tensor));
+        let tensor = backend.tensor(&left_column, &right_column).unwrap();
+        let measured_tensor =
+            backend.tensor_range_for_measurement(&left_column, &right_column, 0, 1).unwrap();
+        assert_eq!(backend.matrix_to_bytes(&left), expected_left);
+        assert_eq!(backend.matrix_to_bytes(&right), expected_right);
+        drop((left, right, sum, negative, upper, lower, left_column, right_column));
+        product.wait_until_ready();
+        recovered.wait_until_ready();
+        rejoined.wait_until_ready();
+        tensor.wait_until_ready();
+        measured_tensor.wait_until_ready();
+        assert_eq!(backend.matrix_to_bytes(&product), expected);
+        assert_eq!(backend.matrix_to_bytes(&recovered), expected_left);
+        assert_eq!(backend.matrix_to_bytes(&rejoined), expected_left);
+        assert_eq!(backend.matrix_to_bytes(&tensor), expected_tensor);
+        assert_eq!(backend.matrix_to_bytes(&measured_tensor), expected_tensor);
     }
 
     #[test]
@@ -1880,6 +1982,47 @@ mod tests {
 
     #[test]
     #[serial_test::serial(gpu_context)]
+    fn test_gpu_fleet_sum_rows_matches_cpu_full_and_partial_waves() {
+        let device = detected_gpu_device_ids()[0];
+        super::super::wait_for_gpu_test_context_quiescence(device);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 4,
+            columns: 3,
+        };
+        let mut backend = super::super::gpu_backend_on([parameters], [device]);
+        let operation = [64u8; 32];
+        backend
+            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 3, nonzero: None });
+        backend.select_operation(operation).unwrap();
+        let source = backend.sample_hash(&ty, rand::random(), b"sum-rows-fleet").unwrap();
+        let cpu = backend.gather_matrix_for_host(&source).unwrap();
+        let first = cpu.slice(3, 4, 0, 3);
+        let repeated = cpu.slice(1, 2, 0, 3) + &cpu.slice(1, 2, 0, 3) + &cpu.slice(0, 1, 0, 3);
+        let cross = cpu.slice(0, 1, 0, 3) + &cpu.slice(2, 3, 0, 3);
+        let expected = first.concat_rows(&[&repeated, &cross]);
+        let groups = vec![vec![3], vec![1, 1, 0], vec![0, 2]];
+        let mut results = Vec::new();
+        for width in [3, 2] {
+            backend.set_column_widths_for_operation(
+                operation,
+                GpuColumnWidths { gpu0: width, nonzero: None },
+            );
+            backend.select_operation(operation).unwrap();
+            let result = backend.sum_rows(&source, &groups).unwrap();
+            assert_eq!(result.shards.len(), if width == 3 { 1 } else { 2 });
+            results.push(result);
+        }
+        drop(source);
+        for result in results {
+            assert_eq!(backend.gather_matrix_for_host(&result).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
     fn gpu_tensor_and_diagonal_concat_match_single_device_semantics() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
@@ -1897,6 +2040,18 @@ mod tests {
         let expected_tensor = full_source.tensor(&full_source);
         let tensor = backend.tensor(&source, &source).unwrap();
         assert_eq!(backend.gather_matrix_for_host(&tensor).unwrap(), expected_tensor);
+
+        // The same multi-column tensor must also match when one full-width wave
+        // dispatches directly instead of splitting at right-matrix boundaries.
+        backend
+            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 9, nonzero: None });
+        backend.select_operation(operation).unwrap();
+        let full_wave_tensor = backend.tensor(&source, &source).unwrap();
+        assert_eq!(full_wave_tensor.shards.len(), 1);
+        assert_eq!(backend.gather_matrix_for_host(&full_wave_tensor).unwrap(), expected_tensor);
+        backend
+            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 2, nonzero: None });
+        backend.select_operation(operation).unwrap();
 
         let expected_diagonal = full_source.concat_diag(&[&full_source]);
         let diagonal = backend.concat(&[&source, &source], ConcatAxis::Diagonal).unwrap();
@@ -1951,6 +2106,21 @@ mod tests {
         let transposed = backend.transpose(&wide).unwrap();
         assert_profile_created(&backend, &transpose_operation);
         assert_eq!(backend.gather_matrix_for_host(&transposed).unwrap(), full_wide.transpose());
+        let mut outputs = Vec::new();
+        for width in [wide.rows, 1] {
+            backend.set_column_widths_for_operation(
+                transpose_operation,
+                GpuColumnWidths { gpu0: width, nonzero: None },
+            );
+            backend.select_operation(transpose_operation).unwrap();
+            let output = backend.transpose(&wide).unwrap();
+            assert_eq!(output.shards.len(), wide.rows.div_ceil(width));
+            outputs.push(output);
+        }
+        drop(wide);
+        for output in outputs {
+            assert_eq!(backend.gather_matrix_for_host(&output).unwrap(), full_wide.transpose());
+        }
     }
 }
 
@@ -2119,6 +2289,44 @@ impl Backend for GpuDcrtBackend {
         self.binary_columns(left, right, Backend::add)
     }
 
+    fn add_row_blocks(
+        &mut self,
+        blocks: &[&Self::Matrix],
+        right: &Self::Matrix,
+    ) -> Result<Self::Matrix, Self::Error> {
+        let rows = blocks.iter().try_fold(0usize, |rows, block| {
+            rows.checked_add(block.rows).ok_or(PolyBackendError::InvalidInteger)
+        })?;
+        if blocks.is_empty() ||
+            rows != right.rows ||
+            blocks.iter().any(|block| block.columns != right.columns)
+        {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        let inputs = blocks.iter().copied().chain(std::iter::once(right)).collect::<Vec<_>>();
+        self.restart_runtime_pilot_after_matrix_inputs(&inputs)?;
+        let mut shards = Vec::new();
+        let mut next_column = 0;
+        while next_column < right.columns {
+            let wave = self.next_column_wave(next_column, right.columns);
+            next_column = wave.last().expect("nonempty GPU wave").2;
+            let launched =
+                self.launch_column_wave(&wave, right.columns, |backend, start, end| {
+                    // Complete resident column shards are borrowed directly; only partial
+                    // ranges or peer transfers allocate input pieces.
+                    let local = blocks
+                        .iter()
+                        .map(|block| Self::matrix_operand_on_device(backend, block, start, end))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let right = Self::matrix_operand_on_device(backend, right, start, end)?;
+                    let refs = local.iter().map(|block| block.as_ref()).collect::<Vec<_>>();
+                    backend.add_row_blocks(&refs, &right)
+                })?;
+            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
+        }
+        Ok(GpuFleetMatrix::new(rows, right.columns, shards))
+    }
+
     fn sub(
         &mut self,
         left: &Self::Matrix,
@@ -2132,6 +2340,29 @@ impl Backend for GpuDcrtBackend {
         left: &Self::Matrix,
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
+        if !self.runtime_pilot_is_pending() &&
+            self.devices.len() == 1 &&
+            left.shards.len() == 1 &&
+            right.shards.len() == 1 &&
+            self.devices[0].1.matrix_is_on_active_placement(&left.shards[0].value) &&
+            self.devices[0].1.matrix_is_on_active_placement(&right.shards[0].value)
+        {
+            let pending_profile = self.pending_profile.clone();
+            self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
+            let columns = if right.size() == (1, 1) { left.columns } else { right.columns };
+            if !self.runtime_pilot_is_pending() && columns <= self.active_role_width(0) {
+                // Complete operands already reside on the sole participating
+                // device. Respect the calibrated wave width, but avoid staging
+                // copies before an operation that only reads those operands.
+                let output =
+                    self.devices[0].1.multiply(&left.shards[0].value, &right.shards[0].value)?;
+                return Ok(GpuFleetMatrix::from_matrix(output));
+            }
+            // The general path may allocate fixed operand replicas. Re-derive
+            // its capacity after those allocations rather than retaining the
+            // borrowed path's earlier residency snapshot.
+            self.pending_profile = pending_profile;
+        }
         if left.size() == (1, 1) {
             let replicas = (0..self.devices.len())
                 .map(|device| self.full_matrix_on_device(device, left))
@@ -2526,21 +2757,16 @@ impl Backend for GpuDcrtBackend {
         while next_column < value.rows {
             let wave = self.next_column_wave(next_column, value.rows);
             next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(Self::matrix_rows_on_device(backend, value, start, end).and_then(|rows| {
-                        backend.transpose(&rows).map(|value| GpuColumnShard {
-                            device_id: *device_id,
-                            global_column_start: start,
-                            value,
-                        })
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let single_wave = self.devices.len() == 1 && wave == [(0, 0, value.rows)];
+            let launched = self.launch_column_wave(&wave, value.rows, |backend, start, end| {
+                if single_wave {
+                    let input = Self::matrix_operand_on_device(backend, value, 0, value.columns)?;
+                    backend.transpose(&input)
+                } else {
+                    let input = Self::matrix_rows_on_device(backend, value, start, end)?;
+                    backend.transpose(&input)
+                }
+            })?;
             self.commit_column_wave(&mut shards, launched, &mut next_column)?;
         }
         Ok(GpuFleetMatrix::new(value.columns, value.rows, shards))
@@ -2561,30 +2787,31 @@ impl Backend for GpuDcrtBackend {
         while next_column < output_columns {
             let wave = self.next_column_wave(next_column, output_columns);
             next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(
-                        Self::matrix_piece_on_device(
-                            backend,
-                            value,
-                            column_range.start + start,
-                            column_range.start + end,
-                        )
-                        .map(|piece| GpuColumnShard {
-                            device_id: *device_id,
-                            global_column_start: start,
-                            value: piece.slice_rows(row_range.start, row_range.end),
-                        }),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let launched =
+                self.launch_column_wave(&wave, output_columns, |backend, start, end| {
+                    let piece = Self::matrix_operand_on_device(
+                        backend,
+                        value,
+                        column_range.start + start,
+                        column_range.start + end,
+                    )?;
+                    Ok(piece.slice_rows(row_range.start, row_range.end))
+                })?;
             self.commit_column_wave(&mut shards, launched, &mut next_column)?;
         }
         Ok(GpuFleetMatrix::new(row_range.end - row_range.start, output_columns, shards))
+    }
+
+    fn sum_rows(
+        &mut self,
+        value: &Self::Matrix,
+        rows: &[Vec<usize>],
+    ) -> Result<Self::Matrix, Self::Error> {
+        let mut output =
+            self.unary_columns(value, |backend, piece| backend.sum_rows(piece, rows))?;
+        // A zero-column matrix has no shards from which unary_columns can infer rows.
+        output.rows = rows.len();
+        Ok(output)
     }
 
     fn tensor(
@@ -2601,43 +2828,35 @@ impl Backend for GpuDcrtBackend {
         while next_column < columns {
             let wave = self.next_column_wave(next_column, columns);
             next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(
-                        tensor_column_segments(start, end, right.columns)
-                            .into_iter()
-                            .map(|(left_column, right_start, right_end)| {
-                                let left = Self::matrix_piece_on_device(
-                                    backend,
-                                    left,
-                                    left_column,
-                                    left_column + 1,
-                                )?;
-                                let right = Self::matrix_piece_on_device(
-                                    backend,
-                                    right,
-                                    right_start,
-                                    right_end,
-                                )?;
-                                backend.tensor(&left, &right)
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                            .map(|pieces| {
-                                let mut pieces = pieces.into_iter();
-                                let first = pieces.next().expect("nonempty tensor range");
-                                GpuColumnShard {
-                                    device_id: *device_id,
-                                    global_column_start: start,
-                                    value: first.concat_columns_owned(pieces.collect()),
-                                }
-                            }),
-                    )
+            let single_wave = self.devices.len() == 1 && wave == [(0, 0, columns)];
+            let launched = self.launch_column_wave(&wave, columns, |backend, start, end| {
+                if single_wave {
+                    let left = Self::matrix_operand_on_device(backend, left, 0, left.columns)?;
+                    let right = Self::matrix_operand_on_device(backend, right, 0, right.columns)?;
+                    return backend.tensor(&left, &right);
+                }
+                let pieces = tensor_column_segments(start, end, right.columns)
+                    .into_iter()
+                    .map(|(left_column, right_start, right_end)| {
+                        let left = Self::matrix_operand_on_device(
+                            backend,
+                            left,
+                            left_column,
+                            left_column + 1,
+                        )?;
+                        let right =
+                            Self::matrix_operand_on_device(backend, right, right_start, right_end)?;
+                        backend.tensor(&left, &right)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut pieces = pieces.into_iter();
+                let first = pieces.next().expect("nonempty tensor range");
+                Ok(if pieces.len() == 0 {
+                    first
+                } else {
+                    first.concat_columns_owned(pieces.collect())
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+            })?;
             self.commit_column_wave(&mut shards, launched, &mut next_column)?;
         }
         Ok(GpuFleetMatrix::new(rows, columns, shards))
@@ -2671,11 +2890,14 @@ impl Backend for GpuDcrtBackend {
                             inputs
                                 .iter()
                                 .map(|value| {
-                                    Self::matrix_piece_on_device(backend, value, start, end)
+                                    Self::matrix_operand_on_device(backend, value, start, end)
                                 })
                                 .collect::<Result<Vec<_>, _>>()
                                 .and_then(|local| {
-                                    let refs = local.iter().collect::<Vec<_>>();
+                                    let refs = local
+                                        .iter()
+                                        .map(|piece| piece.as_ref())
+                                        .collect::<Vec<_>>();
                                     backend.concat(&refs, axis)
                                 })
                                 .map(|value| GpuColumnShard {

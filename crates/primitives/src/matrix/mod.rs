@@ -140,6 +140,37 @@ pub trait PolyMatrix:
     fn add_out_of_place(&self, rhs: &Self) -> Self {
         self.clone() + rhs
     }
+    /// Sums selected source rows into each output row, allowing repeated indices.
+    /// Each group must be nonempty and every index must be in bounds.
+    fn sum_rows(&self, rows: &[Vec<usize>]) -> Self {
+        let (source_rows, cols) = self.size();
+        assert!(
+            rows.iter()
+                .all(|group| !group.is_empty() && group.iter().all(|&row| row < source_rows)),
+            "row sums require nonempty groups of valid row indices"
+        );
+        let mut sums = rows
+            .par_iter()
+            .map(|group| {
+                let mut sum = self.slice(group[0], group[0] + 1, 0, cols);
+                for &row in &group[1..] {
+                    sum = sum.add_out_of_place(&self.slice(row, row + 1, 0, cols));
+                }
+                sum
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        match sums.next() {
+            Some(first) => first.concat_rows_owned(sums.collect()),
+            None => self.slice(0, 0, 0, cols),
+        }
+    }
+
+    /// Adds vertically stacked blocks without requiring a concatenated input.
+    fn add_row_blocks_out_of_place(&self, blocks: &[&Self]) -> Self {
+        let (first, rest) = blocks.split_first().expect("nonempty row blocks");
+        first.concat_rows(rest).add_out_of_place(self)
+    }
     fn add_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
         inputs.into_par_iter().map(|(left, right)| left.add_out_of_place(&right)).collect()
     }

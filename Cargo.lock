@@ -494,6 +494,7 @@ dependencies = [
 name = "mxx-fhe"
 version = "0.1.0"
 dependencies = [
+ "bigdecimal",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",
@@ -503,6 +504,7 @@ dependencies = [
  "num-traits",
  "rand 0.9.2",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

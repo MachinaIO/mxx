@@ -304,20 +304,25 @@ namespace
                 bool dependency_ok = true;
                 bool async_free_queued = false;
                 cudaError_t err = cudaSuccess;
+                uint64_t seen_completions = 0;
                 for (auto &state : states)
                 {
                     if (!state.stream)
                     {
                         continue;
                     }
-                    if (state.device != device || !state.write_done)
+                    const auto &completion = states[state.completion_owner];
+                    const uint64_t bit = uint64_t{1} << state.completion_owner;
+                    if (seen_completions & bit) continue;
+                    seen_completions |= bit;
+                    if (completion.device != device || !completion.write_done)
                     {
                         dependency_ok = false;
                         break;
                     }
-                    if (state.write_done_valid)
+                    if (completion.write_done_valid)
                     {
-                        err = cudaStreamWaitEvent(free_stream, state.write_done, 0);
+                        err = cudaStreamWaitEvent(free_stream, completion.write_done, 0);
                         if (err != cudaSuccess)
                         {
                             dependency_ok = false;
@@ -406,6 +411,8 @@ namespace
                     state.write_done = nullptr;
                 }
                 state.stream = nullptr;
+                state.completion_owner = 0;
+                state.last_write_stream = nullptr;
                 state.write_done_valid = false;
             }
         }
@@ -493,6 +500,27 @@ extern "C" int gpu_matrix_create(
             return set_error(err);
         }
 
+        // Small matrices use all-limb kernels on one stream. Preserve per-limb
+        // stream parallelism for larger matrices and their tiled GEMM kernels.
+        // Independent matrices remain distributed across the context's pool.
+        // Uniform-stream allocation owns one dominating completion per partition.
+        // Individual limb events are created only when a per-limb record needs one.
+        auto &stream_pool = ctx->execution->compute_streams_by_partition[partition_idx];
+        if (stream_pool.empty())
+        {
+            destroy_matrix_contents(mat);
+            delete mat;
+            return set_error("empty compute stream pool in gpu_matrix_create");
+        }
+        const bool shared_stream = rows <= 4 && cols <= 4;
+        cudaStream_t partition_stream = nullptr;
+        if (shared_stream)
+        {
+            const size_t stream_slot =
+                ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
+                stream_pool.size();
+            partition_stream = stream_pool[stream_slot];
+        }
         auto &exec_states = mat->exec_limb_states[partition_idx];
         for (size_t limb_idx = 0; limb_idx < partition.local_limb_count; ++limb_idx)
         {
@@ -500,33 +528,40 @@ extern "C" int gpu_matrix_create(
             state.device = ctx->gpu_ids[partition_idx];
             state.stream = nullptr;
             state.write_done = nullptr;
+            state.completion_owner = static_cast<uint32_t>(limb_idx);
+            state.last_write_stream = nullptr;
             state.write_done_valid = false;
-            auto &stream_pool = ctx->execution->compute_streams_by_partition[partition_idx];
-            if (stream_pool.empty())
+            if (shared_stream)
+                state.stream = partition_stream;
+            else
             {
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error("empty compute stream pool in gpu_matrix_create");
+                const size_t stream_slot =
+                    ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
+                    stream_pool.size();
+                state.stream = stream_pool[stream_slot];
             }
-            const size_t stream_slot =
-                ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
-                stream_pool.size();
-            state.stream = stream_pool[stream_slot];
-            err = cudaEventCreateWithFlags(&state.write_done, cudaEventDisableTiming);
-            if (err != cudaSuccess)
+            if (!shared_stream || limb_idx == 0)
             {
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error(err);
+                err = cudaEventCreateWithFlags(&state.write_done, cudaEventDisableTiming);
+                if (err != cudaSuccess)
+                {
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error(err);
+                }
             }
-            err = cudaEventRecord(state.write_done, state.stream);
-            if (err != cudaSuccess)
+            if (!shared_stream)
             {
-                destroy_matrix_contents(mat);
-                delete mat;
-                return set_error(err);
+                err = cudaEventRecord(state.write_done, state.stream);
+                if (err != cudaSuccess)
+                {
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error(err);
+                }
+                state.last_write_stream = state.stream;
+                state.write_done_valid = true;
             }
-            state.write_done_valid = true;
         }
 
         cudaStream_t alloc_stream = exec_states[0].stream;
@@ -604,6 +639,21 @@ extern "C" int gpu_matrix_create(
             return fail_after_descriptor_enqueue(err);
         }
 
+        if (shared_stream)
+        {
+            // Allocation and descriptor initialization are already ordered on
+            // this partition's sole producer stream. One owned completion
+            // protects every limb. Later per-limb records allocate their owned
+            // event before detaching from this completion alias.
+            auto &completion = exec_states[0];
+            err = cudaEventRecord(completion.write_done, alloc_stream);
+            if (err != cudaSuccess) return fail_after_descriptor_enqueue(err);
+            completion.last_write_stream = alloc_stream;
+            completion.write_done_valid = true;
+            for (auto &state : exec_states) state.completion_owner = 0;
+            continue;
+        }
+
         cudaEvent_t alloc_ready = nullptr;
         err = cudaEventCreateWithFlags(&alloc_ready, cudaEventDisableTiming);
         if (err != cudaSuccess)
@@ -639,6 +689,7 @@ extern "C" int gpu_matrix_create(
                 cudaEventDestroy(alloc_ready);
                 return fail_after_descriptor_enqueue(err);
             }
+            state.last_write_stream = state.stream;
         }
         cudaEventDestroy(alloc_ready);
     }
@@ -665,18 +716,23 @@ extern "C" int gpu_matrix_wait(const GpuMatrix *mat)
     }
     for (const auto &partition : mat->exec_limb_states)
     {
+        uint64_t seen_completions = 0;
         for (const auto &state : partition)
         {
-            if (!state.write_done || !state.write_done_valid)
+            const auto &completion = partition[state.completion_owner];
+            const uint64_t bit = uint64_t{1} << state.completion_owner;
+            if (seen_completions & bit) continue;
+            seen_completions |= bit;
+            if (!completion.write_done || !completion.write_done_valid)
             {
                 continue;
             }
-            cudaError_t err = cudaSetDevice(state.device);
+            cudaError_t err = cudaSetDevice(completion.device);
             if (err != cudaSuccess)
             {
                 return set_error(err);
             }
-            err = cudaEventSynchronize(state.write_done);
+            err = cudaEventSynchronize(completion.write_done);
             if (err != cudaSuccess)
             {
                 return set_error(err);
@@ -853,11 +909,16 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     }
     for (const auto &states : src->exec_limb_states)
     {
+        uint64_t seen_completions = 0;
         for (const auto &state : states)
         {
-            if (state.write_done && state.write_done_valid)
+            const auto &completion = states[state.completion_owner];
+            const uint64_t bit = uint64_t{1} << state.completion_owner;
+            if (seen_completions & bit) continue;
+            seen_completions |= bit;
+            if (completion.write_done && completion.write_done_valid)
             {
-                error = cudaStreamWaitEvent(destination_stream, state.write_done, 0);
+                error = cudaStreamWaitEvent(destination_stream, completion.write_done, 0);
                 if (error != cudaSuccess)
                 {
                     return set_error(error);

@@ -14,6 +14,7 @@ struct PlanKey {
 struct Plan {
     scales: Vec<u64>,
     inverses: Vec<u64>,
+    weights: Option<[u64; 64]>,
 }
 
 thread_local! {
@@ -104,7 +105,29 @@ impl GpuDCRTPolyMatrix {
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let plan = Arc::new(Plan { scales, inverses });
+            // Public CRT weights only: cache once, never inspect ciphertexts.
+            let weights = (source.len() * target.len() <= 64).then(|| {
+                let mut weights = [0u64; 64];
+                weights[..source.len() * target.len()].par_iter_mut().enumerate().for_each(
+                    |(index, weight)| {
+                        let input = index / target.len();
+                        let modulus = target[index % target.len()];
+                        *weight = if down && scales[input] == 0 { 0 } else { 1 };
+                        let begin = if down { 0 } else { (input / digit_size) * digit_size };
+                        let end =
+                            if down { source.len() } else { source.len().min(begin + digit_size) };
+                        for limb in begin..end {
+                            if limb != input && (!down || scales[limb] != 0) {
+                                *weight = ((*weight as u128 * (source[limb] % modulus) as u128) %
+                                    modulus as u128)
+                                    as u64;
+                            }
+                        }
+                    },
+                );
+                weights
+            });
+            let plan = Arc::new(Plan { scales, inverses, weights });
             let mut plans = plans.borrow_mut();
             // Bound retained host metadata even when callers explore many parameter sets.
             if plans.len() >= 64 {
@@ -130,6 +153,7 @@ impl GpuDCRTPolyMatrix {
                 plaintext_modulus,
                 plan.scales.as_ptr(),
                 plan.inverses.as_ptr(),
+                plan.weights.as_ref().map_or(std::ptr::null(), |weights| weights.as_ptr()),
             )
         };
         if status != 0 {
@@ -147,6 +171,71 @@ mod tests {
         matrix::dcrt_poly::DCRTPolyMatrix,
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_rns_compact_plan_boundary_matches_cpu() {
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let full_cpu = DCRTPolyParams::new(dimension, 9, bits, base_bits, None, None);
+        let primes = full_cpu.to_crt().0;
+        let full = GpuDCRTPolyParams::new(dimension, primes.clone(), base_bits, None);
+        let sampler = DCRTPolyUniformSampler::new();
+        // 8x8 reaches the compact64-pair boundary; 8x9 and9x8 use GPU setup.
+        for target_count in [8, 9] {
+            let source_primes = primes[..8].to_vec();
+            let target_primes = primes[..target_count].to_vec();
+            let source_cpu = DCRTPolyParams::new(
+                dimension,
+                8,
+                bits,
+                base_bits,
+                Some(source_primes.clone()),
+                None,
+            );
+            let target_cpu = DCRTPolyParams::new(
+                dimension,
+                target_count,
+                bits,
+                base_bits,
+                Some(target_primes.clone()),
+                None,
+            );
+            let source = GpuDCRTPolyParams::new_with_gpu(
+                dimension,
+                source_primes,
+                base_bits,
+                full.gpu_ids().to_vec(),
+                Some(1),
+                Some(&full),
+                None,
+            );
+            let target = GpuDCRTPolyParams::new_with_gpu(
+                dimension,
+                target_primes,
+                base_bits,
+                full.gpu_ids().to_vec(),
+                Some(1),
+                Some(&full),
+                None,
+            );
+            let cpu = sampler.sample_uniform(&source_cpu, 2, 1, DistType::FinRingDist);
+            let input = GpuDCRTPolyMatrix::from_cpu_matrix(&source, &cpu);
+            for normalize in [false, true] {
+                let result = input.rns_mod_up(&target, 3, normalize).unwrap();
+                assert_eq!(
+                    result.to_cpu_matrix(),
+                    cpu.rns_mod_up(&target_cpu, 3, normalize).unwrap()
+                );
+            }
+            if target_count == 9 {
+                let cpu = sampler.sample_uniform(&target_cpu, 2, 1, DistType::FinRingDist);
+                let input = GpuDCRTPolyMatrix::from_cpu_matrix(&target, &cpu).into_coeff_domain();
+                let result = input.rns_mod_down(&source, 3).unwrap();
+                drop(input);
+                assert_eq!(result.to_cpu_matrix(), cpu.rns_mod_down(&source_cpu, 3).unwrap());
+            }
+        }
+    }
 
     #[test]
     #[sequential]

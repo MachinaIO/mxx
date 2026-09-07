@@ -243,6 +243,29 @@ unsafe extern "C" {
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_transpose(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_tensor(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sum_rows(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        rows: *const usize,
+        offsets: *const usize,
+        group_count: usize,
+        term_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_add_row_blocks(
+        out: *mut GpuMatrixOpaque,
+        blocks: *const *const GpuMatrixOpaque,
+        block_count: usize,
+        rhs: *const GpuMatrixOpaque,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_equal(
         lhs: *const GpuMatrixOpaque,
         rhs: *const GpuMatrixOpaque,
@@ -300,6 +323,7 @@ unsafe extern "C" {
         plaintext_modulus: u64,
         scales: *const u64,
         inverses: *const u64,
+        weights: *const u64,
     ) -> c_int;
     pub(crate) fn gpu_matrix_centered_rebase(
         out: *mut GpuMatrixOpaque,

@@ -16,58 +16,9 @@ use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use std::collections::BTreeMap;
 
-fn configure_widths(backend: &mut GpuDcrtBackend, graph: &mxx_ir_core::ValidatedGraph) {
-    use mxx_runtime::gpu_calibration::{
-        GpuColumnWidths, gpu_calibration_operation_identity,
-        gpu_operation_is_column_separable_for_types,
-    };
-    // Correctness fixtures allocate their complete output widths explicitly.
-    // Avoid measuring the shared CUDA pool while another test owns a context,
-    // without serializing tests or fabricating a measured calibration profile.
-    let mut widths = BTreeMap::<[u8; 32], usize>::new();
-    for (id, validated) in &graph.scopes {
-        let scope = graph.source.scope(id).unwrap();
-        for node in &validated.execution_order {
-            let arguments = scope
-                .arguments(node)
-                .unwrap()
-                .iter()
-                .map(|wire| validated.wire_types[wire].clone())
-                .collect::<Vec<_>>();
-            if !gpu_operation_is_column_separable_for_types(node.kind(), &arguments) {
-                continue;
-            }
-            let outputs = (0..node.output_types().len())
-                .map(|port| {
-                    validated.wire_types
-                        [&scope.wire_ref(&node.output(port as u32).unwrap()).unwrap()]
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let identity = gpu_calibration_operation_identity(
-                node.kind(),
-                &arguments,
-                &outputs,
-                &graph.bindings,
-            )
-            .unwrap();
-            let width = outputs
-                .iter()
-                .filter_map(|ty| ty.matrix_type())
-                .map(|ty| ty.columns)
-                .max()
-                .unwrap_or(1)
-                .max(1);
-            widths.entry(identity).and_modify(|old| *old = (*old).max(width)).or_insert(width);
-        }
-    }
-    for (identity, width) in widths {
-        backend.set_column_widths_for_operation(
-            identity,
-            GpuColumnWidths { gpu0: width, nonzero: Some(width) },
-        );
-    }
-}
+#[path = "gpu_test_utils.rs"]
+mod gpu_test_utils;
+use gpu_test_utils::configure_widths;
 
 fn backend(common: &FheCommonParams, bgv: Option<&BgvParams>) -> GpuDcrtBackend {
     let rings = if let Some(bgv) = bgv {
@@ -193,7 +144,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
     assert!(top >= 2);
-    let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
+    let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::utils::is_prime(t)).unwrap();
     let bgv = BgvParams::new(common.clone(), t, None).unwrap();
     let context = DslContext::new("gpu-bgv-encrypt");
     let slots = context.int_family_input("slots", n);
@@ -363,7 +314,7 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
-    let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
+    let t = (1..).map(|k| k * 2 * n as u64 + 1).find(|&t| crate::utils::is_prime(t)).unwrap();
     let bgv = BgvParams::new(common.clone(), t, None).unwrap();
     let context = DslContext::new("gpu-bgv-short-slots");
     let single = context.int_family_input("single", 1);
@@ -423,7 +374,7 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     let n = common.ring.ring_dimension() as usize;
     let depth = common.ring.crt_depth();
     let order = 2 * n as u64;
-    let t = (1..).map(|k| k * order + 1).find(|&t| crate::bgv::is_prime(t)).unwrap();
+    let t = (1..).map(|k| k * order + 1).find(|&t| crate::utils::is_prime(t)).unwrap();
     let defaults = BgvParams::new(common.clone(), t, None).unwrap();
     let q_primes = common.ring.to_crt().0;
     let mut auxiliary_primes = defaults
@@ -437,7 +388,8 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
         .collect::<Vec<_>>();
     let mut candidate = *auxiliary_primes.last().unwrap() - order;
     while auxiliary_primes.len() < 2 {
-        if !q_primes.contains(&candidate) && t % candidate != 0 && crate::bgv::is_prime(candidate) {
+        if !q_primes.contains(&candidate) && t % candidate != 0 && crate::utils::is_prime(candidate)
+        {
             auxiliary_primes.push(candidate);
         }
         candidate -= order;

@@ -902,6 +902,10 @@ where
         Ok(left.add_out_of_place(right))
     }
 
+    fn add_row_blocks(&mut self, blocks: &[&M], right: &M) -> Result<M, Self::Error> {
+        Ok(right.add_row_blocks_out_of_place(blocks))
+    }
+
     fn add_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
         Ok(M::add_batch_out_of_place(inputs))
     }
@@ -917,7 +921,9 @@ where
     fn multiply(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {
         let left_size = left.size();
         let right_size = right.size();
-        Ok(if left_size == (1, 1) {
+        Ok(if left_size.1 == right_size.0 {
+            left.multiply_out_of_place(right)
+        } else if left_size == (1, 1) {
             right.multiply_poly_out_of_place(&left.entry(0, 0))
         } else if right_size == (1, 1) {
             left.multiply_poly_out_of_place(&right.entry(0, 0))
@@ -1147,6 +1153,10 @@ where
         let rows = rows.cloned().unwrap_or(IndexRange { start: 0, end: row_count });
         let columns = columns.cloned().unwrap_or(IndexRange { start: 0, end: column_count });
         Ok(value.slice(rows.start, rows.end, columns.start, columns.end))
+    }
+
+    fn sum_rows(&mut self, value: &M, rows: &[Vec<usize>]) -> Result<M, Self::Error> {
+        Ok(value.sum_rows(rows))
     }
 
     fn tensor(&mut self, left: &M, right: &M) -> Result<M, Self::Error> {

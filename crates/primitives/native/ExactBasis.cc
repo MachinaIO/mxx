@@ -168,7 +168,7 @@ void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli
 
         lbcrypto::DCRTPoly::DggType dgg(dggStddev);
 
-        auto zero_alloc = lbcrypto::DCRTPoly::Allocator(params, Format::EVALUATION);
+        auto zero_alloc = lbcrypto::DCRTPoly::Allocator(params, Format::COEFFICIENT);
 
         lbcrypto::Matrix<lbcrypto::Field2n> AF([&]()
                                                { return lbcrypto::Field2n(n, Format::EVALUATION, true); }, d, d);
@@ -221,20 +221,29 @@ void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli
                                                                      { return 0; }, n * 2 * d, ncol);
         lbcrypto::LatticeGaussSampUtility<lbcrypto::DCRTPoly>::SampleMat(AF, BF, DF, c, dgg, p1ZVector);
 
-        lbcrypto::Matrix<lbcrypto::DCRTPoly> p1(zero_alloc, 1, 1);
-        std::vector<lbcrypto::Matrix<lbcrypto::DCRTPoly>> p1Cols(ncol);
-#pragma omp parallel for if (ncol > 1)
-        for (long jL = 0; jL < static_cast<long>(ncol); ++jL)
-        {
-            size_t j = static_cast<size_t>(jL);
-            p1Cols[j] = lbcrypto::SplitInt64IntoElements<lbcrypto::DCRTPoly>(p1ZVector->ExtractCol(j), n, params);
-        }
-        if (ncol > 0)
-        {
-            p1 = p1Cols[0];
-            for (size_t j = 1; j < ncol; ++j)
-                p1.HStack(p1Cols[j]);
-        }
+        lbcrypto::Matrix<lbcrypto::DCRTPoly> p1(zero_alloc, 2 * d, ncol);
+#pragma omp parallel for collapse(2)
+        for (size_t row = 0; row < 2 * d; ++row)
+            for (size_t column = 0; column < ncol; ++column) {
+                // Upstream signed-vector assignment assumes |x| < q. Gaussian
+                // samples need not satisfy that for a small CRT prime. Reduce
+                // the original magnitude before forming its negative residue;
+                // reducing an already-underflowed q - |x| would be incorrect.
+                for (auto &tower : p1(row, column).GetAllElements()) {
+                    const auto modulus = tower.GetModulus();
+                    const uint64_t q = modulus.ConvertToInt();
+                    lbcrypto::NativeVector values(n, modulus);
+                    for (size_t coefficient = 0; coefficient < n; ++coefficient) {
+                        const int64_t x = (*p1ZVector)(row * n + coefficient, column);
+                        // Unsigned negation also handles INT64_MIN exactly.
+                        const uint64_t magnitude = x < 0 ?
+                            uint64_t{0} - static_cast<uint64_t>(x) : static_cast<uint64_t>(x);
+                        const uint64_t residue = magnitude % q;
+                        values[coefficient] = x < 0 && residue != 0 ? q - residue : residue;
+                    }
+                    tower.SetValues(std::move(values), Format::COEFFICIENT);
+                }
+            }
 
 #pragma omp parallel for collapse(2)
         for (size_t row = 0; row < p1.GetRows(); ++row)

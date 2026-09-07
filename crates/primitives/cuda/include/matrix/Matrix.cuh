@@ -42,7 +42,12 @@ struct GpuMatrix
     {
         int device;
         cudaStream_t stream;
+        // This event is physically owned here and destroyed exactly once.
         cudaEvent_t write_done;
+        // Local state index whose owned event currently dominates this limb.
+        uint32_t completion_owner;
+        // Producer ownership and last event-recording stream can differ.
+        cudaStream_t last_write_stream;
         bool write_done_valid;
     };
     struct SharedLimbBuffer

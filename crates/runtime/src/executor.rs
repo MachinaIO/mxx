@@ -27,13 +27,17 @@ use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
 use tracing::info;
+
+#[cfg(feature = "gpu")]
+mod gpu_plan;
+mod plan_cache;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionConfig {
@@ -47,6 +51,8 @@ pub struct ExecutionConfig {
     pub preimage_progress: Option<PreimageProgressConfig>,
     /// Optionally fence backend release streams after this many executed nodes.
     /// This bounds queued releases without waiting unrelated live matrices.
+    /// When set, also drain pending releases before returning. With `None`,
+    /// releases remain asynchronous and are protected by backend lifetime events.
     pub release_fence_interval: Option<NonZeroUsize>,
 }
 
@@ -75,6 +81,371 @@ pub struct ExecutionResult<B: Backend> {
     pub production_id: Option<ProductionId>,
     pub artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
     pub staged_family_leases: Vec<StagedFamilyLease>,
+}
+
+/// A dispatch-only optimization: the original graph, validation and producer
+/// execution remain intact. Aliases are installed before concat input release.
+#[derive(Default)]
+struct RootBlockAliases {
+    #[cfg(feature = "gpu")]
+    calibration: gpu_plan::Operations,
+    concats: BTreeMap<NodeId, Vec<(WireRef, WireRef)>>,
+    slices: BTreeSet<NodeId>,
+    add_concats: BTreeSet<NodeId>,
+    adds: BTreeMap<NodeId, (NodeId, WireRef)>,
+    row_sums: BTreeMap<NodeId, RootRowSumPlan>,
+    row_sum_interiors: BTreeSet<NodeId>,
+    row_sum_captures: BTreeMap<NodeId, Vec<NodeId>>,
+}
+
+/// Recognized runtime row sums, exposed for explicit calibration setup.
+/// The original graph must already have passed validation.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RootRowSumPlan {
+    pub source: WireRef,
+    pub rows: Vec<Vec<usize>>,
+    interiors: BTreeSet<NodeId>,
+}
+
+#[doc(hidden)]
+pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRowSumPlan> {
+    let scope = validated.source.scope(&FrozenGraphScopeId::Root).expect("validated root");
+    let checked = validated.root_scope();
+    let mut uses = BTreeMap::<WireRef, Vec<NodeId>>::new();
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        for argument in scope.arguments(node).expect("validated arguments") {
+            uses.entry(argument).or_default().push(NodeId(index as u64));
+        }
+    }
+    let mut plans = BTreeMap::new();
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        if !matches!(node.kind(), NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Rows }) {
+            continue;
+        }
+        let output = WireRef { node: NodeId(index as u64), port: Port(0) };
+        let Some(ConcreteWireType::Matrix(output_type)) = checked.wire_types.get(&output) else {
+            continue
+        };
+        let arguments = scope.arguments(node).expect("validated concat arguments");
+        if arguments.is_empty() || output_type.rows != arguments.len() {
+            continue;
+        }
+        let mut source = None;
+        let mut groups = Vec::new();
+        let mut interiors = BTreeSet::new();
+        let mut valid = true;
+        for argument in arguments {
+            let mut pending = vec![argument];
+            let mut rows = Vec::new();
+            while let Some(wire) = pending.pop() {
+                let Some(ConcreteWireType::Matrix(ty)) = checked.wire_types.get(&wire) else {
+                    valid = false;
+                    break;
+                };
+                if wire.port != Port(0) ||
+                    uses.get(&wire).map(Vec::len) != Some(1) ||
+                    checked.liveness.retained.contains(&wire) ||
+                    scope.outputs().contains(&wire) ||
+                    ty.rows != 1 ||
+                    ty.columns != output_type.columns ||
+                    ty.modulus != output_type.modulus ||
+                    ty.ring_dimension != output_type.ring_dimension
+                {
+                    valid = false;
+                    break;
+                }
+                let producer = scope.node(wire.node).expect("validated row producer");
+                let inputs = scope.arguments(producer).expect("validated row arguments");
+                match producer.kind() {
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Add) if inputs.len() == 2 => {
+                        pending.push(inputs[1]);
+                        pending.push(inputs[0]);
+                    }
+                    NodeKind::Slice { rows: range, columns } if inputs.len() == 1 => {
+                        let input = inputs[0];
+                        let Some(ConcreteWireType::Matrix(input_type)) =
+                            checked.wire_types.get(&input)
+                        else {
+                            valid = false;
+                            break;
+                        };
+                        let evaluate = |range: &mxx_ir_core::node::IndexRange| {
+                            Some((
+                                range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                                range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                            ))
+                        };
+                        let row_range = range.as_ref().map_or(Some((0, input_type.rows)), evaluate);
+                        let column_range =
+                            columns.as_ref().map_or(Some((0, input_type.columns)), evaluate);
+                        let Some((start, end)) = row_range else {
+                            valid = false;
+                            break
+                        };
+                        if end.checked_sub(start) != Some(1) ||
+                            end > input_type.rows ||
+                            column_range != Some((0, input_type.columns)) ||
+                            input_type.columns != output_type.columns ||
+                            input_type.modulus != output_type.modulus ||
+                            input_type.ring_dimension != output_type.ring_dimension ||
+                            source.is_some_and(|source| source != input)
+                        {
+                            valid = false;
+                            break;
+                        }
+                        source = Some(input);
+                        rows.push(start);
+                    }
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+                interiors.insert(wire.node);
+            }
+            if !valid || rows.is_empty() {
+                valid = false;
+                break;
+            }
+            groups.push(rows);
+        }
+        if valid {
+            plans.insert(
+                output.node,
+                RootRowSumPlan {
+                    source: source.expect("nonempty row groups have a source"),
+                    rows: groups,
+                    interiors,
+                },
+            );
+        }
+    }
+    // Compose only when every original consumer remains represented. A
+    // retained parent or a mixed consumer keeps the materialized boundary.
+    loop {
+        let mut replacement = None;
+        for (parent_id, parent) in &plans {
+            let wire = WireRef { node: *parent_id, port: Port(0) };
+            if checked.liveness.retained.contains(&wire) || scope.outputs().contains(&wire) {
+                continue;
+            }
+            let Some(consumers) = uses.get(&wire) else { continue };
+            let parent_type = checked.wire_types[&wire].matrix_type().expect("row sum output");
+            let mut children = plans
+                .iter()
+                .filter(|(_, plan)| plan.source == wire)
+                .map(|(node, plan)| (*node, plan.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let mut covered = true;
+            for consumer in consumers {
+                if children
+                    .iter()
+                    .any(|(node, plan)| node == consumer || plan.interiors.contains(consumer))
+                {
+                    continue;
+                }
+                let node = scope.node(*consumer).expect("validated row sum consumer");
+                let NodeKind::Slice { rows, columns } = node.kind() else {
+                    covered = false;
+                    break
+                };
+                let output = WireRef { node: *consumer, port: Port(0) };
+                let Some(ConcreteWireType::Matrix(output_type)) = checked.wire_types.get(&output)
+                else {
+                    covered = false;
+                    break;
+                };
+                let evaluate = |range: &mxx_ir_core::node::IndexRange| {
+                    Some((
+                        range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                        range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                    ))
+                };
+                let selected = rows.as_ref().map_or(Some((0, parent_type.rows)), evaluate);
+                let columns = columns.as_ref().map_or(Some((0, parent_type.columns)), evaluate);
+                let Some((start, end)) = selected else {
+                    covered = false;
+                    break
+                };
+                if end.checked_sub(start) != Some(1) ||
+                    end > parent.rows.len() ||
+                    columns != Some((0, parent_type.columns)) ||
+                    output_type.rows != 1 ||
+                    output_type.columns != parent_type.columns ||
+                    output_type.modulus != parent_type.modulus ||
+                    output_type.ring_dimension != parent_type.ring_dimension
+                {
+                    covered = false;
+                    break;
+                }
+                children.insert(
+                    *consumer,
+                    RootRowSumPlan {
+                        source: wire,
+                        rows: vec![vec![start]],
+                        interiors: BTreeSet::new(),
+                    },
+                );
+            }
+            if !covered || children.is_empty() {
+                continue;
+            }
+            // A compact DAG can repeatedly sum two copies of a prior row.
+            // Keep that materialized boundary instead of expanding its terms
+            // exponentially. This matches the native row-sum term capacity.
+            let expanded_terms = children.values().try_fold(0usize, |total, child| {
+                child
+                    .rows
+                    .iter()
+                    .flatten()
+                    .try_fold(total, |total, row| total.checked_add(parent.rows[*row].len()))
+            });
+            if expanded_terms.is_none_or(|terms| terms > 32) {
+                continue;
+            }
+            for child in children.values_mut() {
+                child.rows = child
+                    .rows
+                    .iter()
+                    .map(|group| {
+                        group.iter().flat_map(|row| parent.rows[*row].iter().copied()).collect()
+                    })
+                    .collect();
+                child.source = parent.source;
+                child.interiors.extend(parent.interiors.iter().copied());
+                child.interiors.insert(*parent_id);
+            }
+            replacement = Some((*parent_id, children));
+            break;
+        }
+        let Some((parent, children)) = replacement else { break };
+        plans.remove(&parent);
+        plans.extend(children);
+    }
+    plans
+}
+
+fn root_block_aliases(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+    capture_trace: bool,
+) -> Arc<RootBlockAliases> {
+    if capture_trace || scope_id != &FrozenGraphScopeId::Root {
+        return Arc::new(RootBlockAliases::default());
+    }
+    plan_cache::get(validated, || {
+        let plan = build_root_block_aliases(validated);
+        #[cfg(feature = "gpu")]
+        let plan = gpu_plan::prepare(validated, plan);
+        plan
+    })
+}
+
+fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
+    let mut plan = RootBlockAliases::default();
+    let scope = validated.source.scope(&FrozenGraphScopeId::Root).expect("validated root");
+    let checked = validated.root_scope();
+    plan.row_sums = root_row_sum_plans(validated);
+    let mut reserved = BTreeSet::new();
+    for (output, row_sum) in &plan.row_sums {
+        reserved.insert(*output);
+        reserved.insert(row_sum.source.node);
+        reserved.extend(row_sum.interiors.iter().copied());
+        plan.row_sum_interiors.extend(row_sum.interiors.iter().copied());
+        let first = *row_sum.interiors.first().expect("nonempty row sum interiors");
+        plan.row_sum_captures.entry(first).or_default().push(*output);
+    }
+    let mut users = BTreeMap::<WireRef, Vec<usize>>::new();
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        for wire in scope.arguments(node).expect("validated arguments") {
+            users.entry(wire).or_default().push(index);
+        }
+    }
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        if reserved.contains(&NodeId(index as u64)) {
+            continue;
+        }
+        if !matches!(node.kind(), NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Rows }) {
+            continue;
+        }
+        let wire = WireRef { node: NodeId(index as u64), port: Port(0) };
+        if checked.liveness.retained.contains(&wire) || scope.outputs().contains(&wire) {
+            continue;
+        }
+        let Some(consumers) = users.get(&wire) else { continue };
+        let Some(ConcreteWireType::Matrix(concat_type)) = checked.wire_types.get(&wire) else {
+            continue;
+        };
+        let args = scope.arguments(node).expect("validated concat arguments");
+        let mut blocks = Vec::with_capacity(args.len());
+        let mut start = 0usize;
+        for arg in args {
+            let Some(ConcreteWireType::Matrix(ty)) = checked.wire_types.get(&arg) else {
+                break;
+            };
+            let Some(end) = start.checked_add(ty.rows) else { break };
+            blocks.push((start, end, arg));
+            start = end;
+        }
+        if blocks.len() != node.arguments().len() {
+            continue;
+        }
+        if consumers.len() == 1 {
+            let consumer = consumers[0];
+            let add = &checked.execution_order[consumer];
+            let args = scope.arguments(add).expect("validated add arguments");
+            let output = WireRef { node: NodeId(consumer as u64), port: Port(0) };
+            if matches!(add.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add)) &&
+                args.len() == 2 &&
+                args[0] == wire &&
+                args[1] != wire &&
+                checked.wire_types.get(&args[1]) == checked.wire_types.get(&wire) &&
+                checked.wire_types.get(&output) == checked.wire_types.get(&wire)
+            {
+                plan.add_concats.insert(wire.node);
+                plan.adds.insert(output.node, (wire.node, args[1]));
+                continue;
+            }
+        }
+        let mut aliases = Vec::with_capacity(consumers.len());
+        for &consumer in consumers {
+            let slice = &checked.execution_order[consumer];
+            let NodeKind::Slice { rows, columns } = slice.kind() else { break };
+            let range = |range: &mxx_ir_core::node::IndexRange| {
+                Some((
+                    range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                    range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                ))
+            };
+            let row_range = match rows {
+                Some(rows) => range(rows),
+                None => Some((0, concat_type.rows)),
+            };
+            let col_range = match columns {
+                Some(columns) => range(columns),
+                None => Some((0, concat_type.columns)),
+            };
+            if col_range != Some((0, concat_type.columns)) {
+                break;
+            }
+            let Some((_, _, source)) =
+                blocks.iter().find(|(start, end, _)| row_range == Some((*start, *end)))
+            else {
+                break
+            };
+            let output = WireRef { node: NodeId(consumer as u64), port: Port(0) };
+            if checked.wire_types.get(&output) != checked.wire_types.get(source) {
+                break;
+            }
+            aliases.push((output, *source));
+        }
+        if aliases.len() == consumers.len() {
+            plan.slices.extend(aliases.iter().map(|(output, _)| output.node));
+            plan.concats.insert(wire.node, aliases);
+        }
+    }
+    plan
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -448,7 +819,9 @@ where
             });
         }
     }
-    executor.fence_pending_releases()?;
+    if config.release_fence_interval.is_some() {
+        executor.fence_pending_releases()?;
+    }
     info!(
         graph = validated.source.name(),
         host_returned_node_instances = executor.executed_node_count,
@@ -587,9 +960,17 @@ where
             ExecutionError::MissingSubgraph { node: NodeId(0), name: format!("{scope_id:?}") }
         })?;
         let schedule = &validated_scope.liveness;
+        let block_aliases = root_block_aliases(self.validated, scope_id, self.trace.is_some());
         let mut values = (0..envs.len())
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
+        // Own concat blocks until their sole Add consumer executes, even when
+        // the unchanged liveness schedule releases the original input wires.
+        let mut add_blocks = (0..envs.len())
+            .map(|_| BTreeMap::<NodeId, Vec<Arc<B::Matrix>>>::new())
+            .collect::<Vec<_>>();
+        let mut row_sum_sources =
+            (0..envs.len()).map(|_| BTreeMap::<NodeId, Arc<B::Matrix>>::new()).collect::<Vec<_>>();
         for (position, handle) in validated_scope.execution_order.iter().enumerate() {
             // Counts include structural nodes and each instantiated loop-body
             // node, not coefficients, kernels, or device-completed work. Scope
@@ -619,48 +1000,162 @@ where
                 kind: handle.kind(),
                 args: scope.arguments(handle).expect("validated node belongs to its scope"),
             };
-            #[cfg(feature = "gpu")]
-            let calibration_groups =
-                if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
-                    let declared_argument_types = node
+            let aliased = block_aliases.slices.contains(&node.id) ||
+                block_aliases.concats.contains_key(&node.id) ||
+                block_aliases.add_concats.contains(&node.id) ||
+                block_aliases.row_sum_interiors.contains(&node.id);
+            if let Some(outputs) = block_aliases.row_sum_captures.get(&node.id) {
+                for index in 0..envs.len() {
+                    self.set_placement(placements[index])?;
+                    for output in outputs {
+                        let source = block_aliases.row_sums[output].source;
+                        let matrix = self.matrix(&mut values[index], source)?;
+                        row_sum_sources[index].insert(*output, matrix);
+                    }
+                }
+            }
+            if block_aliases.add_concats.contains(&node.id) {
+                for index in 0..envs.len() {
+                    self.set_placement(placements[index])?;
+                    let matrices = node
                         .args
                         .iter()
-                        .map(|wire| {
-                            scope
-                                .node(wire.node)
-                                .and_then(|producer| {
-                                    producer.output_types().get(wire.port.0 as usize)
-                                })
-                                .cloned()
-                                .ok_or_else(|| {
-                                    ExecutionError::MissingMetadata(WireId {
-                                        instantiation_path: paths[0].clone(),
-                                        wire: *wire,
-                                    })
-                                })
-                        })
+                        .map(|argument| self.matrix(&mut values[index], *argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    crate::gpu_calibration::gpu_calibration_groups(
-                        scope_id,
-                        node.id,
+                    add_blocks[index].insert(node.id, matrices);
+                }
+            }
+            if let Some(aliases) = block_aliases.concats.get(&node.id) {
+                for index in 0..envs.len() {
+                    self.set_placement(placements[index])?;
+                    // Materialize every original argument, including unselected
+                    // blocks, preserving artifact-load errors and staging work.
+                    let matrices = node
+                        .args
+                        .iter()
+                        .map(|argument| self.matrix(&mut values[index], *argument))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for (output, source) in aliases {
+                        let argument = node
+                            .args
+                            .iter()
+                            .position(|argument| argument == source)
+                            .expect("block alias selects a concat argument");
+                        let matrix = matrices[argument].clone();
+                        values[index].insert(*output, RuntimeValue::Matrix(matrix));
+                    }
+                }
+            }
+            #[cfg(feature = "gpu")]
+            let calibration_groups = if aliased {
+                Vec::new()
+            } else if scope_id == &FrozenGraphScopeId::Root && self.trace.is_none() {
+                let operation =
+                    block_aliases.calibration[&node.id].clone().map_err(ExecutionError::Backend)?;
+                vec![(operation, (0..envs.len()).collect())]
+            } else if scope_id == &FrozenGraphScopeId::Root &&
+                crate::gpu_calibration::gpu_operation_is_column_separable(node.kind)
+            {
+                // The root executes with exactly validated.bindings. Its concrete
+                // types already passed validation; re-evaluating declared types here
+                // duplicates that work. Child scopes still use their actual runtime
+                // environments below, including loop-dependent preimage bounds.
+                let argument_types = node
+                    .args
+                    .iter()
+                    .map(|wire| validated_scope.wire_types[wire].clone())
+                    .collect::<Vec<_>>();
+                let output_types = (0..handle.output_types().len())
+                    .map(|port| {
+                        // Validation and dispatch both number nodes by their
+                        // position in the frozen scope's execution order.
+                        let wire = WireRef { node: node.id, port: Port(port as u32) };
+                        validated_scope.wire_types[&wire].clone()
+                    })
+                    .collect::<Vec<_>>();
+                let operation =
+                    crate::gpu_calibration::gpu_operation_is_column_separable_for_types(
                         node.kind,
-                        &declared_argument_types,
-                        handle.output_types(),
-                        &envs,
+                        &argument_types,
                     )
-                    .map_err(ExecutionError::Backend)?
-                } else {
-                    vec![(None, (0..envs.len()).collect())]
-                };
+                    .then(|| {
+                        crate::gpu_calibration::gpu_calibration_operation_identity(
+                            node.kind,
+                            &argument_types,
+                            &output_types,
+                            &self.validated.bindings,
+                        )
+                    })
+                    .transpose()
+                    .map_err(ExecutionError::Backend)?;
+                vec![(operation, (0..envs.len()).collect())]
+            } else if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
+                let declared_argument_types = node
+                    .args
+                    .iter()
+                    .map(|wire| {
+                        scope
+                            .node(wire.node)
+                            .and_then(|producer| producer.output_types().get(wire.port.0 as usize))
+                            .cloned()
+                            .ok_or_else(|| {
+                                ExecutionError::MissingMetadata(WireId {
+                                    instantiation_path: paths[0].clone(),
+                                    wire: *wire,
+                                })
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::gpu_calibration::gpu_calibration_groups(
+                    scope_id,
+                    node.id,
+                    node.kind,
+                    &declared_argument_types,
+                    handle.output_types(),
+                    &envs,
+                )
+                .map_err(ExecutionError::Backend)?
+            } else {
+                vec![(None, (0..envs.len()).collect())]
+            };
             #[cfg(not(feature = "gpu"))]
             let calibration_groups: Vec<(Option<[u8; 32]>, Vec<usize>)> =
-                vec![(None, (0..envs.len()).collect())];
+                if aliased { Vec::new() } else { vec![(None, (0..envs.len()).collect())] };
 
             for (operation, indices) in calibration_groups {
                 if let Some(operation) = operation {
                     self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
                 }
-                if matches!(node.kind, NodeKind::PreimageSample { .. }) && indices.len() > 1 {
+                if let Some(row_sum) = block_aliases.row_sums.get(&node.id) {
+                    for index in indices {
+                        self.set_placement(placements[index])?;
+                        let source = row_sum_sources[index]
+                            .remove(&node.id)
+                            .expect("row sum source survives until concat");
+                        let output = self
+                            .backend
+                            .sum_rows(&source, &row_sum.rows)
+                            .map_err(Self::backend_error)?;
+                        self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(output));
+                        self.has_pending_releases = true;
+                    }
+                } else if let Some((concat, right)) = block_aliases.adds.get(&node.id) {
+                    for index in indices {
+                        self.set_placement(placements[index])?;
+                        let right = self.matrix(&mut values[index], *right)?;
+                        let blocks = add_blocks[index]
+                            .remove(concat)
+                            .expect("fused concat blocks survive until Add");
+                        let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        let output = self
+                            .backend
+                            .add_row_blocks(&references, &right)
+                            .map_err(Self::backend_error)?;
+                        self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(output));
+                        self.has_pending_releases = true;
+                    }
+                } else if matches!(node.kind, NodeKind::PreimageSample { .. }) && indices.len() > 1
+                {
                     self.execute_preimage_batch(
                         scope_id,
                         &envs,
@@ -4195,6 +4690,418 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
+
+    #[test]
+    fn root_block_aliases_preserve_multiple_consumers_and_trace_results() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, 8usize);
+        let first = ring.input("first", (1, 1));
+        let second = ring.input("second", (2, 1));
+        let joined = Mat::concat(ConcatAxis::Rows, vec![first, second]);
+        let top = joined.clone().slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+        let bottom = joined.slice(Some(IndexRange { start: 1.into(), end: 3.into() }), None);
+        let graph = DslContext::new("root-block-aliases")
+            .output("top", top.clone())
+            .unwrap()
+            .output("twice", top.clone() + top)
+            .unwrap()
+            .output("bottom", bottom)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert_eq!(plan.concats.len(), 1);
+        assert_eq!(plan.slices.len(), 2);
+        let dynamic_scope = FrozenGraphScopeId::ParallelBody {
+            parent: Box::new(FrozenGraphScopeId::Root),
+            owner: NodeId(0),
+        };
+        assert!(root_block_aliases(&graph, &dynamic_scope, false).concats.is_empty());
+        assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).concats.is_empty());
+
+        let first_matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_biguints(&parameters, &[7u8.into()])],
+        );
+        let second_matrix = first_matrix.concat_rows(&[&first_matrix]);
+        let inputs = BTreeMap::from([
+            ("first".to_owned(), RuntimeValue::matrix(first_matrix.clone())),
+            ("second".to_owned(), RuntimeValue::matrix(second_matrix.clone())),
+        ]);
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let optimized =
+            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
+        let (reference, _) =
+            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                .unwrap();
+        for name in ["top", "twice", "bottom"] {
+            assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
+        }
+        assert_eq!(matrix_output(&optimized, "top"), &first_matrix);
+        assert_eq!(matrix_output(&optimized, "bottom"), &second_matrix);
+    }
+
+    #[test]
+    fn root_sparse_row_sum_preserves_source_and_matches_trace() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, 8usize);
+        // The source concat must survive even though all original consumers
+        // are slices eliminated by the row-sum plan.
+        let source = Mat::concat(
+            ConcatAxis::Rows,
+            vec![ring.input("first", (1, 1)), ring.input("rest", (3, 1))],
+        );
+        let row = |index: usize| {
+            source
+                .clone()
+                .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+        };
+        let sum = Mat::concat(ConcatAxis::Rows, vec![row(0), row(1) + row(2), row(3)]);
+        let graph = DslContext::new("sparse-row-sum")
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert_eq!(plan.row_sums.len(), 1);
+        assert_eq!(plan.row_sums.values().next().unwrap().rows, vec![vec![0], vec![1, 2], vec![3]]);
+        assert!(plan.concats.is_empty());
+        assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).row_sums.is_empty());
+        let matrices = [1u8, 3, 5, 7].map(|value| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+            )
+        });
+        let inputs = BTreeMap::from([
+            ("first".to_owned(), RuntimeValue::matrix(matrices[0].clone())),
+            (
+                "rest".to_owned(),
+                RuntimeValue::matrix(matrices[1].concat_rows(&[&matrices[2], &matrices[3]])),
+            ),
+        ]);
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let optimized =
+            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
+        let (reference, _) =
+            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                .unwrap();
+        assert_eq!(matrix_output(&optimized, "sum"), matrix_output(&reference, "sum"));
+        let middle = &matrices[1] + &matrices[2];
+        let expected = matrices[0].concat_rows(&[&middle, &matrices[3]]);
+        assert_eq!(matrix_output(&optimized, "sum"), &expected);
+    }
+
+    #[test]
+    fn sparse_row_composition_bounds_deep_doubling_without_losing_terms() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        let ring = Ring::new(97, 8usize);
+        let mut value = ring.input("source", (1, 1));
+        for _ in 0..40 {
+            // Separate Slice nodes each have one consumer, so every level is
+            // eligible locally, but expanding the complete chain is not safe.
+            let row =
+                || value.clone().slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+            value = Mat::concat(ConcatAxis::Rows, vec![row() + row()]);
+        }
+        let graph = DslContext::new("bounded-row-composition")
+            .output("result", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plans = root_row_sum_plans(&graph);
+        assert!(plans.len() >= 8, "retain boundaries instead of expanding forty doublings");
+        let scope = graph.source.scope(&FrozenGraphScopeId::Root).unwrap();
+        let source = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .position(
+                |node| matches!(node.kind(), NodeKind::Input { name, .. } if name == "source"),
+            )
+            .unwrap();
+        let mut multiplicities =
+            BTreeMap::from([(WireRef { node: NodeId(source as u64), port: Port(0) }, 1u128)]);
+        for (node, plan) in &plans {
+            assert_eq!(plan.rows.len(), 1);
+            assert!(plan.rows[0].len() <= 32);
+            assert!(plan.rows[0].iter().all(|row| *row == 0));
+            let count = multiplicities[&plan.source] * plan.rows[0].len() as u128;
+            multiplicities.insert(WireRef { node: *node, port: Port(0) }, count);
+        }
+        assert_eq!(
+            multiplicities[&scope.outputs()[0]],
+            1u128 << 40,
+            "bounded plans must preserve every duplicate term exactly"
+        );
+    }
+
+    #[test]
+    fn composed_sparse_rows_preserve_outputs_and_observable_parent_boundaries() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        for mode in 0..3 {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+            let ring = Ring::new(modulus, 8usize);
+            let source = ring.input("source", (4, 1));
+            let row = |matrix: &Mat, index: usize| {
+                matrix
+                    .clone()
+                    .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+            };
+            let product = Mat::concat(
+                ConcatAxis::Rows,
+                vec![row(&source, 0), row(&source, 1) + row(&source, 2), row(&source, 3)],
+            );
+            let leading = row(&product, 0);
+            let carry = Mat::concat(ConcatAxis::Rows, vec![row(&product, 1), row(&product, 2)]);
+            let mut context = DslContext::new("composed-sparse-rows")
+                .output("leading", leading)
+                .unwrap()
+                .output("carry", carry)
+                .unwrap();
+            if mode == 1 {
+                context = context.output("parent", product.clone()).unwrap();
+            }
+            if mode == 2 {
+                context = context.output("transpose", product.transpose()).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let plans = root_row_sum_plans(&graph);
+            assert_eq!(plans.len(), 2);
+            if mode == 0 {
+                assert!(plans.values().any(|plan| plan.rows == vec![vec![0]]));
+                assert!(plans.values().any(|plan| plan.rows == vec![vec![1, 2], vec![3]]));
+                assert_eq!(
+                    plans.values().next().unwrap().source,
+                    plans.values().next_back().unwrap().source
+                );
+            } else {
+                assert!(plans.values().any(|plan| plan.rows == vec![vec![0], vec![1, 2], vec![3]]));
+            }
+            let matrices = [1u8, 3, 5, 7].map(|value| {
+                DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+                )
+            });
+            let source = matrices[0].concat_rows(&[&matrices[1], &matrices[2], &matrices[3]]);
+            let inputs = BTreeMap::from([("source".to_owned(), RuntimeValue::matrix(source))]);
+            let mut backend = cpu_backend([parameters]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            for name in optimized.outputs.keys() {
+                assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
+            }
+            let middle = &matrices[1] + &matrices[2];
+            assert_eq!(matrix_output(&optimized, "leading"), &matrices[0]);
+            assert_eq!(matrix_output(&optimized, "carry"), &middle.concat_rows(&[&matrices[3]]));
+        }
+    }
+
+    #[test]
+    fn root_sparse_row_sum_preserves_observed_interiors_and_partial_slices() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        for mode in 0..4 {
+            let ring = Ring::new(97, 8usize);
+            let source = ring.input("source", (3, 2));
+            let row = |index: usize| {
+                source.clone().slice(
+                    Some(IndexRange { start: index.into(), end: (index + 1).into() }),
+                    (mode == 2).then(|| IndexRange { start: 0.into(), end: 1.into() }),
+                )
+            };
+            let first = row(0);
+            let middle = first.clone() + row(1);
+            let joined = Mat::concat(ConcatAxis::Rows, vec![middle.clone(), row(2)]);
+            let mut context =
+                DslContext::new("sparse-row-sum-fallback").output("joined", joined).unwrap();
+            if mode == 0 {
+                context = context.output("slice", first.clone()).unwrap();
+            }
+            if mode == 1 {
+                context = context.output("add", middle).unwrap();
+            }
+            if mode == 3 {
+                context = context.output("other", first + row(2)).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            assert!(root_row_sum_plans(&graph).is_empty());
+        }
+    }
+
+    #[test]
+    fn root_block_add_preserves_results_and_retained_concat_outputs() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::ConcatAxis;
+
+        for retain_concat in [false, true] {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+            let ring = Ring::new(modulus, 8usize);
+            let first = ring.input("first", (1, 1));
+            let second = ring.input("second", (2, 1));
+            let joined = Mat::concat(ConcatAxis::Rows, vec![first.clone(), second.clone()]);
+            // Both sides are concats. Only the left concat may be stashed;
+            // the right remains an ordinary materialized Add argument.
+            let right = Mat::concat(ConcatAxis::Rows, vec![second, first]);
+            let sum = joined.clone() + right;
+            let mut context = DslContext::new("root-block-add").output("sum", sum).unwrap();
+            if retain_concat {
+                context = context.output("joined", joined).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+            assert_eq!(plan.adds.len(), usize::from(!retain_concat));
+            assert_eq!(plan.add_concats.len(), usize::from(!retain_concat));
+            assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).adds.is_empty());
+
+            let first_matrix = DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[7u8.into()])],
+            );
+            let second_row = DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[11u8.into()])],
+            );
+            let second_matrix = second_row.concat_rows(&[&first_matrix]);
+            let inputs = BTreeMap::from([
+                ("first".to_owned(), RuntimeValue::matrix(first_matrix)),
+                ("second".to_owned(), RuntimeValue::matrix(second_matrix)),
+            ]);
+            let mut backend = cpu_backend([parameters]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            assert_eq!(matrix_output(&optimized, "sum"), matrix_output(&reference, "sum"));
+            if retain_concat {
+                assert_eq!(
+                    matrix_output(&optimized, "joined"),
+                    matrix_output(&reference, "joined")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn root_plan_cache_respects_mutable_validation_metadata() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        let ring = Ring::new(97, 8usize);
+        let joined = Mat::concat(
+            ConcatAxis::Rows,
+            vec![ring.input("first", (2, 2)), ring.input("second", (2, 2))],
+        );
+        let selected = joined.slice(Some(IndexRange { start: 0.into(), end: 2.into() }), None);
+        let mut graph = DslContext::new("cached-block-plan")
+            .output("selected", selected)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let original = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert_eq!(original.concats.len(), 1);
+        assert!(Arc::ptr_eq(
+            &original,
+            &root_block_aliases(&graph, &FrozenGraphScopeId::Root, false)
+        ));
+        let concat = *original.concats.keys().next().unwrap();
+        graph
+            .scopes
+            .get_mut(&FrozenGraphScopeId::Root)
+            .unwrap()
+            .liveness
+            .retained
+            .insert(WireRef { node: concat, port: Port(0) });
+        let retained = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert!(retained.concats.is_empty());
+        assert!(!Arc::ptr_eq(&original, &retained));
+        graph
+            .scopes
+            .get_mut(&FrozenGraphScopeId::Root)
+            .unwrap()
+            .liveness
+            .retained
+            .remove(&WireRef { node: concat, port: Port(0) });
+        assert!(Arc::ptr_eq(
+            &original,
+            &root_block_aliases(&graph, &FrozenGraphScopeId::Root, false)
+        ));
+        assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).concats.is_empty());
+    }
+
+    #[test]
+    fn root_block_aliases_keep_retained_and_partial_concat_materialized() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        for retained in [false, true] {
+            let ring = Ring::new(97, 8usize);
+            let joined = Mat::concat(
+                ConcatAxis::Rows,
+                vec![ring.input("first", (2, 2)), ring.input("second", (2, 2))],
+            );
+            let selected = joined.clone().slice(
+                Some(IndexRange { start: 0.into(), end: 2.into() }),
+                (!retained).then(|| IndexRange { start: 0.into(), end: 1.into() }),
+            );
+            let mut context =
+                DslContext::new("block-alias-fallback").output("selected", selected).unwrap();
+            if retained {
+                context = context.output("joined", joined).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            assert!(
+                root_block_aliases(&graph, &FrozenGraphScopeId::Root, false).concats.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn block_aliases_do_not_hide_invalid_unselected_producers() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        let ring = Ring::new(97, 8usize);
+        let invalid = ring.input("lhs", (2, 3)) * ring.input("rhs", (4, 1));
+        let joined = Mat::concat(ConcatAxis::Rows, vec![ring.input("valid", (1, 1)), invalid]);
+        let selected = joined.slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+        let graph = DslContext::new("invalid-unselected-block")
+            .output("selected", selected)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(graph.validate(&ParamEnv::default()).is_err());
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct PlacementProbeSmallMatrix {

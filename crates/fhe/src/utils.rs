@@ -1,9 +1,53 @@
-//! Coefficient-boundary graphs. RNS modulus switching must not call these.
+//! Shared FHE helpers and coefficient-boundary graphs.
+//! RNS modulus switching must not call the coefficient-boundary helpers.
 use crate::FheError;
 use mxx_dsl::{DslError, Family, Int, Mat, Ring, select};
 use mxx_ir_core::IntExpr;
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
+
+// Public modular constants only: no plaintext or ciphertext values are inspected here.
+pub(crate) fn pow_mod(mut value: u64, mut exponent: u64, modulus: u64) -> u64 {
+    let mut result = 1;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            result = (u128::from(result) * u128::from(value) % u128::from(modulus)) as u64;
+        }
+        value = (u128::from(value) * u128::from(value) % u128::from(modulus)) as u64;
+        exponent >>= 1;
+    }
+    result
+}
+
+pub(crate) fn is_prime(value: u64) -> bool {
+    if value < 2 {
+        return false;
+    }
+    for prime in [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
+        if value % prime == 0 {
+            return value == prime;
+        }
+    }
+    let shifts = (value - 1).trailing_zeros();
+    let odd = (value - 1) >> shifts;
+    // Deterministic Miller-Rabin bases covering every unsigned 64-bit integer.
+    [2, 325, 9375, 28178, 450775, 9780504, 1795265022].into_iter().all(|base| {
+        if base % value == 0 {
+            return true;
+        }
+        let mut x = pow_mod(base % value, odd, value);
+        if x == 1 || x == value - 1 {
+            return true;
+        }
+        for _ in 1..shifts {
+            x = (u128::from(x) * u128::from(x) % u128::from(value)) as u64;
+            if x == value - 1 {
+                return true;
+            }
+        }
+        false
+    })
+}
 
 pub(crate) fn check_family(values: &Family<Int>, count: usize) -> Result<(), FheError> {
     if values.count() != &IntExpr::constant(count) {
@@ -84,6 +128,14 @@ pub(crate) fn common() -> FheCommonParams {
             .map(|value| value.parse().expect("integer test parameter"))
             .unwrap_or(default)
     };
+    let sigma = std::env::var("FHE_TEST_SIGMA").unwrap_or_else(|_| "1.0".into());
+    let sigma_bound: bigdecimal::BigDecimal = sigma.parse().expect("Gaussian sigma");
+    let error_sigma: f64 = sigma.parse().expect("Gaussian sigma");
+    let error_cutoff = std::env::var("FHE_TEST_ERROR_CUTOFF")
+        .map(|value| value.parse::<BigUint>().expect("integer error cutoff"))
+        .unwrap_or_else(|_| {
+            mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma_bound)
+        });
     FheCommonParams {
         ring: DCRTPolyParams::new(
             read("FHE_TEST_RING_DIMENSION", 8) as u32,
@@ -94,11 +146,8 @@ pub(crate) fn common() -> FheCommonParams {
             None,
         ),
         secret_range: SampleRange { minimum: (-1).into(), maximum: 1.into() },
-        error_sigma: std::env::var("FHE_TEST_SIGMA")
-            .ok()
-            .map(|s| s.parse().expect("Gaussian sigma"))
-            .unwrap_or(1.0),
-        error_cutoff: BigUint::from(read("FHE_TEST_ERROR_CUTOFF", 8)),
+        error_sigma,
+        error_cutoff,
     }
 }
 

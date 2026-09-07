@@ -1,7 +1,7 @@
 //! BGV graph builders with RNS hybrid key switching and modulus reduction.
 use crate::{
     FheCommonParams, FheError, FheScheme,
-    utils::{self, check_family, check_matrix},
+    utils::{self, check_family, check_matrix, is_prime, pow_mod},
 };
 use mxx_dsl::{
     DslError, Family, GraphValue, GraphValueSchema, Int, Mat, MatType, Ring, concat_rows, parallel,
@@ -16,7 +16,7 @@ use mxx_primitives::{
         Poly, PolyParams,
         dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
     },
-    utils::{mod_inverse, mod_inverse_biguints},
+    utils::mod_inverse,
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
@@ -358,14 +358,15 @@ impl BgvParams {
         if level != self.validate_ciphertext(rhs, 2)? {
             return Err(FheError::LevelMismatch);
         }
-        let a1 = row(&lhs.components, 0);
-        let b1 = row(&lhs.components, 1);
-        let a2 = row(&rhs.components, 0);
-        let b2 = row(&rhs.components, 1);
+        let products = lhs.components.clone().tensor(rhs.components.clone());
         // Expand (b1 - s*a1)(b2 - s*a2) in descending powers of -s.
         // A negacyclic product coefficient sums N signed products, hence N*V1*V2.
         Ok(BgvCiphertext {
-            components: concat_rows![&a1 * &a2, &a1 * &b2 + &b1 * &a2, &b1 * &b2],
+            components: concat_rows![
+                row(&products, 0),
+                row(&products, 1) + row(&products, 2),
+                row(&products, 3)
+            ],
             noise_bound: self.noise_from_phase(
                 &(BigUint::from(self.common.ring.ring_dimension()) *
                     self.phase_from_noise(&lhs.noise_bound) *
@@ -417,7 +418,7 @@ impl BgvParams {
             ),
         })
     }
-    /// Drops trailing primes with unsigned single-limb corrections, never coefficient extraction.
+    /// Drops trailing primes with centered single-limb RNS corrections.
     pub fn mod_switch_to(
         &self,
         ct: &BgvCiphertext,
@@ -433,18 +434,6 @@ impl BgvParams {
             let source = self.common.parameters_at(level)?;
             let dest = self.common.parameters_at(level - 1)?;
             let p = *source.to_crt().0.last().expect("validated nonempty CRT basis");
-            let dropped =
-                source.select_modulus(&BigUint::from(p)).ok_or(FheError::LevelMismatch)?;
-            let inverse_t = mod_inverse(self.plaintext_modulus % p, p)
-                .ok_or(FheError::InvalidParameters("noninvertible plaintext modulus"))?;
-            // Choose U = -C/t mod p so C + t*U is divisible by the dropped
-            // prime. Only this one-limb residue is centered and rebased; the
-            // full coefficient modulo Q is never reconstructed as a big integer.
-            let u = output.components.clone().reduce_modulus(p) *
-                utils::scalar(&dropped, p - inverse_t);
-            let correction = u.centered_rebase(dest.modulus().as_ref().clone());
-            let inverse_p = mod_inverse_biguints(&BigUint::from(p), dest.modulus().as_ref())
-                .ok_or(FheError::InvalidParameters("noninvertible dropped prime"))?;
             let prime = BigUint::from(p);
             // Each correction has norm <= floor(p/2). The phase correction
             // is t*(U_b - s*U_a), bounded by t*floor(p/2)*(1 + N) for |s| <= 1.
@@ -455,9 +444,16 @@ impl BgvParams {
                 (self.phase_from_noise(&output.noise_bound) + correction_bound + &prime - 1u8) /
                     &prime;
             let noise_bound = self.noise_from_phase(&phase_bound);
-            let components = (output.components.reduce_modulus(dest.modulus().as_ref().clone()) +
-                correction * utils::scalar(&dest, self.plaintext_modulus)) *
-                utils::scalar(&dest, inverse_p);
+            // For one dropped prime, RNS ModDown has P=p and cofactor 1:
+            // U=center_p(-C/t), C'=(C+t*U)/p. This is exactly the previous
+            // centered single-limb correction, batched over both components.
+            // Keep level drops sequential: centering modulo a product instead
+            // would choose a different correction and need a different bound.
+            let components = output.components.rns_mod_down(
+                dest.modulus().as_ref().clone(),
+                source.to_crt().0,
+                self.plaintext_modulus,
+            );
             // Division by p also scales the plaintext phase modulo t; retain
             // that public factor so decryption can undo it after later operations.
             let factor = ((output.correction_factor as u128 *
@@ -564,49 +560,6 @@ impl FheScheme for BgvParams {
     ) -> Result<BgvCiphertext, FheError> {
         self.relinearize(&self.mul_unrelinearized(lhs, rhs)?, eval_key)
     }
-}
-
-// Public modular constants only: no plaintext or ciphertext values are inspected here.
-fn pow_mod(mut value: u64, mut exponent: u64, modulus: u64) -> u64 {
-    let mut result = 1;
-    while exponent != 0 {
-        if exponent & 1 != 0 {
-            result = (u128::from(result) * u128::from(value) % u128::from(modulus)) as u64;
-        }
-        value = (u128::from(value) * u128::from(value) % u128::from(modulus)) as u64;
-        exponent >>= 1;
-    }
-    result
-}
-
-pub(crate) fn is_prime(value: u64) -> bool {
-    if value < 2 {
-        return false;
-    }
-    for prime in [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
-        if value % prime == 0 {
-            return value == prime;
-        }
-    }
-    let shifts = (value - 1).trailing_zeros();
-    let odd = (value - 1) >> shifts;
-    // Deterministic Miller-Rabin bases covering every unsigned 64-bit integer.
-    [2, 325, 9375, 28178, 450775, 9780504, 1795265022].into_iter().all(|base| {
-        if base % value == 0 {
-            return true;
-        }
-        let mut x = pow_mod(base % value, odd, value);
-        if x == 1 || x == value - 1 {
-            return true;
-        }
-        for _ in 1..shifts {
-            x = (u128::from(x) * u128::from(x) % u128::from(value)) as u64;
-            if x == value - 1 {
-                return true;
-            }
-        }
-        false
-    })
 }
 
 impl BgvParams {

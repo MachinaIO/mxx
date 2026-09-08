@@ -73,8 +73,8 @@ pub(super) fn root_readout_function(
             Ok(scalar)
         }
     };
-    let target = scalar("-readout-target-decomposition-0")?;
-    let normalization = scalar("-readout-normalization-decomposition-0")?;
+    let target = scalar("-readout-0.0")?;
+    let normalization = scalar("-readout-0.3")?;
     let matrix = types[&target].matrix_type().ok_or("target not matrix")?;
     let q = &matrix.modulus;
     let n = matrix.ring_dimension;
@@ -209,7 +209,7 @@ pub(super) fn root_readout_function(
             ((value % &modulus) + &modulus) % &modulus
         })
         .collect::<Vec<_>>();
-    let gain = crate::noise::RightActionNoiseGain::from_polynomial_coefficients(
+    let gain = crate::noise_utils::RightActionNoiseGain::from_polynomial_coefficients(
         canonical_values.iter().map(|value| value * 2u8 - 1u8),
     )
     .l1;

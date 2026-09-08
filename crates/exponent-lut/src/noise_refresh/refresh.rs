@@ -1,39 +1,40 @@
-//! The direct RNS refresh protocol.
+//! Native exponent refresh: CRT routing, public preparation and online evaluation.
 //!
-//! This is deliberately separate from mxx_bgg::noise_refresh: it operates
-//! on scalar BGG encodings and follows the defined order
-//! coefficient-switch(scaled state + mask + fresh error) - low-P decoder before CRT
-//! recomposition. Sparse-LWR PRF evaluation produces the mask and fresh-error
-//! wires consumed here; this module owns only CRT routing, scaling, and
-//! aggregation, so it does not duplicate the PRF program.  Quantitative noise
-//! correctness is supplied by the application-specific Exponent-LUT noise
-//! visitor; this protocol declaration checks only structural equations and
-//! identities.
-//!
-//! For CRT slot `t`, let `q_t` be its plaintext modulus and `mu_t=q/q_t`.
-//! Refresh scales an encoding with `u_t = c G^{-1}(mu_t G)` and its public
-//! matrix with `A_t = A G^{-1}(mu_t G)`. It forms
-//! `A_{sum,t} = A_t + A_{m,t} + A_{e,t}`, asks for `K_t` satisfying
-//! `B_P K_t = MS(A_{sum,t}) - (P_t/q_t) reduce(A')`, and applies `d_t = b_P K_t`.
-//! The final scalar relation is `s A' - X^w t G + e'`; the implementation
-//! below keeps these operations in CRT-slot order and recombines only after
-//! each slot has been decoded.
+//! Trait-based witness and direct-decoder paths keep aggregate-before-switch
+//! ordering explicit. Payload-secret/public work belongs to preprocessing;
+//! online preparation binds helpers/decoders to the current mask secret.
+//! BGG-specific witness binding and compilation live in the backend.
 
-use crate::{
-    ExponentLutEncodingCompiler, ExponentLutError,
-    noise_refresh::{
-        pbc::PbcLayoutId,
-        prf::{NativePrfEncodingBatchOutputs, SparseLwrPrfProgram},
-    },
+use super::{
+    ExponentLUTRefreshDirectScheme, ExponentLUTRefreshScheme, ExponentLUTRefreshWitnessScheme,
 };
-use mxx_bgg::{BggEncodingWire, BggPublicKeyWire};
-use mxx_dsl::{Family, Int, Mat, Preimage, Ring};
+use crate::{
+    noise_refresh::{prf::SparseLwrPrfProgram, simulation::RefreshTranscriptTopology},
+    noise_utils::NoiseMoments,
+    program::ProgramValue,
+    readout::{TerminalError, ValueReadout},
+};
+use mxx_dsl::{Bytes, DslError, Family, GraphValue, HashTag, Int};
 use mxx_ir_core::IntExpr;
-use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_bigint::{BigInt, BigUint};
+use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use thiserror::Error;
+
+/// Group canonical slot positions by encoding level, in ascending level order.
+/// The same ordering binds preprocessing anchors, online shared errors and
+/// evaluation batches; family members are never expanded here.
+pub(crate) fn group_refresh_levels<L: Ord>(
+    levels: impl IntoIterator<Item = L>,
+) -> BTreeMap<L, Vec<usize>> {
+    let mut groups = BTreeMap::<L, Vec<usize>>::new();
+    for (slot, level) in levels.into_iter().enumerate() {
+        groups.entry(level).or_default().push(slot);
+    }
+    groups
+}
 
 #[derive(Debug, Error, Eq, PartialEq)]
 /// Validation and graph-linkage failures in the RNS refresh protocol.
@@ -47,9 +48,6 @@ pub enum RefreshError {
     #[error("refresh decoder is not bound to the supplied anchor")]
     /// A decoder package is bound to a different anchor or target.
     AnchorMismatch,
-    #[error("refresh anchor has no graph-checked B*K equation")]
-    /// The anchor lacks the graph-checked `B*K` equation required by refresh.
-    MissingAnchorEquation,
     #[error("all CRT slots must carry the same fresh-error identity")]
     /// CRT slots do not share one fresh-error source identity.
     FreshErrorMismatch,
@@ -62,12 +60,6 @@ pub enum RefreshError {
     #[error("refresh graph linkage failed at {0}")]
     /// A required graph attachment or handle relationship is absent.
     GraphLink(&'static str),
-    #[error(transparent)]
-    /// A lower-level BGG operation failed.
-    Bgg(#[from] mxx_bgg::EncodingCompileError),
-    #[error(transparent)]
-    /// A generic Exponent-LUT operation failed.
-    ExponentLut(#[from] ExponentLutError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,75 +138,38 @@ impl RefreshPrfLabel {
 /// inside each group it is component-major, coefficient-major, then
 /// base-`p`-digit-major. Mask and fresh-error groups intentionally have
 /// independent digit cardinalities: `d_m` is used for every mask group and
-/// `d_e` for the shared fresh-error group. The component count is the BGG
-/// public-key column count (`2 * ell_beta`), not the secret dimension.
-/// These counts are independent of the BGG gadget digit count carried by
-/// [`mxx_bgg::BggSamplerLayout`]. This is public metadata only and contains no
+/// `d_e` for the shared fresh-error group. The component count is the selected
+/// scheme's encoding polynomial count, taken from the same topology used for
+/// noise accounting. This is public metadata only and contains no
 /// selector, support, schedule, or plaintext material.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RefreshPrfLabelIndex {
     refresh_id: [u8; 32],
-    mask_slot_count: usize,
-    component_count: usize,
-    coefficient_count: usize,
-    mask_base_p_digit_counts: Vec<usize>,
+    topology: RefreshTranscriptTopology,
     mask_offsets: Vec<usize>,
-    fresh_error_base_p_digit_count: usize,
 }
 
 impl RefreshPrfLabelIndex {
     /// Creates a canonical label index for a refresh instance.
     pub fn new(
         refresh_id: [u8; 32],
-        mask_slot_count: usize,
-        component_count: usize,
-        coefficient_count: usize,
-        mask_base_p_digit_counts: Vec<usize>,
-        fresh_error_base_p_digit_count: usize,
+        topology: &RefreshTranscriptTopology,
     ) -> Result<Self, RefreshError> {
-        if component_count == 0 ||
-            coefficient_count == 0 ||
-            mask_base_p_digit_counts.len() != mask_slot_count ||
-            mask_base_p_digit_counts.iter().any(|count| *count == 0) ||
-            fresh_error_base_p_digit_count == 0
-        {
-            return Err(RefreshError::InvalidLayout);
+        // The topology checks the complete cardinality once; its positive
+        // group sizes make every prefix operation below fit as well.
+        topology.joint_event_count().map_err(|_| RefreshError::InvalidLayout)?;
+        let coordinates = topology.component_columns * topology.coefficient_count;
+        let mut mask_offsets = Vec::with_capacity(topology.crt_slot_count + 1);
+        mask_offsets.push(0);
+        for digits in &topology.mask_digit_counts {
+            mask_offsets.push(mask_offsets.last().unwrap() + coordinates * digits);
         }
-        // Validate the complete cardinality up front so index arithmetic is
-        // exact and cannot wrap while building structural loop bounds.
-        let coordinates =
-            component_count.checked_mul(coefficient_count).ok_or(RefreshError::InvalidLayout)?;
-        let mut mask_offsets = vec![0usize];
-        for digits in &mask_base_p_digit_counts {
-            let end = coordinates
-                .checked_mul(*digits)
-                .and_then(|count| mask_offsets.last().unwrap().checked_add(count))
-                .ok_or(RefreshError::InvalidLayout)?;
-            mask_offsets.push(end);
-        }
-        let fresh_group_size = component_count
-            .checked_mul(coefficient_count)
-            .and_then(|value| value.checked_mul(fresh_error_base_p_digit_count))
-            .ok_or(RefreshError::InvalidLayout)?;
-        mask_offsets
-            .last()
-            .unwrap()
-            .checked_add(fresh_group_size)
-            .ok_or(RefreshError::InvalidLayout)?;
-        Ok(Self {
-            refresh_id,
-            mask_slot_count,
-            component_count,
-            coefficient_count,
-            mask_base_p_digit_counts,
-            mask_offsets,
-            fresh_error_base_p_digit_count,
-        })
+        Ok(Self { refresh_id, topology: topology.clone(), mask_offsets })
     }
 
     /// Returns the total number of mask and fresh-error labels.
     pub fn len(&self) -> usize {
-        self.mask_offsets[self.mask_slot_count] + self.fresh_group_size()
+        self.mask_offsets[self.topology.crt_slot_count] + self.fresh_group_size()
     }
 
     /// Returns whether the index contains no labels.
@@ -222,19 +177,41 @@ impl RefreshPrfLabelIndex {
         self.len() == 0
     }
 
+    /// Public slice of the canonical label-major output family. `None` is the
+    /// single fresh-error group, shared unchanged by every CRT channel.
+    pub fn group_range(&self, slot: Option<usize>) -> (usize, usize) {
+        match slot {
+            Some(slot) => {
+                (self.mask_offsets[slot], self.mask_offsets[slot + 1] - self.mask_offsets[slot])
+            }
+            None => (self.mask_offsets[self.topology.crt_slot_count], self.fresh_group_size()),
+        }
+    }
+
+    /// Resolve a digit group structurally; this preserves the original graph
+    /// handles and shares the fresh group across CRT channels.
+    fn group<T: GraphValue>(
+        &self,
+        values: &Family<T>,
+        slot: Option<usize>,
+    ) -> Result<ProgramValue<T, Family<T>>, DslError> {
+        let (start, count) = self.group_range(slot);
+        Ok(ProgramValue::Family(mxx_dsl::parallel(count, |index| Ok(values.at(index.add(start))))?))
+    }
+
     /// Returns the canonical label at `index`.
     pub fn label(&self, index: usize) -> Option<RefreshPrfLabel> {
         if index >= self.len() {
             return None;
         }
-        let mask_total = self.mask_offsets[self.mask_slot_count];
+        let mask_total = self.mask_offsets[self.topology.crt_slot_count];
         if index < mask_total {
             let group = self.mask_offsets.partition_point(|offset| *offset <= index) - 1;
             let within = index - self.mask_offsets[group];
-            let digits = self.mask_base_p_digit_counts[group];
+            let digits = self.topology.mask_digit_counts[group];
             let digit = within % digits;
-            let coefficient = (within / digits) % self.coefficient_count;
-            let component = within / (digits * self.coefficient_count);
+            let coefficient = (within / digits) % self.topology.coefficient_count;
+            let component = within / (digits * self.topology.coefficient_count);
             Some(RefreshPrfLabel::Mask {
                 refresh_id: self.refresh_id,
                 slot: group,
@@ -244,10 +221,11 @@ impl RefreshPrfLabelIndex {
             })
         } else {
             let within = index - mask_total;
-            let digit = within % self.fresh_error_base_p_digit_count;
+            let digit = within % self.topology.fresh_digit_count;
             let coefficient =
-                (within / self.fresh_error_base_p_digit_count) % self.coefficient_count;
-            let component = within / (self.fresh_error_base_p_digit_count * self.coefficient_count);
+                (within / self.topology.fresh_digit_count) % self.topology.coefficient_count;
+            let component =
+                within / (self.topology.fresh_digit_count * self.topology.coefficient_count);
             Some(RefreshPrfLabel::FreshError {
                 refresh_id: self.refresh_id,
                 component,
@@ -262,7 +240,7 @@ impl RefreshPrfLabelIndex {
     pub fn index_of(&self, label: RefreshPrfLabel) -> Option<usize> {
         let (group_offset, component, coefficient, digit, is_mask) = match label {
             RefreshPrfLabel::Mask { refresh_id, slot, component, coefficient, digit }
-                if refresh_id == self.refresh_id && slot < self.mask_slot_count =>
+                if refresh_id == self.refresh_id && slot < self.topology.crt_slot_count =>
             {
                 (slot, component, coefficient, digit, true)
             }
@@ -274,27 +252,30 @@ impl RefreshPrfLabelIndex {
             _ => return None,
         };
         let digit_count = if is_mask {
-            self.mask_base_p_digit_counts[group_offset]
+            self.topology.mask_digit_counts[group_offset]
         } else {
-            self.fresh_error_base_p_digit_count
+            self.topology.fresh_digit_count
         };
-        if component >= self.component_count ||
-            coefficient >= self.coefficient_count ||
+        if component >= self.topology.component_columns ||
+            coefficient >= self.topology.coefficient_count ||
             digit >= digit_count
         {
             return None;
         }
-        let offset =
-            component * self.coefficient_count * digit_count + coefficient * digit_count + digit;
+        let offset = component * self.topology.coefficient_count * digit_count +
+            coefficient * digit_count +
+            digit;
         Some(if is_mask {
             self.mask_offsets[group_offset] + offset
         } else {
-            self.mask_offsets[self.mask_slot_count] + offset
+            self.mask_offsets[self.topology.crt_slot_count] + offset
         })
     }
 
     fn fresh_group_size(&self) -> usize {
-        self.component_count * self.coefficient_count * self.fresh_error_base_p_digit_count
+        self.topology.component_columns *
+            self.topology.coefficient_count *
+            self.topology.fresh_digit_count
     }
 }
 
@@ -304,62 +285,18 @@ impl RefreshPrfLabelIndex {
 /// [`SparseLwrPrfProgram`], rather than from the outputs being validated.  It
 /// therefore prevents a producer from making its own program identity or
 /// terminal form authoritative after the fact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RefreshPrfContract {
     program_id: crate::program::ExponentLutProgramId,
     output_wire: crate::program::WireId,
-    native_width: usize,
-    q: usize,
-    p: usize,
-    ring_dimension: usize,
+    profile: super::prf::SparseLwrPrfProfile,
 }
 
 impl RefreshPrfContract {
     /// Derives the contract from the expected canonical sparse-LWR program.
     pub(crate) fn from_program(program: &SparseLwrPrfProgram) -> Self {
         let profile = program.profile();
-        Self {
-            program_id: program.id(),
-            output_wire: program.output(),
-            native_width: profile.native_width(),
-            q: profile.q().expect("validated PRF profile"),
-            p: profile.p().expect("validated PRF profile"),
-            ring_dimension: profile.ring_dimension().expect("validated PRF profile"),
-        }
-    }
-
-    pub(crate) const fn from_parts(
-        program_id: crate::program::ExponentLutProgramId,
-        output_wire: crate::program::WireId,
-        native_width: usize,
-        q: usize,
-        p: usize,
-        ring_dimension: usize,
-    ) -> Self {
-        Self { program_id, output_wire, native_width, q, p, ring_dimension }
-    }
-
-    /// Validates the contract against the refresh setup dimensions.
-    pub(crate) fn validate_for(
-        &self,
-        parameters: &crate::noise_refresh::setup::RefreshSetupParameters,
-    ) -> Result<(), RefreshError> {
-        let ring_dimension = parameters
-            .layout
-            .ring_dimension
-            .evaluate(&Default::default())
-            .map_err(|_| RefreshError::InvalidLayout)?
-            .to_usize()
-            .ok_or(RefreshError::InvalidLayout)?;
-        if self.native_width == 0 ||
-            self.q == 0 ||
-            self.p < 2 ||
-            self.p != parameters.base_p ||
-            self.ring_dimension != ring_dimension
-        {
-            return Err(RefreshError::PrfOutputMismatch);
-        }
-        Ok(())
+        Self { program_id: program.id(), output_wire: program.output(), profile }
     }
 
     /// Checks that one output descriptor is exactly the contracted terminal.
@@ -368,19 +305,21 @@ impl RefreshPrfContract {
     }
 
     pub(crate) const fn q(&self) -> usize {
-        self.q
+        // Construction and profile deserialization establish these ranges.
+        // Accessors need no repeated validation or cached dimension copies.
+        2 * self.profile.native_width()
     }
 
     pub(crate) const fn p(&self) -> usize {
-        self.p
+        2 * self.profile.p_prime
     }
 
     pub(crate) const fn native_width(&self) -> usize {
-        self.native_width
+        self.profile.native_width()
     }
 
     pub(crate) const fn ring_dimension(&self) -> usize {
-        self.ring_dimension
+        1usize << self.profile.native_ring_log2()
     }
 
     pub(crate) const fn output_wire(&self) -> crate::program::WireId {
@@ -388,165 +327,33 @@ impl RefreshPrfContract {
     }
 }
 
-/// Exact finite base-`p` label coverage required for one refresh PRF aggregate.
+/// A PRF output family in canonical refresh-label order.
 ///
-/// This type is intentionally opaque and carries no schedule, selector, or
-/// artifact information. It is created only by the crate's PRF binder.
-#[allow(dead_code)]
-#[derive(Clone, Eq, PartialEq)]
-pub struct RefreshPrfCoverage {
-    refresh_id: [u8; 32],
-    component_count: usize,
-    coefficient_count: usize,
-    mask_base_p_digit_counts: Vec<usize>,
-    fresh_error_base_p_digit_count: usize,
-}
-
-#[allow(dead_code)]
-impl RefreshPrfCoverage {
-    pub(crate) fn new(
-        refresh_id: [u8; 32],
-        component_count: usize,
-        coefficient_count: usize,
-        mask_base_p_digit_counts: Vec<usize>,
-        fresh_error_base_p_digit_count: usize,
-    ) -> Result<Self, RefreshError> {
-        if component_count == 0 ||
-            coefficient_count == 0 ||
-            mask_base_p_digit_counts.iter().any(|count| *count == 0) ||
-            fresh_error_base_p_digit_count == 0
-        {
-            return Err(RefreshError::InvalidLayout);
-        }
-        Ok(Self {
-            refresh_id,
-            component_count,
-            coefficient_count,
-            mask_base_p_digit_counts,
-            fresh_error_base_p_digit_count,
-        })
-    }
-}
-
-/// Sealed family-level PRF provenance and coverage.
-///
-/// The vector and public-key families are kept in the exact canonical order
-/// committed by [`RefreshPrfLabelIndex`]. Only fixed-size mask/fresh slices
-/// are gathered from this value; the production path never materializes a
-/// per-label wrapper.
+/// Setup binds the PRF contract and layout before constructing this routing
+/// value. Only fixed-size mask/fresh slices are gathered here; the production
+/// path never materializes a per-label wrapper.
 #[derive(Clone)]
-pub(crate) struct RefreshPrfFamilyMaterial {
-    coverage: RefreshPrfCoverage,
-    contract: RefreshPrfContract,
-    layout_id: PbcLayoutId,
-    vectors: Family<Mat>,
-    slot_count: usize,
-    family_identity: [u8; 32],
-    family_pair_id: [u8; 32],
+pub(crate) struct RefreshPrfFamilyMaterial<V: GraphValue> {
+    labels: RefreshPrfLabelIndex,
+    vectors: Family<V>,
 }
 
-impl RefreshPrfFamilyMaterial {
-    pub(crate) fn from_native_encoding_batch_outputs(
-        output: &NativePrfEncodingBatchOutputs,
-        index: &RefreshPrfLabelIndex,
-        coverage: RefreshPrfCoverage,
-        contract: RefreshPrfContract,
-        layout_id: PbcLayoutId,
+impl<V: GraphValue> RefreshPrfFamilyMaterial<V> {
+    pub(crate) fn new(
+        vectors: Family<V>,
+        labels: RefreshPrfLabelIndex,
     ) -> Result<Self, RefreshError> {
-        if coverage.refresh_id != index.refresh_id ||
-            coverage.component_count != index.component_count ||
-            coverage.coefficient_count != index.coefficient_count ||
-            coverage.mask_base_p_digit_counts != index.mask_base_p_digit_counts ||
-            coverage.fresh_error_base_p_digit_count != index.fresh_error_base_p_digit_count ||
-            output.label_count() != index.len() ||
-            !family_has_count(output.vectors(), index.len())?
-        {
+        if !family_has_count(&vectors, labels.len())? {
             return Err(RefreshError::PrfOutputMismatch);
         }
-        Ok(Self {
-            coverage,
-            contract,
-            layout_id,
-            vectors: output.vectors().clone(),
-            slot_count: index.mask_slot_count,
-            family_identity: contract.program_id().0,
-            family_pair_id: layout_id.0,
-        })
-    }
-
-    pub(crate) const fn family_identity(&self) -> [u8; 32] {
-        self.family_identity
-    }
-
-    pub(crate) const fn family_pair_id(&self) -> [u8; 32] {
-        self.family_pair_id
-    }
-
-    fn mask_family(&self) -> Result<Family<Mat>, RefreshError> {
-        let digits =
-            self.coverage.mask_base_p_digit_counts.iter().try_fold(0usize, |sum, count| {
-                sum.checked_add(*count).ok_or(RefreshError::InvalidLayout)
-            })?;
-        let count = self
-            .coverage
-            .component_count
-            .checked_mul(self.coverage.coefficient_count)
-            .and_then(|value| value.checked_mul(digits))
-            .ok_or(RefreshError::InvalidLayout)?;
-        let indices = mxx_dsl::parallel(count, |index| Ok(index.clone()))
-            .map_err(|_| RefreshError::InvalidLayout)?;
-        let vectors = {
-            let source_family = self.vectors.clone();
-            let gather_indices = indices.clone();
-            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-                Ok(source_family.at(gather_indices.at(&family_index)))
-            })
-        }
-        .map_err(|_| RefreshError::InvalidLayout)?;
-        Ok(vectors)
-    }
-
-    pub(crate) fn fresh_error(&self) -> Result<Family<Mat>, RefreshError> {
-        let digits =
-            self.coverage.mask_base_p_digit_counts.iter().try_fold(0usize, |sum, count| {
-                sum.checked_add(*count).ok_or(RefreshError::InvalidLayout)
-            })?;
-        let start = self
-            .coverage
-            .component_count
-            .checked_mul(self.coverage.coefficient_count)
-            .and_then(|value| value.checked_mul(digits))
-            .ok_or(RefreshError::InvalidLayout)?;
-        let fresh_group = self
-            .coverage
-            .component_count
-            .checked_mul(self.coverage.coefficient_count)
-            .and_then(|value| value.checked_mul(self.coverage.fresh_error_base_p_digit_count))
-            .ok_or(RefreshError::InvalidLayout)?;
-        let indices = mxx_dsl::parallel(fresh_group, |index| {
-            Ok(mxx_dsl::Int::constant(start).add(index.clone()))
-        })
-        .map_err(|_| RefreshError::InvalidLayout)?;
-        let vectors = {
-            let source_family = self.vectors.clone();
-            let gather_indices = indices.clone();
-            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-                Ok(source_family.at(gather_indices.at(&family_index)))
-            })
-        }
-        .map_err(|_| RefreshError::InvalidLayout)?;
-        Ok(vectors)
-    }
-
-    fn coverage_slot_count(&self) -> usize {
-        // The family-level value is created with the complete label index. The
-        // slot count is carried by the family cardinality only at this layer;
-        // callers pass the authoritative count through `set_slot_count`.
-        self.slot_count
+        Ok(Self { labels, vectors })
     }
 }
 
-fn family_has_count(family: &Family<Mat>, expected: usize) -> Result<bool, RefreshError> {
+fn family_has_count<V: GraphValue>(
+    family: &Family<V>,
+    expected: usize,
+) -> Result<bool, RefreshError> {
     Ok(family
         .count()
         .evaluate(&Default::default())
@@ -555,393 +362,8 @@ fn family_has_count(family: &Family<Mat>, expected: usize) -> Result<bool, Refre
         Some(expected))
 }
 
-/// Opaque, completely covered per-slot mask material.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct RefreshMaskMaterial {
-    coverage: RefreshPrfCoverage,
-    slot: usize,
-    contract: RefreshPrfContract,
-    layout_id: PbcLayoutId,
-    family: Option<RefreshPrfFamilyMaterial>,
-}
-
-#[allow(dead_code)]
-impl RefreshMaskMaterial {
-    pub(crate) fn from_family(
-        coverage: RefreshPrfCoverage,
-        slot: usize,
-        family: RefreshPrfFamilyMaterial,
-    ) -> Result<Self, RefreshError> {
-        if family.coverage != coverage || family.slot_count <= slot {
-            return Err(RefreshError::PrfOutputMismatch);
-        }
-        Ok(Self {
-            coverage,
-            slot,
-            contract: family.contract,
-            layout_id: family.layout_id,
-            family: Some(family),
-        })
-    }
-
-    pub(crate) fn layout_id(&self) -> PbcLayoutId {
-        self.layout_id
-    }
-
-    pub(crate) fn slot(&self) -> usize {
-        self.slot
-    }
-
-    pub(crate) fn family_material(&self) -> Option<&RefreshPrfFamilyMaterial> {
-        self.family.as_ref()
-    }
-
-    pub(crate) fn program_id(&self) -> crate::program::ExponentLutProgramId {
-        self.contract.program_id()
-    }
-
-    pub(crate) const fn contract(&self) -> RefreshPrfContract {
-        self.contract
-    }
-
-    pub(crate) fn coverage_matches(&self, coverage: &RefreshPrfCoverage) -> bool {
-        self.coverage == *coverage
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), RefreshError> {
-        if let Some(family) = &self.family {
-            if family.coverage != self.coverage ||
-                family.contract != self.contract ||
-                family.layout_id != self.layout_id ||
-                family.family_pair_id() == [0; 32]
-            {
-                return Err(RefreshError::PrfOutputMismatch);
-            }
-            return Ok(());
-        }
-        Ok(())
-    }
-}
-
-/// Opaque, completely covered fresh-error material shared by all CRT slots.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct RefreshFreshErrorMaterial {
-    coverage: RefreshPrfCoverage,
-    contract: RefreshPrfContract,
-    layout_id: PbcLayoutId,
-    family: Option<RefreshPrfFamilyMaterial>,
-}
-
-#[allow(dead_code)]
-impl RefreshFreshErrorMaterial {
-    pub(crate) fn family_material(&self) -> Result<RefreshPrfFamilyMaterial, RefreshError> {
-        self.family.clone().ok_or(RefreshError::PrfOutputMismatch)
-    }
-
-    pub(crate) fn family_identity(&self) -> Result<[u8; 32], RefreshError> {
-        self.family
-            .as_ref()
-            .map(RefreshPrfFamilyMaterial::family_identity)
-            .ok_or(RefreshError::PrfOutputMismatch)
-    }
-
-    pub(crate) fn from_family(
-        coverage: RefreshPrfCoverage,
-        family: RefreshPrfFamilyMaterial,
-    ) -> Result<Self, RefreshError> {
-        if family.coverage != coverage {
-            return Err(RefreshError::PrfOutputMismatch);
-        }
-        Ok(Self {
-            coverage,
-            contract: family.contract,
-            layout_id: family.layout_id,
-            family: Some(family),
-        })
-    }
-
-    pub(crate) fn program_id(&self) -> crate::program::ExponentLutProgramId {
-        self.contract.program_id()
-    }
-
-    pub(crate) const fn contract(&self) -> RefreshPrfContract {
-        self.contract
-    }
-
-    pub(crate) fn layout_id(&self) -> PbcLayoutId {
-        self.layout_id
-    }
-
-    pub(crate) fn coverage_matches(&self, coverage: &RefreshPrfCoverage) -> bool {
-        self.coverage == *coverage
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), RefreshError> {
-        if let Some(family) = &self.family {
-            if family.coverage != self.coverage ||
-                family.contract != self.contract ||
-                family.layout_id != self.layout_id
-            {
-                return Err(RefreshError::PrfOutputMismatch);
-            }
-            return Ok(());
-        }
-        Ok(())
-    }
-}
-
-/// Routes the shared raw fresh-error family once for all CRT slots, applying
-/// each slot's exact `kappa_t` inside the same symbolic route body. The output
-/// is reduced to one scaled fresh encoding per slot.
-pub(crate) fn aggregate_refresh_fresh_error_per_slot(
-    base_p: usize,
-    material: &RefreshFreshErrorMaterial,
-    scales: Vec<Mat>,
-    route_preimages: Family<Preimage>,
-) -> Result<Vec<BggEncodingWire>, RefreshError> {
-    let family = material.family.as_ref().ok_or(RefreshError::PrfOutputMismatch)?;
-    let vectors = family.fresh_error()?;
-    let component_count = family.coverage.component_count;
-    let coefficient_count = family.coverage.coefficient_count;
-    let digit_count = family.coverage.fresh_error_base_p_digit_count;
-    let group = component_count
-        .checked_mul(coefficient_count)
-        .and_then(|value| value.checked_mul(digit_count))
-        .ok_or(RefreshError::InvalidLayout)?;
-    let slot_count = scales.len();
-    if slot_count == 0 || !family_has_count(&vectors, group)? {
-        return Err(RefreshError::PrfOutputMismatch);
-    }
-    let total = group.checked_mul(slot_count).ok_or(RefreshError::InvalidLayout)?;
-    let raw_indices = mxx_dsl::parallel(total, |index| {
-        Ok({
-            let flat = index.clone();
-            let quotient = flat.clone().div(Int::constant(group));
-            flat.sub(quotient.mul(Int::constant(group)))
-        })
-    })
-    .map_err(|_| RefreshError::InvalidLayout)?;
-    let repeated_vectors = {
-        let source_family = vectors;
-        let gather_indices = raw_indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }
-    .map_err(|_| RefreshError::InvalidLayout)?;
-    let scales_for_offset = scales.clone();
-    let routed_vectors = route_prf_family(repeated_vectors, route_preimages)?;
-    let vectors = reduce_family_segments(routed_vectors, slot_count, group)?;
-    let columns = vectors
-        .element_type()
-        .columns
-        .evaluate(&Default::default())
-        .map_err(|_| RefreshError::InvalidLayout)?
-        .to_usize()
-        .ok_or(RefreshError::InvalidLayout)?;
-    let ring = Ring::new(
-        vectors.element_type().modulus.clone(),
-        vectors.element_type().ring_dimension.clone(),
-    );
-    let offset = public_half_offset_vector(&ring, base_p, digit_count, columns, false)?;
-    (0..slot_count)
-        .map(|slot| {
-            let scale = scales_for_offset.get(slot).ok_or(RefreshError::InvalidLayout)?;
-            Ok(BggEncodingWire {
-                vector: vectors.at(slot) + scale.clone() * offset.clone(),
-                plaintext: None,
-            })
-        })
-        .collect()
-}
-
-/// Routes a complete canonical family with one symbolic body. Callers may
-/// then perform one or more structural balanced reductions over its output;
-/// no label is projected to a host value during this phase.
-fn route_prf_family(
-    vectors: Family<Mat>,
-    route_preimages: Family<Preimage>,
-) -> Result<Family<Mat>, RefreshError> {
-    {
-        let source_families = (vectors, route_preimages);
-        if source_families.0.count() != source_families.1.count() {
-            Err(mxx_dsl::DslError::Schema)
-        } else {
-            mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
-                let (vector, rhs) =
-                    (source_families.0.at(&family_index), source_families.1.at(&family_index));
-                let _ = family_index;
-                Ok(rhs.mul_small_rhs(vector))
-            })
-        }
-    }
-    .map_err(|_| RefreshError::InvalidLayout)
-}
-
-fn reduce_family_segments(
-    family: Family<Mat>,
-    segment_count: usize,
-    segment_size: usize,
-) -> Result<Family<Mat>, RefreshError> {
-    if segment_count == 0 || segment_size == 0 {
-        return Err(RefreshError::InvalidLayout);
-    }
-    crate::encoding::reduce_encoding_family_segments(family, segment_count, segment_size)
-        .map_err(|_| RefreshError::InvalidLayout)
-}
-
-/// Returns the public vector added after centered native PRF routing.
-///
-/// Value readout returns `g = d - 1/2` for each base-`P` digit.  The routed
-/// digit therefore needs the public offset
-/// `1/2 * sum_c P^c * (1 + X + ... + X^(n-1))` in every public-key column.
-/// This is a public ring expression and contributes no operational noise.
-pub(crate) fn public_half_offset_vector(
-    ring: &Ring,
-    base_p: usize,
-    digit_count: usize,
-    columns: usize,
-    normalize_mask: bool,
-) -> Result<Mat, RefreshError> {
-    if base_p < 2 || digit_count == 0 || columns == 0 {
-        return Err(RefreshError::InvalidLayout);
-    }
-    let ring_type = ring.matrix_type((1, 1));
-    let modulus =
-        ring_type.modulus.evaluate(&Default::default()).map_err(|_| RefreshError::InvalidLayout)?;
-    if modulus <= BigInt::from(1) || (&modulus & BigInt::from(1)) == BigInt::from(0) {
-        return Err(RefreshError::InvalidLayout);
-    }
-    let ring_dimension = ring_type
-        .ring_dimension
-        .evaluate(&Default::default())
-        .map_err(|_| RefreshError::InvalidLayout)?
-        .to_usize()
-        .ok_or(RefreshError::InvalidLayout)?;
-    if ring_dimension == 0 {
-        return Err(RefreshError::InvalidLayout);
-    }
-    let inverse_two = (&modulus + BigInt::from(1)) / BigInt::from(2);
-    let mut powers = BigInt::from(1);
-    let mut digit_sum = BigInt::from(0);
-    let base = BigInt::from(base_p);
-    for _ in 0..digit_count {
-        digit_sum += &powers;
-        powers *= &base;
-    }
-    // Native digits d=g+1/2 span [1-p/2, p/2]. Masks shift this
-    // consecutive interval to exactly [-floor(p^digits/2), ..., ceil(p^digits/2)-1].
-    let scalar = if normalize_mask {
-        let minimum_digit = BigInt::from(1) - BigInt::from(base_p / 2);
-        digit_sum * (inverse_two - minimum_digit) - powers / BigInt::from(2)
-    } else {
-        digit_sum * inverse_two
-    };
-    let all_ones = ring.polynomial((0..ring_dimension).map(|_| IntExpr::constant(1)));
-    let offset = ring.polynomial([IntExpr::constant(scalar)]) * all_ones;
-    Ok(Mat::concat(mxx_dsl::ConcatAxis::Columns, (0..columns).map(|_| offset.clone()).collect()))
-}
-
-/// Routes all mask slots once and reduces each canonical slot segment to one
-/// encoding. Only the resulting fixed-size CRT-slot vector is materialized.
-pub(crate) fn aggregate_refresh_masks(
-    base_p: usize,
-    family: &RefreshPrfFamilyMaterial,
-    slot_count: usize,
-    route_preimages: Family<Preimage>,
-    lifts: Vec<Mat>,
-) -> Result<Vec<BggEncodingWire>, RefreshError> {
-    if slot_count != family.coverage_slot_count() || lifts.len() != slot_count {
-        return Err(RefreshError::SlotOrderMismatch);
-    }
-    let mask_vectors = family.mask_family()?;
-    let routed_vectors = route_prf_family(mask_vectors, route_preimages)?;
-    let columns = routed_vectors
-        .element_type()
-        .columns
-        .evaluate(&Default::default())
-        .ok()
-        .and_then(|value| value.to_usize())
-        .ok_or(RefreshError::InvalidLayout)?;
-    let ring = Ring::new(
-        routed_vectors.element_type().modulus.clone(),
-        routed_vectors.element_type().ring_dimension.clone(),
-    );
-    let coordinates = family
-        .coverage
-        .component_count
-        .checked_mul(family.coverage.coefficient_count)
-        .ok_or(RefreshError::InvalidLayout)?;
-    let mut start = 0usize;
-    family
-        .coverage
-        .mask_base_p_digit_counts
-        .iter()
-        .enumerate()
-        .map(|(slot, digits)| {
-            let count = coordinates.checked_mul(*digits).ok_or(RefreshError::InvalidLayout)?;
-            let indices = mxx_dsl::parallel(count, |index| {
-                Ok(mxx_dsl::Int::constant(start).add(index.clone()))
-            })
-            .map_err(|_| RefreshError::InvalidLayout)?;
-            let slice = {
-                let source_family = routed_vectors.clone();
-                let gather_indices = indices;
-                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-                    Ok(source_family.at(gather_indices.at(&family_index)))
-                })
-            }
-            .map_err(|_| RefreshError::InvalidLayout)?;
-            let vector = reduce_family_segments(slice, 1, count)?.at(0);
-            let offset = public_half_offset_vector(&ring, base_p, *digits, columns, true)?;
-            start = start.checked_add(count).ok_or(RefreshError::InvalidLayout)?;
-            Ok(BggEncodingWire { vector: vector + lifts[slot].clone() * offset, plaintext: None })
-        })
-        .collect()
-}
-
-fn symbolic_prf_route_matrix(
-    ring: &Ring,
-    public_key: &Mat,
-    base_p: usize,
-    digit: IntExpr,
-    coefficient: IntExpr,
-    component: IntExpr,
-) -> Result<Mat, RefreshError> {
-    let public_key_type = public_key.matrix_type();
-    if public_key_type.rows.evaluate(&Default::default()).ok().and_then(|value| value.to_usize()) !=
-        Some(2)
-    {
-        return Err(RefreshError::InvalidLayout);
-    }
-    let columns = public_key_type.columns.clone();
-    let scalar = ring.constant(
-        (1, 1),
-        mxx_ir_core::node::ConstantMatrix::PowerOfBase {
-            base: IntExpr::constant(base_p),
-            exponent: digit,
-        },
-    ) * ring
-        .constant((1, 1), mxx_ir_core::node::ConstantMatrix::Rotation { exponent: coefficient });
-    let secret_dimension = public_key_type.rows.clone();
-    Ok(-scalar *
-        ring.constant(
-            (secret_dimension, 1),
-            mxx_ir_core::node::ConstantMatrix::UnitColumn { index: IntExpr::constant(1) },
-        ) *
-        ring.constant(
-            (1, columns),
-            mxx_ir_core::node::ConstantMatrix::UnitRow { index: component },
-        ))
-}
-
-/// Builds the deterministic decomposition family for a complete PRF route.
-/// The route target depends only on the public plaintext digit base `P`,
-/// mixed-radix coordinates, and the optional CRT scale; it is independent of
-/// the online `s`-dependent carrier. Consequently the family is safe to
-/// persist as public typed preimages and can be consumed online directly.
+/// Resolve a canonical flat digit label into slot, digit, coefficient and
+/// component coordinates. This metadata is independent of encoding layout.
 pub(crate) fn route_coordinates(
     flat: IntExpr,
     component_count: usize,
@@ -996,844 +418,23 @@ pub(crate) fn route_coordinates(
     Ok((slot, digit, coefficient, component))
 }
 
-pub(crate) fn route_preimage_family(
-    ring: &Ring,
-    public_key: &Mat,
-    base_p: usize,
-    component_count: usize,
-    coefficient_count: usize,
-    digit_counts: &[usize],
-    count: usize,
-    scales: Option<Family<Mat>>,
-    corrected_scalars: Option<Family<Mat>>,
-    decomposition_base: IntExpr,
-    decomposition_digit_count: IntExpr,
-) -> Result<Family<Preimage>, RefreshError> {
-    if count == 0 || component_count == 0 || coefficient_count == 0 {
-        return Err(RefreshError::InvalidLayout);
-    }
-    let total_digits = digit_counts.iter().try_fold(0usize, |sum, digits| {
-        sum.checked_add(*digits).ok_or(RefreshError::InvalidLayout)
-    })?;
-    if component_count
-        .checked_mul(coefficient_count)
-        .and_then(|coordinates| coordinates.checked_mul(total_digits)) !=
-        Some(count)
-    {
-        return Err(RefreshError::InvalidLayout);
-    }
-    // Route targets are constructed from the public layout only.  The online
-    // carrier is deliberately absent. The supplied setup public key provides
-    // the two-row BGG+ target shape needed by `u_2`; only its public type is
-    // used, and its value is not copied into the route target.
-    let targets = {
-        let captured_values = Vec::<Mat>::new();
-        mxx_dsl::parallel(count, |index| {
-            let _ = captured_values;
-            {
-                let (_, digit, coefficient, component) = route_coordinates(
-                    index.expression()?,
-                    component_count,
-                    coefficient_count,
-                    digit_counts,
-                )
-                .map_err(|_| mxx_dsl::DslError::Schema)?;
-                symbolic_prf_route_matrix(
-                    ring,
-                    public_key,
-                    if corrected_scalars.is_some() { 1 } else { base_p },
-                    digit,
-                    coefficient,
-                    component,
-                )
-                .map_err(|_| mxx_dsl::DslError::Schema)
-            }
-        })
-    }
-    .map_err(|_| RefreshError::InvalidLayout)?;
-    let targets = if let Some(scales) = corrected_scalars.or(scales) {
-        {
-            let source_families = (targets, scales);
-            if source_families.0.count() != source_families.1.count() {
-                Err(mxx_dsl::DslError::Schema)
-            } else {
-                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
-                    let (target, scale) =
-                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
-                    let _ = family_index;
-                    Ok(scale * target)
-                })
-            }
-        }
-        .map_err(|_| RefreshError::InvalidLayout)?
-    } else {
-        targets
-    };
-    {
-        let source_family = targets;
-        mxx_dsl::parallel(source_family.count().clone(), |family_index| {
-            let target = source_family.at(&family_index);
-            let _ = family_index;
-            Ok(target.decompose(decomposition_base.clone(), decomposition_digit_count.clone()))
-        })
-    }
-    .map_err(|_| RefreshError::InvalidLayout)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-/// Protocol declaration used to validate an RNS refresh graph.
-pub struct RefreshDeclaration {
-    /// Stable declaration identity.
-    pub identity: [u8; 32],
-    /// Identity of the setup that produced this declaration.
-    pub setup_identity: [u8; 32],
-    /// Owning protocol/component name.
-    pub owner: String,
-    /// Named refresh plan.
-    pub plan: String,
-    /// Declared value type.
-    pub value_type: String,
-    /// Matrix row count.
-    pub rows: usize,
-    /// Matrix column count.
-    pub columns: usize,
-    /// CRT slots in canonical order.
-    pub slots: Vec<RefreshSlot>,
-    /// CRT recomposition coefficients in slot order.
-    pub reconstruction_coefficients: Vec<BigInt>,
-}
-
-#[derive(Clone)]
-/// Output of refresh, retaining the declaration beside the resulting wire.
-pub struct RefreshResult {
-    encoding: BggEncodingWire,
-    declaration: RefreshDeclaration,
-}
-
-impl RefreshResult {
-    /// Borrows the refreshed BGG encoding wire.
-    pub fn encoding(&self) -> &BggEncodingWire {
-        &self.encoding
-    }
-    /// Borrows the declaration checked for this result.
-    pub fn declaration(&self) -> &RefreshDeclaration {
-        &self.declaration
-    }
-    /// Extracts the refreshed encoding and discards the declaration.
-    pub fn into_encoding(self) -> BggEncodingWire {
-        self.encoding
-    }
-}
-
-impl RefreshDeclaration {
-    fn validate_parameters(&self) -> Result<(), RefreshError> {
-        if self.owner != "mxx-exponent-lut" ||
-            self.setup_identity == [0; 32] ||
-            self.plan != "section-7-refresh" ||
-            self.value_type != "BggEncodingVector" ||
-            self.rows == 0 ||
-            self.columns == 0 ||
-            self.slots.is_empty() ||
-            self.reconstruction_coefficients.len() != self.slots.len()
-        {
-            return Err(RefreshError::InvalidLayout);
-        }
-        for (expected, slot) in self.slots.iter().enumerate() {
-            if slot.slot != expected ||
-                slot.q <= 0.into() ||
-                slot.q_t <= 0.into() ||
-                slot.p <= 1.into() ||
-                &slot.p % 2 != 1.into() ||
-                &slot.q % &slot.p != 0.into() ||
-                &slot.p % &slot.q_t != 0.into()
-            {
-                return Err(RefreshError::InvalidLayout);
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The graph-checked `B*K` equation used to validate decoder preimages.
-///
-/// The anchor stores only the graph expression needed for identity checks.
-/// It does not expose a secret key or a decoder result; callers can bind a
-/// preimage only to the exact product constructed here.
-#[derive(Clone)]
-struct RefreshAnchor {
-    equation: Option<RefreshAnchorEquation>,
-}
-
-#[derive(Clone)]
-struct RefreshAnchorEquation {
-    /// The graph expression `B * K` that decoder preimages must reference.
-    target: Mat,
-}
-
-impl RefreshAnchor {
-    /// Builds an anchor from the issuer's decoder matrix `B` and preimage
-    /// typed preimage `K`, retaining the exact graph product `B*K` as target.
-    pub(crate) fn with_equation(b: Mat, k: Preimage) -> Self {
-        // Construct the issuer target here so callers cannot attach an
-        // unrelated matrix while claiming it is B*K.
-        let target = k.mul_small_rhs(b);
-        Self { equation: Some(RefreshAnchorEquation { target }) }
-    }
-}
-
-/// One scalar decoder preimage bound to an anchor equation and target matrix.
-///
-/// The stored value handles tie the decoder wire to both the exact `B*K`
-/// anchor and the exact combined public target. This prevents setup code from
-/// substituting a decoder from another slot or another refresh instance.
-#[derive(Clone)]
-struct RefreshDecoderPreimage {
-    /// Decoder encoding supplied by setup binding.
-    encoding: BggEncodingWire,
-    /// Identity of the anchor's graph expression `B*K`.
-    anchor_equation: mxx_ir_core::ValueHandle,
-    /// Identity of the combined public target decoded by this preimage.
-    target_equation: mxx_ir_core::ValueHandle,
-}
-
-impl RefreshDecoderPreimage {
-    /// Binds a decoder wire to an existing anchor and combined target.
-    ///
-    /// Only graph identities are retained here; no private support or
-    /// selector information is copied into the decoder package.
-    fn bind(
-        anchor: &RefreshAnchor,
-        encoding: BggEncodingWire,
-        combined_target: &Mat,
-    ) -> Result<Self, RefreshError> {
-        let equation = anchor.equation.as_ref().ok_or(RefreshError::MissingAnchorEquation)?;
-        Ok(Self {
-            encoding,
-            anchor_equation: equation.target.value_handle().clone(),
-            target_equation: combined_target.value_handle().clone(),
-        })
-    }
-
-    /// Checks that this preimage still references the supplied anchor and
-    /// target before it is admitted to a scalar refresh package.
-    fn validate(&self, anchor: &RefreshAnchor, target: &Mat) -> Result<(), RefreshError> {
-        if anchor.equation.as_ref().map(|equation| equation.target.value_handle()) !=
-            Some(&self.anchor_equation) ||
-            self.target_equation != *target.value_handle()
-        {
-            return Err(RefreshError::AnchorMismatch);
-        }
-        Ok(())
-    }
-}
-
-/// Typed per-slot package for the RNS refresh equation.
-///
-/// The package keeps the old state, scaled state target, mask, fresh-error
-/// source, and decoder preimage together with their graph identities. Mask and
-/// fresh-error material remain separate fields so callers cannot accidentally
-/// decode before combining them. The online `b`, preprocessing-fixed `k`, and
-/// anchor product are linkage evidence, not additional artifact outputs.
-#[derive(Clone)]
-struct RefreshScalarPackage {
-    slot: usize,
-    state_handle: mxx_ir_core::ValueHandle,
-    a_prime_handle: mxx_ir_core::ValueHandle,
-    scale_target: Mat,
-    scaled_state: BggEncodingWire,
-    mask: BggEncodingWire,
-    fresh_error_source: BggEncodingWire,
-    decoder_base_handle: mxx_ir_core::ValueHandle,
-    decoder: RefreshDecoderPreimage,
-    target_public_matrix: Mat,
-    b: Mat,
-    k: Preimage,
-    anchor_product_handle: mxx_ir_core::ValueHandle,
-}
-
-impl RefreshScalarPackage {
-    /// Validates and assembles one CRT-slot refresh package.
-    ///
-    /// The constructor checks the decoder's anchor/target linkage and records
-    /// the state and fresh-error graph handles used by later validation. It
-    /// does not expose the private setup matrices to callers.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        slot: usize,
-        state: &BggEncodingWire,
-        a_prime: &Mat,
-        scale_target: Mat,
-        scaled_state: BggEncodingWire,
-        mask: BggEncodingWire,
-        fresh_error_source: BggEncodingWire,
-        decoder: RefreshDecoderPreimage,
-        decoder_base_handle: mxx_ir_core::ValueHandle,
-        target_public_matrix: Mat,
-        anchor: &RefreshAnchor,
-        b: Mat,
-        k: Preimage,
-    ) -> Result<Self, RefreshError> {
-        decoder.validate(anchor, &target_public_matrix)?;
-        let low = target_public_matrix.matrix_type();
-        let high = state.vector.matrix_type();
-        if !same_matrix_type(
-            b.matrix_type(),
-            &mxx_ir_core::types::MatrixType {
-                modulus: low.modulus.clone(),
-                ring_dimension: low.ring_dimension.clone(),
-                ..b.matrix_type().clone()
-            },
-        ) || !same_matrix_type(
-            k.matrix_type(),
-            &mxx_ir_core::types::MatrixType {
-                rows: b.matrix_type().columns.clone(),
-                columns: high.columns.clone(),
-                ..low.clone()
-            },
-        ) || !same_matrix_type(
-            low,
-            &mxx_ir_core::types::MatrixType {
-                rows: b.matrix_type().rows.clone(),
-                columns: high.columns.clone(),
-                ring_dimension: high.ring_dimension.clone(),
-                ..low.clone()
-            },
-        ) || !same_matrix_type(
-            decoder.encoding.vector.matrix_type(),
-            &mxx_ir_core::types::MatrixType { modulus: low.modulus.clone(), ..high.clone() },
-        ) {
-            return Err(RefreshError::InvalidLayout);
-        }
-        let anchor_product_handle = anchor
-            .equation
-            .as_ref()
-            .ok_or(RefreshError::MissingAnchorEquation)?
-            .target
-            .value_handle()
-            .clone();
-        Ok(Self {
-            slot,
-            state_handle: state.vector.value_handle().clone(),
-            a_prime_handle: a_prime.value_handle().clone(),
-            scale_target,
-            scaled_state,
-            mask,
-            fresh_error_source,
-            decoder_base_handle,
-            decoder,
-            target_public_matrix,
-            b,
-            k,
-            anchor_product_handle,
-        })
-    }
-}
-
-/// Opaque, validated setup for one refresh invocation. It owns the exact input
-/// state and refreshed public matrix, so evaluation cannot substitute either
-/// after setup binding.
-#[derive(Clone)]
-pub struct RefreshSetupManifest {
-    identity: [u8; 32],
-    state: BggEncodingWire,
-    a_prime: Mat,
-    packages: Vec<RefreshScalarPackage>,
-}
-
-impl RefreshSetupManifest {
-    fn bind(
-        state: BggEncodingWire,
-        a_prime: Mat,
-        packages: Vec<RefreshScalarPackage>,
-    ) -> Result<Self, RefreshError> {
-        if packages.is_empty() {
-            return Err(RefreshError::InvalidLayout);
-        }
-        let mut anchors = std::collections::BTreeMap::new();
-        for (slot, package) in packages.iter().enumerate() {
-            if package.slot != slot ||
-                package.state_handle != *state.vector.value_handle() ||
-                package.a_prime_handle != *a_prime.value_handle() ||
-                !same_matrix_type(package.mask.vector.matrix_type(), state.vector.matrix_type()) ||
-                !same_matrix_type(
-                    package.fresh_error_source.vector.matrix_type(),
-                    state.vector.matrix_type(),
-                )
-            {
-                return Err(if package.slot != slot {
-                    RefreshError::SlotOrderMismatch
-                } else {
-                    RefreshError::InvalidLayout
-                });
-            }
-            let modulus = package.b.matrix_type().modulus.clone();
-            let binding = (package.b.value_handle().clone(), package.decoder_base_handle.clone());
-            if anchors.get(&modulus).is_some_and(|previous| previous != &binding) {
-                return Err(RefreshError::AnchorMismatch);
-            }
-            anchors.insert(modulus, binding);
-        }
-        let mut hash = Sha256::new();
-        hash.update(b"mxx.exponent-lut.refresh-setup");
-        hash.update(format!("{:?}", state.vector.value_handle()).as_bytes());
-        hash.update(format!("{:?}", a_prime.value_handle()).as_bytes());
-        for package in &packages {
-            hash.update(package.slot.to_le_bytes());
-            hash.update(format!("{:?}", package.target_public_matrix.value_handle()).as_bytes());
-            hash.update(format!("{:?}", package.b.value_handle()).as_bytes());
-            hash.update(format!("{:?}", package.decoder_base_handle).as_bytes());
-            hash.update(format!("{:?}", package.k.value_handle()).as_bytes());
-        }
-        Ok(Self { identity: hash.finalize().into(), state, a_prime, packages })
-    }
-
-    /// Returns the identity of this validated setup.
-    pub fn identity(&self) -> &[u8; 32] {
-        &self.identity
-    }
-
-    /// Returns the exact state encoding sealed into the setup.
-    pub fn state(&self) -> &BggEncodingWire {
-        &self.state
-    }
-
-    /// Returns the public matrix targeted by refresh.
-    pub fn refreshed_public_matrix(&self) -> &Mat {
-        &self.a_prime
-    }
-}
-
-/// Configuration for exact q/q_t gadget scaling and CRT recomposition.
-#[derive(Clone)]
-pub struct RefreshCompiler {
-    /// Full ciphertext modulus `q`.
-    pub full_modulus: IntExpr,
-    /// CRT plaintext moduli `q_t`, in slot order.
-    pub crt_plaintext_moduli: Vec<IntExpr>,
-    /// Coefficients used to recombine CRT slot outputs.
-    pub reconstruction_coefficients: Vec<IntExpr>,
-}
-
-impl RefreshCompiler {
-    /// Binds setup material imported from the canonical Phase-2 manifest.
-    ///
-    /// The online shared decoder base and imported per-slot preimages are
-    /// deliberately plain wires at this boundary. This helper is the only
-    /// crate-internal adapter that turns them into typed per-slot packages:
-    /// each target is recomputed from the imported state/mask/fresh material
-    /// and the decoder is rebuilt as the shared `base.vector * K_t`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn bind_imported_wires(
-        &self,
-        compiler: &ExponentLutEncodingCompiler,
-        state: BggEncodingWire,
-        state_public: BggPublicKeyWire,
-        a_prime: Mat,
-        public_b: Vec<Mat>,
-        refresh_targets: Vec<Mat>,
-        scaled_freshes: Vec<BggEncodingWire>,
-        masks: Vec<BggEncodingWire>,
-        state_scaling: Vec<Preimage>,
-        decoder_bases: Vec<BggEncodingWire>,
-        preimages: Vec<Preimage>,
-    ) -> Result<RefreshSetupManifest, RefreshError> {
-        self.validate_layout()?;
-        if masks.len() != self.crt_plaintext_moduli.len() ||
-            scaled_freshes.len() != masks.len() ||
-            state_scaling.len() != masks.len() ||
-            preimages.len() != masks.len() ||
-            public_b.len() != masks.len() ||
-            decoder_bases.len() != masks.len() ||
-            refresh_targets.len() != masks.len() ||
-            !same_matrix_type(a_prime.matrix_type(), state_public.matrix.matrix_type())
-        {
-            return Err(RefreshError::InvalidLayout);
-        }
-        // Slots sharing P use the same B_P and online anchor handles. Distinct
-        // rings remain separate, including when their matrix shapes coincide.
-        let mut packages = Vec::with_capacity(masks.len());
-        for (slot, (((mask, scaled_fresh), scale_decomposition), k)) in masks
-            .into_iter()
-            .zip(scaled_freshes.into_iter())
-            .zip(state_scaling.into_iter())
-            .zip(preimages.into_iter())
-            .enumerate()
-        {
-            let base = decoder_bases[slot].clone();
-            let decoder_base_handle = base.vector.value_handle().clone();
-            // `scale = mu_t = q/q_t`; multiplying by its gadget decomposition
-            // implements `u_t=c G^{-1}(mu_t G)` and `A_t=A G^{-1}(mu_t G)`.
-            let scale = mxx_dsl::Ring::new(
-                state.vector.matrix_type().modulus.clone(),
-                state.vector.matrix_type().ring_dimension.clone(),
-            )
-            .polynomial([self.scale_expression(slot)?]);
-            let scaled_state =
-                compiler.bgg.large_scalar_mul(&state, &scale, scale_decomposition.clone());
-            let target = refresh_targets.get(slot).cloned().ok_or(RefreshError::InvalidLayout)?;
-            let p = target
-                .matrix_type()
-                .modulus
-                .evaluate(&Default::default())
-                .map_err(|_| RefreshError::InvalidLayout)?;
-            let q = self
-                .full_modulus
-                .evaluate(&Default::default())
-                .map_err(|_| RefreshError::InvalidLayout)?;
-            let qt = self.crt_plaintext_moduli[slot]
-                .evaluate(&Default::default())
-                .map_err(|_| RefreshError::InvalidLayout)?;
-            if p <= 1.into() || &p % 2 != 1.into() || &q % &p != 0.into() || &p % &qt != 0.into() {
-                return Err(RefreshError::InvalidLayout);
-            }
-            // K_t targets MS(A_sum,t) - Delta_t reduce(A') in R_P.
-            let decoder =
-                BggEncodingWire { vector: k.clone().mul_small_rhs(base.vector), plaintext: None };
-            let anchor = RefreshAnchor::with_equation(public_b[slot].clone(), k.clone());
-            let decoder = RefreshDecoderPreimage::bind(&anchor, decoder, &target)?;
-            packages.push(RefreshScalarPackage::new(
-                slot,
-                &state,
-                &a_prime,
-                scale,
-                scaled_state,
-                mask,
-                scaled_fresh,
-                decoder,
-                decoder_base_handle,
-                target,
-                &anchor,
-                public_b[slot].clone(),
-                k,
-            )?);
-        }
-        RefreshSetupManifest::bind(state, a_prime, packages)
-    }
-
-    /// Build the canonical event from the actual refresh output and equation
-    /// operands. The event is attached to the output graph value below.
-    fn refresh_declaration(
-        &self,
-        setup: &RefreshSetupManifest,
-        output: &Mat,
-    ) -> Result<RefreshDeclaration, RefreshError> {
-        let state = &setup.state;
-        let rows = state
-            .vector
-            .matrix_type()
-            .rows
-            .evaluate(&Default::default())
-            .map_err(|_| RefreshError::InvalidLayout)?
-            .to_usize()
-            .ok_or(RefreshError::InvalidLayout)?;
-        let columns = state
-            .vector
-            .matrix_type()
-            .columns
-            .evaluate(&Default::default())
-            .map_err(|_| RefreshError::InvalidLayout)?
-            .to_usize()
-            .ok_or(RefreshError::InvalidLayout)?;
-        let q = self
-            .full_modulus
-            .evaluate(&Default::default())
-            .map_err(|_| RefreshError::InvalidLayout)?;
-        let slots = self
-            .crt_plaintext_moduli
-            .iter()
-            .enumerate()
-            .map(|(slot, q_t)| {
-                Ok(RefreshSlot {
-                    slot,
-                    q: q.clone(),
-                    p: setup.packages[slot]
-                        .target_public_matrix
-                        .matrix_type()
-                        .modulus
-                        .evaluate(&Default::default())
-                        .map_err(|_| RefreshError::InvalidLayout)?,
-                    q_t: q_t
-                        .evaluate(&Default::default())
-                        .map_err(|_| RefreshError::InvalidLayout)?,
-                })
-            })
-            .collect::<Result<Vec<_>, RefreshError>>()?;
-        let declaration = RefreshDeclaration {
-            identity: matrix_identity(output),
-            setup_identity: setup.identity,
-            owner: "mxx-exponent-lut".into(),
-            plan: "section-7-refresh".into(),
-            value_type: "BggEncodingVector".into(),
-            rows,
-            columns,
-            slots,
-            reconstruction_coefficients: self
-                .reconstruction_coefficients
-                .iter()
-                .map(|coefficient| {
-                    coefficient
-                        .evaluate(&Default::default())
-                        .map_err(|_| RefreshError::InvalidLayout)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        if output.matrix_type().rows.evaluate(&Default::default()).ok().and_then(|v| v.to_usize()) !=
-            Some(rows) ||
-            output
-                .matrix_type()
-                .columns
-                .evaluate(&Default::default())
-                .ok()
-                .and_then(|v| v.to_usize()) !=
-                Some(columns) ||
-            setup.packages.is_empty()
-        {
-            return Err(RefreshError::InvalidLayout);
-        }
-        declaration.validate_parameters()?;
-        Ok(declaration)
-    }
-    /// Validates CRT divisibility and coefficient count.
-    pub fn validate_layout(&self) -> Result<(), RefreshError> {
-        // CRT-backed refresh requires at least two plaintext-modulus slots;
-        // a single slot is not a supported CRT layout.
-        if self.crt_plaintext_moduli.len() < 2 ||
-            self.crt_plaintext_moduli.len() != self.reconstruction_coefficients.len()
-        {
-            return Err(RefreshError::InvalidLayout);
-        }
-        let q = self
-            .full_modulus
-            .evaluate(&Default::default())
-            .map_err(|_| RefreshError::InvalidLayout)?;
-        if q <= BigInt::from(0) {
-            return Err(RefreshError::InvalidLayout);
-        }
-        let q_t = self
-            .crt_plaintext_moduli
-            .iter()
-            .map(|qt| qt.evaluate(&Default::default()).map_err(|_| RefreshError::InvalidLayout))
-            .collect::<Result<Vec<_>, _>>()?;
-        if q_t.iter().any(|value| *value <= BigInt::from(1) || &q % value != BigInt::from(0)) {
-            return Err(RefreshError::InvalidLayout);
-        }
-        for (index, left) in q_t.iter().enumerate() {
-            for right in q_t.iter().skip(index + 1) {
-                if bigint_gcd(left, right) != BigInt::from(1) {
-                    return Err(RefreshError::InvalidLayout);
-                }
-            }
-        }
-        let product = q_t.iter().fold(BigInt::from(1), |product, value| product * value);
-        if product != q {
-            return Err(RefreshError::InvalidLayout);
-        }
-        Ok(())
-    }
-
-    /// Returns the exact `q / q_t` scale expression for one CRT slot.
-    pub fn scale_expression(&self, slot: usize) -> Result<IntExpr, RefreshError> {
-        self.crt_plaintext_moduli
-            .get(slot)
-            .cloned()
-            .map(|q_t| IntExpr::Div(Box::new(self.full_modulus.clone()), Box::new(q_t)))
-            .ok_or(RefreshError::InvalidLayout)
-    }
-
-    /// Refreshes a state using one typed package for each RNS slot. The
-    /// fresh-error identity is checked before any graph is built, and all
-    /// masks/errors are added before their combined decoder is subtracted.
-    pub fn refresh(
-        &self,
-        compiler: &ExponentLutEncodingCompiler,
-        setup: &RefreshSetupManifest,
-    ) -> Result<RefreshResult, RefreshError> {
-        self.validate_layout()?;
-        let state = &setup.state;
-        let packages = &setup.packages;
-        if packages.len() != self.crt_plaintext_moduli.len() {
-            return Err(RefreshError::InvalidLayout);
-        }
-        // One homogeneous family per selected ring performs the slot equation.
-        // This keeps CRT-slot work independent while preserving the caller's
-        // declared slot order for the final recomposition.
-        let mut groups = std::collections::BTreeMap::<IntExpr, Vec<usize>>::new();
-        for (slot, package) in packages.iter().enumerate() {
-            groups
-                .entry(package.target_public_matrix.matrix_type().modulus.clone())
-                .or_default()
-                .push(slot);
-        }
-        let mut levels_by_slot = std::collections::BTreeMap::new();
-        for (modulus, slots) in groups {
-            let scaled = Family::pack(
-                slots.iter().map(|slot| packages[*slot].scaled_state.vector.clone()).collect(),
-            )
-            .map_err(|_| RefreshError::InvalidLayout)?;
-            let masks = Family::pack(
-                slots.iter().map(|slot| packages[*slot].mask.vector.clone()).collect(),
-            )
-            .map_err(|_| RefreshError::InvalidLayout)?;
-            let fresh = Family::pack(
-                slots
-                    .iter()
-                    .map(|slot| packages[*slot].fresh_error_source.vector.clone())
-                    .collect(),
-            )
-            .map_err(|_| RefreshError::InvalidLayout)?;
-            let decoders = Family::pack(
-                slots.iter().map(|slot| packages[*slot].decoder.encoding.vector.clone()).collect(),
-            )
-            .map_err(|_| RefreshError::InvalidLayout)?;
-            let family = {
-                let source_families = vec![scaled, masks, fresh, decoders];
-                if source_families.is_empty() ||
-                    source_families
-                        .iter()
-                        .any(|family| family.count() != source_families[0].count())
-                {
-                    Err(mxx_dsl::DslError::Schema)
-                } else {
-                    mxx_dsl::parallel(source_families[0].count().clone(), |index| {
-                        let mut values = source_families
-                            .iter()
-                            .map(|family| family.at(&index))
-                            .collect::<Vec<_>>();
-                        Ok({
-                            let decoder = values.pop().expect("low-P decoder");
-                            let fresh = BggEncodingWire {
-                                vector: values.pop().expect("fresh"),
-                                plaintext: None,
-                            };
-                            let mask = BggEncodingWire {
-                                vector: values.pop().expect("mask"),
-                                plaintext: None,
-                            };
-                            let scaled = BggEncodingWire {
-                                vector: values.pop().expect("scaled state"),
-                                plaintext: None,
-                            };
-                            let combined =
-                                compiler.bgg.add(&scaled, &mask).expect("validated high-q add");
-                            let sum =
-                                compiler.bgg.add(&combined, &fresh).expect("validated high-q add");
-                            // The complete high-q sum is switched exactly once. No high-q
-                            // combined decoder is provided to this online graph.
-                            sum.vector.modulus_switch(modulus.clone()) - decoder
-                        })
-                    })
-                }
-            }
-            .map_err(|_| RefreshError::InvalidLayout)?;
-            for (local, slot) in slots.into_iter().enumerate() {
-                levels_by_slot.insert(slot, family.at(local));
-            }
-        }
-        let mut levels = Vec::with_capacity(packages.len());
-        let mut slot_roles = Vec::with_capacity(packages.len() * 8);
-        for (slot, package) in packages.iter().enumerate() {
-            if package.slot != slot {
-                return Err(RefreshError::SlotOrderMismatch);
-            }
-            if package.state_handle != *state.vector.value_handle() ||
-                package.a_prime_handle != *setup.a_prime.value_handle()
-            {
-                return Err(RefreshError::TargetMismatch);
-            }
-            if package.decoder.anchor_equation != package.anchor_product_handle ||
-                package.decoder.target_equation != *package.target_public_matrix.value_handle()
-            {
-                return Err(RefreshError::AnchorMismatch);
-            }
-            let level = levels_by_slot.remove(&slot).ok_or(RefreshError::SlotOrderMismatch)?;
-            // These names are retained as a compact linkage manifest. The
-            // actual arithmetic lives in the one parallel body above.
-            slot_roles.extend([
-                (format!("slot-{slot}-scale-target"), package.scale_target.value_handle().clone()),
-                (format!("slot-{slot}-scaled-state"), state.vector.value_handle().clone()),
-                (format!("slot-{slot}-mask"), package.mask.vector.value_handle().clone()),
-                (
-                    format!("slot-{slot}-scaled-fresh-error"),
-                    package.fresh_error_source.vector.value_handle().clone(),
-                ),
-                (format!("slot-{slot}-masked"), package.mask.vector.value_handle().clone()),
-                (
-                    format!("slot-{slot}-combined"),
-                    package.fresh_error_source.vector.value_handle().clone(),
-                ),
-                (
-                    format!("slot-{slot}-decoder"),
-                    package.decoder.encoding.vector.value_handle().clone(),
-                ),
-                (
-                    format!("slot-{slot}-decoder-public"),
-                    package.target_public_matrix.value_handle().clone(),
-                ),
-                (format!("slot-{slot}-level"), level.value_handle().clone()),
-                (
-                    format!("slot-{slot}-target"),
-                    package.target_public_matrix.value_handle().clone(),
-                ),
-                (format!("slot-{slot}-b"), package.b.value_handle().clone()),
-                (format!("slot-{slot}-k"), package.k.value_handle().clone()),
-                (
-                    format!("slot-{slot}-b-k-product"),
-                    package.decoder.encoding.vector.value_handle().clone(),
-                ),
-            ]);
-            levels.push(level);
-        }
-        let vector = Mat::crt_recompose(
-            levels,
-            self.crt_plaintext_moduli.clone(),
-            self.reconstruction_coefficients.clone(),
-            self.full_modulus.clone(),
-        );
-        let declaration = self.refresh_declaration(setup, &vector)?;
-        Ok(RefreshResult { encoding: BggEncodingWire { vector, plaintext: None }, declaration })
-    }
-}
-
-fn bigint_gcd(left: &BigInt, right: &BigInt) -> BigInt {
-    let mut a = left.clone().abs();
-    let mut b = right.clone().abs();
-    while !b.is_zero() {
-        let remainder = a % &b;
-        a = b;
-        b = remainder;
-    }
-    a
-}
-
-fn matrix_identity(matrix: &Mat) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(format!("{:?}", matrix.value_handle()).as_bytes());
-    h.finalize().into()
-}
-
-fn same_matrix_type(
-    left: &mxx_ir_core::types::MatrixType,
-    right: &mxx_ir_core::types::MatrixType,
-) -> bool {
-    let environment = mxx_ir_core::ParamEnv::default();
-    [
-        (&left.modulus, &right.modulus),
-        (&left.ring_dimension, &right.ring_dimension),
-        (&left.rows, &right.rows),
-        (&left.columns, &right.columns),
-    ]
-    .into_iter()
-    .all(|(left, right)| matches!((left.evaluate(&environment), right.evaluate(&environment)), (Ok(left), Ok(right)) if left == right))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn prf_labels_cover_all_public_key_columns_with_separate_digit_groups() {
-        let index =
-            RefreshPrfLabelIndex::new([7; 32], 2, 6, 2, vec![3; 2], 1).expect("label index");
+        let index = RefreshPrfLabelIndex::new(
+            [7; 32],
+            &crate::noise_refresh::simulation::RefreshTranscriptTopology {
+                crt_slot_count: 2,
+                component_columns: 6,
+                coefficient_count: 2,
+                mask_digit_counts: vec![3; 2],
+                fresh_digit_count: 1,
+            },
+        )
+        .expect("label index");
         let mask_group = 6 * 2 * 3;
         let fresh_group = 6 * 2;
         assert_eq!(index.len(), 2 * mask_group + fresh_group);
@@ -1869,7 +470,20 @@ mod tests {
     fn ragged_label_prefixes_match_structural_route_coordinates() {
         let refresh_id = rand::random();
         let digits = vec![1, 3, 2];
-        let index = RefreshPrfLabelIndex::new(refresh_id, 3, 2, 3, digits.clone(), 2).unwrap();
+        let index = RefreshPrfLabelIndex::new(
+            refresh_id,
+            &crate::noise_refresh::simulation::RefreshTranscriptTopology {
+                crt_slot_count: 3,
+                component_columns: 2,
+                coefficient_count: 3,
+                mask_digit_counts: digits.clone(),
+                fresh_digit_count: 2,
+            },
+        )
+        .unwrap();
+        let index: RefreshPrfLabelIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert_eq!(index.len(), index.topology.joint_event_count().unwrap());
         assert_eq!(index.mask_offsets, vec![0, 6, 24, 36]);
         assert_eq!(index.len(), 48);
         for flat in 0..index.len() {
@@ -1905,7 +519,19 @@ mod tests {
                 })
                 .is_none()
         );
-        assert!(RefreshPrfLabelIndex::new(refresh_id, 2, 2, 3, digits, 2).is_err());
+        assert!(
+            RefreshPrfLabelIndex::new(
+                refresh_id,
+                &crate::noise_refresh::simulation::RefreshTranscriptTopology {
+                    crt_slot_count: 2,
+                    component_columns: 2,
+                    coefficient_count: 3,
+                    mask_digit_counts: digits,
+                    fresh_digit_count: 2,
+                }
+            )
+            .is_err()
+        );
         assert!(route_coordinates(0.into(), 2, 3, &[0, 2]).is_err());
         assert!(route_coordinates(0.into(), usize::MAX, 3, &[1, 2]).is_err());
     }
@@ -1917,11 +543,13 @@ mod tests {
         {
             let index = RefreshPrfLabelIndex::new(
                 [0x31; 32],
-                slot_count,
-                component_count,
-                coefficient_count,
-                vec![dm; slot_count],
-                de,
+                &crate::noise_refresh::simulation::RefreshTranscriptTopology {
+                    crt_slot_count: slot_count,
+                    component_columns: component_count,
+                    coefficient_count,
+                    mask_digit_counts: vec![dm; slot_count],
+                    fresh_digit_count: de,
+                },
             )
             .expect("mixed-radix label index");
             let mask_group = component_count * coefficient_count * dm;
@@ -1960,229 +588,954 @@ mod tests {
             assert!(matches!(index.label(fresh_start), Some(RefreshPrfLabel::FreshError { .. })));
         }
     }
+}
 
-    #[test]
-    fn refresh_layout_rejects_duplicate_or_non_coprime_crt_moduli() {
-        let duplicate = RefreshCompiler {
-            full_modulus: 12.into(),
-            crt_plaintext_moduli: vec![2.into(), 2.into(), 3.into()],
-            reconstruction_coefficients: vec![1.into(), 1.into(), 1.into()],
-        };
-        assert!(matches!(duplicate.validate_layout(), Err(RefreshError::InvalidLayout)));
+/// A setup-bound CRT slot. Equal levels promise homogeneous graph schemas;
+/// mask and fresh-error labels and decoder equations are bound by setup.
+pub struct RefreshSlotValues<S: ExponentLUTRefreshScheme> {
+    pub level: S::RefreshLevel,
+    pub scaled_state: S::RefreshRow,
+    pub mask: S::RefreshRow,
+    pub fresh_error: S::RefreshRow,
+    pub decoder: S::RefreshDecoder,
+}
 
-        let non_coprime = RefreshCompiler {
-            full_modulus: 24.into(),
-            crt_plaintext_moduli: vec![4.into(), 6.into()],
-            reconstruction_coefficients: vec![1.into(), 1.into()],
-        };
-        assert!(matches!(non_coprime.validate_layout(), Err(RefreshError::InvalidLayout)));
+impl<S: ExponentLUTRefreshScheme> Clone for RefreshSlotValues<S> {
+    fn clone(&self) -> Self {
+        Self {
+            level: self.level.clone(),
+            scaled_state: self.scaled_state.clone(),
+            mask: self.mask.clone(),
+            fresh_error: self.fresh_error.clone(),
+            decoder: self.decoder.clone(),
+        }
+    }
+}
 
-        let length_mismatch = RefreshCompiler {
-            full_modulus: 6.into(),
-            crt_plaintext_moduli: vec![2.into(), 3.into()],
-            reconstruction_coefficients: vec![1.into()],
-        };
-        assert!(matches!(length_mismatch.validate_layout(), Err(RefreshError::InvalidLayout)));
+/// Per-slot preparation inputs. Scaling and the decoder witness come from
+/// preprocessing; the decoder base is generated for the current online secret.
+pub struct RefreshSlotPreparation<S: ExponentLUTRefreshWitnessScheme> {
+    pub level: S::RefreshLevel,
+    pub scaling: S::RefreshScaling,
+    pub decoder_base: S::RefreshDecoderBase,
+    pub witness: S::RefreshDecoderWitness,
+}
+
+pub fn prepare_refresh_slot<S: ExponentLUTRefreshWitnessScheme>(
+    scheme: &S,
+    state: &S::Encoding,
+    mask: S::RefreshRow,
+    fresh_error: S::RefreshRow,
+    preparation: RefreshSlotPreparation<S>,
+) -> RefreshSlotValues<S> {
+    RefreshSlotValues {
+        level: preparation.level,
+        scaled_state: scheme.scale_refresh_input(state, &preparation.scaling),
+        mask,
+        fresh_error,
+        decoder: scheme.prepare_refresh_decoder(preparation.decoder_base, preparation.witness),
+    }
+}
+
+/// Evaluate one symbolic body per homogeneous level. Slot count affects the
+/// family extent, not the number of arithmetic nodes built on the host.
+pub fn evaluate_refresh<'a, S: ExponentLUTRefreshScheme + 'a>(
+    scheme: &S,
+    slots: impl IntoIterator<Item = &'a RefreshSlotValues<S>>,
+    recomposition: &S::RefreshRecomposition,
+) -> Result<S::Encoding, DslError> {
+    let slots = slots.into_iter().collect::<Vec<_>>();
+    let count = slots.len();
+    let groups = group_refresh_levels(slots.iter().map(|slot| slot.level.clone()));
+    if count == 0 {
+        return Err(DslError::Schema);
+    }
+    let mut ordered = vec![None; count];
+    for (level, members) in groups {
+        let scaled =
+            Family::pack(members.iter().map(|index| slots[*index].scaled_state.clone()).collect())?;
+        let masks = Family::pack(members.iter().map(|index| slots[*index].mask.clone()).collect())?;
+        let fresh =
+            Family::pack(members.iter().map(|index| slots[*index].fresh_error.clone()).collect())?;
+        let decoders =
+            Family::pack(members.iter().map(|index| slots[*index].decoder.clone()).collect())?;
+        let results = mxx_dsl::parallel(members.len(), |index| {
+            let masked = scheme.add_refresh_rows(scaled.at(&index), masks.at(&index));
+            let combined = scheme.add_refresh_rows(masked, fresh.at(&index));
+            let switched = scheme.switch_refresh_row(combined, &level);
+            let decoded = scheme.apply_refresh_decoder(switched, decoders.at(&index));
+            Ok(scheme.extract_refresh_residue(decoded, &level))
+        })?;
+        for (local, index) in members.into_iter().enumerate() {
+            ordered[index] = Some(results.at(local));
+        }
+    }
+    let slots = ordered
+        .into_iter()
+        .map(|row| row.expect("each slot belongs to one level"))
+        .collect::<Vec<_>>();
+    Ok(scheme.recompose_refresh_rows(slots, recomposition))
+}
+
+/// Route public PRF outputs using the same prepared witnesses consumed online.
+/// The canonical label index owns ragged mask ranges and the single fresh
+/// source range. Only routes are slot-specific; fresh PRF outputs are shared.
+/// No target construction, decomposition or sampling occurs in this traversal.
+pub fn prepare_refresh_public_routes<S: ExponentLUTRefreshWitnessScheme>(
+    scheme: &S,
+    labels: &RefreshPrfLabelIndex,
+    outputs: Family<S::RefreshPublicRow>,
+    mask_routes: Family<S::RefreshPublicScaling>,
+    fresh_routes: Family<S::RefreshPublicScaling>,
+) -> Result<(Vec<S::RefreshPublicRow>, Vec<S::RefreshPublicRow>), DslError> {
+    aggregate_refresh_routes(
+        labels,
+        outputs,
+        mask_routes,
+        fresh_routes,
+        |row, route| scheme.scale_refresh_public_input(row, route),
+        |left, right| scheme.add_refresh_public(left, right),
+    )
+}
+
+/// Evaluate the same canonical routing schedule on online rows, then add the
+/// backend-prepared public offsets. Fresh inputs remain shared across slots.
+pub(crate) fn aggregate_refresh_prf<S: ExponentLUTRefreshWitnessScheme>(
+    scheme: &S,
+    family: &RefreshPrfFamilyMaterial<S::RefreshRow>,
+    mask_routes: Family<S::RefreshPublicScaling>,
+    fresh_routes: Family<S::RefreshPublicScaling>,
+    mask_offsets: Vec<S::RefreshRow>,
+    fresh_offsets: Vec<S::RefreshRow>,
+) -> Result<(Vec<S::RefreshRow>, Vec<S::RefreshRow>), DslError> {
+    if mask_offsets.len() != family.labels.topology.crt_slot_count ||
+        fresh_offsets.len() != family.labels.topology.crt_slot_count
+    {
+        return Err(DslError::FamilyCountMismatch);
+    }
+    let (masks, fresh) = aggregate_refresh_routes(
+        &family.labels,
+        family.vectors.clone(),
+        mask_routes,
+        fresh_routes,
+        |row, route| scheme.route_refresh_row(row, route),
+        |left, right| scheme.add_refresh_rows(left, right),
+    )?;
+    Ok((
+        masks
+            .into_iter()
+            .zip(mask_offsets)
+            .map(|(row, offset)| scheme.add_refresh_rows(row, offset))
+            .collect(),
+        fresh
+            .into_iter()
+            .zip(fresh_offsets)
+            .map(|(row, offset)| scheme.add_refresh_rows(row, offset))
+            .collect(),
+    ))
+}
+
+fn aggregate_refresh_routes<V: GraphValue, R: GraphValue>(
+    labels: &RefreshPrfLabelIndex,
+    outputs: Family<V>,
+    mask_routes: Family<R>,
+    fresh_routes: Family<R>,
+    route: impl Fn(V, R) -> V,
+    add: impl Fn(V, V) -> V,
+) -> Result<(Vec<V>, Vec<V>), DslError> {
+    let (fresh_start, fresh_count) = labels.group_range(None);
+    let slot_count = labels.topology.crt_slot_count;
+    if outputs.count() != &IntExpr::constant(labels.len()) ||
+        mask_routes.count() != &IntExpr::constant(fresh_start) ||
+        fresh_routes.count() != &IntExpr::constant(fresh_count * slot_count)
+    {
+        return Err(DslError::FamilyCountMismatch);
+    }
+    let routed_masks = mxx_dsl::parallel(fresh_start, |index| {
+        Ok(route(outputs.at(&index), mask_routes.at(&index)))
+    })?;
+    let mut masks = Vec::with_capacity(slot_count);
+    for slot in 0..slot_count {
+        let (start, count) = labels.group_range(Some(slot));
+        let slice =
+            mxx_dsl::parallel(count, |index| Ok(routed_masks.at(Int::constant(start).add(index))))?;
+        let reduced =
+            crate::utils::reduce_family_segments(slice, 1, count, |left, right| add(left, right))
+                .map_err(|_| DslError::Schema)?;
+        masks.push(reduced.at(0));
+    }
+    let fresh_indices = mxx_dsl::parallel(fresh_count * slot_count, |index| {
+        Ok(Int::constant(fresh_start).add(index.rem(Int::constant(fresh_count))))
+    })?;
+    let repeated_fresh = mxx_dsl::parallel(fresh_indices.count().clone(), |index| {
+        Ok(outputs.at(fresh_indices.at(&index)))
+    })?;
+    let routed_fresh = mxx_dsl::parallel(fresh_routes.count().clone(), |index| {
+        Ok(route(repeated_fresh.at(&index), fresh_routes.at(&index)))
+    })?;
+    let fresh = crate::utils::reduce_family_segments(
+        routed_fresh,
+        slot_count,
+        fresh_count,
+        |left, right| add(left, right),
+    )
+    .map_err(|_| DslError::Schema)?;
+    Ok((masks, (0..slot_count).map(|slot| fresh.at(slot)).collect()))
+}
+
+/// Prepare scaled public inputs and add routed mask/fresh-error keys before
+/// any destination-level switch. Both passes remain structural families.
+pub fn prepare_refresh_public_sums<S: ExponentLUTRefreshWitnessScheme>(
+    scheme: &S,
+    state: S::RefreshPublicRow,
+    scaling: Family<S::RefreshPublicScaling>,
+    masks: Family<S::RefreshPublicRow>,
+    fresh: Family<S::RefreshPublicRow>,
+) -> Result<Family<S::RefreshPublicRow>, DslError> {
+    if scaling.count() != masks.count() || scaling.count() != fresh.count() {
+        return Err(DslError::FamilyCountMismatch);
+    }
+    let scaled = mxx_dsl::parallel(scaling.count().clone(), |index| {
+        Ok(scheme.scale_refresh_public_input(state.clone(), scaling.at(&index)))
+    })?;
+    mxx_dsl::parallel(scaled.count().clone(), |index| {
+        let masked = scheme.add_refresh_public(scaled.at(&index), masks.at(&index));
+        Ok(scheme.add_refresh_public(masked, fresh.at(&index)))
+    })
+}
+
+/// Preprocess the setup-owned CRT groups and restore canonical slot order.
+/// Each tuple supplies a level, its slots, target scales and anchor parameters.
+/// Setup guarantees that groups partition the slots and each level occurs once.
+/// Public anchors stay in group order; targets and witnesses return in slot order.
+/// The online secret is absent from this API and from the generated graph.
+pub fn prepare_refresh_decoders<S: ExponentLUTRefreshWitnessScheme>(
+    scheme: &S,
+    groups: &[(
+        S::RefreshLevel,
+        Vec<usize>,
+        Family<S::RefreshTargetScale>,
+        S::RefreshAnchorParameters,
+    )],
+    sums: Family<S::RefreshPublicRow>,
+    output: S::RefreshPublicRow,
+) -> Result<
+    (Vec<S::RefreshPublicRow>, Vec<S::RefreshPublicRow>, Vec<S::RefreshDecoderWitness>),
+    DslError,
+> {
+    let mut public_anchors = Vec::with_capacity(groups.len());
+    let mut targets_by_slot = BTreeMap::new();
+    let mut witnesses_by_slot = BTreeMap::new();
+    for (level, slots, scales, parameters) in groups {
+        let sums = Family::pack(slots.iter().map(|slot| sums.at(*slot)).collect())?;
+        if sums.count() != scales.count() {
+            return Err(DslError::FamilyCountMismatch);
+        }
+        let anchor = scheme.sample_refresh_anchor(level, parameters);
+        public_anchors.push(scheme.refresh_anchor_public(&anchor));
+        let reduced = scheme.reduce_refresh_public(output.clone(), level);
+        let prepared = mxx_dsl::parallel(sums.count().clone(), |index| {
+            let switched = scheme.switch_refresh_public(sums.at(&index), level);
+            let scaled = scheme.scale_refresh_public(reduced.clone(), scales.at(&index));
+            let target = scheme.subtract_refresh_public(switched, scaled);
+            let witness = scheme.sample_refresh_witness(&anchor, target.clone());
+            Ok((target, witness))
+        })?;
+        for (local, slot) in slots.iter().enumerate() {
+            let (target, witness) = prepared.at(local);
+            targets_by_slot.insert(*slot, target);
+            witnesses_by_slot.insert(*slot, witness);
+        }
+    }
+    Ok((
+        public_anchors,
+        targets_by_slot.into_values().collect(),
+        witnesses_by_slot.into_values().collect(),
+    ))
+}
+
+/// Prepare one online decoder base per public anchor group and restore slot
+/// order. Setup guarantees that groups partition the CRT slots and that each
+/// level occurs once. Cloning a base shares its sampled error across the group;
+/// a new call creates fresh bases for the next online execution.
+pub fn prepare_shared_decoder_bases<S: crate::noise_refresh::ExponentLUTRefreshWitnessScheme>(
+    groups: &[(S::RefreshLevel, Vec<usize>)],
+    public: &[S::RefreshPublicRow],
+    secret: &S::RefreshSecret,
+    parameters: &S::RefreshBaseParameters,
+) -> Result<(Vec<S::RefreshPublicRow>, Vec<S::RefreshDecoderBase>), DslError> {
+    if groups.len() != public.len() {
+        return Err(DslError::Schema);
+    }
+    let mut public_by_slot = BTreeMap::new();
+    let mut bases_by_slot = BTreeMap::new();
+    for ((level, slots), anchor) in groups.iter().zip(public) {
+        let base = S::sample_refresh_decoder_base(secret, anchor, level, parameters);
+        for slot in slots {
+            public_by_slot.insert(*slot, anchor.clone());
+            bases_by_slot.insert(*slot, base.clone());
+        }
+    }
+    Ok((public_by_slot.into_values().collect(), bases_by_slot.into_values().collect()))
+}
+
+/// Construct the decoder target using the actual finalized public aggregate.
+/// No online secret is needed in this pass.
+pub fn prepare_direct_refresh_target<S: ExponentLUTRefreshScheme>(
+    scheme: &S,
+    raw_sum: S::RefreshPublicRow,
+    output_key: S::RefreshPublicRow,
+    scale: S::RefreshTargetScale,
+    level: &S::RefreshLevel,
+) -> S::RefreshPublicRow {
+    let public = scheme.switch_refresh_public(raw_sum, level);
+    let output = scheme.reduce_refresh_public(output_key, level);
+    let scaled = scheme.scale_refresh_public(output, scale);
+    scheme.subtract_refresh_public(public, scaled)
+}
+
+/// A direct-decoder refresh slot compiled entirely before the online secret
+/// exists. Data, mask digits and fresh digits are all ordinary terminal terms.
+pub struct PreparedDirectRefreshSlot<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> {
+    pub level: S::RefreshLevel,
+    pub decoder_target: S::RefreshPublicRow,
+    pub(crate) terms: Vec<ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>>>,
+    pub(crate) offset: S::RefreshRow,
+}
+
+/// One slot's ordered terminal artifacts and decoding level. Keeping them in
+/// one record preserves their association through serialization and import.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PreparedDirectRefreshSlotDescriptor<L, D> {
+    pub(crate) level: L,
+    pub(crate) terms: Vec<D>,
+}
+
+impl<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> PreparedDirectRefreshSlot<S> {
+    pub(crate) fn export(
+        &self,
+        graph: mxx_dsl::DslContext,
+        prefix: &str,
+    ) -> Result<(mxx_dsl::DslContext, PreparedDirectRefreshSlotDescriptor<S::RefreshLevel,
+    <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema>), DslError>{
+        let mut graph = graph
+            .public_output(format!("{prefix}.target"), self.decoder_target.clone())?
+            .public_output(format!("{prefix}.offset"), self.offset.clone())?;
+        let mut terms = Vec::with_capacity(self.terms.len());
+        for (index, term) in self.terms.iter().enumerate() {
+            graph = graph.public_output(format!("{prefix}.term.{index}"), term.clone())?;
+            terms.push(term.schema());
+        }
+        Ok((graph, PreparedDirectRefreshSlotDescriptor { level: self.level.clone(), terms }))
     }
 
-    #[test]
-    fn refresh_layout_rejects_crt_product_mismatch_and_unit_modulus() {
-        let mismatch = RefreshCompiler {
-            full_modulus: 24.into(),
-            crt_plaintext_moduli: vec![3.into(), 5.into()],
-            reconstruction_coefficients: vec![1.into(), 1.into()],
-        };
-        assert!(matches!(mismatch.validate_layout(), Err(RefreshError::InvalidLayout)));
-
-        let unit = RefreshCompiler {
-            full_modulus: 6.into(),
-            crt_plaintext_moduli: vec![1.into(), 6.into()],
-            reconstruction_coefficients: vec![1.into(), 1.into()],
-        };
-        assert!(matches!(unit.validate_layout(), Err(RefreshError::InvalidLayout)));
-    }
-
-    #[test]
-    fn refresh_layout_rejects_single_crt_slot() {
-        let layout = RefreshCompiler {
-            full_modulus: 97.into(),
-            crt_plaintext_moduli: vec![97.into()],
-            reconstruction_coefficients: vec![1.into()],
-        };
-        assert!(matches!(layout.validate_layout(), Err(RefreshError::InvalidLayout)));
-    }
-
-    #[test]
-    fn grouped_low_p_refresh_preserves_slot_order_and_anchor_binding() {
-        let ring = Ring::new(105, 4);
-        let compiler = ExponentLutEncodingCompiler::with_layout(
-            mxx_bgg::BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: 4.into(),
-                digit_count: 2.into(),
-            },
-            crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 },
-        );
-        for (moduli, plaintext) in [([15, 15, 21], [3, 5, 7]), ([21, 15, 15], [7, 3, 5])] {
-            let refresh = RefreshCompiler {
-                full_modulus: 105.into(),
-                crt_plaintext_moduli: plaintext.into_iter().map(IntExpr::constant).collect(),
-                reconstruction_coefficients: vec![1.into(); 3],
-            };
-            let state = BggEncodingWire { vector: ring.input("state", (1, 4)), plaintext: None };
-            let state_public =
-                BggPublicKeyWire { matrix: ring.input("A", (2, 4)), reveal_plaintext: false };
-            let a_prime = ring.input("A-prime", (2, 4));
-            let groups = [15, 21]
-                .map(|p| {
-                    let low = Ring::new(p, 4);
-                    (
-                        p,
-                        (
-                            low.input(format!("B-{p}"), (2, 6)),
-                            BggEncodingWire {
-                                vector: low.input(format!("b-{p}"), (1, 6)),
-                                plaintext: None,
-                            },
-                        ),
+    /// Restore cached raw terms and target directly, without public arithmetic.
+    pub(crate) fn import(
+        descriptor: &PreparedDirectRefreshSlotDescriptor<
+            S::RefreshLevel,
+            <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema,
+        >,
+        production: &mxx_ir_core::artifact::ProductionId,
+        prefix: &str,
+        target: &<S::RefreshPublicRow as GraphValue>::Schema,
+        offset: &<S::RefreshRow as GraphValue>::Schema,
+    ) -> Result<Self, DslError> {
+        use mxx_dsl::GraphValueSchema;
+        use mxx_ir_core::artifact::ArtifactConfidentiality;
+        Ok(Self {
+            level: descriptor.level.clone(),
+            terms: descriptor
+                .terms
+                .iter()
+                .enumerate()
+                .map(|(index, term)| {
+                    term.artifact_input(
+                        production.clone(),
+                        format!("{prefix}.term.{index}"),
+                        ArtifactConfidentiality::Public,
                     )
                 })
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>();
-            let public_b = moduli.map(|p| groups[&p].0.clone()).to_vec();
-            let bases = moduli.map(|p| groups[&p].1.clone()).to_vec();
-            let targets = moduli
-                .iter()
-                .enumerate()
-                .map(|(slot, p)| Ring::new(*p, 4).input(format!("target-{slot}"), (2, 4)))
-                .collect::<Vec<_>>();
-            let preimages = moduli
-                .iter()
-                .enumerate()
-                .map(|(slot, p)| Ring::new(*p, 4).preimage_input(format!("K-{slot}"), (6, 4), 1))
-                .collect::<Vec<_>>();
-            let masks = (0..3)
-                .map(|slot| BggEncodingWire {
-                    vector: ring.input(format!("mask-{slot}"), (1, 4)),
-                    plaintext: None,
-                })
-                .collect::<Vec<_>>();
-            let fresh = (0..3)
-                .map(|slot| BggEncodingWire {
-                    vector: ring.input(format!("fresh-{slot}"), (1, 4)),
-                    plaintext: None,
-                })
-                .collect::<Vec<_>>();
-            let scaling = (0..3)
-                .map(|slot| ring.preimage_input(format!("scale-{slot}"), (4, 4), 1))
-                .collect::<Vec<_>>();
-            let bind = |bases| {
-                refresh.bind_imported_wires(
-                    &compiler,
-                    state.clone(),
-                    state_public.clone(),
-                    a_prime.clone(),
-                    public_b.clone(),
-                    targets.clone(),
-                    fresh.clone(),
-                    masks.clone(),
-                    scaling.clone(),
-                    bases,
-                    preimages.clone(),
+                .collect::<Result<_, _>>()?,
+            decoder_target: target.artifact_input(
+                production.clone(),
+                format!("{prefix}.target"),
+                ArtifactConfidentiality::Public,
+            )?,
+            offset: offset.artifact_input(
+                production.clone(),
+                format!("{prefix}.offset"),
+                ArtifactConfidentiality::Public,
+            )?,
+        })
+    }
+
+    pub fn terms(&self) -> &[ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>>] {
+        &self.terms
+    }
+
+    pub fn new(
+        scheme: &S,
+        inputs: &[(
+            &crate::scheme::PublicProgramValue<S>,
+            &ProgramValue<S::TerminalMaterial, Family<S::TerminalMaterial>>,
+        )],
+        output_key: S::RefreshPublicRow,
+        scale: S::RefreshTargetScale,
+        level: S::RefreshLevel,
+        offset: S::RefreshRow,
+    ) -> Result<Self, crate::readout::TerminalError<S::Error>> {
+        use crate::readout::TerminalError;
+        // Inputs are local arrays after digit routing/slicing. A scalar is
+        // captured directly, and paired families have the same local count.
+        let mut terms = Vec::with_capacity(inputs.len());
+        let raw = crate::readout::sum_terms(
+            inputs.iter().map(|(input, material)| {
+                let (cache, raw) =
+                    crate::readout::prepare_terminal_value(scheme, input, material, true, Ok)?;
+                terms.push(cache);
+                Ok(raw.at(0))
+            }),
+            |left, right| scheme.add_terminal_public(left, right).map_err(TerminalError::Scheme),
+        )?;
+        let public = scheme.refresh_terminal_public(raw);
+        let decoder_target =
+            prepare_direct_refresh_target(scheme, public, output_key, scale, &level);
+        Ok(Self { level, decoder_target, terms, offset })
+    }
+
+    /// Online preparation only. Offsets convert native affine digits to the
+    /// specified integer mask/fresh distributions. Subtracting d-offset later
+    /// adds this public constant after ModDown, without changing any error.
+    pub fn prepare_decoder(
+        &self,
+        scheme: &S,
+        secret: &S::RefreshSecret,
+        parameters: &S::RefreshDecoderParameters,
+    ) -> S::RefreshDecoder {
+        let decoder = scheme.prepare_direct_refresh_decoder(
+            secret,
+            self.decoder_target.clone(),
+            &self.level,
+            parameters,
+        );
+        scheme.offset_refresh_decoder(decoder, self.offset.clone())
+    }
+
+    /// Evaluate a bound combined target and only then release its CRT residue.
+    /// The evaluator receives helpers and a decoder, never the online secret.
+    pub fn evaluate(
+        &self,
+        scheme: &S,
+        inputs: &[(&crate::scheme::EncodingProgramValue<S>, &S::TerminalOnlineHelpers)],
+        decoder: S::RefreshDecoder,
+    ) -> Result<S::RefreshRow, crate::readout::TerminalError<S::Error>> {
+        use crate::readout::TerminalError;
+        if inputs.len() != self.terms.len() {
+            return Err(TerminalError::InputCount);
+        }
+        let raw = crate::readout::sum_terms(
+            inputs.iter().zip(&self.terms).map(|((input, helpers), term)| {
+                crate::readout::evaluate_terminal_value(scheme, input, term, helpers, true, Ok)
+                    .map(|raw| raw.at(0))
+            }),
+            |left, right| scheme.add_terminal_encoding(left, right).map_err(TerminalError::Scheme),
+        )?;
+        let combined = scheme.refresh_terminal_encoding(raw);
+        let switched = scheme.switch_refresh_row(combined, &self.level);
+        let decoded = scheme.apply_refresh_decoder(switched, decoder);
+        Ok(scheme.extract_refresh_residue(decoded, &self.level))
+    }
+}
+
+/// Fixed terminal data target and output-key scale for one CRT channel.
+/// `spacing` is H_t; the target already contains H_t times the desired scale.
+pub struct DirectRefreshChannel<S: ExponentLUTRefreshDirectScheme> {
+    pub level: S::RefreshLevel,
+    pub spacing: BigUint,
+    pub output_scale: S::RefreshTargetScale,
+    pub data: ProgramValue<S::TerminalMaterial, Family<S::TerminalMaterial>>,
+}
+
+/// Public preparation for a complete refresh. Its terminal terms and decoder
+/// targets are cached once; only helpers and decoders depend on the online s.
+pub struct PreparedDirectRefresh<S: ExponentLUTRefreshDirectScheme> {
+    pub(crate) labels: RefreshPrfLabelIndex,
+    pub(crate) slots: Vec<PreparedDirectRefreshSlot<S>>,
+    pub(crate) recomposition: S::RefreshRecomposition,
+}
+
+/// Ordered refresh artifact declaration. Concrete bindings and schemas come
+/// from the adapter; transport and channel ordering are scheme-independent.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PreparedDirectRefreshDescriptor<B, K, L, D> {
+    prefix: String,
+    scheme: B,
+    output_key: K,
+    labels: RefreshPrfLabelIndex,
+    slots: Vec<PreparedDirectRefreshSlotDescriptor<L, D>>,
+}
+
+impl<B: Serialize, K: Serialize, L: Serialize, D: Serialize>
+    PreparedDirectRefreshDescriptor<B, K, L, D>
+{
+    /// Bind this digest independently of the transported descriptor.
+    pub fn identity(&self) -> Result<[u8; 32], serde_json::Error> {
+        let mut hash = Sha256::new();
+        hash.update(b"exponent-lut-direct-refresh");
+        hash.update(serde_json::to_vec(self)?);
+        Ok(hash.finalize().into())
+    }
+}
+
+impl<S: ExponentLUTRefreshDirectScheme> PreparedDirectRefresh<S> {
+    pub fn export(
+        &self,
+        scheme: &S,
+        graph: mxx_dsl::DslContext,
+        prefix: &str,
+    ) -> Result<(mxx_dsl::DslContext, PreparedDirectRefreshDescriptor<
+        S::RefreshArtifactBinding,
+        <S::RefreshOutputKey as GraphValue>::Schema,
+        S::RefreshLevel,
+        <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema,
+    >), DslError>{
+        let key = S::refresh_output_key(&self.recomposition);
+        let mut graph = graph.public_output(format!("{prefix}.output-key"), key.clone())?;
+        let mut slots = Vec::with_capacity(self.slots.len());
+        for (index, slot) in self.slots.iter().enumerate() {
+            let (next, descriptor) = slot.export(graph, &format!("{prefix}.slot.{index}"))?;
+            graph = next;
+            slots.push(descriptor);
+        }
+        Ok((
+            graph,
+            PreparedDirectRefreshDescriptor {
+                prefix: prefix.into(),
+                scheme: scheme.refresh_artifact_binding(),
+                output_key: key.schema(),
+                labels: self.labels.clone(),
+                slots,
+            },
+        ))
+    }
+
+    /// Reopen caches without repeating public sums or ModDown. Secret-dependent
+    /// helpers and decoders remain in online preparation.
+    pub fn import(
+        scheme: &S,
+        descriptor: &PreparedDirectRefreshDescriptor<
+            S::RefreshArtifactBinding,
+            <S::RefreshOutputKey as GraphValue>::Schema,
+            S::RefreshLevel,
+            <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema,
+        >,
+        production: mxx_ir_core::artifact::ProductionId,
+        expected_identity: [u8; 32],
+    ) -> Result<Self, super::setup::RefreshSetupError>
+    where
+        S::RefreshLevel: Serialize,
+        <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema:
+            Serialize,
+    {
+        use super::setup::RefreshSetupError;
+        use mxx_dsl::GraphValueSchema;
+        use mxx_ir_core::artifact::ArtifactConfidentiality;
+        let identity = descriptor.identity().map_err(|error| RefreshSetupError::SetupStage {
+            stage: "serialize refresh descriptor",
+            detail: error.to_string(),
+        })?;
+        if identity != expected_identity || descriptor.scheme != scheme.refresh_artifact_binding() {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
+        let key = descriptor.output_key.artifact_input(
+            production.clone(),
+            format!("{}.output-key", descriptor.prefix),
+            ArtifactConfidentiality::Public,
+        )?;
+        let (recomposition, target, offset) = scheme
+            .import_refresh_recomposition(key)
+            .map_err(|error| RefreshSetupError::Backend(Box::new(error)))?;
+        let slots = descriptor
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                PreparedDirectRefreshSlot::import(
+                    slot,
+                    &production,
+                    &format!("{}.slot.{index}", descriptor.prefix),
+                    &target,
+                    &offset,
                 )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { labels: descriptor.labels.clone(), slots, recomposition })
+    }
+
+    pub fn recomposition(&self) -> &S::RefreshRecomposition {
+        &self.recomposition
+    }
+
+    pub fn slots(&self) -> &[PreparedDirectRefreshSlot<S>] {
+        &self.slots
+    }
+
+    pub fn new(
+        scheme: &S,
+        data: &crate::scheme::PublicProgramValue<S>,
+        digits: &crate::scheme::PublicProgramValue<S>,
+        readout: &ValueReadout,
+        plan: &RefreshDigitPlan,
+        labels: RefreshPrfLabelIndex,
+        secret: &S::RefreshDigitSecret,
+        bank: &S::RefreshDigitMaskBank,
+        channels: Vec<DirectRefreshChannel<S>>,
+        output_key: S::RefreshPublicRow,
+        recomposition: S::RefreshRecomposition,
+        hash_key: Bytes,
+        tag: HashTag,
+        id: [u8; 32],
+    ) -> Result<Self, TerminalError<S::Error>> {
+        if channels.len() != plan.mask_counts.len() {
+            return Err(TerminalError::InputCount);
+        }
+        let ProgramValue::Family(digits) = digits else {
+            return Err(TerminalError::InputCount);
+        };
+        let fresh = labels.group(digits, None)?;
+        let mut slots = Vec::with_capacity(channels.len());
+        // This loop visits heterogeneous CRT moduli, never individual digits.
+        for (slot, channel) in channels.into_iter().enumerate() {
+            let mask = labels.group(digits, Some(slot))?;
+            let prepare = |mask: bool| {
+                let routing = RefreshDigitRouting {
+                    base: plan.base,
+                    count: if mask { plan.mask_counts[slot] } else { plan.fresh_count },
+                    scale: if mask { 1u8.into() } else { channel.spacing.clone() },
+                    mask,
+                };
+                let mut tag = tag.clone();
+                tag.push(mxx_ir_core::IntExpr::constant(slot));
+                tag.push(mxx_ir_core::IntExpr::constant(usize::from(mask)));
+                let mut identity = Sha256::new();
+                identity.update(b"exponent-lut-refresh-digit-material");
+                identity.update(id);
+                identity.update((slot as u64).to_le_bytes());
+                identity.update([u8::from(mask)]);
+                scheme
+                    .sample_refresh_digit_material(
+                        secret,
+                        readout,
+                        bank,
+                        &routing,
+                        hash_key.clone(),
+                        tag,
+                        identity.finalize().into(),
+                    )
+                    .map_err(TerminalError::Scheme)
             };
-            let setup = bind(bases.clone()).unwrap();
-            let result = refresh.refresh(&compiler, &setup).unwrap();
-            assert_eq!(result.encoding().vector.matrix_type(), state.vector.matrix_type());
-            assert_eq!(
-                result.declaration().slots.iter().map(|slot| slot.p.clone()).collect::<Vec<_>>(),
-                moduli.map(BigInt::from)
-            );
-            let graph = mxx_dsl::DslContext::new("grouped-refresh")
-                .output("result", result.into_encoding().vector)
-                .unwrap()
-                .build()
-                .unwrap();
-            graph.validate(&Default::default()).unwrap();
-            let switches = graph
-                .graph
-                .scopes()
-                .values()
-                .flat_map(|scope| scope.nodes())
-                .filter(|node| {
-                    matches!(node.kind(), mxx_ir_core::node::NodeKind::ModulusSwitch { .. })
-                })
-                .count();
-            assert_eq!(switches, 2, "one symbolic complete-sum switch body per distinct P");
-            let shared_slot = moduli.iter().position(|p| *p == 15).unwrap();
-            let mut tampered = bases;
-            tampered[shared_slot].vector = Ring::new(15, 4).input("substituted-anchor", (1, 6));
-            assert!(matches!(bind(tampered), Err(RefreshError::AnchorMismatch)));
+            let (mask_material, mask_offset) = prepare(true)?;
+            let (fresh_material, fresh_offset) = prepare(false)?;
+            let prepared = PreparedDirectRefreshSlot::new(
+                scheme,
+                &[(data, &channel.data), (&mask, &mask_material), (&fresh, &fresh_material)],
+                output_key.clone(),
+                channel.output_scale,
+                channel.level,
+                scheme.add_refresh_rows(mask_offset, fresh_offset),
+            )?;
+            slots.push(prepared);
+        }
+        Ok(Self { labels, slots, recomposition })
+    }
+
+    pub fn prepare_decoders(
+        &self,
+        scheme: &S,
+        secret: &S::RefreshSecret,
+        parameters: &S::RefreshDecoderParameters,
+    ) -> Vec<S::RefreshDecoder> {
+        self.slots.iter().map(|slot| slot.prepare_decoder(scheme, secret, parameters)).collect()
+    }
+
+    pub fn evaluate(
+        &self,
+        scheme: &S,
+        data: &crate::scheme::EncodingProgramValue<S>,
+        digits: &crate::scheme::EncodingProgramValue<S>,
+        data_helpers: &S::TerminalOnlineHelpers,
+        digit_helpers: &S::TerminalOnlineHelpers,
+        decoders: Vec<S::RefreshDecoder>,
+    ) -> Result<S::Encoding, TerminalError<S::Error>> {
+        if decoders.len() != self.slots.len() {
+            return Err(TerminalError::InputCount);
+        }
+        let ProgramValue::Family(digits) = digits else {
+            return Err(TerminalError::InputCount);
+        };
+        let fresh = self.labels.group(digits, None)?;
+        let residues = self
+            .slots
+            .iter()
+            .zip(decoders)
+            .enumerate()
+            .map(|(index, (slot, decoder))| {
+                let mask = self.labels.group(digits, Some(index))?;
+                slot.evaluate(
+                    scheme,
+                    &[(data, data_helpers), (&mask, digit_helpers), (&fresh, digit_helpers)],
+                    decoder,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(scheme.recompose_refresh_rows(residues, &self.recomposition))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshDigitPlan {
+    pub base: usize,
+    pub mask_counts: Vec<usize>,
+    pub fresh_count: usize,
+}
+
+/// One structural group in component/coefficient/digit order. Fresh groups
+/// reuse their PRF inputs across CRT channels, with channel-specific scale H.
+pub struct RefreshDigitRouting {
+    pub base: usize,
+    pub count: usize,
+    pub scale: BigUint,
+    pub mask: bool,
+}
+
+impl RefreshDigitRouting {
+    pub fn offset_numerator(&self) -> BigInt {
+        let support = (0..self.count).fold(BigUint::one(), |value, _| value * self.base);
+        let numerator = if self.mask {
+            -BigInt::one()
+        } else {
+            BigInt::from((support - 1u8) / (self.base - 1))
+        };
+        numerator * BigInt::from(self.scale.clone())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DigitPlanError {
+    #[error("native LWR requires a power-of-two digit base and nonempty support requirements")]
+    Parameters,
+    #[error("the mask interval and exposed error do not fit the CRT spacing")]
+    MaskRange,
+    #[error("the requested fresh digit distribution exceeds the next-state error budget")]
+    FreshRange,
+}
+
+/// Physical payload moments conditional on independent uniform native digits.
+/// `mask` centers their consecutive support; fresh digits retain the native
+/// signed representatives. Parameters establish a positive count and even base.
+pub(crate) fn native_digit_uniform_moments(
+    base: &BigUint,
+    count: usize,
+    mask: bool,
+) -> NoiseMoments {
+    let support = (0..count).fold(BigUint::one(), |value, _| value * base);
+    let lower = if mask {
+        -BigInt::from(&support / 2u8)
+    } else {
+        BigInt::from((&support - 1u8) / (base - 1u8)) * (BigInt::one() - BigInt::from(base / 2u8))
+    };
+    NoiseMoments::uniform_interval(lower, support)
+}
+
+impl RefreshDigitPlan {
+    /// Smallest positive digit counts covering the requested support sizes.
+    /// Public parameter selection uses exact products rather than float logs.
+    pub fn new(
+        base: usize,
+        mask_supports: &[BigUint],
+        fresh_support: &BigUint,
+    ) -> Result<Self, DigitPlanError> {
+        if base < 2 ||
+            !base.is_power_of_two() ||
+            mask_supports.is_empty() ||
+            mask_supports.iter().any(BigUint::is_zero) ||
+            fresh_support.is_zero()
+        {
+            return Err(DigitPlanError::Parameters);
+        }
+        let count = |required: &BigUint| {
+            let mut support = BigUint::from(base);
+            let mut digits = 1;
+            while &support < required {
+                support *= base;
+                digits += 1;
+            }
+            digits
+        };
+        Ok(Self {
+            base,
+            mask_counts: mask_supports.iter().map(count).collect(),
+            fresh_count: count(fresh_support),
+        })
+    }
+
+    pub fn weights(&self, count: usize) -> Vec<BigUint> {
+        let mut weight = BigUint::one();
+        (0..count)
+            .map(|_| {
+                let value = weight.clone();
+                weight *= self.base;
+                value
+            })
+            .collect()
+    }
+
+    pub fn support(&self, count: usize) -> BigUint {
+        (0..count).fold(BigUint::one(), |value, _| value * self.base)
+    }
+
+    /// Native integer digit representatives are [1-p/2, p/2]. This preserves
+    /// their actual support and mean; it is not a centered-binomial sampler.
+    pub fn fresh_interval(&self) -> (BigInt, BigInt) {
+        let sum = (self.support(self.fresh_count) - 1u8) / (self.base - 1);
+        let upper = BigInt::from(&sum * (self.base / 2));
+        let lower = BigInt::from(sum) * (BigInt::one() - BigInt::from(self.base / 2));
+        (lower, upper)
+    }
+
+    /// Conditional on distinct native PRF digits being independent and uniform.
+    /// Positional digits enumerate one consecutive interval bijectively. This
+    /// describes one fresh source shared across CRT channels, not one per slot.
+    pub fn fresh_uniform_moments(&self) -> NoiseMoments {
+        native_digit_uniform_moments(&self.base.into(), self.fresh_count, false)
+    }
+
+    /// Conditional uniform centered mask model, with physical mean -1/2.
+    pub fn mask_uniform_moments(&self, slot: usize) -> NoiseMoments {
+        native_digit_uniform_moments(&self.base.into(), self.mask_counts[slot], true)
+    }
+
+    /// Solve the mask-width/error fixed point at a fixed output modulus.
+    /// The supplied error function includes all digit emissions and the
+    /// decoder; the arithmetic scheme supplies those bounds, not this planner.
+    pub fn fit_masks(
+        &mut self,
+        spacings: &[BigUint],
+        observations: &BigUint,
+        statistical_bits: usize,
+        fresh_bound: &BigUint,
+        exposed_errors: impl Fn(&Self) -> Result<Vec<BigUint>, DigitPlanError>,
+    ) -> Result<Vec<BigUint>, DigitPlanError> {
+        if spacings.len() != self.mask_counts.len() || observations.is_zero() {
+            return Err(DigitPlanError::Parameters);
+        }
+        let (lower, upper) = self.fresh_interval();
+        if lower.magnitude().max(upper.magnitude()) > fresh_bound {
+            return Err(DigitPlanError::FreshRange);
+        }
+        loop {
+            let errors = exposed_errors(self)?;
+            if errors.len() != spacings.len() {
+                return Err(DigitPlanError::Parameters);
+            }
+            let mut changed = false;
+            for index in 0..spacings.len() {
+                let required = (observations * &errors[index] * 2u8) << statistical_bits;
+                let mut support = self.support(self.mask_counts[index]);
+                while support < required {
+                    support *= self.base;
+                    self.mask_counts[index] += 1;
+                    changed = true;
+                }
+                if support + &errors[index] * 2u8 >= spacings[index] {
+                    return Err(DigitPlanError::MaskRange);
+                }
+            }
+            if !changed {
+                return Ok(errors);
+            }
         }
     }
 
-    #[test]
-    fn public_half_offset_supports_native_p16_and_p32() {
-        let ring = Ring::new(97, 8);
-        for (base_p, digit_count) in [(16, 2), (32, 1)] {
-            let offset = public_half_offset_vector(&ring, base_p, digit_count, 2, false)
-                .expect("valid public half offset");
-            assert_eq!(
-                offset.matrix_type().columns.evaluate(&mxx_ir_core::ParamEnv::default()),
-                Ok(BigInt::from(2))
-            );
-            let graph = mxx_dsl::DslContext::new("public-half-offset")
-                .public_output("offset", offset)
-                .expect("offset output")
-                .build()
-                .expect("offset graph");
-            graph.validate(&mxx_ir_core::ParamEnv::default()).expect("valid offset graph");
-        }
-    }
-
-    #[test]
-    fn route_preimages_use_the_two_row_public_key_shape() {
-        let ring = Ring::new(97, 8);
-        let public_key = ring.input("route-public-key", (2, 4));
-        let routes = route_preimage_family(
-            &ring,
-            &public_key,
-            4,
-            4,
-            2,
-            &[2],
-            16,
-            None,
-            None,
-            IntExpr::constant(2),
-            IntExpr::constant(3),
+    pub fn topology<S: crate::scheme::ExponentLUTEncodingScheme>(
+        &self,
+        scheme: &S,
+        key: &S::PublicKey,
+        env: &mxx_ir_core::ParamEnv,
+    ) -> Result<super::simulation::RefreshTranscriptTopology, super::simulation::NoiseSimulationError>
+    {
+        super::simulation::RefreshTranscriptTopology::new(
+            scheme,
+            key,
+            env,
+            self.mask_counts.clone(),
+            self.fresh_count,
         )
-        .expect("valid route family");
-        let graph = mxx_dsl::DslContext::new("route-preimages-two-row-target")
-            .public_output("routes", routes)
-            .expect("route output")
-            .build()
-            .expect("route graph");
-        graph
-            .validate(&mxx_ir_core::ParamEnv::default())
-            .expect("u_2 must be valid for the two-row public-key target");
+    }
+}
 
-        let one_row_public_key = ring.input("invalid-route-public-key", (1, 4));
-        assert!(matches!(
-            route_preimage_family(
-                &ring,
-                &one_row_public_key,
-                4,
-                4,
-                2,
-                &[2],
-                16,
-                None,
-                None,
-                IntExpr::constant(2),
-                IntExpr::constant(3),
-            ),
-            Err(RefreshError::InvalidLayout)
-        ));
+#[cfg(test)]
+mod digit_tests {
+    use super::*;
+
+    #[test]
+    fn test_digit_plan_nonbinary_support_offsets_and_counts() {
+        let plan = RefreshDigitPlan::new(4, &[16u8.into(), 17u8.into()], &5u8.into()).unwrap();
+        assert_eq!(plan.mask_counts, vec![2, 3]);
+        assert_eq!(plan.fresh_count, 2);
+        assert_eq!(plan.weights(3), vec![1u8.into(), 4u8.into(), 16u8.into()]);
+        assert_eq!(plan.fresh_interval(), ((-5).into(), 10.into()));
+        assert_eq!(
+            RefreshDigitRouting { base: plan.base, count: 2, scale: 1u8.into(), mask: true }
+                .offset_numerator(),
+            (-1).into()
+        );
+        assert_eq!(
+            RefreshDigitRouting { base: plan.base, count: 2, scale: 1u8.into(), mask: false }
+                .offset_numerator(),
+            5.into()
+        );
+        // Enumerate the actual independent digit distribution as an oracle.
+        let sums = (-1..=2)
+            .flat_map(|low| (-1..=2).map(move |high| low + 4 * high))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(sums, (-5..=10).collect());
+        let moments = plan.fresh_uniform_moments();
+        let count = BigInt::from(sums.len());
+        let sum: BigInt = sums.iter().copied().map(BigInt::from).sum();
+        let squares: BigInt = sums.iter().map(|value| BigInt::from(value * value)).sum();
+        assert_eq!(
+            &moments.mean_numerator * &count,
+            &sum * BigInt::from(moments.mean_denominator.clone()),
+        );
+        assert_eq!(
+            BigInt::from(moments.variance.numerator) * &count * &count,
+            (squares * count - &sum * &sum) * BigInt::from(moments.variance.denominator),
+        );
+        for slot in 0..plan.mask_counts.len() {
+            let mask = plan.mask_uniform_moments(slot);
+            assert_eq!(mask.mean_numerator, (-1).into());
+            assert_eq!(mask.mean_denominator, 2u8.into());
+            let support = plan.support(plan.mask_counts[slot]);
+            assert_eq!(
+                mask.variance.scaled(&12u8.into()),
+                crate::noise_utils::NonnegativeRational::new(
+                    &support * &support - 1u8, 1u8.into(),
+                ).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_digit_plan_recomputes_error_after_mask_count_growth() {
+        let mut plan = RefreshDigitPlan::new(16, &[1u8.into()], &17u8.into()).unwrap();
+        let result = plan
+            .fit_masks(&[BigUint::from(1u8) << 64], &16u8.into(), 8, &200u8.into(), |current| {
+                Ok(vec![BigUint::from(current.mask_counts[0] + current.fresh_count)])
+            })
+            .unwrap();
+        assert_eq!(result[0], BigUint::from(plan.mask_counts[0] + plan.fresh_count));
+        assert!(plan.support(plan.mask_counts[0]) >= (&result[0] * 32u8) << 8);
+        assert!(plan.support(plan.mask_counts[0] - 1) < (&result[0] * 32u8) << 8);
     }
 }

@@ -5,6 +5,12 @@ pub(crate) mod ffi {
         fn exact_basis_validate(dimension: u32, moduli: &[u64]) -> Result<()>;
         #[namespace = "openfhe"]
         type DCRTPoly = openfhe::ffi::DCRTPoly;
+        fn exact_centered_conversion(
+            input: &DCRTPoly,
+            moduli: &[u64],
+            destination_dimension: u32,
+            plaintext_modulus: u64,
+        ) -> Result<UniquePtr<DCRTPoly>>;
         fn exact_basis_coefficients(input: &DCRTPoly) -> Result<Vec<u8>>;
         #[namespace = "openfhe"]
         type Matrix = openfhe::ffi::Matrix;

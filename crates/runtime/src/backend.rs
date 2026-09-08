@@ -326,6 +326,18 @@ pub trait Backend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
 
+    fn centered_extend(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+    fn block_mod_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error>;
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, usize)>,

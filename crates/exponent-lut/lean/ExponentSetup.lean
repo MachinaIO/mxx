@@ -105,4 +105,78 @@ theorem sampled_fixed_rhs_cache_residual {q n columns inner : Nat}
   rw [Matrix.mul_assoc, reconstruction, Matrix.mul_sub,
     sample_fixed_rhs_equation hsource hslice hlast hconcat, he]
 
+/-- Compose a sampled selector equation with its actual decomposition run.
+The integer action gain comes from that run's retained digit layout; the
+sampled error is reused unchanged, without a new error or independence premise.
+This lemma is independent of whether selection and decomposition share a loop. -/
+theorem sampled_selector_cache {q n columns : Nat}
+    (hq : 1 < q) (hn : 0 < n)
+    {backend : BackendContext} {base digits : Int} {cutoff : Nat}
+    {secret : ExactMatrix q n 1 2} {payload : ExactPoly q n}
+    {ciphertext : ExactMatrix q n 2 columns}
+    {decomposition : ExactMatrix q n columns columns}
+    (layout : RegularLayout q)
+    (lookup : backend.regularLayout q n = some layout)
+    (sampled : ∃ gadget : ExactMatrix q n 2 columns,
+      ∃ error : ErrorMatrix n 1 columns,
+        gadgetMatrixRuns backend base digits gadget ∧
+        secret * ciphertext = payload • (secret * gadget) +
+          reduceMatrix q n 1 columns error ∧
+        CoeffBound error cutoff)
+    (decomposed : gadgetDecomposeRuns backend base digits ciphertext decomposition)
+    (exactLayout : (backend.regularLayout q n).map RegularLayout.droppedModuli = some 0) :
+    ∃ gadget : ExactMatrix q n 2 columns, ∃ error : ErrorMatrix n 1 columns,
+    ∃ action : ErrorMatrix n columns columns,
+      gadgetMatrixRuns backend base digits gadget ∧
+      decomposition = reduceMatrix q n columns columns action ∧
+      ActionGain action (denseRegularGain layout n 2) ∧
+      secret * gadget * decomposition = payload • (secret * gadget) +
+        reduceMatrix q n 1 columns error ∧
+      CoeffBound error cutoff := by
+  obtain ⟨gadget, error, hg, he, hb⟩ := sampled
+  obtain ⟨action, ha, hgain⟩ :=
+    gadgetDecomposeRuns_dense_gain layout lookup hq hn decomposed
+  refine ⟨gadget, error, action, hg, ha, hgain, ?_, hb⟩
+  rw [Matrix.mul_assoc, gadget_runs_reconstruct hq hn hg decomposed exactLayout]
+  exact he
+
+/-- Apply one sampled selector cache to an encoding using the executed product.
+The error and action witnesses are obtained from the fixed cache lemma above. -/
+theorem sampled_selector_private_step {q n columns : Nat}
+    (hq : 1 < q) (hn : 0 < n)
+    {backend : BackendContext} {base digits : Int} {cutoff inputBound : Nat}
+    {secret mask : ExactMatrix q n 1 2} {payload message : ExactPoly q n}
+    {ciphertext gadget publicKey : ExactMatrix q n 2 columns}
+    {decomposition : ExactMatrix q n columns columns}
+    {input output : ExactMatrix q n 1 columns}
+    {inputError : ErrorMatrix n 1 columns} {messageInteger : ErrorPoly n}
+    (layout : RegularLayout q)
+    (lookup : backend.regularLayout q n = some layout)
+    (sampled : ∃ sampledGadget : ExactMatrix q n 2 columns,
+      ∃ error : ErrorMatrix n 1 columns,
+        gadgetMatrixRuns backend base digits sampledGadget ∧
+        secret * ciphertext = payload • (secret * sampledGadget) +
+          reduceMatrix q n 1 columns error ∧
+        CoeffBound error cutoff)
+    (gadgetRuns : gadgetMatrixRuns backend base digits gadget)
+    (decomposed : gadgetDecomposeRuns backend base digits ciphertext decomposition)
+    (online : output = input * decomposition)
+    (encoded : input = mask * publicKey - message • (secret * gadget) +
+      reduceMatrix q n 1 columns inputError)
+    (messageLift : message = reducePoly q n messageInteger)
+    (messageBound : polynomialL1 messageInteger ≤ 1)
+    (inputBounded : CoeffBound inputError inputBound)
+    (exactLayout : (backend.regularLayout q n).map RegularLayout.droppedModuli = some 0) :
+    Approx output (mask * (publicKey * decomposition) -
+      (message * payload) • (secret * gadget))
+      (denseRegularGain layout n 2 * inputBound + cutoff) := by
+  obtain ⟨other, error, action, hg, ha, hgain, hcache, hb⟩ :=
+    sampled_selector_cache hq hn layout lookup sampled decomposed exactLayout
+  have same : other = gadget := gadget_runs_deterministic hg gadgetRuns
+  subst other
+  rw [ha] at hcache
+  rw [online, ha]
+  exact private_encoding_transfer_sampled hn encoded hcache messageLift messageBound
+    inputBounded hb hgain
+
 end MxxExponentLut

@@ -3,7 +3,7 @@
 //! Snapshot numbers are candidates: the emitted `change` and arithmetic proofs
 //! check them against the exported target, index, scale pack, and runtime facts.
 use super::root_inputs::value_expression;
-use crate::noise_refresh::simulation::ExponentLutNoiseSnapshot;
+use crate::bgg::noise::BggNoiseSnapshot;
 use mxx_ir_core::{
     FrozenGraphScopeId, ValidatedGraph,
     lean::{LeanArtifact, ScopeProofShape},
@@ -85,7 +85,7 @@ fn selectors(expression: &str) -> Result<Vec<String>, String> {
 pub(super) fn route_scalar_proofs(
     pre: &ValidatedGraph,
     pa: &LeanArtifact,
-    snapshot: &ExponentLutNoiseSnapshot,
+    snapshot: &BggNoiseSnapshot,
     gather: WireRef,
     n: usize,
     columns: usize,
@@ -232,7 +232,7 @@ pub(super) fn route_scalar_proofs(
         let scale = q / divisor;
         let actual_scale = if digit_table.is_some() {
             format!(
-                "{role}ScalarEntries[{scalar_offset} + digit.val]'(by simp [{role}ScalarEntries] <;> omega)"
+                "{role}ScalarEntries[{scalar_offset} + digit.val]'(by change {scalar_offset} + digit.val < {pack_count}; omega)"
             )
         } else {
             value(shape, args(pack)?[slot])?
@@ -248,7 +248,16 @@ pub(super) fn route_scalar_proofs(
             scale.to_string()
         };
         let scale_proof = if digit_table.is_some() {
-            source.push_str(&format!("theorem {role}_scalar_entries_{slot} : ∀ digit : Fin {digit_count},\n    {actual_scale} = MxxRuntime.liftInteger ({scale_expression}) := by\n  intro digit\n  fin_cases digit <;> dsimp [{role}ScalarEntries] <;> ext row column <;> norm_num [{role}ScalarEntries, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger, MxxIR.exactDiv]\n\n"));
+            let entry_proof = if digit_count == 1 {
+                format!(
+                    "  fin_cases digit\n  dsimp [{role}ScalarEntries]\n  ext row column\n  norm_num [{role}ScalarEntries, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger, MxxIR.exactDiv]\n"
+                )
+            } else {
+                format!(
+                    "  fin_cases digit <;> (dsimp [{role}ScalarEntries]; ext row column; norm_num [{role}ScalarEntries, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger, MxxIR.exactDiv])\n"
+                )
+            };
+            source.push_str(&format!("theorem {role}_scalar_entries_{slot} : ∀ digit : Fin {digit_count},\n    {actual_scale} = MxxRuntime.liftInteger ({scale_expression}) := by\n  intro digit\n{entry_proof}\n"));
             format!("    exact {role}_scalar_entries_{slot} digit\n")
         } else {
             "    funext row column\n    norm_num [MxxIR.exactDiv, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger]\n".into()
@@ -325,7 +334,7 @@ pub(super) fn route_scalar_proofs(
 pub(super) fn root_refresh_route_targets(
     pre: &ValidatedGraph,
     pa: &LeanArtifact,
-    snapshot: &ExponentLutNoiseSnapshot,
+    snapshot: &BggNoiseSnapshot,
 ) -> Result<String, String> {
     let root = pre.source.root_scope();
     let shape = pa.scope_proofs.get(&FrozenGraphScopeId::Root).ok_or("missing PRE proof shape")?;

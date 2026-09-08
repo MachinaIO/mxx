@@ -1,6 +1,6 @@
 //! Close each actual state-scaling source on the witnesses selected by `Runs`.
 use super::root_inputs::value_expression;
-use crate::noise_refresh::simulation::ExponentLutNoiseSnapshot;
+use crate::bgg::noise::BggNoiseSnapshot;
 use mxx_ir_core::{
     FrozenGraphScopeId, ParamEnv, ValidatedGraph,
     graph::GraphScope,
@@ -45,7 +45,7 @@ pub(super) fn root_refresh_state_source(
     pa: &LeanArtifact,
     ver: &ValidatedGraph,
     va: &LeanArtifact,
-    snapshot: &ExponentLutNoiseSnapshot,
+    snapshot: &BggNoiseSnapshot,
 ) -> Result<String, String> {
     let pr = pre.source.root_scope();
     let vr = ver.source.root_scope();

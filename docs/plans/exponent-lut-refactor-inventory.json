@@ -1,0 +1,2744 @@
+{
+  "files": [
+    {
+      "path": "crates/exponent-lut/src/algebra.rs",
+      "sha256": "77ed81d92ae4ba5035cf2ba1d76f110fd5b45c6d25e91f974835e6e6d661fbf0",
+      "lines": 154,
+      "public_types": [],
+      "lines_outside_test_modules": 154
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/artifacts.rs",
+      "sha256": "f109dec9ffc93fc23b58ca25cf19225a05a5e44cd546f9f975d9306d547bfb7a",
+      "lines": 781,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvInputMaterialDescriptor"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedLutDescriptor"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedLutFamilyDescriptor"
+        }
+      ],
+      "lines_outside_test_modules": 459
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/blocks.rs",
+      "sha256": "6db140075b7706e07e0874e473393f00c0eab188cb222d78809f2cea454e6705",
+      "lines": 327,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "Blocks"
+        },
+        {
+          "kind": "struct",
+          "name": "BlocksType"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvBranches"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvBranchesType"
+        }
+      ],
+      "lines_outside_test_modules": 235
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/encoding.rs",
+      "sha256": "9b039ff65d25720d4beb99961defddb7ee14cfef9bc59d81ec94705c135ebbae",
+      "lines": 1170,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvPayloadSecret"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvMaskSecret"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvInputMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "TestSecrets"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPublicKey"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvEncoding"
+        },
+        {
+          "kind": "struct",
+          "name": "MaskBranch"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvMaskBank"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvOnlineMasks"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvLutMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvRhsPlaintext"
+        },
+        {
+          "kind": "struct",
+          "name": "PreparedBranch"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedLut"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvScheme"
+        }
+      ],
+      "lines_outside_test_modules": 552
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/encoding_gpu.rs",
+      "sha256": "c7e327603279593d163d94ad6f700ddaed9c04b1cc31b1ecd0ea16910f442a5d",
+      "lines": 47,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/family.rs",
+      "sha256": "e8013110770cec1b31e3ca9f8c8331189138e299e43b9ec5d51d33033885f953",
+      "lines": 954,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvPublicKeyFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvEncodingFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvRhsPlaintextFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvLutMaterialFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedLutFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedLinearFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedReduction"
+        }
+      ],
+      "lines_outside_test_modules": 500
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/family_adapter.rs",
+      "sha256": "618091f9d67f223f0961822483f06fc856b665391ff060a840a5ea535288680e",
+      "lines": 374,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "BfvPublicProgramValue"
+        },
+        {
+          "kind": "enum",
+          "name": "BfvEncodingProgramValue"
+        },
+        {
+          "kind": "enum",
+          "name": "BfvProgramLutMaterial"
+        }
+      ],
+      "lines_outside_test_modules": 374
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/family_gpu.rs",
+      "sha256": "e7291b152e21dd9cd1890e35ba4e7b33da219ddd7bbffaf5d65a386a5667a9c4",
+      "lines": 83,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/linear.rs",
+      "sha256": "7e1f93a39b321f6563fbb87475578071a8c2197b2f1c1437b78dee49db0a6847",
+      "lines": 240,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "LinearOperation"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedLinear"
+        }
+      ],
+      "lines_outside_test_modules": 106
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/linear_artifacts.rs",
+      "sha256": "fed91a2ba0ed60d5911e250b51ac4ea86ca94d12497da83b5dc727bc150f791b",
+      "lines": 572,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "BfvLinearKind"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvLinearBinding"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedLinearDescriptor"
+        }
+      ],
+      "lines_outside_test_modules": 312
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/mod.rs",
+      "sha256": "ae3288984d5c51df54828b8417ec64d2636594c9aabe21a6075d34fa3afd6fe4",
+      "lines": 55,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "BfvError"
+        }
+      ],
+      "lines_outside_test_modules": 55
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/noise.rs",
+      "sha256": "9b58916042d2b3d46f246c60be5b23eca07031238f8ea45751f63ea37a9d7fcc",
+      "lines": 616,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvNoiseValue"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvNoiseRhs"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvLutNoiseMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvNoiseTrace"
+        }
+      ],
+      "lines_outside_test_modules": 353
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/parameters.rs",
+      "sha256": "fcd5eb426e9a67d9266783aee2bbc521e4b5641ab48c9d9cb87e02edaa9f3c67",
+      "lines": 421,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvParameters"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPlanRequest"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvNoiseBound"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvParameterManifest"
+        }
+      ],
+      "lines_outside_test_modules": 330
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/prf.rs",
+      "sha256": "7f6eece41b2b0c005f878af623981683bb1db12b98e76ad756be4c48f6357320",
+      "lines": 93,
+      "public_types": [],
+      "lines_outside_test_modules": 93
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/prf_artifacts.rs",
+      "sha256": "bd32853e35bde057f5b1cebbe9305d264e10c29ab32667a50c4325116864f341",
+      "lines": 76,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvPrfDescriptor"
+        }
+      ],
+      "lines_outside_test_modules": 76
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/program.rs",
+      "sha256": "f925c3368d3d9ce4d2c70b5f9a599f65ba10369b72061c2bbdf7c9249cd7c744",
+      "lines": 718,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvPublicValue"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvEncodingValue"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvLutBinding"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvOnlineLutHelpers"
+        },
+        {
+          "kind": "enum",
+          "name": "PreparedGate"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvProgramCache"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPublicEvaluator"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvEncodingEvaluator"
+        }
+      ],
+      "lines_outside_test_modules": 436
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/program_artifacts.rs",
+      "sha256": "df8bb22bab3ad53b9efb4f132a2df9614a45c6696dfed28034f5bd1f370e4727",
+      "lines": 855,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvPreparedProgramDescriptor"
+        }
+      ],
+      "lines_outside_test_modules": 339
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/program_artifacts_gpu.rs",
+      "sha256": "014375f352ac52fcd082eec5a0b336bd54827ed32615f19afef293c6f8b24d0e",
+      "lines": 44,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/readout.rs",
+      "sha256": "5daf3c6851785c72cc4d39af7e9cc2d57299f9ea246b8b78ebb3c2356a820879",
+      "lines": 1117,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "BfvReadoutWeights"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedReadoutDescriptor"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvReadoutMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvScalarReadout"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvFamilyReadout"
+        },
+        {
+          "kind": "enum",
+          "name": "BfvPreparedReadout"
+        },
+        {
+          "kind": "enum",
+          "name": "BfvReadoutValues"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvReadoutPublicOutput"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvReadoutEncodingOutput"
+        }
+      ],
+      "lines_outside_test_modules": 690
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/readout_gpu.rs",
+      "sha256": "d38c1505c9b736ea1be49c69f7b3349fd3eb04b0ae78c8cc774d0971b2088b30",
+      "lines": 81,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/refresh.rs",
+      "sha256": "e2006b684edb27f6025da86285f077679c92f2c86df4aa2e70f2e7ccb8d34e8b",
+      "lines": 668,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvRefreshLevel"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvRefreshRecomposition"
+        }
+      ],
+      "lines_outside_test_modules": 304
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/refresh_artifacts.rs",
+      "sha256": "59178ebca4ac34e5e6bf2329897f842f7dbf676ba5862c306259d1a7a72a9da8",
+      "lines": 571,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvRefreshDescriptor"
+        }
+      ],
+      "lines_outside_test_modules": 126
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/refresh_artifacts_gpu.rs",
+      "sha256": "3eba04fab37791e1acef9ad525911877df86dd9b7ec9cfd8233c4b787d86d0dd",
+      "lines": 55,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/refresh_gpu.rs",
+      "sha256": "5e96b0e35f28e81a0ea267c71e1c5623edeac061cd86dd459a1278bc76d6742f",
+      "lines": 68,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/refresh_planning.rs",
+      "sha256": "7517ba6b8f0800ccaeffec7ec7e277bdf5a8eee59a09b0e23f950a6ee6bbe79e",
+      "lines": 183,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvRefreshPlanRequest"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvRefreshPlan"
+        }
+      ],
+      "lines_outside_test_modules": 138
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/terminal.rs",
+      "sha256": "9e3826d4ab7c084edd4d2a10c3a8639f160e4b513799247cb183f87d23154a25",
+      "lines": 985,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvTerminalTable"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvTerminalMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedTerminal"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvTerminalPublicAccumulator"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvTerminalEncodingAccumulator"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvTerminalPublicKey"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvTerminalEncoding"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvTerminalNoise"
+        }
+      ],
+      "lines_outside_test_modules": 567
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/terminal_artifacts.rs",
+      "sha256": "b26e616dcd8fc4121d418b806464c437d0b7321055177ccf12f2301f6c1731ad",
+      "lines": 400,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BfvPreparedTerminalDescriptor"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedTerminalBatchDescriptor"
+        }
+      ],
+      "lines_outside_test_modules": 145
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/terminal_artifacts_gpu.rs",
+      "sha256": "39956ce26873608d9f035f6ef4a58d55a602984cb986cdb5cf9673f4798cc59c",
+      "lines": 47,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/terminal_family.rs",
+      "sha256": "9835fc8dc311e6c207be8dd19b2a00fc10d9030bac5362bd94b83660ccf463b3",
+      "lines": 1069,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "BfvTerminalFamilyMode"
+        },
+        {
+          "kind": "enum",
+          "name": "BfvTerminalFamilyMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvTerminalMaterialFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedTerminalFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "BfvPreparedTerminalFamilyDescriptor"
+        }
+      ],
+      "lines_outside_test_modules": 562
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/terminal_family_gpu.rs",
+      "sha256": "7629a3f37b790c2d136c25e8b27d86e29bcfdab9a371391dd6efc64188b5fc8c",
+      "lines": 98,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/bfv/terminal_gpu.rs",
+      "sha256": "1142a4b3e73824ccb2137e65f1d4d46b6187cb77f3008a5a9d324c42ade2045a",
+      "lines": 82,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/encoding.rs",
+      "sha256": "f232da6fb9d559404f805581e8046dc0525093d2ed0229074a28235f10679f92",
+      "lines": 2877,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BggEncodingFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "LutMaskBank"
+        },
+        {
+          "kind": "struct",
+          "name": "LutPublicMaskBank"
+        },
+        {
+          "kind": "struct",
+          "name": "LutHelper"
+        },
+        {
+          "kind": "struct",
+          "name": "LutHelperSet"
+        },
+        {
+          "kind": "struct",
+          "name": "NativeReadoutHelperFamilies"
+        },
+        {
+          "kind": "enum",
+          "name": "ExponentLutSamplingError"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutEncodingSampler"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutEncodingCompiler"
+        },
+        {
+          "kind": "enum",
+          "name": "EncodingProgramWire"
+        },
+        {
+          "kind": "enum",
+          "name": "EncodingProgramRhs"
+        },
+        {
+          "kind": "struct",
+          "name": "EncodingProgramLowering"
+        },
+        {
+          "kind": "struct",
+          "name": "EncodingFamilyIntermediate"
+        },
+        {
+          "kind": "struct",
+          "name": "SetupRhsFamily"
+        },
+        {
+          "kind": "enum",
+          "name": "ExponentArtifactImportError"
+        }
+      ],
+      "lines_outside_test_modules": 1782
+    },
+    {
+      "path": "crates/exponent-lut/src/encoding_gpu.rs",
+      "sha256": "a84cb9595761ad0dda2e702d2eab811ccdd764f3a08112983a06d9f4bb908874",
+      "lines": 528,
+      "public_types": [],
+      "lines_outside_test_modules": 0
+    },
+    {
+      "path": "crates/exponent-lut/src/layout.rs",
+      "sha256": "8c3cde50cc9b7bd4e42a01bcddec271722e516b23a5ca40348cf851387575e04",
+      "lines": 346,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "LayoutError"
+        },
+        {
+          "kind": "struct",
+          "name": "ExpLayout"
+        }
+      ],
+      "lines_outside_test_modules": 180
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/certify.rs",
+      "sha256": "d9a5f9a44aaca1e5e65507f9053575ce8e97e00f267bcbb47170688d27f9bba6",
+      "lines": 315,
+      "public_types": [],
+      "lines_outside_test_modules": 121
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/check.rs",
+      "sha256": "fa3ce23a9da5a684f2d6c6646658d6a8a2991a879d58fe7d5050a9fdf51017f7",
+      "lines": 643,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "CheckError"
+        },
+        {
+          "kind": "struct",
+          "name": "CheckedCandidate"
+        }
+      ],
+      "lines_outside_test_modules": 459
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/native_program_proof.rs",
+      "sha256": "2701e65512a1e12bf890f0d55368a542d87a016c714518a3b1b248c0e708edd0",
+      "lines": 740,
+      "public_types": [],
+      "lines_outside_test_modules": 740
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/numeric.rs",
+      "sha256": "31b5b4f78f70bc581f0e32f603e817b670b1509ae1903d99e21394b7399a06ce",
+      "lines": 63,
+      "public_types": [],
+      "lines_outside_test_modules": 63
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_cache_alignment.rs",
+      "sha256": "30fb5ba692af68047a3ee76ff49d24138d632d085f268a6243f6e15dd24aba2f",
+      "lines": 132,
+      "public_types": [],
+      "lines_outside_test_modules": 132
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_decoder_setup.rs",
+      "sha256": "6db04155ed32d6266672b944d67c6ff607b99cab93ff041a28aa736d93331de2",
+      "lines": 337,
+      "public_types": [],
+      "lines_outside_test_modules": 337
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_inputs.rs",
+      "sha256": "d0f6e7745a1cfaeb667c09f6874885136acb650160cc6010ab2327a6bbeb181d",
+      "lines": 277,
+      "public_types": [],
+      "lines_outside_test_modules": 277
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_online_readout.rs",
+      "sha256": "e07827b7ecc3a5d824c4afe72c63c32a0c02fdc97658b4e8e712d9fcd1bc3b5d",
+      "lines": 298,
+      "public_types": [],
+      "lines_outside_test_modules": 298
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_private.rs",
+      "sha256": "849f46ce39b2e96dc6c482ee59af9036e376fa5b9be8f90d65a310377563d4f3",
+      "lines": 221,
+      "public_types": [],
+      "lines_outside_test_modules": 221
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program.rs",
+      "sha256": "15cbcd9e642b2f9e0031b1192cd93463aa5c18449f484a0430be4d9648084b51",
+      "lines": 215,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "ProgramStage"
+        }
+      ],
+      "lines_outside_test_modules": 215
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_context.rs",
+      "sha256": "d6b78f6c92b4d3a5ce0964bb8aae5dc68a6ef5bbf985596ffb9311803989ad6b",
+      "lines": 243,
+      "public_types": [],
+      "lines_outside_test_modules": 243
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_inputs.rs",
+      "sha256": "1476ce66ae49ea4a25774a7ecf5eaf5d059d15ad7df11e7ef25ca32eafd57d3b",
+      "lines": 107,
+      "public_types": [],
+      "lines_outside_test_modules": 107
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_keys.rs",
+      "sha256": "cf5884137bb1c6df87614d32c1ac5cdb361ef18fc9a33c074d406124999c98f8",
+      "lines": 272,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "ProgramKeyStage"
+        }
+      ],
+      "lines_outside_test_modules": 272
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_setup.rs",
+      "sha256": "b9a288bd1feb4a3338a4faaa1347a1395a41241ffc9e76b67b3cfcb2727050b2",
+      "lines": 133,
+      "public_types": [],
+      "lines_outside_test_modules": 133
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout.rs",
+      "sha256": "cee70eef531b404b09dcbb25f57b48aa8112f279e0f972f4f5d0dbaff7c62210",
+      "lines": 209,
+      "public_types": [],
+      "lines_outside_test_modules": 209
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_alignment.rs",
+      "sha256": "f5d6316c19afa21f0ba48fba651f7325b80d17e7a151f0fe20a8d5c1c40bcce5",
+      "lines": 279,
+      "public_types": [],
+      "lines_outside_test_modules": 279
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_function.rs",
+      "sha256": "c4f1b4d823ff0130fd0638c79e6914c17c75baaeb5e23fd04cab5227ab5619fb",
+      "lines": 228,
+      "public_types": [],
+      "lines_outside_test_modules": 228
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_proof.rs",
+      "sha256": "2b2e9c1d6679ee3600777ed149e2cfb1ffc5d84eb147f6142e15e37d1088af66",
+      "lines": 366,
+      "public_types": [],
+      "lines_outside_test_modules": 366
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_public.rs",
+      "sha256": "5c5d47bb7ba507c069d53640f956162d3b7039de89055faaf1ce4e29dce3bcb3",
+      "lines": 270,
+      "public_types": [],
+      "lines_outside_test_modules": 270
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "sha256": "150d817a2858e3706b927b1865d0078b41aff49dd779f528f9bc08adf03f2734",
+      "lines": 904,
+      "public_types": [],
+      "lines_outside_test_modules": 904
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_reduction.rs",
+      "sha256": "0adf766b6ce7ee896bea3131cf2ce9118dacb837164385ae59172881370f3e57",
+      "lines": 230,
+      "public_types": [],
+      "lines_outside_test_modules": 230
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_correctness.rs",
+      "sha256": "2927050635ebaa23d252f8b2791f9db85cb473790c5fcc0faed78e6a2495d832",
+      "lines": 18,
+      "public_types": [],
+      "lines_outside_test_modules": 18
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_crt.rs",
+      "sha256": "5df6699356de2a6b91a773d7366bf37735144b36736209f12750278311f19dd9",
+      "lines": 137,
+      "public_types": [],
+      "lines_outside_test_modules": 137
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_decode.rs",
+      "sha256": "b2921df986c92893659fdbd3a315fd331afc2511b2b47e4f6420810bda16c54a",
+      "lines": 389,
+      "public_types": [],
+      "lines_outside_test_modules": 389
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "sha256": "8b83580a17614ed8621fb411a174df1349d610cbaff009d8e25c29b4d0552afd",
+      "lines": 252,
+      "public_types": [],
+      "lines_outside_test_modules": 252
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_finish.rs",
+      "sha256": "fd0f64a31338bf50f451556a991f0d107dcf377c6378fb51f7b75bdfe66b78f2",
+      "lines": 281,
+      "public_types": [],
+      "lines_outside_test_modules": 281
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_links.rs",
+      "sha256": "f3f4fe30a5d164f127fa5053ca9bb635033a98eb321a6bf86ec0c79cfa79a08e",
+      "lines": 346,
+      "public_types": [],
+      "lines_outside_test_modules": 346
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "sha256": "edf2c599928de6ab87289711cfb32b80e2bec8a61284eaa5032e4c5c5aca3ab7",
+      "lines": 305,
+      "public_types": [],
+      "lines_outside_test_modules": 305
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_normalize.rs",
+      "sha256": "25c70ac4822af3098f5e5c0c68a70e39e4e137a6d155d7bab471ba200db308da",
+      "lines": 251,
+      "public_types": [],
+      "lines_outside_test_modules": 251
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_public.rs",
+      "sha256": "86c3b957985b5b5134b7b88e85ad337d400bab6b973bb39d028c85008517fb01",
+      "lines": 474,
+      "public_types": [],
+      "lines_outside_test_modules": 474
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_sums.rs",
+      "sha256": "4091ae55067262fa6f4414573152f4bc329c80eab547edbde07cb4d88e5fbfac",
+      "lines": 264,
+      "public_types": [],
+      "lines_outside_test_modules": 264
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_targets.rs",
+      "sha256": "71e58fd2737adb825f7f3b369ad8eca1688e902bf919b0ea6623ba58915a00c5",
+      "lines": 519,
+      "public_types": [],
+      "lines_outside_test_modules": 519
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source.rs",
+      "sha256": "0f8623a3d1a4c0a265ce235bef55adadbb047b7d511b98a1e2340d6fe150eee1",
+      "lines": 515,
+      "public_types": [],
+      "lines_outside_test_modules": 515
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source_proof.rs",
+      "sha256": "7ff91771f1e804722021a610bb3e81e0e0157330225517379907fb313b9aff22",
+      "lines": 281,
+      "public_types": [],
+      "lines_outside_test_modules": 281
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_state.rs",
+      "sha256": "f7f3c321cd5b7f72bd0c17ab7d1cac42267c516e4c34e5fda46c520da3ddbdbd",
+      "lines": 125,
+      "public_types": [],
+      "lines_outside_test_modules": 125
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_state_source.rs",
+      "sha256": "38f71dc528b67f3b61488ae04e292b1d069e8564b950a8689354720a79269b02",
+      "lines": 222,
+      "public_types": [],
+      "lines_outside_test_modules": 222
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_seeded_keys.rs",
+      "sha256": "df34bb88b23210ed6f91d5d6653eb1b2a3a7448ad112ed006add446139091a9b",
+      "lines": 197,
+      "public_types": [],
+      "lines_outside_test_modules": 197
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "sha256": "46b532f2dc5ab7d9e38a42de7101aea0b038f5ca0ff9cc42bd47b46443176335",
+      "lines": 481,
+      "public_types": [],
+      "lines_outside_test_modules": 481
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/trace.rs",
+      "sha256": "3aafe522de132ac10e53e3a4077844ea564acc07fdb79b7d3af30a5f186ee06e",
+      "lines": 79,
+      "public_types": [],
+      "lines_outside_test_modules": 79
+    },
+    {
+      "path": "crates/exponent-lut/src/lean.rs",
+      "sha256": "0e92c12e334e06db6e50f2536f519c7c1c258c9a3b87bda14f9d7e3a9ff7ea97",
+      "lines": 725,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "ExportedRefreshGraphs"
+        }
+      ],
+      "lines_outside_test_modules": 529
+    },
+    {
+      "path": "crates/exponent-lut/src/lib.rs",
+      "sha256": "b27c2ad5c521846b3600be854b2c77899b6577286823c788ca26bdbb63f6b5c6",
+      "lines": 108,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "ExponentLutError"
+        }
+      ],
+      "lines_outside_test_modules": 108
+    },
+    {
+      "path": "crates/exponent-lut/src/noise.rs",
+      "sha256": "ee696aa3f441f3a0b0f191d6f9ea394a4e8385f7d24c6a287aba311405ec6f4a",
+      "lines": 1988,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "AverageVariance"
+        },
+        {
+          "kind": "struct",
+          "name": "RightActionNoiseGain"
+        },
+        {
+          "kind": "enum",
+          "name": "NoiseDecompositionSource"
+        },
+        {
+          "kind": "struct",
+          "name": "NoiseDecompositionPlan"
+        },
+        {
+          "kind": "enum",
+          "name": "GateNoiseOperation"
+        },
+        {
+          "kind": "struct",
+          "name": "GateNoiseDecomposition"
+        },
+        {
+          "kind": "struct",
+          "name": "GateNoiseGains"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramNoiseGainPlan"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramNoiseState"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramNoiseInputs"
+        },
+        {
+          "kind": "struct",
+          "name": "FamilyBodyNoiseStep"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramNoiseStep"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramNoiseReport"
+        },
+        {
+          "kind": "enum",
+          "name": "ProgramNoiseError"
+        }
+      ],
+      "lines_outside_test_modules": 1955
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/artifacts.rs",
+      "sha256": "6e87684717372dd2ffe359aa519c82cedf771d54bb6fb32d2e6fea37dcee0386",
+      "lines": 863,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "DecompositionOperandRole"
+        },
+        {
+          "kind": "struct",
+          "name": "DecompositionCacheKey"
+        },
+        {
+          "kind": "struct",
+          "name": "DecompositionCacheArtifact"
+        },
+        {
+          "kind": "enum",
+          "name": "ReadoutCacheImportError"
+        },
+        {
+          "kind": "struct",
+          "name": "ReadoutCacheFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutStorageReport"
+        }
+      ],
+      "lines_outside_test_modules": 507
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/digits.rs",
+      "sha256": "08b3fcb0536013ac91270c07bd042171a7deffd69b44758ed804612a5459f214",
+      "lines": 206,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "RefreshDigitPlan"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshDigitRouting"
+        },
+        {
+          "kind": "enum",
+          "name": "DigitPlanError"
+        }
+      ],
+      "lines_outside_test_modules": 173
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/direct.rs",
+      "sha256": "f90beccbd79258ea9787ded66ee71d818ed246414586ea466955b99f255b19da",
+      "lines": 156,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "DirectRefreshChannel"
+        },
+        {
+          "kind": "struct",
+          "name": "PreparedDirectRefresh"
+        }
+      ],
+      "lines_outside_test_modules": 156
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/evaluation.rs",
+      "sha256": "36bf54759fa259ea89d9b1e191cd2f09bee2e5feee84b3ca6340ba55d9238aa3",
+      "lines": 264,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "RefreshSlotValues"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshSlotPreparation"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshDecoderGroup"
+        },
+        {
+          "kind": "struct",
+          "name": "PreparedDirectRefreshSlot"
+        }
+      ],
+      "lines_outside_test_modules": 264
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/mod.rs",
+      "sha256": "819b4d69adf02e07c5565ea001525ee859ef1bff7ba76a50cf2a23e24499df92",
+      "lines": 21,
+      "public_types": [],
+      "lines_outside_test_modules": 21
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/pbc/artifacts.rs",
+      "sha256": "defda9464e21bef54cdccfaa85cac48a10e6a69e8852f1d1a2e34ce9a0089ff8",
+      "lines": 965,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "PbcSelectorPackageArtifactNames"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcSelectorArtifactNames"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcSelectorFamilyMetadata"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcSelectorArtifacts"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcTrustedSelectorBits"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcSelectorRuntimeBinding"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcStructuralSelectorFamilies"
+        }
+      ],
+      "lines_outside_test_modules": 965
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/pbc/diagnostics.rs",
+      "sha256": "7fa0e020f1d9f5026d29398d2389dec0f85a2335fa0f529716f15bfcb03f0ee2",
+      "lines": 461,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "PbcDiagnosticSample"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcDiagnosticReport"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcDiagnosticAggregator"
+        }
+      ],
+      "lines_outside_test_modules": 376
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/pbc/evaluation.rs",
+      "sha256": "715e9f796935ee514cd1d15336be652a7831451917c1ba6e11cc8ccdf0a3cd9e",
+      "lines": 695,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "PbcEncodedPublicVector"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcPublicVectorFamilyBinding"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcLayoutFamilies"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcSelectorFamilyInputs"
+        }
+      ],
+      "lines_outside_test_modules": 588
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/pbc/layout.rs",
+      "sha256": "cd3f0970eadb2a4d12bf74d786291329b634c710a943caff23c55bfe4af58f16",
+      "lines": 701,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "PbcProfile"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcParameters"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcPublicLayout"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcActiveCellIndex"
+        }
+      ],
+      "lines_outside_test_modules": 701
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/pbc/mod.rs",
+      "sha256": "7b40da9afb73cdb656662449b17a44ff9765384af9c57e3e870125a56e712195",
+      "lines": 1334,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "PbcRootSeed"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcLayoutSeed"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcLocation"
+        },
+        {
+          "kind": "enum",
+          "name": "PbcCell"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcLayoutId"
+        },
+        {
+          "kind": "enum",
+          "name": "PbcRetryCause"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcRetryDiagnostics"
+        },
+        {
+          "kind": "enum",
+          "name": "PbcError"
+        }
+      ],
+      "lines_outside_test_modules": 151
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/pbc/schedule.rs",
+      "sha256": "7c2648e40b5b4681fb3fe8d51ac793b137c585a0dc6cf780d9627f227e8e3b84",
+      "lines": 397,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "ValidatedSupport"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcPrivateSchedule"
+        },
+        {
+          "kind": "struct",
+          "name": "PbcGeneratedKeyLayout"
+        }
+      ],
+      "lines_outside_test_modules": 397
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/prf.rs",
+      "sha256": "ac27e31a184e3a6b9a59ee5960ee69b9e28969fbb71201da95240e8887899736",
+      "lines": 896,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "SparseLwrPrfBindings"
+        },
+        {
+          "kind": "struct",
+          "name": "SparseLwrPrfProfile"
+        },
+        {
+          "kind": "struct",
+          "name": "SparseLwrPrfProgram"
+        }
+      ],
+      "lines_outside_test_modules": 442
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/prf_batch.rs",
+      "sha256": "d80b3cddfb6696821e4387b5c0443fc8cadccf5003e1040e26cddae58baf7d22",
+      "lines": 85,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "PrfSelectionInputs"
+        },
+        {
+          "kind": "struct",
+          "name": "PreparedSparseLwrPrf"
+        }
+      ],
+      "lines_outside_test_modules": 85
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/readout.rs",
+      "sha256": "401aa533a6a20d23cc227e46d9260f206166d4cdf66e2133783c58090995f317",
+      "lines": 2110,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "ValueReadoutError"
+        },
+        {
+          "kind": "struct",
+          "name": "ValueReadoutIdentity"
+        },
+        {
+          "kind": "struct",
+          "name": "ValueReadoutTracePlan"
+        },
+        {
+          "kind": "struct",
+          "name": "ReadoutPreimageSchema"
+        },
+        {
+          "kind": "struct",
+          "name": "ValueReadoutHelper"
+        },
+        {
+          "kind": "struct",
+          "name": "ValueReadoutPublicHelper"
+        },
+        {
+          "kind": "struct",
+          "name": "NormalizationTargetDescriptor"
+        },
+        {
+          "kind": "struct",
+          "name": "NormalizationPreimageRequirement"
+        },
+        {
+          "kind": "enum",
+          "name": "NormalizationPreimageRole"
+        },
+        {
+          "kind": "struct",
+          "name": "ValueReadout"
+        }
+      ],
+      "lines_outside_test_modules": 1666
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/refresh.rs",
+      "sha256": "9e59ef0fb41da0c947b220cf26b610132196742eb055d7443db8018767c39703",
+      "lines": 2157,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "RefreshError"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshSlot"
+        },
+        {
+          "kind": "enum",
+          "name": "RefreshPrfLabel"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPrfLabelIndex"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPrfContract"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPrfCoverage"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPrfFamilyMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshMaskMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshFreshErrorMaterial"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshDeclaration"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshResult"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshSetupManifest"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshCompiler"
+        }
+      ],
+      "lines_outside_test_modules": 1764
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/setup.rs",
+      "sha256": "d475a1d738471d11d2e8587b27463b894eccf80fe399881664ebf7fe60d58b5c",
+      "lines": 7542,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "RefreshSetupError"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshSetupParameters"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshAnchorSecurityInputs"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshNoiseGainDecompositions"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPrfInputs"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPreprocessingRequest"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPublicPrfSetup"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshReadoutArtifactNames"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramCacheFamilyNames"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramCacheArtifactNames"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramCacheLutNames"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramCacheGateNames"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPreprocessingArtifactNames"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPreprocessingWires"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPreprocessingDeclaration"
+        },
+        {
+          "kind": "struct",
+          "name": "ImportedRefreshSetup"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshOnlineEvaluationRequest"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshOnlineEvaluation"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshPreprocessingProducer"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshVerification"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshSimulationMatrixInputMetadata"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshSimulationDecoderTarget"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshParameterSimulationRequest"
+        },
+        {
+          "kind": "struct",
+          "name": "NumericRefreshBounds"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshParameterSimulationBundle"
+        }
+      ],
+      "lines_outside_test_modules": 5871
+    },
+    {
+      "path": "crates/exponent-lut/src/noise_refresh/simulation.rs",
+      "sha256": "4671153167b90af372a572d9f445ee42c6f039c45ebec0ce8b792f54e3debf46",
+      "lines": 2536,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "NoiseModelKind"
+        },
+        {
+          "kind": "struct",
+          "name": "AverageCaseConfig"
+        },
+        {
+          "kind": "struct",
+          "name": "NoiseGainPlan"
+        },
+        {
+          "kind": "struct",
+          "name": "NoiseGainPlanBuilder"
+        },
+        {
+          "kind": "struct",
+          "name": "ValueReadoutNoiseGains"
+        },
+        {
+          "kind": "struct",
+          "name": "TraceNoiseGains"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshNoiseParameters"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshTranscriptTopology"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshRouteNoiseGains"
+        },
+        {
+          "kind": "struct",
+          "name": "MaskSmudgingParameters"
+        },
+        {
+          "kind": "struct",
+          "name": "PreRefreshNoiseEvaluation"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshNoiseReport"
+        },
+        {
+          "kind": "struct",
+          "name": "RefreshSlotNoiseReport"
+        },
+        {
+          "kind": "struct",
+          "name": "AverageRefreshNoiseReport"
+        },
+        {
+          "kind": "struct",
+          "name": "AverageRefreshSlotNoiseReport"
+        },
+        {
+          "kind": "struct",
+          "name": "AverageVarianceBreakdown"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutNoiseReport"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutAverageNoiseReport"
+        },
+        {
+          "kind": "enum",
+          "name": "NoiseSimulationError"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutNoiseSnapshot"
+        }
+      ],
+      "lines_outside_test_modules": 1548
+    },
+    {
+      "path": "crates/exponent-lut/src/program.rs",
+      "sha256": "f4c4975c74283f1e6358f0bcc096f01120f02bcf883c136d7edd5bfb03dd1209",
+      "lines": 2370,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "ExponentLutProgramId"
+        },
+        {
+          "kind": "struct",
+          "name": "LutTable"
+        },
+        {
+          "kind": "struct",
+          "name": "RhsInputDeclaration"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramLayout"
+        },
+        {
+          "kind": "struct",
+          "name": "FamilyRange"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramFamilyBindings"
+        },
+        {
+          "kind": "enum",
+          "name": "AttributeKnowledge"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramWireType"
+        },
+        {
+          "kind": "trait",
+          "name": "LutSpec"
+        },
+        {
+          "kind": "enum",
+          "name": "Gate"
+        },
+        {
+          "kind": "enum",
+          "name": "FamilyWireSource"
+        },
+        {
+          "kind": "enum",
+          "name": "FamilyRhsSource"
+        },
+        {
+          "kind": "struct",
+          "name": "FamilyProgram"
+        },
+        {
+          "kind": "enum",
+          "name": "FamilyAggregation"
+        },
+        {
+          "kind": "enum",
+          "name": "ProgramStep"
+        },
+        {
+          "kind": "enum",
+          "name": "ProgramValidationError"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutProgram"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutProgramBuilder"
+        },
+        {
+          "kind": "enum",
+          "name": "ProgramGateInstance"
+        },
+        {
+          "kind": "trait",
+          "name": "ProgramLoweringTypes"
+        },
+        {
+          "kind": "trait",
+          "name": "ExponentProgramLowering"
+        },
+        {
+          "kind": "enum",
+          "name": "ProgramLowerError"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramBindings"
+        }
+      ],
+      "lines_outside_test_modules": 1770
+    },
+    {
+      "path": "crates/exponent-lut/src/public_key.rs",
+      "sha256": "ff6a4e6a2cec1cda397064fe5d168adc084d3518bd0f40b52ec4ab6a0dc3a7aa",
+      "lines": 1884,
+      "public_types": [
+        {
+          "kind": "enum",
+          "name": "ProgramCacheRole"
+        },
+        {
+          "kind": "enum",
+          "name": "ProgramCacheLocation"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramCacheDeclaration"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramCacheBindings"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramCacheBatchBindings"
+        },
+        {
+          "kind": "struct",
+          "name": "ProgramLutCache"
+        },
+        {
+          "kind": "struct",
+          "name": "PublicKeyWireFamily"
+        },
+        {
+          "kind": "struct",
+          "name": "PublicProgramPreprocessing"
+        },
+        {
+          "kind": "struct",
+          "name": "PublicProgramBatchPreprocessing"
+        },
+        {
+          "kind": "struct",
+          "name": "LutPublicHelper"
+        },
+        {
+          "kind": "struct",
+          "name": "LutPublicHelperSet"
+        },
+        {
+          "kind": "enum",
+          "name": "ExponentLutPublicSamplingError"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutPublicKeySampler"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentLutPublicKeyCompiler"
+        },
+        {
+          "kind": "struct",
+          "name": "PublicFamilyIntermediate"
+        },
+        {
+          "kind": "enum",
+          "name": "PublicProgramWire"
+        },
+        {
+          "kind": "enum",
+          "name": "PublicProgramRhs"
+        },
+        {
+          "kind": "struct",
+          "name": "PublicProgramLowering"
+        }
+      ],
+      "lines_outside_test_modules": 1700
+    },
+    {
+      "path": "crates/exponent-lut/src/rhs.rs",
+      "sha256": "1f54c26ba19f568ee4c3f2803a2303e8459f29173ff09b63a3b317429f376548",
+      "lines": 354,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "ExponentRhsPackageArtifactNames"
+        },
+        {
+          "kind": "struct",
+          "name": "ExponentRhsPackage"
+        },
+        {
+          "kind": "struct",
+          "name": "ManifestRhsMetadata"
+        },
+        {
+          "kind": "struct",
+          "name": "ManifestSecretMetadata"
+        },
+        {
+          "kind": "enum",
+          "name": "ExponentRhsPackageError"
+        }
+      ],
+      "lines_outside_test_modules": 185
+    },
+    {
+      "path": "crates/exponent-lut/src/scheme/bgg_prf.rs",
+      "sha256": "ae95e2385a5845c8a37cae2e395cecf5bfd09e35e885879d0ddc8f50d33faff7",
+      "lines": 1720,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "NativePrfLabelInputs"
+        },
+        {
+          "kind": "struct",
+          "name": "NativePrfPublicInputs"
+        },
+        {
+          "kind": "struct",
+          "name": "NativePrfOnlineBatchInputs"
+        },
+        {
+          "kind": "struct",
+          "name": "NativePrfEncodingBatchOutputs"
+        },
+        {
+          "kind": "struct",
+          "name": "NativePrfReadoutArtifacts"
+        },
+        {
+          "kind": "struct",
+          "name": "NativePrfReadoutFamilyArtifacts"
+        },
+        {
+          "kind": "struct",
+          "name": "NativePrfReadoutHelper"
+        },
+        {
+          "kind": "struct",
+          "name": "NativePrfPublicReadoutPlan"
+        }
+      ],
+      "lines_outside_test_modules": 1283
+    },
+    {
+      "path": "crates/exponent-lut/src/scheme/bgg_refresh.rs",
+      "sha256": "6a360adf32b1d4ce736b842a48e8a215b377e6445c5eb49eea7c654084284ed8",
+      "lines": 139,
+      "public_types": [
+        {
+          "kind": "struct",
+          "name": "BggRefreshRecomposition"
+        },
+        {
+          "kind": "struct",
+          "name": "BggRefreshAnchorParameters"
+        }
+      ],
+      "lines_outside_test_modules": 139
+    },
+    {
+      "path": "crates/exponent-lut/src/scheme/prf.rs",
+      "sha256": "0388f5e630b6a40bb286a42e24a654e31de883c0b6ea89b849e7e992710edd4b",
+      "lines": 30,
+      "public_types": [
+        {
+          "kind": "trait",
+          "name": "ExponentLUTPrfScheme"
+        }
+      ],
+      "lines_outside_test_modules": 30
+    },
+    {
+      "path": "crates/exponent-lut/src/scheme/readout.rs",
+      "sha256": "7ec9d1ce9aa591b7388e0edbd3e4c62e6fdb1b77576334afd1bf2b4f1e9280f3",
+      "lines": 47,
+      "public_types": [
+        {
+          "kind": "trait",
+          "name": "ExponentLUTReadoutScheme"
+        }
+      ],
+      "lines_outside_test_modules": 47
+    },
+    {
+      "path": "crates/exponent-lut/src/scheme/refresh.rs",
+      "sha256": "3ea6f98a7b780397a97af674e125b708610cf48bc1ee92ce75078b162fb23250",
+      "lines": 216,
+      "public_types": [
+        {
+          "kind": "trait",
+          "name": "ExponentLUTRefreshScheme"
+        },
+        {
+          "kind": "trait",
+          "name": "ExponentLUTRefreshSetupScheme"
+        },
+        {
+          "kind": "trait",
+          "name": "ExponentLUTRefreshWitnessScheme"
+        },
+        {
+          "kind": "trait",
+          "name": "ExponentLUTRefreshWitnessOnlineScheme"
+        },
+        {
+          "kind": "trait",
+          "name": "ExponentLUTRefreshOnlineScheme"
+        },
+        {
+          "kind": "trait",
+          "name": "ExponentLUTRefreshTerminalScheme"
+        },
+        {
+          "kind": "trait",
+          "name": "ExponentLUTRefreshDigitScheme"
+        }
+      ],
+      "lines_outside_test_modules": 216
+    },
+    {
+      "path": "crates/exponent-lut/src/scheme/terminal.rs",
+      "sha256": "745c73ab20e43d219095ff4c8fc718996f1a7bd52ad0bab19d441892a5c72883",
+      "lines": 175,
+      "public_types": [
+        {
+          "kind": "trait",
+          "name": "ExponentLUTTerminalScheme"
+        },
+        {
+          "kind": "enum",
+          "name": "TerminalError"
+        },
+        {
+          "kind": "struct",
+          "name": "PreparedTerminal"
+        }
+      ],
+      "lines_outside_test_modules": 154
+    },
+    {
+      "path": "crates/exponent-lut/src/scheme.rs",
+      "sha256": "1b40898da4d16bf7ed21025141f651e329c02284000923223fb361023e0286b5",
+      "lines": 400,
+      "public_types": [
+        {
+          "kind": "trait",
+          "name": "ExponentLUTEncodingScheme"
+        },
+        {
+          "kind": "struct",
+          "name": "PreparedProgram"
+        },
+        {
+          "kind": "struct",
+          "name": "BggScheme"
+        }
+      ],
+      "lines_outside_test_modules": 202
+    }
+  ],
+  "proof_templates": [
+    {
+      "path": "crates/exponent-lut/src/lean/certify.rs",
+      "line": 211,
+      "template": "\"expected_failure\": \"Certificate theorem type mismatch\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/certify.rs",
+      "line": 218,
+      "template": "eprintln!(\"actual certificate rejected wrong theorem type; log: {}\", log.display());",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/check.rs",
+      "line": 512,
+      "template": "BTreeMap::from([(\"Certificate\".into(), \"theorem fake : True := trivial\".into())]);",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/check.rs",
+      "line": 528,
+      "template": "fs::write(directory.path().join(\"A.lean\"), \"theorem a : True := trivial\").unwrap();",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/check.rs",
+      "line": 530,
+      "template": "fs::write(directory.path().join(\"A.lean\"), \"theorem a : False := by sorry\").unwrap();",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/check.rs",
+      "line": 539,
+      "template": "fs::write(directory.path().join(\"A.lean\"), \"theorem a : True := True.intro\\n\").unwrap();",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/native_program_proof.rs",
+      "line": 374,
+      "template": "return Err(\"native theorem numbering does not match metadata\".into());",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/native_program_proof.rs",
+      "line": 544,
+      "template": "const FIRST_STAGE_APPROX: &str = r#\"theorem first_stage_approx",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/native_program_proof.rs",
+      "line": 559,
+      "template": "const STAGE: &str = r#\"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/native_program_proof.rs",
+      "line": 718,
+      "template": "theorem native_output_bound : nativeBound@next@ = @expected_bound@ := by decide",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/native_program_proof.rs",
+      "line": 721,
+      "template": "theorem programOutputApprox {hashModel : MxxRuntime.HashModel} {external : ExternalInputs}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/numeric.rs",
+      "line": 19,
+      "template": "\"theorem pre_switch_{i} : ({} : Nat) * {} + ({} + {}) * {} = {} := by decide\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/numeric.rs",
+      "line": 30,
+      "template": "\"theorem decoder_{i} : ({} : Nat) * {} = {} := by decide\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/numeric.rs",
+      "line": 36,
+      "template": "\"theorem switched_bound_{i} : switchedErrorBound {} {} {} {} = {} := by decide\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/numeric.rs",
+      "line": 44,
+      "template": "writeln!(source, \"theorem positive_lift_{i} : (0 : Nat) < {} := by decide\", slot.lift)",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/numeric.rs",
+      "line": 48,
+      "template": "\"theorem mask_bound_{i} : ({} : Nat) / 2 = {} := by decide\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/numeric.rs",
+      "line": 55,
+      "template": "writeln!(source, \"theorem strict_rounding_{i} : 2 * ({} + switchedErrorBound {} {} {} {}) < ({} : Nat) := by decide\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_cache_alignment.rs",
+      "line": 55,
+      "template": "\"import RootProgramSetup\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 2000000\\nnamespace ExponentGeneratedCacheAlignment\\nopen Mxx.Primitives\\n\\nprivate theorem lookup_eq {\u03b1 : Type} {count : Nat} {f : Fin count \u2192 \u03b1} {index : Int} {output : \u03b1} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic f index output) : output = f position := by\\n  obtain \u27e8actual, ha, hv\u27e9 := h\\n  have he : actual = position := by apply Fin.ext; omega\\n  simpa only [he] using hv\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_decoder_setup.rs",
+      "line": 255,
+      "template": "source.push_str(&format!(\"theorem secret_source {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\\n    \u2203 secret : ErrorMatrix {n} 1 2, reduceMatrix {q} {n} 1 2 secret = ({full}) \u2227\\n      (\u2200 i, ((secret 0 0).coeff i).natAbs \u2264 1) \u2227 secret 0 1 = 1 := by\\n  exact augmented_secret_of_sample ({}) ({}) ({full}) {} {} (by simp)\\n\\n\",artifact.root.parameter_type,value(secret_args[0])?,value(secret_args[1])?,fact(shape,secret_args[0],\"facts\")?,fact(shape,full_secret,\"facts\")?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_decoder_setup.rs",
+      "line": 257,
+      "template": "source.push_str(&format!(\"theorem decoder_setup_{slot} {binders}\\n    (secret : ErrorMatrix {n} 1 2) (secretSource : reduceMatrix {q} {n} 1 2 secret = ({full}))\\n    (publicLink : ({vb}) = ({pb})) (preimageLink : ({vk}) = ({pk})) :\\n    let position : Fin {count} := \u27e8{index}, by decide\u27e9\\n    \u2203 anchorError : ErrorMatrix {n} 1 {inner}, \u2203 action : ErrorMatrix {n} {inner} {columns},\\n    \u2203 switchedPublic : ExactMatrix {p} {n} 2 {columns},\\n      reduceMatrix {p} {n} 1 2 secret = ({low}) \u2227\\n      ({av}) = reduceMatrix {p} {n} 1 2 secret * ({vb}) + reduceMatrix {p} {n} 1 {inner} anchorError \u2227\\n      CoeffBound anchorError ({anchor_cutoff} : Int).toNat \u2227\\n      ({vk}) = reduceMatrix {p} {n} {inner} {columns} action \u2227\\n      CoeffBound action ({cutoff} : Int).toNat \u2227 ActionGain action ({inner} * {n} * ({cutoff} : Int).toNat) \u2227\\n      MxxRuntime.modulusSwitchRuns ({high_public}) switchedPublic \u2227\\n      ({vb}) * ({vk}) = switchedPublic - MxxRuntime.matrixMulScalarLeft ({delta}) ({low_a_prime}) := by\\n  let position : Fin {count} := \u27e8{index}, by decide\u27e9\\n  have lowSecret := reduce_secret (by decide) (by decide) secret ({full}) ({low}) secretSource {}\\n  obtain \u27e8anchorError, anchorReduction, anchorBound\u27e9 := gaussian_error_witness {}\\n\",fact(shape,low_secret,\"facts\")?,fact(shape,gaussian,\"facts\")?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_decoder_setup.rs",
+      "line": 285,
+      "template": "const HELPERS: &str = r#\"private theorem poly_ext {q n : Nat} (hq : 1 < q) (hn : 0 < n)",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_decoder_setup.rs",
+      "line": 293,
+      "template": "private theorem reduce_secret {q p n rows columns : Nat}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_decoder_setup.rs",
+      "line": 313,
+      "template": "private theorem sampled_action {q n rows inner columns cutoff : Nat}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_decoder_setup.rs",
+      "line": 330,
+      "template": "private theorem lookup_eq {\u03b1 : Type} {count : Nat} {family : Fin count \u2192 \u03b1}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_inputs.rs",
+      "line": 176,
+      "template": "// theorem verifies all dimensions and the exact selected slice bounds.",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_inputs.rs",
+      "line": 239,
+      "template": "source.push_str(&format!(\"theorem initial_program_state_{count}{backend_binder}{hash_binder}\\n    {{params : {}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {witness_type})\\n    (facts : {body} {backend_arg}{hash_arg}params inputs outputs witness) :\\n    ProgramDerivation ({gadget})\\n      (\u27e8({selected_value}), ({right_public}), ({message}) 0 0, ({secret}), ({payload_secret})\u27e9 : ProgramState {q} {n} 2 {selected_columns}) {cutoff} := by\\n  obtain \u27e8error, equation, bounded\u27e9 := initial_selected_{count} witness facts\\n  exact ProgramDerivation.input _ error {cutoff} equation bounded\\n\\n\", artifact.root.parameter_type));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_online_readout.rs",
+      "line": 156,
+      "template": "source.push_str(&format!(\"theorem family_gather_{} {binders} :\\n    \u2200 i : Fin {lanes}, \u2203 position : Fin {count},\\n      (position.val : Int) = ({index}) \u2227 ({output}) i = ({family}) position := by\\n  intro i\\n  obtain \u27e8selected, hlo, hhi, hget, hout\u27e9 := {family_fact} i\\n  obtain \u27e8position, hindex, heq\u27e9 := hget\\n  exact \u27e8position, hindex, hout.trans heq\u27e9\\n\\n\", owner.0));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_online_readout.rs",
+      "line": 190,
+      "template": "source.push_str(&format!(\"theorem raw_branch_{} {binders} :\\n    \u2200 i : Fin {lanes}, \u2203 raw : ExactMatrix {q} {n} {rows} {columns},\\n      MxxRuntime.ringAutomorphismRuns ({index}) ({transformed}) raw \u2227\\n      ({output}) i = ({aligned}) + raw * ({switch}) := by\\n  intro i\\n  obtain \u27e8{witnesses}, childFacts\u27e9 := {family_fact} i\\n  exact \u27e8_, {hr}, childFacts{output_path}\u27e9\\n\\n\", owner.0));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_online_readout.rs",
+      "line": 285,
+      "template": "source.push_str(&format!(\"theorem helper_mask_{} {binders}\\n    (gadget : ExactMatrix {q} {n} 2 {columns})\\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\\n    \u2200 i : Fin {lanes}, \u2203 error : ErrorMatrix {n} 1 {columns},\\n      ({mask}) i = ({secret}) * (({mask_key}) i) -\\n        MxxRuntime.ringAutomorphism ({index}).toNat ({secret}) * gadget +\\n          reduceMatrix {q} {n} 1 {columns} error \u2227 CoeffBound error ({cutoff} : Nat) := by\\n  intro i\\n  obtain \u27e8{witnesses}, childFacts\u27e9 := {family_fact} i\\n  obtain \u27e8error, he, hb\u27e9 := gaussian_error_witness {hgaussian}\\n  have bounded := initial_right_block {hpublic} {hmessage} {htensor} {hslice}\\n    \u27e8error, by rw [he]; rfl, hb\u27e9\\n  have maskOutput := congrArg (fun result => result{mask_projection}) childFacts{output_path}\\n  have keyOutput := congrArg (fun result => result{key_projection}) childFacts{output_path}\\n  dsimp only at maskOutput keyOutput\\n  have autoEquation := ({hauto}).2.2.2\\n  have same : {gadget_name} = gadget := gadget_runs_deterministic {hgadget} gadgetRuns\\n  obtain \u27e8selectedError, selectedEquation, selectedBound\u27e9 := bounded\\n  refine \u27e8selectedError, ?_, selectedBound\u27e9\\n  rw [maskOutput, selectedEquation, keyOutput, autoEquation, same]\\n  simp [MxxRuntime.matrixMul]\\n\\n\", owner.0));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_private.rs",
+      "line": 187,
+      "template": "let theorem = format!(\"private_cache_{number}\");",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_private.rs",
+      "line": 213,
+      "template": "source.push_str(&format!(\"theorem private_bucket_{number} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {witness_type}) (facts : {body} backend hashModel params inputs outputs witness)\\n    (layout : MxxRuntime.RegularLayout {q}) (lookup : backend.regularLayout {q} {n} = some layout)\\n    (gadget : ExactMatrix {q} {n} 2 {columns}) (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\\n    \u2200 i : Fin {lanes}, \u2203 error : ErrorMatrix {n} 1 {columns}, \u2203 action : ErrorMatrix {n} {columns} {columns},\\n      ({cached}) i = reduceMatrix {q} {n} {columns} {columns} action \u2227\\n      ActionGain action (denseRegularGain layout {n} 2) \u2227\\n      ({secret}) * gadget * (({cached}) i) = (({payload}) \u27e8{offset} + i.val, by omega\u27e9 0 0) \u2022 (({secret}) * gadget) + reduceMatrix {q} {n} 1 {columns} error \u2227\\n      CoeffBound error ({cutoff} : Nat) := by\\n  intro i\\n  obtain \u27e8position,error,action,hindex,ha,hgain,hcache,hbound\u27e9 := {theorem} witness facts layout lookup gadget gadgetRuns i\\n  have indexEquation : ({indices}) i = (i.val : Int) + {offset} := {index_fact} i\\n  have same : position = (\u27e8{offset} + i.val, by omega\u27e9 : Fin {raw_count}) := by\\n    apply Fin.ext\\n    change position.val = {offset} + i.val\\n    omega\\n  rw [same] at hcache\\n  exact \u27e8error,action,ha,hgain,hcache,hbound\u27e9\\n\\n\",params=artifact.root.parameter_type));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_context.rs",
+      "line": 204,
+      "template": "source.push_str(&format!(\"theorem public_branches_{node} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{rootInputs : ExponentGeneratedInputsRoot.RootInput}} {{rootOutputs : ExponentGeneratedInputsRoot.RootOutput}}\\n    (rootWitness : {root_record}) (rootFacts : {root_body} backend hashModel params rootInputs rootOutputs rootWitness)\\n    (i_0 : Nat) (witness : {record}) (outputs : ExponentGeneratedProgramRoot.RootOutput)\\n    (facts : {body} backend hashModel params i_0 {inputs} outputs witness) :\\n    \u2200 i : Fin {lanes}, \u2203 position : Fin {public_count}, \u2203 state : ProgramState {q} {n} 2 {columns},\\n      ProgramDerivation ({gadget}) state {cutoff} \u2227\\n      state.ciphertext = ({actual}) i \u2227 state.message = ({messages}) i 0 0 \u2227\\n      state.mask = ({secret}) \u2227 state.payload = ({secret}) \u2227\\n      state.publicKey = ({gadget}) * (({global_action}) position) \u2227 (position.val : Int) = ({indices}) i := by\\n  intro i\\n  obtain \u27e8cipher,hclo,hchi,hget,hcout\u27e9 := {cf} i\\n  obtain \u27e8position,hindex,hcipher\u27e9 := hget\\n  obtain \u27e8message,hmlo,hmhi,hmget,hmout\u27e9 := {mf} i\\n  obtain \u27e8other,hother,hmessage\u27e9 := hmget\\n  have samePosition : other = position := by\\n    apply Fin.ext\\n    exact_mod_cast hother.trans hindex.symm\\n  subst other\\n  obtain \u27e8localG,state,hg,derived,hc,hkey,hm,hmask,hpayload\u27e9 := ExponentGeneratedProgramInputs.public_inputs_0 rootWitness rootFacts position\\n  have sameG : localG = ({gadget}) := gadget_runs_deterministic hg rootFacts{gadget_path}.1\\n  subst localG\\n  refine \u27e8position,state,derived,?_,?_,hmask,hpayload,hkey,hindex\u27e9\\n  \u00b7 exact hc.trans (hcout.trans hcipher).symm\\n  \u00b7 exact hm.trans (congrArg (fun x => x 0 0) (hmout.trans hmessage)).symm\\n\\n\",node=cipher.node.0,params=artifact.root.parameter_type));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_context.rs",
+      "line": 233,
+      "template": "source.push_str(&format!(\"theorem public_branches_{node} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{rootInputs : ExponentGeneratedInputsRoot.RootInput}} {{rootOutputs : ExponentGeneratedInputsRoot.RootOutput}}\\n    (rootWitness : {root_record}) (rootFacts : {root_body} backend hashModel params rootInputs rootOutputs rootWitness)\\n    (i_0 : Nat) (witness : {record}) (outputs : ExponentGeneratedProgramRoot.RootOutput)\\n    (facts : {body} backend hashModel params i_0 {inputs} outputs witness) :\\n    \u2200 i : Fin {lanes}, \u2203 position : Fin {public_count}, \u2203 localPosition : Fin {prefix_count}, \u2203 state : ProgramState {q} {n} 2 {columns},\\n      ProgramDerivation ({gadget}) state {cutoff} \u2227\\n      state.ciphertext = ({actual}) i \u2227 state.message = ({messages}) i 0 0 \u2227\\n      state.mask = ({secret}) \u2227 state.payload = ({secret}) \u2227\\n      state.publicKey = ({gadget}) * (({global_action}) position) \u2227\\n      (position.val : Int) = ({global_indices}) localPosition \u2227 (localPosition.val : Int) = ({indices}) i := by\\n  intro i\\n  obtain \u27e8cipher,hclo,hchi,hget,hcout\u27e9 := {cf} i\\n  obtain \u27e8localPosition,hindex,hcipher\u27e9 := hget\\n  obtain \u27e8message,hmlo,hmhi,hmget,hmout\u27e9 := {mf} i\\n  obtain \u27e8other,hother,hmessage\u27e9 := hmget\\n  have samePosition : other = localPosition := by\\n    apply Fin.ext\\n    exact_mod_cast hother.trans hindex.symm\\n  subst other\\n  obtain \u27e8position,state,derived,hc,hm,hmask,hpayload,hkey,hglobal\u27e9 := public_branches_{prefix} rootWitness rootFacts i_0 witness outputs facts localPosition\\n  refine \u27e8position,localPosition,state,derived,?_,?_,hmask,hpayload,hkey,hglobal,hindex\u27e9\\n  \u00b7 exact hc.trans (hcout.trans hcipher).symm\\n  \u00b7 exact hm.trans (congrArg (fun x => x 0 0) (hmout.trans hmessage)).symm\\n\\n\",node=cipher.node.0,prefix=prefix_cipher.node.0,params=artifact.root.parameter_type));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_inputs.rs",
+      "line": 99,
+      "template": "source.push_str(&format!(\"theorem public_inputs_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : ExponentGeneratedInputsRoot.RootInput}} {{outputs : ExponentGeneratedInputsRoot.RootOutput}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\\n    \u2200 i : Fin {lanes}, \u2203 gadget : ExactMatrix {q} {n} 2 {columns},\\n      \u2203 state : ProgramState {q} {n} 2 {columns},\\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget \u2227\\n      ProgramDerivation gadget state {cutoff} \u2227\\n      state.ciphertext = ({actual}) i \u2227\\n      state.publicKey = gadget * (({action}) i) \u2227\\n      state.message = ({message}) i 0 0 \u2227\\n      state.mask = ({secret}) \u2227 state.payload = ({secret}) := by\\n  intro i\\n  obtain \u27e8gadget,error,hg,equation,bounded\u27e9 := ExponentGeneratedInputs.encoding_input_{count} ({fact} i)\\n  let state : ProgramState {q} {n} 2 {columns} := \u27e8({actual}) i, gadget * (({action}) i), ({message}) i 0 0, ({secret}), ({secret})\u27e9\\n  exact \u27e8gadget,state,hg,ProgramDerivation.input state error {cutoff} equation bounded,rfl,rfl,rfl,rfl,rfl\u27e9\\n\\n\",params=artifact.root.parameter_type));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_inputs.rs",
+      "line": 103,
+      "template": "return Err(\"ambiguous native input theorem numbering\".into());",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_keys.rs",
+      "line": 65,
+      "template": "\"import RootProgramSetup\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 2000000\\nnamespace ExponentGeneratedProgramKeys\\nopen Mxx.Primitives\\nopen scoped BigOperators\\n\\nprivate theorem lookup_eq {\u03b1 : Type} {count : Nat} {f : Fin count \u2192 \u03b1} {index : Int} {output : \u03b1} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic f index output) : output = f position := by\\n  obtain \u27e8actual, ha, hv\u27e9 := h\\n  have he : actual = position := by apply Fin.ext; omega\\n  simpa only [he] using hv\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_program_keys.rs",
+      "line": 177,
+      "template": "let theorem = format!(\"key_after_{number}\");",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout.rs",
+      "line": 200,
+      "template": "let theorem = format!(\"readout_switch_{}\", theorems.len());",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_alignment.rs",
+      "line": 270,
+      "template": "let theorem = format!(\"readout_alignment_{}\", theorems.len());",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_function.rs",
+      "line": 160,
+      "template": "\"import {}\\nimport TraceIndices\\nimport ExponentReadoutFunction\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 2000000\\n\\nnamespace ExponentGeneratedReadoutFunction\\nopen Mxx.Primitives MxxExponentLut\\nopen scoped BigOperators\\nabbrev RootInput := {input_type}\\nabbrev RootOutput := {output_type}\\n\\ntheorem dimensions : TraceIndices.ringDimension = {n} \u2227 TraceIndices.width = {width} \u2227 TraceIndices.stride = {stride} := by decide\\n\\n{definitions}theorem target_identity {binders} :\\n    ({target_value}) 0 0 = nativeTraceTarget (q := {q}) (n := {n}) (stride := {stride}) {table_function} := by\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_function.rs",
+      "line": 187,
+      "template": "source.push_str(&format!(\"theorem half_identity :\\n    (({width} : ExactPoly {q} {n}) * (({normalization_value}) 0 0)) * 2 = 1 := by\\n  calc\\n    _ = (({normalization_value}) 0 0) * ({width} * 2) := by ring\\n    _ = 1 := normalization_identity\\n\\ntheorem target_lift_sum {binders} :\\n    reducePoly {q} {n} targetInteger = targetScalar witness \u2227\\n      polynomialL1 targetInteger \u2264 \u2211 k : Fin {width}, (2 * ({table_function}) k - 1).natAbs := by\\n  classical\\n  let coefficient : Fin {width} \u2192 Int := fun k => 2 * ({table_function}) k - 1\\n  let positions : Fin {width} \u2192 Fin {n} := ![{positions}]\\n  let signed : Fin {width} \u2192 Int := fun k => if k.val = 0 then coefficient k else -coefficient k\\n  change reducePoly {q} {n} (\u2211 k, scaledBasis (signed k) (positions k)) = ({target_value}) 0 0 \u2227 polynomialL1 (\u2211 k, scaledBasis (signed k) (positions k)) \u2264 _\\n  constructor\\n  \u00b7 rw [target_identity witness facts]\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_function.rs",
+      "line": 218,
+      "template": "source.push_str(&format!(\"theorem target_gain_value :\\n    (\u2211 k : Fin {width}, (2 * ({table_function}) k - 1).natAbs) = {gain} := by\\n  letI : Fact (1 < {q}) := \u27e8by decide\u27e9\\n  have expansion : ({table_value}) 0 0 = {expansion} := by\\n    simp [MxxRuntime.matrixPolynomial]\\n    ring\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_proof.rs",
+      "line": 308,
+      "template": "theorem native_readout {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_proof.rs",
+      "line": 350,
+      "template": "theorem native_readout_closed {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_public.rs",
+      "line": 151,
+      "template": "\"import {}\\nimport ExponentReadout\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 2000000\\n\\nnamespace ExponentGeneratedReadoutPublic\\nopen Mxx.Primitives MxxExponentLut\\nopen scoped BigOperators\\nabbrev RootInput := {input_type}\\nabbrev RootOutput := {output_type}\\n\\nprivate theorem lookup_eq {{\u03b1 : Type}} {{count : Nat}} {{family : Fin count \u2192 \u03b1}} {{index : Int}} {{output : \u03b1}} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic family index output) : output = family position := by\\n  obtain \u27e8actual, ha, hv\u27e9 := h\\n  have same : actual = position := by apply Fin.ext; omega\\n  simpa only [same] using hv\\n\\ntheorem normalized_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\\n    \u2200 label : Fin {labels}, ({normalized}) label =\\n      (({transformed}) label + \u2211 helper : Fin {helpers},\\n        ({original}) \u27e8label.val * {helpers} + helper.val, by omega\u27e9) * ({norm}) := by\\n  intro label\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_public.rs",
+      "line": 268,
+      "template": "source.push_str(&format!(\"theorem normalized_public {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\\n    \u2200 label : Fin {labels}, ({normalized}) label =\\n      (({program}) label * ({target}) label + \u2211 helper : Fin {helpers},\\n        ({masks}) helper * ({cache}) \u27e8label.val * {helpers} + helper.val, by omega\u27e9) * ({norm}) := by\\n  intro label\\n  rw [normalized_execution witness facts]\\n  have targetEquation := {} label\\n  rw [targetEquation]\\n  simp only [MxxRuntime.matrixMul]\\n  congr 1\\n  congr 1\\n  apply Finset.sum_congr rfl\\n  intro helper hmem\\n  have indexEquation : ({indices}) {slot} = (helper.val : Int) := by\\n    have h := {} {slot}\\n    dsimp only [{ir}, {ir}.constraints_0] at h\\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h \u22a2\\n    omega\\n  have gatherEquation : ({gathered_masks}) {slot} = ({masks}) helper := by\\n    have h := {} {slot}\\n    dsimp only [{gr}, {gr}.constraints_0] at h\\n    obtain \u27e8sample, hlo, hhi, hg, hout\u27e9 := h\\n    exact hout.trans (lookup_eq helper indexEquation hg)\\n  have productEquation := {} {slot}\\n  simpa only [MxxRuntime.matrixMul, gatherEquation] using productEquation\\n\\nend ExponentGeneratedReadoutPublic\\n\",fact(transformed_wire)?,fact(mask_indices)?,fact(mask_gather)?,fact(current)?,params=artifact.root.parameter_type));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "line": 155,
+      "template": "\"import {}\\nimport ExponentReadoutStage\\nimport RootOnlineReadout\\nimport RootReadout\\nimport RootReadoutOperands\\nimport RootReadoutFunction\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 4000000\\n\\nnamespace ExponentGeneratedReadoutStage\\nopen Mxx.Primitives MxxRuntime MxxExponentLut\\nopen scoped BigOperators\\nabbrev RootInput := {input_type}\\nabbrev RootOutput := {output_type}\\n\\nprivate theorem lookup_eq {{\u03b1 : Type}} {{count : Nat}} {{family : Fin count \u2192 \u03b1}} {{index : Int}} {{output : \u03b1}} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic family index output) : output = family position := by\\n  obtain \u27e8actual, ha, hv\u27e9 := h\\n  have same : actual = position := by apply Fin.ext; omega\\n  simpa only [same] using hv\\n\\ntheorem normalized_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\\n    \u2200 label : Fin {labels}, ({normalized}) label =\\n      (({transformed}) label + \u2211 helper : Fin {helpers},\\n        ({original}) \u27e8label.val * {helpers} + helper.val, by omega\u27e9) * ({norm}) := by\\n  intro label\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "line": 302,
+      "template": "source.push_str(&format!(\"theorem helper_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\\n    \u2200 label : Fin {labels}, \u2200 helper : Fin {helpers}, \u2203 raw : ExactMatrix {q} {n} {rows} {columns},\\n      MxxRuntime.ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat helper.val) [{indices}])\\n        (({transformed}) label) raw \u2227\\n      ({original}) \u27e8label.val * {helpers} + helper.val, by omega\u27e9 =\\n        ({mask_actual}) helper * ({helper_actual}) \u27e8label.val * {helpers} + helper.val, by omega\u27e9 +\\n          raw * ({switch_actual}) helper := by\\n  intro label helper\\n  let lane : Fin {total} := \u27e8label.val * {helpers} + helper.val, by omega\u27e9\\n{proof}  obtain \u27e8raw, hrun, heq\u27e9 := ExponentGeneratedOnlineReadout.raw_branch_{raw_id} witness facts lane\\n  have hmod : Int.fmod (Int.ofNat lane.val) {helpers} = Int.ofNat helper.val := by\\n    rw [Int.fmod_eq_emod_of_nonneg _ (by decide)]\\n    dsimp only [lane]\\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\\n    omega\\n  refine \u27e8raw, ?_, ?_\u27e9\\n  \u00b7 simpa only [hmod, gathered_target] using hrun\\n  \u00b7 have haligned := ExponentGeneratedOnlineReadout.family_operation_{aligned_id} witness facts lane\\n    simpa only [haligned, gathered_mask, gathered_switch] using heq\\n\\nend ExponentGeneratedReadoutStage\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "line": 444,
+      "template": "private theorem helper_indices_odd : \u2200 i : Fin {helpers},",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "line": 449,
+      "template": "theorem encoding_transfer {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "line": 534,
+      "template": "theorem native_transfer {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "line": 803,
+      "template": "source.push_str(&format!(\"theorem {role}_reconstruction {binders} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)]\\n    (gadget : ExactMatrix {q} {n} {target_rows} {columns})\\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\\n    {quantifier}gadget * {selected} = (({scalar}) 0 0) \u2022 gadget := by\\n{proof_start}  have same : ({other}) = gadget := gadget_runs_deterministic {hg} gadgetRuns\\n{rw_output}  rw [gadget_runs_reconstruct (by decide) (by decide) gadgetRuns {hd} Fact.out]\\n  rw [same]\\n  ext row column\\n  simp [{scalar_operation}, mul_comm]\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_readout_stage.rs",
+      "line": 901,
+      "template": "source.push_str(&format!(\"theorem aligned_helpers {binders} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)]\\n    (layout : MxxRuntime.RegularLayout {q})\\n    (lookup : backend.regularLayout {q} {n} = some layout)\\n    (gadget : ExactMatrix {q} {n} 2 {columns})\\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\\n    \u2200 label : Fin {labels}, \u2200 helper : Fin {helpers},\\n      gadget * ({helper_actual}) \u27e8label.val * {helpers} + helper.val, by omega\u27e9 =\\n        MxxRuntime.ringAutomorphism (MxxIR.selectInt (Int.ofNat helper.val) [{indices}]).toNat\\n          (({public_actual}) label * ({target_actual}) label) * ({switch_actual}) helper := by\\n  intro label helper\\n  let lane : Fin {total} := \u27e8label.val * {helpers} + helper.val, by omega\u27e9\\n  obtain \u27e8position, targetPosition, action, hposition, htarget, _, _, heq\u27e9 :=\\n    ExponentGeneratedReadoutAlignment.readout_alignment_0 witness facts layout lookup gadget gadgetRuns lane\\n  have hlabel : ({li}) lane = (label.val : Int) := by\\n    have h := {lp} lane\\n    dsimp only [{lr}, {lr}.constraints_0, lane] at h \u22a2\\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h\\n    omega\\n  have hhelper : ({hi}) lane = (helper.val : Int) := by\\n    have h := {hp} lane\\n    dsimp only [{hr}, {hr}.constraints_0, lane] at h \u22a2\\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h\\n    omega\\n  have sameLabel : targetPosition = label := by apply Fin.ext; omega\\n  have sameHelper : position = helper := by apply Fin.ext; omega\\n  have hmod : Int.fmod (Int.ofNat lane.val) {helpers} = Int.ofNat helper.val := by\\n    rw [Int.fmod_eq_emod_of_nonneg _ (by decide)]\\n    dsimp only [lane]\\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\\n    omega\\n  simpa only [sameLabel, sameHelper, hmod] using heq\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_reduction.rs",
+      "line": 96,
+      "template": "\"import {}\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 2000000\\nnamespace ExponentGeneratedReduction\\nopen Mxx.Primitives\\nopen scoped BigOperators\\nabbrev RootInput := {input_type}\\nabbrev RootOutput := {}\\n\\nprivate theorem lookup_eq {{\u03b1 : Type}} {{count : Nat}} {{f : Fin count \u2192 \u03b1}} {{index : Int}} {{output : \u03b1}} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic f index output) : output = f position := by\\n  obtain \u27e8actual, ha, hv\u27e9 := h\\n  have he : actual = position := by apply Fin.ext; omega\\n  simpa only [he] using hv\\n\\nprivate theorem singleton_sum {{\u03b1 : Type}} [AddCommMonoid \u03b1] {{f : Fin 1 \u2192 \u03b1}} {{output : \u03b1}} (h : MxxRuntime.familyGetStatic f 0 output) : output = \u2211 i, f i := by\\n  simpa using lookup_eq (0 : Fin 1) rfl h\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_decode.rs",
+      "line": 356,
+      "template": "\"theorem slot_report_bound_{slot} : ({routebound}) = {} := by decide\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_decode.rs",
+      "line": 380,
+      "template": "source.push_str(&format!(\"theorem slot_accepted_{slot} : 2 * ({mask} + ({routebound})) < {spacing} := by decide\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 169,
+      "template": "source.push_str(&format!(\"theorem table_range : \u2200 i, 1 - (radix / 2 : Nat) \u2264 ExponentGeneratedReadoutFunction.targetCoefficients i \u2227\\n    ExponentGeneratedReadoutFunction.targetCoefficients i \u2264 (radix / 2 : Nat) := by\\n  letI : Fact (1 < {q}) := \u27e8by decide\u27e9\\n  have expansion : ({table_value}) 0 0 = {expansion} := by\\n    simp [MxxRuntime.matrixPolynomial]\\n    ring\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 179,
+      "template": "theorem integer_lift (e : Fin (2 * {width})) :",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 183,
+      "template": "theorem digit_range (e : Fin (2 * {width})) :",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 195,
+      "template": "theorem fresh_bound (selection : Fin freshCount \u2192 Fin (2 * {width})) :",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 199,
+      "template": "theorem mask_bound (slot : Fin {slots}) (selection : Fin (maskCount slot) \u2192 Fin (2 * {width})) :",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 211,
+      "template": "theorem fresh_integer_bound",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 216,
+      "template": "theorem mask_integer_bound (slot : Fin {slots})",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 230,
+      "template": "theorem fresh_offset_identity (selection : Fin freshCount \u2192 Fin (2 * {width})) :",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_digits.rs",
+      "line": 238,
+      "template": "theorem mask_offset_identity (slot : Fin {slots})",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_finish.rs",
+      "line": 38,
+      "template": "return Ok(\"-- This numeric report fails strict slot rounding; no finish theorem is emitted.\\nimport RootRefreshDecode\\nnamespace ExponentGeneratedRefreshFinish\\nend ExponentGeneratedRefreshFinish\\n\".into());",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_finish.rs",
+      "line": 113,
+      "template": "s.push_str(&format!(\"theorem secret_source {bind} :\\n{secret_getters}  reduceMatrix {q} {n} 1 2 (secretInteger runs) = ({}) \u2227\\n    (\u2200 i, (((secretInteger runs) 0 0).coeff i).natAbs \u2264 1) \u2227 (secretInteger runs) 0 1 = 1 :=\\n  Classical.choose_spec (ExponentGeneratedDecoderSetup.secret_source (verificationWitness runs) (verificationFacts runs))\\n\\n\",vv(full_secret)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_finish.rs",
+      "line": 249,
+      "template": "\"theorem rounded_{slot} {bind} (selection : {selection}) (source : SourceApprox_{slot} runs selection) :\\n{rounded_getters}  \u2200 row col (k : Fin {n}), ((({} : Int) * Int.ofNat ((({}) row col).coeff k).val + Int.ofNat ({p} / 2)) / Int.ofNat {p}) % ({} : Int) =\\n    ((anchorInteger runs + ExponentGeneratedRefreshDigits.freshInteger (freshSelection selection)) row col).coeff k % ({} : Int) := by\\n{CONTEXT}  have secretFacts := secret_source runs\\n  have publicLink : ({}) = ({}) := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have preimageLink : ({}) = ({}) := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have highPublicLink : ({}) = ({}) := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have lowPublic : ({}) = reduceMatrix {p} {n} 2 {columns} (publicInteger runs) := by\\n    have lowEquation : ({}) = MxxRuntime.modulusReduce ({}) := ({}).2.2\\n    rw [lowEquation, \u2190 highPublicLink]\\n    exact (refresh_public_integer_reduce (by decide) (by decide) _).symm\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_finish.rs",
+      "line": 271,
+      "template": "s.push_str(&format!(\"theorem finish {bind} (selection : {selection})\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_links.rs",
+      "line": 108,
+      "template": "source.push_str(&format!(\"theorem payload_unit {bind} : ExponentGeneratedReadoutProof.payload runs 0 1 = 1 := by\\n{CONTEXT}  exact augmented_source_last ({}) (by rfl)\\n\\n\",fact(ps,payload,true)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_links.rs",
+      "line": 109,
+      "template": "source.push_str(&format!(\"theorem payload_lift {bind} : reduceMatrix {q} {n} 1 {columns} (ExponentGeneratedRefreshFinish.payloadInteger runs) = ExponentGeneratedReadoutProof.payload runs * ExponentGeneratedReadoutProof.gadget runs := by\\n{CONTEXT}  have payloadLink : ({}) = ExponentGeneratedReadoutProof.payload runs := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have hg : ({}) = ExponentGeneratedReadoutProof.gadget runs := gadget_runs_deterministic ({}) ({})\\n  have reduced := refresh_anchor_lift (by decide : 1 < {q}) (by decide : 0 < {n}) ({})\\n  change reduceMatrix {q} {n} 1 {columns} (ExponentGeneratedRefreshFinish.payloadInteger runs) = _ at reduced\\n  rw [reduced]\\n  change MxxRuntime.matrixMulScalarLeft (MxxRuntime.matrixPolynomial [1]) (({}) * ({})) = _\\n  rw [payloadLink, hg]\\n  ext row col\\n  simp [MxxRuntime.matrixMulScalarLeft, MxxRuntime.matrixPolynomial]\\n\\n\",vv(v_payload)?,vv(v_gadget)?,fact(vs,v_gadget,false)?,fact(vs,gadget,false)?,vv(payload_term)?,vv(v_payload)?,vv(v_gadget)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_links.rs",
+      "line": 300,
+      "template": "source.push_str(&format!(\"theorem high_public_{slot} {bind} : highPublic_{slot} runs = ExponentGeneratedRefreshStateSource.stateScaledPublic_{slot} runs + maskPublic_{slot} runs + freshPublic_{slot} runs := by\\n{CONTEXT}{public_links}  have publicEquation := ({}) (\u27e8{public_local}, by decide\u27e9 : Fin {public_count})\\n  dsimp only [{public_relation}, {public_relation}.constraints_0] at publicEquation\\n  change {public_equation} at publicEquation\\n  rw [publicPack0, publicPack1, publicPack2] at publicEquation\\n  have selected : ({}) = ({}) (\u27e8{public_local}, by decide\u27e9 : Fin {public_count}) := by\\n    obtain \u27e8position, indexEquation, equation\u27e9 := ({})\\n    have same : position = \u27e8{public_local}, by decide\u27e9 := by\\n      apply Fin.ext\\n      change position.val = {public_local}\\n      change (position.val : Int) = {public_local} at indexEquation\\n      omega\\n    simpa only [same] using equation\\n  exact highPack.trans (selected.trans publicEquation)\\n\\n\",fact(ps,public_family,true)?,pv(high_getter)?,pv(public_family)?,fact(ps,high_getter,true)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_links.rs",
+      "line": 301,
+      "template": "source.push_str(&format!(\"theorem high_cipher_{slot} {bind} : highCipher_{slot} runs = (ExponentGeneratedRefreshStateSource.stateScaledC_{slot} runs + (maskCipher_{slot} runs + ExponentGeneratedRefreshNormalize.maskPublicOffset_{slot} (verificationWitness runs))) + (freshCipher_{slot} runs + ExponentGeneratedRefreshNormalize.freshPublicOffset_{slot} (verificationWitness runs)) := by\\n{CONTEXT}{online_links}  change ({high_cipher}) = _\\n  rw [onlinePack0, onlinePack1, onlinePack2]\\n  rfl\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 34,
+      "template": "return Ok(\"import RootRefreshFinish\\n-- Strict rounding report rejected; no high source theorem is emitted.\\n\".into())",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 88,
+      "template": "source.push_str(r#\"private theorem combine_sources {q n columns stateBound maskBound freshBound : Nat}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 107,
+      "template": "source.push_str(r#\"private theorem route_transfer {q n columns width digits bound : Nat}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 126,
+      "template": "source.push_str(\"private theorem replace_actual {q n rows columns bound : Nat} {actual other ideal : ExactMatrix q n rows columns} (equation : actual = other) (close : Approx other ideal bound) : Approx actual ideal bound := by\\n  obtain \u27e8error, errorEquation, bounded\u27e9 := close\\n  exact \u27e8error, equation.trans errorEquation, bounded\u27e9\\n\\n\");",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 127,
+      "template": "source.push_str(\"private theorem native_value : ExponentGeneratedReadoutProof.nativeValue = ExponentGeneratedRefreshDigits.nativeValue := rfl\\n\\n\");",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 156,
+      "template": "source.push_str(&format!(\"private theorem {role}_{kind}_selected_{slot} {bind} :\\n  {role}{field}_{slot} runs = ({family_expression}) (\u27e8{index}, by decide\u27e9 : Fin {count}) := by\\n{CONTEXT}  exact route_lookup_eq (\u27e8{index}, by decide\u27e9 : Fin {count}) (by rfl) ({})\\n\\n\",fact(shape,getter,producer)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 185,
+      "template": "source.push_str(&format!(\"theorem {role}_source_{slot} {bind} :\\n    Approx ({role}Cipher_{slot} runs)\\n      (ExponentGeneratedReadoutProof.mask runs * {role}Public_{slot} runs +\\n        ({scale} : Int) \u2022 ExponentGeneratedRefreshNormalize.{role}Native_{slot} (ExponentGeneratedRefreshSourceProof.{role}Selection_{slot} runs))\\n      (ExponentGeneratedRefreshSourceProof.{role}Gain_{slot} * ExponentGeneratedReadoutProof.readoutBound ExponentGeneratedNativeProgramProof.nativeOutputBound) := by\\n  classical\\n{CONTEXT}  have hg : MxxRuntime.gadgetMatrixRuns RefreshBackend.backend {} {} (ExponentGeneratedReadoutProof.gadget runs) := {}\\n  have outputLink : ({output}) = ({}) := by\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have close := ExponentGeneratedRefreshSourceProof.{role}_sum_{slot} runs\\n  dsimp only at close\\n  rw [\u2190 outputLink, ExponentGeneratedRefreshSourceProof.{role}_gain_{slot}] at close\\n  let publicKey := fun (component : Fin {columns}) (coefficient : Fin {n}) (digit : Fin {digits}) => ExponentGeneratedReadoutProof.readoutPublicKey runs {label}\\n  let action := fun (component : Fin {columns}) (coefficient : Fin {n}) (digit : Fin {digits}) => ({output}) ({flat} : Fin {total})\\n  have reconstruction : \u2200 c k d, ExponentGeneratedReadoutProof.gadget runs * action c k d = routeTarget (-({scale} : Int) * ({base} : Int)^d.val) k c := by\\n    intro component coefficient digit\\n    exact (ExponentGeneratedRefreshRouteTargets.{role}_cache_{slot} pw pf _ hg component coefficient digit).2\\n  change Approx _ (\u2211 c, \u2211 k, \u2211 d, (ExponentGeneratedReadoutProof.mask runs * publicKey c k d - ExponentGeneratedReadoutProof.nativeValue (ExponentGeneratedRefreshSourceProof.{role}Selection_{slot} runs 0 c k d) \u2022 (ExponentGeneratedReadoutProof.payload runs * ExponentGeneratedReadoutProof.gadget runs)) * action c k d) _ at close\\n  have converted := route_transfer (q := {q}) (n := {n}) (columns := {columns}) (width := {width}) (digits := {digits}) _ (ExponentGeneratedReadoutProof.mask runs) (ExponentGeneratedReadoutProof.payload runs) (payload_unit runs) (ExponentGeneratedReadoutProof.gadget runs) publicKey action ({scale} : Int) {base} ExponentGeneratedReadoutProof.nativeValue (ExponentGeneratedRefreshSourceProof.{role}Selection_{slot} runs) reconstruction close\\n  have publicSum : {role}Public_{slot} runs = \u2211 c, \u2211 k, \u2211 d, publicKey c k d * action c k d := ({role}_public_selected_{slot} runs).trans (ExponentGeneratedRefreshRouteSums.{role}_public_sum_{slot} pw pf _ hg)\\n  rw [\u2190 publicSum, native_value] at converted\\n  have rawSum := ({role}_cipher_selected_{slot} runs).trans (ExponentGeneratedRefreshRouteSums.{role}_raw_sum_{slot} vw vf)\\n  exact replace_actual rawSum converted\\n\\n\",layout.base,layout.regular_digits,fact(vs,gadget,false)?,pv(cache.wire)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_high_source.rs",
+      "line": 187,
+      "template": "source.push_str(&format!(\"theorem source_{slot} {bind} : ExponentGeneratedRefreshFinish.SourceApprox_{slot} runs (ExponentGeneratedRefreshSourceProof.readoutExponent runs) := by\\n  classical\\n{CONTEXT}  have stateClose := ExponentGeneratedRefreshStateSource.state_source_{slot} runs\\n  have maskClose := mask_source_{slot} runs\\n  have freshClose := fresh_source_{slot} runs\\n  have combined := combine_sources (ExponentGeneratedReadoutProof.mask runs)\\n    (ExponentGeneratedRefreshStateSource.stateScaledPublic_{slot} runs) (maskPublic_{slot} runs) (freshPublic_{slot} runs)\\n    (ExponentGeneratedRefreshStateSource.stateScaledC_{slot} runs) (maskCipher_{slot} runs) (freshCipher_{slot} runs)\\n    (ExponentGeneratedReadoutProof.payload runs * ExponentGeneratedReadoutProof.gadget runs)\\n    (ExponentGeneratedRefreshNormalize.maskNative_{slot} (ExponentGeneratedRefreshSourceProof.maskSelection_{slot} runs))\\n    (ExponentGeneratedRefreshNormalize.freshNative_{slot} (ExponentGeneratedRefreshSourceProof.freshSelection_{slot} runs))\\n    (ExponentGeneratedRefreshNormalize.maskPublicOffset_{slot} vw) (ExponentGeneratedRefreshNormalize.freshPublicOffset_{slot} vw)\\n    ({mu} : Int) ({lift} : Int) stateClose maskClose freshClose\\n  have factor := ExponentGeneratedRefreshNormalize.high_ideal_factor_{slot} vw vf (ExponentGeneratedRefreshFinish.payloadInteger runs)\\n    (ExponentGeneratedRefreshSourceProof.freshSelection_{slot} runs) (ExponentGeneratedRefreshSourceProof.maskSelection_{slot} runs)\\n  rw [payload_lift runs] at factor\\n  rw [factor, \u2190 high_public_{slot} runs] at combined\\n  have boundEquation : (ExponentGeneratedRefreshState.stateGain_{slot} * ExponentGeneratedRefreshStateSource.initialBound +\\n      ExponentGeneratedRefreshSourceProof.maskGain_{slot} * ExponentGeneratedReadoutProof.readoutBound ExponentGeneratedNativeProgramProof.nativeOutputBound) +\\n      ExponentGeneratedRefreshSourceProof.freshGain_{slot} * ExponentGeneratedReadoutProof.readoutBound ExponentGeneratedNativeProgramProof.nativeOutputBound = {pre_bound} := by\\n    have targetGain := ExponentGeneratedReadoutFunction.target_gain_value\\n    change (\u2211 k, (2 * ExponentGeneratedReadoutFunction.targetCoefficients k - 1).natAbs) = _ at targetGain\\n    simp only [ExponentGeneratedNativeProgramProof.nativeOutputBound, ExponentGeneratedNativeProgramProof.native_output_bound, ExponentGeneratedReadoutProof.readoutBound, targetGain]\\n    decide\\n  rw [boundEquation] at combined\\n  change Approx (highCipher_{slot} runs) (ExponentGeneratedReadoutProof.mask runs * (highPublic_{slot} runs) + reduceMatrix {q} {n} 1 {columns} (({lift} : ErrorPoly {n}) \u2022 ExponentGeneratedRefreshFinish.lowIdeal_{slot} runs (ExponentGeneratedRefreshSourceProof.readoutExponent runs))) {pre_bound}\\n  rw [high_cipher_{slot} runs]\\n  have scalar : (({lift} : ErrorPoly {n}) \u2022 ExponentGeneratedRefreshFinish.lowIdeal_{slot} runs (ExponentGeneratedRefreshSourceProof.readoutExponent runs)) = ({lift} : Int) \u2022 ExponentGeneratedRefreshFinish.lowIdeal_{slot} runs (ExponentGeneratedRefreshSourceProof.readoutExponent runs) := by\\n    simpa only [Int.cast_ofNat] using Int.cast_smul_eq_zsmul (ErrorPoly {n}) ({lift} : Int) (ExponentGeneratedRefreshFinish.lowIdeal_{slot} runs (ExponentGeneratedRefreshSourceProof.readoutExponent runs))\\n  rw [scalar]\\n  exact combined\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_normalize.rs",
+      "line": 201,
+      "template": "theorem fresh_assembly_{slot} (selection : {selection}) :",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_normalize.rs",
+      "line": 211,
+      "template": "theorem mask_assembly_{slot} (selection : {mask_selection}) :",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_normalize.rs",
+      "line": 221,
+      "template": "theorem high_ideal_factor_{slot} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_normalize.rs",
+      "line": 235,
+      "template": "theorem decoder_ideal_coeff_{slot} (secret : ErrorMatrix {n} 1 2)",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_public.rs",
+      "line": 416,
+      "template": "source.push_str(&format!(\"theorem {role}_public_{slot} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record})\\n    (facts : {body} RefreshBackend.backend hashModel params inputs outputs witness)\\n    (G : ExactMatrix {q} {n} 2 {columns})\\n    (hg : MxxRuntime.gadgetMatrixRuns RefreshBackend.backend {base} {regular_digits} G)\\n    (component : Fin {columns}) (coefficient : Fin {n}) (digit : Fin {digit_count}) :\\n    ({raw_value}) {idx} =\\n      ({normalized_value}) \u27e8{label}, {bound}\u27e9 * ({output}) {idx} := by\\n  classical\\n  let idx : Fin {total} := {idx}\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_sums.rs",
+      "line": 214,
+      "template": "source.push_str(&format!(\"theorem {prefix}{role}_raw_sum_{slot} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\\n    ({}) (\u27e8{segment}, by decide\u27e9 : Fin {segments}) =\\n      \u2211 component : Fin {columns}, \u2211 coefficient : Fin {n}, \u2211 digit : Fin {digits}, ({}) ({flat} : Fin {total}) := by\\n  classical\\n  calc\\n    _ = \u2211 i : Fin {width}, ({}) \u27e8{segment}*{width}+i.val, by clear * - i; omega\u27e9 := ExponentGeneratedRefreshSource.{prefix}{role}_reduction_{relation_slot} witness facts \u27e8{segment}, by decide\u27e9\\n    _ = \u2211 component : Fin {columns}, \u2211 coefficient : Fin {n}, \u2211 digit : Fin {digits}, ({}) \u27e8{segment}*{width}+({local}), by clear * - component coefficient digit; omega\u27e9 := route_sum_three (columns := {columns}) (n := {n}) (digits := {digits}) _\\n    _ = _ := by\\n      apply Finset.sum_congr rfl\\n      intro component hc\\n      apply Finset.sum_congr rfl\\n      intro coefficient hk\\n      apply Finset.sum_congr rfl\\n      intro digit hd\\n      let index : Fin {count} := \u27e8{segment}*{width}+({local}), by clear * - component coefficient digit; omega\u27e9\\n\",artifact.root.parameter_type,artifact.root.input_type,artifact.root.output_type,value(output)?,value(raw)?,value(leaf)?,value(leaf)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_sums.rs",
+      "line": 258,
+      "template": "source.push_str(&format!(\"theorem {role}_public_sum_{slot} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\\n    (witness : {record}) (facts : {body} RefreshBackend.backend hashModel params inputs outputs witness)\\n    (gadget : ExactMatrix {q} {n} 2 {columns})\\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns RefreshBackend.backend {} {} gadget) :\\n    ({}) (\u27e8{segment}, by decide\u27e9 : Fin {segments}) =\\n      \u2211 component : Fin {columns}, \u2211 coefficient : Fin {n}, \u2211 digit : Fin {digits},\\n        ExponentGeneratedRefreshRoutePublic.normalizedReadoutPublic witness {label} * ExponentGeneratedRefreshRoutePublic.{exported} outputs ({flat} : Fin {total}) := by\\n  classical\\n  calc\\n    _ = \u2211 component : Fin {columns}, \u2211 coefficient : Fin {n}, \u2211 digit : Fin {digits}, ({}) ({flat} : Fin {total}) := pre_{role}_raw_sum_{slot} witness facts\\n    _ = _ := by\\n      apply Finset.sum_congr rfl\\n      intro component hc\\n      apply Finset.sum_congr rfl\\n      intro coefficient hk\\n      apply Finset.sum_congr rfl\\n      intro digit hd\\n      exact ExponentGeneratedRefreshRoutePublic.{role}_public_{slot} witness facts gadget gadgetRuns component coefficient digit\\n\\n\",artifact.root.parameter_type,artifact.root.input_type,artifact.root.output_type,layout.base,layout.regular_digits,value(output)?,value(raw)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_targets.rs",
+      "line": 251,
+      "template": "source.push_str(&format!(\"theorem {role}_scalar_entries_{slot} : \u2200 digit : Fin {digit_count},\\n    {actual_scale} = MxxRuntime.liftInteger ({scale_expression}) := by\\n  intro digit\\n  fin_cases digit <;> dsimp [{role}ScalarEntries] <;> ext row column <;> norm_num [{role}ScalarEntries, MxxRuntime.matrixPolynomial, MxxRuntime.liftInteger, MxxIR.exactDiv]\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_targets.rs",
+      "line": 318,
+      "template": "source.push_str(&format!(\"theorem {role}_route_scale_{slot} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record}) (facts : {body} RefreshBackend.backend hashModel params inputs outputs witness)\\n    {binders} :\\n    ({gather_value}) {idx} = MxxRuntime.liftInteger ({scale_expression}) := by\\n  classical\\n  let idx : Fin {total} := {idx}\\n{scale_proof_body}  exact scaleEq\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_targets.rs",
+      "line": 487,
+      "template": "let theorem = format!(\"{role}_cache_{slot}\");",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_route_targets.rs",
+      "line": 497,
+      "template": "source.push_str(&format!(\"theorem {theorem} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\\n    (witness : {record})\\n    (facts : {body} RefreshBackend.backend hashModel params inputs outputs witness)\\n    (G : ExactMatrix {q} {n} 2 {columns})\\n    (hg : MxxRuntime.gadgetMatrixRuns RefreshBackend.backend {base} {regular_digits} G)\\n    {binders} :\\n    ({output}) {idx} = reduceMatrix {q} {n} {columns} {columns} ({action} component coefficient digit) \u2227\\n    G * ({output}) {idx} = routeTarget (-({scale} : Int) * ({base_p} : Int)^digit.val) coefficient component := by\\n  classical\\n  let idx : Fin {total} := {idx}\\n  have targetEq : ({target_value}) idx = routeTarget (-({target_base} : Int)^digit.val) coefficient component := by\\n    have h := {target_fact} idx\\n    dsimp only [{target_unfold}] at h\\n    have equation := h{target_path}\\n    refine equation.trans ?_\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source.rs",
+      "line": 111,
+      "template": "\"theorem {name} {binders} :\\n    ({}) segment = \u2211 i : Fin {width}, ({}) \u27e8segment.val * {width} + i.val, by clear * - segment i; omega\u27e9 := by\\n  classical\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source.rs",
+      "line": 125,
+      "template": "source.push_str(&format!(\"private theorem {name}_layer_{id} {binders} : (\u2211 i : Fin {next}, ({}) \u27e8segment.val * {next} + i.val, by clear * - segment i; omega\u27e9) =\\n      \u2211 i : Fin {old}, ({}) \u27e8segment.val * {old} + i.val, by clear * - segment i; omega\u27e9 := by\\n    apply pairwise_sum (n := {old}) (f := fun i : Fin {old} => ({previous_value}) \u27e8segment.val * {old} + i.val, by clear * - segment i; omega\u27e9) (g := fun i : Fin {next} => ({result_value}) \u27e8segment.val * {next} + i.val, by clear * - segment i; omega\u27e9)\\n    intro i\\n    have leftBound : 2 * i.val < {old} := by clear * - segment i; omega\\n    have indexDiv : ((segment.val : Int) * {next} + i.val) / {next} = segment.val := by\\n      clear * - segment i\\n      omega\\n    have indexMod : ((segment.val : Int) * {next} + i.val) % {next} = i.val := by\\n      clear * - segment i\\n      omega\\n\",value(*result)?,value(*previous)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source.rs",
+      "line": 228,
+      "template": "\"theorem {prefix}route_gather_{} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\\n    (i : Fin {}) : \u2203 bound : ({expression}).toNat < {},\\n    ({}) i = ({}) \u27e8({expression}).toNat, bound\u27e9 := by\\n  have indexFacts := {} i\\n  dsimp only [{ir}, {ir}.constraints_0] at indexFacts\\n  have indexEq := indexFacts{}\\n  have h := {} i\\n  dsimp only [{gr}, {gr}.constraints_0] at h\\n  obtain \u27e8sample, hlo, hhi, hg, hout\u27e9 := h\\n  rw [indexEq] at hlo hhi hg\\n  have bound : ({expression}).toNat < {} := by clear * - hlo hhi; omega\\n  refine \u27e8bound, hout.trans ?_\u27e9\\n  apply route_lookup_eq (\u27e8({expression}).toNat, bound\u27e9 : Fin {}) _ hg\\n  exact (Int.toNat_of_nonneg hlo).symm\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source.rs",
+      "line": 294,
+      "template": "\"theorem {name} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\\n    (i : Fin {count}) : ({}) i = ({}) i * ({}) i := by\\n  have h := facts{}.1 i\\n  simpa only [{relation}, {relation}.constraints_0, MxxRuntime.matrixMul] using h\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source_proof.rs",
+      "line": 50,
+      "template": "\"import RootRefreshSource\\nimport RootReadoutProof\\nimport RootRefreshRouteTargets\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 2000000\\nnamespace ExponentGeneratedRefreshSourceProof\\nopen Mxx.Primitives MxxRuntime MxxExponentLut GeneratedClaim ExponentGeneratedExecution\\nopen scoped BigOperators\\n\\nprivate theorem replace_actual {q n rows columns bound : Nat}\\n    {actual other ideal : ExactMatrix q n rows columns}\\n    (equation : actual = other) (close : Approx other ideal bound) : Approx actual ideal bound := by\\n  obtain \u27e8error, errorEquation, bounded\u27e9 := close\\n  exact \u27e8error, equation.trans errorEquation, bounded\u27e9\\n\\nnoncomputable def readoutExponent {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}\\n    (runs : Runs hashModel external execution) (label) :=\\n  Classical.choose (ExponentGeneratedReadoutProof.native_readout_closed runs label)\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source_proof.rs",
+      "line": 191,
+      "template": "source.push_str(&format!(\"private theorem {role}_sum_{slot}_at_bound {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\\n    (runs : Runs hashModel external execution) (sourceBound : Nat)\\n    (boundEquation : ExponentGeneratedReadoutProof.readoutBound ExponentGeneratedNativeProgramProof.nativeOutputBound = sourceBound) :\\n{result_type} := by\\n  classical\\n  dsimp only\\n  let pw := preprocessingWitness runs\\n  let vw := verificationWitness runs\\n  let pin := preprocessingInputs runs.2.1\\n  let vin := verificationInputs runs.2.2.1\\n  have pf := preprocessingFacts runs\\n  have vf := verificationFacts runs\\n  have cacheLink : ({online_d}) = ({pre_d}) := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_source_proof.rs",
+      "line": 275,
+      "template": "source.push_str(&format!(\"theorem {role}_sum_{slot} {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\\n    (runs : Runs hashModel external execution) :\\n{result_type} := {role}_sum_{slot}_at_bound runs _ rfl\\n\\n\"));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_state_source.rs",
+      "line": 122,
+      "template": "\"import RootInputs\\nimport RootRefreshState\\nimport RootReadoutProof\\n\\nset_option maxRecDepth 16384\\nset_option maxHeartbeats 2000000\\nnamespace ExponentGeneratedRefreshStateSource\\nopen Mxx.Primitives MxxRuntime MxxExponentLut GeneratedClaim ExponentGeneratedExecution\\n\\nprivate theorem state_transfer {q n columns secret bound gain : Nat} (hn : 0 < n)\\n    {c : ExactMatrix q n 1 columns} {a g : ExactMatrix q n secret columns}\\n    {s payload : ExactMatrix q n 1 secret} {d : ExactMatrix q n columns columns}\\n    {action : ErrorMatrix n columns columns} {mu : Int}\\n    (close : Approx c (s * a - payload * g) bound)\\n    (reduction : d = reduceMatrix q n columns columns action)\\n    (bounded : ActionGain action gain) (cache : g * d = mu \u2022 g) :\\n    Approx (c * d) (s * (a * d) - mu \u2022 (payload * g)) (gain * bound) := by\\n  have result := approximate_right_action hn close bounded\\n  rw [\u2190 reduction] at result\\n  rw [Matrix.sub_mul, Matrix.mul_assoc, Matrix.mul_assoc, cache, Matrix.mul_smul] at result\\n  exact result\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_state_source.rs",
+      "line": 217,
+      "template": "source.push_str(&format!(\"theorem state_public_{slot} {binders} :\\n    stateScaledPublic_{slot} runs =\\n      (let pw := preprocessingWitness runs; {public_input_binding}({public}) * ({p_d})) := by\\n{locals}  have pf := preprocessingFacts runs\\n  have product := {} (\u27e8{slot}, by decide\u27e9 : Fin {count})\\n  dsimp only [{public_relation}, {public_relation}.constraints_0] at product\\n  have packEquation : ({}) (\u27e8{slot}, by decide\u27e9 : Fin {count}) = ({p_d}) := by\\n    obtain \u27e8position, indexEquation, equation\u27e9 := ({}).2.2 (\u27e8{slot}, by decide\u27e9 : Fin {count})\\n    have same : position = \u27e8{slot}, by change {slot} < {count}; decide\u27e9 := Fin.ext indexEquation\\n    simpa only [same] using equation\\n  change ({scaled_public}) = ({public}) * (({}) (\u27e8{slot}, by decide\u27e9 : Fin {count})) at product\\n  rw [packEquation] at product\\n  exact product\\n\\n\", fact(ps, public_product, \"pf\")?, pv(packed)?, fact(ps, packed, \"pf\")?, pv(packed)?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/root_refresh_state_source.rs",
+      "line": 218,
+      "template": "source.push_str(&format!(\"theorem state_source_{slot} {binders} :\\n    Approx (stateScaledC_{slot} runs)\\n      (ExponentGeneratedReadoutProof.mask runs * stateScaledPublic_{slot} runs -\\n        ExponentGeneratedRefreshState.stateScale_{slot} \u2022\\n          (ExponentGeneratedReadoutProof.payload runs * ExponentGeneratedReadoutProof.gadget runs))\\n      (ExponentGeneratedRefreshState.stateGain_{slot} * initialBound) := by\\n{locals}  have pf := preprocessingFacts runs\\n  have vf := verificationFacts runs\\n  have cacheLink : ({v_d}) = ({p_d}) := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have publicLink : ({a}) = ({public}) := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have payloadLink : ({payload}) = ExponentGeneratedReadoutProof.payload runs := by\\n    simp only [vin, verificationInputs]\\n    rw [preprocessingOutput runs]\\n    rfl\\n  have initialRun := ExponentGeneratedInputsRoot.initial_program_state_0 vw vf\\n  have close : Approx ({c})\\n      (ExponentGeneratedReadoutProof.mask runs * ({public}) -\\n        ExponentGeneratedReadoutProof.payload runs * ExponentGeneratedReadoutProof.gadget runs) initialBound := by\\n    have initialClose := initialRun.sound (by decide)\\n    have messageEquation : ({message}) 0 0 = (1 : ExactPoly {q} {n}) := by\\n      norm_num [MxxRuntime.matrixPolynomial]\\n    change Approx ({c}) (({secret}) * ({a}) - (({message}) 0 0) \u2022 (({payload}) * ({g}))) initialBound at initialClose\\n    rw [publicLink, payloadLink, messageEquation, one_smul] at initialClose\\n    exact initialClose\\n  obtain \u27e8action, reduction, bounded, reconstruction, gadgetRuns\u27e9 :=\\n    ExponentGeneratedRefreshState.state_cache_{slot} pw pf\\n  have gadgetEquation : ({p_g}) = ExponentGeneratedReadoutProof.gadget runs :=\\n    gadget_runs_deterministic gadgetRuns (show MxxRuntime.gadgetMatrixRuns RefreshBackend.backend {base} {digits} ({g}) from {})\\n  have cache : ExponentGeneratedReadoutProof.gadget runs * ({p_d}) =\\n      ExponentGeneratedRefreshState.stateScale_{slot} \u2022 ExponentGeneratedReadoutProof.gadget runs := by\\n    rw [gadgetEquation] at reconstruction\\n    exact reconstruction\\n  have result := state_transfer (by decide) close reduction bounded cache\\n  have actualEquation : stateScaledC_{slot} runs = ({c}) * ({p_d}) := by\\n    change ({c}) * ({v_d}) = _\\n    rw [cacheLink]\\n  rw [\u2190 actualEquation] at result\\n  rw [state_public_{slot}]\\n  exact result\\n\\n\", fact(vs, gadget, \"vf\")?));",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 31,
+      "template": "/// Each generated theorem consumes the exported scope relation itself. Scope",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 113,
+      "template": "\"theorem matrix_action_{count} {context_binders}{{params : {parameter_type}}} {{{index_names} : Nat}}\\n    {{input ideal : ExactMatrix {q} {n} {rows} {inner}}}\\n    {{action : ErrorMatrix {n} {inner} {columns}}}\\n    {{output : ExactMatrix {q} {n} {rows} {columns}}} {{bound gain : Nat}}\\n    (runs : {relation} {context_arguments}params {index_names} {inputs} output)\\n    (close : Approx input ideal bound) (actionBound : ActionGain action gain) :\\n    Approx output (ideal * ({action})) (gain * bound) := by\\n  have equation : output = input * ({action}) := runs\\n  rw [equation]\\n  exact approximate_right_action (by decide) close actionBound\\n\\n\"",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 129,
+      "template": "\"theorem matrix_action_family_{count} {context_binders}{{params : {parameter_type}}} {outer_binders} {{lanes : Nat}}\\n    {{input ideal : Fin lanes \u2192 ExactMatrix {q} {n} {rows} {inner}}}\\n    {{action : Fin lanes \u2192 ErrorMatrix {n} {inner} {columns}}}\\n    {{output : Fin lanes \u2192 ExactMatrix {q} {n} {rows} {columns}}} {{bound gain : Fin lanes \u2192 Nat}}\\n    (runs : \u2200 i : Fin lanes, {relation} {context_arguments}params {outer_indices} i.val {family_inputs} (output i))\\n    (close : \u2200 i, Approx (input i) (ideal i) (bound i))\\n    (actionBound : \u2200 i, ActionGain (action i) (gain i)) :\\n    \u2200 i, Approx (output i) (ideal i * ({family_action})) (gain i * bound i) := by\\n  intro i\\n  exact matrix_action_{count} (runs i) (close i) (actionBound i)\\n\\n\"",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 132,
+      "template": "\"theorem matrix_action_family_sum_{count} {context_binders}{{params : {parameter_type}}} {outer_binders} {{lanes : Nat}}\\n    {{input ideal : Fin lanes \u2192 ExactMatrix {q} {n} {rows} {inner}}}\\n    {{action : Fin lanes \u2192 ErrorMatrix {n} {inner} {columns}}}\\n    {{output : Fin lanes \u2192 ExactMatrix {q} {n} {rows} {columns}}} {{bound gain : Fin lanes \u2192 Nat}}\\n    (runs : \u2200 i : Fin lanes, {relation} {context_arguments}params {outer_indices} i.val {family_inputs} (output i))\\n    (close : \u2200 i, Approx (input i) (ideal i) (bound i))\\n    (actionBound : \u2200 i, ActionGain (action i) (gain i)) :\\n    Approx (Finset.univ.sum output)\\n      (Finset.univ.sum (fun i => ideal i * ({family_action})))\\n      (Finset.univ.sum (fun i => gain i * bound i)) := by\\n  exact family_approximate_sum Finset.univ output _ _ (fun i _ => matrix_action_{count} (runs i) (close i) (actionBound i))\\n\\n\"",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 136,
+      "template": "\"theorem private_encoding_scope_{count} {context_binders}{{params : {parameter_type}}} {{{index_names} : Nat}}\\n    {{secret inputBound helperBound gain : Nat}}\\n    {{input output : ExactMatrix {q} {n} 1 {columns}}}\\n    {{mask : ExactMatrix {q} {n} 1 secret}} {{publicKey : ExactMatrix {q} {n} secret {columns}}}\\n    {{payloadGadget : ExactMatrix {q} {n} 1 {columns}}}\\n    {{message rhsMessage : ExactPoly {q} {n}}} {{messageInteger : ErrorPoly {n}}}\\n    {{inputError helperError : ErrorMatrix {n} 1 {columns}}}\\n    {{action : ErrorMatrix {n} {columns} {columns}}}\\n    (runs : {relation} {context_arguments}params {index_names} {inputs} output)\\n    (encodingEquation : input = mask * publicKey - message \u2022 payloadGadget + reduceMatrix {q} {n} 1 {columns} inputError)\\n    (actionEquation : payloadGadget * ({action}) = rhsMessage \u2022 payloadGadget + reduceMatrix {q} {n} 1 {columns} helperError)\\n    (messageLift : message = reducePoly {q} {n} messageInteger)\\n    (messageBound : polynomialL1 messageInteger \u2264 1)\\n    (inputBounded : CoeffBound inputError inputBound)\\n    (helperBounded : CoeffBound helperError helperBound)\\n    (actionBounded : ActionGain action gain) :\\n    Approx output (mask * (publicKey * ({action})) - (message * rhsMessage) \u2022 payloadGadget)\\n      (gain * inputBound + helperBound) := by\\n  have equation : output = input * ({action}) := runs\\n  rw [equation]\\n  exact private_encoding_transfer_sampled (by decide) encodingEquation actionEquation messageLift messageBound inputBounded helperBounded actionBounded\\n\\n\"",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 219,
+      "template": "\"theorem selector_setup_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}.Params}} {{index : Nat}} {{key : ByteArray}}\\n    {{payload : ExactMatrix {q} {n} 1 1}} {{secret : ExactMatrix {q} {n} 1 2}}\\n    {{ciphertext : ExactMatrix {q} {n} 2 {columns}}}\\n    (runs : {relation} backend hashModel params index {inputs} ciphertext)\\n    (augmented : secret 0 1 = 1) :\\n    \u2203 gadget : ExactMatrix {q} {n} 2 {columns}, \u2203 error : ErrorMatrix {n} 1 {columns},\\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget \u2227\\n      secret * ciphertext = (payload 0 0) \u2022 (secret * gadget) + reduceMatrix {q} {n} 1 {columns} error \u2227\\n      CoeffBound error ({cutoff} : Nat) := by\\n  rcases runs with \u27e8top, gadget, sourcePrefix, sample, result, facts\u27e9\\n  rcases facts with \u27e8_, hg, _, _, _, _, _, _, hs, he, hc, ho\u27e9\\n  obtain \u27e8error, herror, hbound\u27e9 := gaussian_error_witness he\\n  refine \u27e8gadget, error, hg, ?_, hbound\u27e9\\n  rw [ho]\\n  have equation := sample_fixed_rhs_equation augmented hs (show MxxRuntime.matrixAdd (MxxRuntime.matrixSub (MxxRuntime.matrixMulScalarLeft payload (MxxRuntime.matrixMul secret gadget)) (MxxRuntime.matrixMulScalarLeft sourcePrefix top)) sample = (payload 0 0) \u2022 (secret * gadget) - sourcePrefix * top + sample from ?_) hc\\n  \u00b7 rw [equation, herror]\\n  \u00b7 ext row column\\n    have hr : row = 0 := Subsingleton.elim _ _\\n    subst row\\n    simp [MxxRuntime.matrixAdd, MxxRuntime.matrixSub, MxxRuntime.matrixMul, Matrix.mul_apply]\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 223,
+      "template": "\"theorem selector_cache_{count} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}.Params}} {{index : Nat}} {{key : ByteArray}}\\n    {{payload : ExactMatrix {q} {n} 1 1}} {{secret : ExactMatrix {q} {n} 1 2}}\\n    {{ciphertext : ExactMatrix {q} {n} 2 {columns}}}\\n    {{decomposition : ExactMatrix {q} {n} {columns} {columns}}}\\n    (layout : MxxRuntime.RegularLayout {q})\\n    (lookup : backend.regularLayout {q} {n} = some layout)\\n    (runs : {relation} backend hashModel params index {inputs} ciphertext)\\n    (augmented : secret 0 1 = 1)\\n    (decomposed : MxxRuntime.gadgetDecomposeRuns backend {base} {digits} ciphertext decomposition) :\\n    \u2203 gadget : ExactMatrix {q} {n} 2 {columns}, \u2203 error : ErrorMatrix {n} 1 {columns},\\n    \u2203 action : ErrorMatrix {n} {columns} {columns},\\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget \u2227\\n      decomposition = reduceMatrix {q} {n} {columns} {columns} action \u2227\\n      ActionGain action (denseRegularGain layout {n} 2) \u2227\\n      secret * gadget * decomposition = (payload 0 0) \u2022 (secret * gadget) + reduceMatrix {q} {n} 1 {columns} error \u2227\\n      CoeffBound error ({cutoff} : Nat) := by\\n  obtain \u27e8gadget, error, hg, he, hb\u27e9 := selector_setup_{count} runs augmented\\n  obtain \u27e8action, ha, hgain\u27e9 := gadgetDecomposeRuns_dense_gain layout lookup (by decide) (by decide) decomposed\\n  refine \u27e8gadget, error, action, hg, ha, hgain, ?_, hb\u27e9\\n  rw [Matrix.mul_assoc, gadget_runs_reconstruct (by decide) (by decide) hg decomposed Fact.out]\\n  exact he\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 227,
+      "template": "\"theorem selector_private_step_{count} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}.Params}} {{index : Nat}} {{key : ByteArray}}\\n    {{payload : ExactMatrix {q} {n} 1 1}} {{secret mask : ExactMatrix {q} {n} 1 2}}\\n    {{ciphertext gadget publicKey : ExactMatrix {q} {n} 2 {columns}}}\\n    {{decomposition : ExactMatrix {q} {n} {columns} {columns}}}\\n    {{input output : ExactMatrix {q} {n} 1 {columns}}}\\n    {{inputError : ErrorMatrix {n} 1 {columns}}} {{inputBound : Nat}}\\n    {{message : ExactPoly {q} {n}}} {{messageInteger : ErrorPoly {n}}}\\n    (layout : MxxRuntime.RegularLayout {q})\\n    (lookup : backend.regularLayout {q} {n} = some layout)\\n    (runs : {relation} backend hashModel params index {inputs} ciphertext)\\n    (augmented : secret 0 1 = 1)\\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget)\\n    (decomposed : MxxRuntime.gadgetDecomposeRuns backend {base} {digits} ciphertext decomposition)\\n    (online : output = input * decomposition)\\n    (encoded : input = mask * publicKey - message \u2022 (secret * gadget) + reduceMatrix {q} {n} 1 {columns} inputError)\\n    (messageLift : message = reducePoly {q} {n} messageInteger)\\n    (messageBound : polynomialL1 messageInteger \u2264 1)\\n    (inputBounded : CoeffBound inputError inputBound) :\\n    Approx output (mask * (publicKey * decomposition) - (message * payload 0 0) \u2022 (secret * gadget))\\n      (denseRegularGain layout {n} 2 * inputBound + {cutoff}) := by\\n  obtain \u27e8other, error, action, hg, ha, hgain, hcache, hb\u27e9 := selector_cache_{count} layout lookup runs augmented decomposed\\n  have same : other = gadget := gadget_runs_deterministic hg gadgetRuns\\n  subst other\\n  rw [ha] at hcache\\n  rw [online, ha]\\n  exact private_encoding_transfer_sampled (by decide) encoded hcache messageLift messageBound inputBounded hb hgain\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 263,
+      "template": "\"theorem root_secret_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {parameter_type}}} {{input : {input_type}}} {{output : {output_type}}}\\n    (runs : {root_relation} backend hashModel params input output) :\\n    \u2203 secret : ErrorMatrix {n} 1 2, reduceMatrix {q} {n} 1 2 secret = ({secret}) \u2227\\n      (\u2200 i, ((secret 0 0).coeff i).natAbs \u2264 1) \u2227 secret 0 1 = 1 := by\\n  obtain \u27e8witness, facts\u27e9 := runs\\n  have sample := facts{sample_path}.1\\n  have concat := facts{concat_path}.1\\n  have outputEquation := facts{output_path}\\n  rw [outputEquation]\\n  exact augmented_secret_of_sample _ _ _ sample concat (by rfl)\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 274,
+      "template": "\"theorem root_selector_setup_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {parameter_type}}} {{input : {input_type}}} {{output : {output_type}}}\\n    (runs : {root_relation} backend hashModel params input output) :\\n    ({secret}) 0 1 = 1 \u2227\\n    \u2200 i, \u2203 gadget : ExactMatrix {q} {n} 2 {columns}, \u2203 error : ErrorMatrix {n} 1 {columns},\\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget \u2227\\n      ({secret}) * (({family}) i) = (({payload}) i 0 0) \u2022 (({secret}) * gadget) + reduceMatrix {q} {n} 1 {columns} error \u2227\\n      CoeffBound error ({cutoff} : Nat) := by\\n  obtain \u27e8witness, facts\u27e9 := runs\\n  have concat := facts{concat_path}.1\\n  have family := facts{family_path}.1\\n  have outputEquation := facts{output_path}\\n  have augmented := augmented_source_last concat (by rfl)\\n  rw [outputEquation]\\n  refine \u27e8augmented, ?_\u27e9\\n  intro i\\n  exact selector_setup_{count} (family i) augmented\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 366,
+      "template": "\"theorem encoding_input_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {}.Params}} {{index : Nat}}\\n    {{message : ExactMatrix {q} {n} 1 1}} {{secret : ExactMatrix {q} {n} 1 2}}\\n    {{action : ExactMatrix {q} {n} {columns} {columns}}} {{output : ExactMatrix {q} {n} 1 {columns}}}\\n    (runs : {relation} backend hashModel params index {inputs} output) :\\n    \u2203 gadget : ExactMatrix {q} {n} 2 {columns}, \u2203 error : ErrorMatrix {n} 1 {columns},\\n      MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget \u2227\\n      output = secret * (gadget * action) - (message 0 0) \u2022 (secret * gadget) + reduceMatrix {q} {n} 1 {columns} error \u2227\\n      CoeffBound error ({cutoff} : Nat) := by\\n  rcases runs with \u27e8gadget, sample, hg, he, ho\u27e9\\n  obtain \u27e8error, herror, hb\u27e9 := gaussian_error_witness he\\n  refine \u27e8gadget, error, hg, ?_, hb\u27e9\\n  rw [ho, \u2190 herror, \u2190 Matrix.mul_assoc]\\n  ext row column\\n  have hr : row = 0 := Subsingleton.elim _ _\\n  subst row\\n  rfl\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 431,
+      "template": "\"theorem root_decomposition_family_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {parameter_type}}} {{input : {input_type}}} {{output : {output_type}}}\\n    (layout : MxxRuntime.RegularLayout {q})\\n    (lookup : backend.regularLayout {q} {n} = some layout)\\n    (runs : {relation} backend hashModel params input output) :\\n    \u2200 i : Fin {lanes}, \u2203 action : ErrorMatrix {n} {rows} {columns},\\n      ({projection}) i = reduceMatrix {q} {n} {rows} {columns} action \u2227\\n      ActionGain action (denseRegularGain layout {n} {target_rows}) := by\\n  obtain \u27e8witness, facts\u27e9 := runs\\n  have family := facts{family_path}.1\\n  have outputEquation := facts{output_path}\\n  rw [outputEquation]\\n  intro i\\n  obtain \u27e8decomposition, hd, ho\u27e9 := family i\\n  obtain \u27e8action, equation, bounded\u27e9 := gadgetDecomposeRuns_dense_gain layout lookup (by decide) (by decide) hd\\n  exact \u27e8action, ho.trans equation, bounded\u27e9\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/scopes.rs",
+      "line": 473,
+      "template": "\"theorem root_decomposition_{count} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\\n    {{params : {parameter_type}}} {{input : {input_type}}} {{output : {output_type}}}\\n    (layout : MxxRuntime.RegularLayout {q})\\n    (lookup : backend.regularLayout {q} {n} = some layout)\\n    (runs : {relation} backend hashModel params input output) :\\n    \u2203 action : ErrorMatrix {n} {rows} {columns},\\n      {projection} = reduceMatrix {q} {n} {rows} {columns} action \u2227\\n      ActionGain action (denseRegularGain layout {n} {target_rows}) := by\\n{witness_tactic}{fact_tactic}  obtain \u27e8action, equation, bounded\u27e9 := gadgetDecomposeRuns_dense_gain layout lookup (by decide) (by decide) fact_{last_constraint}\\n  refine \u27e8action, ?_, bounded\u27e9\\n  rw [outputEquation]\\n  exact equation\\n\\n\",",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/trace.rs",
+      "line": 66,
+      "template": "theorem dimension : ringDimension = stride * width := by decide",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/trace.rs",
+      "line": 67,
+      "template": "theorem width_power : width = 2 ^ widthLog := by decide",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/trace.rs",
+      "line": 68,
+      "template": "theorem all_odd : \u2200 i, Odd (indices i) := by decide",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/trace.rs",
+      "line": 69,
+      "template": "theorem indices_valid : \u2200 i, 0 < indices i \u2227 indices i < 2 * ringDimension := by decide",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/trace.rs",
+      "line": 70,
+      "template": "theorem index_correspondence : \u2200 i, indices i % (2 * width) =",
+      "replacement": null
+    },
+    {
+      "path": "crates/exponent-lut/src/lean/trace.rs",
+      "line": 72,
+      "template": "theorem identity_index : indices \u27e80, by decide\u27e9 = 1 := by decide",
+      "replacement": null
+    }
+  ],
+  "counting_contract": "Line counts exclude complete cfg(test) module bodies and GPU fixture files, never stop at test-only imports. Other test-only items, imports, blank lines, and comments remain in this conservative size measurement. Public type inventory includes restricted visibility and test fixture declarations; final report separates exported API from private items."
+}

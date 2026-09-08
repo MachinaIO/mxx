@@ -1,9 +1,31 @@
 import ExponentAutomorphism
 import ExponentTransfers
+import ExponentRefreshRoutes
 
 namespace MxxExponentLut
 open Mxx.Primitives
 open scoped BigOperators
+
+/-- One balanced level preserves each segment's sum. The executed odd-tail
+branch carries its left member unchanged, so the wrapped right read contributes
+nothing. Flat graph families instantiate these functions with their segment offsets. -/
+theorem segmented_pairwise_sum {A : Type} [AddCommMonoid A] {segments width : Nat}
+    (values : Fin segments → Fin width → A)
+    (pairs : Fin segments → Fin ((width + 1) / 2) → A)
+    (equation : ∀ segment i, pairs segment i =
+      if hright : 2 * i.val + 1 < width then
+        values segment ⟨2 * i.val, by omega⟩ +
+          values segment ⟨2 * i.val + 1, hright⟩
+      else values segment ⟨2 * i.val, by omega⟩) :
+    ∀ segment, ∑ i, pairs segment i = ∑ j, values segment j := by
+  intro segment
+  apply pairwise_sum (values segment) (pairs segment)
+  intro i
+  have hleft : 2 * i.val < width := by omega
+  rw [equation]
+  by_cases hright : 2 * i.val + 1 < width
+  · simp [hleft, hright]
+  · simp [hleft, hright]
 
 /-- Deterministic aggregation retains the actual modular error witnesses. -/
 theorem approximate_sum {q n rows columns : Nat} {α : Type} [DecidableEq α]

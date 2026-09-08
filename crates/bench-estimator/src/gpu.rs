@@ -900,6 +900,25 @@ impl GpuNodeMeasurementBackend {
         request: &PendingMeasurement,
     ) -> Result<NodeMeasurement, GpuMeasurementError> {
         let Some(total_columns) = Self::request_columns(request) else {
+            // A full-shape operation can be the first measured request. Its
+            // synthetic operands still use the fleet's column allocator; do
+            // not inherit an unrelated earlier request's active width.
+            let columns = request
+                .concrete_argument_types
+                .iter()
+                .chain(&request.concrete_output_types)
+                .filter_map(Self::matrix_columns)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            self.workers[0].backend.set_column_widths_for_operation(
+                request.key,
+                GpuColumnWidths { gpu0: columns, nonzero: None },
+            );
+            self.workers[0]
+                .backend
+                .select_operation(request.key)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?;
             let representative = RepresentativeMeasurement {
                 kind: request.kind.clone(),
                 concrete_argument_types: request.concrete_argument_types.clone(),
@@ -1448,6 +1467,8 @@ impl GpuNodeMeasurementBackend {
             NodeKind::RingAutomorphism { .. } |
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredExtend { .. } |
+            NodeKind::BlockModSwitch { .. } |
             NodeKind::MatrixNegate => {
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) |
@@ -2387,6 +2408,27 @@ impl GpuNodeMeasurementBackend {
                                 backend.modulus_switch(source, &destination)
                             } else {
                                 backend.reduce_modulus(source, &destination)
+                            }
+                            .map_err(backend_error)
+                        })
+                        .collect(),
+                )
+            }
+            NodeKind::CenteredExtend { .. } | NodeKind::BlockModSwitch { .. } => {
+                let destination = output_matrix_type()?;
+                let plaintext_modulus = match node.kind {
+                    NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
+                        Some(evaluate_usize(plaintext_modulus)? as u64)
+                    }
+                    _ => None,
+                };
+                matrix_outputs(
+                    (0..batch_size)
+                        .map(|_| {
+                            let source = matrix(0)?;
+                            match plaintext_modulus {
+                                Some(t) => backend.block_mod_switch(source, &destination, t),
+                                None => backend.centered_extend(source, &destination),
                             }
                             .map_err(backend_error)
                         })
@@ -3375,6 +3417,60 @@ mod tests {
             .expect("cache key");
 
         assert_eq!(first_key, second_key);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_full_shape_measurement_initializes_its_operand_width() {
+        let high = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let low = high.select_modulus(&131_041u32.into()).unwrap();
+        let matrix = |p: &GpuDCRTPolyParams| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                rows: 1,
+                columns: 1,
+                ring_dimension: 4,
+                modulus: BigInt::from(p.modulus().as_ref().clone()),
+            })
+        };
+        let request = PendingMeasurement {
+            scope: FrozenGraphScopeId::Root,
+            id: NodeId(0),
+            kind: NodeKind::CenteredExtend {
+                modulus: BigInt::from(high.modulus().as_ref().clone()).into(),
+            },
+            concrete_argument_types: vec![matrix(&low)],
+            concrete_output_types: vec![matrix(&high)],
+            bindings: ParamEnv::default(),
+            key: [93; 32],
+            preimage_sample: false,
+        };
+        assert!(GpuNodeMeasurementBackend::request_columns(&request).is_none());
+        let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let workers = devices
+            .into_iter()
+            .map(|device| {
+                (
+                    mxx_runtime::backend::poly::gpu::gpu_backend_on(
+                        [low.clone(), high.clone()],
+                        [device],
+                    ),
+                    device,
+                )
+            })
+            .collect();
+        drop(low);
+        drop(high);
+        let mut backend = GpuNodeMeasurementBackend::new(
+            workers,
+            crate::harness::MeasurementHarnessConfig {
+                warm_up_iterations: 1,
+                measured_iterations: 1,
+                ..Default::default()
+            },
+        );
+        let report = backend.measure_fleet_request(&request).unwrap();
+        assert!(report.work_seconds > 0.0);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::{
     types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId, Port, WireRef, WireType},
 };
 use num_bigint::BigInt;
+use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -712,6 +713,49 @@ fn validate_node(
                     scope,
                     node.id,
                     "modulus conversion requires a divisor ring; nearest switching requires odd moduli",
+                );
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]
+        }
+        NodeKind::CenteredExtend { modulus } | NodeKind::BlockModSwitch { modulus, .. } => {
+            require_arity(scope, node, 1)?;
+            let input = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => matrix.clone(),
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "exact RNS conversion requires an ordinary matrix",
+                    )
+                }
+            };
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::one() ||
+                input.modulus <= BigInt::one() ||
+                modulus.is_even() ||
+                input.modulus.is_even()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "exact RNS conversion requires odd moduli greater than one",
+                );
+            }
+            let valid = if let NodeKind::BlockModSwitch { plaintext_modulus, .. } = node.kind {
+                let t = plaintext_modulus.evaluate(env)?;
+                t >= 1.into() &&
+                    t.to_u64().is_some() &&
+                    t.gcd(&input.modulus).is_one() &&
+                    modulus < input.modulus &&
+                    (&input.modulus % &modulus).is_zero()
+            } else {
+                (&modulus % &input.modulus).is_zero()
+            };
+            if !valid {
+                return node_error(
+                    scope,
+                    node.id,
+                    "invalid exact RNS modulus inclusion or plaintext modulus",
                 );
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]

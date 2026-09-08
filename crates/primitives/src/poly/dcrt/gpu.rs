@@ -296,9 +296,11 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_convert_modulus(
         out: *mut GpuMatrixOpaque,
         source: *const GpuMatrixOpaque,
-        round_scale: c_int,
+        conversion: c_int,
         division_inverses: *const u64,
         inverse_count: usize,
+        plaintext_modulus: u64,
+        input_scales: *const u64,
     ) -> c_int;
     pub(crate) fn gpu_matrix_crt_recompose(
         out: *mut GpuMatrixOpaque,

@@ -20,7 +20,9 @@ def ProgramState.Invariant {q n secret columns : Nat}
   Approx state.ciphertext (state.mask * state.publicKey -
     state.message • (state.payload * gadget)) bound
 
-noncomputable def ProgramState.privateOutput {q n secret columns : Nat}
+/-- The optimized BGG identity LUT with an encrypted RHS. This proof node
+models the single branch action; it is not a separate Program opcode. -/
+noncomputable def ProgramState.identityLutOutput {q n secret columns : Nat}
     (state : ProgramState q n secret columns) (action : ErrorMatrix n columns columns)
     (rhs : ExactPoly q n) : ProgramState q n secret columns where
   ciphertext := state.ciphertext * reduceMatrix q n columns columns action
@@ -70,6 +72,21 @@ noncomputable def ProgramState.lutOutput {q n secret columns count : Nat}
   mask := state.mask
   payload := state.payload
 
+/-- The existing LUT derivation accepts fused coefficients directly. Its
+message is the table's linear map on the input/RHS product; no private-step
+proof or intermediate ciphertext is required. -/
+theorem ProgramState.fusedLut_message {q n secret columns count : Nat}
+    (state : ProgramState q n secret columns)
+    (index : Fin count → Nat) (hodd : ∀ i, Odd (index i))
+    (raw maskCipher : Fin count → ExactMatrix q n 1 columns)
+    (maskKey : Fin count → ExactMatrix q n secret columns)
+    (action helperAction : Fin count → ErrorMatrix n columns columns)
+    (coefficient : Fin count → ExactPoly q n) (rhs : ExactPoly q n) :
+    (state.lutOutput index hodd raw maskCipher maskKey action helperAction
+      (fun i => coefficient i * readoutAutomorphismHom (index i) (hodd i) rhs)).message =
+    ∑ i, readoutAutomorphismHom (index i) (hodd i) (state.message * rhs) * coefficient i := by
+  exact lut_fused_message index hodd state.message rhs coefficient
+
 /-- Proof structure consumed by extracted graph facts, not another evaluator.
 Each node contains primitive equations and recursive input proofs. The bound
 indices are the exact worst-case recurrences in `src/noise.rs`; no constructor
@@ -80,7 +97,7 @@ inductive ProgramDerivation {q n secret columns : Nat}
       (equation : state.ciphertext = state.mask * state.publicKey -
         state.message • (state.payload * gadget) + reduceMatrix q n 1 columns error)
       (bounded : CoeffBound error bound) : ProgramDerivation gadget state bound
-  | privateStep {state : ProgramState q n secret columns} {bound : Nat}
+  | identityLutStep {state : ProgramState q n secret columns} {bound : Nat}
       (previous : ProgramDerivation gadget state bound)
       (action : ErrorMatrix n columns columns) (rhs : ExactPoly q n)
       (sampledError : ErrorMatrix n 1 columns) (messageLift : ErrorPoly n) (gain cutoff : Nat)
@@ -89,7 +106,7 @@ inductive ProgramDerivation {q n secret columns : Nat}
       (lift : state.message = reducePoly q n messageLift)
       (monomial : polynomialL1 messageLift ≤ 1)
       (sampled : CoeffBound sampledError cutoff) (actionBound : ActionGain action gain) :
-      ProgramDerivation gadget (state.privateOutput action rhs) (gain * bound + cutoff)
+      ProgramDerivation gadget (state.identityLutOutput action rhs) (gain * bound + cutoff)
   | publicStep {privateState publicState : ProgramState q n secret columns}
       {privateBound publicBound : Nat}
       (privatePrevious : ProgramDerivation gadget privateState privateBound)
@@ -141,6 +158,55 @@ inductive ProgramDerivation {q n secret columns : Nat}
       (sharedPayload : ∀ i, (states i).payload = payload) :
       ProgramDerivation gadget (ProgramState.familyOutput states mask payload) (∑ i, bounds i)
 
+/-- Compose an identity LUT with a public multiplication using the actual scalar
+execution equation. Cached actions and both error contributions remain explicit. -/
+theorem program_private_public_transfer {q n secret columns : Nat}
+    {gadget : ExactMatrix q n secret columns}
+    {state publicState : ProgramState q n secret columns}
+    {bound publicBound privateGain publicGain cutoff : Nat}
+    (previous : ProgramDerivation gadget state bound)
+    (publicPrevious : ProgramDerivation gadget publicState publicBound)
+    (privateAction publicAction : ErrorMatrix n columns columns)
+    (rhs : ExactPoly q n) (sampledError : ErrorMatrix n 1 columns)
+    (messageLift publicLift : ErrorPoly n)
+    (cache : (state.payload * gadget) * reduceMatrix q n columns columns privateAction =
+      rhs • (state.payload * gadget) + reduceMatrix q n 1 columns sampledError)
+    (lift : state.message = reducePoly q n messageLift)
+    (monomial : polynomialL1 messageLift ≤ 1)
+    (sampleBound : CoeffBound sampledError cutoff)
+    (privateActionBound : ActionGain privateAction privateGain)
+    (shared : publicState.payload = state.mask)
+    (decomposition : gadget * reduceMatrix q n columns columns publicAction =
+      state.publicKey * reduceMatrix q n columns columns privateAction)
+    (publicMessageLift : publicState.message = reducePoly q n publicLift)
+    (publicMonomial : polynomialL1 publicLift ≤ 1)
+    (publicActionBound : ActionGain publicAction publicGain)
+    {actual current publicCipher : ExactMatrix q n 1 columns}
+    {privateCache publicCache : ExactMatrix q n columns columns}
+    {publicMessage : ExactPoly q n}
+    (currentEquation : state.ciphertext = current)
+    (publicCipherEquation : publicState.ciphertext = publicCipher)
+    (publicMessageEquation : publicState.message = publicMessage)
+    (privateCacheEquation : privateCache = reduceMatrix q n columns columns privateAction)
+    (publicCacheEquation : publicCache = reduceMatrix q n columns columns publicAction)
+    (actualEquation : actual = publicCipher * publicCache +
+      publicMessage • (current * privateCache)) :
+    ∃ result : ProgramState q n secret columns,
+      ProgramDerivation gadget result (privateGain * bound + cutoff + publicGain * publicBound) ∧
+      result.ciphertext = actual ∧
+      result.publicKey = publicState.publicKey * reduceMatrix q n columns columns publicAction ∧
+      result.message = publicState.message * (state.message * rhs) ∧
+      result.mask = publicState.mask ∧ result.payload = state.payload := by
+  have privateDerived := ProgramDerivation.identityLutStep previous privateAction rhs sampledError
+    messageLift privateGain cutoff cache lift monomial sampleBound privateActionBound
+  have derived := ProgramDerivation.publicStep privateDerived publicPrevious publicAction publicLift
+    publicGain shared decomposition publicMessageLift publicMonomial publicActionBound
+  refine ⟨_, derived, ?_, rfl, rfl, rfl, rfl⟩
+  dsimp [ProgramState.identityLutOutput, ProgramState.publicOutput]
+  rw [currentEquation, publicCipherEquation, publicMessageEquation,
+    ← privateCacheEquation, ← publicCacheEquation]
+  exact actualEquation.symm
+
 /-- Structural induction over actual primitive equations propagates the
 encoding invariant through scalar gates and every member of finite families. -/
 theorem ProgramDerivation.sound {q n secret columns : Nat} (hn : 0 < n)
@@ -149,7 +215,7 @@ theorem ProgramDerivation.sound {q n secret columns : Nat} (hn : 0 < n)
     state.Invariant gadget bound := by
   induction run with
   | input state error bound equation bounded => exact ⟨error, equation, bounded⟩
-  | privateStep previous action rhs sampledError messageLift gain cutoff cache lift monomial sampled actionBound ih =>
+  | identityLutStep previous action rhs sampledError messageLift gain cutoff cache lift monomial sampled actionBound ih =>
     obtain ⟨error, equation, bounded⟩ := ih
     exact private_encoding_transfer_sampled hn equation cache lift monomial bounded sampled actionBound
   | publicStep privatePrevious publicPrevious action messageLift gain shared decomposition lift monomial actionBound ihp ihu =>

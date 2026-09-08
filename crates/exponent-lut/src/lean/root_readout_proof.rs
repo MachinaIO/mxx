@@ -53,10 +53,10 @@ pub(super) fn root_readout_proof(
             .map(|(_, boundary)| boundary.wire)
             .ok_or_else(|| format!("missing readout ver boundary {suffix}"))
     };
-    let norm_suffix = "-readout-normalization-decomposition-0";
-    let target_suffix = "-readout-target-decomposition-0";
-    let switch_suffix = "-readout-helper-switch-family-0";
-    let helper_suffix = "-readout-helper-public-family-0";
+    let norm_suffix = "-readout-0.3";
+    let target_suffix = "-readout-0.0";
+    let switch_suffix = "-readout-0.1";
+    let helper_suffix = "-readout-0.2";
     let norm = verboundary(norm_suffix)?;
     let prenorm = preboundary(norm_suffix)?;
     let normalized = root

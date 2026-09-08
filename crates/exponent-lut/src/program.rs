@@ -194,6 +194,13 @@ pub struct ProgramLayout {
     pub ring_dimension_log2: u32,
 }
 
+impl ProgramLayout {
+    fn private_product_width(self, lhs: usize, rhs: usize) -> usize {
+        let native_width = 1usize << (self.ring_dimension_log2 - self.exponent.stride_log2);
+        lhs.saturating_mul(rhs).min(native_width)
+    }
+}
+
 /// Metadata for one externally bound RHS family.
 ///
 /// The width is the per-element domain. Runtime cardinality is supplied by a
@@ -220,7 +227,7 @@ struct WireFamilyDeclaration {
 /// flattened family without constructing a separate Rust graph body for each
 /// member. The view is runtime metadata; it is not part
 /// of the program identity or IR schema.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FamilyRange {
     start: IntExpr,
     count: IntExpr,
@@ -300,7 +307,7 @@ impl FamilyRange {
 ///
 /// Each invocation receives one contiguous active range. Callers that need
 /// the complete family can use [`FamilyRange::full`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProgramFamilyBindings {
     ranges: BTreeMap<ProgramFamilyId, FamilyRange>,
 }
@@ -365,10 +372,10 @@ impl LutSpec for LutTable {
 /// [`ProgramStep`], not by an additional cryptographic gate variant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Gate {
-    MulPrivate { lhs: WireId, rhs: RhsId, output: WireId },
     MulPublic { private: WireId, public: WireId, output: WireId },
     Add { lhs: WireId, rhs: WireId, output: WireId },
-    Lut { input: WireId, lut: LutId, output: WireId },
+    MulPrivate { lhs: WireId, rhs: RhsId, output: WireId },
+    Lut { input: WireId, rhs: Option<RhsId>, lut_id: LutId, output: WireId },
 }
 
 /// Source of an input wire in one indexed family body.
@@ -377,17 +384,13 @@ pub enum Gate {
 /// never requests `capacity` Rust clones. `Member` is the index-dependent
 /// element of an externally bound family at the current logical body index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum FamilyWireSource {
-    Broadcast(WireId),
-    Member(WireFamilyId),
+pub enum FamilySource<S, F> {
+    Broadcast(S),
+    Member(F),
 }
 
-/// Source of an RHS input in one indexed family body. `Member` denotes the
-/// index-dependent element of an externally bound RHS family.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum FamilyRhsSource {
-    Member(RhsFamilyId),
-}
+pub type FamilyWireSource = FamilySource<WireId, WireFamilyId>;
+pub type FamilyRhsSource = FamilySource<RhsId, RhsFamilyId>;
 
 /// Validated local SSA body evaluated once per active family member.
 ///
@@ -419,6 +422,41 @@ impl FamilyProgram {
     pub fn rhs_inputs(&self) -> &BTreeMap<RhsId, FamilyRhsSource> {
         &self.rhs_inputs
     }
+    /// Resolve local ports from enclosing captures and indexed member bindings.
+    /// Graph callers index members inside their single body scope; symbolic
+    /// callers retain their source identities. Neither needs a second traversal
+    /// of the body's reference declarations in a scheme adapter.
+    pub(crate) fn bind_inputs<W, R, E>(
+        &self,
+        mut capture_wire: impl FnMut(WireId) -> Result<W, E>,
+        mut member_wire: impl FnMut(WireFamilyId) -> Result<W, E>,
+        mut capture_rhs: impl FnMut(RhsId) -> Result<R, E>,
+        mut member_rhs: impl FnMut(RhsFamilyId) -> Result<R, E>,
+    ) -> Result<(BTreeMap<WireId, W>, BTreeMap<RhsId, R>), E> {
+        let wires = self
+            .wire_inputs
+            .iter()
+            .map(|(local, source)| {
+                let value = match source {
+                    FamilySource::Broadcast(id) => capture_wire(*id),
+                    FamilySource::Member(id) => member_wire(*id),
+                }?;
+                Ok((*local, value))
+            })
+            .collect::<Result<_, E>>()?;
+        let rhs = self
+            .rhs_inputs
+            .iter()
+            .map(|(local, source)| {
+                let value = match source {
+                    FamilySource::Broadcast(id) => capture_rhs(*id),
+                    FamilySource::Member(id) => member_rhs(*id),
+                }?;
+                Ok((*local, value))
+            })
+            .collect::<Result<_, E>>()?;
+        Ok((wires, rhs))
+    }
     pub fn gates(&self) -> &[Gate] {
         &self.gates
     }
@@ -449,6 +487,8 @@ pub enum ProgramStep {
 /// Errors returned while declaring or validating a program.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ProgramValidationError {
+    #[error("Program artifact: {0}")]
+    Artifact(String),
     #[error("program identifier has already been declared")]
     /// An automatically allocated identifier would collide with an existing declaration.
     DuplicateIdentifier,
@@ -551,6 +591,24 @@ impl ExponentLutProgram {
                 _ => None,
             })
             .collect()
+    }
+    /// Visits scalar gates and structural family body gates in declaration order.
+    /// Each family body is visited once; members and reduction operations are not expanded.
+    pub fn gate_instances(&self) -> impl Iterator<Item = (ProgramGateInstance, &Gate)> {
+        self.steps.iter().enumerate().flat_map(|(step, item)| {
+            let (gates, family) = match item {
+                ProgramStep::Gate(gate) => (std::slice::from_ref(gate), None),
+                ProgramStep::Family { id, body, .. } => (body.gates(), Some(*id)),
+            };
+            gates.iter().enumerate().map(move |(gate, value)| {
+                let instance = if let Some(family) = family {
+                    ProgramGateInstance::FamilyGate { step, gate, family }
+                } else {
+                    ProgramGateInstance::Gate { step }
+                };
+                (instance, value)
+            })
+        })
     }
     /// Returns structural family steps in deterministic declaration order.
     pub fn steps(&self) -> &[ProgramStep] {
@@ -712,7 +770,7 @@ impl ExponentLutProgramBuilder {
         let rhs_width_log2 = rhs_width.trailing_zeros();
         let ring_log2 =
             self.layout.ok_or(ProgramValidationError::MissingProgramLayout)?.ring_dimension_log2;
-        if exponent_scale_log2.saturating_add(rhs_width_log2.saturating_mul(2)) > ring_log2 {
+        if exponent_scale_log2.saturating_add(rhs_width_log2) > ring_log2 {
             return Err(ProgramValidationError::WidthMismatch);
         }
         if self.rhs_families.get(&family).map(|f| f.width) != Some(rhs_width) {
@@ -752,31 +810,50 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    /// Adds a single-layer LUT gate and returns its output wire.
+    /// Adds a table LUT, optionally combining an externally prepared RHS.
     pub fn lut<S: LutSpec>(
         &mut self,
         input: WireId,
         table: S,
+        rhs: Option<RhsId>,
     ) -> Result<WireId, ProgramValidationError> {
         let lut = table.resolve(self)?;
         let table = self.luts.get(&lut).ok_or(ProgramValidationError::UndefinedLut(lut))?.clone();
-        if table.rhs_width().is_some() || self.wire_width(input)? != table.input_width() {
+        validate_binary_lut_layout(self.layout, &table)?;
+        let mut output_type =
+            *self.wire_types.get(&input).ok_or(ProgramValidationError::UndefinedWire(input))?;
+        if self.wire_width(input)? != table.input_width() {
             return Err(ProgramValidationError::WidthMismatch);
+        }
+        match rhs {
+            Some(rhs) => {
+                let declaration = self
+                    .rhs_inputs
+                    .get(&rhs)
+                    .ok_or(ProgramValidationError::UndefinedRhsInput(rhs))?;
+                if declaration.lhs_width != table.input_width() ||
+                    table.rhs_width() != Some(declaration.rhs_width)
+                {
+                    return Err(ProgramValidationError::WidthMismatch);
+                }
+                if declaration.plaintext_knowledge == AttributeKnowledge::Private {
+                    output_type.knowledge = AttributeKnowledge::Private;
+                }
+            }
+            None if table.rhs_width().is_some() => {
+                return Err(ProgramValidationError::WidthMismatch)
+            }
+            None => {}
         }
         let output = WireId::from_index(self.wires.len());
         self.wires.insert(output, table.output_width());
-        let input_type = self
-            .wire_types
-            .get(&input)
-            .copied()
-            .ok_or(ProgramValidationError::UndefinedWire(input))?;
-        self.wire_types.insert(output, input_type);
-        self.steps.push(ProgramStep::Gate(Gate::Lut { input, lut, output }));
+        self.wire_types.insert(output, output_type);
+        self.steps.push(ProgramStep::Gate(Gate::Lut { input, rhs, lut_id: lut, output }));
         Ok(output)
     }
 
     /// Adds a private multiplication with an explicitly declared RHS package.
-    pub fn mul_private(
+    pub fn private_mul(
         &mut self,
         lhs: WireId,
         rhs: RhsId,
@@ -790,9 +867,10 @@ impl ExponentLutProgramBuilder {
         if lhs_width != rhs_decl.lhs_width {
             return Err(ProgramValidationError::WidthMismatch);
         }
-        let output_width = lhs_width
-            .checked_mul(rhs_decl.rhs_width)
-            .ok_or(ProgramValidationError::WidthMismatch)?;
+        let layout = self.layout.ok_or(ProgramValidationError::MissingProgramLayout)?;
+        // Direct ring multiplication may wrap in the signed native domain.
+        // Packed binary LUTs validate their separate table extent at the LUT gate.
+        let output_width = layout.private_product_width(lhs_width, rhs_decl.rhs_width);
         let output = WireId::from_index(self.wires.len());
         self.wires.insert(output, output_width);
         let lhs_type =
@@ -878,38 +956,6 @@ impl ExponentLutProgramBuilder {
         );
         self.steps.push(ProgramStep::Gate(Gate::Add { lhs, rhs, output }));
         Ok(output)
-    }
-
-    /// Adds a two-input LUT as `MulPrivate` followed by `Lut`.
-    pub fn lut2<S: LutSpec>(
-        &mut self,
-        lhs: WireId,
-        rhs: RhsId,
-        table: S,
-    ) -> Result<WireId, ProgramValidationError> {
-        let lut = table.resolve(self)?;
-        let table = self.luts.get(&lut).ok_or(ProgramValidationError::UndefinedLut(lut))?.clone();
-        let rhs_decl = self
-            .rhs_inputs
-            .get(&rhs)
-            .ok_or(ProgramValidationError::UndefinedRhsInput(rhs))?
-            .clone();
-        if table.rhs_width() != Some(rhs_decl.rhs_width) ||
-            table.input_width() != rhs_decl.lhs_width ||
-            self.wire_width(lhs)? != rhs_decl.lhs_width
-        {
-            return Err(ProgramValidationError::WidthMismatch);
-        }
-        let fused = self.mul_private(lhs, rhs)?;
-        let bundled = LutTable::unary(
-            rhs_decl
-                .lhs_width
-                .checked_mul(rhs_decl.rhs_width)
-                .ok_or(ProgramValidationError::WidthMismatch)?,
-            table.output_width(),
-            table.values().to_vec(),
-        )?;
-        self.lut(fused, bundled)
     }
 
     /// Adds a validated selection-only one-hot gate for a selector-family
@@ -1068,7 +1114,7 @@ pub(crate) fn validate_builder(
             declaration.exponent_scale_log2 != layout.exponent.stride_log2 ||
             declaration
                 .exponent_scale_log2
-                .checked_add(declaration.rhs_width.trailing_zeros().saturating_mul(2))
+                .checked_add(declaration.rhs_width.trailing_zeros())
                 .map_or(true, |bound| bound > layout.ring_dimension_log2)
         {
             return Err(ProgramValidationError::WidthMismatch);
@@ -1096,117 +1142,10 @@ pub(crate) fn validate_builder(
         validate_table(table)?;
     }
     for step in &builder.steps {
-        if let ProgramStep::Gate(gate) = step {
-            validate_gate_output_type(builder, gate)?;
-            match gate {
-                Gate::MulPrivate { lhs, rhs, output } => {
-                    let lhs_width = builder.wire_width(*lhs)?;
-                    let rhs_input = builder
-                        .rhs_inputs
-                        .get(rhs)
-                        .ok_or(ProgramValidationError::UndefinedRhsInput(*rhs))?;
-                    let expected_width = lhs_width
-                        .checked_mul(rhs_input.rhs_width)
-                        .ok_or(ProgramValidationError::WidthMismatch)?;
-                    if lhs_width != rhs_input.lhs_width ||
-                        builder.wires.get(output).copied() != Some(expected_width)
-                    {
-                        return Err(ProgramValidationError::WidthMismatch);
-                    }
-                }
-                Gate::MulPublic { private, public, output } => {
-                    if builder.wire_width(*private)? != builder.wire_width(*public)? ||
-                        !builder.wires.contains_key(output)
-                    {
-                        return Err(ProgramValidationError::WidthMismatch);
-                    }
-                    if builder.wire_types.get(public).map(|ty| ty.knowledge) !=
-                        Some(AttributeKnowledge::Public)
-                    {
-                        return Err(ProgramValidationError::PublicAttributeRequired(*public));
-                    }
-                    if builder.wire_types.get(private).map(|ty| ty.stride_log2) !=
-                        builder.wire_types.get(public).map(|ty| ty.stride_log2)
-                    {
-                        return Err(ProgramValidationError::WidthMismatch);
-                    }
-                }
-                Gate::Add { lhs, rhs, output } => {
-                    if builder.wire_width(*lhs)? != builder.wire_width(*rhs)? ||
-                        !builder.wires.contains_key(output)
-                    {
-                        return Err(ProgramValidationError::WidthMismatch);
-                    }
-                    if builder.wire_types.get(lhs).map(|ty| ty.stride_log2) !=
-                        builder.wire_types.get(rhs).map(|ty| ty.stride_log2)
-                    {
-                        return Err(ProgramValidationError::WidthMismatch);
-                    }
-                }
-                Gate::Lut { input, lut, output } => {
-                    let width = builder.wire_width(*input)?;
-                    let table = builder.lut_definition(*lut)?;
-                    if table.input_width() != width || !builder.wires.contains_key(output) {
-                        return Err(ProgramValidationError::WidthMismatch);
-                    }
-                }
-            }
-        }
-    }
-    for step in &builder.steps {
         match step {
-            ProgramStep::Gate(gate) => {
-                validate_gate_output_type(builder, gate)?;
-                // Structural gates are validated by the same frozen rules as
-                // top-level gates; they are included for deserialized IR.
-                match gate {
-                    Gate::MulPrivate { lhs, rhs, output } => {
-                        let rhs_input = builder
-                            .rhs_inputs
-                            .get(rhs)
-                            .ok_or(ProgramValidationError::UndefinedRhsInput(*rhs))?;
-                        let lhs_width = builder.wire_width(*lhs)?;
-                        let expected_width = lhs_width
-                            .checked_mul(rhs_input.rhs_width)
-                            .ok_or(ProgramValidationError::WidthMismatch)?;
-                        if lhs_width != rhs_input.lhs_width ||
-                            builder.wires.get(output).copied() != Some(expected_width)
-                        {
-                            return Err(ProgramValidationError::WidthMismatch);
-                        }
-                    }
-                    Gate::MulPublic { private, public, output } => {
-                        if builder.wire_width(*private)? != builder.wire_width(*public)? ||
-                            builder.wire_types.get(public).map(|ty| ty.knowledge) !=
-                                Some(AttributeKnowledge::Public) ||
-                            builder.wire_types.get(private).map(|ty| ty.stride_log2) !=
-                                builder.wire_types.get(public).map(|ty| ty.stride_log2) ||
-                            !builder.wires.contains_key(output)
-                        {
-                            return Err(ProgramValidationError::WidthMismatch);
-                        }
-                    }
-                    Gate::Add { lhs, rhs, output } => {
-                        if builder.wire_width(*lhs)? != builder.wire_width(*rhs)? ||
-                            builder.wire_types.get(lhs).map(|ty| ty.stride_log2) !=
-                                builder.wire_types.get(rhs).map(|ty| ty.stride_log2) ||
-                            !builder.wires.contains_key(output)
-                        {
-                            return Err(ProgramValidationError::WidthMismatch);
-                        }
-                    }
-                    Gate::Lut { input, lut, output } => {
-                        if builder.wire_width(*input)? !=
-                            builder.lut_definition(*lut)?.input_width() ||
-                            !builder.wires.contains_key(output)
-                        {
-                            return Err(ProgramValidationError::WidthMismatch);
-                        }
-                    }
-                }
-            }
+            ProgramStep::Gate(gate) => validate_gate_output_type(builder, gate)?,
             ProgramStep::Family { capacity, body, output, .. } => {
-                if *capacity == 0 || !builder.wires.contains_key(output) {
+                if *capacity == 0 {
                     return Err(ProgramValidationError::WidthMismatch);
                 }
                 validate_family_program(builder, body, *output)?;
@@ -1225,31 +1164,56 @@ fn validate_gate_output_type(
 ) -> Result<(), ProgramValidationError> {
     let (output, expected_width, expected_type) = match gate {
         Gate::MulPrivate { lhs, rhs, output } => {
-            let lhs_type =
+            let width = builder.wire_width(*lhs)?;
+            let mut ty =
                 *builder.wire_types.get(lhs).ok_or(ProgramValidationError::UndefinedWire(*lhs))?;
-            let rhs_decl = builder
+            let rhs = builder
                 .rhs_inputs
                 .get(rhs)
                 .ok_or(ProgramValidationError::UndefinedRhsInput(*rhs))?;
-            let width = builder
-                .wire_width(*lhs)?
-                .checked_mul(rhs_decl.rhs_width)
-                .ok_or(ProgramValidationError::WidthMismatch)?;
-            (
-                *output,
-                width,
-                ProgramWireType {
-                    knowledge: if lhs_type.knowledge == AttributeKnowledge::Public &&
-                        rhs_decl.plaintext_knowledge == AttributeKnowledge::Public
-                    {
-                        AttributeKnowledge::Public
-                    } else {
-                        AttributeKnowledge::Private
-                    },
-                    ..lhs_type
-                },
-            )
+            if rhs.lhs_width != width {
+                return Err(ProgramValidationError::WidthMismatch);
+            }
+            if rhs.plaintext_knowledge == AttributeKnowledge::Private {
+                ty.knowledge = AttributeKnowledge::Private;
+            }
+            let layout = builder.layout.ok_or(ProgramValidationError::MissingProgramLayout)?;
+            let width = layout.private_product_width(width, rhs.rhs_width);
+            (*output, width, ty)
         }
+        Gate::Lut { input, rhs, lut_id, output } => {
+            let width = builder.wire_width(*input)?;
+            let mut ty = *builder
+                .wire_types
+                .get(input)
+                .ok_or(ProgramValidationError::UndefinedWire(*input))?;
+            let rhs_decl = rhs
+                .map(|rhs| {
+                    builder
+                        .rhs_inputs
+                        .get(&rhs)
+                        .ok_or(ProgramValidationError::UndefinedRhsInput(rhs))
+                })
+                .transpose()?;
+            if let Some(rhs_decl) = rhs_decl {
+                if rhs_decl.lhs_width != width {
+                    return Err(ProgramValidationError::WidthMismatch);
+                }
+                if rhs_decl.plaintext_knowledge == AttributeKnowledge::Private {
+                    ty.knowledge = AttributeKnowledge::Private;
+                }
+            }
+            let table = builder.lut_definition(*lut_id)?;
+            validate_binary_lut_layout(builder.layout, table)?;
+            if table.input_width() != width ||
+                table.rhs_width() != rhs_decl.map(|rhs| rhs.rhs_width)
+            {
+                return Err(ProgramValidationError::WidthMismatch);
+            }
+            let output_width = table.output_width();
+            (*output, output_width, ty)
+        }
+
         Gate::MulPublic { private, public, output } => {
             let private_type = *builder
                 .wire_types
@@ -1259,6 +1223,14 @@ fn validate_gate_output_type(
                 .wire_types
                 .get(public)
                 .ok_or(ProgramValidationError::UndefinedWire(*public))?;
+            if builder.wire_width(*private)? != builder.wire_width(*public)? ||
+                private_type.stride_log2 != public_type.stride_log2
+            {
+                return Err(ProgramValidationError::WidthMismatch);
+            }
+            if public_type.knowledge != AttributeKnowledge::Public {
+                return Err(ProgramValidationError::PublicAttributeRequired(*public));
+            }
             (
                 *output,
                 builder.wire_width(*private)?,
@@ -1279,6 +1251,11 @@ fn validate_gate_output_type(
                 *builder.wire_types.get(lhs).ok_or(ProgramValidationError::UndefinedWire(*lhs))?;
             let rhs_type =
                 *builder.wire_types.get(rhs).ok_or(ProgramValidationError::UndefinedWire(*rhs))?;
+            if builder.wire_width(*lhs)? != builder.wire_width(*rhs)? ||
+                lhs_type.stride_log2 != rhs_type.stride_log2
+            {
+                return Err(ProgramValidationError::WidthMismatch);
+            }
             (
                 *output,
                 builder.wire_width(*lhs)?,
@@ -1294,11 +1271,6 @@ fn validate_gate_output_type(
                 },
             )
         }
-        Gate::Lut { input, lut, output } => (
-            *output,
-            builder.lut_definition(*lut)?.output_width(),
-            *builder.wire_types.get(input).ok_or(ProgramValidationError::UndefinedWire(*input))?,
-        ),
     };
     if builder.wires.get(&output).copied() != Some(expected_width) ||
         builder.wire_types.get(&output).copied() != Some(expected_type)
@@ -1360,11 +1332,26 @@ fn family_program_output_type(
         }
         types.insert(*wire, wire_type);
     }
-    for source in body.rhs_inputs().values() {
-        let FamilyRhsSource::Member(family) = source;
-        if !builder.rhs_families.contains_key(family) {
-            return Err(ProgramValidationError::UndefinedRhsFamily(*family));
+    let rhs_attributes = |source: &FamilyRhsSource| match source {
+        FamilyRhsSource::Broadcast(id) => {
+            let declaration =
+                builder.rhs_inputs.get(id).ok_or(ProgramValidationError::UndefinedRhsInput(*id))?;
+            Ok((
+                Some(declaration.lhs_width),
+                declaration.rhs_width,
+                declaration.plaintext_knowledge,
+            ))
         }
+        FamilyRhsSource::Member(id) => {
+            let declaration = builder
+                .rhs_families
+                .get(id)
+                .ok_or(ProgramValidationError::UndefinedRhsFamily(*id))?;
+            Ok((None, declaration.width, declaration.plaintext_knowledge))
+        }
+    };
+    for source in body.rhs_inputs().values() {
+        rhs_attributes(source)?;
     }
     for gate in body.gates() {
         let (output, width, wire_type) = match gate {
@@ -1372,21 +1359,28 @@ fn family_program_output_type(
                 let lhs_width = *widths.get(lhs).ok_or(ProgramValidationError::WidthMismatch)?;
                 let source =
                     body.rhs_inputs().get(rhs).ok_or(ProgramValidationError::WidthMismatch)?;
-                let FamilyRhsSource::Member(family) = source;
-                let rhs = builder
-                    .rhs_families
-                    .get(family)
-                    .ok_or(ProgramValidationError::UndefinedRhsFamily(*family))?;
-                if lhs_width != rhs.width {
-                    return Err(ProgramValidationError::WidthMismatch);
-                }
+                let (declared_lhs, rhs_width, rhs_knowledge) = rhs_attributes(source)?;
+                let output_width = if let Some(declared_lhs) = declared_lhs {
+                    if lhs_width != declared_lhs {
+                        return Err(ProgramValidationError::WidthMismatch);
+                    }
+                    builder
+                        .layout
+                        .ok_or(ProgramValidationError::MissingProgramLayout)?
+                        .private_product_width(lhs_width, rhs_width)
+                } else {
+                    if lhs_width != rhs_width {
+                        return Err(ProgramValidationError::WidthMismatch);
+                    }
+                    lhs_width
+                };
                 let lhs_type = *types.get(lhs).ok_or(ProgramValidationError::WidthMismatch)?;
                 (
                     *output,
-                    lhs_width,
+                    output_width,
                     ProgramWireType {
                         knowledge: if lhs_type.knowledge == AttributeKnowledge::Public &&
-                            rhs.plaintext_knowledge == AttributeKnowledge::Public
+                            rhs_knowledge == AttributeKnowledge::Public
                         {
                             AttributeKnowledge::Public
                         } else {
@@ -1447,15 +1441,33 @@ fn family_program_output_type(
                     },
                 )
             }
-            Gate::Lut { input, lut, output } => {
+            Gate::Lut { input, lut_id: lut, rhs, output } => {
                 let input_width =
                     *widths.get(input).ok_or(ProgramValidationError::WidthMismatch)?;
-                let input_type = *types.get(input).ok_or(ProgramValidationError::WidthMismatch)?;
+                let mut input_type =
+                    *types.get(input).ok_or(ProgramValidationError::WidthMismatch)?;
                 let table =
                     builder.luts.get(lut).ok_or(ProgramValidationError::UndefinedLut(*lut))?;
-                validate_unary_table(table)?;
-                if input_width != table.input_width() {
+                validate_binary_lut_layout(builder.layout, table)?;
+                let rhs_decl = rhs
+                    .map(|id| {
+                        let source = body
+                            .rhs_inputs()
+                            .get(&id)
+                            .ok_or(ProgramValidationError::UndefinedRhsInput(id))?;
+                        rhs_attributes(source)
+                    })
+                    .transpose()?;
+                if input_width != table.input_width() ||
+                    table.rhs_width() != rhs_decl.map(|(_, width, _)| width) ||
+                    rhs_decl.is_some_and(|(lhs, _, _)| lhs.is_some_and(|lhs| lhs != input_width))
+                {
                     return Err(ProgramValidationError::WidthMismatch);
+                }
+                if rhs_decl
+                    .is_some_and(|(_, _, knowledge)| knowledge == AttributeKnowledge::Private)
+                {
+                    input_type.knowledge = AttributeKnowledge::Private;
                 }
                 (*output, table.output_width(), input_type)
             }
@@ -1468,6 +1480,20 @@ fn family_program_output_type(
     let output_width = *widths.get(&body.output()).ok_or(ProgramValidationError::WidthMismatch)?;
     let output_type = *types.get(&body.output()).ok_or(ProgramValidationError::WidthMismatch)?;
     Ok((output_width, output_type))
+}
+
+fn validate_binary_lut_layout(
+    layout: Option<ProgramLayout>,
+    table: &LutTable,
+) -> Result<(), ProgramValidationError> {
+    let layout = layout.ok_or(ProgramValidationError::MissingProgramLayout)?;
+    if table.rhs_width().is_some_and(|width| {
+        layout.exponent.stride_log2.saturating_add(width.trailing_zeros().saturating_mul(2)) >
+            layout.ring_dimension_log2
+    }) {
+        return Err(ProgramValidationError::WidthMismatch);
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationError> {
@@ -1496,15 +1522,117 @@ pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationEr
 use std::error::Error;
 
 /// Stable structural identity of one primitive-operation invocation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) enum ProgramGateInstance {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum ProgramGateInstance {
     Gate { step: usize },
-    FamilyGate { step: usize, gate: usize },
+    FamilyGate { step: usize, gate: usize, family: ProgramFamilyId },
     FamilyReduction { step: usize },
 }
 
+/// Scalar or structural-family storage for a Program value.
+///
+/// Scalar and indexed storage are a Program concern, including for fixed RHS
+/// operands. The payload types retain their cryptographic and phase identity;
+/// a family is never expanded into scalar values on the host.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProgramValue<S, F> {
+    Scalar(S),
+    Family(F),
+}
+
+impl<S, F> ProgramValue<S, F> {
+    pub fn scalar(&self) -> Option<&S> {
+        match self {
+            Self::Scalar(value) => Some(value),
+            Self::Family(_) => None,
+        }
+    }
+
+    pub fn as_ref(&self) -> ProgramValue<&S, &F> {
+        match self {
+            Self::Scalar(value) => ProgramValue::Scalar(value),
+            Self::Family(values) => ProgramValue::Family(values),
+        }
+    }
+}
+
+impl<S: Clone, F: Clone> ProgramValue<&S, &F> {
+    pub fn cloned(self) -> ProgramValue<S, F> {
+        match self {
+            Self::Scalar(value) => ProgramValue::Scalar(value.clone()),
+            Self::Family(values) => ProgramValue::Family(values.clone()),
+        }
+    }
+}
+
+impl<T: mxx_dsl::GraphValue> ProgramValue<T, mxx_dsl::Family<T>> {
+    /// Resolve an indexed operand without materializing a shared value.
+    /// Cloning a scalar reuses its graph handles and therefore its source.
+    pub fn at(&self, index: impl Into<mxx_dsl::Int>) -> T {
+        match self {
+            Self::Scalar(value) => value.clone(),
+            Self::Family(values) => values.at(index),
+        }
+    }
+
+    pub fn element_schema(&self) -> T::Schema {
+        match self {
+            Self::Scalar(value) => value.schema(),
+            Self::Family(values) => mxx_dsl::GraphValue::schema(values).element,
+        }
+    }
+}
+
+impl<S: mxx_dsl::GraphValue, F: mxx_dsl::GraphValue> mxx_dsl::GraphValue for ProgramValue<S, F> {
+    type Schema = ProgramValue<S::Schema, F::Schema>;
+
+    fn flatten(&self) -> Vec<mxx_ir_core::ValueHandle> {
+        match self {
+            Self::Scalar(value) => value.flatten(),
+            Self::Family(values) => values.flatten(),
+        }
+    }
+
+    fn schema(&self) -> Self::Schema {
+        match self {
+            Self::Scalar(value) => ProgramValue::Scalar(value.schema()),
+            Self::Family(values) => ProgramValue::Family(values.schema()),
+        }
+    }
+
+    fn from_values(
+        schema: &Self::Schema,
+        values: &[mxx_ir_core::ValueHandle],
+    ) -> Result<Self, mxx_dsl::DslError> {
+        match schema {
+            ProgramValue::Scalar(schema) => S::from_values(schema, values).map(Self::Scalar),
+            ProgramValue::Family(schema) => F::from_values(schema, values).map(Self::Family),
+        }
+    }
+}
+
+impl<S: mxx_dsl::GraphValueSchema, F: mxx_dsl::GraphValueSchema> mxx_dsl::GraphValueSchema
+    for ProgramValue<S, F>
+{
+    type Value = ProgramValue<S::Value, F::Value>;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        match self {
+            Self::Scalar(schema) => ProgramValue::Scalar(schema.placeholders_from(next)),
+            Self::Family(schema) => ProgramValue::Family(schema.placeholders_from(next)),
+        }
+    }
+
+    fn wire_types(&self) -> Vec<mxx_ir_core::types::WireType> {
+        match self {
+            Self::Scalar(schema) => schema.wire_types(),
+            Self::Family(schema) => schema.wire_types(),
+        }
+    }
+}
+
 /// Carrier and error types selected by an interpreter for one program scope.
-pub(crate) trait ProgramLoweringTypes {
+pub trait ProgramLoweringTypes {
     type Wire: Clone;
     type Rhs: Clone;
     type HelperSet;
@@ -1512,14 +1640,13 @@ pub(crate) trait ProgramLoweringTypes {
 }
 
 /// The four primitive exponent-program operations.
-pub(crate) trait ExponentProgramLowering: ProgramLoweringTypes {
-    fn mul_private(
-        &mut self,
-        lhs: &Self::Wire,
-        rhs: &Self::Rhs,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, Self::Error>;
-
+///
+/// Preparation must pair the interpreter with a Program of the same exponent
+/// layout and ring dimension. Bindings must provide public plaintext metadata
+/// for public inputs; operations must preserve that metadata whenever their
+/// output remains public. Lowering relies on these contracts without querying
+/// the interpreter again at entry or at each gate.
+pub trait ExponentProgramLowering: ProgramLoweringTypes {
     fn mul_public(
         &mut self,
         private: &Self::Wire,
@@ -1534,44 +1661,31 @@ pub(crate) trait ExponentProgramLowering: ProgramLoweringTypes {
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error>;
 
+    fn mul_private(
+        &mut self,
+        input: &Self::Wire,
+        rhs: &Self::Rhs,
+        material: Option<&Self::HelperSet>,
+        gate: ProgramGateInstance,
+    ) -> Result<Self::Wire, Self::Error>;
+
     fn lut(
         &mut self,
         program: &ExponentLutProgram,
         lut: LutId,
         input: &Self::Wire,
-        helpers: &Self::HelperSet,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, Self::Error>;
-
-    /// Returns the concrete layout committed by this interpreter, if any.
-    fn backend_layout(&self) -> Option<ProgramLayout> {
-        None
-    }
-
-    fn public_attribute_available(&self, wire: &Self::Wire) -> bool;
-
-    /// Creates a structural family view of one scalar.  Implementations must
-    /// not allocate or clone one value per declared capacity entry.
-    fn broadcast_wire(
-        &mut self,
-        wire: &Self::Wire,
-        range: &FamilyRange,
-    ) -> Result<Self::Wire, Self::Error>;
-
-    /// Sums only the active members of a structural family value.  Padding and
-    /// inactive capacity entries are never part of this reduction.
-    fn reduce_add(
-        &mut self,
-        value: &Self::Wire,
-        range: &FamilyRange,
+        helpers: Option<&Self::HelperSet>,
+        rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error>;
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ProgramLowerError<E: Error + Send + Sync + 'static> {
+pub enum ProgramLowerError<E: Error + Send + Sync + 'static> {
     #[error(transparent)]
     Validation(#[from] ProgramValidationError),
+    #[error(transparent)]
+    Graph(#[from] mxx_dsl::DslError),
     #[error("operation {gate:?}: {source}")]
     Operation {
         gate: ProgramGateInstance,
@@ -1584,24 +1698,30 @@ pub(crate) enum ProgramLowerError<E: Error + Send + Sync + 'static> {
 ///
 /// Each interpreter chooses its concrete wire, RHS, and helper carriers.
 /// Family values arrive already wrapped in those carrier types, so traversal
-/// never expands a family into host-side members.
-pub(crate) struct ProgramBindings<'a, W, R, H> {
-    pub(crate) inputs: &'a BTreeMap<ProgramInputId, W>,
-    pub(crate) rhs_inputs: &'a BTreeMap<RhsId, R>,
-    pub(crate) rhs_families: &'a BTreeMap<RhsFamilyId, R>,
-    pub(crate) wire_values: &'a BTreeMap<WireFamilyId, W>,
-    pub(crate) helpers: &'a BTreeMap<LutId, H>,
+/// never expands a family into host-side members. Inputs declared public must
+/// carry their public plaintext metadata. All values and prepared helpers must
+/// belong to the layout and scheme used to prepare this Program.
+pub struct ProgramBindings<'a, W, R, H, WF = W, RF = R> {
+    pub inputs: &'a BTreeMap<ProgramInputId, W>,
+    pub rhs_inputs: &'a BTreeMap<RhsId, R>,
+    pub rhs_families: &'a BTreeMap<RhsFamilyId, RF>,
+    pub wire_values: &'a BTreeMap<WireFamilyId, WF>,
+    pub helpers: &'a BTreeMap<LutId, H>,
+    /// Instance material takes precedence over reusable table-only material.
+    /// Fixed private-product material is bound to its operation instance here.
+    pub gate_helpers: Option<&'a BTreeMap<ProgramGateInstance, H>>,
 }
 
-impl<'a, W, R, H> ProgramBindings<'a, W, R, H> {
-    pub(crate) fn new(
+impl<'a, W, R, H, WF, RF> ProgramBindings<'a, W, R, H, WF, RF> {
+    pub fn new(
         inputs: &'a BTreeMap<ProgramInputId, W>,
         rhs_inputs: &'a BTreeMap<RhsId, R>,
-        rhs_families: &'a BTreeMap<RhsFamilyId, R>,
-        wire_values: &'a BTreeMap<WireFamilyId, W>,
+        rhs_families: &'a BTreeMap<RhsFamilyId, RF>,
+        wire_values: &'a BTreeMap<WireFamilyId, WF>,
         helpers: &'a BTreeMap<LutId, H>,
+        gate_helpers: Option<&'a BTreeMap<ProgramGateInstance, H>>,
     ) -> Self {
-        Self { inputs, rhs_inputs, rhs_families, wire_values, helpers }
+        Self { inputs, rhs_inputs, rhs_families, wire_values, helpers, gate_helpers }
     }
 }
 
@@ -1609,6 +1729,76 @@ type LoweringWire<B> = <B as ProgramLoweringTypes>::Wire;
 type LoweringRhs<B> = <B as ProgramLoweringTypes>::Rhs;
 type LoweringHelpers<B> = <B as ProgramLoweringTypes>::HelperSet;
 type LoweringError<B> = <B as ProgramLoweringTypes>::Error;
+
+/// One gate dispatch for root and indexed scopes; family construction remains
+/// structural in `lower_program`, and scheme operations own only arithmetic.
+pub(crate) fn lower_gate<B: ExponentProgramLowering>(
+    program: &ExponentLutProgram,
+    gate: &Gate,
+    at: ProgramGateInstance,
+    wires: &BTreeMap<WireId, B::Wire>,
+    rhs_inputs: &BTreeMap<RhsId, B::Rhs>,
+    helpers: (&BTreeMap<LutId, B::HelperSet>, Option<&BTreeMap<ProgramGateInstance, B::HelperSet>>),
+    backend: &mut B,
+) -> Result<(WireId, B::Wire), ProgramLowerError<B::Error>> {
+    let wire = |id: &WireId| wires.get(id).ok_or(ProgramValidationError::UndefinedWire(*id));
+    let rhs = |id: RhsId| rhs_inputs.get(&id).ok_or(ProgramValidationError::MissingRuntimeRhs(id));
+    let (output, value) = match gate {
+        Gate::MulPublic { private, public, output } => {
+            let public_value = wire(public)?;
+            (*output, backend.mul_public(wire(private)?, public_value, at))
+        }
+        Gate::Add { lhs, rhs: right, output } => {
+            (*output, backend.add(wire(lhs)?, wire(right)?, at))
+        }
+        Gate::MulPrivate { lhs, rhs: right, output } => {
+            let material = helpers.1.and_then(|helpers| helpers.get(&at));
+            (*output, backend.mul_private(wire(lhs)?, rhs(*right)?, material, at))
+        }
+        Gate::Lut { input, lut_id, rhs: right, output } => {
+            let helper = helpers
+                .1
+                .and_then(|helpers| helpers.get(&at))
+                .or_else(|| helpers.0.get(lut_id))
+                .ok_or(ProgramValidationError::MissingRuntimeLutHelpers(*lut_id))?;
+            (
+                *output,
+                backend.lut(
+                    program,
+                    *lut_id,
+                    wire(input)?,
+                    Some(helper),
+                    right.map(rhs).transpose()?,
+                    at,
+                ),
+            )
+        }
+    };
+    value
+        .map(|value| (output, value))
+        .map_err(|source| ProgramLowerError::Operation { gate: at, source })
+}
+
+/// Evaluate one SSA body after its captures and indexed inputs are resolved.
+/// Graph interpreters call this inside their structural scope; symbolic noise
+/// interpreters use the same gates without constructing graph values.
+pub(crate) fn lower_body<B: ExponentProgramLowering>(
+    program: &ExponentLutProgram,
+    step_index: usize,
+    family: ProgramFamilyId,
+    body: &FamilyProgram,
+    mut wires: BTreeMap<WireId, B::Wire>,
+    rhs_inputs: &BTreeMap<RhsId, B::Rhs>,
+    helpers: (&BTreeMap<LutId, B::HelperSet>, Option<&BTreeMap<ProgramGateInstance, B::HelperSet>>),
+    backend: &mut B,
+) -> Result<B::Wire, ProgramLowerError<B::Error>> {
+    for (gate_index, gate) in body.gates().iter().enumerate() {
+        let at = ProgramGateInstance::FamilyGate { step: step_index, gate: gate_index, family };
+        let (output, value) = lower_gate(program, gate, at, &wires, rhs_inputs, helpers, backend)?;
+        wires.insert(output, value);
+    }
+    wires.remove(&body.output()).ok_or_else(|| ProgramValidationError::InvalidOutput.into())
+}
 
 /// Resolves bindings and evaluates a frozen program through an opaque
 /// interpreter.  The program layer owns only SSA traversal and structural
@@ -1618,15 +1808,16 @@ pub(crate) fn lower_program<B>(
     bindings: &ProgramBindings<'_, LoweringWire<B>, LoweringRhs<B>, LoweringHelpers<B>>,
     family_ranges: &ProgramFamilyBindings,
     backend: &mut B,
+    mut reduce: impl FnMut(
+        &mut B,
+        &B::Wire,
+        &FamilyRange,
+        ProgramGateInstance,
+    ) -> Result<B::Wire, B::Error>,
 ) -> Result<BTreeMap<WireId, LoweringWire<B>>, ProgramLowerError<LoweringError<B>>>
 where
     B: ExponentProgramLowering,
 {
-    let program_layout = program.layout.ok_or(ProgramValidationError::MissingProgramLayout)?;
-    if backend.backend_layout().is_some_and(|layout| layout != program_layout) {
-        return Err(ProgramValidationError::WidthMismatch.into());
-    }
-
     let mut wires = BTreeMap::new();
     for (input_id, wire_id) in program.input_wires() {
         let value = bindings
@@ -1634,11 +1825,6 @@ where
             .get(input_id)
             .cloned()
             .ok_or(ProgramValidationError::MissingRuntimeInput(*input_id))?;
-        if program.wire_type(*wire_id).map(|ty| ty.knowledge) == Some(AttributeKnowledge::Public) &&
-            !backend.public_attribute_available(&value)
-        {
-            return Err(ProgramValidationError::PublicAttributeRequired(*wire_id).into());
-        }
         wires.insert(*wire_id, value);
     }
 
@@ -1646,66 +1832,15 @@ where
         match step {
             ProgramStep::Gate(gate) => {
                 let at = ProgramGateInstance::Gate { step: step_index };
-                let (output, value) = match gate {
-                    Gate::MulPrivate { lhs, rhs, output } => {
-                        let lhs =
-                            wires.get(lhs).ok_or(ProgramValidationError::UndefinedWire(*lhs))?;
-                        let rhs = bindings
-                            .rhs_inputs
-                            .get(rhs)
-                            .ok_or(ProgramValidationError::MissingRuntimeRhs(*rhs))?;
-                        let value = backend
-                            .mul_private(lhs, rhs, at)
-                            .map_err(|source| ProgramLowerError::Operation { gate: at, source })?;
-                        (*output, value)
-                    }
-                    Gate::MulPublic { private, public, output } => {
-                        let private = wires
-                            .get(private)
-                            .ok_or(ProgramValidationError::UndefinedWire(*private))?;
-                        let public_value = wires
-                            .get(public)
-                            .ok_or(ProgramValidationError::UndefinedWire(*public))?;
-                        if program.wire_type(*public).map(|ty| ty.knowledge) ==
-                            Some(AttributeKnowledge::Public) &&
-                            !backend.public_attribute_available(public_value)
-                        {
-                            return Err(
-                                ProgramValidationError::PublicAttributeRequired(*public).into()
-                            );
-                        }
-                        let value = backend
-                            .mul_public(private, public_value, at)
-                            .map_err(|source| ProgramLowerError::Operation { gate: at, source })?;
-                        (*output, value)
-                    }
-                    Gate::Add { lhs, rhs, output } => {
-                        let lhs =
-                            wires.get(lhs).ok_or(ProgramValidationError::UndefinedWire(*lhs))?;
-                        let rhs =
-                            wires.get(rhs).ok_or(ProgramValidationError::UndefinedWire(*rhs))?;
-                        let value = backend
-                            .add(lhs, rhs, at)
-                            .map_err(|source| ProgramLowerError::Operation { gate: at, source })?;
-                        (*output, value)
-                    }
-                    Gate::Lut { input, lut, output } => {
-                        let input = wires
-                            .get(input)
-                            .ok_or(ProgramValidationError::UndefinedWire(*input))?;
-                        validate_unary_table(
-                            program.lut(*lut).ok_or(ProgramValidationError::UndefinedLut(*lut))?,
-                        )?;
-                        let helpers = bindings
-                            .helpers
-                            .get(lut)
-                            .ok_or(ProgramValidationError::MissingRuntimeLutHelpers(*lut))?;
-                        let value = backend
-                            .lut(program, *lut, input, helpers, at)
-                            .map_err(|source| ProgramLowerError::Operation { gate: at, source })?;
-                        (*output, value)
-                    }
-                };
+                let (output, value) = lower_gate(
+                    program,
+                    gate,
+                    at,
+                    &wires,
+                    bindings.rhs_inputs,
+                    (bindings.helpers, bindings.gate_helpers),
+                    backend,
+                )?;
                 wires.insert(output, value);
             }
             ProgramStep::Family { id, capacity, body, output, .. } => {
@@ -1721,118 +1856,53 @@ where
                     return Err(ProgramValidationError::WidthMismatch.into());
                 }
 
-                let mut family_wires = BTreeMap::<WireId, LoweringWire<B>>::new();
-                for (wire_id, source) in body.wire_inputs() {
-                    let value = match source {
-                        FamilyWireSource::Broadcast(wire) => {
-                            let value = wires
-                                .get(wire)
-                                .ok_or(ProgramValidationError::UndefinedWire(*wire))?;
-                            backend.broadcast_wire(value, range).map_err(|source| {
-                                ProgramLowerError::Operation {
-                                    gate: ProgramGateInstance::FamilyReduction { step: step_index },
-                                    source,
-                                }
-                            })?
-                        }
-                        FamilyWireSource::Member(family) => bindings
+                let (family_wires, family_rhs) = body.bind_inputs(
+                    |wire| {
+                        let value =
+                            wires.get(&wire).ok_or(ProgramValidationError::UndefinedWire(wire))?;
+                        Ok::<_, ProgramLowerError<B::Error>>(value.clone())
+                    },
+                    |family| {
+                        bindings
                             .wire_values
-                            .get(family)
+                            .get(&family)
                             .cloned()
-                            .ok_or(ProgramValidationError::WidthMismatch)?,
-                    };
-                    family_wires.insert(*wire_id, value);
-                }
-                let mut family_rhs = BTreeMap::<RhsId, LoweringRhs<B>>::new();
-                for (rhs_id, source) in body.rhs_inputs() {
-                    let FamilyRhsSource::Member(family) = source;
-                    let value = bindings
-                        .rhs_families
-                        .get(family)
-                        .cloned()
-                        .ok_or(ProgramValidationError::WidthMismatch)?;
-                    family_rhs.insert(*rhs_id, value);
-                }
+                            .ok_or_else(|| ProgramValidationError::WidthMismatch.into())
+                    },
+                    |rhs| {
+                        bindings
+                            .rhs_inputs
+                            .get(&rhs)
+                            .cloned()
+                            .ok_or_else(|| ProgramValidationError::MissingRuntimeRhs(rhs).into())
+                    },
+                    |family| {
+                        bindings
+                            .rhs_families
+                            .get(&family)
+                            .cloned()
+                            .ok_or_else(|| ProgramValidationError::WidthMismatch.into())
+                    },
+                )?;
 
-                for (gate_index, gate) in body.gates().iter().enumerate() {
-                    let at = ProgramGateInstance::FamilyGate { step: step_index, gate: gate_index };
-                    let (local_output, value) = match gate {
-                        Gate::MulPrivate { lhs, rhs, output } => {
-                            let lhs = family_wires
-                                .get(lhs)
-                                .ok_or(ProgramValidationError::WidthMismatch)?;
-                            let rhs =
-                                family_rhs.get(rhs).ok_or(ProgramValidationError::WidthMismatch)?;
-                            let value = backend.mul_private(lhs, rhs, at).map_err(|source| {
-                                ProgramLowerError::Operation { gate: at, source }
-                            })?;
-                            (*output, value)
-                        }
-                        Gate::MulPublic { private, public, output } => {
-                            let private = family_wires
-                                .get(private)
-                                .ok_or(ProgramValidationError::WidthMismatch)?;
-                            let public = family_wires
-                                .get(public)
-                                .ok_or(ProgramValidationError::WidthMismatch)?;
-                            let value =
-                                backend.mul_public(private, public, at).map_err(|source| {
-                                    ProgramLowerError::Operation { gate: at, source }
-                                })?;
-                            (*output, value)
-                        }
-                        Gate::Add { lhs, rhs, output } => {
-                            let lhs = family_wires
-                                .get(lhs)
-                                .ok_or(ProgramValidationError::WidthMismatch)?;
-                            let rhs = family_wires
-                                .get(rhs)
-                                .ok_or(ProgramValidationError::WidthMismatch)?;
-                            let value = backend.add(lhs, rhs, at).map_err(|source| {
-                                ProgramLowerError::Operation { gate: at, source }
-                            })?;
-                            (*output, value)
-                        }
-                        Gate::Lut { input, lut, output } => {
-                            let input = family_wires
-                                .get(input)
-                                .ok_or(ProgramValidationError::WidthMismatch)?;
-                            validate_unary_table(
-                                program
-                                    .lut(*lut)
-                                    .ok_or(ProgramValidationError::UndefinedLut(*lut))?,
-                            )?;
-                            let helpers = bindings
-                                .helpers
-                                .get(lut)
-                                .ok_or(ProgramValidationError::MissingRuntimeLutHelpers(*lut))?;
-                            let value = backend.lut(program, *lut, input, helpers, at).map_err(
-                                |source| ProgramLowerError::Operation { gate: at, source },
-                            )?;
-                            (*output, value)
-                        }
-                    };
-                    family_wires.insert(local_output, value);
-                }
-                let value = family_wires
-                    .get(&body.output())
-                    .ok_or(ProgramValidationError::WidthMismatch)?;
+                let value = lower_body(
+                    program,
+                    step_index,
+                    *id,
+                    body,
+                    family_wires,
+                    &family_rhs,
+                    (bindings.helpers, bindings.gate_helpers),
+                    backend,
+                )?;
                 let at = ProgramGateInstance::FamilyReduction { step: step_index };
-                let reduced = backend
-                    .reduce_add(value, range, at)
+                let reduced = reduce(backend, &value, range, at)
                     .map_err(|source| ProgramLowerError::Operation { gate: at, source })?;
                 wires.insert(*output, reduced);
             }
         }
     }
     Ok(wires)
-}
-
-fn validate_unary_table(table: &LutTable) -> Result<(), ProgramValidationError> {
-    if table.rhs_width().is_some() {
-        return Err(ProgramValidationError::InvalidLutTable);
-    }
-    Ok(())
 }
 
 // Public artifact namespace.
@@ -1856,6 +1926,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gate_instances_cover_each_multiplication_and_family_body() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        builder.set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 2 }, 16).unwrap();
+        let private = builder
+            .input(1, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
+            .unwrap();
+        let public = builder
+            .input(4, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Public })
+            .unwrap();
+        let family = builder.rhs_family(4).unwrap();
+        let values = builder.wire_family(4).unwrap();
+        let rhs = builder.rhs_input(family, 1, 4).unwrap();
+        let first = builder.private_mul(builder.input_wire(private).unwrap(), rhs).unwrap();
+        let second = builder.mul_public(first, builder.input_wire(public).unwrap()).unwrap();
+        let selected = builder.select(second, family, values, 4).unwrap();
+        builder.output(selected).unwrap();
+        let program = builder.build().unwrap();
+        let instances = program.gate_instances().collect::<Vec<_>>();
+        assert_eq!(instances.len(), 4);
+        assert!(instances.iter().all(|(_, gate)| matches!(
+            gate,
+            crate::program::Gate::MulPrivate { .. } | crate::program::Gate::MulPublic { .. }
+        )));
+        assert!(instances.iter().any(|(instance, _)| matches!(
+            instance,
+            crate::program::ProgramGateInstance::FamilyGate { gate: 0, .. }
+        )));
+        assert!(instances.iter().any(|(instance, _)| matches!(
+            instance,
+            crate::program::ProgramGateInstance::FamilyGate { gate: 1, .. }
+        )));
+    }
+
+    #[test]
     fn binary_rhs_is_explicit_and_identity_is_canonical() {
         let mut builder = ExponentLutProgramBuilder::new();
         builder.set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 }, 16).unwrap();
@@ -1865,7 +1969,7 @@ mod tests {
         let family = builder.rhs_family(2).unwrap();
         let rhs = builder.rhs_input(family, 2, 2).unwrap();
         let lut = LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap();
-        let output = builder.lut2(builder.input_wire(lhs).unwrap(), rhs, lut).unwrap();
+        let output = builder.lut(builder.input_wire(lhs).unwrap(), lut, Some(rhs)).unwrap();
         builder.output(output).unwrap();
         let first = builder.build().unwrap();
 
@@ -1880,10 +1984,10 @@ mod tests {
         let rhs = second_builder.rhs_input(family, 2, 2).unwrap();
         let lut = LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap();
         let output =
-            second_builder.lut2(second_builder.input_wire(lhs).unwrap(), rhs, lut).unwrap();
+            second_builder.lut(second_builder.input_wire(lhs).unwrap(), lut, Some(rhs)).unwrap();
         second_builder.output(output).unwrap();
         assert_eq!(first.id(), second_builder.build().unwrap().id());
-        assert!(matches!(first.gates()[0], Gate::MulPrivate { rhs: RhsId(0), .. }));
+        assert!(matches!(first.gates()[0], Gate::Lut { lut_id: _, rhs: Some(RhsId(0)), .. }));
     }
 
     #[test]
@@ -1898,11 +2002,52 @@ mod tests {
             Err(ProgramValidationError::MissingProgramLayout)
         );
         builder.set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 }, 16).unwrap();
-        let output = builder
-            .lut(builder.input_wire(input).unwrap(), LutTable::unary(2, 2, vec![0, 1]).unwrap());
+        let output = builder.lut(
+            builder.input_wire(input).unwrap(),
+            LutTable::unary(2, 2, vec![0, 1]).unwrap(),
+            None,
+        );
         let output = output.unwrap();
         builder.output(output).unwrap();
         assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn native_private_product_preserves_the_full_signed_domain() {
+        for stride_log2 in [0, 1, 3] {
+            let width = 16 >> stride_log2;
+            let mut builder = ExponentLutProgramBuilder::new();
+            builder
+                .set_layout(
+                    crate::layout::ExpLayout { stride_log2, width_log2: 4 - stride_log2 },
+                    16,
+                )
+                .unwrap();
+            let input = builder
+                .input(
+                    width,
+                    ProgramWireType { stride_log2, knowledge: AttributeKnowledge::Private },
+                )
+                .unwrap();
+            let family = builder.rhs_family(width).unwrap();
+            let rhs = builder.rhs_input(family, width, width).unwrap();
+            let first = builder.private_mul(builder.input_wire(input).unwrap(), rhs).unwrap();
+            let second = builder.private_mul(first, rhs).unwrap();
+            assert_eq!(builder.wire_width(first).unwrap(), width);
+            assert_eq!(builder.wire_width(second).unwrap(), width);
+            // A direct native product is not an injective two-axis LUT packing.
+            assert_eq!(
+                builder.lut(
+                    first,
+                    LutTable::binary(width, width, width, vec![0; width * width]).unwrap(),
+                    Some(rhs),
+                ),
+                Err(ProgramValidationError::WidthMismatch)
+            );
+            builder.output(second).unwrap();
+            let program = builder.build().unwrap();
+            assert!(program.gates().iter().all(|gate| matches!(gate, Gate::MulPrivate { .. })));
+        }
     }
 
     #[test]
@@ -1915,7 +2060,7 @@ mod tests {
         let family = first.rhs_family(2).unwrap();
         let rhs = first.rhs_input(family, 2, 2).unwrap();
         assert_eq!(first.rhs_inputs.get(&rhs).map(|decl| decl.exponent_scale_log2), Some(0));
-        let output = first.mul_private(first.input_wire(input).unwrap(), rhs).unwrap();
+        let output = first.private_mul(first.input_wire(input).unwrap(), rhs).unwrap();
         first.output(output).unwrap();
         let first = first.build().unwrap();
 
@@ -1926,7 +2071,7 @@ mod tests {
             .unwrap();
         let family = second.rhs_family(2).unwrap();
         let rhs = second.rhs_input(family, 2, 2).unwrap();
-        let output = second.mul_private(second.input_wire(input).unwrap(), rhs).unwrap();
+        let output = second.private_mul(second.input_wire(input).unwrap(), rhs).unwrap();
         second.output(output).unwrap();
         let second = second.build().unwrap();
         assert_ne!(first.id(), second.id());
@@ -1935,8 +2080,8 @@ mod tests {
         rejected
             .set_layout(crate::layout::ExpLayout { stride_log2: 3, width_log2: 0 }, 16)
             .unwrap();
-        let family = rejected.rhs_family(2).unwrap();
-        assert_eq!(rejected.rhs_input(family, 2, 2), Err(ProgramValidationError::WidthMismatch));
+        let family = rejected.rhs_family(4).unwrap();
+        assert_eq!(rejected.rhs_input(family, 2, 4), Err(ProgramValidationError::WidthMismatch));
 
         // A declaration made under m=0 must not survive a later final
         // layout change to m=3.  The declaration stores its committed scale,
@@ -1950,7 +2095,7 @@ mod tests {
         let input = changed
             .input(2, ProgramWireType { stride_log2: 3, knowledge: AttributeKnowledge::Private })
             .unwrap();
-        let output = changed.mul_private(changed.input_wire(input).unwrap(), rhs).unwrap();
+        let output = changed.private_mul(changed.input_wire(input).unwrap(), rhs).unwrap();
         changed.output(output).unwrap();
         assert!(matches!(changed.build(), Err(ProgramValidationError::WidthMismatch)));
     }
@@ -1969,7 +2114,7 @@ mod tests {
         let rhs = builder.rhs_input(family, 2, 2).unwrap();
         let private_wire = builder.input_wire(private).unwrap();
         let public_wire = builder.input_wire(public).unwrap();
-        let _fused = builder.mul_private(private_wire, rhs).unwrap();
+        let _fused = builder.private_mul(private_wire, rhs).unwrap();
         let rejected = builder.mul_public(private_wire, private_wire);
         assert_eq!(rejected, Err(ProgramValidationError::PublicAttributeRequired(private_wire)));
         let product = builder.mul_public(public_wire, public_wire).unwrap();
@@ -1998,7 +2143,7 @@ mod tests {
             public_builder.rhs_family_with_knowledge(2, AttributeKnowledge::Public).unwrap();
         let public_rhs = public_builder.rhs_input(public_family, 2, 2).unwrap();
         let public_product = public_builder
-            .mul_private(public_builder.input_wire(lhs).unwrap(), public_rhs)
+            .private_mul(public_builder.input_wire(lhs).unwrap(), public_rhs)
             .unwrap();
         public_builder.output(public_product).unwrap();
         let public_program = public_builder.build().unwrap();
@@ -2017,7 +2162,7 @@ mod tests {
         let private_family = private_builder.rhs_family(2).unwrap();
         let private_rhs = private_builder.rhs_input(private_family, 2, 2).unwrap();
         let private_product = private_builder
-            .mul_private(private_builder.input_wire(lhs).unwrap(), private_rhs)
+            .private_mul(private_builder.input_wire(lhs).unwrap(), private_rhs)
             .unwrap();
         private_builder.output(private_product).unwrap();
         let private_program = private_builder.build().unwrap();
@@ -2028,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn lut2_is_mul_private_then_lut_in_mandatory_order() {
+    fn binary_lut_is_one_gate_with_explicit_rhs() {
         let mut builder = ExponentLutProgramBuilder::new();
         builder.set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 }, 16).unwrap();
         let input = builder
@@ -2037,20 +2182,22 @@ mod tests {
         let family = builder.rhs_family(2).unwrap();
         let rhs = builder.rhs_input(family, 2, 2).unwrap();
         let output = builder
-            .lut2(
+            .lut(
                 builder.input_wire(input).unwrap(),
-                rhs,
                 LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap(),
+                Some(rhs),
             )
             .unwrap();
         builder.output(output).unwrap();
         let program = builder.build().unwrap();
-        assert!(matches!(program.gates()[0], Gate::MulPrivate { .. }));
-        assert!(matches!(program.gates()[1], Gate::Lut { .. }));
+        assert_eq!(program.gates().len(), 1);
+        assert!(
+            matches!(program.gates()[0], Gate::Lut { lut_id: _, rhs: Some(id), .. } if id == rhs)
+        );
     }
 
     #[test]
-    fn one_hot_selection_has_no_lut() {
+    fn one_hot_selection_uses_mul_private_without_registered_table() {
         let mut builder = ExponentLutProgramBuilder::new();
         builder.set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 }, 16).unwrap();
         let input = builder
@@ -2093,7 +2240,6 @@ mod tests {
         #[derive(Clone)]
         enum TestWire {
             Scalar(i32),
-            Broadcast(i32, usize, usize),
             Members(Vec<i32>),
             Active { values: Vec<i32>, start: usize },
         }
@@ -2101,7 +2247,10 @@ mod tests {
         enum TestRhs {
             Members,
         }
-        struct TestBackend;
+        struct TestBackend {
+            start: usize,
+            count: usize,
+        }
         impl ProgramLoweringTypes for TestBackend {
             type Wire = TestWire;
             type Rhs = TestRhs;
@@ -2109,17 +2258,6 @@ mod tests {
             type Error = crate::ExponentLutError;
         }
         impl ExponentProgramLowering for TestBackend {
-            fn mul_private(
-                &mut self,
-                lhs: &Self::Wire,
-                _rhs: &Self::Rhs,
-                _gate: ProgramGateInstance,
-            ) -> Result<Self::Wire, Self::Error> {
-                let TestWire::Broadcast(value, start, count) = lhs else {
-                    return Err(crate::ExponentLutError::InvalidSparseLwrBlock);
-                };
-                Ok(TestWire::Active { values: vec![*value; *count], start: *start })
-            }
             fn mul_public(
                 &mut self,
                 private: &Self::Wire,
@@ -2129,7 +2267,7 @@ mod tests {
                 let (TestWire::Active { values: private, start }, TestWire::Members(public)) =
                     (private, public)
                 else {
-                    return Err(crate::ExponentLutError::InvalidSparseLwrBlock);
+                    return Err(crate::ExponentLutError::InvalidLut);
                 };
                 Ok(TestWire::Active {
                     values: private
@@ -2148,49 +2286,39 @@ mod tests {
             ) -> Result<Self::Wire, Self::Error> {
                 unreachable!()
             }
+            fn mul_private(
+                &mut self,
+                input: &Self::Wire,
+                _: &Self::Rhs,
+                _: Option<&Self::HelperSet>,
+                _: ProgramGateInstance,
+            ) -> Result<Self::Wire, Self::Error> {
+                let TestWire::Scalar(value) = input else {
+                    return Err(crate::ExponentLutError::InvalidLut);
+                };
+                Ok(TestWire::Active { values: vec![*value; self.count], start: self.start })
+            }
             fn lut(
                 &mut self,
                 _program: &ExponentLutProgram,
                 _lut: LutId,
                 _input: &Self::Wire,
-                _helpers: &Self::HelperSet,
+                _helpers: Option<&Self::HelperSet>,
+                _: Option<&Self::Rhs>,
                 _gate: ProgramGateInstance,
             ) -> Result<Self::Wire, Self::Error> {
                 unreachable!()
             }
-            fn public_attribute_available(&self, _wire: &Self::Wire) -> bool {
-                true
-            }
-            fn broadcast_wire(
-                &mut self,
-                wire: &Self::Wire,
-                range: &FamilyRange,
-            ) -> Result<Self::Wire, Self::Error> {
-                let TestWire::Scalar(value) = wire else {
-                    return Err(crate::ExponentLutError::InvalidSparseLwrBlock);
-                };
-                let count = range
-                    .count()
-                    .evaluate(&mxx_ir_core::ParamEnv::default())
-                    .unwrap()
-                    .to_usize()
-                    .unwrap();
-                let start = range
-                    .start()
-                    .evaluate(&mxx_ir_core::ParamEnv::default())
-                    .unwrap()
-                    .to_usize()
-                    .unwrap();
-                Ok(TestWire::Broadcast(*value, start, count))
-            }
+        }
+        impl TestBackend {
             fn reduce_add(
                 &mut self,
-                value: &Self::Wire,
+                value: &TestWire,
                 _range: &FamilyRange,
                 _gate: ProgramGateInstance,
-            ) -> Result<Self::Wire, Self::Error> {
+            ) -> Result<TestWire, crate::ExponentLutError> {
                 let TestWire::Active { values, .. } = value else {
-                    return Err(crate::ExponentLutError::InvalidSparseLwrBlock);
+                    return Err(crate::ExponentLutError::InvalidLut);
                 };
                 Ok(TestWire::Scalar(values.iter().sum()))
             }
@@ -2212,10 +2340,18 @@ mod tests {
         let rhs_families = BTreeMap::from([(selectors, TestRhs::Members)]);
         let wire_families = BTreeMap::from([(values, TestWire::Members(vec![10, 20, 30, 40, 50]))]);
         let helpers = BTreeMap::new();
-        let bindings = ProgramBindings::new(&inputs, &rhs, &rhs_families, &wire_families, &helpers);
+        let bindings =
+            ProgramBindings::new(&inputs, &rhs, &rhs_families, &wire_families, &helpers, None);
         let mut ranges = ProgramFamilyBindings::new();
         ranges.bind(ProgramFamilyId::from_index(0), FamilyRange::bounded(3, 2, 4).unwrap());
-        let lowered = lower_program(&program, &bindings, &ranges, &mut TestBackend).unwrap();
+        let lowered = lower_program(
+            &program,
+            &bindings,
+            &ranges,
+            &mut TestBackend { start: 3, count: 2 },
+            TestBackend::reduce_add,
+        )
+        .unwrap();
         assert!(matches!(lowered[&output], TestWire::Scalar(92)));
     }
 
@@ -2233,7 +2369,7 @@ mod tests {
                 FamilyProgram::new(
                     BTreeMap::from([(input, FamilyWireSource::Member(members))]),
                     BTreeMap::new(),
-                    vec![Gate::Lut { input, lut, output: transformed }],
+                    vec![Gate::Lut { input, lut_id: lut, output: transformed, rhs: None }],
                     transformed,
                 )
                 .unwrap(),
@@ -2246,7 +2382,7 @@ mod tests {
         assert!(matches!(
             program.steps(),
             [ProgramStep::Family { body, .. }]
-                if matches!(body.gates(), [Gate::Lut { lut: gate_lut, .. }] if *gate_lut == lut)
+                if matches!(body.gates(), [Gate::Lut { lut_id: gate_lut, .. }] if *gate_lut == lut)
         ));
     }
 
@@ -2267,14 +2403,6 @@ mod tests {
             type Error = crate::ExponentLutError;
         }
         impl ExponentProgramLowering for TestBackend {
-            fn mul_private(
-                &mut self,
-                _lhs: &Self::Wire,
-                _rhs: &Self::Rhs,
-                _gate: ProgramGateInstance,
-            ) -> Result<Self::Wire, Self::Error> {
-                unreachable!()
-            }
             fn mul_public(
                 &mut self,
                 _private: &Self::Wire,
@@ -2291,38 +2419,42 @@ mod tests {
             ) -> Result<Self::Wire, Self::Error> {
                 unreachable!()
             }
+            fn mul_private(
+                &mut self,
+                _: &Self::Wire,
+                _: &Self::Rhs,
+                _: Option<&Self::HelperSet>,
+                _: ProgramGateInstance,
+            ) -> Result<Self::Wire, Self::Error> {
+                unreachable!()
+            }
             fn lut(
                 &mut self,
                 _program: &ExponentLutProgram,
                 _lut: LutId,
                 input: &Self::Wire,
-                helper: &Self::HelperSet,
+                helper: Option<&Self::HelperSet>,
+                _: Option<&Self::Rhs>,
                 gate: ProgramGateInstance,
             ) -> Result<Self::Wire, Self::Error> {
+                let helper = helper.ok_or(crate::ExponentLutError::InvalidLut)?;
+
                 let TestWire::Members(values) = input else {
-                    return Err(crate::ExponentLutError::InvalidSparseLwrBlock);
+                    return Err(crate::ExponentLutError::InvalidLut);
                 };
                 self.lut_gate = Some(gate);
                 Ok(TestWire::Members(values.iter().map(|value| value * helper).collect()))
             }
-            fn public_attribute_available(&self, _wire: &Self::Wire) -> bool {
-                true
-            }
-            fn broadcast_wire(
-                &mut self,
-                _wire: &Self::Wire,
-                _range: &FamilyRange,
-            ) -> Result<Self::Wire, Self::Error> {
-                unreachable!()
-            }
+        }
+        impl TestBackend {
             fn reduce_add(
                 &mut self,
-                wire: &Self::Wire,
+                wire: &TestWire,
                 _range: &FamilyRange,
                 _gate: ProgramGateInstance,
-            ) -> Result<Self::Wire, Self::Error> {
+            ) -> Result<TestWire, crate::ExponentLutError> {
                 let TestWire::Members(values) = wire else {
-                    return Err(crate::ExponentLutError::InvalidSparseLwrBlock);
+                    return Err(crate::ExponentLutError::InvalidLut);
                 };
                 Ok(TestWire::Scalar(values.iter().sum()))
             }
@@ -2340,7 +2472,7 @@ mod tests {
                 FamilyProgram::new(
                     BTreeMap::from([(input, FamilyWireSource::Member(members))]),
                     BTreeMap::new(),
-                    vec![Gate::Lut { input, lut, output: transformed }],
+                    vec![Gate::Lut { input, lut_id: lut, output: transformed, rhs: None }],
                     transformed,
                 )
                 .unwrap(),
@@ -2353,14 +2485,20 @@ mod tests {
         let rhs_families = BTreeMap::new();
         let wire_families = BTreeMap::from([(members, TestWire::Members(vec![2, 3, 5]))]);
         let helpers = BTreeMap::from([(lut, 4)]);
-        let bindings = ProgramBindings::new(&inputs, &rhs, &rhs_families, &wire_families, &helpers);
+        let bindings =
+            ProgramBindings::new(&inputs, &rhs, &rhs_families, &wire_families, &helpers, None);
         let mut ranges = ProgramFamilyBindings::new();
         ranges.bind(ProgramFamilyId::from_index(0), FamilyRange::full(3).unwrap());
         let mut backend = TestBackend { lut_gate: None };
-        let lowered = lower_program(&program, &bindings, &ranges, &mut backend).unwrap();
+        let lowered =
+            lower_program(&program, &bindings, &ranges, &mut backend, TestBackend::reduce_add)
+                .unwrap();
 
         assert!(matches!(lowered[&output], TestWire::Scalar(40)));
-        assert_eq!(backend.lut_gate, Some(ProgramGateInstance::FamilyGate { step: 0, gate: 0 }));
+        assert_eq!(
+            backend.lut_gate,
+            Some(ProgramGateInstance::FamilyGate { step: 0, gate: 0, family: ProgramFamilyId(0) })
+        );
     }
 
     #[test]
@@ -2397,44 +2535,5 @@ mod tests {
                 *output == WireId::from_index(1) &&
                 matches!(body.gates(), [Gate::MulPrivate { .. }, Gate::MulPublic { .. }]))
         );
-    }
-
-    #[test]
-    fn cache_declarations_cover_each_multiplication_and_family_body() {
-        let mut builder = ExponentLutProgramBuilder::new();
-        builder.set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 2 }, 16).unwrap();
-        let private = builder
-            .input(1, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
-            .unwrap();
-        let public = builder
-            .input(4, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Public })
-            .unwrap();
-        let family = builder.rhs_family(4).unwrap();
-        let values = builder.wire_family(4).unwrap();
-        let rhs = builder.rhs_input(family, 1, 4).unwrap();
-        let first = builder.mul_private(builder.input_wire(private).unwrap(), rhs).unwrap();
-        let second = builder.mul_public(first, builder.input_wire(public).unwrap()).unwrap();
-        let selected = builder.select(second, family, values, 4).unwrap();
-        builder.output(selected).unwrap();
-        let program = builder.build().unwrap();
-        let declarations = crate::public_key::program_cache_declarations(&program);
-        assert_eq!(declarations.len(), 4);
-        assert_eq!(
-            declarations
-                .iter()
-                .filter(|declaration| {
-                    declaration.role == crate::public_key::ProgramCacheRole::K_rhs
-                })
-                .count(),
-            4
-        );
-        assert!(declarations.iter().any(|declaration| matches!(
-            declaration.location,
-            crate::public_key::ProgramCacheLocation::Family { body_gate: 0, .. }
-        )));
-        assert!(declarations.iter().any(|declaration| matches!(
-            declaration.location,
-            crate::public_key::ProgramCacheLocation::Family { body_gate: 1, .. }
-        )));
     }
 }

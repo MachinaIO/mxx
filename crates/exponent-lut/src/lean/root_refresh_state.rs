@@ -1,6 +1,6 @@
 //! Bind each actual state-scaling cache to its exact GadgetScalar noise gain.
 use super::root_inputs::value_expression;
-use crate::noise_refresh::simulation::ExponentLutNoiseSnapshot;
+use crate::bgg::noise::BggNoiseSnapshot;
 use mxx_ir_core::{
     FrozenGraphScopeId, ParamEnv, ValidatedGraph,
     lean::LeanArtifact,
@@ -11,7 +11,7 @@ use mxx_ir_core::{
 pub(super) fn root_refresh_state(
     graph: &ValidatedGraph,
     artifact: &LeanArtifact,
-    snapshot: &ExponentLutNoiseSnapshot,
+    snapshot: &BggNoiseSnapshot,
 ) -> Result<String, String> {
     let root = graph.source.root_scope();
     let shape = &artifact.scope_proofs[&FrozenGraphScopeId::Root];

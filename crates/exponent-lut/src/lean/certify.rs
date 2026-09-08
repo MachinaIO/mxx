@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, fs, io::Write, path::Path, time::Duration};
 use mxx_ir_core::ParamEnv;
 use mxx_runtime::lean::LeanBackendArtifact;
 
-use super::check::{CheckedCandidate, check_candidate};
 use crate::noise_refresh::setup::RefreshParameterSimulationBundle;
+use mxx_runtime::lean::check::{CheckedCandidate, check_candidate};
 
 pub const PROOF_MODULE: &str = "RefreshCorrectness";
 pub const PROOF_THEOREM: &str = "ExponentGeneratedRefreshCorrectness.correctness";
@@ -68,6 +68,14 @@ fn complete_sources(
     Ok(sources)
 }
 
+fn proof_source_roots() -> Vec<std::path::PathBuf> {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    ["primitives", "runtime", "ir-core", "bgg", "gadgets", "exponent-lut"]
+        .iter()
+        .map(|name| crates.join(name).join("lean"))
+        .collect()
+}
+
 /// Export into a uniquely reserved directory, then check every generated source.
 /// Missing proofs, tools, rejected bounds, timeouts and checker errors are fatal.
 /// The durable record contains source/dependency hashes and per-module log paths.
@@ -102,7 +110,15 @@ pub fn certify(
         permissions.set_readonly(true);
         fs::set_permissions(path, permissions)?;
     }
-    let checked = check_candidate(&directory, &sources, PROOF_MODULE, PROOF_THEOREM, timeout)?;
+    let checked = check_candidate(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+        &proof_source_roots(),
+        &directory,
+        &sources,
+        PROOF_MODULE,
+        PROOF_THEOREM,
+        timeout,
+    )?;
     let record = serde_json::json!({
         "sources": checked.sources,
         "dependency_sha256": checked.dependency_sha256,
@@ -181,6 +197,8 @@ mod tests {
         // Disk and expected bytes agree, so source-integrity rejection is not
         // success. Only Lean's type error in the core Certificate is expected.
         let error = check_candidate(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+            &proof_source_roots(),
             &directory,
             &sources,
             PROOF_MODULE,
@@ -189,7 +207,7 @@ mod tests {
         )
         .unwrap_err();
         match error {
-            super::super::check::CheckError::Process { module, status, log } => {
+            mxx_runtime::lean::check::CheckError::Process { module, status, log } => {
                 assert_eq!(module, "Certificate");
                 let diagnostics = fs::read_to_string(&log).unwrap();
                 assert!(diagnostics.contains("type mismatch"), "{diagnostics}");
@@ -281,6 +299,8 @@ mod tests {
         assert!(complete_sources(directory.path(), sources.clone()).is_err());
         fs::write(directory.path().join("Claim.lean"), "-- altered bound").unwrap();
         let error = check_candidate(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+            &proof_source_roots(),
             directory.path(),
             &sources,
             PROOF_MODULE,

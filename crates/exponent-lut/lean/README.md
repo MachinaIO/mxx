@@ -20,6 +20,28 @@ cd crates/exponent-lut/lean
 lake build
 ```
 
+The BGG identity LUT with an encrypted RHS uses
+`ProgramState.identityLutOutput` and `ProgramDerivation.identityLutStep`;
+these describe the optimized single branch action, not a separate Program
+opcode. `MxxExponentLut.lut_fused_message` and
+`ProgramState.fusedLut_message` identify the sum with branch coefficients
+`D_i * sigma_i(rhs)` as the linear LUT map on `message * rhs`. The existing
+`lutStep` and branch error theorem accept those fused coefficients directly.
+The switch-error term is multiplied by the input message only. These lemmas
+do not by themselves certify the new BFV backend or a particular exported
+binary-LUT execution.
+
+`ExponentBfv.lean` contains equal-level Add/public multiplication, BFV branch cancellation, aggregate relation,
+fresh-RHS wrap cancellation, scaled outer-switch relation, and coefficientwise error-numerator
+divisibility for ordinary ModDown, direct-decoder cancellation, and fresh-target
+affine readout from the BFV double-scale note. It also proves that strict
+low-order mask/error bounds give the exact centered remainder, that ordinary
+ModDown recovers the fresh coefficient, and that full-modulus lift changes
+leave its CRT residue unchanged. Its premises expose the internal/outer switch
+equations and the integer wrap witness. These are reusable algebraic lemmas;
+linking actual primitive executions to those premises, proving the full norm
+recurrence, and certifying an exported BFV Program remain separate work.
+
 Candidate-specific modules belong in ignored `test_data` directories. The
 exporters in `crates/exponent-lut/src/lean.rs` and
 `crates/exponent-lut/src/lean/` connect the reusable lemmas to the actual frozen
@@ -44,9 +66,15 @@ source closure and core certificate before retaining worst-case acceptance.
 Average-case acceptance continues to use the Rust simulation; it does not produce
 a worst-case Lean certificate.
 
+The reusable checker lives in `crates/runtime/src/lean/check.rs`. The application
+supplies its Lake package directory and complete local Lean source roots; Lake
+builds the package's declared default targets.
+
 The checker builds the static dependency closure first, records its source and
 object fingerprints, and compiles candidate modules into a fresh check directory
-in dependency order, with `Certificate` last. It compares candidate bytes with the
+in dependency order, with up to three independent modules running concurrently
+and `Certificate` last. WE uses the same runtime process scheduler; its application
+adapter retains its own final theorem identity and axiom policy. It compares candidate bytes with the
 exporter's authoritative in-memory source map before and after checking. Missing
 proofs or dependencies, compiler failures, timeouts, source changes, and failed
 axiom audits reject certification. The certificate's allowed axioms are

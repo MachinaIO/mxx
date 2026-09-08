@@ -1,4 +1,5 @@
 //! Actual switched decoder levels and strict canonical residues.
+use crate::bgg::noise::ProgramNoiseReport;
 use std::collections::BTreeMap;
 
 use super::root_inputs::value_expression;
@@ -40,7 +41,7 @@ pub(super) fn root_refresh_decode(
     preartifact: &LeanArtifact,
     graph: &ValidatedGraph,
     artifact: &LeanArtifact,
-    report: &crate::noise_refresh::simulation::ExponentLutNoiseReport,
+    report: &crate::noise_refresh::simulation::ExponentLutNoiseReport<ProgramNoiseReport>,
 ) -> Result<String, String> {
     let preroot = pregraph.source.root_scope();
     let root = graph.source.root_scope();

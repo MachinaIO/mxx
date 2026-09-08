@@ -73,7 +73,7 @@ pub(super) fn root_readout(
     );
     let mut theorems = BTreeMap::new();
     for (name, output) in &artifact.root.outputs {
-        if !name.ends_with("-readout-helper-switch-family-0") {
+        if !name.ends_with("-readout-0.1") {
             continue;
         }
         let fail = || format!("unsupported readout switch graph at {name}");

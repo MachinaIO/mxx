@@ -65,6 +65,17 @@ All variance arithmetic is exact in the squared domain; no square root,
 floating-point CLT approximation, or saturating arithmetic is allowed.
 Negacyclic wrapping only changes signs and therefore preserves the square sum.
 
+For BGG `MulPublic`, the implemented error relation is
+`e_out = nu_public * e_private + e_public * K_private`. Preparation binds
+`GateNoiseGains.public_plaintext_action` to the integer-lift polynomial norms
+of `nu_public`, independently of the decomposition gain for `K_private`.
+The coefficient bound is `||nu_public||_1 B_private + gamma_1(K_private) B_public`.
+Under the coefficient and cross-term assumptions used by the native model,
+the doubled-coordinate variance is
+`||nu_public||_2^2 V2_private + gamma_2^2(K_private) V2_public`.
+Native PRF monomials supply unit norms; general public polynomials must supply
+their actual bounds. This metadata does not require runtime coefficient scans.
+
 ```rust
 struct VarianceTransfer { gain_sq: BigUint, additive_var: BigRational }
 struct DualTransfer {
@@ -103,7 +114,7 @@ must not receive a square-root reduction:
 Accordingly the original average-estimate reductions are retained: independent
 ring contributions use `sqrt(n)`, flat independent LUT branches use
 `sqrt(W_L)` under H3. The selector family does not receive a square-root
-reduction: each active member executes `MulPrivate` followed by `MulPublic`,
+reduction: each active member executes `MulPrivate` with a prepared RHS followed by `MulPublic`,
 then the members are combined by the conservative `FamilyAggregation::Add`.
 That transfer is derived by the interpreter from the primitive gate rows and
 the active range, not from a selector-specific formula. Distinct routed labels
@@ -132,6 +143,52 @@ over the active range. A flat `Lut` is independent only under H3 and retains its
 `sqrt(W_L)` estimate. An unclassified addition, including raw `z + phi(z)`
 without gadget mixing, fails closed in `AverageCase`. There is no `V := E^2`
 escape hatch.
+
+### Fixed-RHS independence (H4)
+
+For the direct relation `e_out = e D - mu F`, H4 treats the inherited
+right-action contribution and the fresh RHS contribution as uncorrelated.
+It also permits using the state coefficient model conditionally on the
+prepared right action. This is a modeling assumption: the action is derived
+from the RHS ciphertext, which itself contains `F`. Distinct ciphertext
+objects alone do not establish it. The corresponding LUT transfer applies
+the same assumption to its inherited and fresh/helper terms; H3 separately
+controls addition across flat branches.
+
+Fresh RHS errors sampled separately may contribute their variances with their
+respective squared polynomial gains. Reusing an RHS or helper preserves the
+same error source: combine its deterministic linear actions before estimating
+that source, and do not reclassify it as newly sampled. Public weights applied
+to plaintext targets before fresh encryption do not weight the fresh errors.
+Weights applied to ciphertexts do. Neither H4 nor H3 authorizes independent
+addition for an ordinary Program Add or for CRT-shared fresh digits.
+
+The evaluator receives the actual execution Program and explicitly prepared
+input and RHS error states. Missing RHS bindings are not interpreted as one
+fresh encryption. For a composed selector RHS, preparation includes every
+weighted selector error; one-hot payload semantics do not remove those errors.
+This changes binding responsibility, not the H4 independence heuristic.
+
+The refresh construction request owns its supplied PRF Program, and both
+executable construction and graph-free noise planning consume that value.
+Compact gain and route planning accepts the caller's Program rather than
+rebuilding an accumulation schedule from its profile. Parameter search keeps
+one Program per candidate context and reuses it across mask-digit choices.
+
+### Approximate-gadget reconstruction residuals
+
+AverageCase intentionally models the discarded centered CRT residues as
+independent uniform variables, and models their secret-weighted reconstruction
+error as independent of the ordinary gate error. Thus an additive residual
+with doubled-coordinate variance `V2_residual` contributes
+`V2_out = V2_ordinary + V2_residual`. This is the existing approximate-gadget
+heuristic, not a claim that decomposition residues are mathematically
+independent of their ciphertext. Its marginal formula and ternary-secret
+factor are documented in
+`docs/plans/exponent-lut-approximate-gadget-maximum-drop-results.md`.
+Worst-case residual bounds remain additive. A zero-variance residual changes
+only the bound. This model does not authorize independent-sum discounts for
+explicit Add, repeated wires, or shared fresh digits across CRT channels.
 
 ## Refresh, centering, and CRT safety
 
@@ -250,8 +307,11 @@ setup/model identity, `d_m/d_e`, event budget, model inputs, and the
 setup-derived nonzero initial doubled variance; old schemas fail closed. No
 secret support, schedule, or key material is serialized.
 
-The PRF report records the primitive `MulPrivate`, `MulPublic`, and active-range
-`FamilyAggregation::Add` rows emitted by the shared interpreter. Flat LUT branch
+The BGG PRF report records `IdentityLut`, `MulPublic`, and active-range
+`FamilyAggregation::Add` rows emitted by the shared interpreter. `IdentityLut`
+is the noise operation for the identity form of the `Lut` primitive, not a
+separate Program gate. These BGG average-case rules do not apply to BGV's
+deterministic error analysis. Flat LUT branch
 counts and their H3 independence assumption remain separate report data. Any
 program-shape change must be reflected in the immutable snapshot and rejected
 on identity mismatch.
@@ -326,3 +386,61 @@ the new single-channel enum with zero behavior change; implement compositional a
 transfers and classifier; add centering/refresh formulas; add reports and
 ledger; then enable opt-in tests. Do not alter generic noise simulation, reduce
 WorstCase depth exponents, or silently weaken any existing reduction effect.
+
+## Production fixed-selector composition
+
+Production BGG PRF preparation forms each block's fixed ciphertext
+`C_j = sum_i a_{j,i} C_i` before gadget decomposition. Native public labels
+`a_{j,i}` are signed monomials, so each has unit l1 and l2-squared norm. If the
+block contains m active ciphertexts, preparation binds the composed RHS error
+as `B_F = m B_chi` and `V_(2F) = m V_(2chi)` under the existing independent
+fresh-selector-draw assumptions. A zero selector plaintext does not remove
+its encryption error.
+
+The executed Program has one MulPrivate per block. The common BGG noise
+interpreter applies `e_next = e D_j - mu F_j` using the prepared decomposition
+gain and explicit RHS error binding. It does not add an online-label error,
+apply the old per-member public multiplication, or use the old coherent
+Family-reduction multiplicity. Production and graph-free candidate planning
+use this same direct Program identity. General cross-output source tracking
+and non-monomial payload propagation remain separate migration requirements;
+this native binding does not establish their completion.
+
+### BFV terminal and refresh selection
+
+Both integration workflows select `NoiseModelKind` with
+`MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL=worst-case|average-case` (integration
+default: `average-case`). This does not change the default opt-in contract of
+`AverageCaseConfig`: callers must still enable conditional average acceptance.
+
+BFV terminal moments use the same signed raw-aggregate equation as its worst
+bound. With `J` freshly prepared target branches, input variance `V`, CBD
+variance `eta/2`, `N` coefficients and drop `p`, inherited plus mask-helper
+variance contributes `J*N*(q-1)^2*(V+eta/2)/(2*p^2)`. Fresh target error uses
+`J*(eta/2)*payload_l2_squared`; target plaintext weights do not multiply it.
+Internal remainders contribute `J*(2*N+3)*(p^2-1)/(36*p^2)`. The outer public
+and encoding remainders together contribute `(N+3)*(p^2-1)/(18*p^2)` once,
+after all groups. Input mean enclosures propagate through the corresponding
+row-l1 action. Grouping or splitting identical contributors does not change
+these quantities.
+
+The terminal transfer explicitly extends H1/H3/H4 to decorrelation of centered
+right actions across freshly prepared terminal targets, even when the input or
+mask-helper errors are shared. It does not infer independence from different
+loop indices or ciphertext objects. Fresh target errors must come from distinct
+sampling paths. Centered-uniform ModDown remainders and H6 Gaussian-tail closure
+remain conditional assumptions. Reusing the same prepared target twice does
+not meet this fresh-target contract; combine that target's action first.
+
+Refresh adds the independently sampled online decoder's CBD variance under the
+stated residual-independence heuristic. Its digit fixed point recomputes the
+exposed-error envelope and event budget from the current mask/fresh schedule.
+The schedule counts final observed coordinates and PRF-state coordinates.
+Worst-case mode instead uses deterministic terminal and decoder supports.
+Reports retain the selected model and tail multiplier; a conditional average
+report is not an unconditional spacing or implementation certificate.
+
+`NoiseMoments::tail_bound` rounds the combined mean enclosure and tail outward
+using exact rational/integer arithmetic. It removes the possible extra unit
+introduced by separately rounding the bias and square-root term. BGG PRF uses
+the same utility after dividing its doubled-coordinate variance by four.

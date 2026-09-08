@@ -337,7 +337,7 @@ current implementation and validation evidence is summarized in §8.
 
 | Location / existing symbol | Required change |
 | --- | --- |
-| `crates/exponent-lut/src/noise_refresh/setup.rs`: `RefreshSetupParameters`, `refresh_noise_parameters`, `RefreshParameterSimulationRequest` | Add slot/group switching moduli and mask digit counts; derive exact `J,Delta`; expose per-modulus decoder sampler parameters and security inputs. |
+| `crates/exponent-lut/src/bgg/mod.rs`: `BggRefreshParameters`, `refresh_noise_parameters`; `crates/exponent-lut/src/noise_refresh/setup.rs`: `RefreshParameterSimulationRequest` | Add slot/group switching moduli and mask digit counts; derive exact `J,Delta`; expose per-modulus decoder sampler parameters and security inputs. |
 | `crates/exponent-lut/src/noise_refresh/simulation.rs`: `RefreshNoiseParameters`, `RefreshRouteNoiseGains`, `RefreshSlotNoiseReport`, `AverageRefreshSlotNoiseReport`, `ExponentLutNoiseSnapshot` | Model `H/J`, deterministic paired rounding, unscaled low-modulus decoder noise, exact support, strict rounding and smudging; retain detailed stage reports. |
 | `crates/exponent-lut/src/noise.rs`: `NoiseDecompositionPlan`, `simulate_program` | Reuse actual decomposition gains and the common program interpreter; no refresh-specific gate rules or generic-simulator fallback. |
 | `crates/exponent-lut/src/noise_refresh/refresh.rs`: `RefreshSlot`, `RefreshPrfLabelIndex`, `RefreshCompiler::refresh` | Represent `P_t`; generalize uniform mask-digit indexing to per-slot counts with checked prefix offsets; combine then switch, subtract only low-`P` decoder, round and CRT-recombine. |
@@ -555,7 +555,7 @@ minimum smudging margin
 Noise acceptance does not imply that the original high-q security estimates
 cover these new views.
 
-`RefreshSetupParameters::anchor_security_inputs(execution_budget)` reports
+`bgg::BggRefreshParameters::anchor_security_inputs(execution_budget)` reports
 each exact `P`, complementary `J`, slot group, ring dimension, one random
 ternary secret polynomial and the fixed augmented coordinate `1`, actual
 anchor error sigma/cutoff, anchor columns and sample budget. Production

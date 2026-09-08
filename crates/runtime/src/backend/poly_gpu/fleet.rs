@@ -2358,6 +2358,25 @@ impl Backend for GpuDcrtBackend {
         self.unary_columns(value, |backend, input| backend.reduce_modulus(input, destination))
     }
 
+    fn centered_extend(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.centered_extend(input, destination))
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| {
+            backend.block_mod_switch(input, destination, plaintext_modulus)
+        })
+    }
+
     fn preimage_target(
         &mut self,
         value: Arc<Self::Matrix>,

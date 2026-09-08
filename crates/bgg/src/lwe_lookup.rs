@@ -1764,7 +1764,7 @@ mod tests {
     use num_bigint::BigUint;
     use std::num::NonZeroUsize;
 
-    fn identity_lut(length: u64) -> PublicLutProgram {
+    fn mul_private(length: u64) -> PublicLutProgram {
         PublicLutProgram::new(length, LutExpr::input()).expect("identity LUT")
     }
 
@@ -2612,7 +2612,7 @@ mod tests {
     fn lookup_identity_collection_matches_the_lowering_identity() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let lookup_id = circuit.register_public_lookup(mul_private(2));
         let output = circuit.public_lookup_gate(input, lookup_id).as_single_wire();
         circuit.output([output]);
         assert_eq!(
@@ -2636,7 +2636,7 @@ mod tests {
             500_000_000,
             vec![Some(0), None, Some(2), None],
         );
-        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let lookup_id = circuit.register_public_lookup(mul_private(2));
         let output = circuit.public_lookup_gate(transferred, lookup_id).as_single_wire();
         circuit.output([output]);
 
@@ -2655,7 +2655,7 @@ mod tests {
     #[test]
     fn lookup_registry_conversion_cache_reuses_same_program_arc() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let lookup_id = circuit.register_public_lookup(mul_private(2));
         let mut cache = BTreeMap::new();
         let first = cached_lookup_table(&mut cache, &circuit, lookup_id).unwrap();
         let second = cached_lookup_table(&mut cache, &circuit, lookup_id).unwrap();
@@ -2673,8 +2673,8 @@ mod tests {
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let first_lookup_id = circuit.register_public_lookup(identity_lut(2));
-        let second_lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let first_lookup_id = circuit.register_public_lookup(mul_private(2));
+        let second_lookup_id = circuit.register_public_lookup(mul_private(2));
         let first = circuit.public_lookup_gate(input, first_lookup_id);
         let second = circuit.public_lookup_gate(input, second_lookup_id);
         circuit.output([first, second]);
@@ -2765,7 +2765,7 @@ mod tests {
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let lookup_id = circuit.register_public_lookup(mul_private(2));
         let output = circuit.public_lookup_gate(input, lookup_id);
         circuit.output([output]);
         let public_key = |name: &str| NaiveBggPublicKeyVecWire {
@@ -2825,7 +2825,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let lookup_id = circuit.register_public_lookup(mul_private(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let lookup = compiler(
@@ -2992,7 +2992,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let lookup_id = circuit.register_public_lookup(mul_private(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let lookup = compiler(
@@ -3135,7 +3135,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let lookup_id = circuit.register_public_lookup(mul_private(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let identity = LweLookupIdentity {

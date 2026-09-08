@@ -26,8 +26,8 @@ fn boundary_type(values: &BTreeMap<String, BoundaryValue>, count: usize) -> Stri
     }
 }
 
-/// Follow the actual decomposition, gather and sampler operands. Unsupported
-/// cache shapes fail closed instead of acquiring an assumed cache equation.
+/// Follow the actual indexed decomposition and sampler operands. The core
+/// accessors expose their execution facts without positional proof projections.
 pub(super) fn root_private(
     graph: &ValidatedGraph,
     artifact: &LeanArtifact,
@@ -41,12 +41,14 @@ pub(super) fn root_private(
         value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &shape.value_expressions)
     };
     let fact = |wire: WireRef| -> Result<String, String> {
-        let position = shape
-            .node_constraints
+        let accessor = shape
+            .node_facts
             .get(&wire.node)
-            .and_then(|range| range.clone().last())
-            .ok_or("missing root node constraint")?;
-        Ok(format!("facts{}.1", ".2".repeat(position)))
+            .and_then(|facts| facts.last())
+            .ok_or("missing root node fact")?;
+        Ok(format!(
+            "({accessor} (backend := backend) (hashModel := hashModel) (params := params) (inputs := inputs) (outputs := outputs) (witness := witness) facts)"
+        ))
     };
     let child_id = |wire: WireRef| FrozenGraphScopeId::ParallelBody {
         parent: Box::new(FrozenGraphScopeId::Root),
@@ -66,9 +68,11 @@ pub(super) fn root_private(
         let fail = || format!("unsupported actual private cache shape at {name}");
         let decomp_node = root.node(output.wire.node).ok_or_else(fail)?;
         let NodeKind::ParallelLoop(decomp_loop) = decomp_node.kind() else { return Err(fail()) };
-        if decomp_loop.input_modes != [LoopInputMode::Zip] {
-            return Err(fail());
-        }
+        let offset = match decomp_loop.input_modes.as_slice() {
+            [LoopInputMode::Zip] => 0,
+            [LoopInputMode::ZipOffset { offset }] => *offset,
+            _ => return Err(fail()),
+        };
         let decomp_scope_id = child_id(output.wire);
         let decomp_scope = graph.source.scopes().get(&decomp_scope_id).ok_or_else(fail)?;
         if decomp_scope.nodes().len() != 2 ||
@@ -83,35 +87,8 @@ pub(super) fn root_private(
         };
         let base = base.evaluate(&ParamEnv::default()).map_err(|_| fail())?;
         let digits = digit_count.evaluate(&ParamEnv::default()).map_err(|_| fail())?;
-        let gather_wire =
+        let sampler_wire =
             root.arguments(decomp_node).and_then(|a| a.first().copied()).ok_or_else(fail)?;
-        let gather_node = root.node(gather_wire.node).ok_or_else(fail)?;
-        let NodeKind::ParallelLoop(gather_loop) = gather_node.kind() else { return Err(fail()) };
-        let gather_scope_id = child_id(gather_wire);
-        let gather_scope = graph.source.scopes().get(&gather_scope_id).ok_or_else(fail)?;
-        if gather_scope.nodes().len() != 3 ||
-            gather_scope.inputs().len() != 2 ||
-            gather_scope.outputs().len() != 1
-        {
-            return Err(fail());
-        }
-        let get = gather_scope.node(gather_scope.outputs()[0].node).ok_or_else(fail)?;
-        if !matches!(get.kind(), NodeKind::FamilyGetDynamic) {
-            return Err(fail());
-        }
-        let get_args = gather_scope.arguments(get).ok_or_else(fail)?;
-        let family_slot =
-            gather_scope.inputs().iter().position(|w| *w == get_args[0]).ok_or_else(fail)?;
-        let index_slot =
-            gather_scope.inputs().iter().position(|w| *w == get_args[1]).ok_or_else(fail)?;
-        if gather_loop.input_modes[family_slot] != LoopInputMode::Broadcast ||
-            gather_loop.input_modes[index_slot] != LoopInputMode::Zip
-        {
-            return Err(fail());
-        }
-        let gather_args = root.arguments(gather_node).ok_or_else(fail)?;
-        let sampler_wire = gather_args[family_slot];
-        let indices = value(gather_args[index_slot])?;
         let sampler_node = root.node(sampler_wire.node).ok_or_else(fail)?;
         let NodeKind::ParallelLoop(sampler_loop) = sampler_node.kind() else { return Err(fail()) };
         let sampler_id = child_id(sampler_wire);
@@ -180,37 +157,24 @@ pub(super) fn root_private(
         let columns = matrix.columns;
         let cached = value(output.wire)?;
         let decomp_fact = fact(output.wire)?;
-        let gather_fact = fact(gather_wire)?;
         let sampler_fact = fact(sampler_wire)?;
         let secret_fact = fact(secret_wire)?;
-        let number = theorems.len();
-        let theorem = format!("private_cache_{number}");
-        source.push_str(&format!(
-            "-- Actual exported cache {name:?}.\ntheorem {theorem} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {witness_type})\n    (facts : {body} backend hashModel params inputs outputs witness)\n    (layout : MxxRuntime.RegularLayout {q})\n    (lookup : backend.regularLayout {q} {n} = some layout)\n    (gadget : ExactMatrix {q} {n} 2 {columns})\n    (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, ∃ position : Fin {raw_count}, ∃ error : ErrorMatrix {n} 1 {columns},\n    ∃ action : ErrorMatrix {n} {columns} {columns},\n      (position.val : Int) = ({indices}) i ∧\n      ({cached}) i = reduceMatrix {q} {n} {columns} {columns} action ∧\n      ActionGain action (denseRegularGain layout {n} 2) ∧\n      ({secret}) * gadget * (({cached}) i) = (({payload}) position 0 0) • (({secret}) * gadget) + reduceMatrix {q} {n} 1 {columns} error ∧\n      CoeffBound error ({cutoff} : Nat) := by\n  have augmented := augmented_source_last {secret_fact} (by rfl)\n  intro i\n  obtain ⟨selected, hlo, hhi, hget, hout⟩ := {gather_fact} i\n  obtain ⟨position, hindex, hselected⟩ := hget\n  obtain ⟨decomposition, hd, hdout⟩ := {decomp_fact} i\n  rw [hout, hselected] at hd\n  obtain ⟨other, error, action, hg, ha, hgain, hcache, hb⟩ :=\n    selector_cache_0 layout lookup ({sampler_fact} position) augmented hd\n  have same : other = gadget := gadget_runs_deterministic hg gadgetRuns\n  subst other\n  exact ⟨position, error, action, hindex, hdout.trans ha, hgain, by rw [hdout]; exact hcache, hb⟩\n\n",
-            params = artifact.root.parameter_type,
-        ));
-        let index_wire = gather_args[index_slot];
-        let index_node = root.node(index_wire.node).ok_or_else(fail)?;
-        let NodeKind::ParallelLoop(index_loop) = index_node.kind() else {
-            return Err(fail());
-        };
-        let index_scope_id = child_id(index_wire);
-        let index_scope = &graph.source.scopes()[&index_scope_id];
-        let sum = index_scope.node(index_scope.outputs()[0].node).ok_or_else(fail)?;
-        if !matches!(sum.kind(), NodeKind::IntBinary(mxx_ir_core::node::IntBinaryOp::Add)) {
-            return Err(fail());
-        }
-        let sum_args = index_scope.arguments(sum).ok_or_else(fail)?;
-        let offset = sum_args
-            .iter()
-            .find_map(|arg| match index_scope.node(arg.node)?.kind() {
-                NodeKind::ConstantInt(value) => usize::try_from(value).ok(),
-                _ => None,
-            })
+        let child_shape = &artifact.scope_proofs[&decomp_scope_id];
+        let child_decomp = child_shape
+            .node_facts
+            .get(&decomp_scope.outputs()[0].node)
+            .and_then(|facts| facts.last())
             .ok_or_else(fail)?;
-        if !sum_args.iter().any(|arg| matches!(index_scope.node(arg.node).map(|n|n.kind()), Some(NodeKind::EvaluateInt(mxx_ir_core::IntExpr::LoopIndex(slot))) if *slot == index_loop.index_slot)) || offset + lanes > *raw_count { return Err(fail()); }
-        let index_fact = fact(index_wire)?;
-        source.push_str(&format!("theorem private_bucket_{number} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {witness_type}) (facts : {body} backend hashModel params inputs outputs witness)\n    (layout : MxxRuntime.RegularLayout {q}) (lookup : backend.regularLayout {q} {n} = some layout)\n    (gadget : ExactMatrix {q} {n} 2 {columns}) (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, ∃ error : ErrorMatrix {n} 1 {columns}, ∃ action : ErrorMatrix {n} {columns} {columns},\n      ({cached}) i = reduceMatrix {q} {n} {columns} {columns} action ∧\n      ActionGain action (denseRegularGain layout {n} 2) ∧\n      ({secret}) * gadget * (({cached}) i) = (({payload}) ⟨{offset} + i.val, by omega⟩ 0 0) • (({secret}) * gadget) + reduceMatrix {q} {n} 1 {columns} error ∧\n      CoeffBound error ({cutoff} : Nat) := by\n  intro i\n  obtain ⟨position,error,action,hindex,ha,hgain,hcache,hbound⟩ := {theorem} witness facts layout lookup gadget gadgetRuns i\n  have indexEquation : ({indices}) i = (i.val : Int) + {offset} := {index_fact} i\n  have same : position = (⟨{offset} + i.val, by omega⟩ : Fin {raw_count}) := by\n    apply Fin.ext\n    change position.val = {offset} + i.val\n    omega\n  rw [same] at hcache\n  exact ⟨error,action,ha,hgain,hcache,hbound⟩\n\n",params=artifact.root.parameter_type));
+        let child_output = child_shape.output_fact.as_ref().ok_or_else(fail)?;
+        let child_view = &child_shape.runs_iff_body;
+        let child_index = decomp_loop.index_slot;
+        let number = theorems.len();
+        let theorem = format!("private_bucket_{number}");
+        source.push_str(&format!(
+            "-- Actual exported cache {name:?}.\ntheorem {theorem} {{backend : MxxRuntime.BackendContext}} [Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0)] {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {witness_type}) (facts : {body} backend hashModel params inputs outputs witness)\n    (layout : MxxRuntime.RegularLayout {q}) (lookup : backend.regularLayout {q} {n} = some layout)\n    (gadget : ExactMatrix {q} {n} 2 {columns}) (gadgetRuns : MxxRuntime.gadgetMatrixRuns backend {base} {digits} gadget) :\n    ∀ i : Fin {lanes}, ∃ error : ErrorMatrix {n} 1 {columns}, ∃ action : ErrorMatrix {n} {columns} {columns},\n      ({cached}) i = reduceMatrix {q} {n} {columns} {columns} action ∧\n      ActionGain action (denseRegularGain layout {n} 2) ∧\n      ({secret}) * gadget * (({cached}) i) = (({payload}) ⟨{offset} + i.val, by omega⟩ 0 0) • (({secret}) * gadget) + reduceMatrix {q} {n} 1 {columns} error ∧\n      CoeffBound error ({cutoff} : Nat) := by\n  have augmented := augmented_source_last {secret_fact} (by rfl)\n  intro i\n  let position : Fin {raw_count} := ⟨i.val + {offset}, by omega⟩\n  obtain ⟨cacheWitness, cacheFacts⟩ := ({child_view} backend hashModel params i.val _ _).mp ({decomp_fact} i)\n  have hd := {child_decomp} (backend := backend) (hashModel := hashModel) (params := params) (i_{child_index} := i.val) (inputs := ({sampler}) position) (outputs := ({cached}) i) (witness := cacheWitness) cacheFacts\n  have hout := {child_output} (backend := backend) (hashModel := hashModel) (params := params) (i_{child_index} := i.val) (inputs := ({sampler}) position) (outputs := ({cached}) i) (witness := cacheWitness) cacheFacts\n  obtain ⟨other, error, action, hg, ha, hgain, hcache, hb⟩ :=\n    selector_cache_0 layout lookup ({sampler_fact} position) augmented hd\n  have same : other = gadget := gadget_runs_deterministic hg gadgetRuns\n  subst other\n  refine ⟨error, action, hout.trans ha, hgain, ?_, hb⟩\n  rw [hout]\n  simpa only [position, Nat.add_comm] using hcache\n\n",
+            params = artifact.root.parameter_type,
+            sampler = value(sampler_wire)?,
+        ));
         theorems.insert(name.clone(), format!("ExponentGeneratedPrivateRoot.{theorem}"));
     }
     if theorems.is_empty() {

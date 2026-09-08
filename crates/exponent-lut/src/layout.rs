@@ -162,7 +162,7 @@ impl ExpLayout {
 
     /// Selects the canonical automorphism at a structural loop index without
     /// expanding one matrix operation per entry on the host.
-    pub(crate) fn automorphism_index_expression(
+    pub fn automorphism_index_expression(
         &self,
         ring_dimension: usize,
         index: IntExpr,

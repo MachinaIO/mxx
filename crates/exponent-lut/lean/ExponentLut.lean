@@ -29,6 +29,21 @@ theorem signedMonomial_automorphism {q n : Nat} (hn : 0 < n) (index : Nat) (hodd
   rw [hroot, ← pow_mul]
   exact root_power_signedMonomial hn _
 
+/-- Folding the rotated RHS into each fresh branch coefficient gives the
+same message as applying the linear LUT map to the product. Only the input
+message acts on the freshly sampled switch error in the branch theorem below;
+there is no preliminary GSW multiplication and no extra error from that step. -/
+theorem lut_fused_message {q n count : Nat}
+    (index : Fin count → Nat) (hodd : ∀ i, Odd (index i))
+    (message rhs : ExactPoly q n) (coefficient : Fin count → ExactPoly q n) :
+    (∑ i, readoutAutomorphismHom (index i) (hodd i) message *
+      (coefficient i * readoutAutomorphismHom (index i) (hodd i) rhs)) =
+    ∑ i, readoutAutomorphismHom (index i) (hodd i) (message * rhs) * coefficient i := by
+  apply Finset.sum_congr rfl
+  intro i hi
+  rw [map_mul]
+  ring
+
 /-- LUT cache equations differ from normalized readout by the actual Fourier
 coefficient in the fixed RHS. The sampled error still appears negatively and
 is multiplied only by the rotated native message, not the Fourier coefficient. -/

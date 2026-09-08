@@ -157,7 +157,9 @@ pub(super) fn root_seeded_keys(
         ("ver", &ver, artifact, shape, ver_scope, &mask),
     ] {
         let child_shape = &exported.scope_proofs[&sample.scope];
-        if child_shape.witness_record.is_some() {
+        if scope.nodes().iter().any(|node| {
+            matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_))
+        }) {
             return Err("mask sampler unexpectedly contains structural loops".into());
         }
         let names = child_shape

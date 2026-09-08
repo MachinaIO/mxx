@@ -287,6 +287,25 @@ pub fn generate_key_layout(
     root_seed: PbcRootSeed,
     sparse_support: &[usize],
 ) -> Result<PbcGeneratedKeyLayout, PbcError> {
+    retry_layout(
+        parameters,
+        root_seed,
+        sparse_support,
+        |seed, attempt| PbcPublicLayout::build(parameters, seed, attempt),
+        schedule,
+    )
+}
+
+pub(super) fn retry_layout(
+    parameters: &PbcParameters,
+    root_seed: PbcRootSeed,
+    sparse_support: &[usize],
+    mut build: impl FnMut(super::PbcLayoutSeed, u32) -> Result<PbcPublicLayout, PbcError>,
+    mut match_schedule: impl FnMut(
+        &PbcPublicLayout,
+        &ValidatedSupport,
+    ) -> Result<PbcPrivateSchedule, PbcError>,
+) -> Result<PbcGeneratedKeyLayout, PbcError> {
     parameters.validate()?;
     let support = ValidatedSupport::new(parameters, sparse_support)?;
     let mut bucket_width_failures = 0;
@@ -294,7 +313,7 @@ pub fn generate_key_layout(
     let mut last_public_cause = None;
     for attempt in 0..parameters.max_seed_attempts {
         let seed = derive_attempt_seed(root_seed, attempt);
-        let layout = match PbcPublicLayout::build(parameters, seed, attempt) {
+        let layout = match build(seed, attempt) {
             Ok(layout) => layout,
             Err(PbcError::BucketWidthExceeded) => {
                 bucket_width_failures += 1;
@@ -303,7 +322,7 @@ pub fn generate_key_layout(
             }
             Err(error) => return Err(error),
         };
-        match schedule(&layout, &support) {
+        match match_schedule(&layout, &support) {
             Ok(private_schedule) => {
                 return Ok(PbcGeneratedKeyLayout { public_layout: layout, private_schedule });
             }

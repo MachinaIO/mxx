@@ -1,6 +1,6 @@
 //! Integer native digits and exact positional refresh supports from the actual table.
 use super::root_inputs::value_expression;
-use crate::noise_refresh::simulation::ExponentLutNoiseSnapshot;
+use crate::bgg::noise::BggNoiseSnapshot;
 use mxx_ir_core::{
     FrozenGraphScopeId, ParamEnv, ValidatedGraph,
     lean::LeanArtifact,
@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn root_refresh_digits(
     graph: &ValidatedGraph,
     artifact: &LeanArtifact,
-    snapshot: &ExponentLutNoiseSnapshot,
+    snapshot: &BggNoiseSnapshot,
 ) -> Result<String, String> {
     let root = graph.source.root_scope();
     let shape = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
@@ -74,7 +74,7 @@ pub(super) fn root_refresh_digits(
             Ok(scalar)
         }
     };
-    let target = scalar("-readout-target-decomposition-0")?;
+    let target = scalar("-readout-0.0")?;
     let matrix = types[&target].matrix_type().ok_or("target not matrix")?;
     let q = &matrix.modulus;
     let n = matrix.ring_dimension;

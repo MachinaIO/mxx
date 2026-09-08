@@ -43,182 +43,19 @@ pub(super) fn root_readout_stage(
     let value = |wire: WireRef| {
         value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &shape.value_expressions)
     };
-    let fact = |wire: WireRef| -> Result<String, String> {
-        let position = shape
-            .node_constraints
-            .get(&wire.node)
-            .and_then(|r| r.clone().last())
-            .ok_or("missing readout constraint")?;
-        Ok(format!("facts{}.1", ".2".repeat(position)))
-    };
-    let normalization = artifact
-        .root
-        .inputs
-        .iter()
-        .find(|(name, _)| name.ends_with("-readout-normalization-decomposition-0"))
-        .ok_or("missing readout normalization input")?
-        .1
-        .wire;
-    let (normalization_node, normalization_args) = root
-        .nodes()
-        .iter()
-        .enumerate()
-        .find_map(|(index, node)| {
-            let args = root.arguments(node)?;
-            (matches!(node.kind(), NodeKind::ParallelLoop(_)) && args.contains(&normalization))
-                .then_some((index, args))
-        })
-        .ok_or("missing normalization operation")?;
-    let normalized_wire = WireRef { node: NodeId(normalization_node as u64), port: Port(0) };
-    let traced = *normalization_args
-        .iter()
-        .find(|wire| **wire != normalization)
-        .ok_or("missing trace input")?;
-    let traced_node = root.node(traced.node).ok_or("missing traced family")?;
-    let traced_args = root.arguments(traced_node).ok_or("missing traced operands")?;
-    if traced_args.len() != 2 {
-        return Err("trace must add identity and helpers".into());
-    }
-    let ConcreteWireType::IndexedFamily { count: labels, .. } = &types[&traced] else {
-        return Err("trace is not family".into());
-    };
-    let transformed = traced_args[0];
-    let mut current = traced_args[1];
-    let mut levels = Vec::new();
-    loop {
-        let Some(scope) = child(current) else {
-            break;
-        };
-        let Some(parents) = root.arguments(root.node(current.node).ok_or("missing reducer node")?)
-        else {
-            break;
-        };
-        if parents.len() != 2 || scope.outputs().len() != 1 {
-            break;
-        }
-        let (Some((left_source, left_indices)), Some((right_source, right_indices))) =
-            (gather(parents[0]), gather(parents[1]))
-        else {
-            break;
-        };
-        if left_source != right_source {
-            break;
-        }
-        let ConcreteWireType::IndexedFamily { count, .. } = &types[&left_source] else {
-            break;
-        };
-        let ConcreteWireType::IndexedFamily { count: next, .. } = &types[&current] else {
-            break;
-        };
-        if *labels == 0 ||
-            count % labels != 0 ||
-            next % labels != 0 ||
-            next / labels != (count / labels).div_ceil(2)
-        {
-            return Err("non-segmented readout reducer".into());
-        }
-        levels.push((
-            current,
-            parents[0],
-            parents[1],
-            left_indices,
-            right_indices,
-            left_source,
-            count / labels,
-            next / labels,
-        ));
-        current = left_source;
-    }
-    if levels.is_empty() {
-        return Err("missing balanced readout helper sum".into());
-    }
-    let ConcreteWireType::IndexedFamily { count: total, .. } = &types[&current] else {
-        return Err("invalid helper family".into());
-    };
-    let helpers = total / labels;
-    let mut input_types = vec![String::new(); artifact.root.input_count];
-    for input in artifact.root.inputs.values() {
-        input_types[input.tuple_index] = format!("({})", input.lean_type);
-    }
-    let input_type = input_types.join(" × ") + " × Unit";
-    let mut outputs = vec![String::new(); artifact.root.output_count];
-    for output in artifact.root.outputs.values() {
-        outputs[output.tuple_index] = format!("({})", output.lean_type);
-    }
-    let output_type = outputs.join(" × ") + " × Unit";
+    let fact = |wire: WireRef| super::root_readout_public::root_fact(artifact, wire);
+    let (mut source, normalized_wire, transformed_wire, current, normalization, labels, helpers) =
+        super::root_readout_public::normalized_execution(
+            graph,
+            artifact,
+            "ExponentGeneratedReadoutStage",
+            "import ExponentReadoutStage\nimport RootOnlineReadout\nimport RootReadout\nimport RootReadoutOperands\nimport RootReadoutFunction\n",
+        )?;
+    let total = labels * helpers;
     let normalized = value(normalized_wire)?;
-    let transformed_wire = transformed;
-    let transformed = value(transformed)?;
+    let transformed = value(transformed_wire)?;
     let original = value(current)?;
     let norm = value(normalization)?;
-    let mut source = format!(
-        "import {}\nimport ExponentReadoutStage\nimport RootOnlineReadout\nimport RootReadout\nimport RootReadoutOperands\nimport RootReadoutFunction\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 4000000\n\nnamespace ExponentGeneratedReadoutStage\nopen Mxx.Primitives MxxRuntime MxxExponentLut\nopen scoped BigOperators\nabbrev RootInput := {input_type}\nabbrev RootOutput := {output_type}\n\nprivate theorem lookup_eq {{α : Type}} {{count : Nat}} {{family : Fin count → α}} {{index : Int}} {{output : α}} (position : Fin count) (hindex : index = (position.val : Int)) (h : MxxRuntime.familyGetDynamic family index output) : output = family position := by\n  obtain ⟨actual, ha, hv⟩ := h\n  have same : actual = position := by apply Fin.ext; omega\n  simpa only [same] using hv\n\ntheorem normalized_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\n    ∀ label : Fin {labels}, ({normalized}) label =\n      (({transformed}) label + ∑ helper : Fin {helpers},\n        ({original}) ⟨label.val * {helpers} + helper.val, by omega⟩) * ({norm}) := by\n  intro label\n",
-        artifact.module_name,
-        params = artifact.root.parameter_type
-    );
-    let mut equations = Vec::new();
-    for (result, left, right, left_indices, right_indices, previous, width, next_width) in
-        levels.iter().rev()
-    {
-        let count = labels * width;
-        let next = labels * next_width;
-        for lane in 0..*next_width {
-            for (side, gather_wire, indices, position) in [
-                ("l", *left, *left_indices, lane * 2),
-                ("r", *right, *right_indices, (lane * 2 + 1) % width),
-            ] {
-                let ir = &artifact.scope_relations[&child_id(indices)];
-                let gr = &artifact.scope_relations[&child_id(gather_wire)];
-                let index_value = value(indices)?;
-                let previous_value = value(*previous)?;
-                let gather_value = value(gather_wire)?;
-                let ipath = fact(indices)?;
-                let gpath = fact(gather_wire)?;
-                let id = result.node.0;
-                source.push_str(&format!("  have idx_{id}_{lane}_{side} : ({index_value}) ⟨label.val * {next_width} + {lane}, by omega⟩ = ((label.val * {width} + {position} : Nat) : Int) := by\n    have h := {ipath} (⟨label.val * {next_width} + {lane}, by omega⟩ : Fin {next})\n    dsimp only [{ir}, {ir}.constraints_0] at h\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat] at h ⊢\n    omega\n  have get_{id}_{lane}_{side} : ({gather_value}) ⟨label.val * {next_width} + {lane}, by omega⟩ = ({previous_value}) ⟨label.val * {width} + {position}, by omega⟩ := by\n    have h := {gpath} (⟨label.val * {next_width} + {lane}, by omega⟩ : Fin {next})\n    dsimp only [{gr}, {gr}.constraints_0] at h\n    obtain ⟨sample, hlo, hhi, hg, hout⟩ := h\n    exact hout.trans (lookup_eq (⟨label.val * {width} + {position}, by omega⟩ : Fin {count}) idx_{id}_{lane}_{side} hg)\n"));
-            }
-            if lane == 0 || (2 * lane + 1) % width == 0 {
-                source.push_str(&format!(
-                    "  simp only [Nat.add_zero] at get_{id}_{lane}_l get_{id}_{lane}_r\n",
-                    id = result.node.0
-                ));
-            }
-            let result_value = value(*result)?;
-            let previous_value = value(*previous)?;
-            let rpath = fact(*result)?;
-            let rr = &artifact.scope_relations[&child_id(*result)];
-            let id = result.node.0;
-            let left_index = lane * 2;
-            let right_index = lane * 2 + 1;
-            let rhs = if right_index < *width {
-                format!(
-                    "({previous_value}) ⟨label.val * {width} + {left_index}, by omega⟩ + ({previous_value}) ⟨label.val * {width} + {right_index}, by omega⟩"
-                )
-            } else {
-                format!("({previous_value}) ⟨label.val * {width} + {left_index}, by omega⟩")
-            };
-            let eq = format!("step_{id}_{lane}");
-            source.push_str(&format!("  have {eq} : ({result_value}) ⟨label.val * {next_width} + {lane}, by omega⟩ = {rhs} := by\n    have h := {rpath} (⟨label.val * {next_width} + {lane}, by omega⟩ : Fin {next})\n"));
-            let is_select = matches!(
-                child(*result)
-                    .and_then(|scope| scope.node(scope.outputs()[0].node))
-                    .map(|node| node.kind()),
-                Some(NodeKind::Select { .. })
-            );
-            if is_select {
-                source.push_str(&format!("    have modEq : ((label.val * {next_width} + {lane} : Nat) : Int) % {next_width} = {lane} := by\n      simp only [Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\n      omega\n    norm_num [{rr}, {rr}.constraints_0, modEq, MxxRuntime.select] at h\n"));
-                if right_index < *width {
-                    source.push_str(&format!("    simpa only [MxxRuntime.matrixAdd, get_{id}_{lane}_l, get_{id}_{lane}_r, Nat.add_zero] using h\n"));
-                } else {
-                    source.push_str(&format!("    obtain ⟨position, hp, hv⟩ := h\n    have same : position = (1 : Fin 2) := by apply Fin.ext; exact_mod_cast hp\n    subst position\n    simpa only [List.get_eq_getElem, List.getElem_cons_succ, List.getElem_cons_zero, get_{id}_{lane}_l, Nat.add_zero] using hv\n"));
-                }
-            } else {
-                source.push_str(&format!("    simpa only [{rr}, {rr}.constraints_0, MxxRuntime.matrixAdd, get_{id}_{lane}_l, get_{id}_{lane}_r, Nat.add_zero] using h\n"));
-            }
-            equations.push(eq);
-        }
-    }
-    source.push_str(&format!("  have normalizedEquation := {} label\n  have tracedEquation := {} label\n  rw [normalizedEquation, tracedEquation]\n  simp only [MxxRuntime.matrixMul, MxxRuntime.matrixAdd]\n  congr 1\n  congr 1\n  have labelEq : label = (⟨label.val * 1 + 0, by omega⟩ : Fin {labels}) := by apply Fin.ext; simp\n  conv_lhs => rw [labelEq]\n  simp only [{}]\n  simp [Fin.sum_univ_succ, add_assoc]\n\nend ExponentGeneratedReadoutStage\n",fact(normalized_wire)?,fact(traced)?,equations.iter().rev().cloned().collect::<Vec<_>>().join(", ")));
     let raw_scope = child(current).ok_or("missing raw readout branch")?;
     let raw_node = root.node(current.node).ok_or("missing raw loop")?;
     let raw_parents = root.arguments(raw_node).ok_or("missing raw loop operands")?;
@@ -265,7 +102,7 @@ pub(super) fn root_readout_stage(
     let mut proof = String::new();
     let mut gathered_sources = Vec::new();
     for (role, wire, position, count) in [
-        ("target", transformed_gather, "label", *labels),
+        ("target", transformed_gather, "label", labels),
         ("mask", mask_gather, "helper", helpers),
         ("switch", switch_gather, "helper", helpers),
     ] {
@@ -298,8 +135,7 @@ pub(super) fn root_readout_stage(
     let rows = matrix.rows;
     let columns = matrix.columns;
     online_dependencies.extend([current.node, aligned_wire.node]);
-    source = source.replace("end ExponentGeneratedReadoutStage\n", "");
-    source.push_str(&format!("theorem helper_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\n    ∀ label : Fin {labels}, ∀ helper : Fin {helpers}, ∃ raw : ExactMatrix {q} {n} {rows} {columns},\n      MxxRuntime.ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat helper.val) [{indices}])\n        (({transformed}) label) raw ∧\n      ({original}) ⟨label.val * {helpers} + helper.val, by omega⟩ =\n        ({mask_actual}) helper * ({helper_actual}) ⟨label.val * {helpers} + helper.val, by omega⟩ +\n          raw * ({switch_actual}) helper := by\n  intro label helper\n  let lane : Fin {total} := ⟨label.val * {helpers} + helper.val, by omega⟩\n{proof}  obtain ⟨raw, hrun, heq⟩ := ExponentGeneratedOnlineReadout.raw_branch_{raw_id} witness facts lane\n  have hmod : Int.fmod (Int.ofNat lane.val) {helpers} = Int.ofNat helper.val := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by decide)]\n    dsimp only [lane]\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\n    omega\n  refine ⟨raw, ?_, ?_⟩\n  · simpa only [hmod, gathered_target] using hrun\n  · have haligned := ExponentGeneratedOnlineReadout.family_operation_{aligned_id} witness facts lane\n    simpa only [haligned, gathered_mask, gathered_switch] using heq\n\nend ExponentGeneratedReadoutStage\n",
+    source.push_str(&format!("theorem helper_execution {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {params}}} {{inputs : RootInput}} {{outputs : RootOutput}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness) :\n    ∀ label : Fin {labels}, ∀ helper : Fin {helpers}, ∃ raw : ExactMatrix {q} {n} {rows} {columns},\n      MxxRuntime.ringAutomorphismRuns (MxxIR.selectInt (Int.ofNat helper.val) [{indices}])\n        (({transformed}) label) raw ∧\n      ({original}) ⟨label.val * {helpers} + helper.val, by omega⟩ =\n        ({mask_actual}) helper * ({helper_actual}) ⟨label.val * {helpers} + helper.val, by omega⟩ +\n          raw * ({switch_actual}) helper := by\n  intro label helper\n  let lane : Fin {total} := ⟨label.val * {helpers} + helper.val, by omega⟩\n{proof}  obtain ⟨raw, hrun, heq⟩ := ExponentGeneratedOnlineReadout.raw_branch_{raw_id} witness facts lane\n  have hmod : Int.fmod (Int.ofNat lane.val) {helpers} = Int.ofNat helper.val := by\n    rw [Int.fmod_eq_emod_of_nonneg _ (by decide)]\n    dsimp only [lane]\n    simp only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat]\n    omega\n  refine ⟨raw, ?_, ?_⟩\n  · simpa only [hmod, gathered_target] using hrun\n  · have haligned := ExponentGeneratedOnlineReadout.family_operation_{aligned_id} witness facts lane\n    simpa only [haligned, gathered_mask, gathered_switch] using heq\n\n",
         params = artifact.root.parameter_type, raw_id = current.node.0, aligned_id = aligned_wire.node.0));
     let preroot = pregraph.source.root_scope();
     let preshape = &preartifact.scope_proofs[&FrozenGraphScopeId::Root];
@@ -316,10 +152,10 @@ pub(super) fn root_readout_stage(
             .map(|(_, value)| value.wire)
             .ok_or_else(|| format!("missing pre boundary {suffix}"))
     };
-    let target_cache_wire = preboundary("-readout-target-decomposition-0")?;
-    let normalization_cache_wire = preboundary("-readout-normalization-decomposition-0")?;
-    let switch_cache_wire = preboundary("-readout-helper-switch-family-0")?;
-    let helper_cache_wire = preboundary("-readout-helper-public-family-0")?;
+    let target_cache_wire = preboundary("-readout-0.0")?;
+    let normalization_cache_wire = preboundary("-readout-0.3")?;
+    let switch_cache_wire = preboundary("-readout-0.1")?;
+    let helper_cache_wire = preboundary("-readout-0.2")?;
     let pretarget = prevalue(target_cache_wire)?;
     let prenorm = prevalue(normalization_cache_wire)?;
     let preswitch = prevalue(switch_cache_wire)?;
@@ -439,7 +275,6 @@ pub(super) fn root_readout_stage(
     let width_log = width.trailing_zeros();
     let stride = n / width;
     let gain = format!("({columns} * {n} * (({base} : Int).toNat / 2))");
-    source = source.replace("end ExponentGeneratedReadoutStage\n", "");
     source.push_str(&format!(r#"
 private theorem helper_indices_odd : ∀ i : Fin {helpers},
     Odd (MxxIR.selectInt (Int.ofNat i.val) [{indices}]).toNat := by decide
@@ -665,13 +500,13 @@ pub(super) fn pre_readout_operands(
     );
     let mut found = 0;
     for (name, output) in &artifact.root.outputs {
-        let role = if name.ends_with("-readout-target-decomposition-0") {
+        let role = if name.ends_with("-readout-0.0") {
             "target"
-        } else if name.ends_with("-readout-normalization-decomposition-0") {
+        } else if name.ends_with("-readout-0.3") {
             "normalization"
-        } else if name.ends_with("-readout-helper-switch-family-0") {
+        } else if name.ends_with("-readout-0.1") {
             "switch"
-        } else if name.ends_with("-readout-helper-public-family-0") {
+        } else if name.ends_with("-readout-0.2") {
             "helper"
         } else {
             continue
@@ -813,7 +648,7 @@ pub(super) fn pre_readout_operands(
         .root
         .outputs
         .iter()
-        .find(|(name, _)| name.ends_with("-readout-helper-public-family-0"))
+        .find(|(name, _)| name.ends_with("-readout-0.2"))
         .ok_or("missing readout helper output")?
         .1
         .wire;

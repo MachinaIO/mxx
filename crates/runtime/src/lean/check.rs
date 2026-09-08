@@ -194,7 +194,9 @@ fn source_identity(directory: &Path) -> Result<BTreeMap<String, String>, CheckEr
         .collect()
 }
 
-fn workspace_source_identity() -> Result<BTreeMap<PathBuf, String>, CheckError> {
+fn workspace_source_identity(
+    source_roots: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, String>, CheckError> {
     fn visit(path: &Path, sources: &mut BTreeMap<PathBuf, String>) -> Result<(), CheckError> {
         for entry in fs::read_dir(path).map_err(io_error("read workspace Lean sources"))? {
             let path = entry.map_err(io_error("read workspace Lean source entry"))?.path();
@@ -213,12 +215,8 @@ fn workspace_source_identity() -> Result<BTreeMap<PathBuf, String>, CheckError> 
         Ok(())
     }
     let mut sources = BTreeMap::new();
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    for name in ["primitives", "runtime", "ir-core", "bgg", "gadgets", "exponent-lut"] {
-        let path = crates.join(name).join("lean");
-        if path.is_dir() {
-            visit(&path, &mut sources)?;
-        }
+    for path in source_roots {
+        visit(path, &mut sources)?;
     }
     Ok(sources)
 }
@@ -291,10 +289,160 @@ fn validate_axioms(log: &str) -> Result<(), CheckError> {
     Ok(())
 }
 
+fn lean_environment(
+    package: &Path,
+    extra_paths: &[PathBuf],
+    directory: &Path,
+    deadline: Instant,
+) -> Result<(Vec<PathBuf>, PathBuf), CheckError> {
+    let mut command = Command::new("lake");
+    command.current_dir(&package).env_remove("LEAN_PATH").args([
+        "env",
+        "printenv",
+        "LEAN_PATH",
+        "PATH",
+    ]);
+    if !extra_paths.is_empty() {
+        command.env(
+            "LEAN_PATH",
+            std::env::join_paths(extra_paths)
+                .map_err(|error| CheckError::Environment(error.to_string()))?,
+        );
+    }
+    let mut environment =
+        start(&mut command, "environment".into(), directory.join("environment.log"))?;
+    while !poll(&mut environment, deadline)? {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let text = fs::read_to_string(&environment.log).map_err(io_error("read environment"))?;
+    let lines: Vec<_> = text.lines().collect();
+    if lines.len() != 2 {
+        return Err(CheckError::Environment("unexpected Lake environment output".into()));
+    }
+    let libraries: Vec<_> = std::env::split_paths(lines[0])
+        .map(|path| if path.is_absolute() { path } else { package.join(path) })
+        .filter(|path| path.is_dir())
+        .map(|path| fs::canonicalize(path).map_err(io_error("resolve dependency path")))
+        .collect::<Result<_, _>>()?;
+    let lean = std::env::split_paths(lines[1])
+        .map(|path| path.join("lean"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| CheckError::Environment("missing pinned Lean".into()))?;
+    Ok((libraries, lean))
+}
+
+/// Compile a generated DAG against existing package objects. The caller owns
+/// the final theorem policy; certificate checking below additionally binds the
+/// core claim and fingerprints source/dependency snapshots.
+pub fn check_generated_modules(
+    package: &Path,
+    extra_paths: &[PathBuf],
+    directory: &Path,
+    timeout: Duration,
+) -> Result<(), CheckError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| CheckError::Environment("timeout is too large".into()))?;
+    let directory = fs::canonicalize(directory).map_err(io_error("resolve generated directory"))?;
+    let (libraries, lean) = lean_environment(package, extra_paths, &directory, deadline)?;
+    check_modules(package, &directory, &libraries, &lean, deadline)?;
+    Ok(())
+}
+
+fn check_modules(
+    package: &Path,
+    directory: &Path,
+    libraries: &[PathBuf],
+    lean: &Path,
+    deadline: Instant,
+) -> Result<BTreeMap<String, PathBuf>, CheckError> {
+    let modules = local_imports(directory)?;
+    validate_dependencies(&modules, libraries)?;
+    if modules
+        .iter()
+        .any(|(name, imports)| name != "Certificate" && imports.contains("Certificate"))
+    {
+        return Err(CheckError::Environment("certificate must be the final module".into()));
+    }
+    let lean_path: OsString = std::env::join_paths(
+        std::iter::once(directory).chain(libraries.iter().map(PathBuf::as_path)),
+    )
+    .map_err(|error| CheckError::Environment(error.to_string()))?;
+    // Preserve WE's bounded parallelism without expanding the dependency DAG.
+    let concurrency = thread::available_parallelism().map_or(1, |count| count.get().min(3));
+    let mut pending: BTreeSet<_> = modules.keys().cloned().collect();
+    let mut completed = BTreeSet::new();
+    let mut running = Vec::<Running>::new();
+    let mut logs = BTreeMap::new();
+    while !pending.is_empty() || !running.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(CheckError::Timeout {
+                module: "generated DAG".into(),
+                log: directory.join("environment.log"),
+            });
+        }
+        let ready: Vec<_> = pending
+            .iter()
+            .filter(|name| {
+                (name.as_str() != "Certificate" || (pending.len() == 1 && running.is_empty())) &&
+                    modules[*name]
+                        .iter()
+                        .all(|dep| !modules.contains_key(dep) || completed.contains(dep))
+            })
+            .take(concurrency - running.len())
+            .cloned()
+            .collect();
+        for name in ready {
+            let mut command = Command::new(lean);
+            command
+                .current_dir(package)
+                .env("LEAN_PATH", &lean_path)
+                .args(["-s131072", "-DmaxHeartbeats=2000000", "-DmaxRecDepth=16384", "-R"])
+                .arg(directory)
+                .arg("-o")
+                .arg(directory.join(format!("{name}.olean")))
+                .arg(directory.join(format!("{name}.lean")));
+            running.push(start(&mut command, name.clone(), directory.join(format!("{name}.log")))?);
+            pending.remove(&name);
+        }
+        let mut index = 0;
+        while index < running.len() {
+            if !poll(&mut running[index], deadline)? {
+                index += 1;
+                continue;
+            }
+            let process = running.swap_remove(index);
+            let log = fs::read_to_string(&process.log).map_err(io_error("read checker log"))?;
+            if log.contains("declaration uses 'sorry'") || log.contains("error:") {
+                return Err(CheckError::Environment(format!(
+                    "untrusted diagnostics in {}",
+                    process.module
+                )));
+            }
+            if !directory.join(format!("{}.olean", process.module)).is_file() {
+                return Err(CheckError::Environment(format!(
+                    "missing checked object for {}",
+                    process.module
+                )));
+            }
+            logs.insert(process.module.clone(), process.log.clone());
+            completed.insert(process.module.clone());
+        }
+        if !running.is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(logs)
+}
+
 /// Check exactly the supplied source snapshot, with the IR-generated theorem
 /// statement and a fresh local object directory. No candidate object is reused.
 /// The returned record identifies the checked bytes, dependencies, and durable logs.
+/// `package` selects the Lake default targets; `source_roots` lists the complete
+/// local Lean dependency sources whose identity must remain fixed during checking.
 pub fn check_candidate(
+    package: &Path,
+    source_roots: &[PathBuf],
     directory: &Path,
     expected_sources: &BTreeMap<String, String>,
     proof_module: &str,
@@ -344,100 +492,30 @@ pub fn check_candidate(
         fs::write(work.join(format!("{name}.lean")), source)
             .map_err(io_error("write frozen source"))?;
     }
-    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("lean");
-    let source_dependencies = workspace_source_identity()?;
+    let source_dependencies = workspace_source_identity(source_roots)?;
     // Lake validates/rebuilds the static closure from current sources before any
     // object identity is captured. Candidate modules never enter this package.
     let mut build = Command::new("lake");
-    build.current_dir(&package).env_remove("LEAN_PATH").args(["build", "MxxExponentLut"]);
+    build.current_dir(&package).env_remove("LEAN_PATH").args(["build"]);
     let mut build = start(&mut build, "static dependencies".into(), work.join("dependencies.log"))?;
     while !poll(&mut build, deadline)? {
         thread::sleep(Duration::from_millis(10));
     }
-    if workspace_source_identity()? != source_dependencies {
+    if workspace_source_identity(source_roots)? != source_dependencies {
         return Err(CheckError::Environment(
             "workspace Lean sources changed during dependency build".into(),
         ));
     }
-    let mut command = Command::new("lake");
-    command.current_dir(&package).env_remove("LEAN_PATH").args([
-        "env",
-        "printenv",
-        "LEAN_PATH",
-        "PATH",
-    ]);
-    let mut environment = start(&mut command, "environment".into(), work.join("environment.log"))?;
-    while !poll(&mut environment, deadline)? {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let text = fs::read_to_string(&environment.log).map_err(io_error("read environment"))?;
-    let lines: Vec<_> = text.lines().collect();
-    if lines.len() != 2 {
-        return Err(CheckError::Environment("unexpected Lake environment output".into()));
-    }
-    let libraries: Vec<_> = std::env::split_paths(lines[0])
-        .map(|path| if path.is_absolute() { path } else { package.join(path) })
-        .filter(|path| path.is_dir())
-        .map(|path| fs::canonicalize(path).map_err(io_error("resolve dependency path")))
-        .collect::<Result<_, _>>()?;
-    let lean = std::env::split_paths(lines[1])
-        .map(|path| path.join("lean"))
-        .find(|path| path.is_file())
-        .ok_or_else(|| CheckError::Environment("missing pinned Lean".into()))?;
+    let (libraries, lean) = lean_environment(package, &[], &work, deadline)?;
     let dependencies = dependency_identity(&libraries, &lean, deadline)?;
-    let modules = local_imports(&work)?;
-    validate_dependencies(&modules, &libraries)?;
-    if modules
-        .iter()
-        .any(|(name, imports)| name != "Certificate" && imports.contains("Certificate"))
-    {
-        return Err(CheckError::Environment("certificate must be the final module".into()));
-    }
-    let lean_path: OsString = std::env::join_paths(std::iter::once(&work).chain(libraries.iter()))
-        .map_err(|error| CheckError::Environment(error.to_string()))?;
-    let mut pending: BTreeSet<_> = modules.keys().cloned().collect();
-    let mut logs = BTreeMap::new();
-    while !pending.is_empty() {
-        let name = pending
-            .iter()
-            .find(|name| {
-                (name.as_str() != "Certificate" || pending.len() == 1) &&
-                    modules[*name].iter().all(|dependency| !pending.contains(dependency))
-            })
-            .cloned()
-            .ok_or_else(|| CheckError::Cycle(pending.iter().cloned().collect()))?;
-        if Instant::now() >= deadline {
-            return Err(CheckError::Timeout { module: name, log: work.join("environment.log") });
-        }
-        let mut command = Command::new(&lean);
-        command
-            .current_dir(&package)
-            .env("LEAN_PATH", &lean_path)
-            .args(["-s131072", "-DmaxHeartbeats=2000000", "-DmaxRecDepth=16384", "-R"])
-            .arg(&work)
-            .arg("-o")
-            .arg(work.join(format!("{name}.olean")))
-            .arg(work.join(format!("{name}.lean")));
-        let mut process = start(&mut command, name.clone(), work.join(format!("{name}.log")))?;
-        while !poll(&mut process, deadline)? {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let log = fs::read_to_string(&process.log).map_err(io_error("read checker log"))?;
-        if name == "Certificate" {
-            validate_axioms(&log)?;
-        } else if log.contains("declaration uses 'sorry'") || log.contains("error:") {
-            return Err(CheckError::Environment(format!("untrusted diagnostics in {name}")));
-        }
-        if !work.join(format!("{name}.olean")).is_file() {
-            return Err(CheckError::Environment(format!("missing checked object for {name}")));
-        }
-        logs.insert(name.clone(), process.log.clone());
-        pending.remove(&name);
-    }
+    let logs = check_modules(package, &work, &libraries, &lean, deadline)?;
+    validate_axioms(
+        &fs::read_to_string(&logs["Certificate"]).map_err(io_error("read certificate log"))?,
+    )?;
     if source_identity(&directory)? != expected ||
         source_identity(&work)? != expected ||
         dependency_identity(&libraries, &lean, deadline)? != dependencies ||
-        workspace_source_identity()? != source_dependencies
+        workspace_source_identity(source_roots)? != source_dependencies
     {
         return Err(CheckError::Environment("source or dependency changed while checking".into()));
     }
@@ -465,7 +543,7 @@ mod tests {
     #[ignore = "requires the pinned Lean toolchain and static package build"]
     fn checks_sound_core_certificate_with_real_package_environment() {
         let directory =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/exponent_checker_positive");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/runtime_checker_positive");
         fs::create_dir_all(&directory).unwrap();
         let sources = BTreeMap::from([
             ("Claim".into(), "namespace GeneratedClaim\ndef CorrectnessClaim : Prop := True\nend GeneratedClaim\n".into()),
@@ -476,6 +554,11 @@ mod tests {
             fs::write(directory.join(format!("{name}.lean")), source).unwrap();
         }
         let checked = check_candidate(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+            &[
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../primitives/lean"),
+            ],
             &directory,
             &sources,
             "Proof",
@@ -512,6 +595,8 @@ mod tests {
             BTreeMap::from([("Certificate".into(), "theorem fake : True := trivial".into())]);
         assert!(matches!(
             check_candidate(
+                directory.path(),
+                &[],
                 directory.path(),
                 &sources,
                 "Proof",
@@ -639,5 +724,57 @@ mod tests {
             ),
             Err(CheckError::Spawn { .. })
         ));
+    }
+    #[test]
+    #[ignore = "requires the pinned Lean/Lake installation and built crate dependencies"]
+    fn checks_fresh_dag_and_rejects_changed_source() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("A.lean"), "theorem a : True := True.intro\n").unwrap();
+        fs::write(directory.path().join("B.lean"), "import A\nexample : True := a\n").unwrap();
+        fs::write(directory.path().join("C.lean"), "theorem c : True := True.intro\n").unwrap();
+        fs::write(directory.path().join("D.lean"), "import B\nimport C\nexample : True := c\n")
+            .unwrap();
+        if let Err(error) = check_generated_modules(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+            &[],
+            directory.path(),
+            Duration::from_secs(30),
+        ) {
+            if let CheckError::Process { log, .. } = &error {
+                panic!("{error}: {}", fs::read_to_string(log).unwrap());
+            }
+            panic!("{error}");
+        }
+        assert!(directory.path().join("A.olean").is_file());
+        assert!(directory.path().join("B.log").is_file());
+        fs::write(directory.path().join("A.lean"), "theorem a : False := by exact True.intro\n")
+            .unwrap();
+        assert!(matches!(
+            check_generated_modules(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+                &[],
+                directory.path(),
+                Duration::from_secs(30)
+            ),
+            Err(CheckError::Process { .. })
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Lean/Lake installation"]
+    fn generated_module_timeout_is_an_infrastructure_error() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("Slow.lean"), "#eval IO.sleep 10000\n").unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            check_generated_modules(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("lean"),
+                &[],
+                directory.path(),
+                Duration::from_secs(1)
+            ),
+            Err(CheckError::Timeout { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

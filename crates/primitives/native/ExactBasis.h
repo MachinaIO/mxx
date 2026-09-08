@@ -2,6 +2,9 @@
 #include "openfhe/DCRTPoly.h"
 
 namespace mxx {
+std::unique_ptr<openfhe::DCRTPoly> exact_centered_conversion(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> moduli,
+    uint32_t destination_dimension, uint64_t plaintext_modulus);
 rust::Vec<uint8_t> exact_basis_coefficients(const openfhe::DCRTPoly &input);
 void exact_basis_matrix_coefficients(openfhe::Matrix &matrix);
 void exact_basis_validate(uint32_t dimension, rust::Slice<const uint64_t> moduli);

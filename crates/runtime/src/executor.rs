@@ -1904,6 +1904,20 @@ where
                 .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
+            NodeKind::CenteredExtend { .. } | NodeKind::BlockModSwitch { .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let output = if let NodeKind::BlockModSwitch { plaintext_modulus, .. } = &node.kind
+                {
+                    let t = self.eval_usize(node.id, plaintext_modulus, env)? as u64;
+                    self.backend.block_mod_switch(&input, &ty, t)
+                } else {
+                    self.backend.centered_extend(&input, &ty)
+                }
+                .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
             NodeKind::RingAutomorphism { index } => {
                 let input = self.matrix(values, node.args[0])?;
                 let index = self.eval_usize(node.id, index, env)?;
@@ -4354,6 +4368,22 @@ mod tests {
             unused_probe_operation!(value, destination)
         }
 
+        fn centered_extend(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+        fn block_mod_switch(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+            plaintext_modulus: u64,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination, plaintext_modulus)
+        }
+
         fn preimage_target(
             &mut self,
             value: Arc<Self::Matrix>,
@@ -6371,6 +6401,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_exact_rns_graph_executes_centered_lift_and_block_switch() {
+        use num_bigint::BigUint;
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let depth = std::env::var("MXX_PRIMITIVE_TEST_CRT_DEPTH")
+            .ok()
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(4);
+        assert!(depth >= 4);
+        let high = DCRTPolyParams::new(n, depth, 30, 2, None, None);
+        let low_modulus = high.to_crt().0.iter().step_by(2).map(|p| BigUint::from(*p)).product();
+        let low = high.select_modulus(&low_modulus).unwrap();
+        let ring = Ring::new(BigInt::from(low_modulus.clone()), n as usize);
+        let input = ring.input("input", (1, 2));
+        let lifted = input.centered_extend(BigInt::from(high.modulus().as_ref().clone()));
+        let switched = lifted.clone().block_mod_switch(BigInt::from(low_modulus.clone()), 17usize);
+        let graph = DslContext::new("exact-rns-runtime")
+            .output("lifted", lifted)
+            .unwrap()
+            .output("switched", switched)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut rng = rand::rng();
+        let values =
+            (0..n).map(|_| BigUint::from(rng.random::<u64>()) % &low_modulus).collect::<Vec<_>>();
+        let matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &low,
+            vec![DCRTPoly::from_biguints(&low, &values), DCRTPoly::const_one(&low)],
+        );
+        let expected_lift = matrix.centered_extend(&high).unwrap();
+        let expected_switch = expected_lift.block_mod_switch(&low, 17).unwrap();
+        let result = execute(
+            &graph,
+            &mut cpu_backend([low, high]),
+            BTreeMap::from([("input".into(), RuntimeValue::matrix(matrix))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        assert_eq!(matrix_output(&result, "lifted"), &expected_lift);
+        assert_eq!(matrix_output(&result, "switched"), &expected_switch);
     }
 
     #[test]

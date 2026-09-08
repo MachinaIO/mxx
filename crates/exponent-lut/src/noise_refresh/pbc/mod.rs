@@ -12,12 +12,11 @@
 //! The module also exposes clear oracles and diagnostics. They are reference
 //! and setup tools, not a replacement for the encrypted DSL graph.
 
-mod artifacts;
-pub mod diagnostics;
-mod evaluation;
-mod layout;
+pub(crate) mod artifacts;
 mod schedule;
 
+use mxx_dsl::{DslContext, Family, Mat, Ring};
+use mxx_ir_core::artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId};
 use thiserror::Error;
 
 /// Semantic version of the serialized public layout schema.
@@ -125,24 +124,11 @@ pub enum PbcError {
     SizeOverflow,
 }
 
-pub(crate) use artifacts::PbcSelectorRuntimeBinding;
 pub use artifacts::{
-    PbcSelectorArtifactNames, PbcSelectorArtifacts, PbcSelectorPackageArtifactNames,
-    PbcStructuralSelectorFamilies, PbcTrustedSelectorBits, build_structural_selector_families,
+    PbcSelectorArtifactNames, PbcSelectorArtifacts, PbcSelectorFamilyMetadata,
+    PbcSelectorPackageArtifactNames, PbcSelectorRuntimeBinding, PbcTrustedSelectorBits,
     canonical_component_name, public_family_artifact_name, selector_bit_family_name,
     selector_family_artifact_name, selector_family_artifact_name_from_names,
-};
-pub use diagnostics::{
-    PERFORMANCE_CATEGORIES, PbcDiagnosticAggregator, PbcDiagnosticReport, PbcDiagnosticSample,
-    measure_key_layout,
-};
-pub(crate) use evaluation::PbcSelectorFamilyInputs;
-pub use evaluation::{
-    PbcEncodedPublicVector, PbcLayoutFamilies, PbcPublicVectorFamilyBinding, derive_lwr_vector,
-};
-pub use layout::{
-    PbcActiveCellIndex, PbcParameters, PbcProfile, PbcPublicLayout, derive_attempt_seed,
-    derive_candidate_buckets,
 };
 pub use schedule::{
     PbcGeneratedKeyLayout, PbcPrivateSchedule, canonical_decode, clear_pbc_inner_product,
@@ -155,8 +141,6 @@ mod tests {
         schedule::{ValidatedSupport, deterministic_matching, schedule, schedule_from_owners},
         *,
     };
-    use mxx_bgg::BggSamplerLayout;
-    use mxx_ir_core::artifact::{Manifest, ProductionId};
 
     fn seed(byte: u8) -> PbcRootSeed {
         PbcRootSeed([byte; 32])
@@ -559,7 +543,6 @@ mod tests {
 
     #[test]
     fn selector_names_are_layout_and_key_namespace_bound_but_schedule_independent() {
-        use crate::rhs::ExponentRhsPackageArtifactNames;
         let parameters = PbcParameters::custom(7, 2, 2, 3, 1, None);
         let layout =
             PbcPublicLayout::build(&parameters, derive_attempt_seed(seed(11), 0), 0).unwrap();
@@ -574,14 +557,12 @@ mod tests {
                             PbcSelectorPackageArtifactNames {
                                 bucket,
                                 slot,
-                                package: ExponentRhsPackageArtifactNames {
-                                    gsw_ciphertext: canonical_component_name(
-                                        layout.layout_id,
-                                        key_instance_id,
-                                        bucket,
-                                        slot,
-                                    ),
-                                },
+                                ciphertext: canonical_component_name(
+                                    layout.layout_id,
+                                    key_instance_id,
+                                    bucket,
+                                    slot,
+                                ),
                             },
                         )
                     })
@@ -600,71 +581,19 @@ mod tests {
         );
         assert_ne!(names_a, names_b);
         assert!(
-            names_a
-                .selector_packages
-                .iter()
-                .all(|entry| !entry.package.gsw_ciphertext.contains("selected"))
+            names_a.selector_packages.iter().all(|entry| !entry.ciphertext.contains("selected"))
         );
         assert!(
-            names_a
-                .selector_packages
-                .iter()
-                .all(|entry| !entry.package.gsw_ciphertext.contains("support"))
-        );
-    }
-
-    #[test]
-    fn selector_artifact_import_rejects_production_mismatch() {
-        use mxx_ir_core::artifact::{Manifest, ProductionId, SpecHash};
-
-        let parameters = PbcParameters::custom(7, 2, 2, 3, 1, None);
-        let layout =
-            PbcPublicLayout::build(&parameters, derive_attempt_seed(seed(12), 0), 0).unwrap();
-        let names = PbcSelectorArtifactNames { selector_packages: Vec::new() };
-        let expected = ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] };
-        let wrong_manifest = Manifest {
-            ir_version: 1,
-            production_id: ProductionId { spec_hash: SpecHash([3; 32]), execution_nonce: [4; 32] },
-            artifacts: Default::default(),
-        };
-        let sampler_layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 1,
-            gadget_base: 2.into(),
-        };
-        assert!(
-            PbcSelectorArtifacts::import(
-                expected,
-                &layout,
-                [4; 32],
-                &wrong_manifest,
-                names,
-                &sampler_layout,
-                [4; 32],
-                &sampler_layout,
-                [4; 32],
-            )
-            .is_err()
+            names_a.selector_packages.iter().all(|entry| !entry.ciphertext.contains("support"))
         );
     }
 
     #[test]
     fn trusted_selector_bits_validate_count_order_and_binary_values() {
-        use mxx_bgg::BggSamplerLayout;
-
         let parameters = PbcParameters::custom(5, 1, 2, 3, 1, None);
         let generated = generate_key_layout(&parameters, seed(15), &[0]).unwrap();
         let layout = &generated.public_layout;
-        let sampler_layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 1,
-            gadget_base: 2.into(),
-        };
-        let ring = sampler_layout.ring();
+        let ring = Ring::new(257, 4);
         let active = PbcActiveCellIndex::build(layout).unwrap();
         let expected_active = layout
             .cells
@@ -813,522 +742,1681 @@ mod tests {
             assert_eq!(actual.as_ref(), &expected);
         }
     }
+}
 
-    #[test]
-    fn large_selector_bits_remain_one_structural_family_input() {
-        use crate::encoding::ExponentLutEncodingSampler;
-        use mxx_bgg::BggSamplerLayout;
-        use mxx_dsl::DslContext;
-        use mxx_ir_core::node::NodeKind;
+use std::collections::HashSet;
 
-        // This is the accepted benchmark topology: 16,384 * 3 real cells plus
-        // one dummy in each of 20 buckets gives exactly 49,172 active bits.
-        let parameters = PbcParameters::custom(16_384, 17, 3, 20, 128, None);
-        let support = (0..17).collect::<Vec<_>>();
-        let generated = generate_key_layout(&parameters, seed(17), &support).unwrap();
-        let sampler_layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 1,
-            gadget_base: 2.into(),
+use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Named parameter policy used when generating a PBC layout.
+pub enum PbcProfile {
+    /// A conservative bucket-count and retry policy.
+    Conservative,
+    /// Parameters using three candidate buckets per coordinate and a larger
+    /// deterministic retry budget.
+    PaperEvaluation,
+    /// Explicit values supplied through [`PbcParameters::custom`].
+    Custom,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Validated public dimensions and retry limits for PBC.
+pub struct PbcParameters {
+    /// Number of coordinates in the public universe.
+    pub universe_size: usize,
+    /// Number of nonzero coordinates in the sparse support.
+    pub support_weight: usize,
+    /// Number of candidate buckets hashed for each coordinate.
+    pub hash_count: usize,
+    /// Number of bucket rows in the rectangular layout.
+    pub bucket_count: usize,
+    /// Maximum number of deterministic seeds tried by schedule generation.
+    pub max_seed_attempts: u32,
+    /// Optional hard limit on the rectangular bucket width.
+    pub bucket_width_limit: Option<usize>,
+    /// Preset or custom policy associated with these values.
+    pub profile: PbcProfile,
+}
+
+#[derive(Deserialize)]
+struct PbcParametersRepr {
+    universe_size: usize,
+    support_weight: usize,
+    hash_count: usize,
+    bucket_count: usize,
+    max_seed_attempts: u32,
+    bucket_width_limit: Option<usize>,
+    profile: PbcProfile,
+}
+
+impl<'de> Deserialize<'de> for PbcParameters {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = PbcParametersRepr::deserialize(deserializer)?;
+        let parameters = Self {
+            universe_size: repr.universe_size,
+            support_weight: repr.support_weight,
+            hash_count: repr.hash_count,
+            bucket_count: repr.bucket_count,
+            max_seed_attempts: repr.max_seed_attempts,
+            bucket_width_limit: repr.bucket_width_limit,
+            profile: repr.profile,
         };
-        let trusted =
-            PbcTrustedSelectorBits::from_schedule(&generated, &sampler_layout.ring(), [8; 32])
-                .unwrap();
-        assert_eq!(trusted.runtime_bits().len(), 49_172);
-        assert_eq!(
-            trusted.family().count(),
-            &mxx_ir_core::IntExpr::constant(trusted.runtime_bits().len())
-        );
+        parameters.validate().map_err(serde::de::Error::custom)?;
+        Ok(parameters)
+    }
+}
 
-        let sampler = ExponentLutEncodingSampler {
-            layout: sampler_layout,
-            exponent_layout: crate::layout::ExpLayout { stride_log2: 0, width_log2: 0 },
-            gaussian_sigma: None,
-            gaussian_max_coefficient_bound: None,
-        };
-        let families = build_structural_selector_families(
-            &sampler,
-            trusted.family().clone(),
-            sampler.sample_secret().unwrap(),
-            sampler.sample_secret().unwrap(),
-            sampler.layout.ring().bytes_input("large-selector-hash-key", 32),
-            &generated.public_layout,
-            [8; 32],
-        )
-        .unwrap();
-        let built = DslContext::new("large-structural-selector-input")
-            .public_output("gsw", families.gsw)
-            .unwrap()
-            .build()
-            .unwrap();
-        let nodes =
-            built.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
-        assert!(nodes.len() < 64, "selector graph must not grow with active count");
-        let bit_name = trusted.input_name().to_owned();
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| {
-                    matches!(node.kind(), NodeKind::Input { name, .. } if name == &bit_name)
-                })
-                .count(),
-            1
-        );
-        assert!(!nodes.iter().any(|node| {
-            matches!(node.kind(), NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyPack { .. })
-        }));
+impl PbcParameters {
+    /// Creates the conservative preset for a universe and support weight.
+    pub fn conservative(universe_size: usize, support_weight: usize) -> Self {
+        Self {
+            universe_size,
+            support_weight,
+            hash_count: 3,
+            bucket_count: support_weight.saturating_mul(3).div_ceil(2).max(3),
+            max_seed_attempts: 16,
+            bucket_width_limit: None,
+            profile: PbcProfile::Conservative,
+        }
     }
 
-    #[test]
-    fn selector_sampling_uses_one_structural_loop_and_runtime_bits() {
-        use crate::encoding::ExponentLutEncodingSampler;
-        use mxx_bgg::BggSamplerLayout;
-        use mxx_dsl::DslContext;
-        use mxx_ir_core::node::NodeKind;
+    /// Creates the numeric policy with three candidate buckets per coordinate,
+    /// `bucket_count = max(3, support_weight + 3)`, and 128 retries.
+    pub fn paper_evaluation(universe_size: usize, support_weight: usize) -> Self {
+        Self {
+            universe_size,
+            support_weight,
+            hash_count: 3,
+            bucket_count: support_weight.saturating_add(3).max(3),
+            max_seed_attempts: 128,
+            bucket_width_limit: None,
+            profile: PbcProfile::PaperEvaluation,
+        }
+    }
 
-        let parameters = PbcParameters::custom(5, 1, 2, 3, 1, None);
-        let first = generate_key_layout(&parameters, seed(16), &[0]).unwrap();
-        let second = generate_key_layout(&parameters, seed(16), &[1]).unwrap();
-        assert_eq!(first.public_layout, second.public_layout);
-        let sampler_layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 1,
-            gadget_base: 2.into(),
-        };
-        let ring = sampler_layout.ring();
-        let sampler = ExponentLutEncodingSampler {
-            layout: sampler_layout.clone(),
-            exponent_layout: crate::layout::ExpLayout { stride_log2: 0, width_log2: 0 },
-            gaussian_sigma: None,
-            gaussian_max_coefficient_bound: None,
-        };
-        let bits = PbcTrustedSelectorBits::from_schedule(&first, &ring, [7; 32]).unwrap();
-        let source = sampler.sample_secret().unwrap();
-        let target = sampler.sample_secret().unwrap();
-        let hash_key = ring.bytes_input("selector-hash-key", 32);
-        let families = build_structural_selector_families(
-            &sampler,
-            bits.family().clone(),
-            source,
-            target,
-            hash_key,
-            &first.public_layout,
-            [7; 32],
-        )
-        .unwrap();
-        let names = PbcSelectorArtifactNames::canonicalize_schema(
-            &first.public_layout,
-            [7; 32],
-            sampler_layout.secret_dimension,
-            sampler_layout.public_key_columns(),
-        )
-        .unwrap();
-        let artifacts = PbcSelectorArtifacts::from_structural(
-            &first.public_layout,
-            [7; 32],
-            names,
-            &sampler_layout,
-            [7; 32],
-            &sampler_layout,
-            [7; 32],
-        )
-        .unwrap();
-        let context = artifacts
-            .add_structural_family_outputs(
-                DslContext::new("trusted-selector-structural-loop"),
-                &first.public_layout,
-                families,
-            )
-            .unwrap();
-        let built = context.build().unwrap();
-        let loops = built
-            .graph
-            .root_scope()
-            .nodes()
-            .iter()
-            .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
-            .count();
-        assert_eq!(loops, 1);
-        let bit_name = bits.input_name().to_owned();
-        let bit_inputs = built.graph.root_scope().nodes().iter().filter(|node| {
-            matches!(node.kind(), NodeKind::Input { name, artifact: None, .. } if name == &bit_name)
+    /// Creates an explicit parameter set; call [`Self::validate`] before use.
+    pub fn custom(
+        universe_size: usize,
+        support_weight: usize,
+        hash_count: usize,
+        bucket_count: usize,
+        max_seed_attempts: u32,
+        bucket_width_limit: Option<usize>,
+    ) -> Self {
+        Self {
+            universe_size,
+            support_weight,
+            hash_count,
+            bucket_count,
+            max_seed_attempts,
+            bucket_width_limit,
+            profile: PbcProfile::Custom,
+        }
+    }
+
+    /// Checks dimensions, overflow limits, and profile-specific invariants.
+    pub fn validate(&self) -> Result<(), PbcError> {
+        if self.universe_size == 0 {
+            return Err(PbcError::InvalidParameters("universe_size must be positive".into()));
+        }
+        if self.support_weight == 0 || self.support_weight > self.universe_size {
+            return Err(PbcError::InvalidParameters(
+                "support_weight must be in 1..=universe_size".into(),
+            ));
+        }
+        if self.hash_count < 2 {
+            return Err(PbcError::InvalidParameters("hash_count must be at least two".into()));
+        }
+        if self.bucket_count < self.support_weight {
+            return Err(PbcError::InvalidParameters("bucket_count must cover the support".into()));
+        }
+        if self.bucket_count < self.hash_count {
+            return Err(PbcError::InvalidParameters(
+                "bucket_count must be at least hash_count".into(),
+            ));
+        }
+        if self.max_seed_attempts == 0 {
+            return Err(PbcError::InvalidParameters("max_seed_attempts must be positive".into()));
+        }
+        if self.bucket_width_limit.is_some_and(|width| width < 2) {
+            return Err(PbcError::InvalidParameters(
+                "bucket_width_limit must be at least two".into(),
+            ));
+        }
+        for value in [self.universe_size, self.support_weight, self.hash_count, self.bucket_count] {
+            if u64::try_from(value).is_err() {
+                return Err(PbcError::SizeOverflow);
+            }
+        }
+        match self.profile {
+            PbcProfile::Conservative => {
+                let expected_bucket_count = self
+                    .support_weight
+                    .checked_mul(3)
+                    .ok_or(PbcError::SizeOverflow)?
+                    .div_ceil(2)
+                    .max(3);
+                if self.hash_count != 3 ||
+                    self.bucket_count != expected_bucket_count ||
+                    self.max_seed_attempts != 16
+                {
+                    return Err(PbcError::InvalidParameters(
+                        "Conservative profile requires hash_count=3, bucket_count=max(3, ceil(3*support_weight/2)), and max_seed_attempts=16".into(),
+                    ));
+                }
+            }
+            PbcProfile::PaperEvaluation => {
+                let expected_bucket_count =
+                    self.support_weight.checked_add(3).ok_or(PbcError::SizeOverflow)?.max(3);
+                if self.hash_count != 3 ||
+                    self.bucket_count != expected_bucket_count ||
+                    self.max_seed_attempts != 128
+                {
+                    return Err(PbcError::InvalidParameters(
+                        "PaperEvaluation profile requires hash_count=3, bucket_count=max(3, support_weight+3), and max_seed_attempts=128".into(),
+                    ));
+                }
+            }
+            PbcProfile::Custom => {}
+        }
+        Ok(())
+    }
+
+    /// Appends the canonical field order and profile tag used in layout IDs.
+    ///
+    /// This is an identity encoding, not a general-purpose serialization:
+    /// callers validate the parameters first and then include these fields in
+    /// the public layout digest.
+    pub(crate) fn encode_canonical(&self, out: &mut Vec<u8>) -> Result<(), PbcError> {
+        for value in [self.universe_size, self.support_weight, self.hash_count, self.bucket_count] {
+            out.extend(u64::try_from(value).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes());
+        }
+        out.extend(u64::from(self.max_seed_attempts).to_le_bytes());
+        match self.bucket_width_limit {
+            Some(width) => {
+                out.push(1);
+                out.extend(u64::try_from(width).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        out.push(match self.profile {
+            PbcProfile::Conservative => 0,
+            PbcProfile::PaperEvaluation => 1,
+            PbcProfile::Custom => 2,
         });
-        assert_eq!(bit_inputs.count(), 1);
-
-        // A different private schedule still produces the same structural graph
-        // schema.  Concrete fixed-C family contents are runtime artifacts and may
-        // differ with the sampled RHS inputs; this assertion concerns only the
-        // graph shape and public namespace, not matrix-value invariance.
-        let second_bits = PbcTrustedSelectorBits::from_schedule(&second, &ring, [7; 32]).unwrap();
-        let second_families = build_structural_selector_families(
-            &sampler,
-            second_bits.family().clone(),
-            sampler.sample_secret().unwrap(),
-            sampler.sample_secret().unwrap(),
-            ring.bytes_input("selector-hash-key", 32),
-            &second.public_layout,
-            [7; 32],
-        )
-        .unwrap();
-        let second_names = PbcSelectorArtifactNames::canonicalize_schema(
-            &second.public_layout,
-            [7; 32],
-            sampler_layout.secret_dimension,
-            sampler_layout.public_key_columns(),
-        )
-        .unwrap();
-        let second_artifacts = PbcSelectorArtifacts::from_structural(
-            &second.public_layout,
-            [7; 32],
-            second_names,
-            &sampler_layout,
-            [7; 32],
-            &sampler_layout,
-            [7; 32],
-        )
-        .unwrap();
-        let second_context = second_artifacts
-            .add_structural_family_outputs(
-                DslContext::new("trusted-selector-structural-loop"),
-                &second.public_layout,
-                second_families,
-            )
-            .unwrap();
-        let second_built = second_context.build().unwrap();
-        let first_hash =
-            mxx_ir_core::encoding::spec_hash(&built.graph, &Default::default()).unwrap();
-        let second_hash =
-            mxx_ir_core::encoding::spec_hash(&second_built.graph, &Default::default()).unwrap();
-        assert_eq!(first_hash, second_hash);
+        Ok(())
     }
-    #[test]
-    fn fixed_rhs_selector_schema_exposes_only_gsw_component() {
-        let parameters = PbcParameters::custom(7, 2, 2, 3, 1, None);
-        let layout =
-            PbcPublicLayout::build(&parameters, derive_attempt_seed(seed(14), 0), 0).unwrap();
-        let names = PbcSelectorArtifactNames::canonicalize_schema(&layout, [8; 32], 1, 1).unwrap();
-        assert_eq!(
-            names.selector_packages.len(),
-            parameters.universe_size * parameters.hash_count + parameters.bucket_count
-        );
-        assert!(
-            names
-                .selector_packages
-                .iter()
-                .all(|package| !package.package.gsw_ciphertext.contains("selected"))
-        );
-        assert!(
-            names
-                .selector_packages
-                .iter()
-                .all(|package| !package.package.gsw_ciphertext.contains("support"))
-        );
-        let sampler_layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 1,
-            gadget_base: 2.into(),
-        };
-        let artifacts = PbcSelectorArtifacts::from_structural(
-            &layout,
-            [8; 32],
-            names.clone(),
-            &sampler_layout,
-            [8; 32],
-            &sampler_layout,
-            [8; 32],
-        )
-        .unwrap();
-        let family_name = selector_family_artifact_name(&artifacts, "gsw");
-        assert!(!family_name.is_empty());
+}
+
+/// Derives the public seed for one retry attempt.
+pub fn derive_attempt_seed(root_seed: PbcRootSeed, attempt: u32) -> PbcLayoutSeed {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mxx-exponent-lut/pbc/layout-seed/v1");
+    hasher.update(root_seed.0);
+    hasher.update(u64::from(attempt).to_le_bytes());
+    PbcLayoutSeed(hasher.finalize().into())
+}
+
+/// Derives `hash_count` distinct candidate buckets for one coordinate.
+///
+/// The replica number is part of the hash domain, so each candidate has a
+/// stable position in the public candidate list. Rejection sampling accepts
+/// only the largest multiple of `bucket_count` below `2^64`; the accepted
+/// digest is then reduced without modulo bias.
+pub fn derive_candidate_buckets(
+    seed: PbcLayoutSeed,
+    coordinate: usize,
+    bucket_count: usize,
+    hash_count: usize,
+) -> Result<Vec<usize>, PbcError> {
+    if bucket_count == 0 || hash_count == 0 || hash_count > bucket_count {
+        return Err(PbcError::InvalidParameters(
+            "candidate derivation requires 0 < hash_count <= bucket_count".into(),
+        ));
     }
-
-    fn selector_family_manifest_fixture() -> (
-        PbcSelectorArtifacts,
-        PbcPublicLayout,
-        PbcSelectorArtifactNames,
-        BggSamplerLayout,
-        ProductionId,
-        Manifest,
-        [u8; 32],
-        [u8; 32],
-        [u8; 32],
-    ) {
-        use mxx_ir_core::{
-            artifact::{ArtifactConfidentiality, ArtifactType, ManifestArtifact, SpecHash},
-            types::ConcreteMatrixType,
-        };
-        use std::collections::BTreeMap;
-
-        let parameters = PbcParameters::custom(5, 1, 2, 2, 1, None);
-        let layout =
-            PbcPublicLayout::build(&parameters, derive_attempt_seed(seed(17), 0), 0).unwrap();
-        let sampler = BggSamplerLayout {
-            modulus: 97.into(),
-            ring_dimension: 4.into(),
-            secret_dimension: 2,
-            digit_count: 1,
-            gadget_base: 4.into(),
-        };
-        let key_instance_id = [4; 32];
-        let source_identity = [5; 32];
-        let target_identity = [6; 32];
-        let names = PbcSelectorArtifactNames::canonicalize_schema(
-            &layout,
-            key_instance_id,
-            sampler.secret_dimension,
-            sampler.public_key_columns(),
-        )
-        .unwrap();
-        let artifacts = PbcSelectorArtifacts::from_structural(
-            &layout,
-            key_instance_id,
-            names.clone(),
-            &sampler,
-            source_identity,
-            &sampler,
-            target_identity,
-        )
-        .unwrap();
-        let family_name = selector_family_artifact_name(&artifacts, "gsw");
-        let active_count = names.selector_packages.len();
-        let mut manifest = Manifest {
-            ir_version: mxx_ir_core::encoding::IR_VERSION,
-            production_id: ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] },
-            artifacts: BTreeMap::from([(
-                family_name,
-                ManifestArtifact {
-                    artifact_type: ArtifactType::Matrix(ConcreteMatrixType {
-                        modulus: 97.into(),
-                        ring_dimension: 4,
-                        rows: sampler.secret_dimension,
-                        columns: sampler.public_key_columns(),
-                    }),
-                    family_count: Some(active_count),
-                    confidentiality: ArtifactConfidentiality::Public,
-                    content_hash: Some([9; 32]),
-                    layout: None,
-                },
-            )]),
-        };
-        artifacts.finalize_export_manifest(&mut manifest).unwrap();
-        (
-            artifacts,
-            layout,
-            names,
-            sampler,
-            manifest.production_id.clone(),
-            manifest,
-            key_instance_id,
-            source_identity,
-            target_identity,
-        )
+    let coordinate = u64::try_from(coordinate).map_err(|_| PbcError::SizeOverflow)?;
+    let bucket_count = u64::try_from(bucket_count).map_err(|_| PbcError::SizeOverflow)?;
+    let range = 1u128 << 64;
+    let limit = (range / u128::from(bucket_count)) * u128::from(bucket_count);
+    let mut candidates = Vec::with_capacity(hash_count);
+    for replica in 0..hash_count {
+        let replica = u64::try_from(replica).map_err(|_| PbcError::SizeOverflow)?;
+        let mut nonce = 0u64;
+        loop {
+            let mut hasher = Sha256::new();
+            hasher.update(b"mxx-exponent-lut/pbc/candidate/v1");
+            hasher.update(seed.0);
+            hasher.update(coordinate.to_le_bytes());
+            hasher.update(replica.to_le_bytes());
+            hasher.update(nonce.to_le_bytes());
+            let digest = hasher.finalize();
+            let z = u64::from_le_bytes(
+                digest[..8].try_into().map_err(|_| PbcError::HashNonceOverflow)?,
+            );
+            let z128 = u128::from(z);
+            if z128 < limit {
+                let bucket = (z128 % u128::from(bucket_count)) as usize;
+                if !candidates.contains(&bucket) {
+                    candidates.push(bucket);
+                    break;
+                }
+            }
+            nonce = nonce.checked_add(1).ok_or(PbcError::HashNonceOverflow)?;
+        }
     }
+    Ok(candidates)
+}
 
-    #[test]
-    fn selector_family_finalization_preserves_runtime_descriptor() {
-        let (artifacts, _, _, _, _, mut manifest, _, _, _) = selector_family_manifest_fixture();
-        let before = manifest.clone();
-        artifacts.finalize_export_manifest(&mut manifest).unwrap();
-        assert_eq!(manifest, before);
-        assert!(manifest.artifacts.values().all(|descriptor| descriptor.layout.is_none()));
-    }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Public, serializable description of all PBC buckets and coordinate replicas.
+pub struct PbcPublicLayout {
+    /// Layout schema version checked during deserialization.
+    pub semantic_version: u32,
+    /// Public dimensions and retry policy used to build the layout.
+    pub parameters: PbcParameters,
+    /// Accepted attempt seed.
+    pub seed: PbcLayoutSeed,
+    /// Zero-based attempt number at which this layout was accepted.
+    pub accepted_attempt: u32,
+    /// Candidate bucket list for each universe coordinate.
+    pub candidates: Vec<Vec<usize>>,
+    /// Rectangular bucket rows containing real, dummy, and padding cells.
+    pub cells: Vec<Vec<PbcCell>>,
+    /// Inverse coordinate-to-replica locations.
+    pub locations: Vec<Vec<PbcLocation>>,
+    /// Common row width after rectangularization.
+    pub bucket_width: usize,
+    /// Digest binding all public layout fields.
+    pub layout_id: PbcLayoutId,
+}
 
-    #[test]
-    fn selector_family_import_round_trip_validates_rhs_layouts_and_identities() {
-        let (_, layout, names, sampler, production_id, manifest, key_id, source_id, target_id) =
-            selector_family_manifest_fixture();
-        let imported = PbcSelectorArtifacts::import(
-            production_id,
-            &layout,
-            key_id,
-            &manifest,
-            names,
-            &sampler,
-            source_id,
-            &sampler,
-            target_id,
-        )
-        .unwrap();
-        assert_eq!(imported.layout_id(), layout.layout_id);
-        assert_eq!(imported.key_instance_id(), key_id);
-        assert_eq!(imported.package_count(), layout.parameters.universe_size * 2 + 2);
-    }
+#[derive(Deserialize)]
+struct PbcPublicLayoutRepr {
+    semantic_version: u32,
+    parameters: PbcParameters,
+    seed: PbcLayoutSeed,
+    accepted_attempt: u32,
+    candidates: Vec<Vec<usize>>,
+    cells: Vec<Vec<PbcCell>>,
+    locations: Vec<Vec<PbcLocation>>,
+    bucket_width: usize,
+    layout_id: PbcLayoutId,
+}
 
-    #[test]
-    fn selector_family_import_rejects_wrong_rhs_bindings_and_family_schema() {
-        use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
-
-        let (_, layout, names, sampler, production_id, manifest, key_id, source_id, target_id) =
-            selector_family_manifest_fixture();
-        let import = |manifest: &Manifest,
-                      names: PbcSelectorArtifactNames,
-                      layout: &PbcPublicLayout,
-                      key_id: [u8; 32],
-                      source: &BggSamplerLayout,
-                      source_id: [u8; 32],
-                      target: &BggSamplerLayout,
-                      target_id: [u8; 32]| {
-            PbcSelectorArtifacts::import(
-                production_id.clone(),
-                layout,
-                key_id,
-                manifest,
-                names,
-                source,
-                source_id,
-                target,
-                target_id,
-            )
+impl<'de> Deserialize<'de> for PbcPublicLayout {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = PbcPublicLayoutRepr::deserialize(deserializer)?;
+        let layout = Self {
+            semantic_version: repr.semantic_version,
+            parameters: repr.parameters,
+            seed: repr.seed,
+            accepted_attempt: repr.accepted_attempt,
+            candidates: repr.candidates,
+            cells: repr.cells,
+            locations: repr.locations,
+            bucket_width: repr.bucket_width,
+            layout_id: repr.layout_id,
         };
+        layout.validate().map_err(serde::de::Error::custom)?;
+        Ok(layout)
+    }
+}
 
-        let mut wrong_source = sampler.clone();
-        wrong_source.gadget_base = 8.into();
-        assert!(
-            import(
-                &manifest,
-                names.clone(),
-                &layout,
-                key_id,
-                &wrong_source,
-                source_id,
-                &sampler,
-                target_id
-            )
-            .is_err()
-        );
-        assert!(
-            import(
-                &manifest,
-                names.clone(),
-                &layout,
-                key_id,
-                &sampler,
-                [10; 32],
-                &sampler,
-                target_id
-            )
-            .is_err()
-        );
-        let mut wrong_target = sampler.clone();
-        wrong_target.digit_count = 2;
-        assert!(
-            import(
-                &manifest,
-                names.clone(),
-                &layout,
-                key_id,
-                &sampler,
-                source_id,
-                &wrong_target,
-                target_id
-            )
-            .is_err()
-        );
-        assert!(
-            import(
-                &manifest,
-                names.clone(),
-                &layout,
-                [11; 32],
-                &sampler,
-                source_id,
-                &sampler,
-                target_id
-            )
-            .is_err()
-        );
-
-        let mut wrong_count = manifest.clone();
-        let family_name = selector_family_artifact_name(
-            &PbcSelectorArtifacts::from_structural(
-                &layout,
-                key_id,
-                names.clone(),
-                &sampler,
-                source_id,
-                &sampler,
-                target_id,
-            )
-            .unwrap(),
-            "gsw",
-        );
-        wrong_count.artifacts.get_mut(&family_name).unwrap().family_count = Some(1);
-        assert!(
-            import(
-                &wrong_count,
-                names.clone(),
-                &layout,
-                key_id,
-                &sampler,
-                source_id,
-                &sampler,
-                target_id
-            )
-            .is_err()
-        );
-
-        let mut wrong_type = manifest.clone();
-        wrong_type.artifacts.get_mut(&family_name).unwrap().artifact_type =
-            ArtifactType::Matrix(ConcreteMatrixType {
-                modulus: 97.into(),
-                ring_dimension: 4,
-                rows: 2,
-                columns: 1,
+impl PbcPublicLayout {
+    /// Builds and validates a public layout for one accepted seed attempt.
+    pub fn build(
+        parameters: &PbcParameters,
+        seed: PbcLayoutSeed,
+        accepted_attempt: u32,
+    ) -> Result<Self, PbcError> {
+        parameters.validate()?;
+        if accepted_attempt >= parameters.max_seed_attempts {
+            return Err(PbcError::InvalidParameters(
+                "accepted attempt exceeds max_seed_attempts".into(),
+            ));
+        }
+        let mut candidates = Vec::with_capacity(parameters.universe_size);
+        let mut bucket_real_cells = vec![Vec::<PbcCell>::new(); parameters.bucket_count];
+        for coordinate in 0..parameters.universe_size {
+            // `candidate_buckets[x]` is the ordered public hash-neighborhood
+            // of x; each replica is inserted into exactly one bucket row.
+            let candidate_buckets = derive_candidate_buckets(
+                seed,
+                coordinate,
+                parameters.bucket_count,
+                parameters.hash_count,
+            )?;
+            for (replica, &bucket) in candidate_buckets.iter().enumerate() {
+                bucket_real_cells[bucket].push(PbcCell::Real { coordinate, replica });
+            }
+            candidates.push(candidate_buckets);
+        }
+        for cells in &mut bucket_real_cells {
+            cells.sort_by_key(|cell| match cell {
+                PbcCell::Real { coordinate, replica } => (*coordinate, *replica),
+                PbcCell::Dummy | PbcCell::Padding => (usize::MAX, usize::MAX),
             });
-        assert!(
-            import(
-                &wrong_type,
-                names.clone(),
-                &layout,
-                key_id,
-                &sampler,
-                source_id,
-                &sampler,
-                target_id
-            )
-            .is_err()
-        );
+        }
+        // Rectangularization adds one dummy to every row, then enough padding
+        // for the row with the most real replicas.
+        let max_real = bucket_real_cells.iter().map(Vec::len).max().unwrap_or(0);
+        let bucket_width = max_real.checked_add(1).ok_or(PbcError::SizeOverflow)?;
+        if parameters.bucket_width_limit.is_some_and(|limit| bucket_width > limit) {
+            return Err(PbcError::BucketWidthExceeded);
+        }
+        let cells = bucket_real_cells
+            .into_iter()
+            .map(|mut real| {
+                real.push(PbcCell::Dummy);
+                real.resize(bucket_width, PbcCell::Padding);
+                real
+            })
+            .collect::<Vec<_>>();
+        // `locations[x][r]` is the inverse address used by private matching;
+        // it is public because it reveals only the hash layout, not support.
+        let mut locations = vec![
+            vec![PbcLocation { bucket: 0, slot: 0 }; parameters.hash_count];
+            parameters.universe_size
+        ];
+        for (bucket, row) in cells.iter().enumerate() {
+            for (slot, cell) in row.iter().enumerate() {
+                if let PbcCell::Real { coordinate, replica } = cell {
+                    locations[*coordinate][*replica] = PbcLocation { bucket, slot };
+                }
+            }
+        }
+        let layout = Self {
+            semantic_version: PBC_LAYOUT_SEMANTIC_VERSION,
+            parameters: parameters.clone(),
+            seed,
+            accepted_attempt,
+            candidates,
+            cells,
+            locations,
+            bucket_width,
+            layout_id: PbcLayoutId([0; 32]),
+        };
+        let layout_id = layout.compute_id()?;
+        let layout = Self { layout_id, ..layout };
+        layout.validate()?;
+        Ok(layout)
+    }
 
-        let mut wrong_metadata = manifest.clone();
-        let descriptor = wrong_metadata.artifacts.get_mut(&family_name).unwrap();
-        // The runtime owns the generic descriptor layout and persists it as
-        // `None`.  A PBC-specific layout payload is therefore malformed rather
-        // than a second source of metadata that import would have to reconcile.
-        descriptor.layout = Some("unexpected-pbc-metadata".to_owned());
-        assert!(
-            import(
-                &wrong_metadata,
-                names.clone(),
-                &layout,
-                key_id,
-                &sampler,
-                source_id,
-                &sampler,
-                target_id
-            )
-            .is_err()
+    /// Recomputes all structural invariants and the layout identity.
+    pub fn validate(&self) -> Result<(), PbcError> {
+        self.parameters.validate()?;
+        if self.semantic_version != PBC_LAYOUT_SEMANTIC_VERSION {
+            return Err(PbcError::InvalidLayout("unsupported PBC layout semantic version".into()));
+        }
+        if self.accepted_attempt >= self.parameters.max_seed_attempts {
+            return Err(PbcError::InvalidLayout("accepted attempt is out of range".into()));
+        }
+        if self.candidates.len() != self.parameters.universe_size {
+            return Err(PbcError::InvalidLayout("candidate row count mismatch".into()));
+        }
+        let mut expected_real_count = vec![0usize; self.parameters.bucket_count];
+        for (coordinate, row) in self.candidates.iter().enumerate() {
+            if row.len() != self.parameters.hash_count {
+                return Err(PbcError::InvalidLayout("candidate count mismatch".into()));
+            }
+            let mut seen = HashSet::with_capacity(row.len());
+            for &bucket in row {
+                if bucket >= self.parameters.bucket_count || !seen.insert(bucket) {
+                    return Err(PbcError::InvalidLayout("candidate bucket is invalid".into()));
+                }
+                expected_real_count[bucket] += 1;
+            }
+            let derived = derive_candidate_buckets(
+                self.seed,
+                coordinate,
+                self.parameters.bucket_count,
+                self.parameters.hash_count,
+            )?;
+            if derived != *row {
+                return Err(PbcError::InvalidLayout("candidate derivation mismatch".into()));
+            }
+        }
+        if self.cells.len() != self.parameters.bucket_count || self.bucket_width == 0 {
+            return Err(PbcError::InvalidLayout("bucket row count or width mismatch".into()));
+        }
+        let mut observed_real = vec![0usize; self.parameters.bucket_count];
+        let mut seen_real = HashSet::with_capacity(
+            self.parameters
+                .universe_size
+                .checked_mul(self.parameters.hash_count)
+                .ok_or(PbcError::SizeOverflow)?,
         );
+        for (bucket, row) in self.cells.iter().enumerate() {
+            if row.len() != self.bucket_width {
+                return Err(PbcError::InvalidLayout("bucket is not rectangular".into()));
+            }
+            let dummy_slot = row
+                .iter()
+                .position(|cell| matches!(cell, PbcCell::Dummy))
+                .ok_or_else(|| PbcError::InvalidLayout("missing dummy".into()))?;
+            if row.iter().filter(|cell| matches!(cell, PbcCell::Dummy)).count() != 1 {
+                return Err(PbcError::InvalidLayout("bucket must contain one dummy".into()));
+            }
+            let mut previous_real = None;
+            for (slot, cell) in row.iter().enumerate() {
+                match cell {
+                    PbcCell::Real { coordinate, replica } => {
+                        if *coordinate >= self.parameters.universe_size ||
+                            *replica >= self.parameters.hash_count ||
+                            slot > dummy_slot
+                        {
+                            return Err(PbcError::InvalidLayout("invalid real cell".into()));
+                        }
+                        if let Some(previous) = previous_real &&
+                            previous >= (*coordinate, *replica)
+                        {
+                            return Err(PbcError::InvalidLayout(
+                                "real cells are not canonical".into(),
+                            ));
+                        }
+                        previous_real = Some((*coordinate, *replica));
+                        if self.candidates[*coordinate][*replica] != bucket ||
+                            !seen_real.insert((*coordinate, *replica))
+                        {
+                            return Err(PbcError::InvalidLayout(
+                                "real cell is not canonical".into(),
+                            ));
+                        }
+                        observed_real[bucket] += 1;
+                    }
+                    PbcCell::Dummy if slot != dummy_slot => {
+                        return Err(PbcError::InvalidLayout("dummy ordering is invalid".into()));
+                    }
+                    PbcCell::Padding if slot <= dummy_slot => {
+                        return Err(PbcError::InvalidLayout("padding must follow dummy".into()));
+                    }
+                    PbcCell::Dummy | PbcCell::Padding => {}
+                }
+            }
+        }
+        if observed_real != expected_real_count ||
+            seen_real.len() !=
+                self.parameters
+                    .universe_size
+                    .checked_mul(self.parameters.hash_count)
+                    .ok_or(PbcError::SizeOverflow)? ||
+            self.bucket_width != 1 + expected_real_count.iter().copied().max().unwrap_or(0)
+        {
+            return Err(PbcError::InvalidLayout("real-cell accounting mismatch".into()));
+        }
+        if self.locations.len() != self.parameters.universe_size ||
+            self.locations.iter().any(|row| row.len() != self.parameters.hash_count)
+        {
+            return Err(PbcError::InvalidLayout("location map shape mismatch".into()));
+        }
+        for (coordinate, row) in self.locations.iter().enumerate() {
+            for (replica, location) in row.iter().enumerate() {
+                if location.bucket >= self.parameters.bucket_count ||
+                    location.slot >= self.bucket_width ||
+                    !matches!(
+                        self.cells[location.bucket][location.slot],
+                        PbcCell::Real { coordinate: x, replica: r }
+                            if x == coordinate && r == replica
+                    )
+                {
+                    return Err(PbcError::InvalidLayout("location inverse map mismatch".into()));
+                }
+            }
+        }
+        if self.compute_id()? != self.layout_id {
+            return Err(PbcError::LayoutIdentityMismatch);
+        }
+        Ok(())
+    }
 
-        let mut wrong_order_names = names;
-        wrong_order_names.selector_packages.swap(0, 1);
-        assert!(
-            import(
-                &manifest,
-                wrong_order_names,
-                &layout,
-                key_id,
-                &sampler,
-                source_id,
-                &sampler,
-                target_id
-            )
-            .is_err()
+    fn compute_id(&self) -> Result<PbcLayoutId, PbcError> {
+        let mut encoding = Vec::new();
+        encoding.extend(u64::from(self.semantic_version).to_le_bytes());
+        self.parameters.encode_canonical(&mut encoding)?;
+        encoding.extend(self.seed.0);
+        encoding.extend(u64::from(self.accepted_attempt).to_le_bytes());
+        encode_nested_usizes(&mut encoding, &self.candidates)?;
+        encode_cells(&mut encoding, &self.cells)?;
+        encoding.extend(
+            u64::try_from(self.bucket_width).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes(),
         );
+        let mut hasher = Sha256::new();
+        hasher.update(b"mxx-exponent-lut/pbc/layout-id/v1");
+        hasher.update(encoding);
+        Ok(PbcLayoutId(hasher.finalize().into()))
+    }
+}
+
+/// The canonical row-major index of all cells that can carry a selector.
+///
+/// A PBC row contains real cells followed by exactly one dummy cell and then
+/// optional padding cells.  This index includes the real and dummy cells, but
+/// never padding.  The third tuple component is a dense index over those
+/// active cells, so a flattened selector family can use it without scanning
+/// the rectangular storage again.
+///
+/// The index contains derived, non-serialized state.  Construct it with
+/// [`PbcActiveCellIndex::build`] after obtaining a validated public layout;
+/// construction validates the layout itself and therefore cannot accidentally
+/// index malformed or untrusted serialized data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PbcActiveCellIndex {
+    /// `(bucket, slot, flat_nonpadding_index)` in canonical row-major order.
+    entries: Vec<(usize, usize, usize)>,
+    /// Half-open entry ranges for each bucket, with one final total offset.
+    bucket_offsets: Vec<usize>,
+}
+
+impl PbcActiveCellIndex {
+    /// Validates `layout` and derives its canonical active-cell index.
+    pub fn build(layout: &PbcPublicLayout) -> Result<Self, PbcError> {
+        layout.validate()?;
+
+        // Every coordinate has exactly `hash_count` real replicas, and every
+        // bucket contributes exactly one dummy.  This reserves only active
+        // cells instead of the potentially much larger padded rectangle.
+        let active_cell_count = layout
+            .parameters
+            .universe_size
+            .checked_mul(layout.parameters.hash_count)
+            .and_then(|real| real.checked_add(layout.parameters.bucket_count))
+            .ok_or(PbcError::SizeOverflow)?;
+        let mut entries = Vec::with_capacity(active_cell_count);
+        let mut bucket_offsets = Vec::with_capacity(layout.cells.len() + 1);
+        bucket_offsets.push(0);
+
+        for (bucket, row) in layout.cells.iter().enumerate() {
+            for (slot, cell) in row.iter().enumerate() {
+                if !matches!(cell, PbcCell::Padding) {
+                    entries.push((bucket, slot, entries.len()));
+                }
+            }
+            bucket_offsets.push(entries.len());
+        }
+
+        if entries.len() != active_cell_count {
+            return Err(PbcError::InvalidLayout(
+                "active-cell accounting does not equal real replicas plus dummies".into(),
+            ));
+        }
+
+        Ok(Self { entries, bucket_offsets })
+    }
+
+    /// Iterates `(bucket, slot, flat_nonpadding_index)` in canonical order.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.entries.iter().copied()
+    }
+
+    /// Returns the number of active (real plus dummy) cells in all buckets.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether the index contains no real or dummy cells.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the active width/count of `bucket`, or `None` if it is absent.
+    ///
+    /// Since padding is the only inactive cell kind, this value is both the
+    /// number of selectable cells and the width of the bucket's flattened
+    /// active slice.
+    pub fn bucket_active_width(&self, bucket: usize) -> Option<usize> {
+        let end = bucket.checked_add(1)?;
+        self.bucket_offsets.get(bucket..=end).map(|range| range[1] - range[0])
+    }
+
+    /// Alias emphasizing that the active width is a cell count.
+    pub fn bucket_active_count(&self, bucket: usize) -> Option<usize> {
+        self.bucket_active_width(bucket)
+    }
+
+    /// Returns the active entries for `bucket` in canonical slot order.
+    pub fn bucket_iter(
+        &self,
+        bucket: usize,
+    ) -> Option<impl Iterator<Item = (usize, usize, usize)> + '_> {
+        let end = bucket.checked_add(1)?;
+        let range = self.bucket_offsets.get(bucket..=end)?;
+        Some(self.entries[range[0]..range[1]].iter().copied())
+    }
+
+    /// Returns all per-bucket active widths/counts in bucket order.
+    pub fn bucket_active_widths(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bucket_offsets.windows(2).map(|range| range[1] - range[0])
+    }
+}
+
+fn encode_nested_usizes(out: &mut Vec<u8>, values: &[Vec<usize>]) -> Result<(), PbcError> {
+    out.extend(u64::try_from(values.len()).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes());
+    for row in values {
+        out.extend(u64::try_from(row.len()).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes());
+        for &value in row {
+            out.extend(u64::try_from(value).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn encode_cells(out: &mut Vec<u8>, cells: &[Vec<PbcCell>]) -> Result<(), PbcError> {
+    out.extend(u64::try_from(cells.len()).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes());
+    for row in cells {
+        out.extend(u64::try_from(row.len()).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes());
+        for cell in row {
+            match cell {
+                PbcCell::Real { coordinate, replica } => {
+                    out.push(0);
+                    out.extend(
+                        u64::try_from(*coordinate)
+                            .map_err(|_| PbcError::SizeOverflow)?
+                            .to_le_bytes(),
+                    );
+                    out.extend(
+                        u64::try_from(*replica).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes(),
+                    );
+                }
+                PbcCell::Dummy => out.push(1),
+                PbcCell::Padding => out.push(2),
+            }
+        }
+    }
+    Ok(())
+}
+
+use std::time::Instant;
+
+use schedule::{deterministic_matching, schedule_from_owners};
+
+/// Stable names used by [`PbcDiagnosticReport::performance_values`].
+pub const PERFORMANCE_CATEGORIES: [&str; 7] = [
+    "pbc_layout_hashing",
+    "pbc_matching",
+    "pbc_real_selector_packages",
+    "pbc_dummy_selector_packages",
+    "pbc_bucket_cell_evaluations",
+    "pbc_bucket_reductions",
+    "pbc_padding_overhead",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Measurements from one attempted PBC layout generation.
+pub struct PbcDiagnosticSample {
+    /// Number of seed attempts performed.
+    pub attempts: u32,
+    /// Accepted attempt, if any.
+    pub accepted_attempt: Option<u32>,
+    /// Accepted rectangular bucket width, if any.
+    pub bucket_width: Option<usize>,
+    /// Count of width-limit failures.
+    pub bucket_width_failures: u32,
+    /// Count of matching failures.
+    pub no_perfect_schedule_failures: u32,
+    /// Layout construction time in nanoseconds.
+    pub layout_time_nanos: u128,
+    /// Matching time in nanoseconds.
+    pub matching_time_nanos: u128,
+}
+
+impl PbcDiagnosticSample {
+    /// Returns whether this sample produced an accepted layout.
+    pub fn accepted(&self) -> bool {
+        self.accepted_attempt.is_some()
+    }
+}
+
+/// Measures one complete v1 key-layout generation attempt sequence.
+///
+/// The support is supplied together with the root seed so this API models the
+/// supported honest key-generation order: the sparse support is fixed before
+/// layout randomness is derived, and failed layout seeds are retried without
+/// changing the support.  Callers cannot provide a pre-built public layout or
+/// invoke the exact scheduler directly.  This keeps the diagnostic from
+/// turning a long-lived public layout into an API for scheduling arbitrary
+/// later supports.
+///
+/// The returned sample contains only aggregate timing, retry, and rectangular
+/// layout information.  It never contains the support, selected slots, or the
+/// private schedule.  Structural errors are returned immediately.  Exhausting
+/// the declared retry budget is represented by an accepted-less sample so a
+/// caller can include the failure in an aggregate success-rate report.
+pub fn measure_key_layout(
+    parameters: &PbcParameters,
+    root_seed: PbcRootSeed,
+    support: &[usize],
+) -> Result<PbcDiagnosticSample, PbcError> {
+    let mut layout_time_nanos = 0_u128;
+    let mut matching_time_nanos = 0_u128;
+    let mut bucket_width_failures = 0_u32;
+    let result = schedule::retry_layout(
+        parameters,
+        root_seed,
+        support,
+        |seed, attempt| {
+            let start = Instant::now();
+            let result = PbcPublicLayout::build(parameters, seed, attempt);
+            layout_time_nanos = layout_time_nanos.saturating_add(start.elapsed().as_nanos());
+            if matches!(&result, Err(PbcError::BucketWidthExceeded)) {
+                bucket_width_failures += 1;
+            }
+            result
+        },
+        |layout, support| {
+            let start = Instant::now();
+            let owners = deterministic_matching(layout, support);
+            matching_time_nanos = matching_time_nanos.saturating_add(start.elapsed().as_nanos());
+            // Validation remains outside the matching timer.
+            schedule_from_owners(layout, support, owners?)
+        },
+    );
+    let (attempts, accepted_attempt, bucket_width, no_perfect_schedule_failures) = match result {
+        Ok(generated) => {
+            let layout = generated.public_layout;
+            (
+                layout.accepted_attempt + 1,
+                Some(layout.accepted_attempt),
+                Some(layout.bucket_width),
+                layout.accepted_attempt - bucket_width_failures,
+            )
+        }
+        Err(PbcError::SeedAttemptsExhausted(diagnostics)) => {
+            (diagnostics.attempts, None, None, diagnostics.no_perfect_schedule_failures)
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(PbcDiagnosticSample {
+        attempts,
+        accepted_attempt,
+        bucket_width,
+        bucket_width_failures,
+        no_perfect_schedule_failures,
+        layout_time_nanos,
+        matching_time_nanos,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Aggregated layout-generation and cost measurements.
+pub struct PbcDiagnosticReport {
+    /// Names of reported performance categories.
+    pub performance_categories: Vec<String>,
+    /// Stable category-keyed values. Timing values are nanoseconds; count
+    /// values use the natural units named by the corresponding field below.
+    pub performance_values: std::collections::BTreeMap<String, u128>,
+    /// Parameter set used by the samples.
+    pub parameters: PbcParameters,
+    /// Number of recorded trials.
+    pub trials: u64,
+    /// Number of accepted trials.
+    pub accepted_trials: u64,
+    /// Number of first-attempt successes.
+    pub first_attempt_successes: u64,
+    /// Cumulative successes indexed by attempt number.
+    pub cumulative_success_by_attempt: Vec<u64>,
+    /// Aggregate width-limit failures.
+    pub bucket_width_failures: u64,
+    /// Aggregate matching failures.
+    pub no_perfect_schedule_failures: u64,
+    /// Minimum accepted bucket width.
+    pub bucket_width_min: Option<usize>,
+    /// Median accepted bucket width.
+    pub bucket_width_p50: Option<usize>,
+    /// 95th-percentile accepted bucket width.
+    pub bucket_width_p95: Option<usize>,
+    /// Maximum accepted bucket width.
+    pub bucket_width_max: Option<usize>,
+    /// Number of real cells.
+    pub real_cells: u128,
+    /// Minimum padded storage size.
+    pub padded_storage_min: Option<u128>,
+    /// Median padded storage size.
+    pub padded_storage_p50: Option<u128>,
+    /// 95th-percentile padded storage size.
+    pub padded_storage_p95: Option<u128>,
+    /// Maximum padded storage size.
+    pub padded_storage_max: Option<u128>,
+    /// Median padded-to-real storage ratio.
+    pub padded_to_real_ratio_p50: Option<f64>,
+    /// Aggregate layout time in nanoseconds.
+    pub layout_time_nanos: u128,
+    /// Aggregate matching time in nanoseconds.
+    pub matching_time_nanos: u128,
+    /// Number of real selector packages.
+    pub selector_real_packages: u128,
+    /// Number of dummy selector packages.
+    pub selector_dummy_packages: u128,
+    /// Total selector packages.
+    pub selector_total_packages: u128,
+    /// Number of bucket-cell evaluations.
+    pub bucket_cell_evaluations: u128,
+    /// Number of bucket reductions.
+    pub bucket_reductions: u128,
+    /// Padding overhead in storage units.
+    pub padding_overhead: u128,
+}
+
+#[derive(Clone, Debug)]
+/// Accumulates opt-in PBC construction diagnostics without ciphertext data.
+pub struct PbcDiagnosticAggregator {
+    parameters: PbcParameters,
+    samples: Vec<PbcDiagnosticSample>,
+}
+
+impl PbcDiagnosticAggregator {
+    /// Starts an empty report for `parameters`.
+    pub fn new(parameters: PbcParameters) -> Self {
+        Self { parameters, samples: Vec::new() }
+    }
+
+    /// Adds one layout-generation sample to the aggregate.
+    pub fn record(&mut self, sample: PbcDiagnosticSample) {
+        self.samples.push(sample);
+    }
+
+    /// Borrows all recorded samples.
+    pub fn samples(&self) -> &[PbcDiagnosticSample] {
+        &self.samples
+    }
+
+    /// Computes the aggregate report, including percentile storage estimates.
+    pub fn finish(&self) -> PbcDiagnosticReport {
+        let accepted: Vec<&PbcDiagnosticSample> =
+            self.samples.iter().filter(|sample| sample.accepted()).collect();
+        let mut widths: Vec<usize> =
+            accepted.iter().filter_map(|sample| sample.bucket_width).collect();
+        widths.sort_unstable();
+        let padded: Vec<u128> = widths
+            .iter()
+            .map(|&width| self.parameters.bucket_count as u128 * width as u128)
+            .collect();
+        let accepted_trials = accepted.len() as u64;
+        let mut cumulative_success_by_attempt =
+            vec![0_u64; self.parameters.max_seed_attempts as usize];
+        for sample in &accepted {
+            if let Some(attempt) = sample.accepted_attempt {
+                for count in cumulative_success_by_attempt.iter_mut().skip(attempt as usize) {
+                    *count += 1;
+                }
+            }
+        }
+        let real_cells_per_layout = (self.parameters.hash_count as u128)
+            .saturating_mul(self.parameters.universe_size as u128);
+        let real_cells = real_cells_per_layout.saturating_mul(accepted_trials as u128);
+        let selector_dummy_packages =
+            (self.parameters.bucket_count as u128).saturating_mul(accepted_trials as u128);
+        let selector_real_packages = real_cells;
+        let bucket_cell_evaluations: u128 = padded.iter().sum();
+        let logical_nonpadding = selector_real_packages.saturating_add(selector_dummy_packages);
+        let padding_overhead = bucket_cell_evaluations.saturating_sub(logical_nonpadding);
+        let layout_time_nanos: u128 = accepted.iter().map(|sample| sample.layout_time_nanos).sum();
+        let matching_time_nanos: u128 =
+            accepted.iter().map(|sample| sample.matching_time_nanos).sum();
+        let bucket_reductions = self.parameters.bucket_count as u128 * accepted_trials as u128;
+        let selector_total_packages =
+            selector_real_packages.saturating_add(selector_dummy_packages);
+        let mut performance_values = std::collections::BTreeMap::new();
+        performance_values.insert("pbc_layout_hashing".to_owned(), layout_time_nanos);
+        performance_values.insert("pbc_matching".to_owned(), matching_time_nanos);
+        performance_values.insert("pbc_real_selector_packages".to_owned(), selector_real_packages);
+        performance_values
+            .insert("pbc_dummy_selector_packages".to_owned(), selector_dummy_packages);
+        performance_values
+            .insert("pbc_bucket_cell_evaluations".to_owned(), bucket_cell_evaluations);
+        performance_values.insert("pbc_bucket_reductions".to_owned(), bucket_reductions);
+        performance_values.insert("pbc_padding_overhead".to_owned(), padding_overhead);
+        PbcDiagnosticReport {
+            performance_categories: PERFORMANCE_CATEGORIES
+                .iter()
+                .map(|category| (*category).to_owned())
+                .collect(),
+            performance_values,
+            parameters: self.parameters.clone(),
+            trials: self.samples.len() as u64,
+            accepted_trials,
+            first_attempt_successes: accepted
+                .iter()
+                .filter(|sample| sample.accepted_attempt == Some(0))
+                .count() as u64,
+            cumulative_success_by_attempt,
+            bucket_width_failures: self
+                .samples
+                .iter()
+                .map(|sample| sample.bucket_width_failures as u64)
+                .sum(),
+            no_perfect_schedule_failures: self
+                .samples
+                .iter()
+                .map(|sample| sample.no_perfect_schedule_failures as u64)
+                .sum(),
+            bucket_width_min: widths.first().copied(),
+            bucket_width_p50: percentile(&widths, 50),
+            bucket_width_p95: percentile(&widths, 95),
+            bucket_width_max: widths.last().copied(),
+            real_cells,
+            padded_storage_min: padded.first().copied(),
+            padded_storage_p50: percentile(&padded, 50),
+            padded_storage_p95: percentile(&padded, 95),
+            padded_storage_max: padded.last().copied(),
+            padded_to_real_ratio_p50: percentile(&padded, 50)
+                .map(|value| value as f64 / real_cells_per_layout.max(1) as f64),
+            layout_time_nanos,
+            matching_time_nanos,
+            selector_real_packages,
+            selector_dummy_packages,
+            selector_total_packages,
+            bucket_cell_evaluations,
+            bucket_reductions,
+            padding_overhead,
+        }
+    }
+}
+
+fn percentile<T: Copy>(values: &[T], percentile: usize) -> Option<T> {
+    if values.is_empty() {
+        return None;
+    }
+    // Nearest-rank percentile: p95 of two observations is the larger one.
+    let index = ((values.len() * percentile).saturating_add(99) / 100)
+        .saturating_sub(1)
+        .min(values.len() - 1);
+    Some(values[index])
+}
+
+impl PbcDiagnosticReport {
+    /// Serializes the aggregate report as JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Formats the aggregate report as human-readable text.
+    pub fn to_text(&self) -> String {
+        let optional =
+            |value: Option<usize>| value.map_or_else(|| "n/a".to_owned(), |v| v.to_string());
+        format!(
+            concat!(
+                "PBC diagnostic\n",
+                "parameters: nu={} h={} c={} k={} max_seed_attempts={} profile={:?}\n",
+                "trials: {} accepted={} first_attempt_successes={} cumulative_success_by_attempt={:?}\n",
+                "failures: bucket_width={} no_perfect_schedule={}\n",
+                "bucket_width: min={} p50={} p95={} max={} padded_storage: min={} p50={} p95={} max={} ratio_p50={:?}\n",
+                "cells (accepted-trial totals): real={} selector_real={} selector_dummy={} selector_total={} bucket_cell_evaluations={} bucket_reductions={} padding_overhead={}\n",
+                "time_nanos: layout={} matching={}\n",
+                "performance_categories: {}\n",
+                "performance_values: {:?}"
+            ),
+            self.parameters.universe_size,
+            self.parameters.support_weight,
+            self.parameters.hash_count,
+            self.parameters.bucket_count,
+            self.parameters.max_seed_attempts,
+            self.parameters.profile,
+            self.trials,
+            self.accepted_trials,
+            self.first_attempt_successes,
+            self.cumulative_success_by_attempt,
+            self.bucket_width_failures,
+            self.no_perfect_schedule_failures,
+            optional(self.bucket_width_min),
+            optional(self.bucket_width_p50),
+            optional(self.bucket_width_p95),
+            optional(self.bucket_width_max),
+            self.padded_storage_min.map_or_else(|| "n/a".to_owned(), |v| v.to_string()),
+            self.padded_storage_p50.map_or_else(|| "n/a".to_owned(), |v| v.to_string()),
+            self.padded_storage_p95.map_or_else(|| "n/a".to_owned(), |v| v.to_string()),
+            self.padded_storage_max.map_or_else(|| "n/a".to_owned(), |v| v.to_string()),
+            self.padded_to_real_ratio_p50,
+            self.real_cells,
+            self.selector_real_packages,
+            self.selector_dummy_packages,
+            self.selector_total_packages,
+            self.bucket_cell_evaluations,
+            self.bucket_reductions,
+            self.padding_overhead,
+            self.layout_time_nanos,
+            self.matching_time_nanos,
+            PERFORMANCE_CATEGORIES.join(","),
+            self.performance_values,
+        )
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    fn sample(attempt: Option<u32>, width: Option<usize>) -> PbcDiagnosticSample {
+        PbcDiagnosticSample {
+            attempts: 3,
+            accepted_attempt: attempt,
+            bucket_width: width,
+            bucket_width_failures: 1,
+            no_perfect_schedule_failures: 1,
+            layout_time_nanos: 7,
+            matching_time_nanos: 11,
+        }
+    }
+
+    #[test]
+    fn aggregation_reports_percentiles_and_overhead() {
+        let parameters = PbcParameters::custom(10, 2, 3, 4, 3, None);
+        let mut aggregate = PbcDiagnosticAggregator::new(parameters);
+        aggregate.record(sample(Some(0), Some(4)));
+        aggregate.record(sample(Some(2), Some(6)));
+        aggregate.record(sample(None, None));
+        let report = aggregate.finish();
+        assert_eq!(report.trials, 3);
+        assert_eq!(report.accepted_trials, 2);
+        assert_eq!(report.first_attempt_successes, 1);
+        assert_eq!(report.cumulative_success_by_attempt, vec![1, 1, 2]);
+        assert_eq!(report.bucket_width_min, Some(4));
+        assert_eq!(report.bucket_width_p50, Some(4));
+        assert_eq!(report.bucket_width_p95, Some(6));
+        assert_eq!(report.bucket_width_max, Some(6));
+        assert_eq!(report.real_cells, report.accepted_trials as u128 * 3 * 10);
+        assert_eq!(report.padded_storage_min, Some(16));
+        assert_eq!(report.padded_storage_max, Some(24));
+        assert_eq!(report.bucket_cell_evaluations, 40);
+        assert_eq!(report.bucket_reductions, 8);
+        assert_eq!(report.padding_overhead, 0);
+        assert_eq!(report.bucket_width_failures, 3);
+        assert_eq!(report.no_perfect_schedule_failures, 3);
+        assert_eq!(report.performance_values["pbc_layout_hashing"], 14);
+        assert_eq!(report.performance_values["pbc_matching"], 22);
+        assert_eq!(report.performance_values["pbc_real_selector_packages"], 60);
+        assert_eq!(report.performance_values["pbc_dummy_selector_packages"], 8);
+    }
+
+    #[test]
+    fn text_and_json_use_stable_category_names() {
+        let report =
+            PbcDiagnosticAggregator::new(PbcParameters::custom(4, 1, 2, 2, 1, None)).finish();
+        let text = report.to_text();
+        for category in PERFORMANCE_CATEGORIES {
+            assert!(text.contains(category));
+            assert!(report.to_json().unwrap().contains(category));
+        }
+        assert!(report.to_json().unwrap().contains("cumulative_success_by_attempt"));
+    }
+
+    #[test]
+    fn key_layout_measurement_is_deterministic_and_keeps_support_private() {
+        let parameters = PbcParameters::custom(10, 2, 3, 4, 3, None);
+        let first = measure_key_layout(&parameters, PbcRootSeed([23; 32]), &[1, 7]).unwrap();
+        let second = measure_key_layout(&parameters, PbcRootSeed([23; 32]), &[1, 7]).unwrap();
+        assert_eq!(first.attempts, second.attempts);
+        assert_eq!(first.accepted_attempt, second.accepted_attempt);
+        assert_eq!(first.bucket_width, second.bucket_width);
+        assert_eq!(first.bucket_width_failures, second.bucket_width_failures);
+        assert_eq!(first.no_perfect_schedule_failures, second.no_perfect_schedule_failures);
+        assert!(format!("{first:?}").contains("accepted_attempt"));
+        assert!(!format!("{first:?}").contains("1, 7"));
+    }
+
+    #[test]
+    fn key_layout_measurement_rejects_invalid_support_before_reporting() {
+        let parameters = PbcParameters::custom(10, 2, 3, 4, 3, None);
+        assert!(matches!(
+            measure_key_layout(&parameters, PbcRootSeed([24; 32]), &[1]),
+            Err(PbcError::SupportSize)
+        ));
+        assert!(matches!(
+            measure_key_layout(&parameters, PbcRootSeed([24; 32]), &[1, 1]),
+            Err(PbcError::InvalidSupport)
+        ));
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// A public LWR vector arranged in PBC bucket/slot order.
+pub struct PbcEncodedPublicVector {
+    /// Layout identity for the `values` matrix.
+    pub layout_id: PbcLayoutId,
+    /// Modulus applied to every routed coordinate.
+    pub modulus: usize,
+    /// Rectangular bucket rows in public layout order.
+    pub values: Vec<Vec<usize>>,
+}
+
+impl PbcEncodedPublicVector {
+    /// Routes a `u64` vector through real cells and zeroes dummy/padding cells.
+    pub fn route(
+        layout: &PbcPublicLayout,
+        public_vector: &[u64],
+        modulus: usize,
+    ) -> Result<Self, PbcError> {
+        let modulus_u64 = u64::try_from(modulus).map_err(|_| PbcError::SizeOverflow)?;
+        Self::route_by_coordinate(layout, public_vector.len(), modulus, |coordinate| {
+            usize::try_from(public_vector[coordinate] % modulus_u64)
+                .map_err(|_| PbcError::SizeOverflow)
+        })
+    }
+
+    /// Derives and routes a deterministic public vector from a label.
+    pub fn from_label(
+        layout: &PbcPublicLayout,
+        label: &[u8],
+        modulus: usize,
+    ) -> Result<Self, PbcError> {
+        let vector =
+            derive_lwr_vector(layout.layout_id, label, layout.parameters.universe_size, modulus)?;
+        Self::route_usize(layout, &vector, modulus)
+    }
+
+    /// Routes a vector already represented as `usize` residues.
+    pub fn route_usize(
+        layout: &PbcPublicLayout,
+        public_vector: &[usize],
+        modulus: usize,
+    ) -> Result<Self, PbcError> {
+        Self::route_by_coordinate(layout, public_vector.len(), modulus, |coordinate| {
+            Ok(public_vector[coordinate] % modulus)
+        })
+    }
+
+    /// Checks layout identity, dimensions, modulus bounds, and cell semantics.
+    pub fn validate(&self, layout: &PbcPublicLayout) -> Result<(), PbcError> {
+        layout.validate()?;
+        if self.layout_id != layout.layout_id {
+            return Err(PbcError::LayoutIdentityMismatch);
+        }
+        self.validate_values(layout)
+    }
+
+    /// Routes one coordinate lookup at a time after validating the layout.
+    ///
+    /// Keeping the lookup callback local to the real-cell branch means
+    /// `route_usize` does not allocate an intermediate `u64` vector.  The
+    /// constructor performs one layout validation and one output-shape check;
+    /// the public [`Self::validate`] method remains the fail-closed entry point
+    /// for callers handling deserialized or otherwise untrusted values.
+    fn route_by_coordinate<F>(
+        layout: &PbcPublicLayout,
+        vector_len: usize,
+        modulus: usize,
+        mut value_at: F,
+    ) -> Result<Self, PbcError>
+    where
+        F: FnMut(usize) -> Result<usize, PbcError>,
+    {
+        layout.validate()?;
+        if modulus == 0 {
+            return Err(PbcError::InvalidParameters("LWR modulus must be positive".into()));
+        }
+        if vector_len != layout.parameters.universe_size {
+            return Err(PbcError::InvalidLayout("public vector dimension mismatch".into()));
+        }
+        let values = layout
+            .cells
+            .iter()
+            .map(|row| {
+                // Preserve rectangular storage, but make inactive cells zero
+                // so only real coordinates can contribute to a bucket sum.
+                row.iter()
+                    .map(|cell| match cell {
+                        PbcCell::Real { coordinate, .. } => value_at(*coordinate),
+                        PbcCell::Dummy | PbcCell::Padding => Ok(0),
+                    })
+                    .collect::<Result<Vec<_>, PbcError>>()
+            })
+            .collect::<Result<Vec<_>, PbcError>>()?;
+        let encoded = Self { layout_id: layout.layout_id, modulus, values };
+        encoded.validate_values(layout)?;
+        Ok(encoded)
+    }
+
+    /// Validates output structure against a layout that has already been
+    /// validated by the caller.
+    fn validate_values(&self, layout: &PbcPublicLayout) -> Result<(), PbcError> {
+        if self.modulus == 0 || self.values.len() != layout.parameters.bucket_count {
+            return Err(PbcError::InvalidLayout("encoded vector shape or modulus mismatch".into()));
+        }
+        for (bucket, row) in self.values.iter().enumerate() {
+            if row.len() != layout.bucket_width {
+                return Err(PbcError::InvalidLayout("encoded vector is not rectangular".into()));
+            }
+            for (slot, &value) in row.iter().enumerate() {
+                if value >= self.modulus {
+                    return Err(PbcError::InvalidLayout(
+                        "encoded value is outside the modulus".into(),
+                    ));
+                }
+                if matches!(layout.cells[bucket][slot], PbcCell::Dummy | PbcCell::Padding) &&
+                    value != 0
+                {
+                    return Err(PbcError::InvalidLayout("dummy or padding value is nonzero".into()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Serializable binding between a routed public vector and one DSL family.
+///
+/// The host binding stores one public residue and its active row-major order
+/// for every real or dummy cell, as defined by
+/// [`crate::noise_refresh::pbc::PbcActiveCellIndex`]. Padding has no family element. At the
+/// DSL runtime boundary, each residue `a` is materialized as the public
+/// monomial factor `X^a` consumed by the native selector binding; the declared `(1, 1)` describes
+/// the matrix shape only, not a scalar-output encoding. This is a declaration
+/// and runtime-binding boundary: [`Self::input_family`] and
+/// [`Self::artifact_input_family`] create one structural family input, while
+/// [`Self::values_u64`] supplies its host residue values. They do not pack one
+/// DSL node per cell.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PbcPublicVectorFamilyBinding {
+    /// Public layout to which the family and values are bound.
+    pub layout_id: PbcLayoutId,
+    /// Modulus used when the vector was routed.
+    pub modulus: usize,
+    /// Number of public-factor family elements, excluding padding cells.
+    pub family_count: usize,
+    /// Flattened active values in canonical row-major order.
+    values: Vec<u64>,
+}
+
+impl PbcPublicVectorFamilyBinding {
+    /// Creates a binding from an already routed public vector.
+    ///
+    /// The resulting flat order is the active-cell order shared by PBC
+    /// selector families: real cells and the per-bucket dummy are retained,
+    /// while padding cells are omitted.
+    pub fn from_encoded(
+        layout: &PbcPublicLayout,
+        encoded: &PbcEncodedPublicVector,
+    ) -> Result<Self, PbcError> {
+        layout.validate()?;
+        if encoded.layout_id != layout.layout_id {
+            return Err(PbcError::LayoutIdentityMismatch);
+        }
+        encoded.validate_values(layout)?;
+
+        let mut values = Vec::new();
+        for (bucket, row) in encoded.values.iter().enumerate() {
+            for (slot, &value) in row.iter().enumerate() {
+                if !matches!(layout.cells[bucket][slot], PbcCell::Padding) {
+                    values.push(u64::try_from(value).map_err(|_| PbcError::SizeOverflow)?);
+                }
+            }
+        }
+        let binding = Self {
+            layout_id: layout.layout_id,
+            modulus: encoded.modulus,
+            family_count: values.len(),
+            values,
+        };
+        binding.validate(layout)?;
+        Ok(binding)
+    }
+
+    /// Validates layout identity, modulus, count, and value bounds.
+    ///
+    /// Call this after importing serialized binding metadata and before using
+    /// either the DSL family declaration or runtime values.
+    pub fn validate(&self, layout: &PbcPublicLayout) -> Result<(), PbcError> {
+        layout.validate()?;
+        if self.layout_id != layout.layout_id {
+            return Err(PbcError::LayoutIdentityMismatch);
+        }
+        let expected_count = layout
+            .parameters
+            .universe_size
+            .checked_mul(layout.parameters.hash_count)
+            .and_then(|real| real.checked_add(layout.parameters.bucket_count))
+            .ok_or(PbcError::SizeOverflow)?;
+        if self.modulus == 0 ||
+            self.family_count != expected_count ||
+            self.values.len() != self.family_count
+        {
+            return Err(PbcError::InvalidLayout(
+                "public vector family binding shape mismatch".into(),
+            ));
+        }
+        let modulus = u64::try_from(self.modulus).map_err(|_| PbcError::SizeOverflow)?;
+        if self.values.iter().any(|&value| value >= modulus) {
+            return Err(PbcError::InvalidLayout(
+                "public vector family value is outside the modulus".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical serialized public values as `u64` residues.
+    pub fn values_u64(&self) -> &[u64] {
+        &self.values
+    }
+
+    /// Converts the canonical public values to `usize` residues.
+    pub fn values_usize(&self) -> Result<Vec<usize>, PbcError> {
+        self.values
+            .iter()
+            .copied()
+            .map(|value| usize::try_from(value).map_err(|_| PbcError::SizeOverflow))
+            .collect()
+    }
+
+    /// Declares one structural `(1, 1)` public-factor input family.
+    ///
+    /// The family has one element per active cell and is intended to be read
+    /// through dynamic indexing inside the reusable bucket loop. Runtime
+    /// binding materializes each host residue `a` as the monomial `X^a`;
+    /// `(1, 1)` is the matrix shape, not a scalar-output representation.
+    pub fn input_family(&self, ring: &Ring, name: impl Into<String>) -> Family<Mat> {
+        ring.input_family(name, self.family_count, (1, 1))
+    }
+
+    /// Declares one artifact-backed `(1, 1)` public-factor family with the
+    /// same active count.
+    ///
+    /// The artifact family contains only public routed values; it carries no
+    /// support coordinate or private schedule information.
+    pub fn artifact_input_family(
+        &self,
+        ring: &Ring,
+        production_id: ProductionId,
+        artifact_name: impl Into<String>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> Family<Mat> {
+        ring.family_artifact_input(
+            production_id,
+            artifact_name,
+            self.family_count,
+            (1, 1),
+            confidentiality,
+        )
+    }
+}
+
+/// Derives the public LWR vector associated with a label and domain tag.
+///
+/// Each coordinate is hashed with the layout identity, modulus, label, and
+/// coordinate index. Rejection sampling removes modulo bias before reducing
+/// into `[0, modulus)`, so this function produces public residues without
+/// consulting a private support or schedule.
+pub fn derive_lwr_vector(
+    layout_id: PbcLayoutId,
+    label: &[u8],
+    universe_size: usize,
+    modulus: usize,
+) -> Result<Vec<usize>, PbcError> {
+    if modulus == 0 {
+        return Err(PbcError::InvalidParameters("LWR modulus must be positive".into()));
+    }
+    let modulus_u64 = u64::try_from(modulus).map_err(|_| PbcError::SizeOverflow)?;
+    let range = 1u128 << 64;
+    let limit = (range / u128::from(modulus_u64)) * u128::from(modulus_u64);
+    let mut values = Vec::with_capacity(universe_size);
+    for coordinate in 0..universe_size {
+        let coordinate = u64::try_from(coordinate).map_err(|_| PbcError::SizeOverflow)?;
+        let mut nonce = 0u64;
+        loop {
+            let mut hasher = Sha256::new();
+            hasher.update(b"mxx-exponent-lut/sparse-lwr/vector/v1");
+            hasher.update(layout_id.0);
+            hasher.update(modulus_u64.to_le_bytes());
+            hasher.update(
+                u64::try_from(label.len()).map_err(|_| PbcError::SizeOverflow)?.to_le_bytes(),
+            );
+            hasher.update(label);
+            hasher.update(coordinate.to_le_bytes());
+            hasher.update(nonce.to_le_bytes());
+            let digest = hasher.finalize();
+            // Rejection sampling turns the first 64 digest bits into an
+            // unbiased residue; reduction is reached only after the largest
+            // divisible prefix of the 64-bit domain is accepted.
+            let value =
+                u64::from_le_bytes(digest[..8].try_into().map_err(|_| PbcError::SizeOverflow)?);
+            if u128::from(value) < limit {
+                values.push((value % modulus_u64) as usize);
+                break;
+            }
+            nonce = nonce.checked_add(1).ok_or(PbcError::HashNonceOverflow)?;
+        }
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+pub(crate) mod routing_tests {
+    use super::*;
+    use crate::noise_refresh::pbc::{PbcActiveCellIndex, PbcLayoutSeed, PbcParameters};
+
+    pub(crate) fn layout_with_padding() -> PbcPublicLayout {
+        let parameters = PbcParameters::custom(4, 2, 2, 3, 1, None);
+        for byte in 0..=u8::MAX {
+            let layout = PbcPublicLayout::build(&parameters, PbcLayoutSeed([byte; 32]), 0)
+                .expect("toy layout construction");
+            if layout.cells.iter().flatten().any(|cell| matches!(cell, PbcCell::Padding)) {
+                return layout;
+            }
+        }
+        panic!("toy layout search did not produce padding");
+    }
+
+    #[test]
+    fn family_binding_preserves_active_order_and_excludes_padding() {
+        let layout = layout_with_padding();
+        let vector = PbcEncodedPublicVector::route_usize(&layout, &[11, 22, 33, 44], 17)
+            .expect("route toy vector");
+        let binding =
+            PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
+        let active = PbcActiveCellIndex::build(&layout).expect("index valid layout");
+
+        let expected_locations = layout
+            .cells
+            .iter()
+            .enumerate()
+            .flat_map(|(bucket, row)| {
+                row.iter().enumerate().filter_map(move |(slot, cell)| {
+                    (!matches!(cell, PbcCell::Padding)).then_some((bucket, slot))
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active.iter().map(|(bucket, slot, _)| (bucket, slot)).collect::<Vec<_>>(),
+            expected_locations
+        );
+        assert!(layout.cells.iter().flatten().any(|cell| matches!(cell, PbcCell::Padding)));
+
+        let expected_values = expected_locations
+            .iter()
+            .map(|&(bucket, slot)| vector.values[bucket][slot] as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(binding.values_u64(), expected_values.as_slice());
+        assert_eq!(binding.family_count, active.len());
+        assert_eq!(
+            binding.values_usize().unwrap(),
+            expected_values.iter().map(|&v| v as usize).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn family_binding_declares_a_scalar_family_with_the_active_count() {
+        let layout = layout_with_padding();
+        let vector = PbcEncodedPublicVector::route_usize(&layout, &[11, 22, 33, 44], 17)
+            .expect("route toy vector");
+        let binding =
+            PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
+        let ring = Ring::new(257, 8);
+        let family: Family<Mat> = binding.input_family(&ring, "pbc-values");
+        assert_eq!(binding.family_count, PbcActiveCellIndex::build(&layout).unwrap().len());
+        let _ = family;
+    }
+
+    #[test]
+    fn family_binding_round_trip_and_layout_mismatch_fail_closed() {
+        let parameters = PbcParameters::custom(4, 2, 2, 3, 1, None);
+        let layout = layout_with_padding();
+        let vector = PbcEncodedPublicVector::route_usize(&layout, &[11, 22, 33, 44], 17)
+            .expect("route toy vector");
+        let binding =
+            PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
+        let encoded = serde_json::to_vec(&binding).expect("serialize binding");
+        let decoded: PbcPublicVectorFamilyBinding =
+            serde_json::from_slice(&encoded).expect("deserialize binding");
+        decoded.validate(&layout).expect("round-trip binding validates");
+
+        let other = PbcPublicLayout::build(&parameters, PbcLayoutSeed([77; 32]), 0)
+            .expect("other toy layout");
+        assert!(matches!(decoded.validate(&other), Err(PbcError::LayoutIdentityMismatch)));
+    }
+}
+
+/// Public layout families supplied by the key/label compiler. These are typed
+/// family inputs rather than host-packed values. `package_indices` is a public
+/// 1x1 matrix family: its constant coefficient maps rectangular cells to the
+/// non-padding selector family. Keeping the index in a matrix is intentional;
+/// the artifact model has no first-class integer family artifacts. The other
+/// two families provide the public rotation and active-cell mask.
+pub struct PbcLayoutFamilies {
+    layout_id: crate::noise_refresh::pbc::PbcLayoutId,
+    encoded_vector_id: [u8; 32],
+    rectangular_count: usize,
+    package_indices: Family<Mat>,
+    active_masks: Family<Mat>,
+    shifts: Family<Mat>,
+}
+
+impl PbcLayoutFamilies {
+    /// Construct the only layout-family handles accepted by the PBC compiler.
+    /// Shape and identity are derived from the validated layout/vector; callers
+    /// cannot inject arbitrary index, mask, or shift families.
+    pub(crate) fn from_layout(
+        _context: &DslContext,
+        ring: &Ring,
+        layout: &PbcPublicLayout,
+        encoded: &PbcEncodedPublicVector,
+    ) -> Result<Self, PbcError> {
+        layout.validate().map_err(|_| PbcError::ArtifactIdentityMismatch)?;
+        encoded.validate(layout).map_err(|_| PbcError::ArtifactIdentityMismatch)?;
+        let rectangular_count = layout.parameters.bucket_count * layout.bucket_width;
+        let package_count = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)
+            .map_err(|_| PbcError::ArtifactIdentityMismatch)?
+            .len();
+        Ok(Self {
+            layout_id: layout.layout_id,
+            encoded_vector_id: artifacts::public_vector_id(encoded),
+            rectangular_count,
+            package_indices: ring.input_family(
+                artifacts::canonical_family_name("package-indices", layout.layout_id, None),
+                rectangular_count,
+                (1, 1),
+            ),
+            active_masks: ring.input_family(
+                artifacts::canonical_family_name("active-masks", layout.layout_id, None),
+                rectangular_count,
+                (1, 1),
+            ),
+            shifts: ring.input_family(
+                artifacts::canonical_family_name("shifts", layout.layout_id, None),
+                package_count,
+                (1, 1),
+            ),
+        })
+    }
+
+    /// Construct all public layout families from a validated artifact
+    /// manifest. Every family is artifact-backed, including package indices;
+    /// the latter uses a 1x1 matrix whose constant coefficient is extracted
+    /// inside the structural loop before dynamic selector-family indexing.
+    pub fn from_layout_artifacts(
+        context: &DslContext,
+        ring: &Ring,
+        layout: &PbcPublicLayout,
+        encoded: &PbcEncodedPublicVector,
+        production_id: ProductionId,
+        manifest: &Manifest,
+    ) -> Result<Self, PbcError> {
+        let mut families = Self::from_layout(context, ring, layout, encoded)?;
+        artifacts::validate_manifest_identity(manifest, &production_id)?;
+        let rectangular_count = families.rectangular_count;
+        let package_count = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)
+            .map_err(|_| PbcError::ArtifactIdentityMismatch)?
+            .len();
+        let mask_name = artifacts::public_family_artifact_name(encoded, "active-masks");
+        let shift_name = artifacts::public_family_artifact_name(encoded, "shifts");
+        let package_index_name = artifacts::public_family_artifact_name(encoded, "package-indices");
+        let scalar_type = ArtifactType::Matrix(artifacts::concrete_matrix_type(ring, (1, 1))?);
+        artifacts::require_family_descriptor(
+            manifest,
+            &package_index_name,
+            scalar_type.clone(),
+            rectangular_count,
+            ArtifactConfidentiality::Public,
+            true,
+        )
+        .map_err(|_| PbcError::ArtifactIdentityMismatch)?;
+        artifacts::require_family_descriptor(
+            manifest,
+            &mask_name,
+            scalar_type.clone(),
+            rectangular_count,
+            ArtifactConfidentiality::Public,
+            true,
+        )
+        .map_err(|_| PbcError::ArtifactIdentityMismatch)?;
+        artifacts::require_family_descriptor(
+            manifest,
+            &shift_name,
+            ArtifactType::Matrix(artifacts::concrete_matrix_type(ring, (1, 1))?),
+            package_count,
+            ArtifactConfidentiality::Public,
+            true,
+        )
+        .map_err(|_| PbcError::ArtifactIdentityMismatch)?;
+        families.package_indices = ring.family_artifact_input(
+            production_id.clone(),
+            package_index_name,
+            rectangular_count,
+            (1, 1),
+            ArtifactConfidentiality::Public,
+        );
+        families.active_masks = ring.family_artifact_input(
+            production_id.clone(),
+            mask_name,
+            rectangular_count,
+            (1, 1),
+            ArtifactConfidentiality::Public,
+        );
+        families.shifts = ring.family_artifact_input(
+            production_id,
+            shift_name,
+            package_count,
+            (1, 1),
+            ArtifactConfidentiality::Public,
+        );
+        Ok(families)
+    }
+
+    /// Public family carrying the canonical non-padding package indices.
+    pub fn package_indices(&self) -> &Family<Mat> {
+        &self.package_indices
+    }
+    /// Public family carrying the rectangular active-cell mask.
+    pub fn active_masks(&self) -> &Family<Mat> {
+        &self.active_masks
+    }
+    /// Public family carrying the canonical package shifts.
+    pub fn shifts(&self) -> &Family<Mat> {
+        &self.shifts
+    }
+
+    /// Returns the layout identity committed by these family handles.
+    pub fn layout_id(&self) -> crate::noise_refresh::pbc::PbcLayoutId {
+        self.layout_id
+    }
+
+    /// Returns the identity of the routed public vector.
+    pub fn encoded_vector_id(&self) -> [u8; 32] {
+        self.encoded_vector_id
     }
 }

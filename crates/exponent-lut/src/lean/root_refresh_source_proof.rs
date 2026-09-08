@@ -1,6 +1,9 @@
 //! Closed routed readout bounds, using one exponent choice for the entire run.
-use super::root_inputs::value_expression;
-use crate::noise_refresh::simulation::ExponentLutNoiseSnapshot;
+use super::{
+    root_inputs::value_expression, root_program_setup::parallel_operand,
+    root_refresh_source::route_binding,
+};
+use crate::bgg::noise::BggNoiseSnapshot;
 use mxx_ir_core::{
     FrozenGraphScopeId, ValidatedGraph,
     lean::{LeanArtifact, ScopeProofShape},
@@ -32,7 +35,7 @@ pub(super) fn root_refresh_source_proof(
     pa: &LeanArtifact,
     ver: &ValidatedGraph,
     va: &LeanArtifact,
-    snapshot: &ExponentLutNoiseSnapshot,
+    snapshot: &BggNoiseSnapshot,
 ) -> Result<String, String> {
     let root = ver.source.root_scope();
     let ps = &pa.scope_proofs[&FrozenGraphScopeId::Root];
@@ -40,11 +43,6 @@ pub(super) fn root_refresh_source_proof(
     let vt = &ver.scopes[&FrozenGraphScopeId::Root].wire_types;
     let pv = |wire| expression(ps, wire, "pw", "pin");
     let vv = |wire| expression(vs, wire, "vw", "vin");
-    let args = |wire: WireRef| {
-        root.node(wire.node)
-            .and_then(|node| root.arguments(node))
-            .ok_or("missing source route operands")
-    };
     let refresh = &snapshot.refresh;
     let mut source = String::from(
         "import RootRefreshSource\nimport RootReadoutProof\nimport RootRefreshRouteTargets\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedRefreshSourceProof\nopen Mxx.Primitives MxxRuntime MxxExponentLut GeneratedClaim ExponentGeneratedExecution\nopen scoped BigOperators\n\nprivate theorem replace_actual {q n rows columns bound : Nat}\n    {actual other ideal : ExactMatrix q n rows columns}\n    (equation : actual = other) (close : Approx other ideal bound) : Approx actual ideal bound := by\n  obtain ⟨error, errorEquation, bounded⟩ := close\n  exact ⟨error, equation.trans errorEquation, bounded⟩\n\nnoncomputable def readoutExponent {hashModel : MxxRuntime.HashModel} {external : ExternalInputs} {execution : Execution}\n    (runs : Runs hashModel external execution) (label) :=\n  Classical.choose (ExponentGeneratedReadoutProof.native_readout_closed runs label)\n\n",
@@ -131,8 +129,7 @@ pub(super) fn root_refresh_source_proof(
             )
             .then_some((wire, scope, parents))
         });
-        let (product, product_scope, captures) =
-            products.next().ok_or("missing actual routed product")?;
+        let (product, product_scope, _) = products.next().ok_or("missing actual routed product")?;
         if products.next().is_some() {
             return Err("ambiguous actual routed product".into())
         }
@@ -143,13 +140,34 @@ pub(super) fn root_refresh_source_proof(
                     .ok_or("missing route product output")?,
             )
             .ok_or("missing route product operands")?;
-        let input = captures[product_scope
-            .inputs()
-            .iter()
-            .position(|wire| *wire == operands[0])
-            .ok_or("route input is not captured")?];
+        let (input, input_slot, lookup, member_input) =
+            parallel_operand(ver, va, product, operands[0], "position")?;
+        let ConcreteWireType::IndexedFamily { count: input_count, .. } = &vt[&input] else {
+            return Err("routed input is not a family".into())
+        };
+        let NodeKind::ParallelLoop(spec) =
+            root.node(product.node).ok_or("missing route loop")?.kind()
+        else {
+            return Err("routed product is not parallel".into())
+        };
+        let input_index = if let Some((_, index)) = lookup {
+            format!("({}).toNat", index.replace("position", "index0"))
+        } else {
+            match spec.input_modes[input_slot] {
+                LoopInputMode::Zip => "index0.val".to_owned(),
+                LoopInputMode::ZipOffset { offset } => format!("index0.val + {offset}"),
+                LoopInputMode::Broadcast => return Err("routed matrix input is not indexed".into()),
+            }
+        };
         let actual = vv(product)?;
-        let input_value = vv(input)?;
+        let input_value = value_expression(
+            "member",
+            &std::collections::BTreeMap::from([
+                ("member".into(), format!("fun position : Fin {total} => {member_input}")),
+                ("witness".into(), "vw".into()),
+                ("inputs".into(), "vin".into()),
+            ]),
+        )?;
         let online_d = vv(cache)?;
         let pre_d = pv(precache)?;
         let mut offset = 0usize;
@@ -189,73 +207,35 @@ pub(super) fn root_refresh_source_proof(
             );
             let result_type = result_type.replace("SOURCE_BOUND", "sourceBound");
             source.push_str(&format!("private theorem {role}_sum_{slot}_at_bound {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\n    (runs : Runs hashModel external execution) (sourceBound : Nat)\n    (boundEquation : ExponentGeneratedReadoutProof.readoutBound ExponentGeneratedNativeProgramProof.nativeOutputBound = sourceBound) :\n{result_type} := by\n  classical\n  dsimp only\n  let pw := preprocessingWitness runs\n  let vw := verificationWitness runs\n  let pin := preprocessingInputs runs.2.1\n  let vin := verificationInputs runs.2.2.1\n  have pf := preprocessingFacts runs\n  have vf := verificationFacts runs\n  have cacheLink : ({online_d}) = ({pre_d}) := by\n    simp only [vin, verificationInputs]\n    rw [preprocessingOutput runs]\n    rfl\n"));
-            // The same actual gather chain fixes every readout label, including repeated fresh
-            // inputs.
-            source.push_str(&format!("  have inputEquation (component : Fin {columns}) (coefficient : Fin {n}) (digit : Fin {digits}) :\n      ({}) ({flat} : Fin {total}) = ExponentGeneratedReadoutProof.readoutCiphertext runs ⟨{label}, by clear * - component coefficient digit; omega⟩ := by\n    let index0 : Fin {total} := {flat}\n", vv(input)?));
+            // Follow actual indexed captures and route views. A direct readout capture has
+            // no intermediate view, but still requires the exact label-index equality.
+            source.push_str(&format!("  have inputEquation (component : Fin {columns}) (coefficient : Fin {n}) (digit : Fin {digits}) :\n      ({input_value}) ({flat} : Fin {total}) = ExponentGeneratedReadoutProof.readoutCiphertext runs ⟨{label}, by clear * - component coefficient digit; omega⟩ := by\n    let index0 : Fin {total} := {flat}\n    let index1 : Fin {input_count} := ⟨{input_index}, by have inputBound := index0.isLt; omega⟩\n"));
             let mut wire = input;
-            let mut depth = 0;
-            while let Some(scope) = ver.source.scopes().get(&child(wire)) {
-                let output =
-                    scope.node(scope.outputs()[0].node).ok_or("missing route gather output")?;
-                if !matches!(output.kind(), NodeKind::FamilyGetDynamic) {
-                    break
-                }
-                let operands = scope.arguments(output).ok_or("missing gather operands")?;
-                let parents = args(wire)?;
-                let family = parents[scope
-                    .inputs()
-                    .iter()
-                    .position(|w| *w == operands[0])
-                    .ok_or("gather family not capture")?];
-                let indices = parents[scope
-                    .inputs()
-                    .iter()
-                    .position(|w| *w == operands[1])
-                    .ok_or("gather index not capture")?];
-                let index_scope = &ver.source.scopes()[&child(indices)];
-                if !index_scope.inputs().is_empty() {
-                    return Err("route index not pure".into())
-                }
-                let NodeKind::ParallelLoop(spec) =
-                    root.node(indices.node).ok_or("missing index loop")?.kind()
-                else {
-                    return Err("route indices not loop".into())
-                };
-                if spec.input_modes.iter().any(|mode| *mode != LoopInputMode::Broadcast) {
-                    return Err("unexpected route index modes".into())
-                }
-                let index_shape = &va.scope_proofs[&child(indices)];
-                let mut values = index_shape.value_expressions.clone();
-                values.insert(format!("i_{}", spec.index_slot), format!("index{depth}.val"));
-                let index_output = index_scope.outputs()[0];
-                let index_value = value_expression(
-                    &format!("w_{}_{}", index_output.node.0, index_output.port.0),
-                    &values,
-                )?;
+            let mut depth = 1;
+            while let Some((family, index_value)) =
+                route_binding(ver, va, wire, &format!("index{depth}"))?
+            {
                 let ConcreteWireType::IndexedFamily { count, .. } = &vt[&family] else {
-                    return Err("gather source not family".into())
+                    return Err("route view source is not a family".into())
                 };
-                source.push_str(&format!("    obtain ⟨bound{depth}, eq{depth}⟩ := ExponentGeneratedRefreshSource.route_gather_{} vw vf index{depth}\n    let index{} : Fin {count} := ⟨({index_value}).toNat, bound{depth}⟩\n",wire.node.0,depth+1));
+                source.push_str(&format!("    obtain ⟨bound{depth}, eq{depth}⟩ := ExponentGeneratedRefreshSource.route_gather_{} vw vf index{depth}\n    let index{} : Fin {count} := ⟨({index_value}).toNat, bound{depth}⟩\n", wire.node.0, depth + 1));
                 wire = family;
                 depth += 1;
             }
-            if depth == 0 {
-                return Err("routed source has no readout gather".into())
+            source.push_str(&format!("    have same : index{depth} = ⟨{label}, by clear * - component coefficient digit; omega⟩ := by\n"));
+            if depth == 1 {
+                // A direct readout prefix preserves the index definition exactly.
+                source.push_str("      rfl\n");
+            } else {
+                let indices =
+                    (0..=depth).map(|i| format!("index{i}")).collect::<Vec<_>>().join(", ");
+                source.push_str(&format!("      apply Fin.ext\n      dsimp only [{indices}]\n      norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat, Int.toNat_natCast]\n      clear * - component coefficient digit\n      omega\n"));
             }
-            let indices = (0..=depth).map(|i| format!("index{i}")).collect::<Vec<_>>().join(", ");
-            source.push_str(&format!("    have same : index{depth} = ⟨{label}, by clear * - component coefficient digit; omega⟩ := by\n      apply Fin.ext\n      dsimp only [{indices}]\n      norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat, Int.toNat_natCast]\n      clear * - component coefficient digit\n      omega\n"));
-            for d in (0..depth - 1).rev() {
-                source.push_str(&format!(
-                    "    have combined{d} := eq{d}.trans {}\n",
-                    if d + 1 == depth - 1 {
-                        format!("eq{}", d + 1)
-                    } else {
-                        format!("combined{}", d + 1)
-                    }
-                ));
+            source.push_str(&format!("    change ({}) index1 = ({}) ⟨{label}, by clear * - component coefficient digit; omega⟩\n", vv(input)?, vv(wire)?));
+            for d in 1..depth {
+                source.push_str(&format!("    rw [eq{d}]\n"));
             }
-            let result = if depth == 1 { "eq0" } else { "combined0" };
-            source.push_str(&format!("    change ({}) index0 = ({}) index{depth} at {result}\n    rw [same] at {result}\n    exact {result}\n",vv(input)?,vv(wire)?));
+            source.push_str(&format!("    exact congrArg ({}) same\n", vv(wire)?));
             // Final proof is emitted after exact input lineage, with no source approximation
             // premise.
             let output_projection = pa

@@ -1,3 +1,6 @@
+#[path = "gpu_rns.rs"]
+mod exact_rns;
+
 use crate::{
     element::PolyElem,
     matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix},
@@ -1070,6 +1073,8 @@ impl GpuDCRTPolyMatrix {
                 i32::from(round_scale),
                 division_inverses.as_ptr(),
                 division_inverses.len(),
+                0,
+                std::ptr::null(),
             )
         };
         check_status(status, "gpu_matrix_convert_modulus");
@@ -3505,6 +3510,18 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self {
         self.convert_modulus(destination, false)
+    }
+
+    fn centered_extend(&self, destination: &GpuDCRTPolyParams) -> Result<Self, String> {
+        self.exact_centered_conversion(destination, None)
+    }
+
+    fn block_mod_switch(
+        &self,
+        destination: &GpuDCRTPolyParams,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String> {
+        self.exact_centered_conversion(destination, Some(plaintext_modulus))
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {

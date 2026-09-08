@@ -11,6 +11,37 @@ def refreshCeilDiv (numerator denominator : Nat) : Nat :=
 def switchedErrorBound (pre lift dimension decoder : Nat) : Nat :=
   refreshCeilDiv (2 * pre + (lift - 1) * (dimension + 2)) (2 * lift) + decoder
 
+/-- Data exported from the candidate's actual noise report and route gains. -/
+structure RefreshNumericSlot where
+  stateGain : Nat
+  initialBound : Nat
+  maskGain : Nat
+  freshGain : Nat
+  readoutBound : Nat
+  preBound : Nat
+  decoderGain : Nat
+  helperCutoff : Nat
+  decoderBound : Nat
+  lift : Nat
+  dimension : Nat
+  residualBound : Nat
+  maskModulus : Nat
+  maskBound : Nat
+  spacing : Nat
+
+/-- Rejected candidates retain arithmetic checks but do not claim strict decoding. -/
+def RefreshNumericSlot.Valid (s : RefreshNumericSlot) (accepted : Bool) : Prop :=
+  s.stateGain * s.initialBound + (s.maskGain + s.freshGain) * s.readoutBound = s.preBound ∧
+  s.decoderGain * s.helperCutoff = s.decoderBound ∧
+  switchedErrorBound s.preBound s.lift s.dimension s.decoderBound = s.residualBound ∧
+  0 < s.lift ∧ s.maskModulus / 2 = s.maskBound ∧
+  (accepted = true →
+    2 * (s.maskBound + switchedErrorBound s.preBound s.lift s.dimension s.decoderBound) < s.spacing)
+
+instance (s : RefreshNumericSlot) (accepted : Bool) : Decidable (s.Valid accepted) := by
+  unfold RefreshNumericSlot.Valid
+  infer_instance
+
 theorem refreshCeilDiv_eq (numerator denominator : Nat) (hd : 0 < denominator) :
     refreshCeilDiv numerator denominator = (numerator + denominator - 1) / denominator := by
   unfold refreshCeilDiv

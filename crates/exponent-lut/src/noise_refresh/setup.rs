@@ -17,54 +17,46 @@
 //! online secret `s` nor `b` crosses the artifact boundary.
 
 use crate::{
-    ExponentLutEncodingCompiler, ExponentLutError,
-    encoding::{EncodingRhsFamily, ExponentLutEncodingSampler},
-    noise::{
-        AverageVariance, GateNoiseDecomposition, GateNoiseGains, GateNoiseOperation,
-        NoiseDecompositionPlan, ProgramNoiseState, RightActionNoiseGain,
+    bgg::{
+        BggPreparedReadout, BggRefreshParameters, BggScheme,
+        encoding::{ExponentLutEncodingCompiler, ExponentLutEncodingSampler},
+        noise::{
+            BggNoiseSnapshot, NoiseGainPlan, ProgramNoiseReport, RefreshNoiseGainDecompositions,
+            compact_noise_snapshot_plans, compact_readout_plan_schema,
+            producer_readout_plan_schema,
+        },
+        pbc_selector_metadata, setup_identity_digest,
     },
     noise_refresh::{
         pbc::{
             PbcActiveCellIndex, PbcPublicLayout, PbcSelectorArtifactNames, PbcSelectorArtifacts,
-            PbcSelectorFamilyInputs, PbcSelectorRuntimeBinding, PbcTrustedSelectorBits,
-            build_structural_selector_families, selector_family_artifact_name,
+            PbcSelectorRuntimeBinding, PbcTrustedSelectorBits, selector_family_artifact_name,
         },
         prf::{
-            NativePrfEncodingBatchOutputs, NativePrfOnlineBatchInputs, NativePrfPublicInputs,
-            NativePrfReadoutFamilyArtifacts, SparseLwrPrfProfile, SparseLwrPrfProgram,
+            PreparedSparseLwrPrf, PreparedSparseLwrPrfDescriptor, PrfPublicSetup,
+            SparseLwrPrfProgram,
         },
-        refresh::{
-            RefreshCompiler, RefreshError, RefreshFreshErrorMaterial, RefreshMaskMaterial,
-            RefreshPrfContract, RefreshPrfCoverage, RefreshPrfFamilyMaterial, RefreshSetupManifest,
-            aggregate_refresh_fresh_error_per_slot, aggregate_refresh_masks,
-        },
-        simulation::{
-            AverageCaseConfig, ExponentLutAverageNoiseReport, ExponentLutNoiseReport,
-            ExponentLutNoiseSnapshot, MaskSmudgingParameters, NoiseGainPlan, NoiseGainPlanBuilder,
-            RefreshNoiseParameters, RefreshRouteNoiseGains, RefreshTranscriptTopology,
-            TraceNoiseGains, ValueReadoutNoiseGains, centered_base_p_digit_variance,
-        },
+        refresh::{RefreshError, RefreshPrfContract},
+        simulation::{AverageCaseConfig, ExponentLutAverageNoiseReport, ExponentLutNoiseReport},
     },
-    program::{ExponentLutProgramId, Gate, LutTable, ProgramStep},
-    public_key::{
-        ExponentLutPublicKeyCompiler, ProgramCacheBatchBindings, ProgramCacheLocation,
-        ProgramCacheRole, PublicRhsFamily, program_cache_declarations,
-    },
+    program::ProgramValue,
+    scheme::ExponentLUTFixedRhsScheme,
 };
-use bigdecimal::BigDecimal;
-use mxx_bgg::{BggEncodingWire, BggPublicKeyCompiler, BggPublicKeyWire, BggSamplerLayout};
-use mxx_dsl::{Bool, BuiltGraph, Bytes, DslContext, Family, HashTag, Int, Mat, Preimage};
+use mxx_bgg::{BggEncodingWire, BggPublicKeyWire};
+use mxx_dsl::{
+    Bool, BuiltGraph, Bytes, DslContext, Family, GraphValue, GraphValueSchema, HashTag, Mat,
+    Preimage,
+};
 use mxx_ir_core::{
     BenchmarkRole, IntExpr, ParamEnv, ScopedWireRef,
     artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId},
-    encoding::{IR_VERSION, hash_canonical, spec_hash},
+    encoding::spec_hash,
     graph::FrozenGraphScopeId,
-    types::{ConcreteMatrixType, NodeId, WireType},
+    types::{NodeId, WireType},
     with_benchmark_role,
 };
-use mxx_primitives::sampler::bounds::TrapdoorPreimageCutoffPolicy;
-use num_bigint::{BigInt, BigUint, ToBigInt};
-use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
+use num_bigint::{BigInt, BigUint};
+use num_traits::{ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -73,20 +65,15 @@ use thiserror::Error;
 /// Errors raised while building or importing trusted refresh setup.
 pub enum RefreshSetupError {
     #[error(transparent)]
+    Prf(#[from] crate::noise_refresh::prf::PrfError),
+    #[error(transparent)]
     /// The refresh declaration or its CRT equations are invalid.
     Refresh(#[from] RefreshError),
-    #[error(transparent)]
-    /// A Exponent-LUT boundary rejected the setup inputs.
-    ExponentLut(#[from] ExponentLutError),
-    #[error(transparent)]
-    /// Sparse-LWR encoding setup sampling failed.
-    Sampling(#[from] crate::encoding::ExponentLutSamplingError),
-    #[error(transparent)]
-    /// A BGG encoding operation failed while constructing setup.
-    Encoding(#[from] mxx_bgg::EncodingCompileError),
-    #[error(transparent)]
-    /// BGG trapdoor or matrix sampling failed.
-    BggSampling(#[from] mxx_bgg::BggSampleError),
+    /// Backend errors retain their original type and source chain. Conversion
+    /// belongs to each adapter, so this application error has no concrete
+    /// encoding, sampler, or trapdoor dependency.
+    #[error("{0}")]
+    Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("PBC construction failed: {0}")]
     /// Public PBC layout generation failed.
     Pbc(String),
@@ -111,1036 +98,21 @@ pub enum RefreshSetupError {
     DecoderResidualMismatch,
 }
 
-#[derive(Clone)]
-/// Public dimensions and identities used to build one refresh setup.
-///
-/// The fields describe both the BGG sampler and the CRT refresh.
-/// `lut_width` is the Exponent-LUT coefficient-sieve width; it is independent of
-/// any PBC bucket width. The constructor sets the authoritative decoder bound
-/// policy, and validation is repeated at every producer/import boundary.
-pub struct RefreshSetupParameters {
-    /// Application-level refresh instance identity.
-    pub refresh_id: [u8; 32],
-    /// Sparse-LWR modulus used by the PRF layer.
-    pub base_p: usize,
-    /// Number of secret components represented by each BGG matrix.
-    pub component_count: usize,
-    /// Number of refresh coefficients processed per CRT slot.
-    pub coefficient_count: usize,
-    /// Number of base-`p` digits represented by each mask PRF label. This is
-    /// independent of `layout.digit_count`, which is the gadget digit count.
-    pub mask_base_p_digit_counts: Vec<usize>,
-    /// Number of base-`p` digits represented by each fresh-error PRF label.
-    pub fresh_error_base_p_digit_count: usize,
-    /// Statistical security parameter used for the joint mask transcript.
-    pub mask_statistical_security_bits: usize,
-    /// Explicit Exponent-LUT sieve width `W`; this is not the PBC bucket width.
-    pub lut_width: usize,
-    /// BGG sampler dimensions shared by setup artifacts.
-    pub layout: BggSamplerLayout,
-    /// CRT modulus and reconstruction data for the refresh equations.
-    pub refresh: RefreshCompiler,
-    /// Exact selected CRT-subset destination modulus for each refresh slot.
-    pub switch_moduli: Vec<BigUint>,
-    /// Gaussian width used when sampling the decoder trapdoor.
-    pub decoder_sigma: mxx_ir_core::RealExpr,
-    /// Gaussian width used by every setup helper and the shared anchor error.
-    pub encoding_error_sigma: mxx_ir_core::RealExpr,
-    /// Common hard coefficient cutoff `B_chi` for setup helper errors.
-    pub encoding_error_bound: mxx_ir_core::IntExpr,
-    /// Policy for the decoder preimage rejection cutoff.  The policy is
-    /// resolved to one concrete integer before the producer graph is built.
-    pub decoder_preimage_bound: TrapdoorPreimageCutoffPolicy,
-    /// Human-readable setup name used by callers when selecting a production.
-    pub name: String,
-}
-
-/// Public security-analysis inputs, not a security estimate or joint-view proof.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RefreshAnchorSecurityInputs {
-    pub modulus: BigUint,
-    pub complementary_modulus: BigUint,
-    pub slots: Vec<usize>,
-    pub ring_dimension: usize,
-    pub random_secret_polynomials: usize,
-    pub secret_distribution: String,
-    pub fixed_augmented_coordinate: i32,
-    pub error_sigma: mxx_ir_core::RealExpr,
-    pub error_coefficient_cutoff: mxx_ir_core::IntExpr,
-    pub anchor_columns: usize,
-    pub execution_budget: usize,
-    pub ring_samples: usize,
-    pub estimated_security_bits: Option<u64>,
-    pub status: String,
-}
-
-/// Setup-produced decomposition plans for the refresh routes.
-///
-/// Each plan must contain either the concrete balanced coefficients or a
-/// validated compact source/bound for the corresponding target.  The setup
-/// boundary derives all route gains through
-/// [`NoiseDecompositionPlan::action_gain`]; callers cannot provide a detached
-/// scalar gain in its place.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RefreshNoiseGainDecompositions {
-    /// One compact decomposition for each CRT slot's `G^-1(kappa_t G)` action.
-    pub state_scaling: Vec<NoiseDecompositionPlan>,
-    /// One compact decomposition for every P-adic mask digit `P^c`.
-    pub mask: Vec<Vec<NoiseDecompositionPlan>>,
-    /// Number of ring-coefficient positions represented by each mask plan.
-    /// The compact search path stores one plan per P-adic digit and uses this
-    /// multiplicity instead of materializing `coefficient_count` copies.
-    #[serde(default = "one_usize")]
-    pub mask_multiplicity: usize,
-    /// One compact decomposition family for every slot's `kappa_t P^c` fresh digit.
-    pub fresh: Vec<Vec<NoiseDecompositionPlan>>,
-    /// Per-slot ring-coefficient multiplicity for the compact fresh plans.
-    #[serde(default = "one_usize_vec")]
-    pub fresh_multiplicity: Vec<usize>,
-    pub decoder: Vec<NoiseDecompositionPlan>,
-}
-
-fn one_usize() -> usize {
-    1
-}
-
-fn one_usize_vec() -> Vec<usize> {
-    Vec::new()
-}
-
-impl RefreshNoiseGainDecompositions {
-    fn derive_route_gains(
-        &self,
-        slot_count: usize,
-    ) -> Result<RefreshRouteNoiseGains, RefreshSetupError> {
-        if self.state_scaling.len() != slot_count ||
-            self.mask.len() != slot_count ||
-            self.mask.iter().any(|plans| plans.is_empty()) ||
-            self.fresh.len() != slot_count ||
-            self.mask_multiplicity == 0 ||
-            (!self.fresh_multiplicity.is_empty() &&
-                (self.fresh_multiplicity.len() != slot_count ||
-                    self.fresh_multiplicity.iter().any(|value| *value == 0))) ||
-            self.fresh.iter().any(|plans| plans.is_empty()) ||
-            self.decoder.len() != slot_count
-        {
-            return Err(RefreshSetupError::InvalidParameters(
-                "refresh decomposition slot count mismatch",
-            ));
-        }
-        let derive = |plan: &NoiseDecompositionPlan| {
-            NoiseGainPlanBuilder::derive_route_gains(std::slice::from_ref(plan))
-                .map(|mut gains| gains.remove(0))
-                .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh decomposition"))
-        };
-        let derive_sum = |plans: &[NoiseDecompositionPlan], multiplicity: usize| {
-            let gains = plans.iter().map(derive).collect::<Result<Vec<_>, _>>()?;
-            let mut aggregate =
-                RightActionNoiseGain { l1: BigUint::zero(), l2_squared: BigUint::zero() };
-            for gain in gains {
-                aggregate.l1 += gain.l1 * multiplicity;
-                aggregate.l2_squared += gain.l2_squared * multiplicity;
-            }
-            if aggregate.l1.is_zero() != aggregate.l2_squared.is_zero() {
-                return Err(RefreshSetupError::InvalidParameters("invalid refresh decomposition"));
-            }
-            Ok(aggregate)
-        };
-        Ok(RefreshRouteNoiseGains {
-            state_scaling: self.state_scaling.iter().map(derive).collect::<Result<Vec<_>, _>>()?,
-            mask: self
-                .mask
-                .iter()
-                .map(|plans| derive_sum(plans, self.mask_multiplicity))
-                .collect::<Result<Vec<_>, _>>()?,
-            fresh: self
-                .fresh
-                .iter()
-                .enumerate()
-                .map(|(slot, plans)| {
-                    let multiplicity = self
-                        .fresh_multiplicity
-                        .get(slot)
-                        .copied()
-                        .unwrap_or(self.mask_multiplicity);
-                    derive_sum(plans, multiplicity)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            decoder: self.decoder.iter().map(derive).collect::<Result<Vec<_>, _>>()?,
-        })
-    }
-}
-
-fn resolve_encoding_error_bound(
-    sigma: &mxx_ir_core::RealExpr,
-) -> Result<mxx_ir_core::IntExpr, RefreshSetupError> {
-    let sigma = sigma
-        .evaluate_f64(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("encoding sigma must be concrete"))?;
-    if !sigma.is_finite() || sigma <= 0.0 {
-        return Err(RefreshSetupError::InvalidParameters(
-            "encoding sigma must be positive and finite",
-        ));
-    }
-    let sigma = BigDecimal::from_f64(sigma)
-        .ok_or(RefreshSetupError::InvalidParameters("encoding sigma is not finite"))?;
-    mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma)
-        .to_bigint()
-        .map(Into::into)
-        .ok_or(RefreshSetupError::InvalidParameters("encoding cutoff overflow"))
-}
-
-fn encoding_error_bound_or_zero(sigma: &mxx_ir_core::RealExpr) -> mxx_ir_core::IntExpr {
-    resolve_encoding_error_bound(sigma).unwrap_or_else(|_| 0.into())
-}
-
-fn average_variance_from_encoding_sigma(
-    sigma: &mxx_ir_core::RealExpr,
-) -> Result<AverageVariance, RefreshSetupError> {
-    let sigma = sigma
-        .evaluate_rational(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("encoding sigma must be rational"))?;
-    let numerator = sigma
-        .numerator()
-        .to_biguint()
-        .filter(|value| !value.is_zero())
-        .ok_or(RefreshSetupError::InvalidParameters("encoding sigma must be positive"))?;
-    let denominator = sigma
-        .denominator()
-        .to_biguint()
-        .filter(|value| !value.is_zero())
-        .ok_or(RefreshSetupError::InvalidParameters("encoding sigma denominator invalid"))?;
-    AverageVariance::new(BigUint::from(4u8) * &numerator * &numerator, &denominator * &denominator)
-        .map_err(|_| RefreshSetupError::InvalidParameters("encoding variance is invalid"))
-}
-
-fn is_power_of_two_expr(value: &mxx_ir_core::IntExpr) -> bool {
-    value
-        .evaluate(&ParamEnv::default())
-        .ok()
-        .and_then(|value| value.to_biguint())
-        .is_some_and(|value| value > 1u8.into() && (BigUint::one() << (value.bits() - 1)) == value)
-}
-
-impl std::fmt::Debug for RefreshSetupParameters {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RefreshSetupParameters")
-            .field("refresh_id", &self.refresh_id)
-            .field("base_p", &self.base_p)
-            .field("component_count", &self.component_count)
-            .field("coefficient_count", &self.coefficient_count)
-            .field("mask_base_p_digit_count", &self.mask_base_p_digit_counts)
-            .field("fresh_error_base_p_digit_count", &self.fresh_error_base_p_digit_count)
-            .field("mask_statistical_security_bits", &self.mask_statistical_security_bits)
-            .field("lut_width", &self.lut_width)
-            .field("layout", &self.layout)
-            .field("decoder_sigma", &self.decoder_sigma)
-            .field("encoding_error_sigma", &self.encoding_error_sigma)
-            .field("encoding_error_bound", &self.encoding_error_bound)
-            .field("decoder_preimage_bound", &self.decoder_preimage_bound)
-            .field("name", &self.name)
-            .finish()
-    }
-}
-impl RefreshSetupParameters {
-    /// Creates refresh setup parameters with the official preimage cutoff
-    /// policy.  Call [`Self::with_decoder_preimage_bound`] only for an
-    /// explicitly reviewed alternative cutoff.
-    pub fn new(
-        refresh_id: [u8; 32],
-        base_p: usize,
-        component_count: usize,
-        coefficient_count: usize,
-        mask_base_p_digit_count: usize,
-        fresh_error_base_p_digit_count: usize,
-        mask_statistical_security_bits: usize,
-        lut_width: usize,
-        layout: BggSamplerLayout,
-        refresh: RefreshCompiler,
-        decoder_sigma: mxx_ir_core::RealExpr,
-        encoding_error_sigma: mxx_ir_core::RealExpr,
-        name: impl Into<String>,
-    ) -> Self {
-        let encoding_error_bound = encoding_error_bound_or_zero(&encoding_error_sigma);
-        let switch_moduli = vec![
-            refresh
-                .full_modulus
-                .evaluate(&ParamEnv::default())
-                .ok()
-                .and_then(|value| value.to_biguint())
-                .unwrap_or_default();
-            refresh.crt_plaintext_moduli.len()
-        ];
-        Self {
-            refresh_id,
-            base_p,
-            component_count,
-            coefficient_count,
-            mask_base_p_digit_counts: vec![mask_base_p_digit_count; switch_moduli.len()],
-            fresh_error_base_p_digit_count,
-            mask_statistical_security_bits,
-            lut_width,
-            layout,
-            refresh,
-            switch_moduli,
-            decoder_sigma,
-            encoding_error_sigma,
-            encoding_error_bound,
-            decoder_preimage_bound: TrapdoorPreimageCutoffPolicy::Default,
-            name: name.into(),
-        }
-    }
-
-    /// Replaces the default trapdoor-sampler cutoff policy with an explicit policy.
-    pub fn with_decoder_preimage_bound(mut self, bound: TrapdoorPreimageCutoffPolicy) -> Self {
-        self.decoder_preimage_bound = bound;
-        self
-    }
-
-    /// Builds the native sparse-LWR profile for a selected power-of-two `Q`.
-    ///
-    /// Refresh setup owns `p` and `W`; the caller supplies the concrete
-    /// plaintext modulus because a refresh may contain several CRT moduli.
-    /// Keeping this check explicit prevents a PBC bucket width from being
-    /// accidentally reused as the Exponent-LUT domain width.
-    pub fn sparse_lwr_profile(
-        &self,
-        q_l: usize,
-    ) -> Result<crate::noise_refresh::prf::SparseLwrPrfProfile, RefreshSetupError> {
-        let ring_dimension = self
-            .layout
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_usize())
-            .ok_or(RefreshSetupError::InvalidParameters("ring dimension must be concrete"))?;
-        if q_l < 2 || !q_l.is_power_of_two() {
-            return Err(RefreshSetupError::InvalidParameters("native PRF Q must be a power of two"));
-        }
-        let width_log2 = q_l
-            .trailing_zeros()
-            .checked_sub(1)
-            .ok_or(RefreshSetupError::InvalidParameters("native PRF Q is too small"))?;
-        let stride_log2 = ring_dimension
-            .trailing_zeros()
-            .checked_sub(width_log2)
-            .ok_or(RefreshSetupError::InvalidParameters("native PRF layout exceeds ring"))?;
-        let layout = crate::layout::ExpLayout { stride_log2, width_log2 };
-        crate::noise_refresh::prf::SparseLwrPrfProfile::new(layout, self.base_p / 2)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid sparse-LWR profile"))
-    }
-
-    /// Number of PRF components covered by every mask and fresh-error group.
-    /// This is the BGG public-key column count (`2 * ell_beta`), not the
-    /// secret dimension stored in `component_count`.
-    pub fn prf_component_count(&self) -> usize {
-        self.layout.public_key_columns()
-    }
-
-    /// Returns the setup-derived doubled-coordinate variance of one sampled
-    /// encoding-error coefficient. AverageCase cannot start from a caller
-    /// supplied variance; unsupported symbolic/non-rational distributions
-    /// fail closed.
-    pub fn average_initial_variance(&self) -> Result<AverageVariance, RefreshSetupError> {
-        self.validate()?;
-        average_variance_from_encoding_sigma(&self.encoding_error_sigma)
-    }
-
-    /// Constructs the complete refresh-noise schema from setup parameters.
-    ///
-    /// This is intentionally independent of any PRF evaluator.  It binds the
-    /// full modulus and every CRT modulus, derives both the joint tail event
-    /// count and the mask-only smudging dimension from the refresh topology.
-    /// Route-dependent digit variances remain
-    /// unattached until preprocessing supplies the balanced decomposition
-    /// plans (explicit or compact), because the route's concrete row `L2²`
-    /// controls the transported variance.
-    pub fn refresh_noise_parameters(&self) -> Result<RefreshNoiseParameters, RefreshSetupError> {
-        self.validate()?;
-        let eval_uint = |value: &mxx_ir_core::IntExpr,
-                         message: &'static str|
-         -> Result<BigUint, RefreshSetupError> {
-            value
-                .evaluate(&ParamEnv::default())
-                .map_err(|_| RefreshSetupError::InvalidParameters(message))?
-                .to_biguint()
-                .ok_or(RefreshSetupError::InvalidParameters(message))
-        };
-        let full_modulus = eval_uint(
-            &self.refresh.full_modulus,
-            "full refresh modulus must be a positive concrete integer",
-        )?;
-        let plaintext_moduli = self
-            .refresh
-            .crt_plaintext_moduli
-            .iter()
-            .map(|value| eval_uint(value, "CRT plaintext modulus must be positive"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let component_columns = self.prf_component_count();
-        let topology = RefreshTranscriptTopology {
-            crt_slot_count: plaintext_moduli.len(),
-            component_columns,
-            coefficient_count: self.coefficient_count,
-            mask_digit_counts: self.mask_base_p_digit_counts.clone(),
-            fresh_digit_count: self.fresh_error_base_p_digit_count,
-        };
-        // The joint mask/fresh event count belongs only to the average tail
-        // budget. Smudging uses the mask transcript dimension D, without the
-        // P-adic digit axis or shared fresh labels.
-        let smudging_coordinates = topology
-            .mask_smudging_coordinates()
-            .map_err(|_| RefreshSetupError::InvalidParameters("refresh topology overflows"))?;
-        let mut refresh = RefreshNoiseParameters::new(
-            plaintext_moduli,
-            self.switch_moduli.clone(),
-            self.base_p.into(),
-            self.mask_base_p_digit_counts.clone(),
-            self.fresh_error_base_p_digit_count,
-        )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh noise parameters"))?;
-        refresh = refresh
-            .with_global_modulus(full_modulus)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid full refresh modulus"))?
-            .with_transcript_topology(topology.clone())
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh topology"))?
-            .with_mask_smudging_parameters(MaskSmudgingParameters {
-                lambda_mask: self.mask_statistical_security_bits,
-                transcript_coordinates: smudging_coordinates,
-            })
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid mask smudging schema"))?;
-        Ok(refresh)
-    }
-
-    /// Builds the setup-owned noise snapshot from the exact producer plans.
-    /// Every plan is derived from the producer's program/readout/refresh
-    /// descriptors; geometry-only gains are rejected by the snapshot schema.
-    fn build_noise_snapshot(
-        &self,
-        prf_program: SparseLwrPrfProgram,
-        pbc_layout: &PbcPublicLayout,
-        gain_plan: crate::noise_refresh::simulation::NoiseGainPlan,
-        route_decompositions: RefreshNoiseGainDecompositions,
-    ) -> Result<ExponentLutNoiseSnapshot, RefreshSetupError> {
-        let family_active_counts = PbcActiveCellIndex::build(pbc_layout)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid PBC active-cell index"))?
-            .bucket_active_widths()
-            .collect::<Vec<_>>();
-        self.build_noise_snapshot_with_family_active_counts(
-            prf_program,
-            pbc_layout,
-            gain_plan,
-            route_decompositions,
-            family_active_counts,
-        )
-    }
-
-    fn build_noise_snapshot_with_family_active_counts(
-        &self,
-        prf_program: SparseLwrPrfProgram,
-        pbc_layout: &PbcPublicLayout,
-        gain_plan: crate::noise_refresh::simulation::NoiseGainPlan,
-        route_decompositions: RefreshNoiseGainDecompositions,
-        family_active_counts: Vec<usize>,
-    ) -> Result<ExponentLutNoiseSnapshot, RefreshSetupError> {
-        self.validate()?;
-        let decoder_preimage_bound = self.resolve_decoder_preimage_bound()?;
-        let contract = RefreshPrfContract::from_program(&prf_program);
-        // The producer declaration commits to the exact value-readout
-        // semantics as well as the geometry.  Use the same readout-inclusive
-        // identity here so the production snapshot can be compared directly
-        // with that declaration.
-        let setup_identity = setup_identity_digest(
-            self,
-            &contract,
-            pbc_layout.layout_id,
-            &decoder_preimage_bound,
-            prf_program.readout.identity(),
-        );
-        let helper_error_bound = self
-            .encoding_error_bound
-            .evaluate(&ParamEnv::default())
-            .map_err(|_| {
-                RefreshSetupError::InvalidParameters("encoding error bound must be concrete")
-            })?
-            .to_biguint()
-            .ok_or(RefreshSetupError::InvalidParameters(
-                "encoding error bound must be non-negative",
-            ))?;
-        let expected_mask_route_counts = self
-            .mask_base_p_digit_counts
-            .iter()
-            .map(|digits| {
-                self.coefficient_count
-                    .checked_mul(*digits)
-                    .ok_or(RefreshSetupError::InvalidParameters("mask route count overflow"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let expected_fresh_route_count = Some(self.coefficient_count)
-            .and_then(|value| value.checked_mul(self.fresh_error_base_p_digit_count))
-            .ok_or(RefreshSetupError::InvalidParameters("fresh route count overflow"))?;
-        let actual_mask_route_counts = route_decompositions
-            .mask
-            .iter()
-            .map(|plans| {
-                plans
-                    .len()
-                    .checked_mul(route_decompositions.mask_multiplicity)
-                    .ok_or(RefreshSetupError::InvalidParameters("mask route count overflow"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let actual_fresh_route_counts = route_decompositions
-            .fresh
-            .iter()
-            .enumerate()
-            .map(|(slot, plans)| {
-                plans
-                    .len()
-                    .checked_mul(
-                        route_decompositions
-                            .fresh_multiplicity
-                            .get(slot)
-                            .copied()
-                            .unwrap_or(route_decompositions.mask_multiplicity),
-                    )
-                    .ok_or(RefreshSetupError::InvalidParameters("fresh route count overflow"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if actual_mask_route_counts.len() != self.switch_moduli.len() ||
-            actual_mask_route_counts != expected_mask_route_counts ||
-            route_decompositions.fresh.len() != self.refresh.crt_plaintext_moduli.len() ||
-            actual_fresh_route_counts.iter().any(|count| *count != expected_fresh_route_count)
-        {
-            return Err(RefreshSetupError::InvalidParameters(
-                "refresh route count does not match P-adic topology",
-            ));
-        }
-        let route_gains =
-            route_decompositions.derive_route_gains(self.refresh.crt_plaintext_moduli.len())?;
-        // These are nominal payload variances, not decomposition-transported
-        // operational errors. Independent base-p digits form a uniform interval.
-        let support_variance = |digits: usize| {
-            let digits = u32::try_from(digits)
-                .map_err(|_| RefreshSetupError::InvalidParameters("digit count overflow"))?;
-            centered_base_p_digit_variance(&BigUint::from(self.base_p).pow(digits))
-                .map_err(|_| RefreshSetupError::InvalidParameters("invalid payload variance"))
-        };
-        let mask_digit_variances = self
-            .mask_base_p_digit_counts
-            .iter()
-            .map(|digits| support_variance(*digits))
-            .collect::<Result<Vec<_>, _>>()?;
-        let fresh_digit_variances =
-            vec![support_variance(self.fresh_error_base_p_digit_count)?; self.switch_moduli.len()];
-        let mut refresh = self
-            .refresh_noise_parameters()?
-            .with_route_gains(route_gains)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh route gains"))?
-            .with_digit_variances(mask_digit_variances, fresh_digit_variances)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid digit variances"))?;
-        let (_, mask_bias) = corrected_route_scalars(self, false)?;
-        let (_, fresh_bias) = corrected_route_scalars(self, true)?;
-        refresh.route_bias_bounds =
-            mask_bias.into_iter().zip(fresh_bias).map(|(mask, fresh)| mask + fresh).collect();
-        let mut snapshot = ExponentLutNoiseSnapshot::from_setup(
-            setup_identity,
-            prf_program,
-            helper_error_bound.clone(),
-            self.average_initial_variance()?,
-            helper_error_bound,
-            self.average_initial_variance()?,
-            refresh,
-            gain_plan,
-            family_active_counts,
-        )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid noise snapshot"))?;
-        let moduli = self
-            .refresh
-            .crt_plaintext_moduli
-            .iter()
-            .map(|p| {
-                p.evaluate(&ParamEnv::default())
-                    .ok()
-                    .and_then(|p| p.to_biguint())
-                    .ok_or(RefreshSetupError::InvalidManifest)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let base = self
-            .layout
-            .gadget_base
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|base| base.to_biguint())
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let (_, retained) = ordinary_gadget_towers(&moduli, &base, self.layout.digit_count)?;
-        if retained < moduli.len() {
-            if self.layout.secret_dimension != 2 {
-                return Err(RefreshSetupError::InvalidParameters(
-                    "approximate residual requires augmented ternary dimension two",
-                ));
-            }
-            let omitted = &moduli[retained..];
-            let product = omitted.iter().product::<BigUint>();
-            let epsilon = omitted.iter().map(|p| (&product / p) * (p / 2u8)).sum::<BigUint>();
-            let variance_sum =
-                omitted.iter().map(|p| (&product / p).pow(2) * (p.pow(2) - 1u8)).sum::<BigUint>();
-            // Independent uniform discarded residues and augmented ternary
-            // secret: Var(R)*(1+2N/3). The stored convention is four Var.
-            let residual = ProgramNoiseState {
-                bound: epsilon * BigUint::from(self.coefficient_count + 1),
-                doubled_variance: AverageVariance::new(
-                    variance_sum * BigUint::from(3 + 2 * self.coefficient_count),
-                    9u8.into(),
-                )
-                .map_err(|_| RefreshSetupError::InvalidManifest)?,
-            };
-            for gate in &snapshot.gate_gains {
-                if gate.operation == GateNoiseOperation::Add {
-                    continue;
-                }
-                let sources = if gate.operation == GateNoiseOperation::Lut { 2u8 } else { 1u8 };
-                snapshot.operation_residuals.insert(
-                    gate.operation_index,
-                    ProgramNoiseState {
-                        bound: &residual.bound * sources,
-                        doubled_variance: residual.doubled_variance.scaled(&BigUint::from(sources)),
-                    },
-                );
-            }
-            let zero = ProgramNoiseState {
-                bound: BigUint::zero(),
-                doubled_variance: AverageVariance::zero(),
-            };
-            let trace = ProgramNoiseState {
-                bound: &residual.bound * (&snapshot.target_plaintext_gain().l1 + 1u8),
-                doubled_variance: residual
-                    .doubled_variance
-                    .scaled(&(&snapshot.target_plaintext_gain().l2_squared + 1u8)),
-            };
-            snapshot.readout_residuals = Some((
-                zero.clone(),
-                vec![trace; snapshot.readout_gains.nonidentity_trace.len()],
-                zero,
-            ));
-        }
-        Ok(snapshot)
-    }
-
-    /// Evaluates one AverageCase search candidate using the same complete,
-    /// setup-owned snapshot construction used by final graph assembly.
-    ///
-    /// Only the candidate mask digit count is varied; all other setup fields,
-    /// including the fresh-error digit count, remain fixed.  The returned
-    /// report carries the canonical snapshot identity and both the independent
-    /// WorstCase hard authority and AverageCase correctness result, so a
-    /// selector can compare the report with the final bundle without building
-    /// a graph or supplying a proxy variance.
-    pub fn evaluate_average_candidate(
-        &self,
-        prf_program: SparseLwrPrfProgram,
-        pbc_layout: PbcPublicLayout,
-        candidate_mask_base_p_digit_count: usize,
-        config: &AverageCaseConfig,
-    ) -> Result<ExponentLutAverageNoiseReport, RefreshSetupError> {
-        let mut candidate = self.clone();
-        candidate.mask_base_p_digit_counts.fill(candidate_mask_base_p_digit_count);
-        // The mask digit count changes the route topology.  Rebuild both the
-        // compact route plans and the gain plan from the candidate instead of
-        // reusing plans generated for the previous digit count.
-        let readout_schema = compact_readout_plan_schema(&candidate, &prf_program)?;
-        let active_cells = PbcActiveCellIndex::build(&pbc_layout)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid PBC active-cell index"))?;
-        let (gain_plan, route_decompositions) = compact_noise_snapshot_plans(
-            &candidate,
-            &prf_program,
-            &pbc_layout,
-            &active_cells,
-            &readout_schema,
-        )?;
-        let snapshot = candidate.build_noise_snapshot(
-            prf_program,
-            &pbc_layout,
-            gain_plan,
-            route_decompositions,
-        )?;
-        snapshot
-            .simulate_average(config)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid AverageCase candidate"))
-    }
-
-    fn validate_dimensions(&self) -> Result<(), RefreshSetupError> {
-        let n = self
-            .layout
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|x| x.to_usize())
-            .ok_or(RefreshSetupError::InvalidParameters("ring dimension must be concrete"))?;
-        if self.base_p < 2 ||
-            self.component_count != self.layout.secret_dimension ||
-            self.coefficient_count == 0 ||
-            self.coefficient_count != n ||
-            self.lut_width == 0 ||
-            !self.lut_width.is_power_of_two() ||
-            self.lut_width > n ||
-            n % self.lut_width != 0 ||
-            self.mask_base_p_digit_counts.len() != self.switch_moduli.len() ||
-            self.mask_base_p_digit_counts.iter().any(|count| *count == 0) ||
-            self.fresh_error_base_p_digit_count == 0 ||
-            self.mask_statistical_security_bits == 0 ||
-            self.layout.digit_count == 0 ||
-            self.layout.secret_dimension != 2 ||
-            !is_power_of_two_expr(&self.layout.gadget_base) ||
-            self.refresh.full_modulus.canonicalize() != self.layout.modulus.canonicalize()
-        {
-            return Err(RefreshSetupError::InvalidParameters("inconsistent dimensions"));
-        }
-        let expected_prf_component_count = self
-            .layout
-            .secret_dimension
-            .checked_mul(self.layout.digit_count)
-            .ok_or(RefreshSetupError::InvalidParameters("public-key column count overflow"))?;
-        if self.prf_component_count() != expected_prf_component_count {
-            return Err(RefreshSetupError::InvalidParameters("invalid public-key column count"));
-        }
-        self.refresh.validate_layout()?;
-        let expected_bound = resolve_encoding_error_bound(&self.encoding_error_sigma)?;
-        if self.encoding_error_bound != expected_bound {
-            return Err(RefreshSetupError::InvalidParameters(
-                "encoding error cutoff does not match encoding sigma",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Resolves the preimage cutoff using the authoritative primitives formula.
-    /// All dimensions and sigma must be concrete and valid; symbolic,
-    /// non-positive, non-finite, and overflowing inputs fail closed.
-    pub fn resolve_decoder_preimage_bound(
-        &self,
-    ) -> Result<mxx_ir_core::IntExpr, RefreshSetupError> {
-        self.validate_dimensions()?;
-        let ring_dimension = self
-            .layout
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_u32())
-            .ok_or(RefreshSetupError::InvalidParameters(
-                "decoder cutoff requires a concrete ring dimension that fits in u32",
-            ))?;
-        let gadget_base = self
-            .layout
-            .gadget_base
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_u32())
-            .ok_or(RefreshSetupError::InvalidParameters(
-                "decoder cutoff requires a concrete gadget base that fits in u32",
-            ))?;
-        let decoder_sigma =
-            self.decoder_sigma.evaluate_f64(&ParamEnv::default()).map_err(|_| {
-                RefreshSetupError::InvalidParameters(
-                    "decoder cutoff requires a concrete finite sigma",
-                )
-            })?;
-        let selected = (0..self.switch_moduli.len())
-            .map(|slot| {
-                self.decoder_preimage_bound
-                    .resolve(
-                        ring_dimension,
-                        self.layout.secret_dimension,
-                        self.decoder_digit_count(slot)?,
-                        gadget_base,
-                        decoder_sigma,
-                    )
-                    .map_err(|_| {
-                        RefreshSetupError::InvalidParameters(
-                            "invalid decoder trapdoor preimage cutoff policy",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, RefreshSetupError>>()?
-            .into_iter()
-            .max()
-            .ok_or(RefreshSetupError::InvalidParameters("empty decoder moduli"))?;
-        Ok(IntExpr::constant(BigInt::from_biguint(num_bigint::Sign::Plus, selected)))
-    }
-
-    /// Gadget digits for the exact retained CRT basis of one low-modulus anchor.
-    /// Tower order is inherited from the source; arbitrary subsets are supported.
-    pub fn decoder_digit_count(&self, slot: usize) -> Result<usize, RefreshSetupError> {
-        let selected = self
-            .switch_moduli
-            .get(slot)
-            .filter(|modulus| **modulus > BigUint::one())
-            .ok_or(RefreshSetupError::InvalidParameters("missing switching modulus"))?;
-        let towers = &self.refresh.crt_plaintext_moduli;
-        let base = self
-            .layout
-            .gadget_base
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_u64())
-            .filter(|base| *base >= 2 && base.is_power_of_two())
-            .ok_or(RefreshSetupError::InvalidParameters("invalid decoder gadget base"))?;
-        let base_bits = base.trailing_zeros() as usize;
-        let mut product = BigUint::one();
-        let mut count = 0usize;
-        let mut maximum_bits = 0usize;
-        for tower in towers {
-            let modulus = tower
-                .evaluate(&ParamEnv::default())
-                .ok()
-                .and_then(|value| value.to_biguint())
-                .filter(|value| *value > BigUint::one())
-                .ok_or(RefreshSetupError::InvalidParameters("invalid decoder CRT tower"))?;
-            if selected % &modulus == BigUint::zero() {
-                maximum_bits = maximum_bits.max(modulus.bits() as usize);
-                product *= modulus;
-                count = count
-                    .checked_add(1)
-                    .ok_or(RefreshSetupError::InvalidParameters("decoder digit count overflow"))?;
-            }
-        }
-        if &product != selected {
-            return Err(RefreshSetupError::InvalidParameters(
-                "switching modulus is not a CRT subset",
-            ));
-        }
-        count
-            .checked_mul(maximum_bits.div_ceil(base_bits))
-            .ok_or(RefreshSetupError::InvalidParameters("decoder digit count overflow"))
-    }
-
-    /// Describe every new marginal and complementary view without borrowing
-    /// security bits from the original high-q BGG distribution. The declared
-    /// budget counts fresh anchor samples across executions of this setup.
-    pub fn anchor_security_inputs(
-        &self,
-        execution_budget: usize,
-    ) -> Result<Vec<RefreshAnchorSecurityInputs>, RefreshSetupError> {
-        self.validate_dimensions()?;
-        if execution_budget == 0 {
-            return Err(RefreshSetupError::InvalidParameters("zero security execution budget"));
-        }
-        let q = self
-            .refresh
-            .full_modulus
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_biguint())
-            .ok_or(RefreshSetupError::InvalidParameters("invalid security modulus"))?;
-        self.anchor_groups().into_iter().map(|(modulus, slots)| {
-            let digits = self.decoder_digit_count(slots[0])?;
-            let columns = digits.checked_add(2)
-                .and_then(|value| value.checked_mul(self.layout.secret_dimension))
-                .ok_or(RefreshSetupError::InvalidParameters("anchor sample count overflow"))?;
-            let samples = columns.checked_mul(execution_budget)
-                .ok_or(RefreshSetupError::InvalidParameters("anchor sample budget overflow"))?;
-            Ok(RefreshAnchorSecurityInputs {
-                complementary_modulus: &q / &modulus,
-                modulus,
-                slots,
-                ring_dimension: self.coefficient_count,
-                random_secret_polynomials: self.layout.secret_dimension - 1,
-                secret_distribution: "one coefficientwise uniform ternary polynomial, shared across all moduli".into(),
-                fixed_augmented_coordinate: 1,
-                error_sigma: self.encoding_error_sigma.clone(),
-                error_coefficient_cutoff: self.encoding_error_bound.clone(),
-                anchor_columns: columns,
-                execution_budget,
-                ring_samples: samples,
-                estimated_security_bits: None,
-                status: "not estimated: low-P marginal with fixed coordinate, complementary J-view with correlated operational errors, and their joint view with high-q encodings/targets/preimages require analysis; noise acceptance is not security acceptance".into(),
-            })
-        }).collect()
-    }
-
-    /// Deterministic public anchor groups, ordered by their exact modulus.
-    fn anchor_groups(&self) -> Vec<(BigUint, Vec<usize>)> {
-        let mut groups = BTreeMap::<BigUint, Vec<usize>>::new();
-        for (slot, modulus) in self.switch_moduli.iter().enumerate() {
-            groups.entry(modulus.clone()).or_default().push(slot);
-        }
-        groups.into_iter().collect()
-    }
-
-    fn switch_ring(&self, slot: usize) -> Result<mxx_dsl::Ring, RefreshSetupError> {
-        let modulus = self.switch_moduli.get(slot).ok_or(RefreshSetupError::InvalidManifest)?;
-        Ok(mxx_dsl::Ring::new(
-            IntExpr::constant(BigInt::from(modulus.clone())),
-            self.layout.ring_dimension.clone(),
-        ))
-    }
-
-    fn mask_lifts(&self) -> Result<Vec<Mat>, RefreshSetupError> {
-        let q = self
-            .refresh
-            .full_modulus
-            .evaluate(&ParamEnv::default())
-            .map_err(|_| RefreshSetupError::InvalidManifest)?;
-        Ok(self
-            .switch_moduli
-            .iter()
-            .map(|modulus| {
-                self.layout
-                    .ring()
-                    .polynomial([IntExpr::constant(&q / BigInt::from(modulus.clone()))])
-            })
-            .collect())
-    }
-
-    fn validate(&self) -> Result<(), RefreshSetupError> {
-        self.validate_dimensions()?;
-        self.resolve_decoder_preimage_bound().map(|_| ())
-    }
-}
-
-#[derive(Clone)]
-/// Validated PRF outputs needed by refresh preprocessing.
-///
-/// The private vectors are retained only behind this setup boundary. Each
-/// output carries the exact PRF program and PBC layout identities, and the
-/// constructor checks complete slot/component/coefficient/digit coverage.
-pub struct RefreshPrfInputs {
-    masks: Vec<RefreshMaskMaterial>,
-    fresh_error: RefreshFreshErrorMaterial,
-    contract: RefreshPrfContract,
-    layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-    encoding_error_sigma: mxx_ir_core::RealExpr,
-    encoding_error_bound: mxx_ir_core::IntExpr,
-}
-
-impl RefreshPrfInputs {
-    /// Binds the label-major output of the online native PRF batch. This
-    /// boundary has no plaintext family: the public monomials were already
-    /// consumed by the PRF program, and only the resulting encoding vectors
-    /// are routed into the refresh transcript.
-    pub(crate) fn from_native_encoding_batch_outputs(
-        parameters: &RefreshSetupParameters,
-        expected_program: &SparseLwrPrfProgram,
-        outputs: &NativePrfEncodingBatchOutputs,
-        layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-    ) -> Result<Self, RefreshSetupError> {
-        parameters.validate()?;
-        let contract = RefreshPrfContract::from_program(expected_program);
-        contract.validate_for(parameters)?;
-        let coverage = RefreshPrfCoverage::new(
-            parameters.refresh_id,
-            parameters.prf_component_count(),
-            parameters.coefficient_count,
-            parameters.mask_base_p_digit_counts.clone(),
-            parameters.fresh_error_base_p_digit_count,
-        )?;
-        let labels = crate::noise_refresh::refresh::RefreshPrfLabelIndex::new(
-            parameters.refresh_id,
-            parameters.refresh.crt_plaintext_moduli.len(),
-            parameters.prf_component_count(),
-            parameters.coefficient_count,
-            parameters.mask_base_p_digit_counts.clone(),
-            parameters.fresh_error_base_p_digit_count,
-        )?;
-        let family = RefreshPrfFamilyMaterial::from_native_encoding_batch_outputs(
-            outputs,
-            &labels,
-            coverage.clone(),
-            contract,
-            layout_id,
-        )?;
-        let slot_count = parameters.refresh.crt_plaintext_moduli.len();
-        let masks = (0..slot_count)
-            .map(|slot| RefreshMaskMaterial::from_family(coverage.clone(), slot, family.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let fresh_error = RefreshFreshErrorMaterial::from_family(coverage, family)?;
-        let inputs = Self {
-            masks,
-            fresh_error,
-            contract,
-            layout_id,
-            encoding_error_sigma: parameters.encoding_error_sigma.clone(),
-            encoding_error_bound: parameters.encoding_error_bound.clone(),
-        };
-        inputs.validate_for(parameters)?;
-        Ok(inputs)
-    }
-
-    /// Re-runs all producer-side identity and coverage checks at consumption.
-    pub(crate) fn validate_for(
-        &self,
-        parameters: &RefreshSetupParameters,
-    ) -> Result<(), RefreshSetupError> {
-        parameters.validate()?;
-        if self.encoding_error_sigma != parameters.encoding_error_sigma ||
-            self.encoding_error_bound != parameters.encoding_error_bound
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        self.contract.validate_for(parameters)?;
-        let coverage = RefreshPrfCoverage::new(
-            parameters.refresh_id,
-            parameters.prf_component_count(),
-            parameters.coefficient_count,
-            parameters.mask_base_p_digit_counts.clone(),
-            parameters.fresh_error_base_p_digit_count,
-        )?;
-        if self.masks.len() != parameters.refresh.crt_plaintext_moduli.len() {
-            return Err(RefreshSetupError::Refresh(RefreshError::SlotOrderMismatch));
-        }
-        for (slot, material) in self.masks.iter().enumerate() {
-            if material.slot() != slot ||
-                material.contract() != self.contract ||
-                material.layout_id() != self.layout_id ||
-                !material.coverage_matches(&coverage)
-            {
-                return Err(RefreshSetupError::Refresh(RefreshError::PrfOutputMismatch));
-            }
-            material.validate()?;
-        }
-        if self.fresh_error.contract() != self.contract ||
-            self.fresh_error.layout_id() != self.layout_id ||
-            !self.fresh_error.coverage_matches(&coverage)
-        {
-            return Err(RefreshSetupError::Refresh(RefreshError::PrfOutputMismatch));
-        }
-        self.fresh_error.validate()?;
-        Ok(())
-    }
-
-    /// Aggregates the complete mask family in one symbolic routing body and
-    /// one structural reduction per CRT slot. The fixed-size slot vector is
-    /// materialized only after those reductions.
-    fn aggregate_masks(
-        &self,
-        base_p: usize,
-        route_preimages: Family<mxx_dsl::Preimage>,
-        lifts: Vec<Mat>,
-    ) -> Result<Vec<BggEncodingWire>, RefreshSetupError> {
-        let family = self
-            .masks
-            .first()
-            .and_then(RefreshMaskMaterial::family_material)
-            .ok_or(RefreshSetupError::InvalidParameters("missing native mask family"))?;
-        aggregate_refresh_masks(base_p, family, self.masks.len(), route_preimages, lifts)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid native mask family"))
-    }
-}
-
 /// Inputs for constructing the trusted refresh preprocessing graph.
 ///
-/// `state`, `secret`, and `hash_key` are setup material. The resulting graph
-/// exports named artifacts; later execution imports typed artifact handles
-/// rather than reusing live producer wires.
+/// The public PRF initial key is also the state encoding's public key.
+/// The state vector and online secret never enter this request. The resulting
+/// graph exports named artifacts for typed import at the execution boundary.
 pub struct RefreshPreprocessingRequest {
+    /// Frozen PRF schedule shared by preparation, execution and noise tracing.
+    pub program: SparseLwrPrfProgram,
+    /// Public structural PBC layout used to resolve active selector ranges.
+    pub layout: PbcPublicLayout,
     /// Validated dimensions and CRT refresh declaration.
-    pub parameters: RefreshSetupParameters,
+    pub parameters: BggRefreshParameters,
     /// Setup-fixed public PRF and readout inputs. This value contains no
     /// label-dependent vectors, monomials, or online refresh outputs.
-    pub public_prf: RefreshPublicPrfSetup,
-    /// Private Exponent-LUT compiler used to aggregate PRF digits.
-    pub compiler: ExponentLutEncodingCompiler,
-    /// Setup-fixed public matrix of the state encoding. The state vector is
-    /// online input and never enters this preprocessing request.
-    pub state: BggPublicKeyWire,
+    pub public_prf: PrfPublicSetup<BggScheme>,
     /// Setup secret `t` used by the preprocessing equations. This is not the
     /// online evaluator secret `s`; it crosses the trusted local boundary only
     /// as a typed private setup artifact and is never transmitted.
@@ -1150,127 +122,10 @@ pub struct RefreshPreprocessingRequest {
     pub selector_gsw: Family<Mat>,
     /// Canonical PBC artifact name for the selector family.
     pub selector_gsw_name: String,
-    /// Public typed decompositions of the setup PRF public-key family.  The
-    /// corresponding `A[S]` matrices are reconstructed as `G*K` at each
-    /// consumer and are never exported as raw artifacts.
-    pub setup_public_key_rhs: Family<mxx_dsl::Preimage>,
+    /// Public native label monomials, used only to compose preprocessing-fixed RHSs.
+    pub label_plaintexts: Family<Mat>,
     /// Hash key used for deterministic public matrix derivation.
     pub hash_key: Bytes,
-}
-
-/// Setup-fixed public inputs required by the refresh preprocessing producer.
-///
-/// The public compiler evaluates the accumulator and value-readout projection
-/// once. The helper set may retain setup-private mask vectors for the online
-/// readout artifact bundle, but no label-dependent input is accepted here.
-pub struct RefreshPublicPrfSetup {
-    pub program: SparseLwrPrfProgram,
-    pub compiler: ExponentLutPublicKeyCompiler,
-    pub initial: BggPublicKeyWire,
-    pub selectors: PublicRhsFamily,
-    pub inputs: NativePrfPublicInputs,
-    pub layout: PbcPublicLayout,
-    pub(crate) helpers: crate::encoding::NativeReadoutHelperFamilies,
-    pub normalization_gadget: Mat,
-}
-
-impl RefreshPublicPrfSetup {
-    /// Validates the public PRF setup against the refresh dimensions and
-    /// compiler ring. The checks intentionally inspect only setup-fixed
-    /// public matrices and declarations.
-    pub fn validate(&self, parameters: &RefreshSetupParameters) -> Result<(), RefreshSetupError> {
-        parameters.validate_dimensions()?;
-        RefreshPrfContract::from_program(&self.program).validate_for(parameters)?;
-        self.layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        if self.inputs.layout_id() != Some(self.layout.layout_id) ||
-            self.selectors.layout_id() != Some(self.layout.layout_id) ||
-            self.program.profile().ring_dimension()? !=
-                self.compiler
-                    .public_key
-                    .ring
-                    .matrix_type((1, 1))
-                    .ring_dimension
-                    .evaluate(&ParamEnv::default())
-                    .map_err(|_| {
-                        RefreshSetupError::InvalidParameters(
-                            "public PRF compiler ring dimension must be concrete",
-                        )
-                    })?
-                    .to_usize()
-                    .ok_or(RefreshSetupError::InvalidParameters(
-                        "public PRF compiler ring dimension must fit usize",
-                    ))?
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        if self.initial.reveal_plaintext ||
-            *self.initial.matrix.matrix_type() !=
-                self.compiler.public_key.ring.matrix_type((
-                    parameters.component_count,
-                    parameters.layout.public_key_columns(),
-                ))
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        if self.normalization_gadget.matrix_type().modulus !=
-            self.compiler.public_key.ring.matrix_type((1, 1)).modulus ||
-            self.normalization_gadget.matrix_type().ring_dimension !=
-                self.compiler.public_key.ring.matrix_type((1, 1)).ring_dimension
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        Ok(())
-    }
-}
-
-/// Names crossing the preprocessing/online boundary. The decomposition names
-/// below identify deterministic, typed `Preimage` cache entries. The helper
-/// protocol pair names identify t-only setup encodings (including their fresh
-/// setup error); they are protocol data, not cache entries, and must not be
-/// confused with online s-dependent label vectors.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RefreshReadoutArtifactNames {
-    pub target_decomposition: String,
-    pub helper_switch_decompositions: String,
-    pub helper_public_decompositions: String,
-    pub normalization_decomposition: String,
-}
-
-/// Names and structural coordinates of the public deterministic program
-/// cache. Each entry names the one `K_rhs` decomposition consumed online.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramCacheFamilyNames {
-    pub step: usize,
-    pub body_gate: usize,
-    pub count: usize,
-    /// Whether the flat artifact has shape `[output][member]`; false means
-    /// the setup-fixed member family is shared by every output.
-    pub output_indexed: bool,
-    pub rhs: String,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramCacheArtifactNames {
-    pub gates: Vec<ProgramCacheGateNames>,
-    pub luts: Vec<ProgramCacheLutNames>,
-    pub families: Vec<ProgramCacheFamilyNames>,
-}
-
-/// Artifact names for a LUT gate's per-branch public-key decompositions.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramCacheLutNames {
-    pub step: usize,
-    pub body_gate: Option<usize>,
-    pub count: usize,
-    pub width: usize,
-    pub switch: String,
-    pub branch: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramCacheGateNames {
-    pub step: usize,
-    pub rhs: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1280,8 +135,6 @@ pub struct RefreshPreprocessingArtifactNames {
     pub setup_secret_t: String,
     /// Setup-fixed selector GSW family used by online accumulation.
     pub selector_gsw: String,
-    /// Public typed `K_rhs = G^-1(A[S])` family for setup PRF keys.
-    pub setup_public_key_rhs: String,
     /// Public typed decompositions of each CRT `kappa_t` state scale.
     pub state_scaling: Vec<String>,
     /// Public typed route decompositions for mask and fresh label families.
@@ -1299,120 +152,55 @@ pub struct RefreshPreprocessingArtifactNames {
     /// Per-slot sampled preimage matrices.
     pub preimages: Vec<String>,
     /// Public value-readout and typed decomposition-cache artifacts.
-    pub readout: RefreshReadoutArtifactNames,
-    /// Public typed Preimage families for every program multiplication.
-    pub program_cache: ProgramCacheArtifactNames,
+    pub readout: String,
 }
 
-#[derive(Clone)]
-pub(crate) struct RefreshPreprocessingWires {
-    pub(crate) setup_secret_t: Mat,
-    pub(crate) selector_gsw: Family<Mat>,
-    pub(crate) setup_public_key_rhs: Family<mxx_dsl::Preimage>,
-    pub(crate) state_scaling: Vec<mxx_dsl::Preimage>,
-    pub(crate) mask_route_rhs_decompositions: Family<mxx_dsl::Preimage>,
-    pub(crate) fresh_route_rhs_decompositions: Family<mxx_dsl::Preimage>,
-    pub(crate) state: BggPublicKeyWire,
-    pub(crate) a_prime: Mat,
-    pub(crate) public_b: Vec<Mat>,
-    pub(crate) refresh_targets: Vec<Mat>,
-    pub(crate) scaled_fresh: Vec<Mat>,
-    pub(crate) masks: Vec<Mat>,
-    pub(crate) preimages: Vec<mxx_dsl::Preimage>,
-    pub(crate) readout_artifacts: NativePrfReadoutFamilyArtifacts,
-    pub(crate) program_cache: ProgramCacheBatchBindings,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// Public declaration of a preprocessing producer and its artifact schema.
 ///
 /// The identity commits to all dimensions, setup identities, decoder policy,
-/// scales, and canonical artifact names.
-pub struct RefreshPreprocessingDeclaration {
-    /// Digest of this complete declaration.
+/// scales, and canonical artifact names. Parameters remain authoritative in
+/// the producer/import owner: this declaration binds their digest instead of
+/// serializing a second, independently mutable projection of their fields.
+/// The PRF binding and prepared-value schema are supplied by the encoding
+/// capability; this declaration does not prescribe a cache representation.
+pub struct RefreshPreprocessingDeclaration<B, D> {
+    /// Digest of the resolved setup parameters, PRF contract and readout identity.
     pub identity: [u8; 32],
     /// PBC layout identity used by the PRF outputs.
     pub pbc_layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-    /// Refresh instance identity.
-    pub refresh_id: [u8; 32],
-    /// Sparse-LWR/Exponent-LUT program identity.
-    pub program_id: ExponentLutProgramId,
-    /// Plaintext modulus bound to the sparse-LWR PRF terminal.
-    pub prf_q: usize,
-    /// Raw scalar output modulus bound to the sparse-LWR PRF terminal.
-    pub prf_p: usize,
-    /// Logical LUT width bound to the sparse-LWR PRF program.
-    pub prf_native_width: usize,
-    /// Ring dimension bound to the sparse-LWR PRF program.
-    pub prf_ring_dimension: usize,
-    /// Algebraic form promised by the PRF terminal.
-    /// Output wire promised by the PRF terminal.
-    pub prf_output_wire: crate::program::WireId,
+    /// Canonical program and terminal contract, serialized without reconstructing it.
+    pub(crate) prf_contract: RefreshPrfContract,
     /// Canonical names and roles of all produced artifacts.
     pub names: RefreshPreprocessingArtifactNames,
-    /// Number of CRT slots.
-    pub slot_count: usize,
-    /// Exact per-slot destination rings; equal moduli share one public anchor.
-    pub switch_moduli: Vec<BigUint>,
-    /// Number of secret components.
-    pub component_count: usize,
-    /// Number of public-key columns covered by each PRF group (`2 * ell_beta`).
-    pub prf_component_count: usize,
-    /// Number of coefficients per slot.
-    pub coefficient_count: usize,
-    /// Number of base-`p` digits represented by each mask PRF label.
-    pub mask_base_p_digit_counts: Vec<usize>,
-    /// Number of base-`p` digits represented by the shared fresh-error label group.
-    pub fresh_error_base_p_digit_count: usize,
-    /// Statistical security parameter used for the joint mask transcript.
-    pub mask_statistical_security_bits: usize,
-    /// Number of gadget digits used by the BGG layout.
-    pub gadget_digit_count: usize,
-    /// Decoder trapdoor Gaussian width.
-    pub decoder_sigma: mxx_ir_core::RealExpr,
-    /// Concrete maximum coefficient accepted by preimage sampling.
-    pub decoder_preimage_bound: mxx_ir_core::IntExpr,
-    /// Gaussian cutoff shared by helper and anchor errors.
-    pub encoding_error_sigma: mxx_ir_core::RealExpr,
-    /// Concrete common helper/anchor cutoff `B_chi`.
-    pub encoding_error_bound: mxx_ir_core::IntExpr,
-    /// Per-slot CRT scaling polynomials.
-    pub slot_scales: Vec<mxx_ir_core::IntExpr>,
-    /// Full modulus used by the BGG layout.
-    pub layout_modulus: mxx_ir_core::IntExpr,
-    /// Ring dimension used by the BGG layout.
-    pub layout_ring_dimension: mxx_ir_core::IntExpr,
-    /// Gadget base used by the BGG layout.
-    pub layout_gadget_base: mxx_ir_core::IntExpr,
+    pub prepared_prf: PreparedSparseLwrPrfDescriptor<B, D>,
     /// Stable identity of the value-form readout used by this setup.
-    pub readout_identity: crate::noise_refresh::readout::ValueReadoutIdentity,
-    /// Canonical non-identity trace automorphisms for the readout helpers.
-    /// Keeping this in the declaration lets an importer reconstruct the
-    /// typed helper set without requiring the online program or its labels.
-    pub readout_helper_sigmas: Vec<usize>,
+    pub readout_identity: crate::readout::ValueReadoutIdentity,
 }
 
 #[derive(Clone)]
 /// Runtime setup material imported from a validated producer declaration.
 ///
 /// Private setup values and preimages remain crate-visible only. Consumers use
-/// them through [`RefreshOnlineEvaluationRequest`] after all manifest,
+/// them through the online construction stage after all manifest,
 /// identity, and artifact-schema checks succeed.
 pub struct ImportedRefreshSetup {
-    parameters: RefreshSetupParameters,
+    parameters: BggRefreshParameters,
     pub(crate) state: BggPublicKeyWire,
     pub(crate) setup_secret_t: Mat,
     pub(crate) a_prime: Mat,
     pub(crate) public_b: Vec<Mat>,
     pub(crate) refresh_targets: Vec<Mat>,
-    pub(crate) readout_artifacts: NativePrfReadoutFamilyArtifacts,
-    pub(crate) program_cache: ProgramCacheBatchBindings,
-    pub(crate) setup_public_key_rhs: Family<mxx_dsl::Preimage>,
+    pub(crate) readout_artifacts: BggPreparedReadout,
+    pub(crate) program_cache: PreparedSparseLwrPrf<BggScheme>,
     pub(crate) state_scaling: Vec<mxx_dsl::Preimage>,
     pub(crate) mask_route_rhs_decompositions: Family<mxx_dsl::Preimage>,
     pub(crate) fresh_route_rhs_decompositions: Family<mxx_dsl::Preimage>,
     pub(crate) preimages: Vec<mxx_dsl::Preimage>,
-    declaration: RefreshPreprocessingDeclaration,
+    declaration: RefreshPreprocessingDeclaration<
+        <BggScheme as ExponentLUTFixedRhsScheme>::FixedProductBinding,
+        <<BggScheme as ExponentLUTFixedRhsScheme>::PreparedFixedProduct as GraphValue>::Schema,
+    >,
 }
 impl std::fmt::Debug for ImportedRefreshSetup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1423,96 +211,6 @@ impl std::fmt::Debug for ImportedRefreshSetup {
     }
 }
 
-/// Explicit online evaluation request for one imported refresh setup.
-///
-/// The state encoding, secret `s`, and label-major online inputs are owned by
-/// the caller; preprocessing contributes only imported public projections,
-/// readout artifacts, public decoder targets, and typed `K_t` preimages. In
-/// particular, preprocessing never contributes the decoder anchor `b`. This is
-/// the production boundary used by benchmark graph construction as well as by
-/// a runtime evaluator.
-pub struct RefreshOnlineEvaluationRequest<'a> {
-    pub refresh: &'a RefreshCompiler,
-    pub compiler: &'a ExponentLutEncodingCompiler,
-    pub setup: &'a ImportedRefreshSetup,
-    pub program: &'a SparseLwrPrfProgram,
-    /// The fresh online secret `s` shared by the state, PRF inputs, helper
-    /// masks, and the one decoder anchor `b = sB + e_b`. It is never exported.
-    pub online_secret_s: Mat,
-    pub state: BggEncodingWire,
-    pub selectors: &'a EncodingRhsFamily,
-    pub inputs: &'a NativePrfOnlineBatchInputs,
-    /// Fresh `s`-dependent helper mask encodings, keyed by canonical sigma.
-    /// Setup-fixed switches and decompositions are loaded from artifacts.
-    pub online_masks: Family<Mat>,
-    pub layout: &'a PbcPublicLayout,
-}
-
-/// Outputs retained at the online stage boundary for routing and tests.
-pub struct RefreshOnlineEvaluation {
-    pub accumulation: NativePrfEncodingBatchOutputs,
-    pub readout: NativePrfEncodingBatchOutputs,
-    pub manifest: RefreshSetupManifest,
-    pub refreshed: crate::noise_refresh::refresh::RefreshResult,
-}
-
-impl<'a> RefreshOnlineEvaluationRequest<'a> {
-    /// Runs online encoding accumulation, imported-artifact value readout,
-    /// centered mask/fresh routing, and decoder-preimage application.
-    pub fn evaluate(self) -> Result<RefreshOnlineEvaluation, RefreshSetupError> {
-        let accumulation = self
-            .program
-            .compile_encoding_batch_with_preprocessed_artifacts(
-                self.compiler,
-                self.state.clone(),
-                self.selectors,
-                self.inputs,
-                self.layout,
-                &self.setup.program_cache,
-            )
-            .map_err(|error| RefreshSetupError::SetupStage {
-                stage: "evaluate online PRF accumulation",
-                detail: error.to_string(),
-            })?;
-        let readout = self
-            .program
-            .execute_value_readout_batch_with_mask_family(
-                &self.compiler.bgg,
-                &accumulation,
-                &self.setup.readout_artifacts,
-                self.online_masks.clone(),
-            )
-            .map_err(|error| RefreshSetupError::SetupStage {
-                stage: "evaluate online PRF readout",
-                detail: error.to_string(),
-            })?;
-        let manifest = self
-            .refresh
-            .bind_online_outputs(
-                self.compiler,
-                self.setup,
-                self.online_secret_s,
-                self.state,
-                self.program,
-                &readout,
-            )
-            .map_err(|error| RefreshSetupError::SetupStage {
-                stage: "bind online refresh inputs",
-                detail: error.to_string(),
-            })?;
-        let refreshed = self.refresh.refresh(self.compiler, &manifest).map_err(|error| {
-            RefreshSetupError::SetupStage {
-                stage: "apply online refresh",
-                detail: error.to_string(),
-            }
-        })?;
-        Ok(RefreshOnlineEvaluation { accumulation, readout, manifest, refreshed })
-    }
-}
-
-/// Builds the compact gain plan for a sampled preimage matrix consumed
-/// directly by the runtime. The typed preimage bound is checked against the
-/// producer schema before its exact matrix shape and bound are retained.
 /// Enforces the production online boundary: all deterministic decompositions
 /// must have crossed preprocessing as typed artifacts. This scan traverses
 /// every frozen scope, including structural family bodies.
@@ -1529,914 +227,82 @@ fn validate_cache_required_online_graph(graph: &BuiltGraph) -> Result<(), Refres
     Ok(())
 }
 
-#[cfg(test)]
-fn direct_bounded_preimage_plan(
-    preimage: &mxx_dsl::Preimage,
-    base: &BigUint,
-    schema_bound: BigUint,
-) -> Result<NoiseDecompositionPlan, RefreshSetupError> {
-    let rows = preimage
-        .matrix_type()
-        .rows
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("preimage rows must be concrete"))?
-        .to_usize()
-        .ok_or(RefreshSetupError::InvalidParameters("preimage rows must fit usize"))?;
-    let columns = preimage
-        .matrix_type()
-        .columns
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("preimage columns must be concrete"))?
-        .to_usize()
-        .ok_or(RefreshSetupError::InvalidParameters("preimage columns must fit usize"))?;
-    let ring = preimage
-        .matrix_type()
-        .ring_dimension
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| {
-            RefreshSetupError::InvalidParameters("preimage ring dimension must be concrete")
-        })?
-        .to_usize()
-        .ok_or(RefreshSetupError::InvalidParameters("preimage ring dimension must fit usize"))?;
-    let actual_bound = preimage
-        .max_coefficient_bound()
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("preimage bound must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("preimage bound must be non-negative"))?;
-    if actual_bound != schema_bound {
-        return Err(RefreshSetupError::IdentityMismatch);
-    }
-    NoiseDecompositionPlan::bounded_matrix(base.clone(), rows, columns, ring, actual_bound)
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid bounded preimage action"))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CompactPreimageSchema {
-    rows: usize,
-    columns: usize,
-    ring_dimension: usize,
-    max_coefficient_bound: BigUint,
-}
-
-fn compact_preimage_schema(
-    preimage: &mxx_dsl::Preimage,
-) -> Result<CompactPreimageSchema, RefreshSetupError> {
-    let matrix = preimage.matrix_type();
-    let concrete = |value: &IntExpr, what: &'static str| {
-        value
-            .evaluate(&ParamEnv::default())
-            .map_err(|_| RefreshSetupError::InvalidParameters(what))?
-            .to_usize()
-            .ok_or(RefreshSetupError::InvalidParameters(what))
-    };
-    let bound = preimage
-        .max_coefficient_bound()
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("preimage bound must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("preimage bound must be non-negative"))?;
-    Ok(CompactPreimageSchema {
-        rows: concrete(&matrix.rows, "preimage rows must be concrete")?,
-        columns: concrete(&matrix.columns, "preimage columns must be concrete")?,
-        ring_dimension: concrete(
-            &matrix.ring_dimension,
-            "preimage ring dimension must be concrete",
-        )?,
-        max_coefficient_bound: bound,
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CompactReadoutPlanSchema {
-    target: CompactPreimageSchema,
-    normalization: CompactPreimageSchema,
-    trace: Vec<(CompactPreimageSchema, CompactPreimageSchema)>,
-    decoder: Vec<CompactPreimageSchema>,
-}
-
-fn compact_readout_plan_schema(
-    parameters: &RefreshSetupParameters,
-    program: &SparseLwrPrfProgram,
-) -> Result<CompactReadoutPlanSchema, RefreshSetupError> {
-    let ring_dimension = parameters
-        .layout
-        .ring_dimension
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("ring dimension must be concrete"))?
-        .to_usize()
-        .ok_or(RefreshSetupError::InvalidParameters("ring dimension must fit usize"))?;
-    let digit_count = parameters.layout.digit_count;
-    let decomposed_rows = parameters
-        .layout
-        .secret_dimension
-        .checked_mul(digit_count)
-        .ok_or(RefreshSetupError::InvalidParameters("decomposed readout rows overflow"))?;
-    let direct_bound = parameters
-        .layout
-        .gadget_base
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("gadget base must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("gadget base must be positive"))? /
-        2u8;
-    let direct = |rows: usize, columns: usize| CompactPreimageSchema {
-        rows,
-        columns,
-        ring_dimension,
-        max_coefficient_bound: direct_bound.clone(),
-    };
-    let normalization_size = parameters
-        .component_count
-        .checked_mul(digit_count)
-        .ok_or(RefreshSetupError::InvalidParameters("normalization shape overflow"))?;
-    let trace_count = program
-        .readout
-        .trace_plan(ring_dimension)
-        .map_err(|_| RefreshSetupError::InvalidManifest)?
-        .helper_count();
-    let decoder_bound = parameters
-        .resolve_decoder_preimage_bound()?
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("decoder bound must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("decoder bound must be non-negative"))?;
-    Ok(CompactReadoutPlanSchema {
-        target: direct(decomposed_rows, parameters.layout.public_key_columns()),
-        normalization: direct(normalization_size, normalization_size),
-        trace: (0..trace_count)
-            .map(|_| {
-                (
-                    direct(decomposed_rows, parameters.layout.public_key_columns()),
-                    direct(decomposed_rows, parameters.layout.public_key_columns()),
-                )
-            })
-            .collect(),
-        decoder: (0..parameters.refresh.crt_plaintext_moduli.len())
-            .map(|slot| {
-                let decoder_rows = parameters
-                    .decoder_digit_count(slot)?
-                    .checked_add(2)
-                    .and_then(|digits| parameters.component_count.checked_mul(digits))
-                    .ok_or(RefreshSetupError::InvalidParameters("decoder shape overflow"))?;
-                Ok(CompactPreimageSchema {
-                    rows: decoder_rows,
-                    columns: parameters.layout.public_key_columns(),
-                    ring_dimension,
-                    max_coefficient_bound: decoder_bound.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, RefreshSetupError>>()?,
-    })
-}
-
-fn bounded_plan_from_schema(
-    base: &BigUint,
-    schema: &CompactPreimageSchema,
-) -> Result<NoiseDecompositionPlan, RefreshSetupError> {
-    NoiseDecompositionPlan::bounded_matrix(
-        base.clone(),
-        schema.rows,
-        schema.columns,
-        schema.ring_dimension,
-        schema.max_coefficient_bound.clone(),
-    )
-    .map_err(|_| RefreshSetupError::InvalidParameters("invalid compact preimage action"))
-}
-
-fn producer_readout_plan_schema(
-    parameters: &RefreshSetupParameters,
-    artifacts: &NativePrfReadoutFamilyArtifacts,
-    decoder: &[mxx_dsl::Preimage],
-) -> Result<CompactReadoutPlanSchema, RefreshSetupError> {
-    let direct_bound = parameters
-        .layout
-        .gadget_base
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("gadget base must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("gadget base must be positive"))? /
-        2u8;
-    let family_schema = |matrix: &mxx_ir_core::types::MatrixType| {
-        let concrete = |value: &IntExpr, what: &'static str| {
-            value
-                .evaluate(&ParamEnv::default())
-                .map_err(|_| RefreshSetupError::InvalidParameters(what))?
-                .to_usize()
-                .ok_or(RefreshSetupError::InvalidParameters(what))
-        };
-        Ok::<_, RefreshSetupError>(CompactPreimageSchema {
-            rows: concrete(&matrix.rows, "readout helper rows must be concrete")?,
-            columns: concrete(&matrix.columns, "readout helper columns must be concrete")?,
-            ring_dimension: concrete(
-                &matrix.ring_dimension,
-                "readout helper ring dimension must be concrete",
-            )?,
-            max_coefficient_bound: direct_bound.clone(),
-        })
-    };
-    let switch_schema = family_schema(artifacts.helper_switch_decompositions().element_type())?;
-    let public_schema = family_schema(artifacts.helper_public_decompositions().element_type())?;
-    let trace = (0..artifacts.helper_sigmas().len())
-        .map(|_| (switch_schema.clone(), public_schema.clone()))
-        .collect();
-    let decoder = decoder.iter().map(compact_preimage_schema).collect::<Result<Vec<_>, _>>()?;
-    if decoder.len() != parameters.refresh.crt_plaintext_moduli.len() {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    Ok(CompactReadoutPlanSchema {
-        target: compact_preimage_schema(&artifacts.target_decompositions().at(0))?,
-        normalization: compact_preimage_schema(artifacts.normalization_decomposition())?,
-        trace,
-        decoder,
-    })
-}
-
-/// Derives the compact noise plans used by the application-specific snapshot
-/// without constructing any label-major executable graph.  The dimensions are
-/// the same dimensions produced by the public producer: a decomposed BGG
-/// matrix has `secret_dimension * gadget_digit_count` rows and the original
-/// public-key columns, while normalization has `component_count * digits`
-/// rows and columns.  Directly consumed preimages intentionally use the
-/// bounded-matrix source with their typed decomposition bound.
-fn compact_noise_snapshot_plans(
-    parameters: &RefreshSetupParameters,
-    program: &SparseLwrPrfProgram,
-    pbc_layout: &PbcPublicLayout,
-    active_cells: &PbcActiveCellIndex,
-    readout_schema: &CompactReadoutPlanSchema,
-) -> Result<(NoiseGainPlan, RefreshNoiseGainDecompositions), RefreshSetupError> {
-    let p = parameters;
-    RefreshPrfContract::from_program(program).validate_for(p)?;
-    if program.block_count() != pbc_layout.parameters.bucket_count ||
-        program.bucket_width() != pbc_layout.bucket_width
-    {
-        return Err(RefreshSetupError::InvalidParameters(
-            "PRF program topology does not match PBC layout",
-        ));
-    }
-    if active_cells.bucket_active_widths().count() != pbc_layout.cells.len() {
-        return Err(RefreshSetupError::InvalidParameters("PBC active-cell index shape mismatch"));
-    }
-    let ring_dimension = p
-        .layout
-        .ring_dimension
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("ring dimension must be concrete"))?
-        .to_usize()
-        .ok_or(RefreshSetupError::InvalidParameters("ring dimension must fit usize"))?;
-    let base = p
-        .layout
-        .gadget_base
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("gadget base must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("gadget base must be positive"))?;
-    let digit_count = p.layout.digit_count;
-    let target_rows = p.layout.secret_dimension;
-    let target_columns = p.layout.public_key_columns();
-    let crt_moduli = p
-        .refresh
-        .crt_plaintext_moduli
-        .iter()
-        .map(|modulus| {
-            modulus
-                .evaluate(&ParamEnv::default())
-                .map_err(|_| RefreshSetupError::InvalidParameters("CRT modulus must be concrete"))?
-                .to_biguint()
-                .ok_or(RefreshSetupError::InvalidParameters("CRT modulus must be positive"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (digits_per_tower, retained_towers) =
-        ordinary_gadget_towers(&crt_moduli, &base, digit_count)?;
-    let bind_crt = |plan: NoiseDecompositionPlan| {
-        plan.bind_crt_layout(crt_moduli[..retained_towers].to_vec(), digits_per_tower)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid compact CRT decomposition"))
-    };
-    let public_bound = p
-        .refresh
-        .full_modulus
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("full modulus must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("full modulus must be positive"))? /
-        2u8;
-    let public_action = || {
-        if retained_towers < crt_moduli.len() {
-            return NoiseDecompositionPlan::bounded_matrix(
-                base.clone(),
-                target_rows * digit_count,
-                target_columns,
-                ring_dimension,
-                &base / 2u8,
-            )
-            .map_err(|_| {
-                RefreshSetupError::InvalidParameters("invalid approximate public action plan")
-            });
-        }
-        NoiseDecompositionPlan::dense_bound(
-            base.clone(),
-            digit_count,
-            target_rows,
-            target_columns,
-            ring_dimension,
-            public_bound.clone(),
-        )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid public action plan"))
-        .and_then(&bind_crt)
-    };
-    let unit_action = || {
-        NoiseDecompositionPlan::unit(
-            base.clone(),
-            digit_count,
-            target_rows,
-            target_columns,
-            ring_dimension,
-            0,
-            0,
-            0,
-        )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid unit action plan"))
-        .and_then(&bind_crt)
-    };
-    let mut gate_decompositions = Vec::new();
-    let mut gates = Vec::new();
-    let mut operation_index = 0usize;
-    let mut add_gate = |step_index: usize,
-                        branch_index: usize,
-                        operation: GateNoiseOperation,
-                        action: NoiseDecompositionPlan,
-                        helper_action: Option<NoiseDecompositionPlan>| {
-        gate_decompositions.push(GateNoiseDecomposition { action, helper_action });
-        gates.push(GateNoiseGains {
-            step_index,
-            operation_index,
-            branch_index,
-            operation,
-            gate: "refresh-producer".to_owned(),
-            action: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-            helper_action: None,
-            inherited_bound: BigUint::zero(),
-            fresh_bound: BigUint::zero(),
-            output_bound: BigUint::zero(),
-            inherited_variance: AverageVariance::zero(),
-            fresh_variance: AverageVariance::zero(),
-            output_variance: AverageVariance::zero(),
-        });
-        operation_index += 1;
-    };
-    let mut family_index = 0usize;
-    for (step_index, step) in program.accumulation.steps().iter().enumerate() {
-        match step {
-            ProgramStep::Family { body, .. } => {
-                let count = active_cells
-                    .bucket_active_width(family_index)
-                    .ok_or(RefreshSetupError::InvalidParameters("family layout mismatch"))?;
-                family_index += 1;
-                if count == 0 {
-                    return Err(RefreshSetupError::InvalidParameters("invalid program family body"));
-                }
-                // All active family members use the same typed public/private
-                // action schema.  Keep one pair of gains for the structural
-                // body and apply it to `count` members in the simulator;
-                // materializing one pair per member makes search scale with
-                // the PBC family rather than with the program shape.
-                for (body_gate, gate) in body.gates().iter().enumerate() {
-                    let (operation, action) = match gate {
-                        crate::program::Gate::MulPrivate { .. } => {
-                            (GateNoiseOperation::MulPrivate, public_action()?)
-                        }
-                        crate::program::Gate::MulPublic { .. } => {
-                            (GateNoiseOperation::MulPublic, public_action()?)
-                        }
-                        crate::program::Gate::Add { .. } => {
-                            (GateNoiseOperation::Add, unit_action()?)
-                        }
-                        crate::program::Gate::Lut { .. } => {
-                            (GateNoiseOperation::Lut, public_action()?)
-                        }
-                    };
-                    add_gate(step_index, body_gate, operation, action, None);
-                }
-                add_gate(
-                    step_index,
-                    body.gates().len(),
-                    GateNoiseOperation::Add,
-                    unit_action()?,
-                    None,
-                );
-            }
-            ProgramStep::Gate(gate) => match gate {
-                Gate::MulPrivate { .. } => {
-                    add_gate(step_index, 0, GateNoiseOperation::MulPrivate, public_action()?, None)
-                }
-                Gate::MulPublic { .. } => {
-                    add_gate(step_index, 0, GateNoiseOperation::MulPublic, public_action()?, None)
-                }
-                Gate::Add { .. } => {
-                    add_gate(step_index, 0, GateNoiseOperation::Add, unit_action()?, None)
-                }
-                Gate::Lut { lut, .. } => {
-                    let branches = program
-                        .accumulation
-                        .lut(*lut)
-                        .ok_or(RefreshSetupError::InvalidParameters("missing LUT"))?
-                        .values()
-                        .len();
-                    for branch_index in 0..branches {
-                        add_gate(
-                            step_index,
-                            branch_index,
-                            GateNoiseOperation::Lut,
-                            public_action()?,
-                            Some(public_action()?),
-                        );
-                    }
-                }
-            },
-        }
-    }
-    if family_index != pbc_layout.cells.len() {
-        return Err(RefreshSetupError::InvalidParameters("program family count mismatch"));
-    }
-
-    let target_plan = bounded_plan_from_schema(&base, &readout_schema.target)?;
-    let normalization_plan = bounded_plan_from_schema(&base, &readout_schema.normalization)?;
-    let trace_plan = readout_schema
-        .trace
-        .iter()
-        .map(|(action, helper)| {
-            Ok((bounded_plan_from_schema(&base, action)?, bounded_plan_from_schema(&base, helper)?))
-        })
-        .collect::<Result<Vec<_>, RefreshSetupError>>()?;
-    let readout = ValueReadoutNoiseGains {
-        target: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-        identity_trace: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-        nonidentity_trace: trace_plan
-            .iter()
-            .map(|_| TraceNoiseGains {
-                action: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-                helper_action: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-            })
-            .collect(),
-        normalization: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-        inherited_bound: BigUint::zero(),
-        output_bound: BigUint::zero(),
-        output_variance: AverageVariance::zero(),
-    };
-    let gain_plan =
-        NoiseGainPlanBuilder::new(gate_decompositions, target_plan, trace_plan, normalization_plan)
-            .map_err(|_| {
-                RefreshSetupError::InvalidParameters("invalid compact producer gain plan")
-            })?
-            .build(gates, readout)
-            .map_err(|_| {
-                RefreshSetupError::InvalidParameters("invalid compact producer gain plan")
-            })?;
-    Ok((gain_plan, compact_noise_snapshot_routes(p, readout_schema)?))
-}
-
-/// Rebuilds only the mask/fresh route decomposition for a changed `d_m`.
-/// Gate/readout plans are independent of the mask digit count and are cached
-/// by the parameter-search context.
-/// The ordinary gadget retains a prefix of the full CRT idempotents. Decoder
-/// trapdoors remain exact in their independently selected modulus.
-fn ordinary_gadget_towers(
-    moduli: &[BigUint],
-    base: &BigUint,
-    digits: usize,
-) -> Result<(usize, usize), RefreshSetupError> {
-    let bits = base
-        .bits()
-        .checked_sub(1)
-        .filter(|bits| *bits > 0)
-        .ok_or(RefreshSetupError::InvalidParameters("invalid gadget base"))?;
-    if base != &(BigUint::one() << bits as usize) {
-        return Err(RefreshSetupError::InvalidParameters("gadget base must be binary"));
-    }
-    let per_tower = moduli
-        .iter()
-        .map(|p| p.bits().div_ceil(bits) as usize)
-        .max()
-        .ok_or(RefreshSetupError::InvalidParameters("missing CRT towers"))?;
-    if digits == 0 || digits % per_tower != 0 || digits / per_tower > moduli.len() {
-        return Err(RefreshSetupError::InvalidParameters("invalid ordinary gadget width"));
-    }
-    Ok((per_tower, digits / per_tower))
-}
-
-/// An even representative prevents multiplication by the native half-integer
-/// readout payload from introducing a modular half-wrap. The corrected target
-/// is divisible by every omitted tower, hence ordinary approximate D is exact
-/// on this target. This is public target construction, not a modified gadget.
-fn even_route_correction(value: &BigInt, dropped_product: &BigUint) -> BigInt {
-    if dropped_product.is_one() {
-        return BigInt::zero();
-    }
-    let period = BigInt::from(dropped_product * 2u8);
-    let mut residue = ((value % &period) + &period) % &period;
-    if residue.magnitude() % 2u8 == BigUint::one() {
-        residue += BigInt::from(dropped_product.clone());
-        residue %= &period;
-    }
-    if residue > BigInt::from(dropped_product.clone()) {
-        residue -= period;
-    }
-    residue
-}
-
-fn corrected_route_scalars(
-    p: &RefreshSetupParameters,
-    fresh: bool,
-) -> Result<(Vec<Vec<BigInt>>, Vec<BigUint>), RefreshSetupError> {
-    let evaluate = |x: &IntExpr| {
-        x.evaluate(&ParamEnv::default())
-            .map_err(|_| RefreshSetupError::InvalidParameters("nonconcrete route parameter"))
-    };
-    let moduli = p
-        .refresh
-        .crt_plaintext_moduli
-        .iter()
-        .map(|x| evaluate(x)?.to_biguint().ok_or(RefreshSetupError::InvalidManifest))
-        .collect::<Result<Vec<_>, _>>()?;
-    let base =
-        evaluate(&p.layout.gadget_base)?.to_biguint().ok_or(RefreshSetupError::InvalidManifest)?;
-    let (_, retained) = ordinary_gadget_towers(&moduli, &base, p.layout.digit_count)?;
-    let dropped = moduli[retained..].iter().product::<BigUint>();
-    let full = moduli.iter().product::<BigUint>();
-    let mut values = Vec::new();
-    let mut biases = Vec::new();
-    for slot in 0..moduli.len() {
-        let scale = if fresh {
-            evaluate(&p.refresh.scale_expression(slot)?)?
-        } else {
-            BigInt::from(&full / &p.switch_moduli[slot])
-        };
-        let digits =
-            if fresh { p.fresh_error_base_p_digit_count } else { p.mask_base_p_digit_counts[slot] };
-        let mut bias = BigUint::zero();
-        let scalars = (0..digits)
-            .map(|digit| {
-                let value = &scale * BigInt::from(BigUint::from(p.base_p).pow(digit as u32));
-                let residual = even_route_correction(&value, &dropped);
-                bias += residual.magnitude();
-                value - residual
-            })
-            .collect();
-        values.push(scalars);
-        biases.push(bias * BigUint::from(p.base_p - 1) / 2u8);
-    }
-    Ok((values, biases))
-}
-
-fn corrected_route_scalar_family(
-    p: &RefreshSetupParameters,
-    ring: &mxx_dsl::Ring,
-    fresh: bool,
-) -> Result<Family<Mat>, RefreshSetupError> {
-    let (values, _) = corrected_route_scalars(p, fresh)?;
-    let digits = values.iter().map(Vec::len).collect::<Vec<_>>();
-    let mut offsets = Vec::new();
-    let mut scalars = Vec::new();
-    for slot in values {
-        offsets.push(scalars.len());
-        scalars.extend(slot.into_iter().map(|value| ring.polynomial([IntExpr::constant(value)])));
-    }
-    let count = refresh_route_family_count(p, &digits)?;
-    let offsets = Family::pack(offsets.into_iter().map(Int::constant).collect())?;
-    let slots = {
-        let captured_values = Vec::<Mat>::new();
-        mxx_dsl::parallel(count, |index| {
-            let _ = captured_values;
-            {
-                let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
-                    index.expression()?,
-                    p.prf_component_count(),
-                    p.coefficient_count,
-                    &digits,
-                )
-                .map_err(|_| mxx_dsl::DslError::Schema)?;
-                Ok(Int::evaluate(slot))
-            }
-        })
-    }?;
-    let offsets = {
-        let source_family = offsets;
-        let gather_indices = slots;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?;
-    let digit_indices = {
-        let captured_values = Vec::<Mat>::new();
-        mxx_dsl::parallel(count, |index| {
-            let _ = captured_values;
-            {
-                let (_, digit, _, _) = crate::noise_refresh::refresh::route_coordinates(
-                    index.expression()?,
-                    p.prf_component_count(),
-                    p.coefficient_count,
-                    &digits,
-                )
-                .map_err(|_| mxx_dsl::DslError::Schema)?;
-                Ok(Int::evaluate(digit))
-            }
-        })
-    }?;
-    let indices = {
-        let source_families = (offsets, digit_indices);
-        if source_families.0.count() != source_families.1.count() {
-            Err(mxx_dsl::DslError::Schema)
-        } else {
-            mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
-                let (offset, digit) =
-                    (source_families.0.at(&family_index), source_families.1.at(&family_index));
-                let _ = family_index;
-                Ok(offset.add(digit))
-            })
-        }
-    }?;
-    Ok({
-        let source_family = Family::pack(scalars)?;
-        let gather_indices = indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?)
-}
-
-fn compact_mask_routes(
-    parameters: &RefreshSetupParameters,
-) -> Result<(Vec<Vec<NoiseDecompositionPlan>>, usize), RefreshSetupError> {
-    let p = parameters;
-    let ring_dimension = p
-        .layout
-        .ring_dimension
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("ring dimension must be concrete"))?
-        .to_usize()
-        .ok_or(RefreshSetupError::InvalidParameters("ring dimension must fit usize"))?;
-    let base = p
-        .layout
-        .gadget_base
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("gadget base must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("gadget base must be positive"))?;
-    let digit_count = p.layout.digit_count;
-    let target_rows = p.layout.secret_dimension;
-    let crt_moduli = p
-        .refresh
-        .crt_plaintext_moduli
-        .iter()
-        .map(|modulus| {
-            modulus
-                .evaluate(&ParamEnv::default())
-                .map_err(|_| RefreshSetupError::InvalidParameters("CRT modulus must be concrete"))?
-                .to_biguint()
-                .ok_or(RefreshSetupError::InvalidParameters("CRT modulus must be positive"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (digits_per_tower, retained_towers) =
-        ordinary_gadget_towers(&crt_moduli, &base, digit_count)?;
-    let bind_crt = |plan: NoiseDecompositionPlan| {
-        plan.bind_crt_layout(crt_moduli[..retained_towers].to_vec(), digits_per_tower)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid compact CRT decomposition"))
-    };
-    let dropped_product = crt_moduli[retained_towers..].iter().product::<BigUint>();
-    let retained_product = BigInt::from(crt_moduli[..retained_towers].iter().product::<BigUint>());
-    let route_plan = |value: BigInt| {
-        // Gain-only representative: retained residues (and therefore every
-        // balanced digit) are unchanged. Runtime keeps the full-q target.
-        let mut value =
-            (&value - even_route_correction(&value, &dropped_product)) % &retained_product;
-        if value.magnitude() * 2u8 > *retained_product.magnitude() {
-            value = if value < BigInt::zero() {
-                value + &retained_product
-            } else {
-                value - &retained_product
-            };
-        }
-        NoiseDecompositionPlan::sparse_monomial(
-            base.clone(),
-            digit_count,
-            target_rows,
-            p.prf_component_count(),
-            ring_dimension,
-            target_rows.saturating_sub(1),
-            0,
-            0,
-            value,
-        )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid PRF route plan"))
-        .and_then(bind_crt)
-    };
-    let full_modulus: BigUint = crt_moduli.iter().product();
-    if p.switch_moduli.len() != crt_moduli.len() ||
-        p.switch_moduli
-            .iter()
-            .any(|modulus| modulus.is_zero() || &full_modulus % modulus != BigUint::zero())
-    {
-        return Err(RefreshSetupError::InvalidParameters("invalid switching moduli"));
-    }
-    let mask = p
-        .switch_moduli
-        .iter()
-        .zip(&p.mask_base_p_digit_counts)
-        .map(|(modulus, digits)| {
-            let lift = &full_modulus / modulus;
-            (0..*digits)
-                .map(|c| {
-                    let c = u32::try_from(c).map_err(|_| {
-                        RefreshSetupError::InvalidParameters("mask digit count overflow")
-                    })?;
-                    route_plan(-BigInt::from(&lift * BigUint::from(p.base_p).pow(c)))
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((mask, p.coefficient_count))
-}
-
-fn compact_noise_snapshot_routes(
-    parameters: &RefreshSetupParameters,
-    readout_schema: &CompactReadoutPlanSchema,
-) -> Result<RefreshNoiseGainDecompositions, RefreshSetupError> {
-    let p = parameters;
-    let ring_dimension = p
-        .layout
-        .ring_dimension
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("ring dimension must be concrete"))?
-        .to_usize()
-        .ok_or(RefreshSetupError::InvalidParameters("ring dimension must fit usize"))?;
-    let base = p
-        .layout
-        .gadget_base
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidParameters("gadget base must be concrete"))?
-        .to_biguint()
-        .ok_or(RefreshSetupError::InvalidParameters("gadget base must be positive"))?;
-    let digit_count = p.layout.digit_count;
-    let target_rows = p.layout.secret_dimension;
-    let crt_moduli = p
-        .refresh
-        .crt_plaintext_moduli
-        .iter()
-        .map(|modulus| {
-            modulus
-                .evaluate(&ParamEnv::default())
-                .map_err(|_| RefreshSetupError::InvalidParameters("CRT modulus must be concrete"))?
-                .to_biguint()
-                .ok_or(RefreshSetupError::InvalidParameters("CRT modulus must be positive"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (digits_per_tower, retained_towers) =
-        ordinary_gadget_towers(&crt_moduli, &base, digit_count)?;
-    let bind_crt = |plan: NoiseDecompositionPlan| {
-        plan.bind_crt_layout(crt_moduli[..retained_towers].to_vec(), digits_per_tower)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid compact CRT decomposition"))
-    };
-    let scales = (0..p.refresh.crt_plaintext_moduli.len())
-        .map(|slot| {
-            let expression = p.refresh.scale_expression(slot)?;
-            expression
-                .evaluate(&ParamEnv::default())
-                .map_err(|_| {
-                    RefreshSetupError::InvalidParameters("refresh scale must be concrete")
-                })?
-                .to_biguint()
-                .ok_or(RefreshSetupError::InvalidParameters("refresh scale must be positive"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let state_scaling = scales
-        .iter()
-        .map(|scale| {
-            NoiseDecompositionPlan::gadget_scalar(
-                base.clone(),
-                digit_count,
-                target_rows,
-                target_rows * digit_count,
-                ring_dimension,
-                BigInt::from(scale % crt_moduli[..retained_towers].iter().product::<BigUint>()),
-            )
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid refresh scale plan"))
-            .and_then(&bind_crt)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let dropped_product = crt_moduli[retained_towers..].iter().product::<BigUint>();
-    let retained_product = BigInt::from(crt_moduli[..retained_towers].iter().product::<BigUint>());
-    let route_plan = |value: BigInt, ring_coefficient: usize| {
-        let mut value =
-            (&value - even_route_correction(&value, &dropped_product)) % &retained_product;
-        if value.magnitude() * 2u8 > *retained_product.magnitude() {
-            value = if value < BigInt::zero() {
-                value + &retained_product
-            } else {
-                value - &retained_product
-            };
-        }
-        NoiseDecompositionPlan::sparse_monomial(
-            base.clone(),
-            digit_count,
-            target_rows,
-            p.prf_component_count(),
-            ring_dimension,
-            target_rows.saturating_sub(1),
-            0,
-            ring_coefficient,
-            value,
-        )
-        .map_err(|_| RefreshSetupError::InvalidParameters("invalid PRF route plan"))
-        .and_then(&bind_crt)
-    };
-    let (mask, _) = compact_mask_routes(p)?;
-    let fresh = scales
-        .iter()
-        .map(|scale| {
-            (0..p.fresh_error_base_p_digit_count)
-                .map(|c| {
-                    route_plan(-BigInt::from(scale * BigUint::from(p.base_p).pow(c as u32)), 0)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let decoder = readout_schema
-        .decoder
-        .iter()
-        .map(|schema| bounded_plan_from_schema(&base, schema))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(RefreshNoiseGainDecompositions {
-        state_scaling,
-        mask,
-        mask_multiplicity: p.coefficient_count,
-        fresh_multiplicity: vec![p.coefficient_count; fresh.len()],
-        fresh,
-        decoder,
-    })
-}
-
 /// Immutable producer for the trusted refresh preprocessing graph.
 ///
 /// Building this value samples setup artifacts, freezes the graph, and
-/// validates the declaration and output schema. The producer retains
-/// private setup internally; callers should export its declaration and use
+/// validates the declaration and output schema. Live construction wires and
+/// the request are released after freezing; callers export the declaration and use
 /// [`ImportedRefreshSetup::import`] at an execution boundary.
 pub struct RefreshPreprocessingProducer {
-    request: RefreshPreprocessingRequest,
-    wires: RefreshPreprocessingWires,
+    parameters: BggRefreshParameters,
+    noise_plans: (NoiseGainPlan, RefreshNoiseGainDecompositions),
     built: BuiltGraph,
-    declaration: RefreshPreprocessingDeclaration,
+    declaration: RefreshPreprocessingDeclaration<
+        <BggScheme as ExponentLUTFixedRhsScheme>::FixedProductBinding,
+        <<BggScheme as ExponentLUTFixedRhsScheme>::PreparedFixedProduct as GraphValue>::Schema,
+    >,
 }
 
 impl RefreshPreprocessingProducer {
     /// Builds and validates the immutable preprocessing graph.
     pub fn build(request: RefreshPreprocessingRequest) -> Result<Self, RefreshSetupError> {
-        request.parameters.validate_dimensions()?;
-        let decoder_preimage_bound = request.parameters.resolve_decoder_preimage_bound()?;
         request.public_prf.validate(&request.parameters)?;
+        let decoder_preimage_bound = request.parameters.resolve_decoder_preimage_bound()?;
         let p = &request.parameters;
         let ring = p.layout.ring();
-        if request.state.reveal_plaintext ||
-            request.state.matrix.value_handle() !=
-                request.public_prf.initial.matrix.value_handle()
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        let output_count = refresh_prf_output_count(p)?;
-        if request.public_prf.inputs.output_count() != output_count {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        let public_preprocessing =
-            request.public_prf.program.compile_public_batch_with_preprocessing(
-                &request.public_prf.compiler,
-                request.public_prf.initial.clone(),
-                &request.public_prf.selectors,
-                &request.public_prf.inputs,
-                &request.public_prf.layout,
-            )?;
+        p.validate_prf(&RefreshPrfContract::from_program(&request.program))?;
+        request.layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
+        let scheme = BggScheme::new(p.public_key_compiler(), request.program.profile().layout);
+        let selectors = crate::bgg::encoding::SetupRhsFamily::new_for_layout(
+            request.selector_gsw.clone(),
+            request.layout.layout_id,
+        )?;
+        let blocks = request.program.selection_inputs(
+            &request.layout,
+            &selectors,
+            &request.label_plaintexts,
+            request.layout.layout_id.0,
+        )?;
+        let (public_outputs, prepared_prf) =
+            with_benchmark_role(BenchmarkRole::PublicPrfAccumulation, || {
+                PreparedSparseLwrPrf::new(
+                    &scheme,
+                    request.program.clone(),
+                    ProgramValue::Scalar(request.public_prf.initial.clone()),
+                    &blocks,
+                )
+            })
+            .map_err(|error| RefreshSetupError::SetupStage {
+                stage: "prepare fixed-RHS PRF",
+                detail: error.to_string(),
+            })?;
         // The readout cache schema is the deterministic `Mat::decompose`
         // bound, not the Gaussian helper cutoff `B_chi`.
         let (readout_artifacts, public_readout_output) =
             with_benchmark_role(BenchmarkRole::PublicReadout, || {
                 let readout_artifacts = request
-                    .public_prf
                     .program
-                    .produce_public_readout_family_artifacts(
-                        &request.public_prf.compiler,
-                        public_preprocessing.outputs.clone(),
-                        &request.public_prf.helpers,
-                        request.public_prf.normalization_gadget.clone(),
+                    .prepare_readout(
+                        &scheme,
+                        &public_outputs,
+                        &request.public_prf.readout_preparation,
                     )
-                    .map_err(|_| RefreshSetupError::InvalidManifest)?;
-                let public_readout_output = readout_artifacts
-                    .project_public_batch(
-                        &request.public_prf.program.readout,
-                        &request.public_prf.compiler.public_key,
-                        public_preprocessing.outputs.clone(),
-                        request.public_prf.helpers.public_masks.clone(),
+                    .map_err(|error| RefreshSetupError::SetupStage {
+                        stage: "prepare public readout",
+                        detail: error.to_string(),
+                    })?;
+                let public_readout_output = request
+                    .program
+                    .project_readout(
+                        &scheme,
+                        &public_outputs,
+                        &readout_artifacts,
+                        &request.public_prf.readout_public_masks,
                     )
-                    .map_err(|_| RefreshSetupError::InvalidManifest)?;
+                    .map_err(|error| RefreshSetupError::SetupStage {
+                        stage: "prepare public readout",
+                        detail: error.to_string(),
+                    })?;
                 Ok::<_, RefreshSetupError>((readout_artifacts, public_readout_output))
             })?;
         // `A'` is the public random matrix used in every slot target
@@ -2448,205 +314,110 @@ impl RefreshPreprocessingProducer {
             ),
             (p.layout.secret_dimension, p.layout.public_key_columns()),
         );
-        let mut scales = Vec::new();
-        for slot in 0..p.refresh.crt_plaintext_moduli.len() {
-            // `scale = mu_t = q/q_t` is the scalar represented by the
-            // setup-fixed RNS scaling LUT for CRT slot t.
-            let scale = ring.polynomial([p.refresh.scale_expression(slot)?]);
-            scales.push(scale);
-        }
-        let decomposition_base = p.layout.gadget_base.clone();
-        let decomposition_digit_count = p.layout.digit_count;
-        let state_gadget =
-            ring.gadget(p.component_count, decomposition_base.clone(), decomposition_digit_count);
-        let state_scaling = scales
-            .iter()
-            .map(|scale| {
-                (scale.clone() * state_gadget.clone())
-                    .decompose(decomposition_base.clone(), decomposition_digit_count)
-            })
-            .collect::<Vec<_>>();
-        let fresh_group = p
-            .prf_component_count()
-            .checked_mul(p.coefficient_count)
-            .and_then(|value| value.checked_mul(p.fresh_error_base_p_digit_count))
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let mask_route_count = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
-        let fresh_digits = vec![p.fresh_error_base_p_digit_count; p.switch_moduli.len()];
-        let fresh_route_count = refresh_route_family_count(p, &fresh_digits)?;
-        // The route constructor uses only the matrix type. Selecting one
-        // symbolic member does not enumerate or share its value.
-        let public_key_for_routes = public_readout_output.at(0);
-        let mask_route_rhs_decompositions = crate::noise_refresh::refresh::route_preimage_family(
-            &ring,
-            &public_key_for_routes,
-            p.base_p,
-            p.prf_component_count(),
-            p.coefficient_count,
-            &p.mask_base_p_digit_counts,
-            mask_route_count,
-            Some(route_scale_family(
-                p.mask_lifts()?,
-                p.prf_component_count(),
-                p.coefficient_count,
-                &p.mask_base_p_digit_counts,
-            )?),
-            Some(corrected_route_scalar_family(p, &ring, false)?),
-            decomposition_base.clone(),
-            IntExpr::constant(decomposition_digit_count),
-        )?;
-        let slot_indices = mxx_dsl::parallel(fresh_route_count, |index| {
-            Ok(index.clone().div(Int::constant(fresh_group)))
-        })?;
-        let repeated_scales = {
-            let source_family = Family::pack(scales.clone())?;
-            let gather_indices = slot_indices;
-            mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-                Ok(source_family.at(gather_indices.at(&family_index)))
-            })
-        }?;
-        let fresh_route_rhs_decompositions = crate::noise_refresh::refresh::route_preimage_family(
-            &ring,
-            &public_key_for_routes,
-            p.base_p,
-            p.prf_component_count(),
-            p.coefficient_count,
-            &fresh_digits,
-            fresh_route_count,
-            Some(repeated_scales),
-            Some(corrected_route_scalar_family(p, &ring, true)?),
-            decomposition_base.clone(),
-            IntExpr::constant(decomposition_digit_count),
-        )?;
-        let active_count = PbcActiveCellIndex::build(&request.public_prf.layout)
-            .map_err(|_| RefreshSetupError::InvalidManifest)?
-            .len();
-        let expected_setup_public_key_count =
-            output_count.checked_mul(active_count).ok_or(RefreshSetupError::InvalidManifest)?;
-        if concrete_preimage_family_count(&request.setup_public_key_rhs)? !=
-            expected_setup_public_key_count ||
-            concrete_preimage_family_count(&mask_route_rhs_decompositions)? != mask_route_count ||
-            concrete_preimage_family_count(&fresh_route_rhs_decompositions)? != fresh_route_count
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let (public_masks, public_fresh) = aggregate_public_refresh_prf(
-            p,
-            &request.public_prf.compiler,
+        let (state_scaling, mask_route_rhs_decompositions, fresh_route_rhs_decompositions) =
+            p.prepare_refresh_route_witnesses(public_readout_output.element_type())?;
+        // Public routing and online routing consume the same preprocessed
+        // decompositions, including digit weights and route corrections.
+        let label_index =
+            super::refresh::RefreshPrfLabelIndex::new(p.refresh_id, &p.transcript_topology())?;
+        let (public_masks, public_fresh) = super::refresh::prepare_refresh_public_routes(
+            &scheme,
+            &label_index,
             public_readout_output,
-            p.base_p,
-            p.refresh.crt_plaintext_moduli.len(),
-            p.prf_component_count(),
-            p.coefficient_count,
-            &p.mask_base_p_digit_counts,
-            p.fresh_error_base_p_digit_count,
-            scales.clone(),
-            p.mask_lifts()?,
+            mask_route_rhs_decompositions.clone(),
+            fresh_route_rhs_decompositions.clone(),
         )?;
-        let mask_public_family = Family::pack(public_masks.clone())?;
-        let scaled_fresh_public_family = Family::pack(public_fresh.clone())?;
-        let state_public = request.state.clone();
-        let state_scaling_family = Family::pack(state_scaling.clone())?;
-        let scaled_state_family = {
-            let source_family = state_scaling_family;
-            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
-                let decomposition = source_family.at(&family_index);
-                let _ = family_index;
-                Ok(decomposition.mul_small_rhs(state_public.matrix.clone()))
-            })
-        }?;
-        // Sum all high-q public terms before the single coefficient switch.
-        let sum_family = {
-            let source_families =
-                vec![mask_public_family, scaled_fresh_public_family, scaled_state_family];
-            if source_families.is_empty() ||
-                source_families.iter().any(|family| family.count() != source_families[0].count())
-            {
-                Err(mxx_dsl::DslError::Schema)
-            } else {
-                mxx_dsl::parallel(source_families[0].count().clone(), |index| {
-                    let mut items =
-                        source_families.iter().map(|family| family.at(&index)).collect::<Vec<_>>();
-                    Ok({
-                        let scaled_state = items.pop().expect("scaled state family");
-                        let fresh_public = items.pop().expect("scaled fresh family");
-                        let mask_public = items.pop().expect("mask family");
-                        scaled_state + mask_public + fresh_public
-                    })
-                })
-            }
-        }?;
+        let mask_public_family = Family::pack(public_masks)?;
+        let scaled_fresh_public_family = Family::pack(public_fresh)?;
+        let sum_family = super::refresh::prepare_refresh_public_sums(
+            &scheme,
+            request.public_prf.initial.matrix.clone(),
+            Family::pack(state_scaling.clone())?,
+            mask_public_family,
+            scaled_fresh_public_family,
+        )?;
         let (public_b, refresh_targets, ks) =
-            sample_refresh_decoders(p, sum_family, &a_prime, &decoder_preimage_bound)?;
-        let ring_dimension = p
-            .layout
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
-            .map_err(|_| RefreshSetupError::InvalidParameters("ring dimension must be concrete"))?
-            .to_usize()
-            .ok_or(RefreshSetupError::InvalidParameters("ring dimension must fit usize"))?;
-        let readout_helper_sigmas = request
-            .public_prf
-            .program
-            .readout
-            .trace_plan(ring_dimension)
-            .map_err(|_| RefreshSetupError::InvalidManifest)?
-            .non_identity_helpers()
-            .to_vec();
-        if readout_helper_sigmas.len() != p.lut_width.saturating_sub(1) {
+            p.sample_refresh_decoders(&scheme, sum_family, &a_prime, &decoder_preimage_bound)?;
+        let expected_readout_schema = p
+            .refresh_readout_schema(refresh_prf_output_count(p)?)
+            .map_err(|error| RefreshSetupError::SetupStage {
+                stage: "prepare public readout",
+                detail: error.to_string(),
+            })?;
+        if readout_artifacts.schema() != expected_readout_schema {
             return Err(RefreshSetupError::InvalidManifest);
         }
-        let mut names = canonical_names(
+        let prf_contract = RefreshPrfContract::from_program(&request.program);
+        let readout_identity = request.program.readout.identity();
+        let identity = setup_identity_digest(
             p,
-            &RefreshPrfContract::from_program(&request.public_prf.program),
-            request.public_prf.layout.layout_id,
+            &prf_contract,
+            request.layout.layout_id,
             &decoder_preimage_bound,
-            request.public_prf.program.readout.identity(),
-            request.selector_gsw_name.clone(),
+            readout_identity,
         );
-        names.program_cache = canonical_program_cache_names(
-            &request.public_prf.program,
-            &request.public_prf.layout,
-            setup_identity_digest(
-                p,
-                &RefreshPrfContract::from_program(&request.public_prf.program),
-                request.public_prf.layout.layout_id,
-                &decoder_preimage_bound,
-                request.public_prf.program.readout.identity(),
-            ),
+        let names = RefreshPreprocessingArtifactNames::new(
+            &identity,
+            p.refresh.crt_plaintext_moduli.len(),
+            public_b.len(),
+            request.selector_gsw_name,
+        );
+        let (context, prepared_descriptor) = prepared_prf.export(
+            &scheme,
+            DslContext::new("mxx-exponent-lut-refresh-setup"),
+            &format!("{}-fixed-prf", names.readout),
         )?;
-        let declaration = make_declaration(
-            p,
-            &RefreshPrfContract::from_program(&request.public_prf.program),
-            names.clone(),
-            request.public_prf.layout.layout_id,
-            &decoder_preimage_bound,
-            request.public_prf.program.readout.identity(),
-            readout_helper_sigmas.clone(),
-        );
-        let wires = RefreshPreprocessingWires {
-            setup_secret_t: request.setup_secret_t.clone(),
-            selector_gsw: request.selector_gsw.clone(),
-            setup_public_key_rhs: request.setup_public_key_rhs.clone(),
-            state_scaling,
-            mask_route_rhs_decompositions,
-            fresh_route_rhs_decompositions,
-            state: request.state.clone(),
-            a_prime,
-            public_b,
-            refresh_targets,
-            scaled_fresh: public_fresh.clone(),
-            masks: public_masks.clone(),
-            preimages: ks,
-            readout_artifacts,
-            program_cache: public_preprocessing.cache,
+        let declaration = RefreshPreprocessingDeclaration {
+            identity,
+            pbc_layout_id: request.layout.layout_id,
+            prf_contract,
+            names,
+            prepared_prf: prepared_descriptor,
+            readout_identity,
         };
-        let mut context = DslContext::new("mxx-exponent-lut-refresh-setup");
-        context = add_setup_outputs(context, &wires, &names)?;
+        let names = &declaration.names;
+        // Export the construction-owned values directly. Setup secret t and
+        // sampled decoder witnesses stay private; online values are absent.
+        let mut context = context
+            .private_output(names.setup_secret_t.clone(), request.setup_secret_t)?
+            .public_output(names.selector_gsw.clone(), request.selector_gsw)?
+            .public_output(
+                names.mask_route_rhs_decompositions.clone(),
+                mask_route_rhs_decompositions,
+            )?
+            .public_output(
+                names.fresh_route_rhs_decompositions.clone(),
+                fresh_route_rhs_decompositions,
+            )?
+            .public_output(
+                names.state_public_matrix.clone(),
+                request.public_prf.initial.matrix.clone(),
+            )?
+            .public_output(names.a_prime.clone(), a_prime)?;
+        for (name, matrix) in names.public_matrix_b.iter().zip(public_b) {
+            context = context.public_output(name.clone(), matrix)?;
+        }
+        for (name, target) in names.refresh_targets.iter().zip(refresh_targets) {
+            context = context.public_output(name.clone(), target)?;
+        }
+        for (name, decomposition) in names.state_scaling.iter().zip(state_scaling) {
+            context = context.public_output(name.clone(), decomposition)?;
+        }
+        for (name, preimage) in names.preimages.iter().zip(&ks) {
+            context = context.private_output(name.clone(), preimage.clone())?;
+        }
+        let context = context.public_output(names.readout.clone(), readout_artifacts.clone())?;
         let built = context.build()?;
-        let producer = Self { request, wires, built, declaration };
-        producer.validate_built()?;
-        Ok(producer)
+        // Read the actual artifact schemas once, while construction handles
+        // are available. Retain only compact plans after the graph is frozen.
+        let expected_schema = compact_readout_plan_schema(p, &request.program)?;
+        let actual_schema = producer_readout_plan_schema(p, &readout_artifacts, &ks)?;
+        if expected_schema != actual_schema {
+            return Err(RefreshSetupError::InvalidManifest);
+        }
+        let noise_plans =
+            compact_noise_snapshot_plans(p, prepared_prf.program(), &[], &actual_schema)?;
+        Ok(Self { parameters: request.parameters, noise_plans, built, declaration })
     }
     /// Returns the frozen preprocessing graph and its artifact outputs.
     pub fn built(&self) -> &BuiltGraph {
@@ -2654,196 +425,13 @@ impl RefreshPreprocessingProducer {
     }
 
     /// Returns the public declaration describing this producer's artifacts.
-    pub fn declaration(&self) -> &RefreshPreprocessingDeclaration {
-        &self.declaration
-    }
-
-    /// Derives the compact operational-noise plans from this producer's
-    /// actual program, readout artifacts, and refresh descriptors.  The
-    /// returned plans retain exact matrix shapes, ring dimension, CRT towers,
-    /// and the enforced preimage bounds; callers must pass them unchanged to
-    /// [`RefreshSetupParameters::build_noise_snapshot`].
-    pub(crate) fn noise_snapshot_plans(
+    pub fn declaration(
         &self,
-    ) -> Result<(NoiseGainPlan, RefreshNoiseGainDecompositions), RefreshSetupError> {
-        let parameters = &self.request.parameters;
-        let expected_schema =
-            compact_readout_plan_schema(parameters, &self.request.public_prf.program)?;
-        let actual_schema = producer_readout_plan_schema(
-            parameters,
-            &self.wires.readout_artifacts,
-            &self.wires.preimages,
-        )?;
-        if expected_schema != actual_schema {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let active_cells = PbcActiveCellIndex::build(&self.request.public_prf.layout)
-            .map_err(|_| RefreshSetupError::InvalidParameters("invalid PBC active-cell index"))?;
-        compact_noise_snapshot_plans(
-            parameters,
-            &self.request.public_prf.program,
-            &self.request.public_prf.layout,
-            &active_cells,
-            &actual_schema,
-        )
-    }
-    /// Checks the actual setup equations and all canonical output roles.
-    pub fn validate_built(&self) -> Result<(), RefreshSetupError> {
-        self.declaration.validate_built(&self.wires)?;
-        let p = &self.request.parameters;
-        let decoder_preimage_bound = p.resolve_decoder_preimage_bound()?;
-        let contract = RefreshPrfContract::from_program(&self.request.public_prf.program);
-        let w = &self.wires;
-        let active_count = PbcActiveCellIndex::build(&self.request.public_prf.layout)
-            .map_err(|_| RefreshSetupError::InvalidManifest)?
-            .len();
-        let setup_public_key_count = refresh_prf_output_count(p)?
-            .checked_mul(active_count)
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let mask_route_count = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
-        let fresh_route_count = refresh_route_family_count(
-            p,
-            &vec![p.fresh_error_base_p_digit_count; p.switch_moduli.len()],
-        )?;
-        if concrete_preimage_family_count(&w.setup_public_key_rhs)? != setup_public_key_count ||
-            concrete_preimage_family_count(&w.mask_route_rhs_decompositions)? != mask_route_count ||
-            concrete_preimage_family_count(&w.fresh_route_rhs_decompositions)? !=
-                fresh_route_count
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        if self.declaration.identity !=
-            setup_identity_digest(
-                p,
-                &contract,
-                self.request.public_prf.layout.layout_id,
-                &decoder_preimage_bound,
-                self.request.public_prf.program.readout.identity(),
-            ) ||
-            names_without_program_cache(&self.declaration.names) !=
-                canonical_names(
-                    p,
-                    &contract,
-                    self.request.public_prf.layout.layout_id,
-                    &decoder_preimage_bound,
-                    self.request.public_prf.program.readout.identity(),
-                    self.request.selector_gsw_name.clone(),
-                )
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        let expected_program_cache = canonical_program_cache_names(
-            &self.request.public_prf.program,
-            &self.request.public_prf.layout,
-            self.declaration.identity,
-        )?;
-        if self.declaration.names.program_cache != expected_program_cache {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        validate_program_cache_names(
-            &self.declaration.names.program_cache,
-            self.declaration.identity,
-        )?;
-        if w.masks.is_empty() ||
-            w.masks.len() != p.refresh.crt_plaintext_moduli.len() ||
-            w.preimages.len() != w.masks.len() ||
-            w.scaled_fresh.len() != w.masks.len() ||
-            w.refresh_targets.len() != w.masks.len() ||
-            w.setup_public_key_rhs
-                .count()
-                .evaluate(&ParamEnv::default())
-                .ok()
-                .and_then(|count| count.to_usize()) ==
-                Some(0)
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let ring = p.layout.ring();
-        let cols = p.layout.public_key_columns();
-        let setup_key_schema = ring.matrix_type((p.component_count * p.layout.digit_count, cols));
-        if w.setup_public_key_rhs.element_type() != &setup_key_schema {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        if w.state.reveal_plaintext ||
-            !same_matrix_type(
-                w.state.matrix.matrix_type(),
-                &ring.matrix_type((p.component_count, cols)),
-            ) ||
-            !same_matrix_type(
-                w.state.matrix.matrix_type(),
-                &ring.matrix_type((p.component_count, cols)),
-            ) ||
-            !same_matrix_type(
-                w.a_prime.matrix_type(),
-                &ring.matrix_type((p.component_count, cols)),
-            )
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let groups = p.anchor_groups();
-        if w.public_b.len() != groups.len() {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let mut anchors_by_slot = BTreeMap::new();
-        for (group, (_, slots)) in groups.iter().enumerate() {
-            let low_ring = p.switch_ring(slots[0])?;
-            let b_columns = p.component_count * (p.decoder_digit_count(slots[0])? + 2);
-            if !same_matrix_type(
-                w.public_b[group].matrix_type(),
-                &low_ring.matrix_type((p.component_count, b_columns)),
-            ) {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-            for slot in slots {
-                anchors_by_slot.insert(*slot, w.public_b[group].clone());
-            }
-        }
-        for (slot, (mask, k)) in w.masks.iter().zip(w.preimages.iter()).enumerate() {
-            let low_ring = p.switch_ring(slot)?;
-            let b_columns = p.component_count * (p.decoder_digit_count(slot)? + 2);
-            if !same_matrix_type(mask.matrix_type(), &ring.matrix_type((p.component_count, cols))) ||
-                !same_matrix_type(
-                    w.scaled_fresh[slot].matrix_type(),
-                    &ring.matrix_type((p.component_count, cols)),
-                ) ||
-                !same_matrix_type(
-                    w.refresh_targets[slot].matrix_type(),
-                    &low_ring.matrix_type((p.component_count, cols)),
-                ) ||
-                !same_matrix_type(k.matrix_type(), &low_ring.matrix_type((b_columns, cols)))
-            {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-            // Reconstruct the same `mu_t = q/q_t` scaling used to define
-            // `T_t`; this check prevents a preimage from being paired with a
-            // target from another CRT modulus.
-            let scale = p.layout.ring().polynomial([p.refresh.scale_expression(slot)?]);
-            let scaled_state = self
-                .request
-                .public_prf
-                .compiler
-                .public_key
-                .large_scalar_mul(
-                    &BggPublicKeyWire { matrix: w.state.matrix.clone(), reveal_plaintext: false },
-                    &scale,
-                )
-                .matrix;
-            let modulus = IntExpr::constant(BigInt::from(p.switch_moduli[slot].clone()));
-            let delta = low_ring.polynomial([IntExpr::Div(
-                Box::new(modulus.clone()),
-                Box::new(p.refresh.crt_plaintext_moduli[slot].clone()),
-            )]);
-            let target = (scaled_state + w.masks[slot].clone() + w.scaled_fresh[slot].clone())
-                .modulus_switch(modulus.clone()) -
-                delta * w.a_prime.clone().reduce_modulus(modulus);
-            if !same_matrix_type(
-                k.clone().mul_small_rhs(anchors_by_slot[&slot].clone()).matrix_type(),
-                target.matrix_type(),
-            ) {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-        }
-        Ok(())
+    ) -> &RefreshPreprocessingDeclaration<
+        <BggScheme as ExponentLUTFixedRhsScheme>::FixedProductBinding,
+        <<BggScheme as ExponentLUTFixedRhsScheme>::PreparedFixedProduct as GraphValue>::Schema,
+    > {
+        &self.declaration
     }
 
     /// Applies the declaration's role/type checks to an exported manifest.
@@ -2851,537 +439,32 @@ impl RefreshPreprocessingProducer {
         &self,
         manifest: &mut Manifest,
     ) -> Result<(), RefreshSetupError> {
-        self.declaration.finalize_export_manifest(manifest, &self.request.parameters)
+        self.parameters.validate_refresh_manifest(&self.declaration, manifest)
     }
 }
 
-/// Samples the preprocessing-fixed low-P targets and decoder families.
-fn sample_refresh_decoders(
-    p: &RefreshSetupParameters,
-    sum_family: Family<Mat>,
-    a_prime: &Mat,
-    decoder_preimage_bound: &IntExpr,
-) -> Result<(Vec<Mat>, Vec<Mat>, Vec<mxx_dsl::Preimage>), RefreshSetupError> {
-    let mut public_b = Vec::new();
-    let mut targets_by_slot = BTreeMap::new();
-    let mut preimages_by_slot = BTreeMap::new();
-    for (modulus, slots) in p.anchor_groups() {
-        let low_ring = p.switch_ring(slots[0])?;
-        let modulus = IntExpr::constant(BigInt::from(modulus));
-        let digits = p.decoder_digit_count(slots[0])?;
-        let b_columns =
-            p.component_count.checked_mul(digits + 2).ok_or(RefreshSetupError::InvalidManifest)?;
-        let trapdoor = low_ring.sample_trapdoor(
-            p.component_count,
-            p.decoder_sigma.clone(),
-            p.layout.gadget_base.clone(),
-            digits,
-            decoder_preimage_bound.clone(),
-        );
-        public_b.push(trapdoor.public_matrix());
-        let low_a_prime = a_prime.clone().reduce_modulus(modulus.clone());
-        let group_sums = Family::pack(slots.iter().map(|slot| sum_family.at(*slot)).collect())?;
-        let deltas = Family::pack(
-            slots
-                .iter()
-                .map(|slot| {
-                    low_ring.polynomial([IntExpr::Div(
-                        Box::new(modulus.clone()),
-                        Box::new(p.refresh.crt_plaintext_moduli[*slot].clone()),
-                    )])
-                })
-                .collect(),
-        )?;
-        let targets = {
-            let source_families = (group_sums, deltas);
-            if source_families.0.count() != source_families.1.count() {
-                Err(mxx_dsl::DslError::Schema)
-            } else {
-                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
-                    let (sum, delta) =
-                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
-                    let _ = family_index;
-                    Ok(sum.modulus_switch(modulus.clone()) - delta * low_a_prime.clone())
-                })
-            }
-        }?;
-        let preimages = {
-            let source_family = targets.clone();
-            mxx_dsl::parallel(source_family.count().clone(), |family_index| {
-                let target = source_family.at(&family_index);
-                let _ = family_index;
-                Ok(trapdoor.sample_preimage(target, (b_columns, p.layout.public_key_columns())))
-            })
-        }?;
-        for (local, slot) in slots.into_iter().enumerate() {
-            targets_by_slot.insert(slot, targets.at(local));
-            preimages_by_slot.insert(slot, preimages.at(local));
-        }
-    }
-    let refresh_targets = targets_by_slot.into_values().collect();
-    let ks = preimages_by_slot.into_values().collect();
-    Ok((public_b, refresh_targets, ks))
-}
-
-/// Samples one online anchor per exact P group and restores original slot order.
-fn shared_decoder_bases(
-    parameters: &RefreshSetupParameters,
-    secret: Mat,
-    public_b: &[Mat],
-) -> Result<(Vec<Mat>, Vec<BggEncodingWire>), RefreshSetupError> {
-    let groups = parameters.anchor_groups();
-    if public_b.len() != groups.len() {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let mut public_by_slot = BTreeMap::new();
-    let mut bases_by_slot = BTreeMap::new();
-    for ((modulus, slots), public) in groups.into_iter().zip(public_b) {
-        let ring = parameters.switch_ring(slots[0])?;
-        let reduced_secret =
-            secret.clone().reduce_modulus(IntExpr::constant(BigInt::from(modulus)));
-        let anchor_error = ring.gaussian(
-            (1, public.matrix_type().columns.clone()),
-            parameters.encoding_error_sigma.clone(),
-            parameters.encoding_error_bound.clone(),
-        );
-        let base = BggEncodingWire {
-            vector: reduced_secret * public.clone() + anchor_error,
-            plaintext: None,
-        };
-        for slot in slots {
-            public_by_slot.insert(slot, public.clone());
-            bases_by_slot.insert(slot, base.clone());
-        }
-    }
-    Ok((public_by_slot.into_values().collect(), bases_by_slot.into_values().collect()))
-}
-
-/// Public-key-only counterpart of the refresh PRF routing performed online on
-/// complete encodings.  The canonical label order is
-/// `[slot][component][coefficient][base-p digit]`, followed by the shared
-/// fresh-error group.  Keeping this separate is essential for benchmark stage
-/// fidelity: preprocessing must not pull private encoding-vector work into its
-/// graph merely to obtain the public matrices used by the decoder targets.
-fn aggregate_public_refresh_prf(
-    parameters: &RefreshSetupParameters,
-    compiler: &ExponentLutPublicKeyCompiler,
-    outputs: Family<Mat>,
-    base_p: usize,
-    slot_count: usize,
-    component_count: usize,
-    coefficient_count: usize,
-    mask_digit_counts: &[usize],
-    fresh_digit_count: usize,
-    scales: Vec<Mat>,
-    mask_lifts: Vec<Mat>,
-) -> Result<(Vec<Mat>, Vec<Mat>), RefreshSetupError> {
-    let coordinates =
-        component_count.checked_mul(coefficient_count).ok_or(RefreshSetupError::InvalidManifest)?;
-    let mask_total = mask_digit_counts.iter().try_fold(0usize, |total, digits| {
-        coordinates
-            .checked_mul(*digits)
-            .and_then(|count| total.checked_add(count))
-            .ok_or(RefreshSetupError::InvalidManifest)
-    })?;
-    let fresh_group = component_count
-        .checked_mul(coefficient_count)
-        .and_then(|value| value.checked_mul(fresh_digit_count))
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let total = mask_total.checked_add(fresh_group).ok_or(RefreshSetupError::InvalidManifest)?;
-    if slot_count == 0 || scales.len() != slot_count || mask_digit_counts.len() != slot_count {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-
-    if !family_count_is(&outputs, total)? {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-
-    let mask_indices = mxx_dsl::parallel(mask_total, |index| Ok(index.clone()))?;
-    let mask_outputs = {
-        let source_family = outputs.clone();
-        let gather_indices = mask_indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?;
-    let routed_masks = route_public_prf_family(
-        compiler,
-        base_p,
-        mask_outputs,
-        component_count,
-        coefficient_count,
-        mask_digit_counts,
-        Some(route_scale_family(
-            mask_lifts,
-            component_count,
-            coefficient_count,
-            mask_digit_counts,
-        )?),
-        Some(corrected_route_scalar_family(parameters, &parameters.layout.ring(), false)?),
-    )?;
-    let mut start = 0usize;
-    let masks = mask_digit_counts
-        .iter()
-        .map(|digits| {
-            let count =
-                coordinates.checked_mul(*digits).ok_or(RefreshSetupError::InvalidManifest)?;
-            let indices =
-                mxx_dsl::parallel(count, |index| Ok(Int::constant(start).add(index.clone())))?;
-            let slice = {
-                let source_family = routed_masks.clone();
-                let gather_indices = indices;
-                mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-                    Ok(source_family.at(gather_indices.at(&family_index)))
-                })
-            }?;
-            start = start.checked_add(count).ok_or(RefreshSetupError::InvalidManifest)?;
-            Ok(reduce_public_family_segments(slice, 1, count)?.at(0))
-        })
-        .collect::<Result<Vec<_>, RefreshSetupError>>()?;
-
-    let fresh_indices =
-        mxx_dsl::parallel(fresh_group, |index| Ok(Int::constant(mask_total).add(index.clone())))?;
-    let fresh_outputs = {
-        let source_family = outputs;
-        let gather_indices = fresh_indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?;
-    let repeated_count =
-        fresh_group.checked_mul(slot_count).ok_or(RefreshSetupError::InvalidManifest)?;
-    let repeated_fresh_indices = mxx_dsl::parallel(repeated_count, |index| {
-        Ok({
-            let flat = index.clone();
-            let quotient = flat.clone().div(Int::constant(fresh_group));
-            flat.sub(quotient.mul(Int::constant(fresh_group)))
-        })
-    })?;
-    let slot_indices = mxx_dsl::parallel(repeated_count, |index| {
-        Ok(index.clone().div(Int::constant(fresh_group)))
-    })?;
-    let repeated_fresh = {
-        let source_family = fresh_outputs;
-        let gather_indices = repeated_fresh_indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?;
-    let repeated_scales = {
-        let source_family = Family::pack(scales)?;
-        let gather_indices = slot_indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?;
-    let routed_fresh = route_public_prf_family(
-        compiler,
-        base_p,
-        repeated_fresh,
-        component_count,
-        coefficient_count,
-        &vec![fresh_digit_count; slot_count],
-        Some(repeated_scales),
-        Some(corrected_route_scalar_family(parameters, &parameters.layout.ring(), true)?),
-    )?;
-    let fresh = reduce_public_family_segments(routed_fresh, slot_count, fresh_group)?;
-    if !family_count_is(&fresh, slot_count)? {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    Ok((masks, (0..slot_count).map(|slot| fresh.at(slot)).collect()))
-}
-
-fn refresh_prf_output_count(p: &RefreshSetupParameters) -> Result<usize, RefreshSetupError> {
-    let mask = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
-    let fresh = p
-        .prf_component_count()
-        .checked_mul(p.coefficient_count)
-        .and_then(|value| value.checked_mul(p.fresh_error_base_p_digit_count))
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    mask.checked_add(fresh).ok_or(RefreshSetupError::InvalidManifest)
-}
-
-fn refresh_route_family_count(
-    p: &RefreshSetupParameters,
-    digit_counts: &[usize],
-) -> Result<usize, RefreshSetupError> {
-    if digit_counts.len() != p.refresh.crt_plaintext_moduli.len() {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let digits = digit_counts.iter().try_fold(0usize, |sum, count| {
-        sum.checked_add(*count).ok_or(RefreshSetupError::InvalidManifest)
-    })?;
-    digits
-        .checked_mul(p.prf_component_count())
-        .and_then(|value| value.checked_mul(p.coefficient_count))
-        .ok_or(RefreshSetupError::InvalidManifest)
-}
-
-fn concrete_preimage_family_count(
-    family: &Family<mxx_dsl::Preimage>,
-) -> Result<usize, RefreshSetupError> {
-    family
-        .count()
-        .evaluate(&ParamEnv::default())
-        .ok()
-        .and_then(|count| count.to_usize())
-        .ok_or(RefreshSetupError::InvalidManifest)
-}
-
-fn route_scale_family(
-    scales: Vec<Mat>,
-    component_count: usize,
-    coefficient_count: usize,
-    digit_counts: &[usize],
-) -> Result<Family<Mat>, RefreshSetupError> {
-    if scales.len() != digit_counts.len() {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let count = digit_counts.iter().try_fold(0usize, |total, digits| {
-        component_count
-            .checked_mul(coefficient_count)
-            .and_then(|count| count.checked_mul(*digits))
-            .and_then(|count| total.checked_add(count))
-            .ok_or(RefreshSetupError::InvalidManifest)
-    })?;
-    let indices = {
-        let captured_values = Vec::<Mat>::new();
-        mxx_dsl::parallel(count, |index| {
-            let _ = captured_values;
-            {
-                let (slot, _, _, _) = crate::noise_refresh::refresh::route_coordinates(
-                    index.expression()?,
-                    component_count,
-                    coefficient_count,
-                    digit_counts,
-                )
-                .map_err(|_| mxx_dsl::DslError::Schema)?;
-                Ok(Int::evaluate(slot))
-            }
-        })
-    }?;
-    Ok({
-        let source_family = Family::pack(scales)?;
-        let gather_indices = indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?)
-}
-
-fn route_public_prf_family(
-    compiler: &ExponentLutPublicKeyCompiler,
-    base_p: usize,
-    public_keys: Family<Mat>,
-    component_count: usize,
-    coefficient_count: usize,
-    digit_counts: &[usize],
-    scales: Option<Family<Mat>>,
-    corrected_scalars: Option<Family<Mat>>,
-) -> Result<Family<Mat>, RefreshSetupError> {
-    let base_p = if corrected_scalars.is_some() { 1 } else { base_p };
-    let scales = corrected_scalars.or(scales);
-    let has_scales = scales.is_some();
-    let total_digits = digit_counts.iter().try_fold(0usize, |sum, digits| {
-        sum.checked_add(*digits).ok_or(RefreshSetupError::InvalidManifest)
-    })?;
-    let expected_count = component_count
-        .checked_mul(coefficient_count)
-        .and_then(|coordinates| coordinates.checked_mul(total_digits))
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    if !family_count_is(&public_keys, expected_count)? {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let mut families = vec![public_keys];
-    if let Some(scales) = scales {
-        families.push(scales);
-    }
-    {
-        let source_families = families;
-        if source_families.is_empty() ||
-            source_families.iter().any(|family| family.count() != source_families[0].count())
-        {
-            Err(mxx_dsl::DslError::Schema)
-        } else {
-            mxx_dsl::parallel(source_families[0].count().clone(), |index| {
-                let mut inputs =
-                    source_families.iter().map(|family| family.at(&index)).collect::<Vec<_>>();
-                {
-                    let scale = has_scales.then(|| inputs.pop().expect("scale family"));
-                    let public_key = inputs.pop().ok_or(mxx_dsl::DslError::Schema)?;
-                    let (_, digit, coefficient, component) =
-                        crate::noise_refresh::refresh::route_coordinates(
-                            index.expression()?,
-                            component_count,
-                            coefficient_count,
-                            digit_counts,
-                        )
-                        .map_err(|_| mxx_dsl::DslError::Schema)?;
-                    let public_type = public_key.matrix_type();
-                    let ring = mxx_dsl::Ring::new(
-                        public_type.modulus.clone(),
-                        public_type.ring_dimension.clone(),
-                    );
-                    let scalar = ring.constant(
-                        (1, 1),
-                        mxx_ir_core::node::ConstantMatrix::PowerOfBase {
-                            base: mxx_ir_core::IntExpr::constant(base_p),
-                            exponent: digit,
-                        },
-                    ) * ring.constant(
-                        (1, 1),
-                        mxx_ir_core::node::ConstantMatrix::Rotation { exponent: coefficient },
-                    );
-                    let route = -scalar *
-                        ring.constant(
-                            (public_type.rows.clone(), 1),
-                            mxx_ir_core::node::ConstantMatrix::UnitColumn {
-                                index: mxx_ir_core::IntExpr::constant(1),
-                            },
-                        ) *
-                        ring.constant(
-                            (1, public_type.columns.clone()),
-                            mxx_ir_core::node::ConstantMatrix::UnitRow { index: component },
-                        );
-                    let target = match scale {
-                        Some(scale) => scale * route,
-                        None => route,
-                    };
-                    Ok(compiler
-                        .public_key
-                        .matrix_mul(
-                            &BggPublicKeyWire { matrix: public_key, reveal_plaintext: false },
-                            &target,
-                        )
-                        .matrix)
-                }
-            })
-        }
-    }
-    .map_err(RefreshSetupError::from)
-}
-
-fn reduce_public_family_segments(
-    family: Family<Mat>,
-    segment_count: usize,
-    segment_size: usize,
-) -> Result<Family<Mat>, RefreshSetupError> {
-    if segment_count == 0 || segment_size == 0 {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    crate::encoding::reduce_encoding_family_segments(family, segment_count, segment_size)
-        .map_err(RefreshSetupError::from)
-}
-
-fn family_count_is(family: &Family<Mat>, expected: usize) -> Result<bool, RefreshSetupError> {
-    Ok(family
-        .count()
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidManifest)?
-        .to_usize() ==
-        Some(expected))
-}
-impl RefreshPreprocessingDeclaration {
-    /// Rejects declarations that cannot represent the supported CRT refresh
-    /// layout. This check is repeated at every declaration boundary so a
-    /// depth-one manifest cannot enter through direct import.
-    fn validate_slot_count(&self) -> Result<(), RefreshSetupError> {
-        if self.slot_count < 2 {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        Ok(())
-    }
-
-    fn validate_prf_contract(
-        &self,
-        parameters: &RefreshSetupParameters,
-    ) -> Result<(), RefreshSetupError> {
-        declaration_contract(self).validate_for(parameters)?;
-        if self.program_id == ExponentLutProgramId::from_digest([0; 32]) {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn validate_built(
-        &self,
-        w: &RefreshPreprocessingWires,
-    ) -> Result<(), RefreshSetupError> {
-        self.validate_slot_count()?;
-        if self.slot_count != w.masks.len() ||
-            self.component_count == 0 ||
-            self.prf_component_count == 0 ||
-            self.coefficient_count == 0 ||
-            self.mask_base_p_digit_counts.iter().any(|count| *count == 0) ||
-            self.fresh_error_base_p_digit_count == 0 ||
-            self.mask_statistical_security_bits == 0 ||
-            self.gadget_digit_count == 0 ||
-            self.component_count.checked_mul(self.gadget_digit_count) !=
-                Some(self.prf_component_count) ||
-            self.encoding_error_bound == 0.into() ||
-            self.slot_scales.len() != self.slot_count ||
-            self.switch_moduli.len() != self.slot_count ||
-            self.names.preimages.len() != self.slot_count ||
-            self.names.state_scaling.len() != self.slot_count ||
-            self.names.setup_public_key_rhs.is_empty()
-        {
-            Err(RefreshSetupError::IdentityMismatch)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Validates every exported artifact's canonical name, shape, and
-    /// confidentiality.  Private values may never carry a public hash.
-    pub fn finalize_export_manifest(
-        &self,
-        manifest: &mut Manifest,
-        parameters: &RefreshSetupParameters,
-    ) -> Result<(), RefreshSetupError> {
-        parameters.validate()?;
-        self.validate_slot_count()?;
-        self.validate_prf_contract(parameters)?;
-        let decoder_preimage_bound = parameters.resolve_decoder_preimage_bound()?;
-        if self.identity !=
-            setup_identity_digest(
-                parameters,
-                &declaration_contract(self),
-                self.pbc_layout_id,
-                &decoder_preimage_bound,
-                self.readout_identity,
-            ) ||
-            names_without_program_cache(&self.names) !=
-                canonical_names(
-                    parameters,
-                    &declaration_contract(self),
-                    self.pbc_layout_id,
-                    &decoder_preimage_bound,
-                    self.readout_identity,
-                    self.names.selector_gsw.clone(),
-                ) ||
-            self.slot_count != parameters.refresh.crt_plaintext_moduli.len() ||
-            manifest.ir_version != IR_VERSION
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        validate_program_cache_names(&self.names.program_cache, self.identity)?;
-        validate_manifest(manifest, &self.names, parameters)
-    }
+fn refresh_prf_output_count(p: &BggRefreshParameters) -> Result<usize, RefreshSetupError> {
+    p.transcript_topology().joint_event_count().map_err(|_| RefreshSetupError::InvalidManifest)
 }
 
 impl ImportedRefreshSetup {
     /// Returns the validated setup parameters used by this import.
-    pub fn parameters(&self) -> &RefreshSetupParameters {
+    pub fn parameters(&self) -> &BggRefreshParameters {
         &self.parameters
     }
 
     /// Returns the declaration that was checked during import.
-    pub fn declaration(&self) -> &RefreshPreprocessingDeclaration {
+    pub fn declaration(
+        &self,
+    ) -> &RefreshPreprocessingDeclaration<
+        <BggScheme as ExponentLUTFixedRhsScheme>::FixedProductBinding,
+        <<BggScheme as ExponentLUTFixedRhsScheme>::PreparedFixedProduct as GraphValue>::Schema,
+    > {
         &self.declaration
     }
 
     /// Returns the setup-fixed public state key paired with the online state
-    /// vector supplied to [`RefreshOnlineEvaluationRequest`].
+    /// vector supplied to the online construction stage.
     pub fn state_public_key(&self) -> &BggPublicKeyWire {
         &self.state
     }
@@ -3396,327 +479,116 @@ impl ImportedRefreshSetup {
     /// Imports preprocessing artifacts after validating their declaration
     /// identity, confidentiality, bounds, and concrete matrix shapes.
     pub fn import(
-        parameters: RefreshSetupParameters,
-        declaration: RefreshPreprocessingDeclaration,
+        parameters: BggRefreshParameters,
+        program: SparseLwrPrfProgram,
+        declaration: RefreshPreprocessingDeclaration<
+            <BggScheme as ExponentLUTFixedRhsScheme>::FixedProductBinding,
+            <<BggScheme as ExponentLUTFixedRhsScheme>::PreparedFixedProduct as GraphValue>::Schema,
+        >,
         manifest: &Manifest,
     ) -> Result<Self, RefreshSetupError> {
-        parameters.validate()?;
-        declaration.validate_slot_count()?;
-        declaration.validate_prf_contract(&parameters)?;
-        let decoder_preimage_bound = parameters.resolve_decoder_preimage_bound()?;
-        if manifest.ir_version != IR_VERSION ||
-            declaration.identity !=
-                setup_identity_digest(
-                    &parameters,
-                    &declaration_contract(&declaration),
-                    declaration.pbc_layout_id,
-                    &decoder_preimage_bound,
-                    declaration.readout_identity,
-                ) ||
-            declaration.refresh_id != parameters.refresh_id ||
-            declaration.component_count != parameters.component_count ||
-            declaration.prf_component_count != parameters.prf_component_count() ||
-            declaration.coefficient_count != parameters.coefficient_count ||
-            declaration.mask_base_p_digit_counts != parameters.mask_base_p_digit_counts ||
-            declaration.switch_moduli != parameters.switch_moduli ||
-            declaration.fresh_error_base_p_digit_count !=
-                parameters.fresh_error_base_p_digit_count ||
-            declaration.mask_statistical_security_bits !=
-                parameters.mask_statistical_security_bits ||
-            declaration.gadget_digit_count != parameters.layout.digit_count ||
-            declaration.encoding_error_sigma != parameters.encoding_error_sigma ||
-            declaration.encoding_error_bound != parameters.encoding_error_bound ||
-            names_without_program_cache(&declaration.names) !=
-                canonical_names(
-                    &parameters,
-                    &declaration_contract(&declaration),
-                    declaration.pbc_layout_id,
-                    &decoder_preimage_bound,
-                    declaration.readout_identity,
-                    declaration.names.selector_gsw.clone(),
-                )
-        {
-            return Err(RefreshSetupError::IdentityMismatch)
-        };
-        validate_program_cache_names(&declaration.names.program_cache, declaration.identity)?;
-        validate_manifest(manifest, &declaration.names, &parameters)?;
+        parameters.validate_refresh_manifest(&declaration, manifest)?;
+        if program.id() != declaration.prf_contract.program_id() {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
         let production_id = manifest.production_id.clone();
         let n = &declaration.names;
-        let cols = parameters.layout.public_key_columns();
-        // The manifest has already checked every concrete type. Preserve the
-        // parameter-derived symbolic shape in the consumer graph; no producer
-        // graph or live producer wire crosses this artifact boundary.
-        let imported = |name: &str,
-                        confidentiality: ArtifactConfidentiality,
-                        expected: &mxx_ir_core::types::MatrixType|
-         -> Result<Mat, RefreshSetupError> {
-            let ring =
-                mxx_dsl::Ring::new(expected.modulus.clone(), expected.ring_dimension.clone());
-            Ok(ring.artifact_input(
+        // The adapter already validated every concrete field, bound and role.
+        // Import that exact contract instead of reconstructing gadget dimensions.
+        let matrix_type =
+            |matrix: &mxx_ir_core::types::ConcreteMatrixType| mxx_ir_core::types::MatrixType {
+                modulus: matrix.modulus.clone().into(),
+                ring_dimension: matrix.ring_dimension.into(),
+                rows: matrix.rows.into(),
+                columns: matrix.columns.into(),
+            };
+        let imported = |name: &str| -> Result<Mat, RefreshSetupError> {
+            let field = &manifest.artifacts[name];
+            let ArtifactType::Matrix(matrix) = &field.artifact_type else {
+                return Err(RefreshSetupError::InvalidManifest);
+            };
+            Ok(mxx_dsl::MatType(matrix_type(matrix)).artifact_input(
                 production_id.clone(),
-                name.to_owned(),
-                (expected.rows.clone(), expected.columns.clone()),
-                confidentiality,
-            ))
+                name,
+                field.confidentiality,
+            )?)
         };
-        let state_public_matrix = imported(
-            &n.state_public_matrix,
-            ArtifactConfidentiality::Public,
-            &parameters.layout.ring().matrix_type((parameters.component_count, cols)),
-        )?;
-        let setup_secret_t = imported(
-            &n.setup_secret_t,
-            ArtifactConfidentiality::Private,
-            &parameters.layout.ring().matrix_type((1, parameters.layout.secret_dimension)),
-        )?;
-        let a_prime = imported(
-            &n.a_prime,
-            ArtifactConfidentiality::Public,
-            &parameters.layout.ring().matrix_type((parameters.component_count, cols)),
-        )?;
-        let public_b = parameters
-            .anchor_groups()
+        let preimage_schema = |name: &str| -> Result<mxx_dsl::PreimageType, RefreshSetupError> {
+            let ArtifactType::Preimage { matrix, max_coefficient_bound } =
+                &manifest.artifacts[name].artifact_type
+            else {
+                return Err(RefreshSetupError::InvalidManifest);
+            };
+            Ok(mxx_dsl::PreimageType {
+                matrix: matrix_type(matrix),
+                max_coefficient_bound: max_coefficient_bound.clone().into(),
+            })
+        };
+        let state_public_matrix = imported(&n.state_public_matrix)?;
+        let setup_secret_t = imported(&n.setup_secret_t)?;
+        let a_prime = imported(&n.a_prime)?;
+        let public_b =
+            n.public_matrix_b.iter().map(|name| imported(name)).collect::<Result<Vec<_>, _>>()?;
+        let refresh_targets =
+            n.refresh_targets.iter().map(|name| imported(name)).collect::<Result<Vec<_>, _>>()?;
+        let state = BggPublicKeyWire { matrix: state_public_matrix, reveal_plaintext: false };
+        // Preserve the bounded preimage type, so evaluation keeps mul_small_rhs.
+        let ks = n
+            .preimages
             .iter()
-            .enumerate()
-            .map(|(group, (_, slots))| {
-                let b_columns =
-                    parameters.component_count * (parameters.decoder_digit_count(slots[0])? + 2);
-                imported(
-                    &n.public_matrix_b[group],
-                    ArtifactConfidentiality::Public,
-                    &parameters
-                        .switch_ring(slots[0])?
-                        .matrix_type((parameters.component_count, b_columns)),
-                )
+            .map(|name| {
+                Ok(preimage_schema(name)?.artifact_input(
+                    production_id.clone(),
+                    name,
+                    manifest.artifacts[name].confidentiality,
+                )?)
             })
             .collect::<Result<Vec<_>, RefreshSetupError>>()?;
-        let refresh_targets = n
-            .refresh_targets
-            .iter()
-            .enumerate()
-            .map(|(slot, name)| {
-                imported(
-                    name,
-                    ArtifactConfidentiality::Public,
-                    &parameters.switch_ring(slot)?.matrix_type((parameters.component_count, cols)),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let state = BggPublicKeyWire { matrix: state_public_matrix, reveal_plaintext: false };
-        let mut ks = Vec::new();
-        for (slot, x) in n.preimages.iter().enumerate() {
-            // Keep K typed as a preimage across the artifact boundary. The
-            // consumer therefore applies the bounded witness through `mul_small_rhs`
-            // instead of materializing it as an untyped matrix.
-            let b_columns =
-                parameters.component_count * (parameters.decoder_digit_count(slot)? + 2);
-            let matrix = parameters.switch_ring(slot)?.matrix_type((b_columns, cols));
-            let ring = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
-            ks.push(ring.preimage_artifact_input(
-                production_id.clone(),
-                x.to_owned(),
-                (matrix.rows.clone(), matrix.columns.clone()),
-                decoder_preimage_bound.clone(),
-                ArtifactConfidentiality::Private,
-            ));
-        }
-        let gadget_base = parameters
-            .layout
-            .gadget_base
-            .evaluate(&ParamEnv::default())
-            .map_err(|_| RefreshSetupError::InvalidManifest)?;
-        // Readout Preimage artifacts carry Mat::decompose's deterministic
-        // coefficient bound floor(beta/2). B_chi remains the helper/anchor
-        // error cutoff and is not the cache schema bound.
-        let readout_bound = gadget_base.clone() / BigInt::from(2u8);
-        let ring_dimension = parameters
-            .layout
-            .ring_dimension
-            .evaluate(&ParamEnv::default())
+        let readout_artifacts = parameters
+            .refresh_readout_schema(refresh_prf_output_count(&parameters)?)
             .map_err(|_| RefreshSetupError::InvalidManifest)?
-            .to_usize()
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let readout_schema = crate::noise_refresh::readout::ReadoutPreimageSchema::new(
-            gadget_base.clone(),
-            parameters.layout.digit_count,
-            readout_bound.clone(),
-        )
-        .map_err(|_| RefreshSetupError::InvalidManifest)?;
-        let _readout_layout = {
-            let width = declaration.prf_native_width;
-            if width == 0 ||
-                !width.is_power_of_two() ||
-                ring_dimension == 0 ||
-                width > ring_dimension
-            {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-            crate::layout::ExpLayout {
-                stride_log2: ring_dimension.trailing_zeros() - width.trailing_zeros(),
-                width_log2: width.trailing_zeros(),
-            }
-        };
-        let readout_preimage = |name: &str| -> Result<mxx_dsl::Preimage, RefreshSetupError> {
-            let matrix = parameters
-                .layout
-                .ring()
-                .matrix_type((parameters.component_count * parameters.layout.digit_count, cols));
-            let ring = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
-            Ok(ring.preimage_artifact_input(
+            .artifact_input(
                 production_id.clone(),
-                name.to_owned(),
-                (matrix.rows.clone(), matrix.columns.clone()),
-                readout_bound.clone(),
+                n.readout.clone(),
                 ArtifactConfidentiality::Public,
-            ))
-        };
-        let output_count = refresh_prf_output_count(&parameters)?;
-        let target_decompositions = {
-            let matrix = parameters
-                .layout
-                .ring()
-                .matrix_type((parameters.component_count * parameters.layout.digit_count, cols));
-            let ring = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
-            ring.preimage_family_artifact_input(
-                production_id.clone(),
-                n.readout.target_decomposition.clone(),
-                output_count,
-                (matrix.rows, matrix.columns),
-                readout_bound.clone(),
-                ArtifactConfidentiality::Public,
-            )
-        };
-        let normalization_decomposition = readout_preimage(&n.readout.normalization_decomposition)?;
-        let helper_count = declaration.readout_helper_sigmas.len();
-        let readout_preimage_family = |name: &str, count: usize| {
-            let matrix = parameters
-                .layout
-                .ring()
-                .matrix_type((parameters.component_count * parameters.layout.digit_count, cols));
-            let ring = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
-            ring.preimage_family_artifact_input(
-                production_id.clone(),
-                name.to_owned(),
-                count,
-                (matrix.rows.clone(), matrix.columns.clone()),
-                readout_bound.clone(),
-                ArtifactConfidentiality::Public,
-            )
-        };
-        let readout_artifacts = NativePrfReadoutFamilyArtifacts::new(
-            target_decompositions,
-            readout_schema.clone(),
-            declaration.readout_helper_sigmas.clone(),
-            readout_preimage_family(&n.readout.helper_switch_decompositions, helper_count),
-            readout_preimage_family(
-                &n.readout.helper_public_decompositions,
-                refresh_prf_output_count(&parameters)?
-                    .checked_mul(helper_count)
-                    .ok_or(RefreshSetupError::InvalidManifest)?,
-            ),
-            normalization_decomposition.clone(),
-            readout_schema,
-            output_count,
-        )
-        .map_err(|_| RefreshSetupError::InvalidManifest)?;
-        let cache_matrix = parameters
-            .layout
-            .ring()
-            .matrix_type((parameters.component_count * parameters.layout.digit_count, cols));
-        let family_count = |name: &str| -> Result<usize, RefreshSetupError> {
-            let count = manifest
-                .artifacts
-                .get(name)
-                .and_then(|artifact| artifact.family_count)
-                .ok_or(RefreshSetupError::InvalidManifest)?;
-            match count {
-                count if count > 0 => Ok(count),
-                _ => Err(RefreshSetupError::InvalidManifest),
+            )?;
+        let import_cache_family = |name: &str| -> Result<Family<Preimage>, RefreshSetupError> {
+            // validate_manifest established the exact positive count and
+            // schema before any consumer handle is constructed.
+            let count = manifest.artifacts[name].family_count.expect("validated family count");
+            Ok(mxx_dsl::FamilyType {
+                element: preimage_schema(name)?,
+                count: count.into(),
+                shared: vec![false],
             }
+            .artifact_input(
+                production_id.clone(),
+                name,
+                ArtifactConfidentiality::Public,
+            )?)
         };
-        let setup_public_key_matrix = cache_matrix.clone();
-        let setup_public_key_count = family_count(&n.setup_public_key_rhs)?;
-        let setup_public_key_ring = mxx_dsl::Ring::new(
-            setup_public_key_matrix.modulus.clone(),
-            setup_public_key_matrix.ring_dimension.clone(),
-        );
-        let setup_public_key_rhs = setup_public_key_ring.preimage_family_artifact_input(
-            production_id.clone(),
-            n.setup_public_key_rhs.clone(),
-            setup_public_key_count,
-            (setup_public_key_matrix.rows.clone(), setup_public_key_matrix.columns.clone()),
-            readout_bound.clone(),
-            ArtifactConfidentiality::Public,
-        );
         let state_scaling = n
             .state_scaling
             .iter()
             .map(|name| {
-                let matrix = cache_matrix.clone();
-                let ring =
-                    mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
-                Ok(ring.preimage_artifact_input(
+                Ok(preimage_schema(name)?.artifact_input(
                     production_id.clone(),
                     name.clone(),
-                    (matrix.rows.clone(), matrix.columns.clone()),
-                    readout_bound.clone(),
-                    ArtifactConfidentiality::Public,
-                ))
+                    manifest.artifacts[name].confidentiality,
+                )?)
             })
             .collect::<Result<Vec<_>, RefreshSetupError>>()?;
-        let import_route_family = |name: &str| -> Result<Family<Preimage>, RefreshSetupError> {
-            let matrix = cache_matrix.clone();
-            let count = family_count(name)?;
-            let ring = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension.clone());
-            Ok(ring.preimage_family_artifact_input(
-                production_id.clone(),
-                name.to_owned(),
-                count,
-                (matrix.rows.clone(), matrix.columns.clone()),
-                readout_bound.clone(),
-                ArtifactConfidentiality::Public,
-            ))
-        };
-        let mask_route_rhs_decompositions = import_route_family(&n.mask_route_rhs_decompositions)?;
+        let mask_route_rhs_decompositions = import_cache_family(&n.mask_route_rhs_decompositions)?;
         let fresh_route_rhs_decompositions =
-            import_route_family(&n.fresh_route_rhs_decompositions)?;
-        if !n.program_cache.gates.is_empty() || !n.program_cache.luts.is_empty() {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let output_count = refresh_prf_output_count(&parameters)?;
-        let mut program_cache = ProgramCacheBatchBindings::new(output_count)?;
-        for entry in &n.program_cache.families {
-            let flat_count = if entry.output_indexed {
-                output_count.checked_mul(entry.count).ok_or(RefreshSetupError::InvalidManifest)?
-            } else {
-                entry.count
-            };
-            if family_count(&entry.rhs)? != flat_count {
-                return Err(RefreshSetupError::InvalidManifest);
-            }
-            let rhs_matrix = cache_matrix.clone();
-            let shape = IntExpr::constant(flat_count);
-            let rhs_ring =
-                mxx_dsl::Ring::new(rhs_matrix.modulus.clone(), rhs_matrix.ring_dimension.clone());
-            let family = rhs_ring.preimage_family_artifact_input(
-                production_id.clone(),
-                entry.rhs.clone(),
-                shape.clone(),
-                (rhs_matrix.rows.clone(), rhs_matrix.columns.clone()),
-                readout_bound.clone(),
-                ArtifactConfidentiality::Public,
-            );
-            if entry.output_indexed {
-                program_cache.insert_family(entry.step, entry.body_gate, entry.count, family)?;
-            } else {
-                program_cache.insert_shared_family(
-                    entry.step,
-                    entry.body_gate,
-                    entry.count,
-                    family,
-                )?;
-            }
-        }
+            import_cache_family(&n.fresh_route_rhs_decompositions)?;
+        let scheme = BggScheme::new(parameters.public_key_compiler(), program.profile().layout);
+        let program_cache = PreparedSparseLwrPrf::import(
+            &scheme,
+            program,
+            &declaration.prepared_prf,
+            production_id,
+            declaration.prepared_prf.identity()?,
+        )?;
         Ok(Self {
             parameters,
             state,
@@ -3726,7 +598,6 @@ impl ImportedRefreshSetup {
             refresh_targets,
             readout_artifacts,
             program_cache,
-            setup_public_key_rhs,
             state_scaling,
             mask_route_rhs_decompositions,
             fresh_route_rhs_decompositions,
@@ -3736,874 +607,90 @@ impl ImportedRefreshSetup {
     }
 }
 
-impl RefreshCompiler {
-    /// Binds online PRF outputs to an imported preprocessing setup.
-    ///
-    /// The preprocessing import contains only setup-fixed public projections,
-    /// public decoder targets, typed `K_t` preimages, and readout artifacts;
-    /// it never contains the online decoder anchor `b`. Label-dependent
-    /// encoding vectors and the secret `s` enter here from the online
-    /// evaluator. This method performs canonical mask/fresh routing, samples
-    /// `b`, and only then constructs the refresh packages.
-    pub fn bind_online_outputs(
-        &self,
-        compiler: &ExponentLutEncodingCompiler,
-        setup: &ImportedRefreshSetup,
-        online_secret_s: Mat,
-        state: BggEncodingWire,
-        program: &SparseLwrPrfProgram,
-        outputs: &NativePrfEncodingBatchOutputs,
-    ) -> Result<RefreshSetupManifest, RefreshSetupError> {
-        if setup.parameters.refresh.crt_plaintext_moduli != self.crt_plaintext_moduli ||
-            setup.parameters.refresh.reconstruction_coefficients !=
-                self.reconstruction_coefficients ||
-            setup.parameters.refresh.full_modulus != self.full_modulus ||
-            setup.declaration.readout_identity != program.readout.identity()
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        if !same_matrix_type(
-            online_secret_s.matrix_type(),
-            &setup
-                .parameters
-                .layout
-                .ring()
-                .matrix_type((1, setup.parameters.layout.secret_dimension)),
-        ) || !same_matrix_type(
-            state.vector.matrix_type(),
-            &setup
-                .parameters
-                .layout
-                .ring()
-                .matrix_type((1, setup.parameters.layout.public_key_columns())),
-        ) {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-        // Sample one fresh error per distinct public B_P in this execution.
-        // All anchors reduce the same integer secret; switching or independently
-        // resampling the secret would change the defining decoder equation.
-        let (public_b_by_slot, decoder_bases_by_slot) =
-            shared_decoder_bases(&setup.parameters, online_secret_s, &setup.public_b)?;
-        let online = RefreshPrfInputs::from_native_encoding_batch_outputs(
-            &setup.parameters,
-            program,
-            outputs,
-            setup.declaration.pbc_layout_id,
-        )?;
-        let masks = online.aggregate_masks(
-            setup.parameters.base_p,
-            setup.mask_route_rhs_decompositions.clone(),
-            setup.parameters.mask_lifts()?,
-        )?;
-        let scales = (0..setup.parameters.refresh.crt_plaintext_moduli.len())
-            .map(|slot| {
-                Ok(setup.parameters.layout.ring().polynomial([self.scale_expression(slot)?]))
-            })
-            .collect::<Result<Vec<_>, RefreshError>>()?;
-        let scaled_fresh = aggregate_refresh_fresh_error_per_slot(
-            setup.parameters.base_p,
-            &online.fresh_error,
-            scales,
-            setup.fresh_route_rhs_decompositions.clone(),
-        )?;
-        Ok(self.bind_imported_wires(
-            compiler,
-            state,
-            setup.state.clone(),
-            setup.a_prime.clone(),
-            public_b_by_slot,
-            setup.refresh_targets.clone(),
-            scaled_fresh,
-            masks,
-            setup.state_scaling.clone(),
-            decoder_bases_by_slot,
-            setup.preimages.clone(),
-        )?)
-    }
-}
-
 /// Derives all preprocessing artifact names from the public setup identity.
 ///
 /// Slot-indexed names are emitted in CRT order, so an importer cannot silently
 /// exchange two mask or preimage artifacts.
-fn canonical_names(
-    p: &RefreshSetupParameters,
-    contract: &RefreshPrfContract,
-    pbc_layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-    decoder_preimage_bound: &mxx_ir_core::IntExpr,
-    readout_identity: crate::noise_refresh::readout::ValueReadoutIdentity,
-    selector_gsw_name: String,
-) -> RefreshPreprocessingArtifactNames {
-    let d =
-        setup_identity_digest(p, contract, pbc_layout_id, decoder_preimage_bound, readout_identity);
-    let n = |r: &str, i: usize| format!("mxx-refresh-{}-{r}-{i}", hex(&d));
-    let s = p.refresh.crt_plaintext_moduli.len();
-    RefreshPreprocessingArtifactNames {
-        setup_secret_t: n("setup-secret-t", 0),
-        selector_gsw: selector_gsw_name,
-        setup_public_key_rhs: n("setup-public-key-k-rhs", 0),
-        state_scaling: (0..s).map(|i| n("state-scaling-k-rhs", i)).collect(),
-        mask_route_rhs_decompositions: n("mask-route-k-rhs", 0),
-        fresh_route_rhs_decompositions: n("fresh-route-k-rhs", 0),
-        state_public_matrix: n("state-public", 0),
-        a_prime: n("a-prime", 0),
-        public_matrix_b: (0..p.anchor_groups().len()).map(|group| n("public-b", group)).collect(),
-        refresh_targets: (0..s).map(|i| n("refresh-target", i)).collect(),
-        preimages: (0..s).map(|i| n("preimage", i)).collect(),
-        readout: RefreshReadoutArtifactNames {
-            target_decomposition: n("readout-target-decomposition", 0),
-            helper_switch_decompositions: n("readout-helper-switch-family", 0),
-            helper_public_decompositions: n("readout-helper-public-family", 0),
-            normalization_decomposition: n("readout-normalization-decomposition", 0),
-        },
-        program_cache: ProgramCacheArtifactNames::default(),
-    }
-}
-
-fn canonical_program_cache_names(
-    program: &SparseLwrPrfProgram,
-    layout: &PbcPublicLayout,
-    setup_identity: [u8; 32],
-) -> Result<ProgramCacheArtifactNames, RefreshSetupError> {
-    let active =
-        PbcActiveCellIndex::build(layout).map_err(|_| RefreshSetupError::InvalidManifest)?;
-    let prefix = format!("mxx-refresh-{}-program-cache", hex(&setup_identity));
-    let role_name = |role: ProgramCacheRole| match role {
-        ProgramCacheRole::K_rhs => "k-rhs",
-        ProgramCacheRole::LutSwitch => "lut-switch",
-        ProgramCacheRole::LutBranch => "lut-branch",
-    };
-    let mut gates = Vec::new();
-    let mut luts = Vec::new();
-    let mut families = Vec::new();
-    for declaration in program_cache_declarations(&program.accumulation) {
-        match declaration.location {
-            ProgramCacheLocation::Gate { step } => {
-                let entry =
-                    gates.iter_mut().find(|entry: &&mut ProgramCacheGateNames| entry.step == step);
-                if let Some(entry) = entry {
-                    match declaration.role {
-                        ProgramCacheRole::K_rhs => {
-                            entry.rhs =
-                                format!("{prefix}-gate-{step}-{}", role_name(declaration.role))
-                        }
-                        ProgramCacheRole::LutSwitch | ProgramCacheRole::LutBranch => {
-                            return Err(RefreshSetupError::InvalidManifest)
-                        }
-                    }
-                } else {
-                    gates.push(ProgramCacheGateNames {
-                        step,
-                        rhs: format!("{prefix}-gate-{step}-k-rhs"),
-                    });
-                }
-            }
-            ProgramCacheLocation::Family { step, body_gate } => {
-                let block = program.accumulation.steps()[..step]
-                    .iter()
-                    .filter(|step| matches!(step, ProgramStep::Family { .. }))
-                    .count();
-                let count =
-                    active.bucket_active_width(block).ok_or(RefreshSetupError::InvalidManifest)?;
-                let entry = families.iter_mut().find(|entry: &&mut ProgramCacheFamilyNames| {
-                    entry.step == step && entry.body_gate == body_gate
-                });
-                if entry.is_none() {
-                    let output_indexed = matches!(
-                        program.accumulation.steps().get(step),
-                        Some(ProgramStep::Family { body, .. })
-                            if matches!(body.gates().get(body_gate), Some(Gate::MulPublic { .. }))
-                    );
-                    families.push(ProgramCacheFamilyNames {
-                        step,
-                        body_gate,
-                        count,
-                        output_indexed,
-                        rhs: format!("{prefix}-family-{step}-body-{body_gate}-k-rhs"),
-                    });
-                }
-            }
-            ProgramCacheLocation::Lut { step, branch } => {
-                let entry = luts.iter_mut().find(|entry: &&mut ProgramCacheLutNames| {
-                    entry.step == step && entry.body_gate.is_none()
-                });
-                let entry = if let Some(entry) = entry {
-                    entry
-                } else {
-                    let width = match program.accumulation.steps().get(step) {
-                        Some(ProgramStep::Gate(Gate::Lut { lut, .. })) => program
-                            .accumulation
-                            .lut(*lut)
-                            .map(|table| table.values().len())
-                            .ok_or(RefreshSetupError::InvalidManifest)?,
-                        _ => return Err(RefreshSetupError::InvalidManifest),
-                    };
-                    luts.push(ProgramCacheLutNames {
-                        step,
-                        body_gate: None,
-                        count: 1,
-                        width,
-                        switch: format!("{prefix}-lut-{step}-lut-switch-family"),
-                        branch: format!("{prefix}-lut-{step}-lut-branch-family"),
-                    });
-                    luts.last_mut().expect("inserted LUT cache names")
-                };
-                match declaration.role {
-                    ProgramCacheRole::LutSwitch | ProgramCacheRole::LutBranch => {
-                        if branch >= entry.width {
-                            return Err(RefreshSetupError::InvalidManifest);
-                        }
-                    }
-                    _ => return Err(RefreshSetupError::InvalidManifest),
-                }
-            }
-            ProgramCacheLocation::FamilyLut { step, body_gate, branch } => {
-                let entry = luts.iter_mut().find(|entry: &&mut ProgramCacheLutNames| {
-                    entry.step == step && entry.body_gate == Some(body_gate)
-                });
-                let entry = if let Some(entry) = entry {
-                    entry
-                } else {
-                    let (body, width) = match program.accumulation.steps().get(step) {
-                        Some(ProgramStep::Family { body, .. }) => {
-                            let width = match body.gates().get(body_gate) {
-                                Some(Gate::Lut { lut, .. }) => program
-                                    .accumulation
-                                    .lut(*lut)
-                                    .map(|table| table.values().len())
-                                    .ok_or(RefreshSetupError::InvalidManifest)?,
-                                _ => return Err(RefreshSetupError::InvalidManifest),
-                            };
-                            (body, width)
-                        }
-                        _ => return Err(RefreshSetupError::InvalidManifest),
-                    };
-                    let _ = body;
-                    let block = program.accumulation.steps()[..step]
-                        .iter()
-                        .filter(|step| matches!(step, ProgramStep::Family { .. }))
-                        .count();
-                    let count = active
-                        .bucket_active_width(block)
-                        .ok_or(RefreshSetupError::InvalidManifest)?;
-                    luts.push(ProgramCacheLutNames {
-                        step,
-                        body_gate: Some(body_gate),
-                        count,
-                        width,
-                        switch: format!(
-                            "{prefix}-family-{step}-body-{body_gate}-lut-switch-family"
-                        ),
-                        branch: format!(
-                            "{prefix}-family-{step}-body-{body_gate}-lut-branch-family"
-                        ),
-                    });
-                    luts.last_mut().expect("inserted family LUT cache names")
-                };
-                if branch >= entry.width ||
-                    !matches!(
-                        declaration.role,
-                        ProgramCacheRole::LutSwitch | ProgramCacheRole::LutBranch
-                    )
-                {
-                    return Err(RefreshSetupError::InvalidManifest);
-                }
-            }
+impl RefreshPreprocessingArtifactNames {
+    /// Naming depends only on the committed setup identity and shared channel
+    /// schedule. Cryptographic parameter binding belongs to the adapter.
+    pub(crate) fn new(
+        identity: &[u8; 32],
+        slot_count: usize,
+        group_count: usize,
+        selector_gsw_name: String,
+    ) -> Self {
+        let prefix = hex(identity);
+        let n = |r: &str, i: usize| format!("mxx-refresh-{prefix}-{r}-{i}");
+        RefreshPreprocessingArtifactNames {
+            setup_secret_t: n("setup-secret-t", 0),
+            selector_gsw: selector_gsw_name,
+            state_scaling: (0..slot_count).map(|i| n("state-scaling-k-rhs", i)).collect(),
+            mask_route_rhs_decompositions: n("mask-route-k-rhs", 0),
+            fresh_route_rhs_decompositions: n("fresh-route-k-rhs", 0),
+            state_public_matrix: n("state-public", 0),
+            a_prime: n("a-prime", 0),
+            public_matrix_b: (0..group_count).map(|group| n("public-b", group)).collect(),
+            refresh_targets: (0..slot_count).map(|i| n("refresh-target", i)).collect(),
+            preimages: (0..slot_count).map(|i| n("preimage", i)).collect(),
+            readout: n("readout", 0),
         }
     }
-    Ok(ProgramCacheArtifactNames { gates, luts, families })
 }
 
-fn names_without_program_cache(
-    names: &RefreshPreprocessingArtifactNames,
-) -> RefreshPreprocessingArtifactNames {
-    let mut names = names.clone();
-    names.program_cache = ProgramCacheArtifactNames::default();
-    names
-}
-
-fn validate_program_cache_names(
-    names: &ProgramCacheArtifactNames,
-    setup_identity: [u8; 32],
-) -> Result<(), RefreshSetupError> {
-    let prefix = format!("mxx-refresh-{}-program-cache", hex(&setup_identity));
-    let mut gate_steps = BTreeMap::new();
-    for entry in &names.gates {
-        if gate_steps.insert(entry.step, ()).is_some() ||
-            entry.rhs != format!("{prefix}-gate-{}-k-rhs", entry.step)
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-    }
-    let mut family_keys = BTreeMap::new();
-    let mut lut_steps = BTreeMap::new();
-    for entry in &names.luts {
-        if entry.width == 0 ||
-            lut_steps.insert(entry.step, ()).is_some() ||
-            entry.switch != format!("{prefix}-lut-{}-lut-switch-family", entry.step) ||
-            entry.branch != format!("{prefix}-lut-{}-lut-branch-family", entry.step)
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-    }
-    for entry in &names.families {
-        if entry.count == 0 ||
-            family_keys.insert((entry.step, entry.body_gate), ()).is_some() ||
-            entry.rhs != format!("{prefix}-family-{}-body-{}-k-rhs", entry.step, entry.body_gate)
-        {
-            return Err(RefreshSetupError::IdentityMismatch);
-        }
-    }
-    Ok(())
-}
-/// Constructs the declaration committed by a preprocessing producer.
-fn make_declaration(
-    p: &RefreshSetupParameters,
-    contract: &RefreshPrfContract,
-    n: RefreshPreprocessingArtifactNames,
-    pbc_layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-    decoder_preimage_bound: &mxx_ir_core::IntExpr,
-    readout_identity: crate::noise_refresh::readout::ValueReadoutIdentity,
-    readout_helper_sigmas: Vec<usize>,
-) -> RefreshPreprocessingDeclaration {
-    RefreshPreprocessingDeclaration {
-        identity: setup_identity_digest(
-            p,
-            contract,
-            pbc_layout_id,
-            decoder_preimage_bound,
-            readout_identity,
-        ),
-        pbc_layout_id,
-        refresh_id: p.refresh_id,
-        program_id: contract.program_id(),
-        prf_q: contract.q(),
-        prf_p: contract.p(),
-        prf_native_width: contract.native_width(),
-        prf_ring_dimension: contract.ring_dimension(),
-        prf_output_wire: contract.output_wire(),
-        names: n,
-        slot_count: p.refresh.crt_plaintext_moduli.len(),
-        switch_moduli: p.switch_moduli.clone(),
-        component_count: p.component_count,
-        prf_component_count: p.prf_component_count(),
-        coefficient_count: p.coefficient_count,
-        mask_base_p_digit_counts: p.mask_base_p_digit_counts.clone(),
-        fresh_error_base_p_digit_count: p.fresh_error_base_p_digit_count,
-        mask_statistical_security_bits: p.mask_statistical_security_bits,
-        gadget_digit_count: p.layout.digit_count,
-        decoder_sigma: p.decoder_sigma.clone(),
-        decoder_preimage_bound: decoder_preimage_bound.clone(),
-        encoding_error_sigma: p.encoding_error_sigma.clone(),
-        encoding_error_bound: p.encoding_error_bound.clone(),
-        slot_scales: (0..p.refresh.crt_plaintext_moduli.len())
-            .map(|slot| p.refresh.scale_expression(slot).expect("validated scale"))
-            .collect(),
-        layout_modulus: p.layout.modulus.clone(),
-        layout_ring_dimension: p.layout.ring_dimension.clone(),
-        layout_gadget_base: p.layout.gadget_base.clone(),
-        readout_identity,
-        readout_helper_sigmas,
-    }
-}
-
-/// Reconstructs the committed PRF contract from an imported declaration.
-///
-/// This is used only to recompute the declaration identity; runtime output
-/// validation still originates from the independently constructed program.
-fn declaration_contract(declaration: &RefreshPreprocessingDeclaration) -> RefreshPrfContract {
-    RefreshPrfContract::from_parts(
-        declaration.program_id,
-        declaration.prf_output_wire,
-        declaration.prf_native_width,
-        declaration.prf_q,
-        declaration.prf_p,
-        declaration.prf_ring_dimension,
-    )
-}
-
-/// Exports producer wires under their canonical public/private artifact names.
-fn add_setup_outputs(
-    mut context: DslContext,
-    wires: &RefreshPreprocessingWires,
-    names: &RefreshPreprocessingArtifactNames,
-) -> Result<DslContext, RefreshSetupError> {
-    // The sampled K_t witnesses and setup secret t remain private artifacts.
-    // The state vector, online secret s, decoder anchor b, and PRF mask/fresh
-    // vectors are deliberately absent from this preprocessing graph.
-    context = context
-        .private_output(names.setup_secret_t.clone(), wires.setup_secret_t.clone())?
-        .public_output(names.selector_gsw.clone(), wires.selector_gsw.clone())?
-        .public_output(names.setup_public_key_rhs.clone(), wires.setup_public_key_rhs.clone())?
-        .public_output(
-            names.mask_route_rhs_decompositions.clone(),
-            wires.mask_route_rhs_decompositions.clone(),
-        )?
-        .public_output(
-            names.fresh_route_rhs_decompositions.clone(),
-            wires.fresh_route_rhs_decompositions.clone(),
-        )?
-        .public_output(names.state_public_matrix.clone(), wires.state.matrix.clone())?
-        .public_output(names.a_prime.clone(), wires.a_prime.clone())?;
-    for (name, public_b) in names.public_matrix_b.iter().zip(&wires.public_b) {
-        context = context.public_output(name.clone(), public_b.clone())?;
-    }
-    for (slot, target) in wires.refresh_targets.iter().enumerate() {
-        context = context.public_output(names.refresh_targets[slot].clone(), target.clone())?;
-    }
-    for (slot, decomposition) in wires.state_scaling.iter().enumerate() {
-        context =
-            context.public_output(names.state_scaling[slot].clone(), decomposition.clone())?;
-    }
-    for slot in 0..wires.masks.len() {
-        context =
-            context.private_output(names.preimages[slot].clone(), wires.preimages[slot].clone())?;
-    }
-    let readout = &names.readout;
-    context = context
-        .public_output(
-            readout.target_decomposition.clone(),
-            wires.readout_artifacts.target_decompositions().clone(),
-        )?
-        .public_output(
-            readout.normalization_decomposition.clone(),
-            wires.readout_artifacts.normalization_decomposition().clone(),
-        )?
-        .public_output(
-            readout.helper_switch_decompositions.clone(),
-            wires.readout_artifacts.helper_switch_decompositions().clone(),
-        )?
-        .public_output(
-            readout.helper_public_decompositions.clone(),
-            wires.readout_artifacts.helper_public_decompositions().clone(),
-        )?;
-    if !names.program_cache.gates.is_empty() || !names.program_cache.luts.is_empty() {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    for entry in &names.program_cache.families {
-        let (per_output_count, output_indexed, rhs) = wires
-            .program_cache
-            .family_entry(entry.step, entry.body_gate)
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        if per_output_count != entry.count || output_indexed != entry.output_indexed {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        context = context.public_output(entry.rhs.clone(), rhs.clone())?;
-    }
-    Ok(context)
-}
-
-/// Computes the canonical public identity for refresh preprocessing setup.
-///
-/// The digest includes dimensions, CRT data, PRF identity, decoder policy,
-/// and public artifact schema; private vectors, support, schedules, and
-/// plaintext values are deliberately excluded.
-fn identity_digest(
-    p: &RefreshSetupParameters,
-    contract: &RefreshPrfContract,
-    pbc_layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-    decoder_preimage_bound: &mxx_ir_core::IntExpr,
-) -> [u8; 32] {
-    #[derive(Serialize)]
-    struct Layout {
-        modulus: mxx_ir_core::IntExpr,
-        ring_dimension: mxx_ir_core::IntExpr,
-        secret_dimension: usize,
-        gadget_digit_count: usize,
-        gadget_base: mxx_ir_core::IntExpr,
-    }
-    #[derive(Serialize)]
-    struct Refresh {
-        full_modulus: mxx_ir_core::IntExpr,
-        crt_plaintext_moduli: Vec<mxx_ir_core::IntExpr>,
-        reconstruction_coefficients: Vec<mxx_ir_core::IntExpr>,
-    }
-    #[derive(Serialize)]
-    struct Payload<'a> {
-        schema: &'static str,
-        refresh_id: [u8; 32],
-        program_id: ExponentLutProgramId,
-        prf_q: usize,
-        prf_p: usize,
-        prf_native_width: usize,
-        prf_ring_dimension: usize,
-        prf_output_wire: crate::program::WireId,
-        pbc_layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-        name: &'a str,
-        base_p: usize,
-        component_count: usize,
-        prf_component_count: usize,
-        coefficient_count: usize,
-        mask_base_p_digit_counts: &'a [usize],
-        switch_moduli: &'a [BigUint],
-        fresh_error_base_p_digit_count: usize,
-        mask_statistical_security_bits: usize,
-        gadget_digit_count: usize,
-        lut_width: usize,
-        layout: Layout,
-        refresh: Refresh,
-        decoder_sigma: &'a mxx_ir_core::RealExpr,
-        decoder_preimage_bound: &'a mxx_ir_core::IntExpr,
-        encoding_error_sigma: &'a mxx_ir_core::RealExpr,
-        encoding_error_bound: &'a mxx_ir_core::IntExpr,
-    }
-    let payload = Payload {
-        schema: "mxx-exponent-lut/refresh-setup/v7",
-        refresh_id: p.refresh_id,
-        program_id: contract.program_id(),
-        prf_q: contract.q(),
-        prf_p: contract.p(),
-        prf_native_width: contract.native_width(),
-        prf_ring_dimension: contract.ring_dimension(),
-        prf_output_wire: contract.output_wire(),
-        pbc_layout_id,
-        name: &p.name,
-        base_p: p.base_p,
-        component_count: p.component_count,
-        prf_component_count: p.prf_component_count(),
-        coefficient_count: p.coefficient_count,
-        mask_base_p_digit_counts: &p.mask_base_p_digit_counts,
-        switch_moduli: &p.switch_moduli,
-        fresh_error_base_p_digit_count: p.fresh_error_base_p_digit_count,
-        mask_statistical_security_bits: p.mask_statistical_security_bits,
-        gadget_digit_count: p.layout.digit_count,
-        lut_width: p.lut_width,
-        layout: Layout {
-            modulus: p.layout.modulus.clone().canonicalize(),
-            ring_dimension: p.layout.ring_dimension.clone().canonicalize(),
-            secret_dimension: p.layout.secret_dimension,
-            gadget_digit_count: p.layout.digit_count,
-            gadget_base: p.layout.gadget_base.clone().canonicalize(),
-        },
-        refresh: Refresh {
-            full_modulus: p.refresh.full_modulus.clone().canonicalize(),
-            crt_plaintext_moduli: p
-                .refresh
-                .crt_plaintext_moduli
-                .iter()
-                .cloned()
-                .map(|value| value.canonicalize())
-                .collect(),
-            reconstruction_coefficients: p
-                .refresh
-                .reconstruction_coefficients
-                .iter()
-                .cloned()
-                .map(|value| value.canonicalize())
-                .collect(),
-        },
-        decoder_sigma: &p.decoder_sigma,
-        decoder_preimage_bound,
-        encoding_error_sigma: &p.encoding_error_sigma,
-        encoding_error_bound: &p.encoding_error_bound,
-    };
-    hash_canonical(&payload).expect("canonical refresh setup identity")
-}
-
-/// Extends the refresh identity with the exact value-form readout.  The
-/// legacy geometry identity remains available to noise planning, while the
-/// artifact declaration must also bind the readout table/trace semantics.
-fn setup_identity_digest(
-    p: &RefreshSetupParameters,
-    contract: &RefreshPrfContract,
-    pbc_layout_id: crate::noise_refresh::pbc::PbcLayoutId,
-    decoder_preimage_bound: &mxx_ir_core::IntExpr,
-    readout_identity: crate::noise_refresh::readout::ValueReadoutIdentity,
-) -> [u8; 32] {
-    #[derive(Serialize)]
-    struct Payload {
-        base: [u8; 32],
-        readout_identity: crate::noise_refresh::readout::ValueReadoutIdentity,
-    }
-    hash_canonical(&Payload {
-        base: identity_digest(p, contract, pbc_layout_id, decoder_preimage_bound),
-        readout_identity,
-    })
-    .expect("canonical refresh setup/readout identity")
-}
 fn hex(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn expected_setup_artifact_count(
-    slots: usize,
-    _helper_count: usize,
-    program_cache_artifact_count: usize,
-) -> Option<usize> {
-    10usize
-        .checked_add(slots.checked_mul(3)?)
-        .and_then(|count| count.checked_add(2))
-        .and_then(|count| count.checked_add(program_cache_artifact_count))
-}
-
-fn exact_family_count(actual: Option<usize>, expected_count: usize) -> bool {
-    actual == Some(expected_count)
-}
-
-/// Validates one setup helper's ordinary vector/public-matrix artifact pair.
-///
-/// Checks the imported artifact manifest against the declaration's role schema.
-fn validate_manifest(
+/// Checks concrete backend fields and typed PRF/readout ports using the same
+/// transport rules. Backend parameters and dimension formulas stay outside.
+pub(crate) fn validate_manifest<B, D: GraphValueSchema>(
     m: &Manifest,
-    n: &RefreshPreprocessingArtifactNames,
-    p: &RefreshSetupParameters,
+    readout_name: &str,
+    prepared_prf: &PreparedSparseLwrPrfDescriptor<B, D>,
+    mut fields: Vec<(String, ArtifactConfidentiality, ArtifactType, Option<usize>)>,
+    readout_schema: impl GraphValueSchema,
 ) -> Result<(), RefreshSetupError> {
-    let decoder_preimage_bound = p
-        .resolve_decoder_preimage_bound()?
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidManifest)?;
-    let ring_dimension = p
-        .layout
-        .ring_dimension
-        .evaluate(&ParamEnv::default())
-        .ok()
-        .and_then(|x| x.to_usize())
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let modulus = p
-        .layout
-        .modulus
-        .evaluate(&ParamEnv::default())
-        .map_err(|_| RefreshSetupError::InvalidManifest)?;
-    let matrix_type = |rows: usize, columns: usize| {
-        ArtifactType::Matrix(ConcreteMatrixType {
-            modulus: modulus.clone(),
-            ring_dimension,
-            rows,
-            columns,
+    let artifact_ports = |prefix: String, ports: Vec<WireType>| {
+        let arity = ports.len();
+        ports.into_iter().enumerate().map(move |(port, wire_type)| {
+            let name = if arity == 1 { prefix.clone() } else { format!("{prefix}.{port}") };
+            (name, wire_type)
         })
     };
-    let check_type = |name: &str,
-                      confidentiality: ArtifactConfidentiality,
-                      artifact_type: ArtifactType|
-     -> Result<(), RefreshSetupError> {
-        let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
-        if artifact.confidentiality != confidentiality ||
-            artifact.family_count.is_some() ||
-            artifact.artifact_type != artifact_type ||
-            (confidentiality == ArtifactConfidentiality::Private &&
-                artifact.content_hash.is_some()) ||
-            (confidentiality == ArtifactConfidentiality::Public &&
-                artifact.content_hash.is_none())
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        Ok(())
-    };
-    let slots = p.refresh.crt_plaintext_moduli.len();
-    let helper_count = p.lut_width.saturating_sub(1);
-    let output_count = refresh_prf_output_count(p)?;
-    let mask_route_count = refresh_route_family_count(p, &p.mask_base_p_digit_counts)?;
-    let fresh_route_count =
-        refresh_route_family_count(p, &vec![p.fresh_error_base_p_digit_count; slots])?;
-    let cols = p.layout.public_key_columns();
-    let check =
-        |name: &str, confidentiality: ArtifactConfidentiality, rows: usize, columns: usize| {
-            check_type(name, confidentiality, matrix_type(rows, columns))
-        };
-    let check_preimage = |name: &str, ring_modulus: BigInt, rows: usize, columns: usize| {
-        check_type(
-            name,
-            ArtifactConfidentiality::Private,
-            ArtifactType::Preimage {
-                matrix: ConcreteMatrixType { modulus: ring_modulus, ring_dimension, rows, columns },
-                max_coefficient_bound: decoder_preimage_bound.clone(),
-            },
+    let public_ports = artifact_ports(readout_name.to_owned(), readout_schema.wire_types()).chain(
+        prepared_prf
+            .artifacts()
+            .flat_map(|(name, schema)| artifact_ports(name, schema.wire_types())),
+    );
+    for (name, wire_type) in public_ports {
+        let concrete = mxx_ir_core::validate::concretize_wire_type(
+            &wire_type,
+            &ParamEnv::default(),
+            &FrozenGraphScopeId::Root,
+            NodeId(0),
         )
-    };
-    // In addition to refresh/readout material, the producer exports the
-    // setup-only `t` and the selector GSW family. Both are protocol setup
-    // artifacts (the latter public); neither is a decomposition cache.
-    let program_cache_artifact_count = n
-        .program_cache
-        .gates
-        .len()
-        .checked_add(n.program_cache.luts.iter().map(|_| 2).sum::<usize>())
-        .and_then(|count| count.checked_add(n.program_cache.families.len()))
-        .ok_or(RefreshSetupError::InvalidManifest)?;
-    let expected_artifact_count =
-        expected_setup_artifact_count(slots, helper_count, program_cache_artifact_count)
-            .and_then(|count| count.checked_add(p.anchor_groups().len().checked_sub(1)?))
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-    if m.artifacts.len() != expected_artifact_count {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    if n.preimages.len() != slots {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    check(&n.setup_secret_t, ArtifactConfidentiality::Private, 1, p.layout.secret_dimension)?;
-    let selector = m.artifacts.get(&n.selector_gsw).ok_or(RefreshSetupError::InvalidManifest)?;
-    let active_count = match selector.family_count {
-        Some(count) if count != 0 => count,
-        _ => return Err(RefreshSetupError::InvalidManifest),
-    };
-    if selector.confidentiality != ArtifactConfidentiality::Public ||
-        !matches!(selector.artifact_type, ArtifactType::Matrix(_)) ||
-        selector.content_hash.is_none()
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let setup_public_key_count =
-        output_count.checked_mul(active_count).ok_or(RefreshSetupError::InvalidManifest)?;
-    check(&n.state_public_matrix, ArtifactConfidentiality::Public, p.component_count, cols)?;
-    check(&n.a_prime, ArtifactConfidentiality::Public, p.component_count, cols)?;
-    let groups = p.anchor_groups();
-    if n.public_matrix_b.len() != groups.len() {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    for (group, (group_modulus, slots)) in groups.iter().enumerate() {
-        let b_columns = p.component_count * (p.decoder_digit_count(slots[0])? + 2);
-        check_type(
-            &n.public_matrix_b[group],
-            ArtifactConfidentiality::Public,
-            ArtifactType::Matrix(ConcreteMatrixType {
-                modulus: BigInt::from(group_modulus.clone()),
-                ring_dimension,
-                rows: p.component_count,
-                columns: b_columns,
-            }),
-        )?;
-    }
-    if n.refresh_targets.len() != slots {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    for (slot, name) in n.refresh_targets.iter().enumerate() {
-        check_type(
-            name,
-            ArtifactConfidentiality::Public,
-            ArtifactType::Matrix(ConcreteMatrixType {
-                modulus: BigInt::from(p.switch_moduli[slot].clone()),
-                ring_dimension,
-                rows: p.component_count,
-                columns: cols,
-            }),
-        )?;
-    }
-    for (slot, preimage) in n.preimages.iter().enumerate() {
-        let b_columns = p.component_count * (p.decoder_digit_count(slot)? + 2);
-        check_preimage(preimage, BigInt::from(p.switch_moduli[slot].clone()), b_columns, cols)?;
-    }
-    let gadget_base = p
-        .layout
-        .gadget_base
-        .evaluate(&ParamEnv::default())
         .map_err(|_| RefreshSetupError::InvalidManifest)?;
-    let readout_bound = gadget_base.clone() / BigInt::from(2u8);
-    let check_readout_preimage = |name: &str| {
-        check_type(
-            name,
-            ArtifactConfidentiality::Public,
-            ArtifactType::Preimage {
-                matrix: ConcreteMatrixType {
-                    modulus: modulus.clone(),
-                    ring_dimension,
-                    rows: p
-                        .component_count
-                        .checked_mul(p.layout.digit_count)
-                        .ok_or(RefreshSetupError::InvalidManifest)?,
-                    columns: cols,
-                },
-                max_coefficient_bound: readout_bound.clone(),
-            },
-        )
-    };
-    for (name, expected_count) in [
-        (&n.readout.target_decomposition, output_count),
-        (&n.readout.helper_switch_decompositions, helper_count),
-        (
-            &n.readout.helper_public_decompositions,
-            output_count.checked_mul(helper_count).ok_or(RefreshSetupError::InvalidManifest)?,
-        ),
-    ] {
-        let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
-        if artifact.confidentiality != ArtifactConfidentiality::Public ||
-            artifact.family_count != Some(expected_count) ||
-            artifact.artifact_type !=
-                (ArtifactType::Preimage {
-                    matrix: ConcreteMatrixType {
-                        modulus: modulus.clone(),
-                        ring_dimension,
-                        rows: p
-                            .component_count
-                            .checked_mul(p.layout.digit_count)
-                            .ok_or(RefreshSetupError::InvalidManifest)?,
-                        columns: cols,
-                    },
-                    max_coefficient_bound: readout_bound.clone(),
-                }) ||
-            artifact.content_hash.is_none()
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-    }
-    check_readout_preimage(&n.readout.normalization_decomposition)?;
-    let cache_bound = gadget_base / BigInt::from(2u8);
-    let cache_matrix = ConcreteMatrixType {
-        modulus: modulus.clone(),
-        ring_dimension,
-        rows: p
-            .component_count
-            .checked_mul(p.layout.digit_count)
-            .ok_or(RefreshSetupError::InvalidManifest)?,
-        columns: cols,
-    };
-    let setup_public_key_rhs =
-        m.artifacts.get(&n.setup_public_key_rhs).ok_or(RefreshSetupError::InvalidManifest)?;
-    if setup_public_key_rhs.confidentiality != ArtifactConfidentiality::Public ||
-        !exact_family_count(setup_public_key_rhs.family_count, setup_public_key_count) ||
-        setup_public_key_rhs.artifact_type !=
-            (ArtifactType::Preimage {
-                matrix: cache_matrix.clone(),
-                max_coefficient_bound: cache_bound.clone(),
-            }) ||
-        setup_public_key_rhs.content_hash.is_none()
-    {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    let check_cache = |name: &str, family_count: Option<usize>| {
-        let artifact = m.artifacts.get(name).ok_or(RefreshSetupError::InvalidManifest)?;
-        if artifact.confidentiality != ArtifactConfidentiality::Public ||
-            artifact.artifact_type !=
-                (ArtifactType::Preimage {
-                    matrix: cache_matrix.clone(),
-                    max_coefficient_bound: cache_bound.clone(),
-                }) ||
-            artifact.family_count != family_count ||
-            artifact.content_hash.is_none()
-        {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        Ok::<(), RefreshSetupError>(())
-    };
-    if !n.program_cache.gates.is_empty() || !n.program_cache.luts.is_empty() {
-        return Err(RefreshSetupError::InvalidManifest);
-    }
-    for entry in &n.program_cache.families {
-        if entry.count == 0 {
-            return Err(RefreshSetupError::InvalidManifest);
-        }
-        let count = if entry.output_indexed {
-            output_count.checked_mul(entry.count).ok_or(RefreshSetupError::InvalidManifest)?
-        } else {
-            entry.count
+        let (element, count) = match &concrete {
+            mxx_ir_core::types::ConcreteWireType::IndexedFamily { element, count } => {
+                (element.as_ref(), Some(*count))
+            }
+            scalar => (scalar, None),
         };
-        check_cache(&entry.rhs, Some(count))?;
+        let expected =
+            ArtifactType::from_wire_type(element).ok_or(RefreshSetupError::InvalidManifest)?;
+        fields.push((name, ArtifactConfidentiality::Public, expected, count));
     }
-    for name in &n.state_scaling {
-        check_cache(name, None)?;
+    if m.artifacts.len() != fields.len() {
+        return Err(RefreshSetupError::InvalidManifest);
     }
-    for (name, expected_count) in [
-        (&n.mask_route_rhs_decompositions, mask_route_count),
-        (&n.fresh_route_rhs_decompositions, fresh_route_count),
-    ] {
-        let artifact = m.artifacts.get(name.as_str()).ok_or(RefreshSetupError::InvalidManifest)?;
-        if artifact.confidentiality != ArtifactConfidentiality::Public ||
-            !exact_family_count(artifact.family_count, expected_count) ||
-            artifact.artifact_type !=
-                (ArtifactType::Preimage {
-                    matrix: cache_matrix.clone(),
-                    max_coefficient_bound: cache_bound.clone(),
-                }) ||
-            artifact.content_hash.is_none()
+    for (name, confidentiality, expected, count) in fields {
+        let artifact = m.artifacts.get(&name).ok_or(RefreshSetupError::InvalidManifest)?;
+        if artifact.artifact_type != expected ||
+            artifact.family_count != count ||
+            artifact.confidentiality != confidentiality ||
+            artifact.content_hash.is_some() !=
+                (confidentiality == ArtifactConfidentiality::Public)
         {
             return Err(RefreshSetupError::InvalidManifest);
         }
@@ -4612,13 +699,13 @@ fn validate_manifest(
     Ok(())
 }
 
-/// The graph values produced by [`build_refresh_verification`].  This is a
-/// verification circuit boundary, not a decryption API: the caller supplies
-/// the expected plaintext and decides how to consume the decoded outputs.
-pub struct RefreshVerification {
-    encoding_vector: Mat,
-    anchor: Mat,
-    residual: Mat,
+/// Verification graph outputs and their exact threshold-decoder operands.
+/// The backend supplies its encoding relation and scalar residual components;
+/// this boundary connects them to decoders without changing the row carrier.
+pub struct RefreshVerification<V: mxx_dsl::GraphValue> {
+    encoding_vector: V,
+    anchor: V,
+    residual: V,
     /// The exact scalar matrix passed as the input to each threshold decoder,
     /// in public-key-column order.  Keeping these wires prevents consumers
     /// from reconstructing an equivalent-looking slice and accidentally
@@ -4627,15 +714,42 @@ pub struct RefreshVerification {
     decoded: Vec<Bool>,
 }
 
-impl RefreshVerification {
-    /// The exact residual `c - sA + mu*(tG)`, where `s` is the mask secret
-    /// and `t` is the payload secret.
-    pub fn residual(&self) -> &Mat {
+impl<V: mxx_dsl::GraphValue> RefreshVerification<V> {
+    /// The backend constructs the relation residual and its scalar components
+    /// together. The same component handles are retained and passed to the
+    /// threshold decoders, so output linkage never reconstructs those operands.
+    /// `decode_length` is positive under the setup construction contract.
+    pub fn new(
+        encoding_vector: V,
+        anchor: V,
+        residual: V,
+        decoder_residuals: Vec<Mat>,
+        plaintext_modulus: impl Into<IntExpr>,
+        decode_length: usize,
+    ) -> Result<Self, RefreshSetupError> {
+        let decoded_count = decoder_residuals
+            .len()
+            .checked_mul(decode_length)
+            .ok_or(RefreshSetupError::InvalidParameters("decoded output count overflow"))?;
+        let plaintext_modulus = plaintext_modulus.into();
+        let mut decoded = Vec::with_capacity(decoded_count);
+        for scalar_residual in &decoder_residuals {
+            decoded.extend(
+                scalar_residual
+                    .clone()
+                    .threshold_decode_bools(plaintext_modulus.clone(), decode_length),
+            );
+        }
+        Ok(Self { encoding_vector, anchor, residual, decoder_residuals, decoded })
+    }
+
+    /// The relation residual in the backend's original graph-value carrier.
+    pub fn residual(&self) -> &V {
         &self.residual
     }
 
     /// Returns the exact threshold-decoder operands, one 1x1 matrix per
-    /// public-key column, in column order.
+    /// residual component, in canonical order.
     ///
     /// These are the same wires consumed by the `ThresholdDecode` nodes that
     /// produce [`Self::decoded`].  The returned slice is borrowed from the
@@ -4704,107 +818,6 @@ impl RefreshVerification {
     }
 }
 
-/// Builds the noiseless refresh verification residual and threshold decoder.
-///
-/// The expected plaintext is explicit and is never read from
-/// `BggEncodingWire::plaintext`.  All arithmetic is ordinary matrix
-/// multiplication, matching the separate-secret BGG+ relation
-/// `c' = sA' - X^w*(tG) + e'`: the mask secret `s` is used for the public-key
-/// term and the payload secret `t` is used for the gadget term. The supplied
-/// `expected_plaintext` is the scalar/monomial `X^w` multiplier in that
-/// residual, so the noiseless check is `c' - sA' + X^w(tG) = 0`.
-///
-/// Threshold decoding is scalar-only.  Since a BGG+ residual has one row and
-/// one column per public-key column, this function slices each concrete
-/// residual column to a 1x1 matrix before decoding it.  The returned Boolean
-/// values are flattened in column-major, then coefficient order.  A `true`
-/// value means that the corresponding residual decoded as nonzero.
-pub fn build_refresh_verification(
-    encoding: &BggEncodingWire,
-    public_key: &Mat,
-    mask_secret: &Mat,
-    payload_secret: &Mat,
-    expected_plaintext: &Mat,
-    gadget_base: impl Into<mxx_ir_core::IntExpr>,
-    gadget_digit_count: usize,
-    plaintext_modulus: impl Into<mxx_ir_core::IntExpr>,
-    decode_length: usize,
-) -> Result<RefreshVerification, RefreshSetupError> {
-    let scalar = expected_plaintext.matrix_type();
-    if scalar.rows != 1.into() || scalar.columns != 1.into() {
-        return Err(RefreshSetupError::InvalidParameters("expected plaintext must be 1x1"));
-    }
-    let gadget = public_key.matrix_type();
-    let expected_vector = mxx_ir_core::types::MatrixType {
-        modulus: gadget.modulus.clone(),
-        ring_dimension: gadget.ring_dimension.clone(),
-        rows: 1.into(),
-        columns: gadget.columns.clone(),
-    };
-    let secret_shape_matches = |secret: &Mat| {
-        secret.matrix_type().rows == 1.into() &&
-            secret.matrix_type().columns.evaluate(&ParamEnv::default()).ok() ==
-                gadget.rows.evaluate(&ParamEnv::default()).ok() &&
-            secret.matrix_type().modulus.evaluate(&ParamEnv::default()).ok() ==
-                gadget.modulus.evaluate(&ParamEnv::default()).ok() &&
-            secret.matrix_type().ring_dimension.evaluate(&ParamEnv::default()).ok() ==
-                gadget.ring_dimension.evaluate(&ParamEnv::default()).ok()
-    };
-    if !same_matrix_type(encoding.vector.matrix_type(), &expected_vector) ||
-        !secret_shape_matches(mask_secret) ||
-        !secret_shape_matches(payload_secret)
-    {
-        return Err(RefreshSetupError::InvalidParameters(
-            "mask and payload secrets must both be 1 x gadget-row matrices compatible with the encoding",
-        ));
-    }
-    let public_key_columns = public_key
-        .matrix_type()
-        .columns
-        .evaluate(&ParamEnv::default())
-        .ok()
-        .and_then(|value| value.to_usize())
-        .ok_or(RefreshSetupError::InvalidParameters(
-            "public-key column count must be concrete and fit usize",
-        ))?;
-    if public_key_columns == 0 || decode_length == 0 {
-        return Err(RefreshSetupError::InvalidParameters(
-            "verification requires positive public-key columns and decode length",
-        ));
-    }
-    let decoded_count = public_key_columns
-        .checked_mul(decode_length)
-        .ok_or(RefreshSetupError::InvalidParameters("decoded output count overflow"))?;
-    let ring = mxx_dsl::Ring::new(
-        public_key.matrix_type().modulus.clone(),
-        public_key.matrix_type().ring_dimension.clone(),
-    );
-    let g = ring.gadget(mask_secret.matrix_type().columns.clone(), gadget_base, gadget_digit_count);
-    let anchor = mask_secret.clone() * public_key.clone() -
-        expected_plaintext.clone() * (payload_secret.clone() * g);
-    let residual = encoding.vector.clone() - anchor.clone();
-    let plaintext_modulus = plaintext_modulus.into();
-    let mut decoder_residuals = Vec::with_capacity(public_key_columns);
-    let mut decoded = Vec::with_capacity(decoded_count);
-    for column in 0..public_key_columns {
-        let scalar_residual = residual.clone().slice(
-            None,
-            Some(mxx_ir_core::node::IndexRange { start: column.into(), end: (column + 1).into() }),
-        );
-        decoder_residuals.push(scalar_residual.clone());
-        decoded.extend(
-            scalar_residual.threshold_decode_bools(plaintext_modulus.clone(), decode_length),
-        );
-    }
-    Ok(RefreshVerification {
-        encoding_vector: encoding.vector.clone(),
-        anchor,
-        residual,
-        decoder_residuals,
-        decoded,
-    })
-}
-
 /// Exact matrix facts exported for request-level external-input validation.
 /// BuiltGraph and declaration validation occurs while the
 /// simulation bundle is constructed; these facts do not define operational
@@ -4850,107 +863,40 @@ pub struct RefreshSimulationDecoderTarget {
 
 /// Opaque request for the honest parameter-search construction.
 ///
-/// The trusted key provider supplies the validated setup, sparse-LWR profile,
+/// The trusted key provider supplies the validated setup, sparse-LWR Program,
 /// generated PBC layout, and key identity.  Sampling, selector construction,
 /// preprocessing, refresh, and verification are intentionally kept inside the
 /// consuming [`RefreshParameterSimulationBundle`] builder.
 pub struct RefreshParameterSimulationRequest {
-    setup: RefreshSetupParameters,
-    profile: SparseLwrPrfProfile,
+    setup: BggRefreshParameters,
+    program: SparseLwrPrfProgram,
     generated_layout: crate::noise_refresh::pbc::PbcGeneratedKeyLayout,
     key_instance_id: [u8; 32],
     expected_plaintext: Mat,
     decode_length: usize,
 }
 
-/// Samples the setup public-key family at hash indices `1..=active_count` and
-/// derives its deterministic gadget decompositions without projecting family
-/// members into Rust. Index zero remains reserved exactly as in
-/// [`mxx_bgg::BggPublicKeySampler::sample`].
-fn sample_setup_public_key_families(
-    sampler: &mxx_bgg::BggPublicKeySampler,
-    hash_key: Bytes,
-    active_count: usize,
-) -> Result<(Family<Mat>, Family<Preimage>), RefreshSetupError> {
-    let sampled = sampler.sample_family(
-        hash_key,
-        b"refresh-parameter-search-setup-keys".as_slice(),
-        active_count.checked_add(1).ok_or(RefreshSetupError::InvalidManifest)?,
-        sampler.layout.public_key_columns(),
-    )?;
-    let indices = mxx_dsl::parallel(active_count, |index| Ok(index.clone().add(Int::constant(1))))?;
-    let public_keys = {
-        let source_family = sampled.field(|key| key.matrix)?;
-        let gather_indices = indices;
-        mxx_dsl::parallel(gather_indices.count().clone(), |family_index| {
-            Ok(source_family.at(gather_indices.at(&family_index)))
-        })
-    }?;
-    let decompositions = {
-        let source_family = public_keys.clone();
-        mxx_dsl::parallel(source_family.count().clone(), |family_index| {
-            let matrix = source_family.at(&family_index);
-            let _ = family_index;
-            Ok(matrix.decompose(
-                sampler.layout.gadget_base.clone(),
-                IntExpr::constant(sampler.layout.digit_count),
-            ))
-        })
-    }?;
-    Ok((public_keys, decompositions))
-}
-
-/// Samples an online public-exponent input directly from the cached RHS
-/// decomposition.  Since `G*K_rhs = A`, the expression is
-/// `(sG)*K_rhs - x*(sG) + e`; no public matrix is reconstructed online.
-/// The label's public monomial encoding uses the same online secret `s` for
-/// both mask and payload. The private accumulator separately uses setup `t`.
-fn sample_online_label_vector_from_preimage(
-    sampler: &ExponentLutEncodingSampler,
-    online_secret_s: &Mat,
-    decomposition: mxx_dsl::Preimage,
-    plaintext: Mat,
-) -> Result<Mat, RefreshSetupError> {
-    let ring = sampler.layout.ring();
-    let gadget = ring.gadget(
-        sampler.layout.secret_dimension,
-        sampler.layout.gadget_base.clone(),
-        sampler.layout.digit_count,
-    );
-    let mask_secret_gadget = online_secret_s.clone() * gadget.clone();
-    let payload_secret_gadget = online_secret_s.clone() * gadget;
-    let public_term = decomposition.mul_small_rhs(mask_secret_gadget);
-    let error = match (&sampler.gaussian_sigma, &sampler.gaussian_max_coefficient_bound) {
-        (Some(sigma), Some(bound)) => {
-            ring.gaussian((1, sampler.layout.public_key_columns()), sigma.clone(), bound.clone())
-        }
-        (None, None) => ring.zero((1, sampler.layout.public_key_columns())),
-        _ => return Err(RefreshSetupError::InvalidManifest),
-    };
-    Ok(public_term - plaintext * payload_secret_gadget + error)
-}
-
 impl RefreshParameterSimulationRequest {
     /// Creates a request after checking all cross-layer dimensions and the
-    /// selected decoder cutoff against the official policy. The sparse support and one-hot
-    /// schedule remain private inside the generated PBC layout.
+    /// selected decoder cutoff against the official policy. Decoder sampling
+    /// parameters come exclusively from `setup`; the request keeps that
+    /// validated value private until graph construction consumes it.
+    /// The sparse support and one-hot schedule remain private inside the generated PBC layout.
     /// Verification builds encode `expected_plaintext` as the initial state
     /// and independently use it in the output relation. Benchmark-only builds
     /// retain the fixed identity attribute and do not construct this oracle.
     pub fn new(
-        setup: RefreshSetupParameters,
-        profile: SparseLwrPrfProfile,
+        setup: BggRefreshParameters,
+        program: SparseLwrPrfProgram,
         generated_layout: crate::noise_refresh::pbc::PbcGeneratedKeyLayout,
         key_instance_id: [u8; 32],
-        decoder_sigma: mxx_ir_core::RealExpr,
         expected_plaintext: Mat,
         decode_length: usize,
     ) -> Result<Self, RefreshSetupError> {
+        let profile = program.profile();
         setup.validate()?;
-        if setup.decoder_sigma != decoder_sigma || decode_length == 0 {
-            return Err(RefreshSetupError::InvalidParameters(
-                "decoder sigma or decode length does not match setup",
-            ));
+        if decode_length == 0 {
+            return Err(RefreshSetupError::InvalidParameters("decode length must be positive"));
         }
         generated_layout
             .public_layout
@@ -4976,7 +922,7 @@ impl RefreshParameterSimulationRequest {
         }
         Ok(Self {
             setup,
-            profile,
+            program,
             generated_layout,
             key_instance_id,
             expected_plaintext,
@@ -5002,220 +948,19 @@ impl RefreshParameterSimulationRequest {
     ///
     /// Parameter search uses this path before a candidate is selected.  It
     /// derives the same compact decomposition plans and refresh descriptors
-    /// as [`RefreshPreprocessingProducer::noise_snapshot_plans`], but does not
+    /// as [`RefreshPreprocessingProducer`], but does not
     /// lower the label-major PRF family or construct executable graph stages.
     /// The full graph remains available through [`Self::build`] and
     /// [`Self::build_benchmark`] for the selected candidate and benchmark.
-    pub fn build_noise_snapshot_only(self) -> Result<ExponentLutNoiseSnapshot, RefreshSetupError> {
-        let setup = self.setup;
-        setup.validate()?;
-        let pbc_layout = self.generated_layout.public_layout;
-        pbc_layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let program = SparseLwrPrfProgram::new(
-            self.profile,
-            pbc_layout.bucket_width,
-            pbc_layout.parameters.bucket_count,
-        )?;
-        let active_cells = PbcActiveCellIndex::build(&pbc_layout)
+    pub fn build_noise_snapshot_only(self) -> Result<BggNoiseSnapshot, RefreshSetupError> {
+        let layout = &self.generated_layout.public_layout;
+        let active_cells = PbcActiveCellIndex::build(layout)
             .map_err(|_| RefreshSetupError::InvalidParameters("invalid PBC active-cell index"))?;
-        let readout_schema = compact_readout_plan_schema(&setup, &program)?;
-        let (gain_plan, route_decompositions) = compact_noise_snapshot_plans(
-            &setup,
-            &program,
-            &pbc_layout,
+        self.setup.build_noise_snapshot_from_public_layout(
+            &self.program,
+            layout,
             &active_cells,
-            &readout_schema,
-        )?;
-        setup.build_noise_snapshot(program, &pbc_layout, gain_plan, route_decompositions)
-    }
-
-    /// Builds the compact application-specific noise snapshot from a validated
-    /// public PBC layout without constructing the private schedule or any
-    /// executable graph.  Parameter search uses this entry point after it has
-    /// cached the candidate's immutable layout context.
-    pub fn build_noise_snapshot_from_public_layout(
-        setup: RefreshSetupParameters,
-        profile: SparseLwrPrfProfile,
-        pbc_layout: &PbcPublicLayout,
-        active_cells: &PbcActiveCellIndex,
-    ) -> Result<ExponentLutNoiseSnapshot, RefreshSetupError> {
-        setup.validate()?;
-        pbc_layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let program = SparseLwrPrfProgram::new(
-            profile,
-            pbc_layout.bucket_width,
-            pbc_layout.parameters.bucket_count,
-        )?;
-        let readout_schema = compact_readout_plan_schema(&setup, &program)?;
-        let (gain_plan, route_decompositions) = compact_noise_snapshot_plans(
-            &setup,
-            &program,
-            pbc_layout,
-            &active_cells,
-            &readout_schema,
-        )?;
-        setup.build_noise_snapshot(program, pbc_layout, gain_plan, route_decompositions)
-    }
-
-    /// Returns the invariant gate/readout plan for a validated public layout.
-    /// This is used by search to avoid regenerating decomposition plans while
-    /// it scans mask digit counts.
-    pub fn noise_gain_plan_from_public_layout(
-        setup: &RefreshSetupParameters,
-        profile: SparseLwrPrfProfile,
-        pbc_layout: &PbcPublicLayout,
-        active_cells: &PbcActiveCellIndex,
-    ) -> Result<crate::noise_refresh::simulation::NoiseGainPlan, RefreshSetupError> {
-        setup.validate()?;
-        pbc_layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let program = SparseLwrPrfProgram::new(
-            profile,
-            pbc_layout.bucket_width,
-            pbc_layout.parameters.bucket_count,
-        )?;
-        let readout_schema = compact_readout_plan_schema(setup, &program)?;
-        compact_noise_snapshot_plans(setup, &program, pbc_layout, active_cells, &readout_schema)
-            .map(|(gain_plan, _)| gain_plan)
-    }
-
-    /// Returns the invariant decomposition routes together with their gain
-    /// plan.  The caller may reuse these routes while scanning `d_m`; only the
-    /// P-adic mask route changes with that parameter.
-    pub fn noise_gain_and_route_invariants_from_public_layout(
-        setup: &RefreshSetupParameters,
-        profile: SparseLwrPrfProfile,
-        pbc_layout: &PbcPublicLayout,
-        active_cells: &PbcActiveCellIndex,
-    ) -> Result<
-        (crate::noise_refresh::simulation::NoiseGainPlan, RefreshNoiseGainDecompositions),
-        RefreshSetupError,
-    > {
-        setup.validate()?;
-        pbc_layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let program = SparseLwrPrfProgram::new(
-            profile,
-            pbc_layout.bucket_width,
-            pbc_layout.parameters.bucket_count,
-        )?;
-        let readout_schema = compact_readout_plan_schema(setup, &program)?;
-        compact_noise_snapshot_plans(setup, &program, pbc_layout, active_cells, &readout_schema)
-    }
-
-    /// Derives the exact aggregate mask route gain for one `d_m` without
-    /// constructing a program, snapshot, or executable graph.  This is the
-    /// only route component that changes during a mask-digit scan.
-    pub fn mask_route_gain_for_digit_count(
-        setup: &RefreshSetupParameters,
-        mask_digit_count: usize,
-    ) -> Result<Vec<crate::noise::RightActionNoiseGain>, RefreshSetupError> {
-        let mut candidate = setup.clone();
-        candidate.mask_base_p_digit_counts.fill(mask_digit_count);
-        let (plans, multiplicity) = compact_mask_routes(&candidate)?;
-        plans
-            .iter()
-            .map(|plans| {
-                let gains =
-                    crate::noise_refresh::simulation::NoiseGainPlanBuilder::derive_route_gains(
-                        plans,
-                    )
-                    .map_err(|_| RefreshSetupError::InvalidParameters("invalid mask route plan"))?;
-                let mut aggregate =
-                    crate::noise::RightActionNoiseGain { l1: 0u8.into(), l2_squared: 0u8.into() };
-                for gain in gains {
-                    aggregate.l1 += gain.l1 * multiplicity;
-                    aggregate.l2_squared += gain.l2_squared * multiplicity;
-                }
-                Ok(aggregate)
-            })
-            .collect()
-    }
-
-    /// Builds a compact snapshot with a previously derived invariant plan.
-    /// Only the `d_m`-dependent route decompositions are rebuilt.
-    pub fn build_noise_snapshot_from_public_layout_with_gain_plan(
-        setup: RefreshSetupParameters,
-        profile: SparseLwrPrfProfile,
-        pbc_layout: &PbcPublicLayout,
-        active_cells: &PbcActiveCellIndex,
-        gain_plan: &crate::noise_refresh::simulation::NoiseGainPlan,
-    ) -> Result<ExponentLutNoiseSnapshot, RefreshSetupError> {
-        setup.validate()?;
-        pbc_layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let program = SparseLwrPrfProgram::new(
-            profile,
-            pbc_layout.bucket_width,
-            pbc_layout.parameters.bucket_count,
-        )?;
-        let readout_schema = compact_readout_plan_schema(&setup, &program)?;
-        let routes = compact_noise_snapshot_routes(&setup, &readout_schema)?;
-        if active_cells.bucket_active_widths().count() != pbc_layout.cells.len() {
-            return Err(RefreshSetupError::InvalidParameters(
-                "PBC active-cell index shape mismatch",
-            ));
-        }
-        setup.build_noise_snapshot(program, pbc_layout, gain_plan.clone(), routes)
-    }
-
-    /// Builds a compact snapshot using cached state/fresh/decoder routes.  A
-    /// new mask route is constructed for the setup's current `d_m`, preserving
-    /// the exact route schema while avoiding repeated invariant decomposition.
-    pub fn build_noise_snapshot_from_public_layout_with_cached_routes(
-        setup: RefreshSetupParameters,
-        profile: SparseLwrPrfProfile,
-        pbc_layout: &PbcPublicLayout,
-        active_cells: &PbcActiveCellIndex,
-        gain_plan: &crate::noise_refresh::simulation::NoiseGainPlan,
-        invariant_routes: &RefreshNoiseGainDecompositions,
-    ) -> Result<ExponentLutNoiseSnapshot, RefreshSetupError> {
-        setup.validate()?;
-        pbc_layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let program = SparseLwrPrfProgram::new(
-            profile,
-            pbc_layout.bucket_width,
-            pbc_layout.parameters.bucket_count,
-        )?;
-        if active_cells.bucket_active_widths().count() != pbc_layout.cells.len() {
-            return Err(RefreshSetupError::InvalidParameters(
-                "PBC active-cell index shape mismatch",
-            ));
-        }
-        if invariant_routes.state_scaling.len() != setup.refresh.crt_plaintext_moduli.len() ||
-            invariant_routes.fresh.len() != setup.refresh.crt_plaintext_moduli.len() ||
-            invariant_routes.decoder.len() != setup.refresh.crt_plaintext_moduli.len()
-        {
-            return Err(RefreshSetupError::InvalidParameters(
-                "cached refresh route slot count mismatch",
-            ));
-        }
-        let (mask, mask_multiplicity) = compact_mask_routes(&setup)?;
-        let decoder_schema = compact_readout_plan_schema(&setup, &program)?;
-        let base = setup
-            .layout
-            .gadget_base
-            .evaluate(&ParamEnv::default())
-            .ok()
-            .and_then(|value| value.to_biguint())
-            .ok_or(RefreshSetupError::InvalidParameters("invalid gadget base"))?;
-        let decoder = decoder_schema
-            .decoder
-            .iter()
-            .map(|schema| bounded_plan_from_schema(&base, schema))
-            .collect::<Result<Vec<_>, _>>()?;
-        let routes = RefreshNoiseGainDecompositions {
-            state_scaling: invariant_routes.state_scaling.clone(),
-            mask,
-            mask_multiplicity,
-            fresh: invariant_routes.fresh.clone(),
-            fresh_multiplicity: invariant_routes.fresh_multiplicity.clone(),
-            decoder,
-        };
-        let family_active_counts = active_cells.bucket_active_widths().collect::<Vec<_>>();
-        setup.build_noise_snapshot_with_family_active_counts(
-            program,
-            pbc_layout,
-            gain_plan.clone(),
-            routes,
-            family_active_counts,
+            None,
         )
     }
 
@@ -5223,11 +968,11 @@ impl RefreshParameterSimulationRequest {
         self,
         benchmark_only: bool,
     ) -> Result<RefreshParameterSimulationBundle, RefreshSetupError> {
-        let profile = self.profile;
+        let program = self.program;
+        let profile = program.profile();
         let setup = self.setup;
-        setup.validate()?;
+        // The request owns parameters and layout validated by its constructor.
         let layout = self.generated_layout.public_layout.clone();
-        layout.validate().map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
         let ring = setup.layout.ring();
         let hash_key = ring.bytes_input("refresh-parameter-search-hash-key", 32);
         let sampler = ExponentLutEncodingSampler {
@@ -5247,38 +992,42 @@ impl RefreshParameterSimulationRequest {
             self.key_instance_id,
         )
         .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let selector_runtime_binding = selector_bits.runtime_binding(&ring)?;
-        let selector_names = PbcSelectorArtifactNames::canonicalize_schema(
+        let selector_runtime_binding = selector_bits
+            .runtime_binding(&ring)
+            .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
+        let selector_names =
+            PbcSelectorArtifactNames::canonicalize_schema(&layout, self.key_instance_id)
+                .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
+        let selector_artifacts = pbc_selector_metadata(
             &layout,
             self.key_instance_id,
-            setup.layout.secret_dimension,
-            setup.layout.public_key_columns(),
-        )
-        .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let selector_artifacts = PbcSelectorArtifacts::from_structural(
-            &layout,
-            self.key_instance_id,
-            selector_names,
             &sampler.layout,
             self.key_instance_id,
             &sampler.layout,
             self.key_instance_id,
         )
+        .and_then(|metadata| {
+            PbcSelectorArtifacts::from_structural(
+                &layout,
+                self.key_instance_id,
+                selector_names,
+                metadata,
+            )
+        })
         .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let structural = build_structural_selector_families(
-            &sampler,
-            selector_bits.family().clone(),
-            setup_secret.clone(),
-            setup_secret.clone(),
-            hash_key.clone(),
-            &layout,
-            self.key_instance_id,
-        )
-        .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
+        let structural_gsw = sampler
+            .sample_pbc_selectors(
+                selector_bits.family().clone(),
+                setup_secret.clone(),
+                setup_secret.clone(),
+                hash_key.clone(),
+                &layout,
+                self.key_instance_id,
+            )
+            .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
         // Selector GSW material is retained by the preprocessing producer.
         // Freezing it in a separate graph would freeze another copy of the
         // captured `t` sampler and cause setup to be sampled twice.
-        let structural_gsw = structural.gsw;
 
         let active_count = crate::noise_refresh::pbc::PbcActiveCellIndex::build(&layout)
             .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?
@@ -5294,96 +1043,34 @@ impl RefreshParameterSimulationRequest {
         let total_labels = online_label_count
             .checked_mul(active_count)
             .ok_or(RefreshSetupError::InvalidManifest)?;
-        let (setup_public_keys, setup_public_key_rhs) = sample_setup_public_key_families(
-            &mxx_bgg::BggPublicKeySampler { layout: sampler.layout.clone() },
-            hash_key.clone(),
-            total_labels,
-        )?;
-        // The public-key program uses the structural sampled family directly.
-        // Its matching K_rhs family is exported independently for online input
-        // construction and is never expanded back into G*K here.
-        let compiler = ExponentLutEncodingCompiler::with_layout(
-            BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: setup.layout.gadget_base.clone(),
-                digit_count: setup.layout.digit_count.into(),
-            },
-            profile.layout,
-        );
-        let refresh_compiler_encoding = ExponentLutEncodingCompiler::with_layout(
-            BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: setup.layout.gadget_base.clone(),
-                digit_count: setup.layout.digit_count.into(),
-            },
-            profile.layout,
-        );
-        let program =
-            SparseLwrPrfProgram::new(profile, layout.bucket_width, layout.parameters.bucket_count)
-                .map_err(|_| RefreshSetupError::InvalidParameters("invalid native PRF program"))?;
-        let public_compiler = ExponentLutPublicKeyCompiler::with_layout(
-            BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: setup.layout.gadget_base.clone(),
-                digit_count: setup.layout.digit_count.into(),
-            },
-            profile.layout,
-        );
-        let public_selectors =
-            PublicRhsFamily::new_for_layout(structural_gsw.clone(), layout.layout_id)?;
-        let public_inputs = NativePrfPublicInputs::new_for_layout(
-            setup_public_keys.clone(),
-            online_label_count,
-            layout.layout_id,
-        )?;
-        let readout_values = program
-            .readout
-            .canonical_coefficients()
-            .ok_or(RefreshSetupError::InvalidParameters("native readout is not canonical"))?
-            .iter()
-            .map(|value| value.to_usize().ok_or(RefreshSetupError::InvalidManifest))
-            .collect::<Result<Vec<_>, _>>()?;
-        let readout_lut =
-            LutTable::unary(profile.native_width(), profile.native_width(), readout_values)
-                .map_err(|_| RefreshSetupError::InvalidParameters("invalid native readout LUT"))?;
-        let readout_helpers = sampler.sample_native_readout_helper_families(
+        let public_prf = PrfPublicSetup::<BggScheme>::sample(
+            &setup,
+            &sampler,
+            profile.native_width(),
             setup_secret.clone(),
-            online_secret.clone(),
             hash_key.clone(),
-            &readout_lut,
-            b"refresh-parameter-search-readout-mask-bank".as_slice(),
-            b"refresh-parameter-search-readout-helpers".as_slice(),
         )?;
-        let online_masks = readout_helpers.online_mask_vectors.clone();
-        let initial_public_key = mxx_bgg::BggPublicKeySampler { layout: sampler.layout.clone() }
-            .sample(hash_key.clone(), b"refresh-parameter-search-initial".as_slice(), &[false])
-            .into_iter()
-            .nth(1)
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let public_prf = RefreshPublicPrfSetup {
-            program: program.clone(),
-            compiler: public_compiler,
-            initial: initial_public_key.clone(),
-            selectors: public_selectors,
-            inputs: public_inputs,
-            layout: layout.clone(),
-            helpers: readout_helpers,
-            normalization_gadget: ring.gadget(
-                setup.component_count,
-                setup.layout.gadget_base.clone(),
-                setup.layout.digit_count,
-            ),
-        };
+        let compiler =
+            ExponentLutEncodingCompiler::with_layout(setup.public_key_compiler(), profile.layout);
+        let public_readout_masks = public_prf.readout_public_masks.clone();
         let producer = RefreshPreprocessingProducer::build(RefreshPreprocessingRequest {
+            program: program.clone(),
+            layout: layout.clone(),
             parameters: setup.clone(),
             public_prf,
-            compiler,
-            state: initial_public_key,
             setup_secret_t: setup_secret.clone(),
             selector_gsw: structural_gsw,
             selector_gsw_name: selector_family_artifact_name(&selector_artifacts, "gsw"),
-            setup_public_key_rhs,
+            label_plaintexts: ring.input_family(
+                "refresh-parameter-search-native-monomials",
+                total_labels,
+                (1, 1),
+            ),
             hash_key,
+        })
+        .map_err(|error| RefreshSetupError::SetupStage {
+            stage: "construct preprocessing",
+            detail: error.to_string(),
         })?;
         let producer_validated =
             producer.built.validate(&ParamEnv::default()).map_err(|error| {
@@ -5420,14 +1107,15 @@ impl RefreshParameterSimulationRequest {
                 detail: error.to_string(),
             }
         })?;
-        selector_artifacts.finalize_export_manifest(&mut producer_manifest).map_err(|error| {
-            RefreshSetupError::SetupStage {
+        selector_artifacts.finalize_export_manifest(&mut producer_manifest, "gsw").map_err(
+            |error| RefreshSetupError::SetupStage {
                 stage: "finalize selector manifest",
                 detail: error.to_string(),
-            }
-        })?;
+            },
+        )?;
         let imported = ImportedRefreshSetup::import(
             setup.clone(),
+            program.clone(),
             producer.declaration().clone(),
             &producer_manifest,
         )
@@ -5437,30 +1125,6 @@ impl RefreshParameterSimulationRequest {
         })?;
         let mut verification_manifests = BTreeMap::new();
         verification_manifests.insert(producer_production.clone(), producer_manifest.clone());
-        let imported_selector_artifacts = PbcSelectorArtifacts::import(
-            producer_production.clone(),
-            &layout,
-            self.key_instance_id,
-            &producer_manifest,
-            selector_artifacts.names().clone(),
-            &sampler.layout,
-            self.key_instance_id,
-            &sampler.layout,
-            self.key_instance_id,
-        )
-        .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let selector_inputs = PbcSelectorFamilyInputs::from_artifacts(
-            &ring,
-            &layout,
-            &imported_selector_artifacts,
-            &sampler.layout,
-            self.key_instance_id,
-            &sampler.layout,
-            self.key_instance_id,
-        )
-        .map_err(|error| RefreshSetupError::Pbc(error.to_string()))?;
-        let selectors =
-            selector_inputs.encoding_family().map_err(|_| RefreshSetupError::InvalidManifest)?;
         let initial_vector = sampler
             .sample_encodings_for_public_matrices(
                 online_secret.clone(),
@@ -5475,70 +1139,55 @@ impl RefreshParameterSimulationRequest {
             vector: initial_vector.vector,
             plaintext: Some(initial_attribute.clone()),
         };
-        let setup_public_key_rhs = imported.setup_public_key_rhs.clone();
-        // `a_j[i]` is an online-evaluation input, created only after the
-        // preprocessing graph has been frozen and its artifacts imported.
-        // Keeping this family symbolic avoids host expansion while ensuring
-        // neither the exponents nor their monomials enter setup/cache state.
-        let label_plaintext_family =
-            ring.input_family("refresh-parameter-search-native-monomials", total_labels, (1, 1));
-        let online_secret_for_labels = online_secret.clone();
-        let label_plaintext_family_for_sampling = label_plaintext_family.clone();
-        let label_vectors = {
-            let source_families = (setup_public_key_rhs, label_plaintext_family_for_sampling);
-            if source_families.0.count() != source_families.1.count() {
-                Err(mxx_dsl::DslError::Schema)
-            } else {
-                mxx_dsl::parallel(source_families.0.count().clone(), |family_index| {
-                    let (rhs, plaintext) =
-                        (source_families.0.at(&family_index), source_families.1.at(&family_index));
-                    let _ = family_index;
-                    {
-                        sample_online_label_vector_from_preimage(
-                            &sampler,
-                            &online_secret_for_labels,
-                            rhs,
-                            plaintext,
-                        )
-                        .map_err(|_| mxx_dsl::DslError::Schema)
-                    }
-                })
-            }
-        }
-        .map_err(|_| RefreshSetupError::InvalidManifest)?;
-        let labels = NativePrfOnlineBatchInputs::new_for_layout(
-            label_vectors,
-            label_plaintext_family,
-            online_label_count,
-            layout.layout_id,
-        )?;
         let refresh_compiler = setup.refresh.clone();
-        // Online evaluation receives the actual state encoding and the
-        // label-major `[label][active-cell]` vectors plus sampled public
-        // monomials.  The imported preprocessing bundle supplies only public
-        // readout keys/decompositions and decoder preimages.
-        let online = RefreshOnlineEvaluationRequest {
-            refresh: &refresh_compiler,
-            compiler: &refresh_compiler_encoding,
-            setup: &imported,
-            program: &program,
-            online_secret_s: online_secret.clone(),
-            state: initial.clone(),
-            selectors: &selectors,
-            inputs: &labels,
-            online_masks,
-            layout: &layout,
-        }
-        .evaluate()?;
-        let refreshed = online.refreshed;
+        let online_masks =
+            sampler.sample_native_readout_masks(online_secret.clone(), &public_readout_masks)?;
+        let scheme = BggScheme::new(setup.public_key_compiler(), compiler.exponent_layout);
+        let accumulation = with_benchmark_role(BenchmarkRole::EncodingPrfAccumulation, || {
+            imported.program_cache.evaluate(&scheme, ProgramValue::Scalar(initial.clone()))
+        })
+        .map_err(|error| RefreshSetupError::SetupStage {
+            stage: "evaluate online fixed-RHS PRF",
+            detail: error.to_string(),
+        })?;
+        let readout = program
+            .evaluate_readout(&scheme, &accumulation, &imported.readout_artifacts, &online_masks)
+            .map_err(|error| RefreshSetupError::SetupStage {
+                stage: "evaluate online PRF readout",
+                detail: error.to_string(),
+            })?;
+        let manifest = refresh_compiler
+            .bind_online_outputs(
+                &compiler,
+                &imported,
+                online_secret.clone(),
+                initial,
+                &program,
+                &readout,
+            )
+            .map_err(|error| RefreshSetupError::SetupStage {
+                stage: "bind online refresh inputs",
+                detail: error.to_string(),
+            })?;
+        let refreshed = refresh_compiler.refresh(&compiler, &manifest).map_err(|error| {
+            RefreshSetupError::SetupStage {
+                stage: "apply online refresh",
+                detail: error.to_string(),
+            }
+        })?;
         let benchmark_online_graph = DslContext::new("refresh-parameter-search-online-eval")
             .private_output("refreshed-encoding-vector", refreshed.encoding().vector.clone())?
             .build()?;
-        validate_cache_required_online_graph(&benchmark_online_graph)?;
+        validate_cache_required_online_graph(&benchmark_online_graph).map_err(|error| {
+            RefreshSetupError::SetupStage {
+                stage: "check online preparation boundary",
+                detail: error.to_string(),
+            }
+        })?;
         let preprocessing_graph = BuiltGraph { graph: producer.built().graph.clone() };
         let benchmark_preprocessing_graph = BuiltGraph { graph: preprocessing_graph.graph.clone() };
         let public_identity = producer.declaration().identity;
-        let (gain_plan, route_decompositions) = producer.noise_snapshot_plans()?;
+        let (gain_plan, route_decompositions) = producer.noise_plans.clone();
         let noise_snapshot = setup.build_noise_snapshot(
             program.clone(),
             &layout,
@@ -5564,7 +1213,7 @@ impl RefreshParameterSimulationRequest {
                 noise_snapshot,
             });
         }
-        let verification = build_refresh_verification(
+        let verification = crate::bgg::build_refresh_verification(
             refreshed.encoding(),
             &imported.a_prime,
             &online_secret,
@@ -5605,1695 +1254,6 @@ impl RefreshParameterSimulationRequest {
     }
 }
 
-#[cfg(test)]
-#[path = "../../tests/prf_noiseless_tests/test.rs"]
-mod prf_noiseless_tests;
-
-#[cfg(all(test, feature = "gpu"))]
-#[path = "../../tests/prf_round_trip_gpu_tests/test.rs"]
-mod prf_round_trip_gpu_tests;
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use crate::noise_refresh::pbc::{PbcParameters, PbcRootSeed, generate_key_layout};
-    use mxx_ir_core::node::NodeKind;
-    use num_bigint::BigInt;
-
-    #[test]
-    fn even_route_targets_preserve_omitted_residues_and_half_payload() {
-        for product in [5u32, 13, 65] {
-            let p = BigUint::from(product);
-            for scalar in -150i32..150 {
-                let value = BigInt::from(scalar);
-                let residual = even_route_correction(&value, &p);
-                assert_eq!(residual.magnitude() % 2u8, BigUint::zero());
-                assert!(residual.magnitude() <= &p);
-                assert_eq!((&value - &residual) % BigInt::from(p.clone()), BigInt::zero());
-                // Every p=32 native half-payload has a genuine integer error.
-                for odd in (-31i32..32).step_by(2) {
-                    assert_eq!((&residual * odd) % 2u8, BigInt::zero());
-                }
-            }
-        }
-    }
-
-    fn parameters(gadget_base: i32, secret_dimension: usize) -> RefreshSetupParameters {
-        let layout = BggSamplerLayout {
-            modulus: 15.into(),
-            ring_dimension: 4.into(),
-            secret_dimension,
-            digit_count: 2,
-            gadget_base: gadget_base.into(),
-        };
-        RefreshSetupParameters::new(
-            [0x41; 32],
-            2,
-            secret_dimension,
-            4,
-            1,
-            1,
-            32,
-            4,
-            layout,
-            RefreshCompiler {
-                full_modulus: 15.into(),
-                crt_plaintext_moduli: vec![3.into(), 5.into()],
-                reconstruction_coefficients: vec![1.into(), 1.into()],
-            },
-            1.into(),
-            1.into(),
-            "setup-test",
-        )
-    }
-
-    #[test]
-    fn tiny_native_reference_oracle_covers_every_z_mod_q() {
-        let profile =
-            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 4 }, 2)
-                .expect("n=32, Q=32, p'=2 profile");
-        assert_eq!(profile.ring_dimension().unwrap(), 32);
-        assert_eq!(profile.q().unwrap(), 32);
-        assert_eq!(profile.p_prime, 2);
-        assert_eq!(profile.layout.stride_log2, 1);
-        let coefficients = profile
-            .canonical_readout()
-            .expect("canonical readout")
-            .canonical_coefficients()
-            .expect("constant readout table")
-            .to_vec();
-        assert_eq!(coefficients.len(), 16);
-
-        // Readout represents f(z)-1/2 in doubled centered coordinates.
-        // Native negacyclic wrap sends z+n' to the additive inverse, so both
-        // halves of Z_Q are covered without an out-of-range table lookup.
-        let doubled = (0..32)
-            .map(|z| {
-                let k = z % 16;
-                let value = &coefficients[k] * BigInt::from(2_u8) - BigInt::from(1_u8);
-                if z < 16 { value } else { -value }
-            })
-            .collect::<Vec<_>>();
-        for z in 0..16 {
-            let expected = BigInt::from(2 * (2 * z / 16 + 1) - 1);
-            assert_eq!(doubled[z], expected);
-            assert_eq!(doubled[z + 16], -expected);
-        }
-    }
-
-    #[test]
-    fn setup_public_key_sampling_does_not_unroll_active_members() {
-        let ring = mxx_dsl::Ring::new(257, 8);
-        let layout = BggSamplerLayout {
-            modulus: 257.into(),
-            ring_dimension: 8.into(),
-            secret_dimension: 2,
-            digit_count: 4,
-            gadget_base: 4.into(),
-        };
-        let hash_key = ring.bytes_input("setup-family-hash-key", 32);
-        let (public_keys, decompositions) = sample_setup_public_key_families(
-            &mxx_bgg::BggPublicKeySampler { layout },
-            hash_key,
-            49_172,
-        )
-        .expect("structural setup public-key families");
-        let graph = DslContext::new("structural-setup-public-key-families")
-            .public_output("public-keys", public_keys)
-            .expect("public-key family output")
-            .public_output("decompositions", decompositions)
-            .expect("decomposition family output")
-            .build()
-            .expect("setup family graph");
-        graph.validate(&ParamEnv::default()).expect("valid structural setup family graph");
-
-        let nodes =
-            graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
-        assert!(
-            nodes.len() < 32,
-            "structural setup family graph must not grow with active_count: {} nodes",
-            nodes.len()
-        );
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::FamilyGetStatic { .. }))
-                .count(),
-            0,
-            "setup public keys and decompositions must not be host-unrolled"
-        );
-    }
-
-    #[test]
-    fn base_p_digit_counts_are_independent_of_gadget_digit_count() {
-        let setup = parameters(4, 2);
-        assert_eq!(setup.mask_base_p_digit_counts, vec![1; 2]);
-        assert_eq!(setup.fresh_error_base_p_digit_count, 1);
-        assert_eq!(setup.prf_component_count(), 4);
-        assert_eq!(setup.layout.digit_count, 2);
-        setup.validate_dimensions().expect("independent digit counts are valid");
-    }
-
-    #[test]
-    fn setup_manifest_count_matches_exported_artifact_schema() {
-        // Fixed outputs include protocol data and the two fixed readout
-        // preimages. Each slot emits one scale K, one public target, and one
-        // decoder preimage; all helpers share two family artifact names. The
-        // online decoder anchor is intentionally not an artifact.
-        assert_eq!(expected_setup_artifact_count(2, 3, 10), Some(28));
-    }
-
-    #[test]
-    fn public_refresh_segments_preserve_slot_axis_without_implicit_family_capture() {
-        let ring = mxx_dsl::Ring::new(97, 4);
-        let routed = ring.input_family("routed-public-prf", 15, (2, 4));
-        let reduced = reduce_public_family_segments(routed, 3, 5).unwrap();
-        assert_eq!(reduced.count(), &IntExpr::constant(3));
-        assert_eq!(reduced.element_type(), &ring.matrix_type((2, 4)));
-        DslContext::new("public-refresh-segments")
-            .output("slot-targets", reduced)
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-    }
-
-    #[test]
-    fn setup_family_count_contract_accepts_the_exact_output_and_route_shapes() {
-        let setup = parameters(4, 2);
-        let output_count = refresh_prf_output_count(&setup).expect("output count");
-        assert_eq!(output_count, 48);
-        assert_eq!(
-            refresh_route_family_count(&setup, &setup.mask_base_p_digit_counts)
-                .expect("mask route count"),
-            32
-        );
-        assert_eq!(
-            refresh_route_family_count(&setup, &vec![setup.fresh_error_base_p_digit_count; 2])
-                .expect("fresh route count"),
-            32
-        );
-        let active_count = 5usize;
-        let setup_public_key_count = output_count.checked_mul(active_count).unwrap();
-        assert!(exact_family_count(Some(setup_public_key_count), setup_public_key_count));
-    }
-
-    #[test]
-    fn setup_family_count_contract_rejects_nonexact_and_overflowing_shapes() {
-        assert!(!exact_family_count(None, 7));
-        assert!(!exact_family_count(Some(0), 7));
-        assert!(!exact_family_count(Some(6), 7));
-        let mut overflowing = parameters(4, 2);
-        overflowing.coefficient_count = usize::MAX;
-        assert!(
-            refresh_route_family_count(&overflowing, &overflowing.mask_base_p_digit_counts)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn decoder_cutoff_policy_is_checked_against_official_on_the_same_setup() {
-        let setup = parameters(4, 2);
-        let official = setup
-            .clone()
-            .with_decoder_preimage_bound(TrapdoorPreimageCutoffPolicy::Default)
-            .resolve_decoder_preimage_bound()
-            .expect("default cutoff")
-            .evaluate(&ParamEnv::default())
-            .expect("concrete default cutoff")
-            .to_biguint()
-            .expect("positive default cutoff");
-        for (offset, accepted) in [(-1_i32, false), (0, true), (1, true)] {
-            let selected = if offset < 0 {
-                &official - BigUint::from((-offset) as u32)
-            } else {
-                &official + BigUint::from(offset as u32)
-            };
-            let configured = setup.clone().with_decoder_preimage_bound(
-                TrapdoorPreimageCutoffPolicy::Explicit(selected.clone()),
-            );
-            assert_eq!(configured.validate().is_ok(), accepted);
-            if offset == 1 {
-                assert_eq!(
-                    configured
-                        .resolve_decoder_preimage_bound()
-                        .expect("explicit cutoff above official")
-                        .evaluate(&ParamEnv::default())
-                        .expect("concrete explicit cutoff")
-                        .to_biguint()
-                        .expect("positive explicit cutoff"),
-                    selected
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn decoder_cutoff_policy_rejects_zero_explicit_value() {
-        let setup = parameters(4, 2);
-        let zero = setup
-            .with_decoder_preimage_bound(TrapdoorPreimageCutoffPolicy::Explicit(BigUint::zero()));
-        assert!(zero.validate().is_err());
-    }
-
-    #[test]
-    fn simulation_request_accepts_explicit_cutoff_above_official() {
-        let setup = parameters(4, 2);
-        let official = setup
-            .resolve_decoder_preimage_bound()
-            .expect("default cutoff")
-            .evaluate(&ParamEnv::default())
-            .expect("concrete default cutoff")
-            .to_biguint()
-            .expect("positive default cutoff");
-        let selected = &official + BigUint::from(1_u8);
-        let setup =
-            setup.with_decoder_preimage_bound(TrapdoorPreimageCutoffPolicy::Explicit(selected));
-        let pbc_parameters = PbcParameters::paper_evaluation(10, 4);
-        let generated =
-            generate_key_layout(&pbc_parameters, PbcRootSeed([0x77; 32]), &[0, 1, 2, 3])
-                .expect("generated PBC layout");
-        let profile =
-            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 }, 1)
-                .expect("sparse-LWR profile");
-        let expected_plaintext = setup.layout.ring().polynomial([BigInt::from(0_u8).into()]);
-        RefreshParameterSimulationRequest::new(
-            setup,
-            profile,
-            generated.clone(),
-            [0x78; 32],
-            1.into(),
-            expected_plaintext,
-            1,
-        )
-        .expect("explicit cutoff above official is accepted");
-    }
-
-    #[test]
-    fn readout_switch_error_adds_target_plaintext_gains_only() {
-        let mut rng = rand::rng();
-        let generated = generate_key_layout(
-            &PbcParameters::custom(4, 1, 2, 3, 1, None),
-            PbcRootSeed(rand::Rng::random(&mut rng)),
-            &[0],
-        )
-        .unwrap();
-        let active = PbcActiveCellIndex::build(&generated.public_layout).unwrap();
-        let profile =
-            SparseLwrPrfProfile::new(crate::ExpLayout { stride_log2: 0, width_log2: 2 }, 2)
-                .unwrap();
-        let mut setup = parameters(4, 2);
-        setup.base_p = 4;
-        let snapshot = RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout(
-            setup,
-            profile,
-            &generated.public_layout,
-            &active,
-        )
-        .unwrap();
-        let actual = snapshot.evaluate_pre_refresh().unwrap();
-        let gains = &snapshot.readout_gains;
-        let target_bound = &gains.target.l1 * &actual.program.output_bound;
-        let output_wire = snapshot.program.outputs().last().unwrap();
-        let target_variance =
-            actual.program.wire_variances[output_wire].scaled(&gains.target.l2_squared);
-        let mut old_trace_bound = &gains.identity_trace.l1 * &target_bound;
-        let mut old_trace_variance = target_variance.clone();
-        for gain in &gains.nonidentity_trace {
-            old_trace_bound += &gain.action.l1 * &target_bound +
-                (BigUint::one() + &gain.helper_action.l1) * &snapshot.helper_error_cutoff;
-            old_trace_variance =
-                old_trace_variance.add(&target_variance.scaled(&gain.action.l2_squared)).add(
-                    &snapshot
-                        .helper_doubled_variance
-                        .scaled(&(BigUint::one() + &gain.helper_action.l2_squared)),
-                );
-        }
-        let branches = BigUint::from(gains.nonidentity_trace.len());
-        // T'=[1,-3,-3,-1]: the former unit factor omitted exactly 7 B_chi
-        // and 19 V_chi per nonidentity branch, before normalization.
-        let worst_delta = &gains.normalization.l1 *
-            &branches *
-            BigUint::from(7u8) *
-            &snapshot.helper_error_cutoff;
-        let variance_delta = snapshot
-            .helper_doubled_variance
-            .scaled(&(&gains.normalization.l2_squared * branches * BigUint::from(19u8)));
-        assert!(!worst_delta.is_zero() && !variance_delta.numerator.is_zero());
-        assert_eq!(actual.readout_bound, &gains.normalization.l1 * old_trace_bound + worst_delta);
-        assert_eq!(
-            actual.readout_variance,
-            old_trace_variance.scaled(&gains.normalization.l2_squared).add(&variance_delta)
-        );
-    }
-
-    #[test]
-    fn switched_refresh_snapshot_tracks_exact_rounding_and_unscaled_decoder() {
-        let mut setup = parameters(4, 2);
-        setup.layout.modulus = 105.into();
-        setup.layout.digit_count = 6;
-        setup.refresh.full_modulus = 105.into();
-        setup.refresh.crt_plaintext_moduli = vec![3.into(), 5.into(), 7.into()];
-        setup.refresh.reconstruction_coefficients = vec![1.into(); 3];
-        setup.switch_moduli = vec![15u8.into(), 15u8.into(), 21u8.into()];
-        setup.mask_base_p_digit_counts = vec![2; 3];
-        let profile =
-            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 }, 1)
-                .unwrap();
-        let generated = generate_key_layout(
-            &PbcParameters::paper_evaluation(10, 4),
-            PbcRootSeed(rand::random()),
-            &[0, 1, 2, 3],
-        )
-        .unwrap();
-        let active = PbcActiveCellIndex::build(&generated.public_layout).unwrap();
-        let mut snapshot =
-            RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout(
-                setup.clone(),
-                profile,
-                &generated.public_layout,
-                &active,
-            )
-            .unwrap();
-        let candidate = snapshot.simulate().unwrap();
-        assert!(!candidate.refresh.accepted);
-        eprintln!(
-            "small switched-refresh candidate (q=105,n=4,P=[15,15,21],d_m=[2,2,2]): {}",
-            serde_json::to_string(&candidate.refresh).unwrap()
-        );
-        // Real compact routes must depend on the selected J, and low-P decoder
-        // rows retain the original number of target columns.
-        assert_eq!(setup.decoder_digit_count(0).unwrap(), 4);
-        let switched_plans = compact_mask_routes(&setup).unwrap().0;
-        let mut unswitched_setup = setup.clone();
-        unswitched_setup.switch_moduli.fill(105u8.into());
-        assert_ne!(switched_plans, compact_mask_routes(&unswitched_setup).unwrap().0);
-        let mut ragged_setup = setup.clone();
-        ragged_setup.mask_base_p_digit_counts = vec![1, 3, 2];
-        let ragged_snapshot =
-            RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout(
-                ragged_setup,
-                profile,
-                &generated.public_layout,
-                &active,
-            )
-            .unwrap();
-        assert_eq!(ragged_snapshot.refresh.mask_digit_counts, vec![1, 3, 2]);
-        assert_ne!(
-            ragged_snapshot.refresh.route_gains.as_ref().unwrap().mask[0],
-            ragged_snapshot.refresh.route_gains.as_ref().unwrap().mask[1]
-        );
-
-        // Isolate the transfer equation after exercising the real setup path.
-        snapshot.initial_state_bound = 1u8.into();
-        snapshot.helper_error_cutoff = 1u8.into();
-        snapshot.initial_state_doubled_variance = AverageVariance::zero();
-        snapshot.helper_doubled_variance = AverageVariance::new(4u8.into(), 1u8.into()).unwrap();
-        let unit = RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() };
-        snapshot.refresh.route_gains = Some(RefreshRouteNoiseGains {
-            state_scaling: vec![unit.clone(); 3],
-            mask: vec![unit.clone(); 3],
-            fresh: vec![unit; 3],
-            decoder: vec![RightActionNoiseGain { l1: 5u8.into(), l2_squared: 25u8.into() }; 3],
-        });
-        let mut pre = snapshot.evaluate_pre_refresh().unwrap();
-        pre.readout_bound = 0u8.into();
-        pre.readout_variance = AverageVariance::zero();
-        let report = snapshot.simulate_worst_from_pre_refresh(pre.clone()).unwrap();
-        let slot = &report.refresh.slots[1];
-        // n=4, J=7: ceil(1/7 + 18/7) + 5 = 8, while separate
-        // ceilings would incorrectly produce 9. Decoder noise stays 5.
-        assert_eq!(slot.pre_switch_bound, 1u8.into());
-        assert_eq!(slot.lift, 7u8.into());
-        assert_eq!(slot.spacing, 3u8.into());
-        assert_eq!(slot.decoder_bound, 5u8.into());
-        assert_eq!(slot.residual_bound, 8u8.into());
-        assert_eq!(slot.mask_bound, 2u8.into());
-        assert_eq!(slot.rounding_lhs, 20u8.into());
-        assert!(!report.refresh.accepted);
-
-        let config = AverageCaseConfig { allow_average_acceptance: true, ..Default::default() };
-        let average = snapshot.simulate_average_with_pre_refresh(&config, pre.clone()).unwrap();
-        assert_eq!(
-            average.refresh.slots[1].variance,
-            AverageVariance::new(100u8.into(), 1u8.into()).unwrap()
-        );
-        let expected = average.refresh.slots[1].f_avg.clone();
-        snapshot
-            .refresh
-            .mask_digit_variances
-            .fill(AverageVariance::new(BigUint::one() << 100usize, 1u8.into()).unwrap());
-        let average = snapshot.simulate_average_with_pre_refresh(&config, pre.clone()).unwrap();
-        assert_eq!(average.refresh.slots[1].f_avg, expected);
-
-        snapshot.refresh.switch_moduli.fill(105u8.into());
-        let comparison = snapshot.simulate_worst_from_pre_refresh(pre.clone()).unwrap();
-        assert_eq!(comparison.refresh.slots[1].rounding_numerator, 0u8.into());
-        assert_eq!(comparison.refresh.slots[1].residual_bound, 6u8.into());
-        snapshot.refresh.mask_digit_counts = vec![1, 2, 3];
-        snapshot.refresh.transcript_topology.as_mut().unwrap().mask_digit_counts = vec![1, 2, 3];
-        let ragged = snapshot.simulate_worst_from_pre_refresh(pre.clone()).unwrap();
-        assert_eq!(
-            ragged.refresh.slots.iter().map(|slot| slot.mask_modulus.clone()).collect::<Vec<_>>(),
-            vec![2u8.into(), 4u8.into(), 8u8.into()]
-        );
-        for invalid in [0u8, 10, 25, 7] {
-            snapshot.refresh.switch_moduli[1] = invalid.into();
-            assert!(snapshot.simulate_worst_from_pre_refresh(pre.clone()).is_err());
-        }
-    }
-
-    #[test]
-    fn graph_free_snapshot_uses_canonical_setup_without_lowering_graph() {
-        let setup = parameters(4, 2);
-        let pbc_parameters = PbcParameters::paper_evaluation(10, 4);
-        let generated =
-            generate_key_layout(&pbc_parameters, PbcRootSeed([0x79; 32]), &[0, 1, 2, 3])
-                .expect("generated PBC layout");
-        let profile =
-            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 }, 1)
-                .expect("sparse-LWR profile");
-        let expected_plaintext = setup.layout.ring().polynomial([BigInt::from(0_u8).into()]);
-        let request = RefreshParameterSimulationRequest::new(
-            setup,
-            profile,
-            generated.clone(),
-            [0x7a; 32],
-            1.into(),
-            expected_plaintext,
-            1,
-        )
-        .expect("simulation request");
-        let snapshot = request.build_noise_snapshot_only().expect("compact noise snapshot");
-        assert_eq!(snapshot.setup_identity().len(), 32);
-
-        // The graph-free cached-route path must produce the same authoritative
-        // snapshot as the ordinary compact builder.  This guards the search
-        // optimization against silently changing a route gain or refresh
-        // topology while scanning `d_m`.
-        let setup = parameters(4, 2);
-        let pbc_layout =
-            generate_key_layout(&pbc_parameters, PbcRootSeed([0x79; 32]), &[0, 1, 2, 3])
-                .expect("generated PBC layout")
-                .public_layout;
-        let active_cells = PbcActiveCellIndex::build(&pbc_layout).expect("active-cell index");
-        let (gain_plan, invariant_routes) =
-            RefreshParameterSimulationRequest::noise_gain_and_route_invariants_from_public_layout(
-                &setup,
-                profile,
-                &pbc_layout,
-                &active_cells,
-            )
-            .expect("invariant compact plans");
-        let cached = RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout_with_cached_routes(
-            setup,
-            profile,
-            &pbc_layout,
-            &active_cells,
-            &gain_plan,
-            &invariant_routes,
-        )
-        .expect("cached compact noise snapshot");
-        assert_eq!(snapshot.setup_identity(), cached.setup_identity());
-        assert_eq!(snapshot.gain_plan, cached.gain_plan);
-        assert_eq!(snapshot.refresh, cached.refresh);
-        assert_eq!(snapshot.family_active_counts, cached.family_active_counts);
-
-        // Search's borrowed fast path must make the same hard/average
-        // decision as the ordinary full report path.  It reuses the exact
-        // primitive-gate visitor result and evaluates only refresh equations.
-        let pre_refresh = snapshot.evaluate_pre_refresh().expect("pre-refresh evaluation");
-        let worst = snapshot.simulate().expect("worst report");
-        assert_eq!(
-            worst.refresh.accepted,
-            snapshot
-                .worst_refresh_accepted_from_pre_refresh(&pre_refresh)
-                .expect("cached worst refresh")
-        );
-        let average_config = AverageCaseConfig {
-            failure_exponent: 20,
-            tail_correction_bits: 0,
-            allow_average_acceptance: true,
-        };
-        let average = snapshot.simulate_average(&average_config).expect("average report");
-        assert_eq!(
-            average.accepted,
-            snapshot
-                .average_refresh_accepted_from_pre_refresh(&average_config, &pre_refresh)
-                .expect("cached average refresh")
-        );
-
-        let baseline_worst = snapshot.simulate().expect("baseline worst report");
-        let baseline_average =
-            snapshot.simulate_average(&average_config).expect("baseline average report");
-
-        // Repeat the comparison for a second mask digit count.  This checks
-        // the actual materialized worst/average reports (including every
-        // slot breakdown), not only their acceptance booleans, while reusing
-        // the invariant gate/readout routes from the first setup.
-        for mask_digits in [1usize, 2usize] {
-            let mut setup_for_digits = parameters(4, 2);
-            setup_for_digits.mask_base_p_digit_counts.fill(mask_digits);
-            let expected_plaintext =
-                setup_for_digits.layout.ring().polynomial([BigInt::from(0_u8).into()]);
-            let full_request = RefreshParameterSimulationRequest::new(
-                setup_for_digits.clone(),
-                profile,
-                generated.clone(),
-                [0x7a; 32],
-                1.into(),
-                expected_plaintext,
-                1,
-            )
-            .expect("per-digit-count simulation request");
-            let full = full_request.build_noise_snapshot_only().expect("ordinary compact snapshot");
-            let cached =
-                RefreshParameterSimulationRequest::build_noise_snapshot_from_public_layout_with_cached_routes(
-                    setup_for_digits,
-                    profile,
-                    &pbc_layout,
-                    &active_cells,
-                    &gain_plan,
-                    &invariant_routes,
-                )
-                .expect("cached compact snapshot");
-
-            let full_worst = full.simulate().expect("ordinary worst report");
-            let cached_worst = cached.simulate().expect("cached worst report");
-            assert_eq!(full_worst, cached_worst);
-            assert_eq!(full_worst.refresh.slots, cached_worst.refresh.slots);
-            assert_eq!(
-                full_worst.refresh.rounding_accepted,
-                cached_worst.refresh.rounding_accepted
-            );
-            assert_eq!(
-                full_worst.refresh.mask_smudging_accepted,
-                cached_worst.refresh.mask_smudging_accepted
-            );
-            let full_average =
-                full.simulate_average(&average_config).expect("ordinary average report");
-            let cached_average =
-                cached.simulate_average(&average_config).expect("cached average report");
-            assert_eq!(full_average, cached_average);
-            assert_eq!(full_average.refresh.slots, cached_average.refresh.slots);
-            assert_eq!(
-                full_average.refresh.rounding_accepted,
-                cached_average.refresh.rounding_accepted
-            );
-            assert_eq!(
-                full_average.refresh.mask_smudging_accepted,
-                cached_average.refresh.mask_smudging_accepted
-            );
-            if mask_digits == 2 {
-                // Ensure that this is a real d_m test rather than two
-                // aliases of the same snapshot.  The small fixture is
-                // intentionally rejected by rounding/smudging, so the
-                // boundary is exercised without depending on acceptance.
-                assert_ne!(full_worst.refresh, baseline_worst.refresh);
-                assert_ne!(full_average.refresh, baseline_average.refresh);
-            }
-            let cached_pre_refresh =
-                cached.evaluate_pre_refresh().expect("cached per-digit pre-refresh evaluation");
-            assert_eq!(
-                full_average.accepted,
-                cached
-                    .average_refresh_accepted_from_pre_refresh(
-                        &average_config,
-                        &cached_pre_refresh,
-                    )
-                    .expect("cached average acceptance")
-            );
-        }
-    }
-
-    #[test]
-    fn average_initial_variance_is_derived_from_setup_sigma() {
-        let setup = parameters(4, 2);
-        assert_eq!(
-            setup.average_initial_variance().expect("rational setup sigma"),
-            AverageVariance::new(4u8.into(), 1u8.into()).expect("positive variance")
-        );
-    }
-
-    #[test]
-    fn refresh_noise_parameters_bind_full_q_topology_and_digit_variances() {
-        let setup = parameters(4, 2);
-        let refresh = setup.refresh_noise_parameters().expect("complete refresh noise schema");
-        assert_eq!(refresh.global_modulus, Some(BigUint::from(15u8)));
-        assert_eq!(refresh.plaintext_moduli, vec![BigUint::from(3u8), BigUint::from(5u8)]);
-        assert_eq!(
-            refresh.transcript_topology,
-            Some(RefreshTranscriptTopology {
-                crt_slot_count: 2,
-                component_columns: 4,
-                coefficient_count: 4,
-                mask_digit_counts: vec![1; 2],
-                fresh_digit_count: 1,
-            })
-        );
-        assert_eq!(
-            refresh.smudging,
-            Some(MaskSmudgingParameters { lambda_mask: 32, transcript_coordinates: 32 })
-        );
-        assert_eq!(
-            refresh
-                .transcript_topology
-                .as_ref()
-                .expect("transcript topology")
-                .joint_event_count()
-                .expect("joint event count"),
-            48
-        );
-        assert!(refresh.mask_digit_variances.is_empty());
-        assert!(refresh.fresh_digit_variances.is_empty());
-        assert!(refresh.route_gains.is_none());
-    }
-
-    #[test]
-    fn refresh_route_gains_require_actual_per_slot_decompositions() {
-        let plan =
-            NoiseDecompositionPlan::new(BigUint::from(2u8), 1, vec![BigInt::from(2u8)], 1, 1, 1)
-                .expect("concrete balanced decomposition");
-        let decompositions = RefreshNoiseGainDecompositions {
-            state_scaling: vec![plan.clone(), plan.clone()],
-            mask: vec![vec![plan.clone()]; 2],
-            mask_multiplicity: 1,
-            fresh: vec![vec![plan.clone()], vec![plan.clone()]],
-            fresh_multiplicity: vec![1, 1],
-            decoder: vec![plan.clone(), plan.clone()],
-        };
-        let gains = decompositions.derive_route_gains(2).expect("per-slot route gains");
-        assert_eq!(gains.state_scaling[0].l1, BigUint::from(2u8));
-        assert_eq!(gains.state_scaling[0].l2_squared, BigUint::from(4u8));
-        assert_eq!(gains.fresh.len(), 2);
-        assert!(
-            RefreshNoiseGainDecompositions { fresh: vec![], ..decompositions }
-                .derive_route_gains(2)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn refresh_route_gains_sum_each_p_digit_and_ring_coordinate() {
-        // P=2 is intentionally distinct from gadget beta=4.  Each of three
-        // P-adic digits is emitted for each of three ring coordinates, while
-        // state scaling remains one exact action per unequal CRT slot.
-        let crt = vec![BigUint::from(101u16), BigUint::from(103u16), BigUint::from(107u16)];
-        let route = |value: BigInt, ring_coefficient: usize| {
-            NoiseDecompositionPlan::sparse_monomial(
-                BigUint::from(4u8),
-                12,
-                2,
-                4,
-                8,
-                1,
-                0,
-                ring_coefficient,
-                value,
-            )
-            .unwrap()
-            .bind_crt_layout(crt.clone(), 4)
-            .unwrap()
-        };
-        let mask: Vec<_> = (0u32..3)
-            .flat_map(|digit| (0..3).map(move |j| route(BigUint::from(2u8).pow(digit).into(), j)))
-            .collect();
-        let fresh: Vec<Vec<_>> = [BigUint::from(7u8), BigUint::from(3u8)]
-            .into_iter()
-            .map(|kappa| {
-                (0u32..3)
-                    .flat_map(|digit| {
-                        let value = &kappa * BigUint::from(2u8).pow(digit);
-                        (0..3).map(move |j| route(value.clone().into(), j))
-                    })
-                    .collect()
-            })
-            .collect();
-        let state_scaling = [BigUint::from(7u8), BigUint::from(3u8)]
-            .into_iter()
-            .map(|kappa| {
-                NoiseDecompositionPlan::gadget_scalar(
-                    BigUint::from(4u8),
-                    12,
-                    2,
-                    24,
-                    8,
-                    kappa.into(),
-                )
-                .unwrap()
-                .bind_crt_layout(crt.clone(), 4)
-                .unwrap()
-            })
-            .collect();
-        let decoder = vec![route(1.into(), 0), route(1.into(), 0)];
-        let decompositions = RefreshNoiseGainDecompositions {
-            state_scaling,
-            mask: vec![mask; 2],
-            mask_multiplicity: 1,
-            fresh_multiplicity: vec![1, 1],
-            fresh,
-            decoder,
-        };
-        let gains = decompositions.derive_route_gains(2).unwrap();
-        let sum = |plans: &[NoiseDecompositionPlan]| {
-            plans.iter().fold(
-                RightActionNoiseGain { l1: BigUint::zero(), l2_squared: BigUint::zero() },
-                |mut total, plan| {
-                    let gain = plan.action_gain();
-                    total.l1 += gain.l1;
-                    total.l2_squared += gain.l2_squared;
-                    total
-                },
-            )
-        };
-        assert_eq!(gains.mask[0], sum(&decompositions.mask[0]));
-        assert_eq!(gains.mask[1], sum(&decompositions.mask[1]));
-        assert_eq!(gains.fresh[0], sum(&decompositions.fresh[0]));
-        assert_eq!(gains.fresh[1], sum(&decompositions.fresh[1]));
-        assert_ne!(gains.fresh[0], gains.fresh[1]);
-        assert_ne!(gains.state_scaling[0], gains.state_scaling[1]);
-
-        // Compact route plans represent all ring-coordinate routes with a
-        // multiplicity; they must produce exactly the same gain as the
-        // explicit per-coordinate plans.  The PRF component axis is already
-        // the target-column axis of `sparse_monomial` and is therefore not a
-        // second multiplicity factor.
-        // A single action per P-adic digit is the compact representation used
-        // by the graph-free path.  Repeat it for each ring coordinate and
-        // compare against the corresponding explicit route sum.
-        let compact = RefreshNoiseGainDecompositions {
-            state_scaling: decompositions.state_scaling.clone(),
-            mask: vec![vec![route(1.into(), 0), route(2.into(), 0), route(4.into(), 0)]; 2],
-            mask_multiplicity: 3,
-            fresh: vec![
-                vec![route(7.into(), 0), route(14.into(), 0), route(28.into(), 0)],
-                vec![route(3.into(), 0), route(6.into(), 0), route(12.into(), 0)],
-            ],
-            fresh_multiplicity: vec![3, 3],
-            decoder: decompositions.decoder.clone(),
-        };
-        let explicit = decompositions.derive_route_gains(2).unwrap();
-        let compact_gains = compact.derive_route_gains(2).unwrap();
-        assert_eq!(explicit.mask, compact_gains.mask);
-        assert_eq!(explicit.fresh, compact_gains.fresh);
-    }
-
-    #[test]
-    fn refresh_family_counts_include_dummy_and_exclude_padding() {
-        let parameters = PbcParameters::custom(8, 1, 2, 3, 1, None);
-        let layout = PbcPublicLayout::build(
-            &parameters,
-            crate::noise_refresh::pbc::derive_attempt_seed(PbcRootSeed([0x2a; 32]), 0),
-            0,
-        )
-        .expect("PBC layout");
-        let active = PbcActiveCellIndex::build(&layout).expect("active-cell index");
-        for (bucket, row) in layout.cells.iter().enumerate() {
-            let nonpadding = row
-                .iter()
-                .filter(|cell| !matches!(cell, crate::noise_refresh::pbc::PbcCell::Padding))
-                .count();
-            assert_eq!(active.bucket_active_width(bucket), Some(nonpadding));
-            assert!(
-                row.iter().any(|cell| matches!(cell, crate::noise_refresh::pbc::PbcCell::Dummy))
-            );
-        }
-    }
-
-    #[test]
-    fn decoder_preimage_plans_preserve_slot_shape_and_bound() {
-        let ring = parameters(4, 2).layout.ring();
-        let preimages = vec![
-            ring.preimage_input("decoder-slot-0", (8, 4), 2),
-            ring.preimage_input("decoder-slot-1", (7, 5), 3),
-        ];
-        let bounds = [BigUint::from(2u8), BigUint::from(3u8)];
-        let plans = preimages
-            .iter()
-            .enumerate()
-            .map(|(slot, preimage)| {
-                direct_bounded_preimage_plan(preimage, &BigUint::from(4u8), bounds[slot].clone())
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .expect("each decoder slot uses its own preimage");
-
-        assert_eq!((plans[0].target_rows, plans[0].target_columns), (8, 4));
-        assert_eq!((plans[1].target_rows, plans[1].target_columns), (7, 5));
-        assert_eq!(plans[0].action_gain().l1, BigUint::from(64u8));
-        assert_eq!(plans[1].action_gain().l1, BigUint::from(84u8));
-        assert!(
-            direct_bounded_preimage_plan(&preimages[1], &BigUint::from(4u8), bounds[0].clone(),)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn setup_decomposition_changes_route_gain_and_digit_variance() {
-        use crate::{
-            noise::{
-                GateNoiseDecomposition, GateNoiseGains, GateNoiseOperation, RightActionNoiseGain,
-            },
-            noise_refresh::simulation::{TraceNoiseGains, ValueReadoutNoiseGains},
-            program::{Gate, ProgramStep},
-        };
-
-        let setup = parameters(4, 2);
-        let pbc_parameters = PbcParameters::custom(4, 1, 2, 2, 1, None);
-        let pbc_layout = crate::noise_refresh::pbc::PbcPublicLayout::build(
-            &pbc_parameters,
-            crate::noise_refresh::pbc::derive_attempt_seed(PbcRootSeed([0x19; 32]), 0),
-            0,
-        )
-        .expect("PBC layout");
-        let profile =
-            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 }, 1)
-                .expect("native profile");
-        let program = SparseLwrPrfProgram::new(
-            profile,
-            pbc_layout.bucket_width,
-            pbc_layout.parameters.bucket_count,
-        )
-        .expect("native program");
-        let unit_plan =
-            NoiseDecompositionPlan::new(BigUint::from(2u8), 1, vec![BigInt::from(1u8)], 1, 1, 1)
-                .expect("unit decomposition");
-        let changed_plan =
-            NoiseDecompositionPlan::new(BigUint::from(2u8), 1, vec![BigInt::from(2u8)], 1, 1, 1)
-                .expect("changed decomposition");
-        let make_gain_plan = |plan: &NoiseDecompositionPlan| {
-            let mut decompositions = Vec::new();
-            let mut gates = Vec::new();
-            for (step_index, step) in program.accumulation.steps().iter().enumerate() {
-                let count = match step {
-                    ProgramStep::Family { body, .. } => {
-                        assert!(matches!(
-                            body.gates(),
-                            [Gate::MulPrivate { .. }, Gate::MulPublic { .. }]
-                        ));
-                        // The compact noise plan keeps one action per
-                        // structural family-body operation; active members
-                        // are applied by `simulate_program`.
-                        body.gates().len() + 1
-                    }
-                    ProgramStep::Gate(Gate::MulPrivate { .. }) |
-                    ProgramStep::Gate(Gate::MulPublic { .. }) |
-                    ProgramStep::Gate(Gate::Add { .. }) |
-                    ProgramStep::Gate(Gate::Lut { .. }) => 1,
-                };
-                for branch_index in 0..count {
-                    let operation = match step {
-                        ProgramStep::Family { body, .. } => {
-                            body.gates().get(branch_index).map_or(GateNoiseOperation::Add, |gate| {
-                                match gate {
-                                    Gate::MulPrivate { .. } => GateNoiseOperation::MulPrivate,
-                                    Gate::MulPublic { .. } => GateNoiseOperation::MulPublic,
-                                    Gate::Add { .. } => GateNoiseOperation::Add,
-                                    Gate::Lut { .. } => GateNoiseOperation::Lut,
-                                }
-                            })
-                        }
-                        ProgramStep::Gate(Gate::MulPrivate { .. }) => {
-                            GateNoiseOperation::MulPrivate
-                        }
-                        ProgramStep::Gate(Gate::MulPublic { .. }) => GateNoiseOperation::MulPublic,
-                        ProgramStep::Gate(Gate::Add { .. }) => GateNoiseOperation::Add,
-                        ProgramStep::Gate(Gate::Lut { .. }) => GateNoiseOperation::Lut,
-                    };
-                    decompositions
-                        .push(GateNoiseDecomposition { action: plan.clone(), helper_action: None });
-                    gates.push(GateNoiseGains {
-                        step_index,
-                        operation_index: gates.len(),
-                        branch_index,
-                        operation,
-                        gate: "setup-test".to_owned(),
-                        action: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-                        helper_action: None,
-                        inherited_bound: BigUint::zero(),
-                        fresh_bound: BigUint::zero(),
-                        output_bound: BigUint::zero(),
-                        inherited_variance: AverageVariance::zero(),
-                        fresh_variance: AverageVariance::zero(),
-                        output_variance: AverageVariance::zero(),
-                    });
-                }
-            }
-            let trace_count = program
-                .readout
-                .trace_plan(profile.ring_dimension().unwrap())
-                .unwrap()
-                .helper_count();
-            let trace = (0..trace_count)
-                .map(|_| TraceNoiseGains {
-                    action: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-                    helper_action: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-                })
-                .collect();
-            let readout_gains = ValueReadoutNoiseGains {
-                target: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-                identity_trace: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-                nonidentity_trace: trace,
-                normalization: RightActionNoiseGain { l1: 1u8.into(), l2_squared: 1u8.into() },
-                inherited_bound: BigUint::zero(),
-                output_bound: BigUint::zero(),
-                output_variance: AverageVariance::zero(),
-            };
-            NoiseGainPlanBuilder::new(
-                decompositions,
-                plan.clone(),
-                (0..trace_count).map(|_| (plan.clone(), plan.clone())).collect(),
-                plan.clone(),
-            )
-            .unwrap()
-            .build(gates, readout_gains)
-            .unwrap()
-        };
-        let make_routes = |plan: &NoiseDecompositionPlan| RefreshNoiseGainDecompositions {
-            state_scaling: vec![plan.clone(), plan.clone()],
-            mask: vec![vec![plan.clone()]; 2],
-            mask_multiplicity: setup.coefficient_count,
-            fresh: vec![vec![plan.clone()], vec![plan.clone()]],
-            fresh_multiplicity: vec![setup.coefficient_count; 2],
-            decoder: vec![plan.clone(), plan.clone()],
-        };
-        let first = setup
-            .build_noise_snapshot(
-                program.clone(),
-                &pbc_layout,
-                make_gain_plan(&unit_plan),
-                make_routes(&unit_plan),
-            )
-            .expect("first snapshot");
-        let second = setup
-            .build_noise_snapshot(
-                program.clone(),
-                &pbc_layout,
-                make_gain_plan(&changed_plan),
-                make_routes(&changed_plan),
-            )
-            .expect("second snapshot");
-        let first_routes = first.refresh.route_gains.as_ref().unwrap();
-        let second_routes = second.refresh.route_gains.as_ref().unwrap();
-        assert_ne!(first_routes.mask[0].l2_squared, second_routes.mask[0].l2_squared);
-        assert_eq!(first.refresh.mask_digit_variances[0], second.refresh.mask_digit_variances[0]);
-        assert_eq!(first.refresh.fresh_digit_variances[0], second.refresh.fresh_digit_variances[0]);
-    }
-
-    #[test]
-    fn setup_requires_secret_dimension_two_and_power_of_two_gadget_base() {
-        assert!(parameters(4, 1).validate_dimensions().is_err());
-        assert!(parameters(3, 2).validate_dimensions().is_err());
-    }
-
-    #[test]
-    fn setup_identity_binds_mask_and_fresh_digit_counts_and_security() {
-        let setup = parameters(4, 2);
-        let profile =
-            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 }, 1)
-                .expect("profile");
-        let program = SparseLwrPrfProgram::new(profile, 1, 1).expect("program");
-        let contract = RefreshPrfContract::from_program(&program);
-        let decoder_bound = 1.into();
-        let identity = |setup: &RefreshSetupParameters| {
-            identity_digest(
-                setup,
-                &contract,
-                crate::noise_refresh::pbc::PbcLayoutId([9; 32]),
-                &decoder_bound,
-            )
-        };
-        let baseline = identity(&setup);
-        let mut changed_mask = setup.clone();
-        changed_mask.mask_base_p_digit_counts.fill(2);
-        assert_ne!(baseline, identity(&changed_mask));
-        let mut changed_fresh = setup.clone();
-        changed_fresh.fresh_error_base_p_digit_count = 2;
-        assert_ne!(baseline, identity(&changed_fresh));
-        let mut changed_security = setup;
-        changed_security.mask_statistical_security_bits = 33;
-        assert_ne!(baseline, identity(&changed_security));
-    }
-
-    #[test]
-    fn online_decoder_base_samples_one_error_without_exporting_the_anchor() {
-        let setup = parameters(4, 2);
-        let ring = setup.layout.ring();
-        let secret = ring.zero((1, 2));
-        let public_b = ring.zero((2, 8));
-        let (_, bases) = shared_decoder_bases(&setup, secret, &[public_b]).unwrap();
-        let base = bases[0].clone();
-        assert_eq!(base.vector.matrix_type().rows, 1.into());
-        assert_eq!(base.vector.matrix_type().columns, 8.into());
-
-        let consumer = ring.input("decoder-anchor-consumer", (8, 1));
-        let context = DslContext::new("online-decoder-base-test")
-            .private_output("decoder-result", base.vector * consumer)
-            .expect("decoder result output")
-            .build()
-            .expect("online decoder graph");
-        let gaussian_nodes = context
-            .graph
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
-            .count();
-        assert_eq!(gaussian_nodes, 1);
-        assert_eq!(context.graph.outputs().len(), 1);
-        assert!(context.graph.outputs().contains_key("decoder-result"));
-    }
-
-    #[derive(Default)]
-    pub(crate) struct NumericRefreshBounds {
-        bounds: BTreeMap<String, BigUint>,
-        paired: Vec<(BigUint, BigUint)>,
-    }
-
-    pub(crate) fn assert_numeric_refresh_outputs(
-        outputs: BTreeMap<String, (BigUint, Vec<BigUint>)>,
-        bounds: &NumericRefreshBounds,
-    ) {
-        let centered = outputs
-            .into_iter()
-            .map(|(name, (modulus, coefficients))| {
-                let half = &modulus / 2u8;
-                let coefficients = coefficients
-                    .into_iter()
-                    .map(|value| {
-                        if value > half {
-                            BigInt::from(value) - BigInt::from(modulus.clone())
-                        } else {
-                            BigInt::from(value)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let bound = bounds.bounds.get(&name).cloned().unwrap_or_default();
-                assert!(
-                    coefficients.iter().all(|value| value.magnitude() <= &bound),
-                    "{name}: observed centered operational error exceeds {bound}"
-                );
-                (name, coefficients)
-            })
-            .collect::<BTreeMap<_, _>>();
-        for (slot, (lift, rounding_numerator)) in bounds.paired.iter().enumerate() {
-            let paired = &centered[&format!("paired-error-{slot}")];
-            let pre_switch = &centered[&format!("pre-switch-error-{slot}")];
-            assert_eq!(paired.len(), pre_switch.len());
-            for (paired, pre_switch) in paired.iter().zip(pre_switch) {
-                let exact_rounding = paired * BigInt::from(lift.clone()) - pre_switch;
-                assert!(
-                    exact_rounding.magnitude() * 2u8 <= *rounding_numerator,
-                    "slot {slot}: exact paired rounding exceeded (J-1)(n+2)/(2J)"
-                );
-            }
-        }
-    }
-
-    pub(crate) fn switched_decoder_numeric_fixture() -> (
-        mxx_ir_core::ValidatedGraph,
-        Vec<mxx_primitives::poly::dcrt::params::DCRTPolyParams>,
-        NumericRefreshBounds,
-    ) {
-        use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-        let parameter = |name, default| {
-            std::env::var(name).ok().map(|value| value.parse::<u32>().unwrap()).unwrap_or(default)
-        };
-        let n = parameter("MXX_PRIMITIVE_TEST_RING_DIMENSION", 32);
-        let depth = parameter("MXX_PRIMITIVE_TEST_CRT_DEPTH", 3) as usize;
-        let bits = parameter("MXX_PRIMITIVE_TEST_CRT_BITS", 40) as usize;
-        let base_bits = parameter("MXX_PRIMITIVE_TEST_BASE_BITS", 4);
-        assert!(depth >= 3, "mixed-P round trip requires at least three towers");
-        let parameters = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
-        let q = parameters.modulus().as_ref().clone();
-        let (primes, _, _) = parameters.to_crt();
-        let ring = mxx_dsl::Ring::new(BigInt::from(q.clone()), n as usize);
-        let mut setup = parameters_for_numeric_refresh(&parameters);
-        setup.switch_moduli = (0..depth)
-            .map(|slot| &q / BigUint::from(primes[if slot + 1 == depth { 0 } else { depth - 1 }]))
-            .collect();
-        setup.mask_base_p_digit_counts = (0..depth).map(|slot| 1 + slot % 2).collect();
-        let columns = setup.layout.public_key_columns();
-        let secret = Mat::concat(
-            mxx_dsl::ConcatAxis::Columns,
-            vec![ring.polynomial([(-1).into()]), ring.polynomial([1.into()])],
-        );
-        let gadget = ring.gadget(2, setup.layout.gadget_base.clone(), setup.layout.digit_count);
-        let payload_secret = Mat::concat(
-            mxx_dsl::ConcatAxis::Columns,
-            vec![ring.polynomial([1.into()]), ring.polynomial([1.into()])],
-        );
-        let public_a = ring.uniform_residue((2, columns));
-        let a_prime = ring.uniform_residue((2, columns));
-        let message = ring.polynomial([1.into(), (-1).into()]);
-        // Nonzero coefficient-bounded input error and post-readout helper
-        // residual. This fixture tests refresh, not the full PRF evaluator.
-        let input_error = Mat::concat(
-            mxx_dsl::ConcatAxis::Columns,
-            vec![ring.polynomial((0..n).map(|_| 1.into())); columns],
-        );
-        let state = BggEncodingWire {
-            vector: secret.clone() * public_a.clone() -
-                message.clone() * (payload_secret.clone() * gadget.clone()) +
-                input_error.clone(),
-            plaintext: None,
-        };
-        let fresh = Mat::concat(
-            mxx_dsl::ConcatAxis::Columns,
-            vec![ring.polynomial((0..n).map(|_| 1.into())); columns],
-        );
-        let mut scalings = Vec::new();
-        let mut sums = Vec::new();
-        let mut masks = Vec::new();
-        let mut scaled_fresh = Vec::new();
-        let mut mask_residuals = Vec::new();
-        let mut pre_switch_errors = Vec::new();
-        let mut bounds = NumericRefreshBounds::default();
-        let inverse_two = (&q + BigUint::one()) / 2u8;
-        for slot in 0..depth {
-            let kappa = ring.polynomial([setup.refresh.scale_expression(slot).unwrap()]);
-            let scaling = (kappa.clone() * gadget.clone())
-                .decompose(setup.layout.gadget_base.clone(), setup.layout.digit_count);
-            sums.push(scaling.clone().mul_small_rhs(public_a.clone()));
-            pre_switch_errors
-                .push(scaling.clone().mul_small_rhs(input_error.clone()) + input_error.clone());
-            scalings.push(scaling);
-            scaled_fresh.push(BggEncodingWire { vector: kappa * fresh.clone(), plaintext: None });
-            let digits = setup.mask_base_p_digit_counts[slot];
-            let support = 4usize.pow(digits as u32);
-            // Enumerate native digit combinations, including endpoints and interior
-            // values. The production public normalization must yield v-M/2.
-            let raw = Mat::concat(
-                mxx_dsl::ConcatAxis::Columns,
-                (0..columns)
-                    .map(|column| {
-                        ring.polynomial((0..n as usize).map(|coefficient| {
-                            let mut value = (column * n as usize + coefficient) % support;
-                            let mut weight = BigInt::one();
-                            let mut encoded = BigInt::zero();
-                            for _ in 0..digits {
-                                let native_digit = BigInt::from(value % 4) - 1;
-                                encoded +=
-                                    &weight * (native_digit - BigInt::from(inverse_two.clone()));
-                                weight *= 4;
-                                value /= 4;
-                            }
-                            IntExpr::constant(encoded)
-                        }))
-                    })
-                    .collect(),
-            );
-            let offset = crate::noise_refresh::refresh::public_half_offset_vector(
-                &ring, 4, digits, columns, true,
-            )
-            .unwrap();
-            let lift =
-                ring.polynomial([IntExpr::constant(BigInt::from(&q / &setup.switch_moduli[slot]))]);
-            let normalized = raw + offset;
-            let expected_mask = Mat::concat(
-                mxx_dsl::ConcatAxis::Columns,
-                (0..columns)
-                    .map(|column| {
-                        ring.polynomial((0..n as usize).map(|coefficient| {
-                            IntExpr::constant(
-                                BigInt::from((column * n as usize + coefficient) % support) -
-                                    BigInt::from(support / 2),
-                            )
-                        }))
-                    })
-                    .collect(),
-            );
-            mask_residuals.push(normalized.clone() - expected_mask);
-            masks.push(BggEncodingWire {
-                vector: lift * normalized + input_error.clone(),
-                plaintext: None,
-            });
-        }
-        let cutoff = setup.resolve_decoder_preimage_bound().unwrap();
-        let decoder_cutoff = cutoff.evaluate(&ParamEnv::default()).unwrap().to_biguint().unwrap();
-        let anchor_cutoff = setup
-            .encoding_error_bound
-            .evaluate(&ParamEnv::default())
-            .unwrap()
-            .to_biguint()
-            .unwrap();
-        // Generic balanced-decomposition bound for the actual D(kappa G)
-        // action, plus one post-readout residual. Constants make this safely
-        // conservative even though the generic convolution factor is retained.
-        let pre_switch_bound =
-            BigUint::from(n) * columns * BigUint::from(1u64 << (base_bits - 1)) + 1u8;
-        for slot in 0..depth {
-            let lift = &q / &setup.switch_moduli[slot];
-            let denominator = &lift * 2u8;
-            let rounding_numerator = (&lift - BigUint::one()) * (n + 2);
-            let decoder_error = &decoder_cutoff *
-                &anchor_cutoff *
-                n *
-                (2 * (setup.decoder_digit_count(slot).unwrap() + 2));
-            let mask_bound =
-                BigUint::from(4usize.pow(setup.mask_base_p_digit_counts[slot] as u32) / 2);
-            let spacing = &setup.switch_moduli[slot] / BigUint::from(primes[slot]);
-            let final_bound = crate::noise_refresh::simulation::switched_error_bound(
-                &pre_switch_bound,
-                &lift,
-                n as usize,
-                &decoder_error,
-            )
-            .unwrap();
-            let paired_bound =
-                (&pre_switch_bound * 2u8 + &rounding_numerator + &denominator - 1u8) / &denominator;
-            assert!(
-                (mask_bound + &final_bound) * 2u8 < spacing,
-                "test parameters must satisfy the strict switched mask-plus-residual margin"
-            );
-            bounds.bounds.insert(format!("pre-switch-error-{slot}"), pre_switch_bound.clone());
-            bounds.bounds.insert(format!("paired-error-{slot}"), paired_bound);
-            bounds.bounds.insert(format!("decoder-error-{slot}"), decoder_error);
-            bounds.bounds.insert(format!("final-error-{slot}"), final_bound);
-            bounds.bounds.insert(format!("anchor-error-{slot}"), anchor_cutoff.clone());
-            bounds.paired.push((lift, rounding_numerator));
-        }
-        let (public_b, targets, preimages) =
-            sample_refresh_decoders(&setup, Family::pack(sums).unwrap(), &a_prime, &cutoff)
-                .unwrap();
-        let (slot_public, bases) = shared_decoder_bases(&setup, secret.clone(), &public_b).unwrap();
-        let anchor_errors = (0..depth)
-            .map(|slot| {
-                bases[slot].vector.clone() -
-                    secret.clone().reduce_modulus(BigInt::from(setup.switch_moduli[slot].clone())) *
-                        slot_public[slot].clone()
-            })
-            .collect::<Vec<_>>();
-        let diagnostic_state = state.vector.clone();
-        let diagnostic_masks = masks.clone();
-        let diagnostic_fresh = scaled_fresh.clone();
-        let diagnostic_scalings = scalings.clone();
-        let diagnostic_bases = bases.clone();
-        let compiler = ExponentLutEncodingCompiler::with_layout(
-            mxx_bgg::BggPublicKeyCompiler {
-                ring: ring.clone(),
-                base: setup.layout.gadget_base.clone(),
-                digit_count: setup.layout.digit_count.into(),
-            },
-            crate::layout::ExpLayout { stride_log2: 1, width_log2: n.ilog2() - 1 },
-        );
-        let bound = setup
-            .refresh
-            .bind_imported_wires(
-                &compiler,
-                state,
-                BggPublicKeyWire { matrix: public_a, reveal_plaintext: false },
-                a_prime.clone(),
-                slot_public.clone(),
-                targets.clone(),
-                scaled_fresh,
-                masks,
-                scalings,
-                bases,
-                preimages.clone(),
-            )
-            .unwrap();
-        let refreshed = setup.refresh.refresh(&compiler, &bound).unwrap().into_encoding().vector;
-        let expected = secret * a_prime - message * (payload_secret * gadget) + fresh;
-        let mut context = DslContext::new("numeric-switched-decoder")
-            .output("refresh-residual", refreshed - expected.clone())
-            .unwrap();
-        for slot in 0..depth {
-            let modulus = IntExpr::constant(BigInt::from(setup.switch_moduli[slot].clone()));
-            let low = setup.switch_ring(slot).unwrap();
-            let delta = low.polynomial([IntExpr::constant(BigInt::from(
-                &setup.switch_moduli[slot] / primes[slot],
-            ))]);
-            let support = 4usize.pow(setup.mask_base_p_digit_counts[slot] as u32);
-            let nominal_mask = Mat::concat(
-                mxx_dsl::ConcatAxis::Columns,
-                (0..columns)
-                    .map(|column| {
-                        low.polynomial((0..n as usize).map(|coefficient| {
-                            IntExpr::constant(
-                                BigInt::from((column * n as usize + coefficient) % support) -
-                                    BigInt::from(support / 2),
-                            )
-                        }))
-                    })
-                    .collect(),
-            );
-            let combined =
-                diagnostic_scalings[slot].clone().mul_small_rhs(diagnostic_state.clone()) +
-                    diagnostic_masks[slot].vector.clone() +
-                    diagnostic_fresh[slot].vector.clone();
-            let decoder_error = preimages[slot].clone().mul_small_rhs(anchor_errors[slot].clone());
-            let final_error = combined.modulus_switch(modulus.clone()) -
-                preimages[slot].clone().mul_small_rhs(diagnostic_bases[slot].vector.clone()) -
-                delta * expected.clone().reduce_modulus(modulus) -
-                nominal_mask;
-            context = context
-                .output(format!("pre-switch-error-{slot}"), pre_switch_errors[slot].clone())
-                .unwrap()
-                .output(format!("paired-error-{slot}"), final_error.clone() + decoder_error.clone())
-                .unwrap()
-                .output(format!("decoder-error-{slot}"), decoder_error)
-                .unwrap()
-                .output(format!("final-error-{slot}"), final_error)
-                .unwrap()
-                .output(format!("anchor-error-{slot}"), anchor_errors[slot].clone())
-                .unwrap();
-            context = context
-                .output(format!("mask-normalization-residual-{slot}"), mask_residuals[slot].clone())
-                .unwrap();
-            context = context
-                .output(
-                    format!("preimage-residual-{slot}"),
-                    preimages[slot].clone().mul_small_rhs(slot_public[slot].clone()) -
-                        targets[slot].clone(),
-                )
-                .unwrap();
-        }
-        let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        let mut concrete = vec![parameters.clone()];
-        for p in setup.switch_moduli.iter().collect::<std::collections::BTreeSet<_>>() {
-            concrete.push(parameters.select_modulus(p).unwrap());
-        }
-        (graph, concrete, bounds)
-    }
-
-    #[test]
-    #[cfg_attr(feature = "gpu", serial_test::serial(dcrt_runtime))]
-    fn switched_decoder_numeric_round_trip_with_shared_fresh_error() {
-        use mxx_primitives::{
-            matrix::PolyMatrix,
-            poly::{Poly, PolyParams},
-        };
-        use mxx_runtime::{
-            MemoryArtifactStore, RuntimeValue, backend::poly::cpu_backend, transcript::SamplingMode,
-        };
-        let (graph, concrete, bounds) = switched_decoder_numeric_fixture();
-        let mut backend = cpu_backend(concrete);
-        // Two fresh execution draws of the same validated graph, with no
-        // replay/cached anchor. Structural tests separately bind draw sites.
-        for _execution in 0..2 {
-            let result = mxx_runtime::execute(
-                &graph,
-                &mut backend,
-                BTreeMap::new(),
-                &mut MemoryArtifactStore::default(),
-                SamplingMode::Fresh,
-            )
-            .unwrap();
-            let mut observations = BTreeMap::new();
-            for (name, output) in result.outputs {
-                let RuntimeValue::Matrix(matrix) = output else {
-                    panic!("matrix output expected");
-                };
-                let mut coefficients = Vec::new();
-                for row in 0..matrix.row_size() {
-                    for column in 0..matrix.col_size() {
-                        coefficients.extend(matrix.entry(row, column).coeffs_biguints());
-                    }
-                }
-                observations
-                    .insert(name, (matrix.params().modulus().as_ref().clone(), coefficients));
-            }
-            assert_numeric_refresh_outputs(observations, &bounds);
-        }
-    }
-
-    pub(crate) fn parameters_for_numeric_refresh(
-        parameters: &mxx_primitives::poly::dcrt::params::DCRTPolyParams,
-    ) -> RefreshSetupParameters {
-        use mxx_primitives::poly::PolyParams;
-        let (primes, _, _) = parameters.to_crt();
-        let q = BigInt::from(parameters.modulus().as_ref().clone());
-        RefreshSetupParameters::new(
-            rand::random(),
-            4,
-            2,
-            parameters.ring_dimension() as usize,
-            1,
-            1,
-            32,
-            4,
-            BggSamplerLayout {
-                modulus: q.clone().into(),
-                ring_dimension: (parameters.ring_dimension() as usize).into(),
-                secret_dimension: 2,
-                digit_count: parameters.modulus_digits(),
-                gadget_base: BigInt::from(1u64 << parameters.base_bits()).into(),
-            },
-            RefreshCompiler {
-                full_modulus: q.into(),
-                crt_plaintext_moduli: primes.into_iter().map(IntExpr::constant).collect(),
-                reconstruction_coefficients: parameters
-                    .reconst_coeffs()
-                    .into_iter()
-                    .map(|value| IntExpr::constant(BigInt::from(value)))
-                    .collect(),
-            },
-            1.into(),
-            1.into(),
-            "numeric-switched-decoder",
-        )
-    }
-
-    #[test]
-    fn switched_preprocessing_artifacts_use_only_selected_decoder_rings() {
-        use mxx_primitives::poly::PolyParams;
-        let (_, rings, _) = switched_decoder_numeric_fixture();
-        let source = &rings[0];
-        let mut setup = parameters_for_numeric_refresh(source);
-        let primes = source.to_crt().0;
-        let q = source.modulus().as_ref().clone();
-        setup.switch_moduli = (0..primes.len())
-            .map(|slot| {
-                &q / BigUint::from(
-                    primes[if slot + 1 == primes.len() { 0 } else { primes.len() - 1 }],
-                )
-            })
-            .collect();
-        let profile = SparseLwrPrfProfile::new(
-            crate::layout::ExpLayout {
-                stride_log2: 1,
-                width_log2: source.ring_dimension().ilog2() - 1,
-            },
-            2,
-        )
-        .unwrap();
-        setup.lut_width = profile.layout.width();
-        let expected = setup.layout.ring().polynomial([1.into()]);
-        let generated = generate_key_layout(
-            &PbcParameters::paper_evaluation(10, 4),
-            PbcRootSeed(rand::random()),
-            &[0, 1, 2, 3],
-        )
-        .unwrap();
-        let bundle = RefreshParameterSimulationRequest::new(
-            setup.clone(),
-            profile,
-            generated,
-            rand::random(),
-            setup.decoder_sigma.clone(),
-            expected,
-            1,
-        )
-        .unwrap()
-        .build_benchmark()
-        .unwrap();
-        assert_eq!(bundle.ring_parameters(source.clone()).unwrap().len(), 3);
-        let nodes = bundle
-            .benchmark_preprocessing_graph()
-            .graph
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .collect::<Vec<_>>();
-        let trapdoors = nodes
-            .iter()
-            .filter_map(|node| match node.kind() {
-                NodeKind::TrapdoorSample { matrix_type, .. } => {
-                    Some(matrix_type.modulus.evaluate(&ParamEnv::default()).unwrap())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(trapdoors.len(), 2);
-        assert!(trapdoors.iter().all(|p| *p != BigInt::from(q.clone())));
-        assert_eq!(
-            trapdoors.into_iter().collect::<std::collections::BTreeSet<_>>(),
-            setup.switch_moduli.iter().cloned().map(BigInt::from).collect()
-        );
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::ModulusSwitch { .. }))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn online_anchor_groups_reduce_one_secret_and_sample_once_per_ring() {
-        let mut setup = parameters(4, 2);
-        setup.layout.modulus = 105.into();
-        setup.refresh.full_modulus = 105.into();
-        setup.refresh.crt_plaintext_moduli = vec![7.into(), 3.into(), 5.into()];
-        setup.refresh.reconstruction_coefficients = vec![1.into(); 3];
-        setup.switch_moduli = vec![21u8.into(), 15u8.into(), 15u8.into()];
-        setup.mask_base_p_digit_counts = vec![1, 3, 2];
-        let security = setup.anchor_security_inputs(3).unwrap();
-        assert_eq!(security.len(), 2);
-        assert_eq!(security[0].modulus, 15u8.into());
-        assert_eq!(security[0].complementary_modulus, 7u8.into());
-        assert_eq!(security[0].slots, vec![1, 2]);
-        assert_eq!(security[1].modulus, 21u8.into());
-        assert_eq!(security[1].complementary_modulus, 5u8.into());
-        for group in security {
-            assert_eq!(group.ring_dimension, 4);
-            assert_eq!(group.random_secret_polynomials, 1);
-            assert_eq!(group.fixed_augmented_coordinate, 1);
-            assert_eq!(group.ring_samples, 3 * group.anchor_columns);
-            assert_eq!(group.error_sigma, setup.encoding_error_sigma);
-            assert_eq!(group.error_coefficient_cutoff, setup.encoding_error_bound);
-            assert_eq!(group.estimated_security_bits, None);
-            assert!(group.status.contains("noise acceptance is not security acceptance"));
-        }
-        assert!(setup.anchor_security_inputs(0).is_err());
-        let ring = setup.layout.ring();
-        let secret = ring.input("shared-small-secret", (1, 2));
-        let public = setup
-            .anchor_groups()
-            .iter()
-            .map(|(p, _)| {
-                mxx_dsl::Ring::new(IntExpr::constant(BigInt::from(p.clone())), 4)
-                    .input(format!("B-{p}"), (2, 8))
-            })
-            .collect::<Vec<_>>();
-        let (anchors, bases) = shared_decoder_bases(&setup, secret.clone(), &public).unwrap();
-        assert_eq!(anchors[1].value_handle(), anchors[2].value_handle());
-        assert_ne!(anchors[0].value_handle(), anchors[1].value_handle());
-        assert_eq!(bases[1].vector.value_handle(), bases[2].vector.value_handle());
-        assert_ne!(bases[0].vector.value_handle(), bases[1].vector.value_handle());
-        let (_, second) = shared_decoder_bases(&setup, secret, &public).unwrap();
-        assert_ne!(bases[0].vector.value_handle(), second[0].vector.value_handle());
-        let mut context = DslContext::new("grouped-online-anchors");
-        for (slot, base) in bases.into_iter().enumerate() {
-            let low = setup.switch_ring(slot).unwrap();
-            context = context
-                .output(
-                    format!("decoder-result-{slot}"),
-                    base.vector * low.input(format!("consumer-{slot}"), (8, 1)),
-                )
-                .unwrap();
-        }
-        let graph = context.build().unwrap();
-        graph.validate(&Default::default()).unwrap();
-        let nodes =
-            graph.graph.scopes().values().flat_map(|scope| scope.nodes()).collect::<Vec<_>>();
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
-                .count(),
-            2
-        );
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::ModulusReduce { .. }))
-                .count(),
-            2
-        );
-        assert!(!nodes.iter().any(|node| matches!(
-            node.kind(),
-            NodeKind::ModulusSwitch { .. } | NodeKind::UniformIntervalSample { .. }
-        )));
-        assert!(graph.graph.outputs().keys().all(|name| name.starts_with("decoder-result-")));
-    }
-
-    #[test]
-    fn online_label_encodings_use_s_for_both_mask_and_payload_when_s_differs_from_t()
-    -> Result<(), RefreshSetupError> {
-        let setup = parameters(4, 2);
-        let sampler = ExponentLutEncodingSampler {
-            layout: setup.layout.clone(),
-            exponent_layout: crate::layout::ExpLayout { stride_log2: 1, width_log2: 1 },
-            gaussian_sigma: Some(setup.encoding_error_sigma.clone()),
-            gaussian_max_coefficient_bound: Some(setup.encoding_error_bound.clone()),
-        };
-        let ring = setup.layout.ring();
-        let s = sampler.sample_secret().expect("online secret s");
-        let t = sampler.sample_secret().expect("setup secret t");
-        let key = mxx_bgg::BggPublicKeySampler { layout: sampler.layout.clone() }
-            .sample(
-                ring.bytes_input("online-s-test-key", 32),
-                b"online-s-test".as_slice(),
-                &[false],
-            )
-            .into_iter()
-            .nth(1)
-            .expect("public key");
-        let plaintext = ring.identity(1);
-        let decomposition = key
-            .matrix
-            .clone()
-            .decompose(setup.layout.gadget_base.clone(), setup.layout.digit_count);
-        let initial = sampler
-            .sample_encodings_for_public_matrices(
-                s.clone(),
-                Some(t.clone()),
-                std::slice::from_ref(&key),
-                std::slice::from_ref(&plaintext),
-            )?
-            .into_iter()
-            .next()
-            .ok_or(RefreshSetupError::InvalidManifest)?
-            .vector;
-        let public_a =
-            sample_online_label_vector_from_preimage(&sampler, &s, decomposition, plaintext)?;
-        let context = DslContext::new("online-s-shared-test")
-            .private_output("initial", initial)
-            .expect("initial output")
-            .private_output("public-a", public_a)
-            .expect("public-a output")
-            .build()?;
-        let uniform_nodes = context
-            .graph
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| matches!(node.kind(), NodeKind::UniformIntervalSample { .. }))
-            .count();
-        assert_eq!(
-            uniform_nodes, 2,
-            "online labels must reuse s for both mask and payload; setup t is distinct and unused"
-        );
-        assert_ne!(s.value_handle(), t.value_handle());
-        Ok(())
-    }
-}
-
-/// Compares matrix schemas by their evaluated dimensions.  DSL constructors
-/// may leave equivalent expressions such as `1 + 1` symbolic in one producer
-/// and `2` in another; those are the same concrete ring matrix and must remain
-/// compatible when the producer's exact expressions are reused.
-fn same_matrix_type(
-    left: &mxx_ir_core::types::MatrixType,
-    right: &mxx_ir_core::types::MatrixType,
-) -> bool {
-    [
-        (&left.modulus, &right.modulus),
-        (&left.ring_dimension, &right.ring_dimension),
-        (&left.rows, &right.rows),
-        (&left.columns, &right.columns),
-    ]
-    .into_iter()
-    .all(|(left, right)| {
-        match (left.evaluate(&ParamEnv::default()), right.evaluate(&ParamEnv::default())) {
-            (Ok(left), Ok(right)) => left == right,
-            _ => false,
-        }
-    })
-}
-
 /// The three immutable graph stages plus request-level external-input facts.
 /// BuiltGraph and declaration validation occurs during bundle
 /// construction. No schedules, secrets, or raw constructors are exposed, and
@@ -7310,12 +1270,12 @@ pub struct RefreshParameterSimulationBundle {
     selector_runtime_binding: PbcSelectorRuntimeBinding,
     metadata: std::collections::BTreeMap<String, RefreshSimulationMatrixInputMetadata>,
     targets: Vec<RefreshSimulationDecoderTarget>,
-    pub(crate) noise_snapshot: ExponentLutNoiseSnapshot,
+    pub(crate) noise_snapshot: BggNoiseSnapshot,
 }
 
 impl RefreshParameterSimulationBundle {
     /// Returns the frozen noise inputs used by this bundle's simulator.
-    pub fn noise_snapshot(&self) -> &ExponentLutNoiseSnapshot {
+    pub fn noise_snapshot(&self) -> &BggNoiseSnapshot {
         &self.noise_snapshot
     }
 
@@ -7422,8 +1382,10 @@ impl RefreshParameterSimulationBundle {
     /// identity before any bound is evaluated.
     pub fn simulate_noise(
         &self,
-    ) -> Result<ExponentLutNoiseReport, crate::noise_refresh::simulation::NoiseSimulationError>
-    {
+    ) -> Result<
+        ExponentLutNoiseReport<ProgramNoiseReport>,
+        crate::noise_refresh::simulation::NoiseSimulationError,
+    > {
         if self.noise_snapshot.setup_identity() != &self.public_identity {
             return Err(crate::noise_refresh::simulation::NoiseSimulationError::InvalidRefresh(
                 "simulation snapshot identity mismatch",
@@ -7437,8 +1399,10 @@ impl RefreshParameterSimulationBundle {
     pub fn simulate_average_noise(
         &self,
         config: &AverageCaseConfig,
-    ) -> Result<ExponentLutAverageNoiseReport, crate::noise_refresh::simulation::NoiseSimulationError>
-    {
+    ) -> Result<
+        ExponentLutAverageNoiseReport<ProgramNoiseReport>,
+        crate::noise_refresh::simulation::NoiseSimulationError,
+    > {
         if self.noise_snapshot.setup_identity() != &self.public_identity {
             return Err(crate::noise_refresh::simulation::NoiseSimulationError::InvalidRefresh(
                 "average simulation snapshot identity mismatch",
@@ -7449,9 +1413,9 @@ impl RefreshParameterSimulationBundle {
 }
 
 /// Resolves and validates each frozen residual-to-decoder output link.
-fn decoder_targets(
+fn decoder_targets<V: mxx_dsl::GraphValue>(
     graph: &BuiltGraph,
-    verification: &RefreshVerification,
+    verification: &RefreshVerification<V>,
     decode_length: usize,
     plaintext_modulus: mxx_ir_core::IntExpr,
 ) -> Result<Vec<RefreshSimulationDecoderTarget>, RefreshSetupError> {

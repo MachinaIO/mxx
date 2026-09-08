@@ -1,7 +1,9 @@
 //! Closed refresh correctness assembled from every actual high-source bound.
-use crate::noise_refresh::simulation::ExponentLutNoiseReport;
+use crate::{bgg::noise::ProgramNoiseReport, noise_refresh::simulation::ExponentLutNoiseReport};
 
-pub(super) fn root_refresh_correctness(report: &ExponentLutNoiseReport) -> Option<String> {
+pub(super) fn root_refresh_correctness(
+    report: &ExponentLutNoiseReport<ProgramNoiseReport>,
+) -> Option<String> {
     if report.refresh.slots.is_empty() ||
         report.refresh.slots.iter().any(|slot| slot.rounding_margin <= 0.into())
     {

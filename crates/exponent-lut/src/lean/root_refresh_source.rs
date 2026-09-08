@@ -1,5 +1,9 @@
 //! Actual pre-switch route sums, retaining per-column support and sampled errors.
-use super::root_inputs::value_expression;
+use super::{
+    root_inputs::value_expression,
+    root_program_setup::{parallel_arguments, parallel_operand},
+    root_readout_public::{root_fact, segmented_reduction},
+};
 use mxx_ir_core::{
     FrozenGraphScopeId, ValidatedGraph,
     graph::GraphScope,
@@ -15,17 +19,79 @@ fn child(wire: WireRef) -> FrozenGraphScopeId {
     }
 }
 
-fn gather(graph: &ValidatedGraph, wire: WireRef) -> Option<(WireRef, WireRef)> {
+fn gather(graph: &ValidatedGraph, wire: WireRef) -> Option<(WireRef, Option<WireRef>)> {
     let root = graph.source.root_scope();
     let scope = graph.source.scopes().get(&child(wire))?;
-    let output = scope.node(scope.outputs()[0].node)?;
-    if !matches!(output.kind(), NodeKind::FamilyGetDynamic) {
+    let output = *scope.outputs().get(wire.port.0 as usize)?;
+    let parent = root.node(wire.node)?;
+    let parents = root.arguments(parent)?;
+    let map = |arg| scope.inputs().iter().position(|input| *input == arg).map(|i| parents[i]);
+    if let Some(slot) = scope.inputs().iter().position(|input| *input == output) {
+        let NodeKind::ParallelLoop(spec) = parent.kind() else { return None };
+        if matches!(
+            spec.input_modes[slot],
+            mxx_ir_core::node::LoopInputMode::Zip |
+                mxx_ir_core::node::LoopInputMode::ZipOffset { .. }
+        ) {
+            return Some((parents[slot], None));
+        }
+    }
+    let node = scope.node(output.node)?;
+    if !matches!(node.kind(), NodeKind::FamilyGetDynamic) {
         return None;
     }
-    let args = scope.arguments(output)?;
-    let parents = root.arguments(root.node(wire.node)?)?;
-    let map = |arg| scope.inputs().iter().position(|input| *input == arg).map(|i| parents[i]);
-    Some((map(args[0])?, map(args[1])?))
+    let args = scope.arguments(node)?;
+    Some((map(args[0])?, Some(map(args[1])?)))
+}
+
+/// Bind a route view to its actual source family and integer index expression.
+pub(super) fn route_binding(
+    graph: &ValidatedGraph,
+    artifact: &LeanArtifact,
+    output: WireRef,
+    index: &str,
+) -> Result<Option<(WireRef, String)>, String> {
+    let Some((family, indices)) = gather(graph, output) else { return Ok(None) };
+    let expression = if let Some(indices) = indices {
+        let scope = &graph.source.scopes()[&child(indices)];
+        if !scope.inputs().is_empty() {
+            return Err("route indices depend on non-index inputs".into());
+        }
+        let NodeKind::ParallelLoop(spec) =
+            graph.source.root_scope().node(indices.node).ok_or("missing route index loop")?.kind()
+        else {
+            return Err("route indices are not parallel".into())
+        };
+        let mut values = artifact.scope_proofs[&child(indices)].value_expressions.clone();
+        values.insert(format!("i_{}", spec.index_slot), format!("({index}).val"));
+        let wire = scope.outputs()[indices.port.0 as usize];
+        value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &values)?
+    } else {
+        let scope = &graph.source.scopes()[&child(output)];
+        let wire = scope.outputs()[output.port.0 as usize];
+        let slot = scope
+            .inputs()
+            .iter()
+            .position(|input| *input == wire)
+            .ok_or("identity route output is not an input")?;
+        let NodeKind::ParallelLoop(spec) = graph
+            .source
+            .root_scope()
+            .node(output.node)
+            .ok_or("missing identity route loop")?
+            .kind()
+        else {
+            return Err("identity route is not parallel".into())
+        };
+        match spec.input_modes[slot] {
+            mxx_ir_core::node::LoopInputMode::Zip => format!("(({index}).val : Int)"),
+            mxx_ir_core::node::LoopInputMode::ZipOffset { offset } => {
+                format!("((({index}).val : Int) + {offset})")
+            }
+            _ => return Err("identity route is not indexed".into()),
+        }
+    };
+    Ok(Some((family, expression)))
 }
 
 fn arguments(scope: &GraphScope, wire: WireRef) -> Result<Vec<WireRef>, String> {
@@ -35,8 +101,7 @@ fn arguments(scope: &GraphScope, wire: WireRef) -> Result<Vec<WireRef>, String> 
         .ok_or("missing refresh operands".into())
 }
 
-/// Every layer is proved for a symbolic position, so large mask families do
-/// not expand into one proof term per label or coefficient.
+/// Shared checked reduction preserves the exact scalar route theorem boundary.
 fn reduction(
     graph: &ValidatedGraph,
     artifact: &LeanArtifact,
@@ -44,144 +109,22 @@ fn reduction(
     segments: usize,
     name: &str,
 ) -> Result<(String, WireRef, usize), String> {
-    let root = graph.source.root_scope();
+    let (proof, leaf, width) = segmented_reduction(graph, artifact, output, segments, "segment")?;
     let shape = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
-    let types = &graph.scopes[&FrozenGraphScopeId::Root].wire_types;
     let value = |wire: WireRef| {
         value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &shape.value_expressions)
     };
-    let maximum_fact = std::cell::Cell::new(0usize);
-    let fact = |wire: WireRef| -> Result<String, String> {
-        let position = shape
-            .node_constraints
-            .get(&wire.node)
-            .and_then(|r| r.clone().last())
-            .ok_or("missing route reduction fact")?;
-        maximum_fact.set(maximum_fact.get().max(position));
-        Ok(format!("facts{}.1", ".2".repeat(position)))
-    };
-    let count = |wire| -> Result<usize, String> {
-        let ConcreteWireType::IndexedFamily { count, .. } = &types[&wire] else {
-            return Err("route reduction not a family".into())
-        };
-        Ok(*count)
-    };
-    if segments == 0 || count(output)? != segments {
-        return Err("route final segment count mismatch".into());
-    }
-    let mut current = output;
-    let mut levels = Vec::new();
-    loop {
-        let Some(scope) = graph.source.scopes().get(&child(current)) else { break };
-        let parents = arguments(root, current)?;
-        if parents.len() != 2 || scope.outputs().len() != 1 {
-            break;
-        }
-        let (Some((left, left_index)), Some((right, right_index))) =
-            (gather(graph, parents[0]), gather(graph, parents[1]))
-        else {
-            break
-        };
-        if left != right {
-            break;
-        }
-        let width = count(left)? / segments;
-        let next = count(current)? / segments;
-        if count(left)? % segments != 0 ||
-            count(current)? % segments != 0 ||
-            next != width.div_ceil(2)
-        {
-            return Err("route reduction has inconsistent segments".into());
-        }
-        levels.push((current, parents[0], parents[1], left_index, right_index, left, width, next));
-        current = left;
-    }
-    let width = count(current)? / segments;
-    if width == 0 {
-        return Err("empty route segment".into());
-    }
-    let record = shape.witness_record.as_ref().ok_or("missing route root record")?;
-    let body = shape.body_relation.as_ref().ok_or("missing route root body")?;
-    let relation = &artifact.root;
-    let binders = format!(
-        "{{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (segment : Fin {segments})",
-        relation.parameter_type, relation.input_type, relation.output_type,
-    );
-    let public_source = format!(
-        "theorem {name} {binders} :\n    ({}) segment = ∑ i : Fin {width}, ({}) ⟨segment.val * {width} + i.val, by clear * - segment i; omega⟩ := by\n  classical\n",
+    let body = shape.body_relation.as_ref().ok_or("missing route body")?;
+    let record = shape.witness_record.as_ref().ok_or("missing route witness")?;
+    let source = format!(
+        "theorem {name} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (segment : Fin {segments}) : ({}) segment = ∑ i : Fin {width}, ({}) ⟨segment.val * {width} + i.val, by omega⟩ := by\n{proof}  exact reduced\n\n",
+        artifact.root.parameter_type,
+        artifact.root.input_type,
+        artifact.root.output_type,
         value(output)?,
-        value(current)?
+        value(leaf)?
     );
-    let mut layers_source = String::new();
-    let mut source = String::new();
-    for (result, left, right, left_index, right_index, previous, old, next) in levels.iter().rev() {
-        source.clear();
-        maximum_fact.set(0);
-        let id = result.node.0;
-        let old_count = segments * old;
-        let next_count = segments * next;
-        let previous_value = value(*previous)?;
-        let result_value = value(*result)?;
-        source.push_str(&format!("private theorem {name}_layer_{id} {binders} : (∑ i : Fin {next}, ({}) ⟨segment.val * {next} + i.val, by clear * - segment i; omega⟩) =\n      ∑ i : Fin {old}, ({}) ⟨segment.val * {old} + i.val, by clear * - segment i; omega⟩ := by\n    apply pairwise_sum (n := {old}) (f := fun i : Fin {old} => ({previous_value}) ⟨segment.val * {old} + i.val, by clear * - segment i; omega⟩) (g := fun i : Fin {next} => ({result_value}) ⟨segment.val * {next} + i.val, by clear * - segment i; omega⟩)\n    intro i\n    have leftBound : 2 * i.val < {old} := by clear * - segment i; omega\n    have indexDiv : ((segment.val : Int) * {next} + i.val) / {next} = segment.val := by\n      clear * - segment i\n      omega\n    have indexMod : ((segment.val : Int) * {next} + i.val) % {next} = i.val := by\n      clear * - segment i\n      omega\n",value(*result)?,value(*previous)?));
-        for (side, wire, indices, position) in [
-            ("left", *left, *left_index, "2 * i.val".to_string()),
-            ("right", *right, *right_index, format!("(2 * i.val + 1) % {old}")),
-        ] {
-            let ir = &artifact.scope_relations[&child(indices)];
-            let gr = &artifact.scope_relations[&child(wire)];
-            source.push_str(&format!("    have {side}Index : ({}) ⟨segment.val * {next} + i.val, by clear * - segment i; omega⟩ = ((segment.val * {old} + {position} : Nat) : Int) := by\n      have h := {} (⟨segment.val * {next} + i.val, by clear * - segment i; omega⟩ : Fin {next_count})\n      dsimp only [{ir}, {ir}.constraints_0] at h\n      norm_num only [Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat, Int.natCast_mod, indexDiv, indexMod] at h ⊢\n      clear * - segment i h leftBound indexDiv indexMod\n      omega\n    have {side}Get : ({}) ⟨segment.val * {next} + i.val, by clear * - segment i; omega⟩ = ({}) ⟨segment.val * {old} + {position}, by clear * - segment i; omega⟩ := by\n      have h := {} (⟨segment.val * {next} + i.val, by clear * - segment i; omega⟩ : Fin {next_count})\n      dsimp only [{gr}, {gr}.constraints_0] at h\n      obtain ⟨sample, hlo, hhi, hg, hout⟩ := h\n      exact hout.trans (route_lookup_eq (⟨segment.val * {old} + {position}, by clear * - segment i; omega⟩ : Fin {old_count}) {side}Index hg)\n",value(indices)?,fact(indices)?,value(wire)?,value(*previous)?,fact(wire)?));
-        }
-        let rr = &artifact.scope_relations[&child(*result)];
-        let scope = &graph.source.scopes()[&child(*result)];
-        let is_select = matches!(
-            scope.node(scope.outputs()[0].node).map(|n| n.kind()),
-            Some(NodeKind::Select { .. })
-        );
-        source.push_str(&format!("    have h := {} (⟨segment.val * {next} + i.val, by clear * - segment i; omega⟩ : Fin {next_count})\n    by_cases rightBound : 2 * i.val + 1 < {old}\n",fact(*result)?));
-        if is_select {
-            source.push_str(&format!("    · have selected : (i.val : Int) ≠ {} := by clear * - segment i rightBound; omega\n      simp only [{rr}, {rr}.constraints_0, Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat, indexMod] at h\n      simp only [selected, decide_false, Bool.false_eq_true, ↓reduceIte] at h\n      obtain ⟨selectedValue, hnonzero, hlo, hhi, hlength, hselect, hout⟩ := h\n      have selectedEq := route_select_zero hselect\n      simpa only [leftBound, rightBound, ↓reduceDIte, MxxRuntime.matrixAdd, leftGet, rightGet, Nat.mod_eq_of_lt rightBound] using hout.trans selectedEq\n    · have selected : (i.val : Int) = {} := by clear * - segment i rightBound; omega\n      simp only [{rr}, {rr}.constraints_0, Int.ofNat_eq_natCast, Nat.cast_add, Nat.cast_mul, Nat.cast_ofNat, indexMod] at h\n      simp only [selected, decide_true, ↓reduceIte] at h\n      obtain ⟨selectedValue, hnonzero, hlo, hhi, hlength, hselect, hout⟩ := h\n      have selectedEq := route_select_one hselect\n      simpa only [leftBound, rightBound, ↓reduceDIte, add_zero, leftGet] using hout.trans selectedEq\n",next-1,next-1));
-        } else {
-            source.push_str(&format!("    · simpa only [{rr}, {rr}.constraints_0, MxxRuntime.matrixAdd, leftBound, rightBound, ↓reduceDIte, leftGet, rightGet, Nat.mod_eq_of_lt rightBound] using h\n    · clear * - i rightBound\n      omega\n"));
-        }
-        source = source
-            .lines()
-            .map(|line| line.strip_prefix("  ").unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        source.push('\n');
-        source = source.replacen(" := by\n", " := by\n  classical\n", 1);
-        let mut tails = String::new();
-        for block in (1..=maximum_fact.get() / 64).rev() {
-            let position = block * 64;
-            source = source
-                .replace(&format!("facts{}", ".2".repeat(position)), &format!("facts_{position}"));
-        }
-        for position in (64..=maximum_fact.get()).step_by(64) {
-            let previous = if position == 64 {
-                "facts".to_string()
-            } else {
-                format!("facts_{}", position - 64)
-            };
-            tails.push_str(&format!("  have facts_{position} := {previous}{}\n", ".2".repeat(64)));
-        }
-        source = source.replacen("  classical\n", &format!("  classical\n{tails}"), 1);
-        layers_source.push_str(&source);
-        layers_source.push('\n');
-    }
-    let mut source = public_source;
-    if levels.is_empty() {
-        source.push_str("  simp\n");
-    } else {
-        source.push_str("  calc\n");
-        let final_value = value(output)?;
-        source.push_str(&format!("    ({final_value}) segment = ∑ i : Fin 1, ({final_value}) ⟨segment.val * 1 + i.val, by clear * - segment i; omega⟩ := by\n      rw [Fin.sum_univ_one]\n      apply congrArg\n      apply Fin.ext\n      simp only [Nat.mul_one, Nat.add_zero, Fin.val_zero]\n"));
-        for (result, _, _, _, _, previous, old, _) in &levels {
-            source.push_str(&format!("    _ = ∑ i : Fin {old}, ({}) ⟨segment.val * {old} + i.val, by clear * - segment i; omega⟩ := {name}_layer_{} witness facts segment\n",value(*previous)?,result.node.0));
-        }
-    }
-    source.push('\n');
-    layers_source.push_str(&source);
-    Ok((layers_source, current, width))
+    Ok((source, leaf, width))
 }
 
 fn route_gather(
@@ -191,41 +134,46 @@ fn route_gather(
     prefix: &str,
 ) -> Result<String, String> {
     let (family, indices) = gather(graph, output).ok_or("missing actual route gather")?;
-    let index_scope = &graph.source.scopes()[&child(indices)];
-    if !index_scope.inputs().is_empty() {
-        return Err("route gather indices depend on non-index inputs".into());
-    }
+    let scope = &graph.source.scopes()[&child(output)];
+    let output_wire = scope.outputs()[output.port.0 as usize];
     let shape = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
-    let index_shape = &artifact.scope_proofs[&child(indices)];
-    let mut values = index_shape.value_expressions.clone();
-    let NodeKind::ParallelLoop(spec) =
-        graph.source.root_scope().node(indices.node).ok_or("missing route indices")?.kind()
-    else {
-        return Err("route indices not parallel".into());
-    };
-    values.insert(format!("i_{}", spec.index_slot), "i.val".into());
-    let wire = index_scope.outputs()[0];
-    let expression = value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &values)?;
+    let member_shape = &artifact.scope_proofs[&child(output)];
     let value = |wire: WireRef| {
         value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &shape.value_expressions)
     };
-    let count = |wire: WireRef| -> Result<usize, String> {
-        match &graph.scopes[&FrozenGraphScopeId::Root].wire_types[&wire] {
-            ConcreteWireType::IndexedFamily { count, .. } => Ok(*count),
-            _ => Err("route gather value not family".into()),
+    let count = |wire: WireRef| match &graph.scopes[&FrozenGraphScopeId::Root].wire_types[&wire] {
+        ConcreteWireType::IndexedFamily { count, .. } => Ok(*count),
+        _ => Err("route gather value not family".to_owned()),
+    };
+    let (slot, inputs, outputs) = parallel_arguments(graph, artifact, output, "i")?;
+    let context = format!(
+        "(backend := backend) (hashModel := hashModel) (params := params) (i_{slot} := i.val) (inputs := {inputs}) (outputs := {outputs}) (witness := member)"
+    );
+    let output_fact = member_shape.output_fact.as_ref().ok_or("missing route output fact")?;
+    let projection = if scope.outputs().len() == 1 {
+        "result".to_owned()
+    } else {
+        format!("result{}.1", ".2".repeat(output.port.0 as usize))
+    };
+    let (_, expression) =
+        route_binding(graph, artifact, output, "i")?.ok_or("missing route binding")?;
+    let mut preparation = String::new();
+    if let Some(indices) = indices {
+        let index_scope = &graph.source.scopes()[&child(indices)];
+        if !index_scope.inputs().is_empty() {
+            return Err("route gather indices depend on non-index inputs".into());
         }
-    };
-    let fact = |wire: WireRef| -> Result<String, String> {
-        let position =
-            shape.node_constraints[&wire.node].clone().last().ok_or("missing route gather fact")?;
-        Ok(format!("facts{}.1", ".2".repeat(position)))
-    };
-    let ir = &artifact.scope_relations[&child(indices)];
-    let gr = &artifact.scope_relations[&child(output)];
+        let index_shape = &artifact.scope_proofs[&child(indices)];
+        let (index_slot, index_inputs, index_outputs) =
+            parallel_arguments(graph, artifact, indices, "indexPosition")?;
+        let index_output_fact =
+            index_shape.output_fact.as_ref().ok_or("missing route index fact")?;
+        preparation.push_str(&format!("  let indexPosition : Fin {} := ⟨i.val, by have bound := i.isLt; omega⟩\n  obtain ⟨indexWitness, indexFacts⟩ := ({} backend hashModel params indexPosition.val {index_inputs} {index_outputs}).mp (({}) indexPosition)\n  have indexEq : ({}) indexPosition = {expression} := {index_output_fact} (backend := backend) (hashModel := hashModel) (params := params) (i_{index_slot} := indexPosition.val) (inputs := {index_inputs}) (outputs := {index_outputs}) (witness := indexWitness) indexFacts\n",count(indices)?,index_shape.runs_iff_body,root_fact(artifact,indices)?,value(indices)?));
+    }
     let record = shape.witness_record.as_ref().ok_or("missing route record")?;
     let body = shape.body_relation.as_ref().ok_or("missing route body")?;
-    Ok(format!(
-        "theorem {prefix}route_gather_{} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (i : Fin {}) : ∃ bound : ({expression}).toNat < {},\n    ({}) i = ({}) ⟨({expression}).toNat, bound⟩ := by\n  have indexFacts := {} i\n  dsimp only [{ir}, {ir}.constraints_0] at indexFacts\n  have indexEq := indexFacts{}\n  have h := {} i\n  dsimp only [{gr}, {gr}.constraints_0] at h\n  obtain ⟨sample, hlo, hhi, hg, hout⟩ := h\n  rw [indexEq] at hlo hhi hg\n  have bound : ({expression}).toNat < {} := by clear * - hlo hhi; omega\n  refine ⟨bound, hout.trans ?_⟩\n  apply route_lookup_eq (⟨({expression}).toNat, bound⟩ : Fin {}) _ hg\n  exact (Int.toNat_of_nonneg hlo).symm\n\n",
+    let mut source = format!(
+        "theorem {prefix}route_gather_{} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (i : Fin {}) : ∃ bound : ({expression}).toNat < {},\n    ({}) i = ({}) ⟨({expression}).toNat, bound⟩ := by\n{preparation}  obtain ⟨member, memberFacts⟩ := ({} backend hashModel params i.val {inputs} {outputs}).mp (({}) i)\n  have outputFact := {output_fact} {context} memberFacts\n",
         output.node.0,
         artifact.root.parameter_type,
         artifact.root.input_type,
@@ -234,12 +182,29 @@ fn route_gather(
         count(family)?,
         value(output)?,
         value(family)?,
-        fact(indices)?,
-        ".2".repeat(index_shape.constraint_count),
-        fact(output)?,
-        count(family)?,
-        count(family)?
-    ))
+        member_shape.runs_iff_body,
+        root_fact(artifact, output)?
+    );
+    if indices.is_some() {
+        let lookup_fact =
+            member_shape.node_facts[&output_wire.node].last().ok_or("missing route lookup fact")?;
+        source.push_str(&format!("  have lookup := {lookup_fact} {context} memberFacts\n  have outputEq := congrArg (fun result => {projection}) outputFact\n  obtain ⟨actual, hindex, hvalue⟩ := lookup\n  rw [indexEq] at hindex\n  have bound : ({expression}).toNat < {} := by have actualBound := actual.isLt; omega\n  refine ⟨bound, outputEq.trans ?_⟩\n  have same : actual = (⟨({expression}).toNat, bound⟩ : Fin {}) := by apply Fin.ext; dsimp at hindex ⊢; omega\n  simpa only [same] using hvalue\n\n",count(family)?,count(family)?));
+    } else {
+        let (_, input_slot, _, bound_operand) =
+            parallel_operand(graph, artifact, output, output_wire, "i")?;
+        let NodeKind::ParallelLoop(spec) =
+            graph.source.root_scope().node(output.node).ok_or("missing route view loop")?.kind()
+        else {
+            unreachable!()
+        };
+        let position = match spec.input_modes[input_slot] {
+            mxx_ir_core::node::LoopInputMode::Zip => "i.val".to_owned(),
+            mxx_ir_core::node::LoopInputMode::ZipOffset { offset } => format!("i.val + {offset}"),
+            _ => return Err("route view is not indexed".into()),
+        };
+        source.push_str(&format!("  have outputEq : ({}) i = {bound_operand} := congrArg (fun result => {projection}) outputFact\n  have bound : ({expression}).toNat < {} := by have bound := i.isLt; omega\n  refine ⟨bound, outputEq.trans ?_⟩\n  exact congrArg (fun position : Fin {} => ({}) position) (by apply Fin.ext; change {position} = ({expression}).toNat; omega)\n\n",value(output)?,count(family)?,count(family)?,value(family)?));
+    }
+    Ok(source)
 }
 
 fn route_product(
@@ -248,58 +213,66 @@ fn route_product(
     output: WireRef,
     name: &str,
 ) -> Result<String, String> {
-    use mxx_ir_core::node::{LoopInputMode, MatrixBinaryOp};
-    let root = graph.source.root_scope();
+    use mxx_ir_core::node::MatrixBinaryOp;
     let scope = &graph.source.scopes()[&child(output)];
-    let product = scope.node(scope.outputs()[0].node).ok_or("missing route product")?;
+    let product_wire = scope.outputs()[output.port.0 as usize];
+    let product = scope.node(product_wire.node).ok_or("missing route product")?;
     if !matches!(
         product.kind(),
         NodeKind::MatrixMulSmallRhs | NodeKind::MatrixBinary(MatrixBinaryOp::Multiply)
     ) {
         return Err("route leaf is not actual matrix product".into());
     }
-    let parent = root.node(output.node).ok_or("missing route product parent")?;
-    let NodeKind::ParallelLoop(loop_spec) = parent.kind() else {
-        return Err("route product is not parallel".into());
-    };
-    let parents = arguments(root, output)?;
-    let operands = arguments(scope, scope.outputs()[0])?;
+    let operands = arguments(scope, product_wire)?;
+    let bound = operands
+        .iter()
+        .map(|wire| parallel_operand(graph, artifact, output, *wire, "i"))
+        .collect::<Result<Vec<_>, _>>()?;
     let shape = &artifact.scope_proofs[&FrozenGraphScopeId::Root];
-    let value = |wire: WireRef| {
-        value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &shape.value_expressions)
-    };
-    let mut captured = Vec::new();
-    for operand in operands {
-        let index = scope
-            .inputs()
-            .iter()
-            .position(|input| *input == operand)
-            .ok_or("route product operand is not captured")?;
-        if loop_spec.input_modes[index] != LoopInputMode::Zip {
-            return Err("route product operand is not zipped".into());
-        }
-        captured.push(value(parents[index])?);
-    }
+    let member_shape = &artifact.scope_proofs[&child(output)];
+    let value = value_expression(
+        &format!("w_{}_{}", output.node.0, output.port.0),
+        &shape.value_expressions,
+    )?;
     let ConcreteWireType::IndexedFamily { count, .. } =
         &graph.scopes[&FrozenGraphScopeId::Root].wire_types[&output]
     else {
         return Err("route product is not a family".into());
     };
-    let position =
-        shape.node_constraints[&output.node].clone().last().ok_or("missing route product fact")?;
     let record = shape.witness_record.as_ref().ok_or("missing route record")?;
     let body = shape.body_relation.as_ref().ok_or("missing route body")?;
-    let relation = &artifact.scope_relations[&child(output)];
-    Ok(format!(
-        "theorem {name} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (i : Fin {count}) : ({}) i = ({}) i * ({}) i := by\n  have h := facts{}.1 i\n  simpa only [{relation}, {relation}.constraints_0, MxxRuntime.matrixMul] using h\n\n",
+    let (slot, inputs, outputs) = parallel_arguments(graph, artifact, output, "i")?;
+    let context = format!(
+        "(backend := backend) (hashModel := hashModel) (params := params) (i_{slot} := i.val) (inputs := {inputs}) (outputs := {outputs}) (witness := member)"
+    );
+    let output_fact = member_shape.output_fact.as_ref().ok_or("missing product output fact")?;
+    let projection = if scope.outputs().len() == 1 {
+        "result".to_owned()
+    } else {
+        format!("result{}.1", ".2".repeat(output.port.0 as usize))
+    };
+    let mut source = format!(
+        "theorem {name} {{backend : MxxRuntime.BackendContext}} {{hashModel : MxxRuntime.HashModel}}\n    {{params : {}}} {{inputs : {}}} {{outputs : {}}}\n    (witness : {record}) (facts : {body} backend hashModel params inputs outputs witness)\n    (i : Fin {count}) : ({value}) i = ({}) * ({}) := by\n  obtain ⟨member, memberFacts⟩ := ({} backend hashModel params i.val {inputs} {outputs}).mp (({}) i)\n  have outputFact := {output_fact} {context} memberFacts\n  have productEq := congrArg (fun result => {projection}) outputFact\n",
         artifact.root.parameter_type,
         artifact.root.input_type,
         artifact.root.output_type,
-        value(output)?,
-        captured[0],
-        captured[1],
-        ".2".repeat(position)
-    ))
+        bound[0].3,
+        bound[1].3,
+        member_shape.runs_iff_body,
+        root_fact(artifact, output)?
+    );
+    let mut rewrites = vec!["MxxRuntime.matrixMul".to_owned()];
+    for (side, (_, _, lookup, expression)) in bound.iter().enumerate() {
+        if let Some((get, index)) = lookup {
+            let get_fact = member_shape.node_facts[&get.node]
+                .last()
+                .ok_or("missing product operand lookup")?;
+            source.push_str(&format!("  have operand_{side} : member.w_{}_{} = {expression} := by\n    have lookup := {get_fact} {context} memberFacts\n    apply route_lookup_eq _ ?_ lookup\n    change ({index}) = (Int.toNat ({index}) : Int)\n    simp only [Int.ofNat_eq_natCast]\n    omega\n",get.node.0,get.port.0));
+            rewrites.push(format!("operand_{side}"));
+        }
+    }
+    source.push_str(&format!("  simpa only [{}] using productEq\n\n", rewrites.join(", ")));
+    Ok(source)
 }
 
 pub(super) fn root_refresh_source(
@@ -317,7 +290,7 @@ pub(super) fn root_refresh_source(
         .ok_or("missing actual refresh CRT")?;
     let levels = root.arguments(crt).ok_or("missing refresh CRT levels")?;
     let mut source = format!(
-        "import {}\nimport {}\nimport ExponentRefreshRoutes\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedRefreshSource\nopen Mxx.Primitives MxxExponentLut\nopen scoped BigOperators\n\n",
+        "import {}\nimport {}\nimport ExponentRefreshRoutes\nimport ExponentReadout\n\nset_option maxRecDepth 16384\nset_option maxHeartbeats 2000000\nnamespace ExponentGeneratedRefreshSource\nopen Mxx.Primitives MxxExponentLut\nopen scoped BigOperators\n\n",
         artifact.module_name, preartifact.module_name
     );
     let mut emitted = std::collections::BTreeSet::new();
@@ -395,13 +368,10 @@ pub(super) fn root_refresh_source(
             }
             if products.insert(leaf) {
                 let product_scope = &graph.source.scopes()[&child(leaf)];
-                let operands = arguments(product_scope, product_scope.outputs()[0])?;
-                let parents = arguments(root, leaf)?;
-                let mut input = parents[product_scope
-                    .inputs()
-                    .iter()
-                    .position(|wire| *wire == operands[0])
-                    .ok_or("route input not captured")?];
+                let operands =
+                    arguments(product_scope, product_scope.outputs()[leaf.port.0 as usize])?;
+                let (mut input, _, _, _) =
+                    parallel_operand(graph, artifact, leaf, operands[0], "i")?;
                 while let Some((family, _)) = gather(graph, input) {
                     if gathers.insert(input) {
                         source.push_str(&route_gather(graph, artifact, input, "")?);
@@ -505,6 +475,15 @@ fn public_reductions(graph: &ValidatedGraph, artifact: &LeanArtifact) -> Result<
                     source.push_str(&route_gather(graph, artifact, leaf, "pre_")?);
                 }
                 leaf = family;
+            }
+            let product_scope = &graph.source.scopes()[&child(leaf)];
+            let operands = arguments(product_scope, product_scope.outputs()[leaf.port.0 as usize])?;
+            let (mut input, ..) = parallel_operand(graph, artifact, leaf, operands[0], "i")?;
+            while let Some((family, _)) = gather(graph, input) {
+                if gathers.insert(input) {
+                    source.push_str(&route_gather(graph, artifact, input, "pre_")?);
+                }
+                input = family;
             }
         }
     }

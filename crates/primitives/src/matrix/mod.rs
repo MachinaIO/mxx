@@ -576,6 +576,15 @@ pub trait PolyMatrix:
     fn modulus_switch(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Ordinary ring reduction into an exact destination CRT basis, without scaling.
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
+    /// Canonical centered coefficient lift to a containing CRT basis.
+    /// No full-coefficient big-integer reconstruction is performed.
+    fn centered_extend(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Exact BFV block switch `(z-t*center_P(t^-1*z))/P` to a strict subset.
+    fn block_mod_switch(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String>;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),

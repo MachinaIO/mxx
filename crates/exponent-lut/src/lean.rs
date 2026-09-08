@@ -1,9 +1,7 @@
 //! Exponent-LUT adapters for mechanical export of the frozen implementation.
 
 pub mod certify;
-pub mod check;
 mod native_program_proof;
-mod numeric;
 mod root_cache_alignment;
 mod root_decoder_setup;
 mod root_inputs;
@@ -38,7 +36,6 @@ mod root_refresh_state;
 mod root_refresh_state_source;
 mod root_seeded_keys;
 mod scopes;
-mod trace;
 
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -242,52 +239,15 @@ pub fn export_refresh_graphs(
 
     let (program_proofs, program_stages) =
         root_program::root_program(&verification, &verification_artifact)?;
-    let cache_wire = verification_artifact
-        .root
-        .inputs
-        .get(&program_stages[0].private_name)
-        .ok_or("missing native cache input")?
-        .wire;
-    let (program_owner, _) = verification
-        .source
-        .root_scope()
-        .nodes()
-        .iter()
-        .enumerate()
-        .find(|(_, node)| {
-            matches!(node.kind(), NodeKind::ParallelLoop(_)) &&
-                verification
-                    .source
-                    .root_scope()
-                    .arguments(node)
-                    .is_some_and(|args| args.contains(&cache_wire))
-        })
-        .ok_or("missing native execution owner")?;
-    let program_owner = mxx_ir_core::types::NodeId(program_owner as u64);
-    let program_execution_path = ".2".repeat(
-        verification_artifact.scope_proofs[&mxx_ir_core::FrozenGraphScopeId::Root].node_constraints
-            [&program_owner]
-            .clone()
-            .last()
-            .ok_or("missing native execution fact")?,
-    );
-    let mxx_ir_core::types::ConcreteWireType::IndexedFamily { count: program_lane_count, .. } =
-        &verification.scopes[&mxx_ir_core::FrozenGraphScopeId::Root].wire_types
-            [&mxx_ir_core::types::WireRef {
-                node: program_owner,
-                port: mxx_ir_core::types::Port(0),
-            }]
-    else {
-        return Err("native execution is not a family".into());
-    };
-    let program_lane_count = *program_lane_count;
+    let program_owner = program_stages[0].output.node;
     let program_context_proofs = root_program_context::root_program_context(
         &verification,
         &verification_artifact,
         &program_stages,
     )?;
-    let reduction_proofs = root_reduction::root_reduction(&verification, &verification_artifact)?;
-    let program_manifest = program_stages.iter().map(|stage| format!("stage {}: {} -> {}; {} members; current {:?}; private {:?}; public {:?}; input {:?}; message {:?}; output {:?}\n",stage.index,stage.private_name,stage.public_name,stage.members,stage.current,stage.private_cache,stage.public_cache,stage.public_ciphertext,stage.public_message,stage.output)).collect::<String>();
+    let (reduction_proofs, program_reductions) =
+        root_reduction::root_reduction(&verification, &verification_artifact, &program_stages)?;
+    let program_manifest = program_stages.iter().map(|stage| format!("stage {}: {} -> {}; {} members; {} lanes; current {:?}; private {:?}; public {:?}; input {:?}; message {:?}; output {:?}\n",stage.index,stage.private_name,stage.public_name,stage.members,stage.lane_count,stage.current,stage.private_cache,stage.public_cache,stage.public_ciphertext,stage.public_message,stage.output)).collect::<String>();
     let (action_proofs, action_scope_count) =
         scopes::matrix_action_proofs(&verification, &verification_artifact);
     let (input_proofs, input_scope_count) =
@@ -344,10 +304,6 @@ pub fn export_refresh_graphs(
             }
             let contract = if name == "refresh-parameter-search-hash-key" {
                 InputContract::Bytes { length: 32.into() }
-            } else if root == 0 {
-                InputContract::OneHotPolynomialFamily {
-                    block_lengths: bundle.noise_snapshot.family_active_counts.clone(),
-                }
             } else if name == "refresh-parameter-search-native-monomials" {
                 let ConcreteWireType::IndexedFamily { count, .. } = value.wire_type else {
                     return Err("native monomial input is not a family".into());
@@ -357,6 +313,10 @@ pub fn export_refresh_graphs(
                     element: Box::new(InputContract::SignedMonomial {
                         exponent_stride: bundle.noise_snapshot.layout.stride(),
                     }),
+                }
+            } else if root == 0 {
+                InputContract::OneHotPolynomialFamily {
+                    block_lengths: bundle.noise_snapshot.family_active_counts.clone(),
                 }
             } else {
                 return Err(format!("unexpected refresh external input: {name}").into());
@@ -415,6 +375,7 @@ pub fn export_refresh_graphs(
         &verification,
         &program_stages,
         &program_key_stages,
+        &program_reductions,
         layout_index,
         &linked.externals,
         &bundle.noise_snapshot,
@@ -448,11 +409,41 @@ pub fn export_refresh_graphs(
             .repeat(artifact.scope_proofs[&mxx_ir_core::FrozenGraphScopeId::Root].constraint_count);
         execution_witnesses.push_str(&format!("noncomputable def {name}Witness {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\n    (runs : Runs hashModel external execution) := Classical.choose ({run})\n\nnoncomputable def {name}Facts {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\n    (runs : Runs hashModel external execution) := Classical.choose_spec ({run})\n\nnoncomputable def {name}Output {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\n    (runs : Runs hashModel external execution) := ({name}Facts runs){output_path}\n\n"));
     }
-    execution_witnesses.push_str(&format!("noncomputable def programWitness {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\n    (runs : Runs hashModel external execution) (lane : Fin {program_lane_count}) := Classical.choose ((verificationFacts runs){program_execution_path}.1 lane)\n\nnoncomputable def programFacts {{hashModel : MxxRuntime.HashModel}} {{external : ExternalInputs}} {{execution : Execution}}\n    (runs : Runs hashModel external execution) (lane : Fin {program_lane_count}) := Classical.choose_spec ((verificationFacts runs){program_execution_path}.1 lane)\n\n"));
     execution_witnesses.push_str("end ExponentGeneratedExecution\n");
     let noise_report = bundle.simulate_noise()?;
-    let numeric_proofs = numeric::refresh_bounds(&bundle.noise_snapshot, &noise_report)?;
-    let trace_proofs = trace::trace_indices(
+    let snapshot = &bundle.noise_snapshot;
+    let topology =
+        snapshot.refresh.transcript_topology.as_ref().ok_or("missing transcript topology")?;
+    let routes = snapshot.refresh.route_gains.as_ref().ok_or("missing refresh action gains")?;
+    let mut numeric_data = format!(
+        "import ExponentRefreshBounds\n\nnamespace ExponentGeneratedNumeric\ndef accepted : Bool := {}\ndef slots : List MxxExponentLut.RefreshNumericSlot := [\n",
+        noise_report.refresh.accepted,
+    );
+    for (i, slot) in noise_report.refresh.slots.iter().enumerate() {
+        if i != 0 {
+            numeric_data.push_str(",\n");
+        }
+        numeric_data.push_str(&format!(
+            "  ⟨{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}⟩",
+            routes.state_scaling[i].l1,
+            snapshot.initial_state_bound,
+            routes.mask[i].l1,
+            routes.fresh[i].l1,
+            noise_report.readout_bound,
+            slot.pre_switch_bound,
+            routes.decoder[i].l1,
+            snapshot.helper_error_cutoff,
+            slot.decoder_bound,
+            slot.lift,
+            topology.coefficient_count,
+            slot.residual_bound,
+            slot.mask_modulus,
+            slot.mask_bound,
+            slot.spacing,
+        ));
+    }
+    numeric_data.push_str("\n]\nend ExponentGeneratedNumeric\n");
+    let trace_proofs = trace_indices_data(
         &bundle.noise_snapshot.layout,
         bundle
             .noise_snapshot
@@ -519,26 +510,84 @@ pub fn export_refresh_graphs(
     sources.insert("RootReadout".into(), readout_proofs);
     sources.insert("RootReadoutAlignment".into(), alignment_proofs);
     sources.insert("RootDecomposition".into(), root_proofs);
-    sources.insert("NumericBounds".into(), numeric_proofs);
-    sources.insert("TraceIndices".into(), trace_proofs);
+    sources.insert("NumericBoundsData".into(), numeric_data);
+    sources.insert("NumericBounds".into(), include_str!("../lean/NumericBounds.lean").to_owned());
+    sources.insert("TraceIndicesData".into(), trace_proofs);
+    sources.insert("TraceIndices".into(), include_str!("../lean/TraceIndices.lean").to_owned());
     for (name, source) in &sources {
         fs::write(directory.join(format!("{name}.lean")), source)?;
     }
     Ok(ExportedRefreshGraphs { sources, preprocessing, verification, ideal })
 }
 
+fn trace_indices_data(layout: &crate::ExpLayout, n: usize) -> Result<String, String> {
+    layout.validate(n).map_err(|error| error.to_string())?;
+    // Match readout::full_trace_layout: operation width is replaced by the
+    // complete native subgroup width while the exponent stride is retained.
+    let full = crate::ExpLayout {
+        stride_log2: layout.stride_log2,
+        width_log2: n.trailing_zeros() - layout.stride_log2,
+    };
+    let indices = full.automorphism_indices(n).map_err(|error| error.to_string())?;
+    let width = indices.len();
+    let period = width.checked_mul(2).ok_or("native trace period overflow")?;
+    let mut positions = Vec::with_capacity(width);
+    let mut inverse = vec![None; width];
+    // The inverse is constructed once, with duplicate/missing residues rejected.
+    // Mutating its disjoint slots follows the canonical ascending source order.
+    for (index, sigma) in indices.iter().copied().enumerate() {
+        let residue = sigma % period;
+        if residue % 2 != 1 {
+            return Err("native trace index has an even residue".into());
+        }
+        let position = residue / 2;
+        if inverse[position].replace(index).is_some() {
+            return Err("native trace indices repeat an odd residue".into());
+        }
+        positions.push(position);
+    }
+    let inverse = inverse
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or("native trace indices omit an odd residue")?;
+    let indices = indices.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    let positions = positions.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    let inverse = inverse.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    Ok(format!(
+        r#"import ExponentTrace
+
+namespace TraceIndices
+
+def ringDimension : Nat := {n}
+def stride : Nat := {stride}
+def widthLog : Nat := {width_log}
+def width : Nat := {width}
+
+def indices : Fin width → Nat := ![{indices}]
+def residuePositions : Fin width → Nat := ![{positions}]
+def inversePositions : Fin width → Nat := ![{inverse}]
+
+end TraceIndices
+"#,
+        stride = full.stride(),
+        width_log = full.width_log2,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::noise_refresh::{
-        pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
-        prf::SparseLwrPrfProfile,
-        setup::{RefreshParameterSimulationRequest, tests::parameters_for_numeric_refresh},
+    use crate::{
+        bgg::encoding::refresh_tests::parameters_for_numeric_refresh,
+        noise_refresh::{
+            pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
+            prf::SparseLwrPrfProfile,
+            setup::RefreshParameterSimulationRequest,
+        },
     };
     use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 
-    #[test]
-    fn test_export_concrete_refresh_implementation() {
+    fn concrete_refresh_fixture() -> (RefreshParameterSimulationBundle, LeanBackendArtifact) {
         let parameter = |name, default| {
             std::env::var(name).ok().map(|value| value.parse::<u32>().unwrap()).unwrap_or(default)
         };
@@ -569,10 +618,14 @@ mod tests {
         .unwrap();
         let bundle = RefreshParameterSimulationRequest::new(
             setup.clone(),
-            profile,
+            crate::noise_refresh::prf::SparseLwrPrfProgram::new(
+                profile,
+                generated.public_layout.bucket_width,
+                generated.public_layout.parameters.bucket_count,
+            )
+            .expect("PRF Program"),
             generated,
             rand::random(),
-            setup.decoder_sigma.clone(),
             expected,
             1,
         )
@@ -584,6 +637,149 @@ mod tests {
         let backend =
             mxx_runtime::lean::render_backend_context(&layouts, "Backend", "RefreshBackend")
                 .unwrap();
+        (bundle, backend)
+    }
+
+    #[test]
+    fn test_export_refresh_scope_proofs() {
+        let (bundle, backend) = concrete_refresh_fixture();
+        let bindings = ParamEnv::default();
+        let graph = validate_with_manifests(
+            &bundle.preprocessing_graph().graph,
+            &bindings,
+            bundle.preprocessing_manifests(),
+        )
+        .unwrap();
+        let artifact = export(
+            &graph,
+            &ExportOptions {
+                namespace: "RefreshPreprocessing".into(),
+                module_name: "RefreshPreprocessing".into(),
+                backend_layouts: backend.exporter_bindings(),
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        let (proof, count) = scopes::selector_setup_proofs(&graph, &artifact, &bindings);
+        assert!(count > 0, "actual selector sampler must be covered");
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/exponent_lut_refresh_scope_proofs")
+            .join(
+                bundle
+                    .public_identity()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            );
+        fs::create_dir_all(&directory).unwrap();
+        let (private_proof, _) = root_private::root_private(&graph, &artifact).unwrap();
+        let public_readout = root_readout_public::root_readout_public(&graph, &artifact).unwrap();
+        let program_setup = root_program_setup::root_program_setup(&graph, &artifact).unwrap();
+        let (program_keys, _) = root_program_keys::root_program_keys(&graph, &artifact).unwrap();
+        let cache_alignment =
+            root_cache_alignment::root_cache_alignment(&graph, &artifact).unwrap();
+        let verification = validate_with_manifests(
+            &bundle.verification_graph().graph,
+            &bindings,
+            bundle.verification_manifests(),
+        )
+        .unwrap();
+        let verification_artifact = export(
+            &verification,
+            &ExportOptions {
+                namespace: "RefreshVerification".into(),
+                module_name: "RefreshVerification".into(),
+                backend_layouts: backend.exporter_bindings(),
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        let (mut online_readout, ..) = root_readout_public::normalized_execution(
+            &verification,
+            &verification_artifact,
+            "ReadoutVerificationReduction",
+            "import ExponentReadout\n",
+        )
+        .unwrap();
+        online_readout.push_str("end ReadoutVerificationReduction\n");
+        let refresh_source = root_refresh_source::root_refresh_source(
+            &graph,
+            &artifact,
+            &verification,
+            &verification_artifact,
+        )
+        .unwrap();
+        let route_targets = root_refresh_route_targets::root_refresh_route_targets(
+            &graph,
+            &artifact,
+            &bundle.noise_snapshot,
+        )
+        .unwrap();
+        let route_public = root_refresh_route_public::root_refresh_route_public(
+            &graph,
+            &artifact,
+            &bundle.noise_snapshot,
+        )
+        .unwrap();
+        let route_sums = root_refresh_route_sums::root_refresh_route_sums(
+            &graph,
+            &artifact,
+            &verification,
+            &verification_artifact,
+            &bundle.noise_snapshot,
+        )
+        .unwrap();
+        let inputs = root_inputs::root_inputs(&verification, &verification_artifact).unwrap();
+        let (input_scopes, input_count) =
+            scopes::encoding_input_proofs(&verification, &verification_artifact, &bindings);
+        assert!(input_count > 0);
+        let program_inputs =
+            root_program_inputs::root_program_inputs(&verification, &verification_artifact)
+                .unwrap();
+        let (program, stages) =
+            root_program::root_program(&verification, &verification_artifact).unwrap();
+        assert_eq!(stages.len(), bundle.noise_snapshot.family_active_counts.len());
+        for stage in &stages {
+            assert!(stage.lane_count > 0);
+            assert_eq!(stage.members, bundle.noise_snapshot.family_active_counts[stage.index]);
+        }
+        let program_context = root_program_context::root_program_context(
+            &verification,
+            &verification_artifact,
+            &stages,
+        )
+        .unwrap();
+        let (program_reduction, reductions) =
+            root_reduction::root_reduction(&verification, &verification_artifact, &stages).unwrap();
+        assert_eq!(reductions.len(), stages.len());
+        fs::write(directory.join("RefreshPreprocessing.lean"), artifact.source).unwrap();
+        fs::write(directory.join("RefreshVerification.lean"), verification_artifact.source)
+            .unwrap();
+        fs::write(directory.join("RootReadoutPublic.lean"), public_readout).unwrap();
+        fs::write(directory.join("ReadoutVerificationReduction.lean"), online_readout).unwrap();
+        fs::write(directory.join("SelectorSetupScopes.lean"), proof).unwrap();
+        fs::write(directory.join("RootPrivate.lean"), private_proof).unwrap();
+        fs::write(directory.join("RootProgramSetup.lean"), program_setup).unwrap();
+        fs::write(directory.join("RootProgramKeys.lean"), program_keys).unwrap();
+        fs::write(directory.join("RootCacheAlignment.lean"), cache_alignment).unwrap();
+        fs::write(directory.join("RootRefreshSource.lean"), refresh_source).unwrap();
+        fs::write(directory.join("RootRefreshRouteTargets.lean"), route_targets).unwrap();
+        fs::write(directory.join("RootRefreshRoutePublic.lean"), route_public).unwrap();
+        fs::write(directory.join("RootRefreshRouteSums.lean"), route_sums).unwrap();
+        fs::write(directory.join("RootProgramInputs.lean"), program_inputs).unwrap();
+        fs::write(directory.join("RootInputs.lean"), inputs).unwrap();
+        fs::write(directory.join("EncodingInputScopes.lean"), input_scopes).unwrap();
+        fs::write(directory.join("RootProgram.lean"), program).unwrap();
+        fs::write(directory.join("RootProgramContext.lean"), program_context).unwrap();
+        fs::write(directory.join("RootReduction.lean"), program_reduction).unwrap();
+        fs::write(directory.join(format!("{}.lean", backend.module_name())), backend.source())
+            .unwrap();
+        println!("refresh scope export: {}", directory.display());
+    }
+
+    #[test]
+    fn test_export_concrete_refresh_implementation() {
+        let (bundle, backend) = concrete_refresh_fixture();
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_data/exponent_lut_lean_export")
             .join(
@@ -662,10 +858,14 @@ mod tests {
                 let expected = setup.layout.ring().polynomial([1.into()]);
                 let snapshot = RefreshParameterSimulationRequest::new(
                     setup.clone(),
-                    profile.clone(),
+                    crate::noise_refresh::prf::SparseLwrPrfProgram::new(
+                        profile,
+                        generated.public_layout.bucket_width,
+                        generated.public_layout.parameters.bucket_count,
+                    )
+                    .expect("PRF Program"),
                     generated.clone(),
                     key_id,
-                    setup.decoder_sigma.clone(),
                     expected,
                     1,
                 )
@@ -685,10 +885,14 @@ mod tests {
         let expected = setup.layout.ring().polynomial([1.into()]);
         let bundle = RefreshParameterSimulationRequest::new(
             setup.clone(),
-            profile,
+            crate::noise_refresh::prf::SparseLwrPrfProgram::new(
+                profile,
+                generated.public_layout.bucket_width,
+                generated.public_layout.parameters.bucket_count,
+            )
+            .expect("PRF Program"),
             generated,
             key_id,
-            setup.decoder_sigma.clone(),
             expected,
             1,
         )

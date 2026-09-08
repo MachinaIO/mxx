@@ -2,6 +2,13 @@
 
 ## Status
 
+The gate/API portions of this document describe the earlier BGG implementation.
+They are superseded by `docs/plans/exponent-lut-scheme-and-bgv-flat-lut.md`:
+`MulPrivate` is now an identity `Lut` with an optional encrypted RHS, exposed
+through builder `private_mul`; explicit two-input LUTs fuse the RHS into fresh
+branch helpers. The shared trait is `ExponentLUTEncodingScheme`. This document
+remains background for the BGG artifact/readout design, not the current gate API.
+
 This document is the self-contained implementation specification for replacing
 the sparse-key LWR PRF path in `mxx-exponent-lut` with native mod-Q exponent
 encoding. It incorporates the design decisions made after the original native

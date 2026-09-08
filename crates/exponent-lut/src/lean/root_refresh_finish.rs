@@ -1,6 +1,9 @@
 //! Downstream refresh correctness from the exact per-slot source approximations.
 use super::root_inputs::value_expression;
-use crate::noise_refresh::simulation::{ExponentLutNoiseReport, ExponentLutNoiseSnapshot};
+use crate::{
+    bgg::noise::{BggNoiseSnapshot, ProgramNoiseReport},
+    noise_refresh::simulation::ExponentLutNoiseReport,
+};
 use mxx_ir_core::{
     FrozenGraphScopeId, ParamEnv, ValidatedGraph,
     lean::{LeanArtifact, ScopeProofShape},
@@ -31,8 +34,8 @@ pub(super) fn root_refresh_finish(
     pa: &LeanArtifact,
     ver: &ValidatedGraph,
     va: &LeanArtifact,
-    snapshot: &ExponentLutNoiseSnapshot,
-    report: &ExponentLutNoiseReport,
+    snapshot: &BggNoiseSnapshot,
+    report: &ExponentLutNoiseReport<ProgramNoiseReport>,
 ) -> Result<String, String> {
     if report.refresh.slots.iter().any(|slot| slot.rounding_margin <= 0.into()) {
         return Ok("-- This numeric report fails strict slot rounding; no finish theorem is emitted.\nimport RootRefreshDecode\nnamespace ExponentGeneratedRefreshFinish\nend ExponentGeneratedRefreshFinish\n".into());

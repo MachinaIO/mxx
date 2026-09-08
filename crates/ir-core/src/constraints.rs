@@ -196,6 +196,8 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::RingAutomorphism { .. } |
                 NodeKind::ModulusSwitch { .. } |
                 NodeKind::ModulusReduce { .. } |
+                NodeKind::CenteredExtend { .. } |
+                NodeKind::BlockModSwitch { .. } |
                 NodeKind::Transpose |
                 NodeKind::Tensor |
                 NodeKind::UniformResidueSample { .. } |

@@ -80,7 +80,7 @@ pub(super) fn root_readout_alignment(
     );
     let mut theorems = BTreeMap::new();
     for (name, output) in &artifact.root.outputs {
-        if !name.ends_with("-readout-helper-public-family-0") {
+        if !name.ends_with("-readout-0.2") {
             continue;
         }
         let fail = || format!("unsupported readout alignment graph at {name}");
@@ -231,9 +231,12 @@ pub(super) fn root_readout_alignment(
         }
         let gather_args = root.arguments(gather_node).ok_or_else(fail)?;
         let switch_wire = gather_args[family_slot];
-        if !artifact.root.outputs.iter().any(|(name, output)| {
-            name.ends_with("-readout-helper-switch-family-0") && output.wire == switch_wire
-        }) {
+        if !artifact
+            .root
+            .outputs
+            .iter()
+            .any(|(name, output)| name.ends_with("-readout-0.1") && output.wire == switch_wire)
+        {
             return Err(fail());
         }
         let switches = value(switch_wire)?;

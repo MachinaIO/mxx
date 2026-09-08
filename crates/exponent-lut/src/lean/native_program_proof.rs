@@ -1,6 +1,10 @@
 //! Application proof composing native program stages from the generated execution contract.
 use super::{
-    root_inputs::value_expression, root_program::ProgramStage, root_program_keys::ProgramKeyStage,
+    root_inputs::value_expression,
+    root_program::ProgramStage,
+    root_program_keys::ProgramKeyStage,
+    root_program_setup::{parallel_arguments, parallel_operand, program_cache_binding},
+    root_readout_public::root_fact,
 };
 use mxx_ir_core::{
     FrozenGraphScopeId, ValidatedGraph,
@@ -21,41 +25,33 @@ fn expression(
     values.insert("inputs".into(), inputs.into());
     value_expression(&format!("w_{}_{}", wire.node.0, wire.port.0), &values)
 }
-fn projection(shape: &ScopeProofShape, wire: WireRef, facts: &str) -> Result<String, String> {
-    let position = shape
-        .node_constraints
-        .get(&wire.node)
-        .and_then(|r| r.clone().last())
-        .ok_or("missing native primitive fact")?;
-    Ok(format!("{facts}{}.1", ".2".repeat(position)))
+fn renamed(text: String, witness: &str, inputs: &str) -> Result<String, String> {
+    value_expression(
+        "expression",
+        &BTreeMap::from([
+            ("expression".into(), text),
+            ("witness".into(), witness.into()),
+            ("inputs".into(), inputs.into()),
+        ]),
+    )
 }
-fn gather(
-    graph: &ValidatedGraph,
-    scope_id: &FrozenGraphScopeId,
+
+fn execution_fact(
+    artifact: &LeanArtifact,
     wire: WireRef,
-) -> Result<(WireRef, WireRef), String> {
-    let scope = &graph.source.scopes()[scope_id];
-    let node = scope.node(wire.node).ok_or("missing native gather")?;
-    if !matches!(node.kind(), NodeKind::ParallelLoop(_)) {
-        return Err("native gather is not a loop".into());
-    }
-    let id =
-        FrozenGraphScopeId::ParallelBody { parent: Box::new(scope_id.clone()), owner: wire.node };
-    let child = &graph.source.scopes()[&id];
-    if child.nodes().len() != 3 || child.inputs().len() != 2 || child.outputs().len() != 1 {
-        return Err("unsupported native gather shape".into());
-    }
-    let get = child.node(child.outputs()[0].node).ok_or("missing native getter")?;
-    if !matches!(get.kind(), NodeKind::FamilyGetDynamic) {
-        return Err("wrong native getter".into());
-    }
-    let args = child.arguments(get).ok_or("missing getter operands")?;
-    let parents = scope.arguments(node).ok_or("missing gather captures")?;
-    Ok((
-        parents
-            [child.inputs().iter().position(|w| *w == args[0]).ok_or("missing gather family")?],
-        parents[child.inputs().iter().position(|w| *w == args[1]).ok_or("missing gather index")?],
-    ))
+    preprocessing: bool,
+) -> Result<String, String> {
+    let (params, inputs, outputs, witness, facts) = if preprocessing {
+        ("preprocessing_params", "pin", "execution.preprocessing", "pw", "pf")
+    } else {
+        ("verification_params", "vin", "execution.verification", "vw", "vf")
+    };
+    Ok(root_fact(artifact, wire)?
+        .replace("(backend := backend)", "(backend := RefreshBackend.backend)")
+        .replace("(params := params)", &format!("(params := {params})"))
+        .replace("(inputs := inputs)", &format!("(inputs := {inputs})"))
+        .replace("(outputs := outputs)", &format!("(outputs := {outputs})"))
+        .replace("(witness := witness) facts", &format!("(witness := {witness}) {facts}")))
 }
 
 fn render(template: &str, values: &BTreeMap<&str, String>) -> Result<String, String> {
@@ -117,35 +113,20 @@ pub(super) fn native_program_proof(
     va: &LeanArtifact,
     stages: &[ProgramStage],
     keys: &BTreeMap<String, ProgramKeyStage>,
+    reductions: &BTreeMap<WireRef, WireRef>,
     layout_index: usize,
     externals: &[mxx_ir_core::lean::claim::ExternalInput],
-    snapshot: &crate::noise_refresh::simulation::ExponentLutNoiseSnapshot,
+    snapshot: &crate::bgg::noise::BggNoiseSnapshot,
 ) -> Result<String, String> {
-    use mxx_ir_core::{lean::claim::InputContract, types::ConcreteWireType};
+    use mxx_ir_core::lean::claim::InputContract;
     let root = FrozenGraphScopeId::Root;
     let first = stages.first().ok_or("empty native program")?;
-    let cache = va.root.inputs.get(&first.private_name).ok_or("missing native cache")?.wire;
     let outer = ver.source.root_scope();
-    let (owner, owner_node) = outer
-        .nodes()
-        .iter()
-        .enumerate()
-        .find(|(_, node)| {
-            matches!(node.kind(), NodeKind::ParallelLoop(_)) &&
-                outer.arguments(node).is_some_and(|args| args.contains(&cache))
-        })
-        .ok_or("missing native loop")?;
-    let owner_wire = WireRef { node: NodeId(owner as u64), port: Port(0) };
-    let sid = child(&root, owner_wire);
-    let scope = &ver.source.scopes()[&sid];
-    let cs = &va.scope_proofs[&sid];
+    let sid = child(&root, first.output);
     let ps = &pa.scope_proofs[&root];
     let vs = &va.scope_proofs[&root];
-    let cv = |wire| expression(cs, wire, "cw", "ci");
     let pv = |wire| expression(ps, wire, "pw", "pin");
     let vv = |wire| expression(vs, wire, "vw", "vin");
-    let cf = |wire| projection(cs, wire, "cf");
-    let pf = |wire| projection(ps, wire, "pf");
     let matrix = ver.scopes[&sid].wire_types[&first.current]
         .matrix_type()
         .ok_or("native state is not a matrix")?;
@@ -162,16 +143,6 @@ pub(super) fn native_program_proof(
         return Err("native backend layout disagrees with actual state type".into());
     }
     let q = matrix.modulus.to_string();
-    let input_tuple = format!(
-        "({}, ())",
-        outer
-            .arguments(owner_node)
-            .ok_or("missing native captures")?
-            .iter()
-            .map(|wire| vv(*wire))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ")
-    );
     let gadget_wire = outer
         .nodes()
         .iter()
@@ -253,7 +224,15 @@ pub(super) fn native_program_proof(
         .map_err(|_| "open native initial cutoff")?
         .to_string();
     if initial_cutoff != snapshot.initial_state_bound.to_string() ||
-        public_cutoff != snapshot.public_input_error_cutoff.to_string()
+        snapshot.inputs.public_family_errors.is_empty() ||
+        snapshot.inputs.public_family_errors.values().any(|family| match family {
+            crate::bgg::noise::FamilyNoiseState::Uniform { state, .. } => {
+                state.bound.to_string() != public_cutoff
+            }
+            crate::bgg::noise::FamilyNoiseState::Members(states) => {
+                states.iter().any(|state| state.bound.to_string() != public_cutoff)
+            }
+        })
     {
         return Err("native input cutoff differs from noise snapshot".into());
     }
@@ -306,12 +285,10 @@ pub(super) fn native_program_proof(
         ("layout", layout_index.to_string()),
         ("stride", stride.to_string()),
         ("width", (n / stride).to_string()),
-        ("child_inputs", input_tuple),
         ("pre_body", ps.body_relation.clone().ok_or("missing preprocessing body")?),
         ("ver_body", vs.body_relation.clone().ok_or("missing verification body")?),
-        ("child_body", cs.body_relation.clone().ok_or("missing program body")?),
         ("gadget", vv(gadget_wire)?),
-        ("gadget_fact", projection(vs, gadget_wire, "vf")?),
+        ("gadget_fact", execution_fact(va, gadget_wire, false)?),
         ("mask", mask),
         ("selector", format!("external.input_{selector_index}")),
         ("monomials", format!("external.input_{monomial_index}")),
@@ -319,47 +296,6 @@ pub(super) fn native_program_proof(
         ("setup_export", export_path(setup.tuple_index)),
         ("public_cutoff", public_cutoff),
     ]);
-    // Trace the actual balanced reductions. The stage dependency is the reduced
-    // wire, not a position in the stage metadata vector.
-    let mut reductions = BTreeMap::new();
-    for (i, node) in scope.nodes().iter().enumerate() {
-        if !matches!(node.kind(), NodeKind::FamilyGetStatic { .. }) {
-            continue;
-        }
-        let wire = WireRef { node: NodeId(i as u64), port: Port(0) };
-        let mut current = arguments(ver, &sid, wire)?[0];
-        loop {
-            let Ok(args) = arguments(ver, &sid, current) else { break };
-            if args.len() != 2 {
-                break;
-            }
-            let (Ok((left, _)), Ok((right, _))) =
-                (gather(ver, &sid, args[0]), gather(ver, &sid, args[1]))
-            else {
-                break
-            };
-            if left != right {
-                break;
-            }
-            let types = &ver.scopes[&sid].wire_types;
-            let (
-                ConcreteWireType::IndexedFamily { count: a, .. },
-                ConcreteWireType::IndexedFamily { count: b, .. },
-            ) = (&types[&left], &types[&current])
-            else {
-                break
-            };
-            if *b != a.div_ceil(2) {
-                break;
-            }
-            current = left;
-        }
-        if stages.iter().any(|stage| stage.output == current) {
-            if reductions.insert(current, (reductions.len(), wire)).is_some() {
-                return Err("ambiguous native reduction".into());
-            }
-        }
-    }
     if reductions.len() != stages.len() {
         return Err("incomplete native reduction coverage".into());
     }
@@ -376,10 +312,9 @@ pub(super) fn native_program_proof(
         let key = keys
             .get(stage.public_name.strip_prefix("artifact:").unwrap_or(&stage.public_name))
             .ok_or("missing native key metadata")?;
-        let (reduction_index, output) = reductions[&stage.output];
-        if reduction_index != stage.index ||
-            previous_output.is_some_and(|wire| stage.current != wire)
-        {
+        let output = reductions[&stage.output];
+        let current = parallel_operand(ver, va, stage.output, stage.current, "(flat i)")?;
+        if previous_output.is_some_and(|wire| current.0 != wire) {
             return Err("native stage dependency does not match the actual reduction wire".into());
         }
         if key.member_count != stage.members ||
@@ -398,8 +333,7 @@ pub(super) fn native_program_proof(
             .outputs
             .get(stage.public_name.strip_prefix("artifact:").unwrap_or(&stage.public_name))
             .ok_or("missing public export")?;
-        let gather_wire = arguments(pre, &root, private.wire)?[0];
-        let (sampler_wire, _) = gather(pre, &root, gather_wire)?;
+        let sampler_wire = arguments(pre, &root, private.wire)?[0];
         let sampler_id = child(&root, sampler_wire);
         let sampler = &pre.source.scopes()[&sampler_id];
         let payload_slot = sampler
@@ -422,16 +356,70 @@ pub(super) fn native_program_proof(
         if private_cutoff != snapshot.helper_error_cutoff.to_string() {
             return Err("native private cutoff differs from noise snapshot".into());
         }
-        let target = arguments(pre, &root, key.public_cache)?[0];
-        let left = arguments(pre, &root, target)?[0];
-        let (prior_key, _) = gather(pre, &root, left)?;
+        let (cache_scope, decomposition, left, _) = program_cache_binding(pre, key.public_cache)?;
+        let prior_key = parallel_operand(pre, pa, key.public_cache, left, "(flat i)")?.0;
         if previous_key.is_some_and(|wire| wire != prior_key) {
             return Err("native key recurrence does not use prior stage key".into());
         }
-        let (_, cache_indices) = gather(ver, &sid, stage.public_cache)?;
-        let (message_prefix, _) = gather(ver, &sid, stage.public_message)?;
-        let (public_prefix, local_indices) = gather(ver, &sid, stage.public_ciphertext)?;
-        let (_, global_indices) = gather(ver, &sid, public_prefix)?;
+        if stage.lane_count != key.lane_count {
+            return Err("native online/preprocessing lane counts differ".into());
+        }
+        let private_operand =
+            parallel_operand(ver, va, stage.output, stage.private_cache, "(flat i)")?;
+        let online_cache = parallel_operand(ver, va, stage.output, stage.public_cache, "(flat i)")?;
+        if va
+            .root
+            .inputs
+            .get(&stage.private_name)
+            .is_none_or(|input| input.wire != private_operand.0) ||
+            va.root
+                .inputs
+                .get(&stage.public_name)
+                .is_none_or(|input| input.wire != online_cache.0)
+        {
+            return Err("native online caches differ from exported cache bindings".into());
+        }
+        let messages = parallel_operand(ver, va, stage.output, stage.public_message, "(flat i)")?;
+        let private_expression = renamed(private_operand.3, "vw", "vin")?;
+        let cache_expression = renamed(online_cache.3, "vw", "vin")?;
+        let message_index = renamed(
+            messages.2.ok_or("native message must use actual indexed input")?.1,
+            "vw",
+            "vin",
+        )?;
+        let public_is_family = matches!(
+            &pre.scopes[&root].wire_types[&prior_key],
+            mxx_ir_core::types::ConcreteWireType::IndexedFamily { .. }
+        );
+        let prior_key_expression =
+            if public_is_family { format!("({}) lane", pv(prior_key)?) } else { pv(prior_key)? };
+        let cache_shape = &pa.scope_proofs[&cache_scope];
+        let (cache_slot, cache_inputs, cache_outputs) =
+            parallel_arguments(pre, pa, key.public_cache, "(flat i)")?;
+        let cache_inputs = renamed(cache_inputs, "pw", "pin")?;
+        let cache_outputs = renamed(cache_outputs, "pw", "pin")?;
+        let cache_context = format!(
+            "(backend := RefreshBackend.backend) (hashModel := hashModel) (params := preprocessing_params) (i_{cache_slot} := (flat i).val) (inputs := {cache_inputs}) (outputs := {cache_outputs}) (witness := member)"
+        );
+        let decomp_fact = cache_shape
+            .node_facts
+            .get(&decomposition.node)
+            .and_then(|facts| facts.last())
+            .ok_or("missing actual public decomposition fact")?;
+        let cache_output_fact =
+            cache_shape.output_fact.as_ref().ok_or("missing actual public cache output fact")?;
+        let cache_port = if pre.source.scopes()[&cache_scope].outputs().len() == 1 {
+            String::new()
+        } else {
+            format!("{}.1", ".2".repeat(key.public_cache.port.0 as usize))
+        };
+        let cache_gain = format!(
+            "    obtain ⟨member, memberFacts⟩ := ({} RefreshBackend.backend hashModel preprocessing_params (flat i).val {cache_inputs} {cache_outputs}).mp (({}) (flat i))\n    have hd := {decomp_fact} {cache_context} memberFacts\n    have ho := {cache_output_fact} {cache_context} memberFacts\n    have cacheEq := congrArg (fun output => output{cache_port}) ho\n    change (@public_cache@) (flat i) = member.w_{}_{} at cacheEq\n    obtain ⟨action, ha, hgain⟩ := gadgetDecomposeRuns_dense_gain layout lookup (by decide) (by decide) hd\n    exact ⟨action, cacheEq.trans ha, hgain⟩\n",
+            cache_shape.runs_iff_body,
+            execution_fact(pa, key.public_cache, true)?,
+            decomposition.node.0,
+            decomposition.port.0
+        );
         values.extend([
             ("stage", j.to_string()),
             ("next", (j + 1).to_string()),
@@ -440,31 +428,20 @@ pub(super) fn native_program_proof(
             ("raw", key.raw_count.to_string()),
             ("global_count", (key.lane_count * key.raw_count).to_string()),
             ("offset", key.offset.to_string()),
-            ("public_node", stage.public_ciphertext.node.0.to_string()),
-            ("output", cv(output)?),
+            ("output", format!("({}) lane", vv(output)?)),
             ("key", pv(key.output)?),
             ("key_theorem", key.theorem.clone()),
             ("global_keys", pv(key.public_inputs)?),
             ("payload", pv(payload_wire)?),
             ("private_cutoff", private_cutoff.clone()),
-            ("private_cache", cv(stage.private_cache)?),
+            ("private_cache", private_expression),
             ("public_cache", pv(key.public_cache)?),
-            ("online_cache", cv(stage.public_cache)?),
+            ("online_cache", cache_expression),
+            ("message_index", message_index),
             ("private_export", export_path(private.tuple_index)),
             ("public_export", export_path(public.tuple_index)),
-            ("cache_fact", cf(stage.public_cache)?),
-            ("cache_index_fact", cf(cache_indices)?),
-            ("cache_index_relation", va.scope_relations[&child(&sid, cache_indices)].clone()),
-            ("decomposition_fact", pf(key.public_cache)?),
-            ("message_fact", cf(stage.public_message)?),
-            ("message_prefix_fact", cf(message_prefix)?),
-            ("message_prefix", cv(message_prefix)?),
-            ("local_index_fact", cf(local_indices)?),
-            ("global_index_fact", cf(global_indices)?),
-            ("local_index_relation", va.scope_relations[&child(&sid, local_indices)].clone()),
-            ("global_index_relation", va.scope_relations[&child(&sid, global_indices)].clone()),
-            ("previous_key", pv(prior_key)?),
-            ("previous_key_fact", pf(prior_key)?),
+            ("cache_gain", cache_gain),
+            ("previous_key", prior_key_expression),
             (
                 "selector_fact",
                 format!(
@@ -485,7 +462,7 @@ pub(super) fn native_program_proof(
         bridge("pre28", setup.tuple_index, pv(setup.wire)?);
         bridge("pre29", payload_export.tuple_index, pv(payload_wire)?);
         if j == 0 {
-            let repeated = arguments(pre, &root, prior_key)?[0];
+            let repeated = prior_key;
             let initial_key = pa
                 .root
                 .outputs
@@ -498,7 +475,7 @@ pub(super) fn native_program_proof(
                 ("initial", INITIAL.to_string()),
                 ("initial_key", INITIAL_KEY.to_string()),
                 ("initial_strided", INITIAL_STRIDED.to_string()),
-                ("current_equation", "(by rfl)".into()),
+                ("current_equation", "(fun _ => rfl)".into()),
                 ("payload_equation", "pre29".into()),
                 ("mask_equation", "rfl".into()),
                 (
@@ -511,7 +488,7 @@ pub(super) fn native_program_proof(
                 ),
             ]);
         } else {
-            values.extend([("initial", format!("  obtain ⟨st0, initial, initialCipher, initialKey, initialStrided, initialMask, initialPayload⟩ := stage_{} runs lane\n  obtain ⟨initialLift, initialEquation, initialNorm⟩ := signedMonomial_integer_lift\n    (by decide : 0 < {n}) (initialStrided.signed (by decide) (by decide))\n", j - 1)), ("initial_key", String::new()), ("initial_strided", String::new()), ("current_equation", "initialCipher".into()), ("payload_equation", "initialPayload".into()), ("mask_equation", "initialMask".into()), ("shared_payload", "exact (publicPayload i).trans initialMask.symm".into()), ("shared_mask", "exact (publicMask i).trans initialMask.symm".into())]);
+            values.extend([("initial", format!("  obtain ⟨st0, initial, initialCipher, initialKey, initialStrided, initialMask, initialPayload⟩ := stage_{} runs lane\n  obtain ⟨initialLift, initialEquation, initialNorm⟩ := signedMonomial_integer_lift\n    (by decide : 0 < {n}) (initialStrided.signed (by decide) (by decide))\n", j - 1)), ("initial_key", String::new()), ("initial_strided", String::new()), ("current_equation", "(by intro i; rw [initialCipher]; congr 1; apply Fin.ext; dsimp [flat]; omega)".into()), ("payload_equation", "initialPayload".into()), ("mask_equation", "initialMask".into()), ("shared_payload", "exact (publicPayload i).trans initialMask.symm".into()), ("shared_mask", "exact (publicMask i).trans initialMask.symm".into())]);
         }
         values.insert("bridges", bridges);
         source.push_str(&format!("abbrev nativeBound{} : Nat := {} * (denseRegularGain RefreshBackend.layout{layout_index} {n} 2 * nativeBound{j} + {private_cutoff} + denseRegularGain RefreshBackend.layout{layout_index} {n} 2 * {})\n", j + 1, stage.members, values["public_cutoff"]));
@@ -522,14 +499,15 @@ pub(super) fn native_program_proof(
         previous_key = Some(key.output);
         previous_output = Some(output);
     }
-    if scope.outputs() != [previous_output.ok_or("missing final native output")?] {
-        return Err("native stages do not reach actual program output".into());
-    }
-    let expected =
-        snapshot.evaluate_pre_refresh().map_err(|error| error.to_string())?.program.output_bound;
+    let expected = snapshot
+        .evaluate_pre_refresh()
+        .map_err(|error| error.to_string())?
+        .program
+        .output_state()
+        .bound
+        .clone();
     values.insert("expected_bound", expected.to_string());
-    values.insert("program_output", vv(owner_wire)?);
-    values.insert("output_path", ".2".repeat(cs.constraint_count));
+    values.insert("program_output", vv(previous_output.ok_or("missing final native output")?)?);
     values.insert("last", (stages.len() - 1).to_string());
     source.push_str(&format!("abbrev nativeOutputBound : Nat := nativeBound{}\n", stages.len()));
     source.push_str(&render(OUTPUT, &values)?);
@@ -546,7 +524,6 @@ const FIRST_STAGE_APPROX: &str = r#"theorem first_stage_approx
     (runs : Runs hashModel external execution) (lane : Fin @lanes@) :
     let pw := preprocessingWitness runs
     let vw := verificationWitness runs
-    let cw := programWitness runs lane
     ∃ message : ExactPoly @q@ @n@, StridedMonomial @stride@ @width@ message ∧
       Approx (@output@) (@mask@ * ((@key@) lane) - message • (@payload@ * (@gadget@)))
         nativeBound1 := by
@@ -560,7 +537,6 @@ const STAGE: &str = r#"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} 
     (runs : Runs hashModel external execution) (lane : Fin @lanes@) :
     let pw := preprocessingWitness runs
     let vw := verificationWitness runs
-    let cw := programWitness runs lane
     ∃ state : ProgramState @q@ @n@ 2 @columns@,
       ProgramDerivation (@gadget@) state nativeBound@next@ ∧
       state.ciphertext = (@output@) ∧ state.publicKey = (@key@) lane ∧
@@ -568,13 +544,10 @@ const STAGE: &str = r#"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} 
   classical
   let pw := preprocessingWitness runs
   let vw := verificationWitness runs
-  let cw := programWitness runs lane
   let pin := preprocessingInputs runs.2.1
   let vin := verificationInputs runs.2.2.1
-  let ci : ExponentGeneratedProgramRoot.RootInput := @child_inputs@
   have pf : @pre_body@ RefreshBackend.backend hashModel preprocessing_params pin execution.preprocessing pw := preprocessingFacts runs
   have vf : @ver_body@ RefreshBackend.backend hashModel verification_params vin execution.verification vw := verificationFacts runs
-  have cf : @child_body@ RefreshBackend.backend hashModel verification_params lane.val ci _ cw := programFacts runs lane
 @bridges@  let g := (@gadget@)
   let layout := RefreshBackend.layout@layout@
   let gain := denseRegularGain layout @n@ 2
@@ -582,32 +555,26 @@ const STAGE: &str = r#"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} 
   have hg := @gadget_fact@
 @initial@  have privateFacts :=  ExponentGeneratedPrivateRoot.private_bucket_@stage@ pw pf layout lookup g hg
   choose privateError privateAction privateEq privateGain privateCache privateBound using privateFacts
-  have publicFacts :=  ExponentGeneratedProgramContext.public_branches_@public_node@ vw vf lane.val cw _ cf
-  choose positions localPositions publicState publicDerived publicCipher publicMessage publicMask publicPayload publicKey globalIndex localIndex using publicFacts
   let flat (i : Fin @members@) : Fin (@lanes@ * @members@) := ⟨lane.val * @members@ + i.val, by clear * - lane i; omega⟩
+  have publicFacts := fun i : Fin @members@ => ExponentGeneratedProgramContext.public_branches_@stage@ vw vf (flat i)
+  choose positions publicState publicDerived publicCipher publicMessage publicMask publicPayload publicKey globalIndex using publicFacts
   have actions : ∀ i : Fin @members@, ∃ action : ErrorMatrix @n@ @columns@ @columns@, (@public_cache@) (flat i) = reduceMatrix @q@ @n@ @columns@ @columns@ action ∧ ActionGain action gain := by
     intro i
-    obtain ⟨decomposition,hd,hout⟩ := @decomposition_fact@ (flat i)
-    obtain ⟨action,ha,hgain⟩ := gadgetDecomposeRuns_dense_gain layout lookup (by decide) (by decide) hd
-    exact ⟨action,hout.trans ha,hgain⟩
-  choose publicAction publicEq publicGain using actions
-  have onlineCache : ∀ i : Fin @members@, (@online_cache@) i = (@public_cache@) (flat i) := by
+@cache_gain@  choose publicAction publicEq publicGain using actions
+  have onlineCache : ∀ i : Fin @members@, (@online_cache@) = (@public_cache@) (flat i) := by
     intro i
-    obtain ⟨selected,hlo,hhi,hget,hout⟩ := @cache_fact@ i
-    obtain ⟨position,hindex,hselected⟩ := hget
-    dsimp only at hindex
-    have indexEquation := @cache_index_fact@ i
-    norm_num [@cache_index_relation@] at indexEquation
-    have same : position = flat i := by apply Fin.ext; dsimp [flat]; clear * - lane i hindex indexEquation; omega
-    rw [same] at hselected
-    have result := hout.trans hselected
-    change @online_cache@ i = (@public_export@) (flat i) at result
-    exact result.trans (congrFun pre7 (flat i))
-@initial_key@  have privateOnline : ∀ i, (@private_cache@) i = reduceMatrix @q@ @n@ @columns@ @columns@ (privateAction i) := by
+    have same : (@online_cache@) = (@public_export@) (flat i) := by
+      rfl
+    exact same.trans (congrFun pre7 (flat i))
+@initial_key@  have privateOnline : ∀ i : Fin @members@, (@private_cache@) = reduceMatrix @q@ @n@ @columns@ @columns@ (privateAction i) := by
     intro i
-    change (@private_export@) i = _
-    exact (congrFun pre6 i).trans (privateEq i)
-  have publicOnline : ∀ i, (@online_cache@) i = reduceMatrix @q@ @n@ @columns@ @columns@ (publicAction i) := by
+    have same : (@private_cache@) = (@private_export@) i := by
+      apply congrArg (@private_export@)
+      apply Fin.ext
+      dsimp [flat]
+      omega
+    exact same.trans ((congrFun pre6 i).trans (privateEq i))
+  have publicOnline : ∀ i : Fin @members@, (@online_cache@) = reduceMatrix @q@ @n@ @columns@ @columns@ (publicAction i) := by
     intro i
     exact (onlineCache i).trans (publicEq i)
   have cache : ∀ i, (st0.payload * g) * reduceMatrix @q@ @n@ @columns@ @columns@ (privateAction i) = (@selector@ ⟨@offset@+i.val,by clear * - lane i; omega⟩ 0 0) • (st0.payload * g) + reduceMatrix @q@ @n@ 1 @columns@ (privateError i) := by
@@ -625,23 +592,17 @@ const STAGE: &str = r#"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} 
   have publicStrided : ∀ i, StridedMonomial @stride@ @width@ (publicState i).message := by
     intro i
     rw [publicMessage i]
-    obtain ⟨selected,hlo,hhi,hget,hout⟩ := @message_fact@ i
-    obtain ⟨position,hindex,hselected⟩ := hget
-    obtain ⟨raw,rlo,rhi,rget,rout⟩ := @message_prefix_fact@ position
-    obtain ⟨rawPosition,rawIndex,rawSelected⟩ := rget
-    rw [hout,hselected]
-    change StridedMonomial @stride@ @width@ (@message_prefix@ position 0 0)
-    rw [rout,rawSelected]
-    change StridedMonomial @stride@ @width@ (@monomials@ rawPosition 0 0)
+    let position : Fin @global_count@ := ⟨Int.toNat (@message_index@), by simp only [Int.ofNat_eq_natCast]; omega⟩
+    change StridedMonomial @stride@ @width@ (@monomials@ position 0 0)
     have valid := runs.1
     simp only [ValidExternals] at valid
     have monomials := @monomial_fact@
-    obtain ⟨exponent,he⟩ := monomials rawPosition
+    obtain ⟨exponent,he⟩ := monomials position
     exact ⟨exponent, he⟩
   have publicSigned := fun i => (publicStrided i).signed (by decide : 0 < @n@) (by decide : @n@ = @stride@ * @width@)
   have lifts := fun i => signedMonomial_integer_lift (by decide : 0 < @n@) (publicSigned i)
   choose publicLift liftEquation liftNorm using lifts
-  have branches := ExponentGeneratedProgramRoot.program_family_@stage@ lane.val cw cf g st0 publicState privateAction publicAction
+  have branches := ExponentGeneratedProgramRoot.program_family_@stage@ lane vw vf g st0 publicState privateAction publicAction
     (fun i => @selector@ ⟨@offset@+i.val,by clear * - lane i; omega⟩ 0 0) privateError initialLift publicLift nativeBound@stage@ @public_cutoff@ gain gain @private_cutoff@
     initial publicDerived @current_equation@ publicCipher publicMessage privateOnline publicOnline cache initialEquation.symm initialNorm privateBound privateGain shared decomposition
     (fun i => (liftEquation i).symm) liftNorm publicGain
@@ -663,25 +624,15 @@ const STAGE: &str = r#"theorem stage_@stage@ {hashModel : MxxRuntime.HashModel} 
   · simpa only [gain,layout,nativeBound@next@] using combinedDerivation
   · change (∑ i, (result i).ciphertext) = _
     simp_rw [ciphertext]
-    exact (ExponentGeneratedReduction.reduction_@stage@ lane.val cw cf).symm
+    exact (ExponentGeneratedReduction.reduction_@stage@ vw vf lane).symm
   · change (∑ i, (result i).publicKey) = _
     simp_rw [resultKey,← publicEq]
-    -- Both global and bucket indices below come from the same actual gathers.
     have selectedKeys : ∀ i, (publicState i).publicKey = (@global_keys@) ⟨lane.val * @raw@ + @offset@ + i.val,by clear * - lane i; omega⟩ := by
       intro i
-      have localFact := localIndex i
       have globalFact := globalIndex i
-      have li := @local_index_fact@ i
-      have gi := @global_index_fact@ (localPositions i)
-      norm_num [@local_index_relation@,
-        @local_index_relation@.constraints_0] at li
-      norm_num [@global_index_relation@,
-        @global_index_relation@.constraints_0] at gi
-      norm_num [MxxIR.exactDiv] at gi
       have positionEq : positions i = (⟨lane.val * @raw@ + @offset@ + i.val, by clear * - lane i; omega⟩ : Fin @global_count@) := by
         apply Fin.ext
-        dsimp only
-        clear * - lane i localFact globalFact li gi
+        dsimp [flat] at globalFact ⊢
         omega
       rw [publicKey i]
       have aligned := ExponentGeneratedProgramSetup.public_inputs_cache pw pf g hg (positions i)
@@ -704,10 +655,9 @@ const INITIAL: &str = r#"  have initial := ExponentGeneratedInputsRoot.initial_p
     (by decide : 0 < @n@) (show SignedMonomial st0.message from initialMessage ▸ signedMonomial_one (by decide))
 "#;
 
-const INITIAL_KEY: &str = r#"  have initialKey : st0.publicKey = (@previous_key@) lane := by
-    have repeated := @previous_key_fact@ lane
-    change @initial_key_export@ = @previous_key@ lane
-    exact pre30.trans repeated.symm
+const INITIAL_KEY: &str = r#"  have initialKey : st0.publicKey = (@previous_key@) := by
+    change @initial_key_export@ = @previous_key@
+    exact pre30
 "#;
 
 const INITIAL_STRIDED: &str = r#"  have initialStrided : StridedMonomial @stride@ @width@ st0.message := by
@@ -727,14 +677,9 @@ theorem programOutputApprox {hashModel : MxxRuntime.HashModel} {external : Exter
       Approx ((@program_output@) lane) (@mask@ * ((@key@) lane) - message • (@payload@ * @gadget@)) @expected_bound@ := by
   let pw := preprocessingWitness runs
   let vw := verificationWitness runs
-  let cw := programWitness runs lane
   obtain ⟨state, derived, ciphertext, key, message, mask, payload⟩ := stage_@last@ runs lane
   refine ⟨state.message, message, ?_⟩
   have invariant := derived.sound (by decide : 0 < @n@)
-  have output := (programFacts runs lane)@output_path@
-  change ((@program_output@) lane) = (@output@) at output
-  change Approx ((@program_output@) lane) _ _
-  rw [output]
   simpa only [ProgramState.Invariant, ciphertext, key, mask, payload, native_output_bound] using invariant
 
 "#;

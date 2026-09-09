@@ -994,7 +994,11 @@ extern "C" int gpu_small_matrix_wait(const GpuSmallMatrix *mat)
 
 extern "C" int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src)
 {
-    if (!out || !src || out->ctx != src->ctx || out->rows != src->rows || out->cols != src->cols ||
+    // Compact coefficients are signed integers independent of the CRT basis.
+    // A containing-basis conversion may therefore cross parameter contexts on
+    // the same CUDA device. The destination owns its allocation and stream;
+    // source readiness and consumption are connected by the existing events.
+    if (!out || !src || out->device != src->device || out->rows != src->rows || out->cols != src->cols ||
         out->n != src->n || out->magnitude_bytes != src->magnitude_bytes || out->payload_bytes != src->payload_bytes)
         return set_error("incompatible compact matrix copy");
     if (small_set_device(out) != 0 || small_wait(src, out->stream) != 0) return 1;

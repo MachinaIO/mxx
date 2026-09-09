@@ -140,6 +140,25 @@ mod tests {
                     ],
                 );
                 let gpu_input = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_low, &input);
+                // Decompose at the low ring, preserve compact signed digits
+                // across contexts, and multiply only after the source is dropped.
+                let cpu_digits = input.clone().gadget_decompose(false, None).unwrap();
+                let gpu_digits = gpu_input.clone().gadget_decompose(false, None).unwrap();
+                let extended_digits = gpu_digits.centered_extend(&gpu_high).unwrap();
+                drop(gpu_digits);
+                assert_eq!(
+                    extended_digits.max_coefficient_bound(),
+                    cpu_digits.max_coefficient_bound()
+                );
+                let low_gadget = DCRTPolyMatrix::gadget_matrix(&low, 2, None);
+                let high_gadget = low_gadget.centered_extend(&high).unwrap();
+                let gpu_gadget = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_high, &high_gadget);
+                assert_eq!(
+                    gpu_gadget.multiply_small_rhs(&extended_digits).unwrap().to_cpu_matrix(),
+                    high_gadget
+                        .multiply_small_rhs(&cpu_digits.centered_extend(&high).unwrap())
+                        .unwrap(),
+                );
                 let lifted = gpu_input.centered_extend(&gpu_high).unwrap();
                 let cpu_lifted = input.centered_extend(&high).unwrap();
                 assert_eq!(lifted.to_cpu_matrix(), cpu_lifted);

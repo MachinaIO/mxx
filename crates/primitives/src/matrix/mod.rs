@@ -749,6 +749,8 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
 
     fn params(&self) -> &Self::Params;
     fn max_coefficient_bound(&self) -> &BigUint;
+    /// Preserve bounded signed coefficients in a containing modulus.
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String>;
     fn rows(&self) -> usize;
     fn columns(&self) -> usize;
     fn size(&self) -> (usize, usize) {
@@ -807,6 +809,13 @@ where
 
     fn params(&self) -> &Self::Params {
         self.value.params()
+    }
+
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String> {
+        Ok(Self::from_validated(
+            self.value.centered_extend(destination)?,
+            self.max_coefficient_bound.clone(),
+        ))
     }
 
     fn max_coefficient_bound(&self) -> &BigUint {

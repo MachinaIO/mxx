@@ -1904,6 +1904,16 @@ where
                 .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
+            NodeKind::CenteredExtend { .. }
+                if matches!(self.value(values, node.args[0])?, RuntimeValue::SmallMatrix(_)) =>
+            {
+                let input = self.small_matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let output =
+                    self.backend.centered_extend_small(&input, &ty).map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
+            }
             NodeKind::CenteredExtend { .. } | NodeKind::BlockModSwitch { .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let ty =
@@ -4375,6 +4385,13 @@ mod tests {
         ) -> Result<Self::Matrix, Self::Error> {
             unused_probe_operation!(value, destination)
         }
+        fn centered_extend_small(
+            &mut self,
+            value: &Self::SmallMatrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
         fn block_mod_switch(
             &mut self,
             value: &Self::Matrix,
@@ -5179,6 +5196,46 @@ mod tests {
         )
         .expect("execution");
         assert_eq!(matrix_output(&result, "product"), matrix_output(&result, "plain"));
+    }
+
+    #[test]
+    fn low_ring_digits_extend_to_high_ring_without_redecomposition() {
+        use num_bigint::BigUint;
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().map(|v| v.parse().unwrap()).unwrap_or(8);
+        let high = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let low_q = high.to_crt().0[..2].iter().map(|p| BigUint::from(*p)).product();
+        let low = high.select_modulus(&low_q).unwrap();
+        let ring = Ring::new(BigInt::from(low_q), n as usize);
+        let q_high = BigInt::from(high.modulus().as_ref().clone());
+        let digits = low.modulus_digits();
+        let input = ring.input("input", (1, 1));
+        let bounded = input.decompose(16, digits).centered_extend(q_high.clone());
+        let gadget = ring.gadget(1, 16, digits).centered_extend(q_high);
+        let product = bounded
+            .clone()
+            .mul_small_rhs(gadget)
+            .reduce_modulus(BigInt::from(low.modulus().as_ref().clone()));
+        let graph = DslContext::new("bounded-digit-extension")
+            .private_output("digits", bounded)
+            .unwrap()
+            .output("product", product)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let expected = -DCRTPolyMatrix::identity(&low, 1, None);
+        let result = execute(
+            &graph,
+            &mut cpu_backend([low, high]),
+            BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(expected.clone()))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        assert_eq!(matrix_output(&result, "product"), &expected);
+        assert!(matches!(result.outputs["digits"], RuntimeValue::SmallMatrix(_)));
     }
 
     #[test]

@@ -1381,6 +1381,27 @@ impl Preimage {
         &self.max_coefficient_bound
     }
 
+    /// Preserve the signed coefficients and their bound in a containing ring.
+    #[track_caller]
+    pub fn centered_extend(self, modulus: impl Into<IntExpr>) -> Self {
+        let modulus = modulus.into();
+        let matrix_type = MatrixType { modulus: modulus.clone(), ..self.matrix_type };
+        let wire_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::CenteredExtend { modulus },
+            vec![self.value],
+            vec![wire_type],
+        );
+        Self {
+            value: node.output(0).expect("bounded centered extension"),
+            matrix_type,
+            max_coefficient_bound: self.max_coefficient_bound,
+        }
+    }
+
     #[track_caller]
     pub fn mul_small_rhs(self, lhs: Mat) -> Mat {
         let output_type = MatrixType {

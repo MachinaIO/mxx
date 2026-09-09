@@ -1,5 +1,7 @@
 //! Deterministic bounds and conditional moments for the common Program.
-use super::{BfvError, BfvNoiseBound, BfvParameterManifest, BfvParameters, BfvPlanRequest};
+use super::{
+    RnsBggError, RnsBggNoiseBound, RnsBggParameterManifest, RnsBggParameters, RnsBggPlanRequest,
+};
 use crate::{
     noise_refresh::{
         refresh::{DigitPlanError, RefreshDigitPlan},
@@ -19,7 +21,7 @@ use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-impl BfvParameters {
+impl RnsBggParameters {
     /// Physical-coordinate variance transfer for the direct product's four
     /// error terms. Conditional model: deviations from the coefficient means
     /// are uncorrelated with a common variance bound, fixed RHS errors are CBD(eta)
@@ -36,15 +38,19 @@ impl BfvParameters {
         input_variance: &NonnegativeRational,
         payload_gain: &RightActionNoiseGain,
         fresh_error_gain: &RightActionNoiseGain,
-    ) -> Result<NonnegativeRational, BfvError> {
+    ) -> Result<NonnegativeRational, RnsBggError> {
         let p = self.scale(level)?;
         let next = self.level(level + 1)?;
         let n = BigUint::from(next.ring_dimension());
         let p_squared = p * p;
-        // e*C/p: two centered polynomial entries per output column, each
-        // with N coefficients bounded by (q-1)/2. No ciphertext scan is needed.
+        // e*U/p: 2D bounded digit polynomials per output column, each with
+        // N coefficients bounded by b/2. H4 conditions on the prepared U;
+        // this is an energy cap, not a uniform-digit independence assumption.
         let inherited = NonnegativeRational::new(
-            &input_variance.numerator * &n * (next.modulus().as_ref() - 1u8).pow(2),
+            &input_variance.numerator *
+                &n *
+                next.modulus_digits() *
+                (BigUint::one() << (2 * next.base_bits())),
             &input_variance.denominator * 2u8 * &p_squared,
         )
         .expect("positive scale and variance denominator");
@@ -78,7 +84,7 @@ impl BfvParameters {
         branches: usize,
         payload_gain: &RightActionNoiseGain,
         fresh_error_gain: &RightActionNoiseGain,
-    ) -> Result<NonnegativeRational, BfvError> {
+    ) -> Result<NonnegativeRational, RnsBggError> {
         let p = self.scale(level)?;
         let next = self.level(level + 1)?;
         let n = BigUint::from(next.ring_dimension());
@@ -86,11 +92,15 @@ impl BfvParameters {
         let p_squared = p * p;
         let cbd = NonnegativeRational::new(self.eta().into(), 2u8.into())
             .expect("positive constant variance denominator");
-        // sum_k (sigma_k(e)*C_k + ed_k*B_k)/p. C_k and B_k are
-        // centered two-by-two blocks in q, with the same coefficient cap.
+        // sum_k (sigma_k(e)*U_k + ed_k*V_k)/p. Both low-ring
+        // decompositions have 2D entries per column with coefficients <= b/2.
         let input_and_helper = input_variance.add(&cbd);
         let inherited_and_helper = NonnegativeRational::new(
-            &input_and_helper.numerator * &j * &n * (next.modulus().as_ref() - 1u8).pow(2),
+            &input_and_helper.numerator *
+                &j *
+                &n *
+                (BigUint::one() << (2 * next.base_bits())) *
+                next.modulus_digits(),
             &input_and_helper.denominator * 2u8 * &p_squared,
         )
         .expect("positive scale and variance denominator");
@@ -110,25 +120,27 @@ impl BfvParameters {
         Ok(inherited_and_helper.add(&fresh).add(&rounding))
     }
 
-    /// Direct product: e*C/p - mu*F + s*rho(A*C)/p - rho(c*C)/p.
-    /// K(C) <= N*(q-1) for a centered two-by-two polynomial block. A composed
+    /// Direct product: e*U/p - mu*F + s*rho(A*U)/p - rho(c*U)/p.
+    /// U = Dec(C), with 2D polynomials bounded by b/2 per output column:
+    /// K(U) <= N*D*b. A composed
     /// fixed RHS contributes all weighted fresh errors, even for one-hot payloads.
     pub fn private_mul_noise_bound(
         &self,
         level: usize,
-        input: &BfvNoiseBound,
+        input: &RnsBggNoiseBound,
         fresh_error_gain: &BigUint,
         output_payload_l1: BigUint,
-    ) -> Result<BfvNoiseBound, BfvError> {
+    ) -> Result<RnsBggNoiseBound, RnsBggError> {
         let p = self.scale(level)?;
         let next = self.level(level + 1)?;
         let n = BigUint::from(next.ring_dimension());
         let twice_p = p * 2u8;
-        let inherited = &input.error * &n * (next.modulus().as_ref() - 1u8) * 2u8;
+        let inherited =
+            &input.error * &n * next.modulus_digits() * (BigUint::one() << next.base_bits()) * 2u8;
         let fresh = &input.payload_l1 * fresh_error_gain * self.eta() * &twice_p;
         // S = ||s_bar||_1 + 1 <= N + 1 for the ternary secret.
         let rounding = (n + 2u8) * (p - 1u8);
-        Ok(BfvNoiseBound {
+        Ok(RnsBggNoiseBound {
             error: (inherited + fresh + rounding + &twice_p - 1u8) / twice_p,
             payload_l1: output_payload_l1,
         })
@@ -138,9 +150,9 @@ impl BfvParameters {
 /// A family envelope applies to each active member, never to its sum.
 /// `one_hot` is an explicit trusted payload contract; it never suppresses noise.
 #[derive(Clone, Debug)]
-pub struct BfvNoiseValue {
+pub struct RnsBggNoiseValue {
     pub level: usize,
-    pub bound: BfvNoiseBound,
+    pub bound: RnsBggNoiseBound,
     /// Squared coefficient norm of the reduced plaintext, bounded separately
     /// from l1 so public polynomial weights do not become monomial estimates.
     pub payload_l2_squared: BigUint,
@@ -155,7 +167,7 @@ pub struct BfvNoiseValue {
     pub one_hot: bool,
 }
 
-impl BfvNoiseValue {
+impl RnsBggNoiseValue {
     /// Known public coefficients provide the convolution gain directly. The
     /// coefficients are the chosen integer lift, with negacyclic terms reduced
     /// and combined before constructing this value.
@@ -169,7 +181,7 @@ impl BfvNoiseValue {
                 variance: NonnegativeRational::zero(),
             }),
             payload_l2_squared: coefficients.iter().map(|c| c.magnitude().pow(2)).sum(),
-            bound: BfvNoiseBound {
+            bound: RnsBggNoiseBound {
                 error: error_bound,
                 payload_l1: coefficients.iter().map(|c| c.magnitude()).sum(),
             },
@@ -181,7 +193,7 @@ impl BfvNoiseValue {
 }
 
 #[derive(Clone, Debug)]
-pub struct BfvNoiseRhs {
+pub struct RnsBggNoiseRhs {
     pub payload_l1: BigUint,
     pub payload_l2_squared: BigUint,
     /// The setup contract guarantees at most one nonzero coefficient-selector
@@ -190,7 +202,7 @@ pub struct BfvNoiseRhs {
 }
 
 #[derive(Clone, Debug)]
-pub struct BfvGateNoiseMaterial {
+pub struct RnsBggGateNoiseMaterial {
     pub level: usize,
     pub table: Option<[u8; 32]>,
     /// Sum of active public multiplier l1 bounds in each composed branch.
@@ -200,7 +212,7 @@ pub struct BfvGateNoiseMaterial {
     pub fresh_error_gain: RightActionNoiseGain,
 }
 
-impl BfvGateNoiseMaterial {
+impl RnsBggGateNoiseMaterial {
     /// Setup-time contract for coefficient selectors with at most one nonzero
     /// active member. Bounds refer to reduced public multiplier polynomials.
     /// The selected payload uses the maximum gain; all ciphertext errors use
@@ -211,12 +223,12 @@ impl BfvGateNoiseMaterial {
         level: usize,
         table: Option<[u8; 32]>,
         multipliers: &[RightActionNoiseGain],
-    ) -> Result<(Self, BfvNoiseRhs), BfvError> {
+    ) -> Result<(Self, RnsBggNoiseRhs), RnsBggError> {
         let payload_l1 = multipliers
             .iter()
             .map(|gain| &gain.l1)
             .max()
-            .ok_or(BfvError::Parameters("empty RHS composition"))?
+            .ok_or(RnsBggError::Parameters("empty RHS composition"))?
             .clone();
         Ok((
             Self {
@@ -227,7 +239,7 @@ impl BfvGateNoiseMaterial {
                     l2_squared: multipliers.iter().map(|gain| &gain.l2_squared).sum(),
                 },
             },
-            BfvNoiseRhs {
+            RnsBggNoiseRhs {
                 payload_l1,
                 payload_l2_squared: multipliers
                     .iter()
@@ -241,26 +253,26 @@ impl BfvGateNoiseMaterial {
     }
 }
 
-pub struct BfvNoiseTrace {
+pub struct RnsBggNoiseTrace {
     /// None for a raw trace; set only by a successful full Program audit.
     pub acceptance: Option<NoiseModelKind>,
     pub joint_event_count: BigUint,
     /// Includes the configured tail correction, in physical coordinates.
     pub z_squared: Option<NonnegativeRational>,
     pub dependencies: crate::noise_utils::NoiseDependencyGraph,
-    pub wires: BTreeMap<WireId, BfvNoiseValue>,
-    pub gates: BTreeMap<ProgramGateInstance, BfvNoiseValue>,
+    pub wires: BTreeMap<WireId, RnsBggNoiseValue>,
+    pub gates: BTreeMap<ProgramGateInstance, RnsBggNoiseValue>,
 }
 
 pub fn trace_program(
-    parameters: &BfvParameters,
+    parameters: &RnsBggParameters,
     program: &ExponentLutProgram,
-    bindings: &ProgramBindings<'_, BfvNoiseValue, BfvNoiseRhs, BfvGateNoiseMaterial>,
+    bindings: &ProgramBindings<'_, RnsBggNoiseValue, RnsBggNoiseRhs, RnsBggGateNoiseMaterial>,
     ranges: &ProgramFamilyBindings,
-) -> Result<BfvNoiseTrace, ProgramLowerError<BfvError>> {
+) -> Result<RnsBggNoiseTrace, ProgramLowerError<RnsBggError>> {
     let (wires, evaluator, dependencies) =
-        crate::scheme::trace_noise::<super::BfvScheme>(program, parameters, bindings, ranges)?;
-    Ok(BfvNoiseTrace {
+        crate::scheme::trace_noise::<super::RnsBggScheme>(program, parameters, bindings, ranges)?;
+    Ok(RnsBggNoiseTrace {
         dependencies,
         wires,
         gates: evaluator.gates,
@@ -270,7 +282,7 @@ pub fn trace_program(
     })
 }
 
-impl BfvParameters {
+impl RnsBggParameters {
     /// Search public prime candidates using the full Program audit. The
     /// request's terminal depth is the lower bound; its CRT/memory budgets
     /// remain hard limits on the declared allocation profile. Width/slot
@@ -279,13 +291,13 @@ impl BfvParameters {
     /// while the returned trace is the actual Program acceptance evidence.
     /// This conservative search does not certify globally minimal parameters.
     pub fn search_program(
-        request: &super::BfvPlanRequest,
+        request: &super::RnsBggPlanRequest,
         program: &ExponentLutProgram,
-        bindings: &ProgramBindings<'_, BfvNoiseValue, BfvNoiseRhs, BfvGateNoiseMaterial>,
+        bindings: &ProgramBindings<'_, RnsBggNoiseValue, RnsBggNoiseRhs, RnsBggGateNoiseMaterial>,
         ranges: &ProgramFamilyBindings,
         terminal_value_bounds: &BTreeMap<WireId, BigUint>,
         average: Option<&AverageCaseConfig>,
-    ) -> Result<(Self, super::BfvParameterManifest, BfvNoiseTrace), BfvError> {
+    ) -> Result<(Self, super::RnsBggParameterManifest, RnsBggNoiseTrace), RnsBggError> {
         let mut candidate = request.clone();
         loop {
             let attempt = Self::plan(&candidate).and_then(|(parameters, manifest)| {
@@ -300,9 +312,9 @@ impl BfvParameters {
             });
             match attempt {
                 Ok(accepted) => return Ok(accepted),
-                Err(BfvError::Budget("evaluation noise" | "terminal range")) => {
+                Err(RnsBggError::Budget("evaluation noise" | "terminal range")) => {
                     if candidate.terminal_depth >= candidate.max_crt_depth {
-                        return Err(BfvError::Budget("CRT depth"));
+                        return Err(RnsBggError::Budget("CRT depth"));
                     }
                     candidate.terminal_depth += 1;
                 }
@@ -323,21 +335,23 @@ impl BfvParameters {
     pub fn audit_program(
         &self,
         program: &ExponentLutProgram,
-        bindings: &ProgramBindings<'_, BfvNoiseValue, BfvNoiseRhs, BfvGateNoiseMaterial>,
+        bindings: &ProgramBindings<'_, RnsBggNoiseValue, RnsBggNoiseRhs, RnsBggGateNoiseMaterial>,
         ranges: &ProgramFamilyBindings,
         terminal_value_bounds: &BTreeMap<WireId, BigUint>,
         average: Option<&AverageCaseConfig>,
-    ) -> Result<BfvNoiseTrace, BfvError> {
+    ) -> Result<RnsBggNoiseTrace, RnsBggError> {
         let outputs = program.outputs().iter().copied().collect::<std::collections::BTreeSet<_>>();
         if terminal_value_bounds.keys().copied().collect::<std::collections::BTreeSet<_>>() !=
             outputs
         {
-            return Err(BfvError::Parameters("terminal bounds must match declared Program outputs"));
+            return Err(RnsBggError::Parameters(
+                "terminal bounds must match declared Program outputs",
+            ));
         }
         let mut trace = trace_program(self, program, bindings, ranges).map_err(|e| match e {
             ProgramLowerError::Operation { source, .. } => source,
-            ProgramLowerError::Validation(error) => BfvError::Graph(error.to_string()),
-            ProgramLowerError::Graph(error) => BfvError::Graph(error.to_string()),
+            ProgramLowerError::Validation(error) => RnsBggError::Graph(error.to_string()),
+            ProgramLowerError::Graph(error) => RnsBggError::Graph(error.to_string()),
         })?;
         // Deduplicate scalar wires and gate results by their common dependency
         // node. A captured wire is one source; family gate coordinates still
@@ -367,28 +381,33 @@ impl BfvParameters {
                     .evaluate(&ParamEnv::default())
                     .ok()
                     .and_then(|count| count.to_biguint())
-                    .ok_or(BfvError::Parameters("noise audit requires concrete active ranges"))?,
+                    .ok_or(RnsBggError::Parameters(
+                        "noise audit requires concrete active ranges",
+                    ))?,
             };
-            events += count * self.level(value.level)?.ring_dimension() * 2u8;
+            events += count *
+                self.level(value.level)?.ring_dimension() *
+                2u8 *
+                self.component_columns(value.level)?;
         }
         let average = average.filter(|config| config.allow_average_acceptance);
         let z_squared = average
             .map(|config| {
                 let z = config
                     .z_squared_for_events(&events)
-                    .map_err(|_| BfvError::Parameters("invalid average-case event budget"))?;
+                    .map_err(|_| RnsBggError::Parameters("invalid average-case event budget"))?;
                 let correction = config
                     .tail_correction_bits
                     .checked_mul(2)
-                    .ok_or(BfvError::Parameters("invalid tail correction"))?;
-                Ok::<_, BfvError>(z.scaled(&(BigUint::one() << correction)))
+                    .ok_or(RnsBggError::Parameters("invalid tail correction"))?;
+                Ok::<_, RnsBggError>(z.scaled(&(BigUint::one() << correction)))
             })
             .transpose()?;
         for value in values.values() {
             let fits = match &z_squared {
                 None => self.noise_fits(value.level, &value.bound)?,
                 Some(z) => {
-                    let moments = value.moments.as_ref().ok_or(BfvError::Parameters(
+                    let moments = value.moments.as_ref().ok_or(RnsBggError::Parameters(
                         "average-case input moment model is missing",
                     ))?;
                     let modulus_limit = NonnegativeRational::new(
@@ -409,11 +428,11 @@ impl BfvParameters {
                 }
             };
             if !fits {
-                return Err(BfvError::Budget("evaluation noise"));
+                return Err(RnsBggError::Budget("evaluation noise"));
             }
         }
         for (wire, value_bound) in terminal_value_bounds {
-            let value = trace.wires.get(wire).ok_or(BfvError::Context)?;
+            let value = trace.wires.get(wire).ok_or(RnsBggError::Context)?;
             let modulus = self.level(value.level)?.modulus();
             let modulus = modulus.as_ref();
             let payload = value_bound * 2u8;
@@ -429,7 +448,7 @@ impl BfvParameters {
                 }
             };
             if !fits {
-                return Err(BfvError::Budget("terminal range"));
+                return Err(RnsBggError::Budget("terminal range"));
             }
         }
         trace.acceptance = Some(if average.is_some() {
@@ -443,28 +462,28 @@ impl BfvParameters {
     }
 }
 
-pub struct BfvNoiseEvaluator<'a> {
-    pub(super) parameters: &'a BfvParameters,
+pub struct RnsBggNoiseEvaluator<'a> {
+    pub(super) parameters: &'a RnsBggParameters,
     pub(super) ranges: &'a ProgramFamilyBindings,
-    pub(super) gates: BTreeMap<ProgramGateInstance, BfvNoiseValue>,
+    pub(super) gates: BTreeMap<ProgramGateInstance, RnsBggNoiseValue>,
 }
 
-impl BfvNoiseEvaluator<'_> {
+impl RnsBggNoiseEvaluator<'_> {
     // Captured scalars keep their dependency identity. Only the transfer's
     // output acquires the current member range; no new source is introduced.
     fn gate_range(
         &self,
         gate: ProgramGateInstance,
-        inputs: &[&BfvNoiseValue],
-    ) -> Result<Option<FamilyRange>, BfvError> {
+        inputs: &[&RnsBggNoiseValue],
+    ) -> Result<Option<FamilyRange>, RnsBggError> {
         let range = match gate {
             ProgramGateInstance::FamilyGate { family, .. } => {
-                Some(self.ranges.range(family).ok_or(BfvError::Context)?.clone())
+                Some(self.ranges.range(family).ok_or(RnsBggError::Context)?.clone())
             }
             _ => None,
         };
         if inputs.iter().any(|input| input.range.is_some() && input.range != range) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         Ok(range)
     }
@@ -472,21 +491,21 @@ impl BfvNoiseEvaluator<'_> {
     fn record(
         &mut self,
         gate: ProgramGateInstance,
-        value: BfvNoiseValue,
-    ) -> Result<BfvNoiseValue, BfvError> {
+        value: RnsBggNoiseValue,
+    ) -> Result<RnsBggNoiseValue, RnsBggError> {
         self.gates.insert(gate, value.clone());
         Ok(value)
     }
 }
 
-impl ProgramLoweringTypes for BfvNoiseEvaluator<'_> {
-    type Wire = BfvNoiseValue;
-    type Rhs = BfvNoiseRhs;
-    type HelperSet = BfvGateNoiseMaterial;
-    type Error = BfvError;
+impl ProgramLoweringTypes for RnsBggNoiseEvaluator<'_> {
+    type Wire = RnsBggNoiseValue;
+    type Rhs = RnsBggNoiseRhs;
+    type HelperSet = RnsBggGateNoiseMaterial;
+    type Error = RnsBggError;
 }
 
-impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
+impl ExponentProgramLowering for RnsBggNoiseEvaluator<'_> {
     fn mul_private(
         &mut self,
         input: &Self::Wire,
@@ -495,13 +514,13 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
         let range = self.gate_range(gate, &[input])?;
-        let material = material.ok_or(BfvError::Context)?;
+        let material = material.ok_or(RnsBggError::Context)?;
         if material.level != input.level || material.table.is_some() {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         if let Some(rhs_range) = &rhs.one_hot {
             if range.as_ref() != Some(rhs_range) || rhs.payload_l1 > BigUint::one() {
-                return Err(BfvError::Context);
+                return Err(RnsBggError::Context);
             }
         }
         let moments = input
@@ -519,11 +538,13 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
                 )?;
                 let next = self.parameters.level(input.level + 1)?;
                 let l1 = NonnegativeRational::new(
-                    BigUint::from(next.ring_dimension()) * (next.modulus().as_ref() - 1u8),
+                    BigUint::from(next.ring_dimension()) *
+                        next.modulus_digits() *
+                        (BigUint::one() << next.base_bits()),
                     self.parameters.scale(input.level)?.clone(),
                 )
                 .expect("positive scale");
-                Ok::<_, BfvError>(m.linear_image(&l1, variance))
+                Ok::<_, RnsBggError>(m.linear_image(&l1, variance))
             })
             .transpose()?;
         let bound = self.parameters.private_mul_noise_bound(
@@ -534,7 +555,7 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
         )?;
         self.record(
             gate,
-            BfvNoiseValue {
+            RnsBggNoiseValue {
                 level: input.level + 1,
                 payload_l2_squared: (input.bound.payload_l1.pow(2) * &rhs.payload_l2_squared)
                     .min(&input.payload_l2_squared * rhs.payload_l1.pow(2)),
@@ -555,11 +576,11 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
     ) -> Result<Self::Wire, Self::Error> {
         let range = self.gate_range(gate, &[private, public])?;
         if private.level != public.level || !public.public {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         self.record(
             gate,
-            BfvNoiseValue {
+            RnsBggNoiseValue {
                 level: private.level,
                 payload_l2_squared: (private.bound.payload_l1.pow(2) * &public.payload_l2_squared)
                     .min(&private.payload_l2_squared * public.bound.payload_l1.pow(2)),
@@ -588,11 +609,11 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
     ) -> Result<Self::Wire, Self::Error> {
         let range = self.gate_range(gate, &[lhs, rhs])?;
         if lhs.level != rhs.level {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         self.record(
             gate,
-            BfvNoiseValue {
+            RnsBggNoiseValue {
                 level: lhs.level,
                 payload_l2_squared: (&lhs.bound.payload_l1 + &rhs.bound.payload_l1)
                     .pow(2)
@@ -621,21 +642,21 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
         let range = self.gate_range(gate, &[input])?;
-        let material = helpers.ok_or(BfvError::Lut)?;
+        let material = helpers.ok_or(RnsBggError::Lut)?;
         use mxx_primitives::poly::PolyParams;
-        let layout = program.layout().ok_or(BfvError::Lut)?;
+        let layout = program.layout().ok_or(RnsBggError::Lut)?;
         if layout.exponent.stride_log2 != 0 ||
             layout.ring_dimension_log2 !=
                 self.parameters.level(input.level)?.ring_dimension().trailing_zeros()
         {
-            return Err(BfvError::Parameters("BFV requires an unstrided exponent layout"));
+            return Err(RnsBggError::Parameters("RNS-BGG requires an unstrided exponent layout"));
         }
-        let table = program.lut(lut).ok_or(BfvError::Lut)?;
+        let table = program.lut(lut).ok_or(RnsBggError::Lut)?;
         if material.level != input.level || material.table != Some(table.commitment()) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         if rhs.is_some_and(|rhs| rhs.one_hot.is_some()) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let rhs_l1 = rhs.map_or_else(BigUint::one, |rhs| rhs.payload_l1.clone());
         // A linear table map sends each supported input monomial to a unit
@@ -660,11 +681,12 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
                 let l1 = NonnegativeRational::new(
                     BigUint::from(table.values().len()) *
                         BigUint::from(next.ring_dimension()) *
-                        (next.modulus().as_ref() - 1u8),
+                        (BigUint::one() << next.base_bits()) *
+                        next.modulus_digits(),
                     self.parameters.scale(input.level)?.clone(),
                 )
                 .expect("positive scale");
-                Ok::<_, BfvError>(m.linear_image(&l1, variance))
+                Ok::<_, RnsBggError>(m.linear_image(&l1, variance))
             })
             .transpose()?;
         let bound = self.parameters.lut_noise_bound(
@@ -676,7 +698,7 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
         )?;
         self.record(
             gate,
-            BfvNoiseValue {
+            RnsBggNoiseValue {
                 level: input.level + 1,
                 // Different table entries may collide: retain the l1-based
                 // cap until the table domain proves a tighter squared norm.
@@ -692,15 +714,15 @@ impl ExponentProgramLowering for BfvNoiseEvaluator<'_> {
     }
 }
 
-impl BfvNoiseEvaluator<'_> {
+impl RnsBggNoiseEvaluator<'_> {
     pub(super) fn reduce_add(
         &mut self,
-        value: &BfvNoiseValue,
+        value: &RnsBggNoiseValue,
         range: &FamilyRange,
         gate: ProgramGateInstance,
-    ) -> Result<BfvNoiseValue, BfvError> {
+    ) -> Result<RnsBggNoiseValue, RnsBggError> {
         if value.range.as_ref().is_some_and(|bound_range| bound_range != range) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let count = range
             .count()
@@ -708,10 +730,10 @@ impl BfvNoiseEvaluator<'_> {
             .ok()
             .and_then(|count| count.to_biguint())
             .filter(|count| *count > 0u8.into())
-            .ok_or(BfvError::Parameters("noise trace needs a concrete active family count"))?;
+            .ok_or(RnsBggError::Parameters("noise trace needs a concrete active family count"))?;
         self.record(
             gate,
-            BfvNoiseValue {
+            RnsBggNoiseValue {
                 level: value.level,
                 payload_l2_squared: if value.range.is_some() && value.one_hot {
                     value.payload_l2_squared.clone()
@@ -719,7 +741,7 @@ impl BfvNoiseEvaluator<'_> {
                     &value.payload_l2_squared * count.pow(2)
                 },
                 moments: value.moments.as_ref().map(|m| m.scaled(&count)),
-                bound: BfvNoiseBound {
+                bound: RnsBggNoiseBound {
                     error: &value.bound.error * &count,
                     payload_l1: if value.range.is_some() && value.one_hot {
                         value.bound.payload_l1.clone()
@@ -739,20 +761,20 @@ impl BfvNoiseEvaluator<'_> {
 mod tests {
     use super::*;
     use crate::{
-        bfv::BfvPlanRequest,
         layout::ExpLayout,
         program::{
             AttributeKnowledge, ExponentLutProgramBuilder, ProgramFamilyId, ProgramWireType,
         },
+        rns_bgg::RnsBggPlanRequest,
     };
 
     #[test]
-    fn test_bfv_composed_noise_uses_sum_for_errors_and_max_for_payload() {
+    fn test_rns_bgg_composed_noise_uses_sum_for_errors_and_max_for_payload() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
@@ -769,7 +791,8 @@ mod tests {
             RightActionNoiseGain::from_polynomial_coefficients([2.into()]),
             RightActionNoiseGain::from_polynomial_coefficients([0.into()]),
         ];
-        let (material, rhs) = BfvGateNoiseMaterial::from_one_hot_labels(0, None, &gains).unwrap();
+        let (material, rhs) =
+            RnsBggGateNoiseMaterial::from_one_hot_labels(0, None, &gains).unwrap();
         assert_eq!(material.fresh_error_gain.l1, BigUint::from(5u8));
         assert_eq!(material.fresh_error_gain.l2_squared, BigUint::from(9u8));
         assert_eq!(rhs.payload_l1, BigUint::from(3u8));
@@ -861,9 +884,9 @@ mod tests {
         let output = builder.private_mul(builder.input_wire(input_id).unwrap(), rhs_id).unwrap();
         builder.output(output).unwrap();
         let program = builder.build().unwrap();
-        let input = BfvNoiseValue {
+        let input = RnsBggNoiseValue {
             level: 0,
-            bound: BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+            bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
             payload_l2_squared: 1u8.into(),
             moments: Some(NoiseMoments {
                 mean_numerator: BigInt::zero(),
@@ -902,16 +925,16 @@ mod tests {
         // Only the fresh term changes: J * ||mu||_1 * (5 - 1) * eta = 8.
         // The exact rounding terms and inherited/mask error remain unchanged.
         assert_eq!(result.error, single.error + 8u8);
-        assert!(BfvGateNoiseMaterial::from_one_hot_labels(0, None, &[]).is_err());
+        assert!(RnsBggGateNoiseMaterial::from_one_hot_labels(0, None, &[]).is_err());
     }
 
     #[test]
-    fn test_bfv_noise_trace_tracks_public_coefficients_and_one_hot_payload() {
+    fn test_rns_bgg_noise_trace_tracks_public_coefficients_and_one_hot_payload() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
@@ -941,9 +964,9 @@ mod tests {
         ranges.bind(ProgramFamilyId::from_index(0), range.clone());
         let inputs = BTreeMap::from([(
             input,
-            BfvNoiseValue {
+            RnsBggNoiseValue {
                 level: 0,
-                bound: BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                 payload_l2_squared: 1u8.into(),
                 moments: Some(NoiseMoments {
                     mean_numerator: BigInt::zero(),
@@ -956,13 +979,13 @@ mod tests {
                 one_hot: false,
             },
         )]);
-        let mut member = BfvNoiseValue::public(1, 2u8.into(), &[2.into(), (-1).into()]);
+        let mut member = RnsBggNoiseValue::public(1, 2u8.into(), &[2.into(), (-1).into()]);
         assert_eq!(member.bound.payload_l1, BigUint::from(3u8));
         member.range = Some(range.clone());
         let members = BTreeMap::from([(public_members, member)]);
         let rhs = BTreeMap::from([(
             selectors,
-            BfvNoiseRhs {
+            RnsBggNoiseRhs {
                 payload_l1: 1u8.into(),
                 payload_l2_squared: 1u8.into(),
                 one_hot: Some(range.clone()),
@@ -974,13 +997,13 @@ mod tests {
         let gate = ProgramGateInstance::FamilyGate { step: 0, gate: 0, family: *family };
         let helpers = BTreeMap::from([(
             gate,
-            BfvGateNoiseMaterial {
+            RnsBggGateNoiseMaterial {
                 level: 0,
                 table: None,
                 fresh_error_gain: RightActionNoiseGain::unit(),
             },
         )]);
-        let evaluate = |rhs: &BTreeMap<crate::program::RhsFamilyId, BfvNoiseRhs>,
+        let evaluate = |rhs: &BTreeMap<crate::program::RhsFamilyId, RnsBggNoiseRhs>,
                         terminal_bounds: &BTreeMap<WireId, BigUint>| {
             parameters.audit_program(
                 &program,
@@ -1001,7 +1024,13 @@ mod tests {
         let trace = evaluate(&rhs, &terminal_bounds).unwrap();
         assert_eq!(trace.acceptance, Some(NoiseModelKind::WorstCase));
         // One scalar input, two three-member gates, one reduction, one Add.
-        assert_eq!(trace.joint_event_count, BigUint::from(n) * 18u8);
+        assert_eq!(
+            trace.joint_event_count,
+            BigUint::from(n) *
+                2u8 *
+                (parameters.component_columns(0).unwrap() +
+                    8 * parameters.component_columns(1).unwrap())
+        );
         let dependencies = &trace.dependencies;
         let crate::noise_utils::NoiseDependencyNode::Add { lhs, rhs: same_rhs, .. } =
             &dependencies.nodes[dependencies.wires[&output].0]
@@ -1019,7 +1048,7 @@ mod tests {
         assert!(evaluate(&rhs, &BTreeMap::from([(selected, 6u8.into())])).is_err());
         assert!(matches!(
             evaluate(&rhs, &BTreeMap::from([(output, BigUint::from(1u8) << 128)])),
-            Err(BfvError::Budget("terminal range"))
+            Err(RnsBggError::Budget("terminal range"))
         ));
         let captured =
             dependencies
@@ -1037,8 +1066,11 @@ mod tests {
             dependencies.wires[&program.input_wires()[&input]],
             "family capture preserves the original scalar source"
         );
-        let mut scalar_evaluator =
-            BfvNoiseEvaluator { parameters: &parameters, ranges: &ranges, gates: BTreeMap::new() };
+        let mut scalar_evaluator = RnsBggNoiseEvaluator {
+            parameters: &parameters,
+            ranges: &ranges,
+            gates: BTreeMap::new(),
+        };
         let repeated_capture = scalar_evaluator.reduce_add(&inputs[&input], &range, gate).unwrap();
         assert_eq!(repeated_capture.bound.error, BigUint::from(6u8));
         assert_eq!(repeated_capture.bound.payload_l1, BigUint::from(3u8));
@@ -1082,7 +1114,7 @@ mod tests {
             .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
             .unwrap();
         let table = crate::program::LutTable::unary(2, 2, vec![1, 0]).unwrap();
-        let lut_material = BfvGateNoiseMaterial {
+        let lut_material = RnsBggGateNoiseMaterial {
             level: 0,
             table: Some(table.commitment()),
             fresh_error_gain: RightActionNoiseGain::unit(),
@@ -1164,7 +1196,7 @@ mod tests {
         // The chain envelope alone accepts one terminal prime, but the
         // actual Program output range requires two. Candidate acceptance
         // must rerun the complete trace, including selection and final Add.
-        let request = BfvPlanRequest {
+        let request = RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![4],
@@ -1176,8 +1208,8 @@ mod tests {
             terminal_value_bound: 1u8.into(),
         };
         let terminal = BTreeMap::from([(output, BigUint::from(1u8) << 35)]);
-        let search = |request: &BfvPlanRequest| {
-            BfvParameters::search_program(
+        let search = |request: &RnsBggPlanRequest| {
+            RnsBggParameters::search_program(
                 request,
                 &program,
                 &ProgramBindings::new(
@@ -1199,8 +1231,8 @@ mod tests {
         assert_eq!(accepted_trace.wires[&output].bound.payload_l1, BigUint::from(6u8));
         assert!(manifest.validate().is_ok());
         let mut insufficient = request;
-        insufficient.max_crt_depth = 4;
-        assert!(matches!(search(&insufficient), Err(BfvError::Budget("CRT depth"))));
+        insufficient.max_crt_depth = insufficient.terminal_depth;
+        assert!(matches!(search(&insufficient), Err(RnsBggError::Budget("CRT depth"))));
 
         // A gate-free output must still satisfy noise acceptance. Its level
         // is supplied by the input contract, not inferred from the last LUT.
@@ -1214,9 +1246,9 @@ mod tests {
         let direct = direct.build().unwrap();
         let mut direct_inputs = BTreeMap::from([(
             direct_input,
-            BfvNoiseValue {
+            RnsBggNoiseValue {
                 level: 1,
-                bound: BfvNoiseBound { error: 1u8.into(), payload_l1: 1u8.into() },
+                bound: RnsBggNoiseBound { error: 1u8.into(), payload_l1: 1u8.into() },
                 payload_l2_squared: 1u8.into(),
                 moments: Some(NoiseMoments {
                     mean_numerator: BigInt::zero(),
@@ -1230,7 +1262,7 @@ mod tests {
             },
         )]);
         let direct_bounds = BTreeMap::from([(direct_output, 1u8.into())]);
-        let check_direct = |inputs: &BTreeMap<crate::program::ProgramInputId, BfvNoiseValue>,
+        let check_direct = |inputs: &BTreeMap<crate::program::ProgramInputId, RnsBggNoiseValue>,
                             average: Option<&AverageCaseConfig>| {
             parameters.audit_program(
                 &direct,
@@ -1252,7 +1284,7 @@ mod tests {
             parameters.level(1).unwrap().modulus().as_ref().clone();
         assert!(matches!(
             check_direct(&direct_inputs, None),
-            Err(BfvError::Budget("evaluation noise"))
+            Err(RnsBggError::Budget("evaluation noise"))
         ));
         let average = AverageCaseConfig { allow_average_acceptance: true, ..Default::default() };
         let accepted = check_direct(&direct_inputs, Some(&average)).unwrap();
@@ -1274,18 +1306,18 @@ mod tests {
         moments.variance = NonnegativeRational::zero();
         assert!(matches!(
             check_direct(&direct_inputs, Some(&average)),
-            Err(BfvError::Budget("evaluation noise"))
+            Err(RnsBggError::Budget("evaluation noise"))
         ));
         direct_inputs.get_mut(&direct_input).unwrap().moments = None;
         assert!(matches!(
             check_direct(&direct_inputs, Some(&average)),
-            Err(BfvError::Parameters("average-case input moment model is missing"))
+            Err(RnsBggError::Parameters("average-case input moment model is missing"))
         ));
     }
 }
 
-impl BfvParameters {
-    /// Double-scale note (6.6), with arithmetic on exact products. The
+impl RnsBggParameters {
+    /// Section 9 LUT alignment, with bounded U and V and exact products. The
     /// numerator includes internal public-matrix rounding and outer rounding.
     /// The caller supplies the output payload bound from its domain analysis:
     /// an identity LUT on a polynomial must not be assigned a monomial bound.
@@ -1295,13 +1327,13 @@ impl BfvParameters {
     pub fn lut_noise_bound(
         &self,
         level: usize,
-        input: &BfvNoiseBound,
+        input: &RnsBggNoiseBound,
         branches: usize,
         fresh_error_gain: &BigUint,
         output_payload_l1: BigUint,
-    ) -> Result<BfvNoiseBound, BfvError> {
+    ) -> Result<RnsBggNoiseBound, RnsBggError> {
         if branches == 0 {
-            return Err(BfvError::Parameters("empty branch family"));
+            return Err(RnsBggError::Parameters("empty branch family"));
         }
         let source = self.level(level)?;
         let next = self.level(level + 1)?;
@@ -1310,17 +1342,22 @@ impl BfvParameters {
         let j = BigUint::from(branches);
         let s = &n + 1u8;
         let twice_p = p * 2u8;
-        let inherited = &j * &n * (next.modulus().as_ref() - 1u8) * (&input.error + self.eta) * 2u8;
+        let inherited = &j *
+            &n *
+            (BigUint::one() << next.base_bits()) *
+            next.modulus_digits() *
+            (&input.error + self.eta) *
+            2u8;
         let fresh = &j * &input.payload_l1 * fresh_error_gain * BigUint::from(self.eta);
         let rounding = ((&j + 1u8) * s + 1u8) * (p - 1u8);
         let numerator = inherited + fresh * &twice_p + rounding;
-        Ok(BfvNoiseBound {
+        Ok(RnsBggNoiseBound {
             error: (numerator + &twice_p - 1u8) / &twice_p,
             payload_l1: output_payload_l1,
         })
     }
 
-    pub fn noise_fits(&self, level: usize, noise: &BfvNoiseBound) -> Result<bool, BfvError> {
+    pub fn noise_fits(&self, level: usize, noise: &RnsBggNoiseBound) -> Result<bool, RnsBggError> {
         let range_fits = self.level(level)?.modulus().as_ref() > &(&noise.error * 8u8);
         // Nonterminal states must resolve adjacent p_i-spaced payloads. The
         // last level is a terminal carrier with a separately audited range.
@@ -1328,49 +1365,165 @@ impl BfvParameters {
             (level + 1 == self.levels.len() || self.scale(level)? > &(&noise.error * 2u8)))
     }
 
-    /// Conservative backward prime allocation followed by a forward exact
-    /// audit. Rejects finite depth/memory budgets instead of inflating them.
-    pub fn plan(request: &BfvPlanRequest) -> Result<(Self, BfvParameterManifest), BfvError> {
+    /// Search nested prime-prefix chains using the actual gate noise transfer.
+    /// At equal last two depths, retain the Pareto frontier of error and peak
+    /// memory. A larger prefix modulus is tried only if smaller prefixes fail.
+    pub fn plan(
+        request: &RnsBggPlanRequest,
+    ) -> Result<(Self, RnsBggParameterManifest), RnsBggError> {
         request.validate()?;
+        let stages = request.widths.len();
+        if request.max_crt_depth - request.terminal_depth < stages {
+            return Err(RnsBggError::Budget("CRT depth"));
+        }
         let pool = DCRTPolyParams::try_new(
             request.ring_dimension,
             request.max_crt_depth,
             request.crt_bits,
-            1,
+            (request.crt_bits / 2).min(31) as u32,
             None,
             None,
         )
-        .map_err(|_| BfvError::Parameters("unsupported prime pool"))?;
+        .map_err(|_| RnsBggError::Parameters("unsupported prime pool"))?;
         let primes = pool.to_crt().0;
-        let mut used = request.terminal_depth;
-        let mut modulus = primes[..used].iter().map(|p| BigUint::from(*p)).product::<BigUint>();
-        let mut reverse = vec![
-            pool.select_modulus(&modulus).ok_or(BfvError::Parameters("invalid terminal base"))?,
-        ];
-        for &width in request.widths.iter().rev() {
-            let threshold = &modulus * BigUint::from(width) * request.ring_dimension * 2u8;
-            let mut drop = BigUint::one();
-            while drop < threshold {
-                let prime = primes.get(used).ok_or(BfvError::Budget("CRT depth"))?;
-                drop *= *prime;
-                used += 1;
-            }
-            modulus *= drop;
-            reverse.push(
-                pool.select_modulus(&modulus)
-                    .ok_or(BfvError::Parameters("invalid planned base"))?,
-            );
+        let bases = (1..=request.max_crt_depth)
+            .map(|depth| {
+                let modulus = primes[..depth].iter().copied().map(BigUint::from).product();
+                pool.select_modulus(&modulus).expect("prime prefix in the pool")
+            })
+            .collect::<Vec<_>>();
+        if bases[request.terminal_depth - 1].modulus().as_ref() <=
+            &(2u8 * &request.terminal_value_bound)
+        {
+            return Err(RnsBggError::Budget("terminal range"));
         }
-        reverse.reverse();
-        let parameters = Self::new(reverse, request.eta)?;
-        let manifest = parameters.audit(request)?;
-        Ok((parameters, manifest))
+        let mut failure = RnsBggError::Budget("evaluation noise");
+        for start in request.terminal_depth + stages..=request.max_crt_depth {
+            let initial =
+                RnsBggNoiseBound { error: request.eta.into(), payload_l1: BigUint::one() };
+            let mut frontier =
+                BTreeMap::from([((start, start), vec![(vec![start], initial, BigUint::zero())])]);
+            for stage in 0..stages {
+                let mut following: BTreeMap<_, Vec<(Vec<usize>, RnsBggNoiseBound, BigUint)>> =
+                    BTreeMap::new();
+                for ((_, high), candidates) in frontier {
+                    let minimum = request.terminal_depth + stages - stage - 1;
+                    let maximum =
+                        if stage + 1 == stages { request.terminal_depth } else { high - 1 };
+                    for low in minimum..=maximum {
+                        for (path, input, peak) in &candidates {
+                            let mut extended = path.clone();
+                            extended.push(low);
+                            let parameters = Self::new(
+                                extended.iter().map(|depth| bases[*depth - 1].clone()).collect(),
+                                request.eta,
+                            )?;
+                            if !parameters.noise_fits(stage, input)? {
+                                continue;
+                            }
+                            let output = parameters.lut_noise_bound(
+                                stage,
+                                input,
+                                request.widths[stage],
+                                &BigUint::from(request.slots[stage]),
+                                BigUint::one(),
+                            )?;
+                            // Output spacing is checked when its next drop is chosen.
+                            if !parameters.noise_fits(stage + 1, &output)? {
+                                continue;
+                            }
+                            let mut peak = peak.clone();
+                            if stage > 0 {
+                                peak = peak.max(parameters.lut_stage_bytes(
+                                    stage - 1,
+                                    request.widths[stage - 1],
+                                    request.slots[stage - 1],
+                                )?);
+                            }
+                            if stage + 1 == stages {
+                                peak = peak.max(parameters.lut_stage_bytes(
+                                    stage,
+                                    request.widths[stage],
+                                    request.slots[stage],
+                                )?);
+                                if parameters.level(stage + 1)?.modulus().as_ref() <=
+                                    &(2u8 * (&request.terminal_value_bound + &output.error))
+                                {
+                                    failure = RnsBggError::Budget("terminal range");
+                                    continue;
+                                }
+                            }
+                            if peak > BigUint::from(request.memory_budget_bytes) {
+                                failure = RnsBggError::Budget("memory");
+                                continue;
+                            }
+                            let states = following.entry((high, low)).or_default();
+                            if states.iter().any(|(_, bound, memory)| {
+                                bound.error <= output.error && *memory <= peak
+                            }) {
+                                continue;
+                            }
+                            states.retain(|(_, bound, memory)| {
+                                !(output.error <= bound.error && peak <= *memory)
+                            });
+                            states.push((extended, output, peak));
+                        }
+                    }
+                }
+                frontier = following;
+                if frontier.is_empty() {
+                    break;
+                }
+            }
+            if let Some((path, _, _)) = frontier
+                .into_values()
+                .flatten()
+                .filter(|(path, _, _)| path.len() == stages + 1)
+                .min_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.error.cmp(&b.1.error)))
+            {
+                let parameters = Self::new(
+                    path.into_iter().map(|depth| bases[depth - 1].clone()).collect(),
+                    request.eta,
+                )?;
+                let manifest = parameters.audit(request)?;
+                return Ok((parameters, manifest));
+            }
+        }
+        Err(failure)
+    }
+
+    /// Graph-value storage for one LUT branch wave on the compact-digit GPU
+    /// backend, excluding allocator/NTT workspaces. Previous stages can be
+    /// streamed to the artifact store, so chain peak is the maximum stage.
+    fn lut_stage_bytes(
+        &self,
+        level: usize,
+        branches: usize,
+        slots: usize,
+    ) -> Result<BigUint, RnsBggError> {
+        let high = self.level(level)?;
+        let low = self.level(level + 1)?;
+        let d = BigUint::from(low.modulus_digits());
+        let output_d = BigUint::from(self.component_columns(level + 1)?);
+        let j = BigUint::from(branches);
+        let high_entries = 6u8 * &d * (&j + 1u8) + 10u8 * &output_d;
+        let low_entries = 4u8 * &j * &output_d * (BigUint::from(slots) + 1u8) + 6u8 * &output_d;
+        // U and V: two 2-by-2 blocks of D-by-D_out digits per branch.
+        // One additional pair covers source/destination conversion scratch.
+        let compact_entries = 8u8 * (&j + 1u8) * &d * &output_d;
+        let compact_bytes = BigUint::from(1 + low.base_bits().div_ceil(8));
+        Ok((8u8 * (high_entries * high.crt_depth() + low_entries * low.crt_depth()) +
+            compact_entries * compact_bytes) *
+            high.ring_dimension())
     }
 
     /// Recompute the certificate from public workload data and exact bases.
     /// This chain planner covers monomial LUT stages; arbitrary Program DAGs
     /// must use their full noise trace before claiming parameter acceptance.
-    pub(super) fn audit(&self, request: &BfvPlanRequest) -> Result<BfvParameterManifest, BfvError> {
+    pub(super) fn audit(
+        &self,
+        request: &RnsBggPlanRequest,
+    ) -> Result<RnsBggParameterManifest, RnsBggError> {
         request.validate()?;
         let stages = request.widths.len();
         if self.levels.len() != stages + 1 ||
@@ -1380,12 +1533,15 @@ impl BfvParameters {
             self.levels[stages].crt_depth() != request.terminal_depth ||
             self.levels.iter().any(|level| level.crt_bits() > request.crt_bits)
         {
-            return Err(BfvError::Parameters("modulus chain does not match workload"));
+            return Err(RnsBggError::Parameters("modulus chain does not match workload"));
         }
         let mut bounds =
-            vec![BfvNoiseBound { error: request.eta.into(), payload_l1: BigUint::one() }];
+            vec![RnsBggNoiseBound { error: request.eta.into(), payload_l1: BigUint::one() }];
         let mut bytes = BigUint::zero();
         for i in 0..stages {
+            if !self.noise_fits(i, &bounds[i])? {
+                return Err(RnsBggError::Budget("evaluation noise"));
+            }
             let bound = self.lut_noise_bound(
                 i,
                 &bounds[i],
@@ -1394,33 +1550,25 @@ impl BfvParameters {
                 BigUint::one(),
             )?;
             if !self.noise_fits(i + 1, &bound)? {
-                return Err(BfvError::Budget("evaluation noise"));
+                return Err(RnsBggError::Budget("evaluation noise"));
             }
             bounds.push(bound);
-            let high = BigUint::from(self.levels[i].crt_depth());
-            let low = BigUint::from(self.levels[i + 1].crt_depth());
-            let branches = BigUint::from(request.widths[i]);
-            // RHS plus helper rows/public matrices; include both public/state
-            // values, C/b lift scratch, and raw accumulators for one branch wave.
-            bytes += (4u8 * &branches * request.slots[i] * low +
-                6u8 * &branches * &high +
-                20u8 * high) *
-                request.ring_dimension *
-                8u8;
+            bytes = bytes.max(self.lut_stage_bytes(i, request.widths[i], request.slots[i])?);
         }
         if bytes > BigUint::from(request.memory_budget_bytes) {
-            return Err(BfvError::Budget("memory"));
+            return Err(RnsBggError::Budget("memory"));
         }
         let terminal = self.level(stages)?;
         let range = (&request.terminal_value_bound + &bounds[stages].error) * 2u8;
         if terminal.modulus().as_ref() <= &range {
-            return Err(BfvError::Budget("terminal range"));
+            return Err(RnsBggError::Budget("terminal range"));
         }
-        let manifest = BfvParameterManifest {
+        let manifest = RnsBggParameterManifest {
             workload: request.clone(),
             ring_dimension: request.ring_dimension,
             eta: request.eta,
             levels: self.levels.iter().map(|level| level.to_crt().0).collect(),
+            base_bits: self.levels.iter().map(PolyParams::base_bits).collect(),
             drops: self.drops[..stages].to_vec(),
             payload_scales: self.drops.clone(),
             noise_bounds: bounds,
@@ -1434,7 +1582,7 @@ impl BfvParameters {
 /// Unresolved refresh workload. Input levels and noise come from the Program
 /// values passed to `plan_refresh`, rather than independently copied bounds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BfvRefreshPlanRequest {
+pub struct RnsBggRefreshPlanRequest {
     pub data_branches: usize,
     pub prf_branches: usize,
     pub base: usize,
@@ -1446,7 +1594,7 @@ pub struct BfvRefreshPlanRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BfvRefreshPlan {
+pub struct RnsBggRefreshPlan {
     pub model: NoiseModelKind,
     pub z_squared: Option<NonnegativeRational>,
     pub digits: RefreshDigitPlan,
@@ -1460,12 +1608,12 @@ pub struct BfvRefreshPlan {
     pub spacings: Vec<BigUint>,
     pub distinct_prf_outputs: BigUint,
     pub terminal_digit_emissions: BigUint,
-    /// Persistent C, b, input-key and raw-public polynomial towers. This is
-    /// total artifact storage, not peak workspace or a measured runtime.
+    /// Persistent bounded U/V, input keys, raw outputs, and shared helpers on
+    /// the compact-digit GPU backend. This is artifact storage, not peak VRAM.
     pub terminal_artifact_bytes: BigUint,
 }
 
-impl BfvParameters {
+impl RnsBggParameters {
     /// Solve counts against the same aggregate-before-ModDown recurrence used
     /// by evaluation, including decoder noise exactly once. Large target
     /// weights do not multiply these errors: RHS errors are sampled afterwards.
@@ -1475,19 +1623,19 @@ impl BfvParameters {
     /// the planner does not rerun either Program or inspect ciphertexts.
     pub fn plan_refresh(
         &self,
-        request: &BfvRefreshPlanRequest,
-        data: &BfvNoiseValue,
-        prf: &BfvNoiseValue,
+        request: &RnsBggRefreshPlanRequest,
+        data: &RnsBggNoiseValue,
+        prf: &RnsBggNoiseValue,
         average: Option<&AverageCaseConfig>,
-    ) -> Result<BfvRefreshPlan, BfvError> {
+    ) -> Result<RnsBggRefreshPlan, RnsBggError> {
         if data.level != prf.level {
-            return Err(BfvError::Parameters("refresh inputs need a common terminal level"));
+            return Err(RnsBggError::Parameters("refresh inputs need a common terminal level"));
         }
         let input_level = data.level;
         let source = self.level(input_level)?;
         let output = self.level(input_level + 1)?;
         if output.crt_depth() < 2 || request.decoder_eta == 0 {
-            return Err(BfvError::Parameters("refresh needs two CRT primes and decoder error"));
+            return Err(RnsBggError::Parameters("refresh needs two CRT primes and decoder error"));
         }
         let q = output.modulus();
         let spacings =
@@ -1497,8 +1645,16 @@ impl BfvParameters {
             &vec![1u8.into(); spacings.len()],
             &request.fresh_support,
         )
-        .map_err(|_| BfvError::Parameters("refresh digit support"))?;
-        let coordinates = 2usize * source.ring_dimension() as usize;
+        .map_err(|_| RnsBggError::Parameters("refresh digit support"))?;
+        let coordinates =
+            2usize * self.component_columns(input_level + 1)? * source.ring_dimension() as usize;
+        let prf_coordinates = (0..=input_level).try_fold(BigUint::zero(), |sum, level| {
+            Ok::<_, RnsBggError>(
+                sum + BigUint::from(self.component_columns(level)?) *
+                    self.level(level)?.ring_dimension() *
+                    2u8,
+            )
+        })?;
         let average = average.filter(|config| config.allow_average_acceptance);
         let tail =
             |plan: &RefreshDigitPlan| -> Result<Option<NonnegativeRational>, DigitPlanError> {
@@ -1508,8 +1664,8 @@ impl BfvParameters {
                         // The count follows the current fixed-point digit schedule.
                         let outputs = (plan.mask_counts.iter().sum::<usize>() + plan.fresh_count) *
                             coordinates;
-                        let events = &request.observations +
-                            BigUint::from(outputs) * coordinates * (input_level + 1);
+                        let events =
+                            &request.observations + BigUint::from(outputs) * &prf_coordinates;
                         config
                             .z_squared_for_events(&events)
                             .map(|z| {
@@ -1567,16 +1723,18 @@ impl BfvParameters {
                 },
             )
             .map_err(|error| match error {
-                DigitPlanError::MaskRange => BfvError::Budget("refresh mask spacing"),
-                DigitPlanError::FreshRange => BfvError::Budget("refresh fresh-error support"),
-                DigitPlanError::Parameters => BfvError::Parameters("refresh digit/error workload"),
+                DigitPlanError::MaskRange => RnsBggError::Budget("refresh mask spacing"),
+                DigitPlanError::FreshRange => RnsBggError::Budget("refresh fresh-error support"),
+                DigitPlanError::Parameters => {
+                    RnsBggError::Parameters("refresh digit/error workload")
+                }
             })?;
         let fresh_error = digits.fresh_interval().1.magnitude().clone();
         if !self.noise_fits(
             input_level + 1,
-            &BfvNoiseBound { error: fresh_error, payload_l1: data.bound.payload_l1.clone() },
+            &RnsBggNoiseBound { error: fresh_error, payload_l1: data.bound.payload_l1.clone() },
         )? {
-            return Err(BfvError::Budget("refreshed state scale"));
+            return Err(RnsBggError::Budget("refreshed state scale"));
         }
         let masks = digits.mask_counts.iter().map(|count| BigUint::from(*count)).sum::<BigUint>();
         let distinct_prf_outputs = (&masks + digits.fresh_count) * coordinates;
@@ -1584,28 +1742,36 @@ impl BfvParameters {
             (&masks + BigUint::from(digits.fresh_count) * spacings.len()) * coordinates;
         let high = BigUint::from(source.crt_depth());
         let low = BigUint::from(output.crt_depth());
-        // Indexed digit terms store fresh C and b for every branch. Input
-        // matrices have four high-base polynomials; a raw aggregate is one
-        // four-polynomial high-base matrix per group (mask/fresh/data).
-        let digit_towers =
-            &terminal_digit_emissions * (&low * request.prf_branches * 8u8 + 4u8 * &high);
-        let data_towers =
-            BigUint::from(spacings.len()) * (&low * request.data_branches * 8u8 + 4u8 * &high);
-        let shared_towers = BigUint::from(spacings.len()) * (12u8 * &high + 6u8 * &low) +
-            4u8 * &low +
-            (BigUint::from(request.prf_branches) * 2u8 + request.data_branches) *
-                4u8 *
+        let d = BigUint::from(output.modulus_digits());
+        let out_d = BigUint::from(self.component_columns(input_level + 1)?);
+        let compact_bytes = BigUint::from(1 + output.base_bits().div_ceil(8));
+        let action_bytes = 8u8 * &d * &out_d * compact_bytes;
+        let key_and_raw_bytes = 32u8 * (&d + &out_d) * &high;
+        let digit_bytes =
+            &terminal_digit_emissions * (&action_bytes * request.prf_branches + &key_and_raw_bytes);
+        let data_bytes = BigUint::from(spacings.len()) *
+            (&action_bytes * request.data_branches + &key_and_raw_bytes);
+        // Captured mask matrices are stored once per structural group; input
+        // keys and raw term outputs remain per member. CRT target/offset rows
+        // retain the full resumable output width.
+        let shared_bytes = BigUint::from(spacings.len()) *
+            (32u8 *
+                &d *
                 &high *
-                spacings.len();
+                (BigUint::from(request.prf_branches) * 2u8 + request.data_branches) +
+                96u8 * &out_d * &high +
+                48u8 * &out_d * &low) +
+            32u8 * &out_d * &low;
         let terminal_artifact_bytes =
-            (digit_towers + data_towers + shared_towers) * source.ring_dimension() * 8u8;
-        Ok(BfvRefreshPlan {
+            (digit_bytes + data_bytes + shared_bytes) * source.ring_dimension();
+        Ok(RnsBggRefreshPlan {
             model: if average.is_some() {
                 NoiseModelKind::AverageCase
             } else {
                 NoiseModelKind::WorstCase
             },
-            z_squared: tail(&digits).map_err(|_| BfvError::Parameters("refresh event budget"))?,
+            z_squared: tail(&digits)
+                .map_err(|_| RnsBggError::Parameters("refresh event budget"))?,
             fresh_uniform_moments: digits.fresh_uniform_moments(),
             mask_uniform_moments: (0..digits.mask_counts.len())
                 .map(|slot| digits.mask_uniform_moments(slot))
@@ -1624,25 +1790,25 @@ impl BfvParameters {
 mod refresh_plan_tests {
     use super::*;
     #[test]
-    fn test_bfv_refresh_plan_uses_emitted_digits_in_noise_fixed_point() {
+    fn test_rns_bgg_refresh_plan_uses_emitted_digits_in_noise_fixed_point() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(4);
-        let (parameters, _) = BfvParameters::plan(&super::super::BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&super::super::RnsBggPlanRequest {
             ring_dimension: n,
             // One composed PRF product precedes refresh and continuation.
             widths: vec![1, n as usize, 1],
             slots: vec![2, 1, 1],
             eta: 2,
             crt_bits: 17,
-            terminal_depth: 2,
+            terminal_depth: 3,
             max_crt_depth: 24,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 32u8.into(),
         })
         .unwrap();
-        let request = BfvRefreshPlanRequest {
+        let request = RnsBggRefreshPlanRequest {
             data_branches: n as usize,
             prf_branches: n as usize,
             base: 4,
@@ -1673,9 +1839,9 @@ mod refresh_plan_tests {
         let inputs = BTreeMap::from([(initial, 0), (data, 1)].map(|(id, level)| {
             (
                 id,
-                BfvNoiseValue {
+                RnsBggNoiseValue {
                     level,
-                    bound: BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                    bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                     payload_l2_squared: 1u8.into(),
                     moments: Some(NoiseMoments {
                         mean_numerator: BigInt::zero(),
@@ -1690,7 +1856,7 @@ mod refresh_plan_tests {
             )
         }));
         // The composed one-hot RHS retains both fresh ciphertext errors.
-        let (material, rhs_bound) = BfvGateNoiseMaterial::from_one_hot_labels(
+        let (material, rhs_bound) = RnsBggGateNoiseMaterial::from_one_hot_labels(
             0,
             None,
             &[RightActionNoiseGain::unit(), RightActionNoiseGain::unit()],
@@ -1760,20 +1926,20 @@ mod refresh_plan_tests {
 
 /// The terminal numerator keeps inherited/fresh/helper/internal-rounding terms
 /// separate until all stages have been added. Outer rounding occurs only once.
-pub struct BfvTerminalNoise {
+pub struct RnsBggTerminalNoise {
     pub error: BigUint,
     pub coefficient_bound: BigUint,
     pub branches: usize,
 }
 
-impl BfvParameters {
+impl RnsBggParameters {
     /// Setup-time integer recovery and evaluation-noise checks at the terminal
     /// output level. Weights affect the required range, never the error gain.
     pub fn terminal_noise_fits(
         &self,
         output_level: usize,
-        bound: &BfvTerminalNoise,
-    ) -> Result<bool, BfvError> {
+        bound: &RnsBggTerminalNoise,
+    ) -> Result<bool, RnsBggError> {
         let q = self.level(output_level)?.modulus();
         let error = &bound.error;
         Ok(q.as_ref() > &((&bound.coefficient_bound + error) * 2u8) && q.as_ref() > &(error * 8u8))
@@ -1788,11 +1954,11 @@ impl BfvParameters {
     pub fn terminal_noise_moments<'a>(
         &self,
         level: usize,
-        stages: impl IntoIterator<Item = (&'a BfvNoiseValue, usize)>,
-    ) -> Result<NoiseMoments, BfvError> {
+        stages: impl IntoIterator<Item = (&'a RnsBggNoiseValue, usize)>,
+    ) -> Result<NoiseMoments, RnsBggError> {
         let p = self.scale(level)?;
         let n = BigUint::from(self.level(level)?.ring_dimension());
-        let q = self.level(level + 1)?.modulus();
+        let low = self.level(level + 1)?;
         let p_squared = p * p;
         let cbd = NonnegativeRational::new(self.eta().into(), 2u8.into()).unwrap();
         let mut result = NoiseMoments {
@@ -1806,11 +1972,15 @@ impl BfvParameters {
             let m = input
                 .moments
                 .as_ref()
-                .ok_or(BfvError::Parameters("terminal input moment model is missing"))?;
+                .ok_or(RnsBggError::Parameters("terminal input moment model is missing"))?;
             let j = BigUint::from(count);
             let input_helper = m.variance.add(&cbd);
             let inherited_helper = NonnegativeRational::new(
-                &input_helper.numerator * &j * &n * (q.as_ref() - 1u8).pow(2),
+                &input_helper.numerator *
+                    &j *
+                    &n *
+                    (BigUint::one() << (2 * low.base_bits())) *
+                    low.modulus_digits(),
                 &input_helper.denominator * 2u8 * &p_squared,
             )
             .unwrap();
@@ -1821,7 +1991,11 @@ impl BfvParameters {
             )
             .unwrap();
             let mean = m.linear_image(
-                &NonnegativeRational::new(&j * &n * (q.as_ref() - 1u8), p.clone()).unwrap(),
+                &NonnegativeRational::new(
+                    &j * &n * (BigUint::one() << low.base_bits()) * low.modulus_digits(),
+                    p.clone(),
+                )
+                .unwrap(),
                 NonnegativeRational::zero(),
             );
             result.mean_radius = result.mean_radius.add(&mean.mean_radius);
@@ -1838,29 +2012,35 @@ impl BfvParameters {
     pub fn terminal_noise_bound<'a>(
         &self,
         level: usize,
-        stages: impl IntoIterator<Item = (&'a BfvNoiseBound, usize, &'a BigUint)>,
+        stages: impl IntoIterator<Item = (&'a RnsBggNoiseBound, usize, &'a BigUint)>,
         coefficient_bound: BigUint,
-    ) -> Result<BfvTerminalNoise, BfvError> {
+    ) -> Result<RnsBggTerminalNoise, RnsBggError> {
         let p = self.scale(level)?;
         let n = BigUint::from(self.level(level)?.ring_dimension());
-        let q = self.level(level + 1)?.modulus();
+        let low = self.level(level + 1)?;
         let twice_p = p * 2u8;
         let mut numerator = (&n + 2u8) * (p - 1u8);
         let mut branches = 0usize;
         for (input, count, gain) in stages {
             if count == 0 {
-                return Err(BfvError::Parameters("empty terminal stage"));
+                return Err(RnsBggError::Parameters("empty terminal stage"));
             }
-            branches = branches.checked_add(count).ok_or(BfvError::Budget("terminal branches"))?;
+            branches =
+                branches.checked_add(count).ok_or(RnsBggError::Budget("terminal branches"))?;
             let j = BigUint::from(count);
-            numerator += &j * &n * (q.as_ref() - 1u8) * (&input.error + self.eta()) * 2u8;
+            numerator += &j *
+                &n *
+                (BigUint::one() << low.base_bits()) *
+                low.modulus_digits() *
+                (&input.error + self.eta()) *
+                2u8;
             numerator += &twice_p * &j * &input.payload_l1 * gain * self.eta();
             numerator += &j * (&n + 1u8) * (p - 1u8);
         }
         if branches == 0 {
-            return Err(BfvError::Parameters("empty terminal batch"));
+            return Err(RnsBggError::Parameters("empty terminal batch"));
         }
-        Ok(BfvTerminalNoise {
+        Ok(RnsBggTerminalNoise {
             error: (numerator + &twice_p - 1u8) / twice_p,
             coefficient_bound,
             branches,

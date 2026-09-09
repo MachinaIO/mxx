@@ -826,6 +826,10 @@ mod tests {
     impl SmallPolyMatrix for MetadataOnlySmallOwner {
         type Params = DCRTPolyParams;
 
+        fn centered_extend(&self, _destination: &Self::Params) -> Result<Self, String> {
+            Err("metadata-only test owner has no coefficient transport".into())
+        }
+
         fn params(&self) -> &Self::Params {
             &self.params
         }
@@ -1259,6 +1263,32 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(chunks[0].concat_rows(&chunks.iter().skip(1).collect::<Vec<_>>()), digits);
         }
+    }
+
+    #[test]
+    fn test_bounded_digits_centered_extension() {
+        use crate::sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler};
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().map(|v| v.parse().unwrap()).unwrap_or(8);
+        let high = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let low_modulus = high.to_crt().0[..2].iter().map(|p| BigUint::from(*p)).product();
+        let low = high.select_modulus(&low_modulus).unwrap();
+        let input = DCRTPolyUniformSampler::new().sample_uniform(&low, 2, 3, DistType::FinRingDist);
+        let digits = input.clone().gadget_decompose(false, None).unwrap();
+        let extended = digits.centered_extend(&high).unwrap();
+        assert_eq!(extended.params(), &high);
+        assert_eq!(extended.max_coefficient_bound(), digits.max_coefficient_bound());
+        assert_eq!(
+            extended.to_canonical_coefficients().unwrap(),
+            digits.to_canonical_coefficients().unwrap()
+        );
+        let gadget = DCRTPolyMatrix::gadget_matrix(&low, 2, None);
+        assert_eq!(gadget.multiply_small_rhs(&digits).unwrap(), input);
+        let product = gadget.centered_extend(&high).unwrap().multiply_small_rhs(&extended).unwrap();
+        assert_eq!(
+            product,
+            gadget.centered_extend(&high).unwrap() * digits.value().centered_extend(&high).unwrap()
+        );
     }
 
     #[test]

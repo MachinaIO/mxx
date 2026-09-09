@@ -1,15 +1,15 @@
-//! BFV secret sampling and online encoding operations.
+//! RNS-BGG secret sampling and online encoding operations.
 use super::*;
 
-impl<R: GraphValue> GraphValue for BfvEncoding<R> {
-    type Schema = BfvEncoding<R::Schema>;
+impl<R: GraphValue> GraphValue for RnsBggEncoding<R> {
+    type Schema = RnsBggEncoding<R::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         self.row.flatten()
     }
 
     fn schema(&self) -> Self::Schema {
-        BfvEncoding {
+        RnsBggEncoding {
             row: self.row.schema(),
             level: self.level,
             key_id: self.key_id,
@@ -27,11 +27,11 @@ impl<R: GraphValue> GraphValue for BfvEncoding<R> {
     }
 }
 
-impl<R: GraphValueSchema> GraphValueSchema for BfvEncoding<R> {
-    type Value = BfvEncoding<R::Value>;
+impl<R: GraphValueSchema> GraphValueSchema for RnsBggEncoding<R> {
+    type Value = RnsBggEncoding<R::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvEncoding {
+        RnsBggEncoding {
             row: self.row.placeholders_from(next),
             level: self.level,
             key_id: self.key_id,
@@ -44,19 +44,19 @@ impl<R: GraphValueSchema> GraphValueSchema for BfvEncoding<R> {
     }
 }
 
-impl BfvScheme {
+impl RnsBggScheme {
     /// Online evaluation is exactly one block row product and one ModDown.
     pub fn evaluate_mul_private(
         &self,
-        input: &BfvEncoding,
-        prepared: &BfvPreparedPrivateMul,
-    ) -> Result<BfvEncoding, BfvError> {
+        input: &RnsBggEncoding,
+        prepared: &RnsBggPreparedPrivateMul,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
         use mxx_primitives::poly::PolyParams;
         self.check_encoding(input, &prepared.input)?;
         let next = num_bigint::BigInt::from(
             self.parameters.level(prepared.output.level)?.modulus().as_ref().clone(),
         );
-        Ok(BfvEncoding {
+        Ok(RnsBggEncoding {
             row: (input.row.clone() * prepared.rhs.lifted_ciphertext.clone())
                 .block_mod_switch(next),
             level: prepared.output.level,
@@ -66,23 +66,49 @@ impl BfvScheme {
     }
     pub fn evaluate_mul_private_family(
         &self,
-        input: &BfvEncodingFamily,
-        prepared: &BfvPreparedPrivateMul<
-            BfvPublicKeyFamily,
-            ProgramValue<BfvMatrix, Family<BfvMatrix>>,
+        input: &RnsBggEncodingFamily,
+        prepared: &RnsBggPreparedPrivateMul<
+            RnsBggPublicKeyFamily,
+            ProgramValue<RnsBggMatrix, Family<RnsBggMatrix>>,
+            ProgramValue<RnsBggDigits, Family<RnsBggDigits>>,
         >,
-    ) -> Result<BfvEncodingFamily, BfvError> {
-        use mxx_primitives::poly::PolyParams;
+    ) -> Result<RnsBggEncodingFamily, RnsBggError> {
         self.check_encoding_family(input, &prepared.input)?;
-        let next = num_bigint::BigInt::from(
-            self.parameters.level(prepared.output.level)?.modulus().as_ref().clone(),
-        );
         let rows = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            Ok((input.rows.at(&index) * prepared.rhs.lifted_ciphertext.at(&index))
-                .block_mod_switch(next.clone()))
+            let element = RnsBggEncoding {
+                row: input.rows.at(&index),
+                level: input.level,
+                key_id: input.key_id,
+                context: input.context,
+            };
+            let prepared = RnsBggPreparedPrivateMul {
+                input: RnsBggPublicKey {
+                    matrix: prepared.input.matrices.at(&index),
+                    level: prepared.input.level,
+                    id: prepared.input.id,
+                    context: prepared.input.context,
+                },
+                output: RnsBggPublicKey {
+                    matrix: prepared.output.matrices.at(&index),
+                    level: prepared.output.level,
+                    id: prepared.output.id,
+                    context: prepared.output.context,
+                },
+                rhs: RnsBggPrivateRhs {
+                    ciphertext: prepared.rhs.ciphertext.at(&index),
+                    lifted_ciphertext: prepared.rhs.lifted_ciphertext.at(&index),
+                    level: prepared.rhs.level,
+                    id: prepared.rhs.id,
+                    rhs_id: prepared.rhs.rhs_id,
+                    context: prepared.rhs.context,
+                },
+            };
+            self.evaluate_mul_private(&element, &prepared)
+                .map(|value| value.row)
+                .map_err(|_| DslError::Schema)
         })
-        .map_err(|error| BfvError::Graph(error.to_string()))?;
-        Ok(BfvEncodingFamily {
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        Ok(RnsBggEncodingFamily {
             rows: ProgramValue::Family(rows),
             level: prepared.output.level,
             key_id: prepared.output.id,
@@ -94,17 +120,17 @@ impl BfvScheme {
     /// Both operations retain the source level and its payload scale.
     pub fn evaluate_linear(
         &self,
-        lhs: &BfvEncoding,
-        rhs: &BfvEncoding,
-        prepared: &BfvPreparedLinear,
-    ) -> Result<BfvEncoding, BfvError> {
+        lhs: &RnsBggEncoding,
+        rhs: &RnsBggEncoding,
+        prepared: &RnsBggPreparedLinear,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
         self.check_encoding(lhs, &prepared.lhs)?;
         self.check_encoding(rhs, &prepared.rhs)?;
         let row = match &prepared.operation {
             LinearOperation::Add => lhs.row.clone() + rhs.row.clone(),
             LinearOperation::MulPublic(multiplier) => multiplier.clone() * lhs.row.clone(),
         };
-        Ok(BfvEncoding {
+        Ok(RnsBggEncoding {
             row,
             level: prepared.output.level,
             key_id: prepared.output.id,
@@ -116,7 +142,7 @@ impl BfvScheme {
         level: usize,
         rows: usize,
         columns: usize,
-    ) -> Result<Mat, BfvError> {
+    ) -> Result<Mat, RnsBggError> {
         let ring = self.ring(level)?;
         if self.parameters.eta() == 0 {
             return Ok(ring.zero((rows, columns)));
@@ -125,43 +151,58 @@ impl BfvScheme {
             Ok(ring.uniform_interval((rows, columns), 0, 1) -
                 ring.uniform_interval((rows, columns), 0, 1))
         })
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
+        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
         sum(bits)
     }
-    pub fn sample_payload_secret(&self) -> Result<BfvPayloadSecret, BfvError> {
+    pub fn sample_payload_secret(&self) -> Result<RnsBggPayloadSecret, RnsBggError> {
         let ring = self.ring(0)?;
-        Ok(BfvPayloadSecret {
-            row: BfvRow::new([[ring.uniform_interval((1, 1), -1, 1), ring.identity(1)]])
-                .map_err(|e| BfvError::Graph(e.to_string()))?,
+        Ok(RnsBggPayloadSecret {
+            row: RnsBggRow::new([[ring.uniform_interval((1, 1), -1, 1), ring.identity(1)]])
+                .map_err(|e| RnsBggError::Graph(e.to_string()))?,
             context: self.context,
         })
     }
-    pub fn sample_mask_secret(&self) -> Result<BfvMaskSecret, BfvError> {
+    pub fn sample_mask_secret(&self) -> Result<RnsBggMaskSecret, RnsBggError> {
         let ring = self.ring(0)?;
-        Ok(BfvMaskSecret {
-            row: BfvRow::new([[ring.uniform_interval((1, 1), -1, 1), ring.identity(1)]])
-                .map_err(|e| BfvError::Graph(e.to_string()))?,
+        Ok(RnsBggMaskSecret {
+            row: RnsBggRow::new([[ring.uniform_interval((1, 1), -1, 1), ring.identity(1)]])
+                .map_err(|e| RnsBggError::Graph(e.to_string()))?,
             context: self.context,
         })
     }
     #[cfg(test)]
-    pub(crate) fn test_secrets(&self) -> Result<TestSecrets, BfvError> {
+    pub(crate) fn test_secrets(&self) -> Result<TestSecrets, RnsBggError> {
         Ok(TestSecrets { mask: self.sample_mask_secret()?, payload: self.sample_payload_secret()? })
     }
-    pub(super) fn small_error_row(&self, level: usize) -> Result<BfvRow, BfvError> {
-        BfvRow::new([[self.small_error(level, 1, 1)?, self.small_error(level, 1, 1)?]])
-            .map_err(|e| BfvError::Graph(e.to_string()))
+    pub(super) fn small_error_row(
+        &self,
+        level: usize,
+        columns: usize,
+    ) -> Result<RnsBggRow, RnsBggError> {
+        RnsBggRow::new([[
+            self.small_error(level, 1, columns)?,
+            self.small_error(level, 1, columns)?,
+        ]])
+        .map_err(|e| RnsBggError::Graph(e.to_string()))
     }
-    pub fn payload_at(&self, secret: &BfvPayloadSecret, level: usize) -> Result<BfvRow, BfvError> {
+    pub fn payload_at(
+        &self,
+        secret: &RnsBggPayloadSecret,
+        level: usize,
+    ) -> Result<RnsBggRow, RnsBggError> {
         if secret.context != self.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let modulus = BigInt::from(self.parameters.level(level)?.modulus().as_ref().clone());
         Ok(secret.row.clone().reduce_modulus(modulus))
     }
-    pub fn mask_at(&self, secret: &BfvMaskSecret, level: usize) -> Result<BfvRow, BfvError> {
+    pub fn mask_at(
+        &self,
+        secret: &RnsBggMaskSecret,
+        level: usize,
+    ) -> Result<RnsBggRow, RnsBggError> {
         if secret.context != self.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let modulus = BigInt::from(self.parameters.level(level)?.modulus().as_ref().clone());
         Ok(secret.row.clone().reduce_modulus(modulus))
@@ -170,66 +211,72 @@ impl BfvScheme {
     /// Fresh error is sampled here exactly once, preserving the eta bound.
     pub fn encode(
         &self,
-        secret: &BfvMaskSecret,
-        key: &BfvPublicKey,
-        material: &BfvInputMaterial,
-    ) -> Result<BfvEncoding, BfvError> {
+        secret: &RnsBggMaskSecret,
+        key: &RnsBggPublicKey,
+        material: &RnsBggInputMaterial,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
         self.check_key(key)?;
         if material.context != self.context ||
             material.level != key.level ||
             material.key_id != key.id
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let s = self.mask_at(secret, key.level)?;
-        let row =
-            s * key.matrix.clone() + material.row.clone() + self.small_error_row(key.level)?;
-        Ok(BfvEncoding { row, level: key.level, key_id: key.id, context: self.context })
+        let row = s * key.matrix.clone() +
+            material.row.clone() +
+            self.small_error_row(key.level, self.parameters.component_columns(key.level)?)?;
+        Ok(RnsBggEncoding { row, level: key.level, key_id: key.id, context: self.context })
     }
     pub(crate) fn check_encoding(
         &self,
-        value: &BfvEncoding,
-        key: &BfvPublicKey,
-    ) -> Result<(), BfvError> {
+        value: &RnsBggEncoding,
+        key: &RnsBggPublicKey,
+    ) -> Result<(), RnsBggError> {
         self.check_key(key)?;
         if value.context != self.context ||
             value.level != key.level ||
             value.key_id != key.id ||
-            value.row.matrix_type() != &self.ring(value.level)?.matrix_type((1, 2))
+            value.row.matrix_type() !=
+                &self
+                    .ring(value.level)?
+                    .matrix_type((1, 2 * self.parameters.component_columns(value.level)?))
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         Ok(())
     }
     pub fn prepare_online_masks(
         &self,
-        secret: &BfvMaskSecret,
-        bank: &BfvMaskBank,
-    ) -> Result<BfvOnlineMasks, BfvError> {
+        secret: &RnsBggMaskSecret,
+        bank: &RnsBggMaskBank,
+    ) -> Result<RnsBggOnlineMasks, RnsBggError> {
         if bank.context != self.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let level = bank.level;
         let s = self.mask_at(secret, level)?;
         let p = self.scalar(level, self.parameters.scale(level)?.clone())?;
+        let gadget = self.state_gadget(level)?;
         let rows = bank
             .branches
             .iter()
             .map(|branch| {
                 let row = s.clone() * branch.public.clone() -
-                    p.clone() * s.clone().ring_automorphism(branch.sigma) +
-                    self.small_error_row(level)?;
+                    (p.clone() * s.clone().ring_automorphism(branch.sigma))
+                        .map(|entry| entry * gadget.clone()) +
+                    self.small_error_row(level, self.parameters.component_columns(level)?)?;
                 Ok((branch.sigma, row))
             })
-            .collect::<Result<_, BfvError>>()?;
-        Ok(BfvOnlineMasks { id: bank.id, level, context: self.context, rows: Arc::new(rows) })
+            .collect::<Result<_, RnsBggError>>()?;
+        Ok(RnsBggOnlineMasks { id: bank.id, level, context: self.context, rows: Arc::new(rows) })
     }
     pub fn evaluate_lut(
         &self,
-        input: &BfvEncoding,
-        prepared: &BfvPreparedLut,
-        masks: &BfvOnlineMasks,
-    ) -> Result<BfvEncoding, BfvError> {
+        input: &RnsBggEncoding,
+        prepared: &RnsBggPreparedLut,
+        masks: &RnsBggOnlineMasks,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
         let raw = self.evaluate_lut_raw(
             input,
             &prepared.input,
@@ -238,7 +285,7 @@ impl BfvScheme {
             masks,
         )?;
         let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
-        Ok(BfvEncoding {
+        Ok(RnsBggEncoding {
             row: raw.block_mod_switch(next),
             level: prepared.output.level,
             key_id: prepared.output.id,
@@ -248,32 +295,32 @@ impl BfvScheme {
     /// z remains at the input base so terminal outputs can share one rounding.
     pub(super) fn evaluate_lut_raw(
         &self,
-        input: &BfvEncoding,
-        expected: &BfvPublicKey,
+        input: &RnsBggEncoding,
+        expected: &RnsBggPublicKey,
         branches: &[PreparedBranch],
         bank_id: [u8; 32],
-        masks: &BfvOnlineMasks,
-    ) -> Result<BfvRow, BfvError> {
+        masks: &RnsBggOnlineMasks,
+    ) -> Result<RnsBggRow, RnsBggError> {
         self.check_encoding(input, expected)?;
         if masks.id != bank_id || masks.context != self.context || masks.level != input.level {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let terms = branches
             .iter()
             .map(|branch| {
-                Ok(masks.rows.get(&branch.sigma).ok_or(BfvError::Context)?.clone() *
+                Ok(masks.rows.get(&branch.sigma).ok_or(RnsBggError::Context)?.clone() *
                     branch.lifted_intermediate.clone() +
                     input.row.clone().ring_automorphism(branch.sigma) *
                         branch.lifted_ciphertext.clone())
             })
-            .collect::<Result<_, BfvError>>()?;
-        sum(Family::pack(terms).map_err(|e| BfvError::Graph(e.to_string()))?)
+            .collect::<Result<_, RnsBggError>>()?;
+        sum(Family::pack(terms).map_err(|e| RnsBggError::Graph(e.to_string()))?)
     }
     pub(super) fn check_encoding_family(
         &self,
-        value: &BfvEncodingFamily,
-        key: &BfvPublicKeyFamily,
-    ) -> Result<(), BfvError> {
+        value: &RnsBggEncodingFamily,
+        key: &RnsBggPublicKeyFamily,
+    ) -> Result<(), RnsBggError> {
         self.check_public_family(key)?;
         if value.context != key.context ||
             value.level != key.level ||
@@ -281,68 +328,32 @@ impl BfvScheme {
             value.range != key.range ||
             matches!(&value.rows, ProgramValue::Family(values) if values.count() != key.range.count()) ||
             value.rows.element_schema().matrix_type() !=
-                self.ring(value.level)?.matrix_type((1, 2))
+                self.ring(value.level)?
+                    .matrix_type((1, 2 * self.parameters.component_columns(value.level)?))
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         Ok(())
     }
     pub fn evaluate_lut_family(
         &self,
-        input: &BfvEncodingFamily,
-        prepared: &BfvPreparedLutFamily,
-        masks: &BfvOnlineMasks,
-    ) -> Result<BfvEncodingFamily, BfvError> {
+        input: &RnsBggEncodingFamily,
+        prepared: &RnsBggPreparedLutFamily,
+        masks: &RnsBggOnlineMasks,
+    ) -> Result<RnsBggEncodingFamily, RnsBggError> {
         self.check_encoding_family(input, &prepared.input)?;
-        let high = num_bigint::BigInt::from(
-            self.parameters.level(input.level)?.modulus().as_ref().clone(),
-        );
-        let next = num_bigint::BigInt::from(
-            self.parameters.level(input.level + 1)?.modulus().as_ref().clone(),
-        );
         let rows = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            let external = index.clone().add(Int::evaluate(input.range.start().clone()));
-            let ciphertexts = prepared.material.ciphertexts.at(external);
-            let intermediates = prepared.intermediates.at(&index);
-            let key = BfvPublicKey {
-                matrix: prepared.input.matrices.at(&index),
-                level: input.level,
-                id: input.key_id,
-                context: input.context,
-            };
-            let branches = prepared
-                .material
-                .masks
-                .iter()
-                .enumerate()
-                .map(|(branch, mask)| {
-                    PreparedBranch::from_parts(
-                        mask,
-                        ciphertexts.0[branch].clone(),
-                        intermediates.0[branch].clone(),
-                        &high,
-                        None,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let scalar = BfvEncoding {
+            let scalar = RnsBggEncoding {
                 row: input.rows.at(&index),
                 level: input.level,
                 key_id: input.key_id,
                 context: input.context,
             };
-            self.evaluate_lut_raw(
-                &scalar,
-                &key,
-                &branches,
-                prepared.material.binding.mask_bank,
-                masks,
-            )
-            .map(|row| row.block_mod_switch(next.clone()))
-            .map_err(|_| DslError::Schema)
-        })
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
-        Ok(BfvEncodingFamily {
+            self.evaluate_lut(&scalar, &prepared.prepared.at(&index), masks)
+                .map(|value| value.row)
+                .map_err(|_| DslError::Schema)
+        })?;
+        Ok(RnsBggEncodingFamily {
             rows: ProgramValue::Family(rows),
             level: prepared.output.level,
             key_id: prepared.output.id,
@@ -352,10 +363,10 @@ impl BfvScheme {
     }
     pub fn evaluate_linear_family(
         &self,
-        lhs: &BfvEncodingFamily,
-        rhs: &BfvEncodingFamily,
-        prepared: &BfvPreparedLinear<BfvPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
-    ) -> Result<BfvEncodingFamily, BfvError> {
+        lhs: &RnsBggEncodingFamily,
+        rhs: &RnsBggEncodingFamily,
+        prepared: &RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
+    ) -> Result<RnsBggEncodingFamily, RnsBggError> {
         self.check_encoding_family(lhs, &prepared.lhs)?;
         self.check_encoding_family(rhs, &prepared.rhs)?;
         let rows = mxx_dsl::parallel(lhs.range.count().clone(), |index| {
@@ -365,8 +376,8 @@ impl BfvScheme {
                 LinearOperation::Add => left + rhs.rows.at(&index),
             })
         })
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
-        Ok(BfvEncodingFamily {
+        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
+        Ok(RnsBggEncodingFamily {
             rows: ProgramValue::Family(rows),
             level: lhs.level,
             key_id: prepared.output.id,
@@ -376,9 +387,9 @@ impl BfvScheme {
     }
     pub fn evaluate_reduce_family(
         &self,
-        value: &BfvEncodingFamily,
-        prepared: &BfvPreparedReduction,
-    ) -> Result<BfvEncoding, BfvError> {
+        value: &RnsBggEncodingFamily,
+        prepared: &RnsBggPreparedReduction,
+    ) -> Result<RnsBggEncoding, RnsBggError> {
         self.check_encoding_family(value, &prepared.input)?;
         let row = match &value.rows {
             ProgramValue::Scalar(row) => {
@@ -386,7 +397,7 @@ impl BfvScheme {
             }
             ProgramValue::Family(rows) => sum(rows.clone())?,
         };
-        Ok(BfvEncoding {
+        Ok(RnsBggEncoding {
             row,
             level: value.level,
             key_id: prepared.output.id,
@@ -395,11 +406,11 @@ impl BfvScheme {
     }
     pub fn evaluate_terminal<P>(
         &self,
-        input: &BfvEncoding,
-        prepared: &BfvPreparedTerminal<BfvPublicKey, BfvMatrix, P>,
-        masks: &BfvOnlineMasks,
-    ) -> Result<BfvTerminalAccumulator<BfvRow>, BfvError> {
-        Ok(BfvTerminalAccumulator {
+        input: &RnsBggEncoding,
+        prepared: &RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, P>,
+        masks: &RnsBggOnlineMasks,
+    ) -> Result<RnsBggTerminalAccumulator<RnsBggRow>, RnsBggError> {
+        Ok(RnsBggTerminalAccumulator {
             value: self.evaluate_lut_raw(
                 input,
                 &prepared.input,
@@ -414,28 +425,28 @@ impl BfvScheme {
     }
     pub fn finalize_terminal_encoding(
         &self,
-        raw: BfvTerminalAccumulator<BfvRow>,
-        public: &BfvTerminalPublicKey,
-    ) -> Result<BfvTerminalEncoding, BfvError> {
+        raw: RnsBggTerminalAccumulator<RnsBggRow>,
+        public: &RnsBggTerminalPublicKey,
+    ) -> Result<RnsBggTerminalEncoding, RnsBggError> {
         // These comparisons run while constructing the graph, not on the device.
         if raw.context != self.context ||
             public.context != self.context ||
             public.level != raw.level + 1 ||
             raw.stages != public.stages
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let next = BigInt::from(self.parameters.level(public.level)?.modulus().as_ref().clone());
-        Ok(BfvTerminalEncoding { row: raw.value.block_mod_switch(next), level: public.level })
+        Ok(RnsBggTerminalEncoding { row: raw.value.block_mod_switch(next), level: public.level })
     }
     /// Shared public ciphertext lifts and online masks are constructed outside
     /// the indexed body. Aggregate mode reduces raw rows before finalization.
     pub fn evaluate_terminal_family(
         &self,
-        input: &BfvEncodingFamily,
-        prepared: &BfvPreparedTerminalFamily,
-        masks: &BfvOnlineMasks,
-    ) -> Result<Family<BfvRow>, BfvError> {
+        input: &RnsBggEncodingFamily,
+        prepared: &RnsBggPreparedTerminalFamily,
+        masks: &RnsBggOnlineMasks,
+    ) -> Result<Family<RnsBggRow>, RnsBggError> {
         self.check_encoding_family(input, &prepared.input)?;
         let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
         let input = input.clone().into_program()?;
@@ -444,40 +455,44 @@ impl BfvScheme {
             &input,
             &ProgramValue::Family(prepared.cache.clone()),
             masks,
-            prepared.mode == BfvTerminalFamilyMode::Sum,
+            prepared.mode == RnsBggTerminalFamilyMode::Sum,
             |raw| Ok(if prepared.finalize { raw.value.block_mod_switch(next) } else { raw.value }),
         )
         .map_err(|error| match error {
             crate::readout::TerminalError::Scheme(error) => error,
-            error => BfvError::Graph(error.to_string()),
+            error => RnsBggError::Graph(error.to_string()),
         })?;
         match raw {
-            ProgramValue::Scalar(value) => Family::pack(vec![value]).map_err(BfvError::from),
+            ProgramValue::Scalar(value) => Family::pack(vec![value]).map_err(RnsBggError::from),
             ProgramValue::Family(values) => Ok(values),
         }
     }
 
     pub fn sample_private_rhs(
         &self,
-        secret: &BfvPayloadSecret,
+        secret: &RnsBggPayloadSecret,
         level: usize,
-        rhs: BfvRhsPlaintext,
+        rhs: RnsBggRhsPlaintext,
         hash_key: mxx_dsl::Bytes,
         tag: impl Into<mxx_dsl::HashTag>,
         id: [u8; 32],
-    ) -> Result<BfvPrivateRhs, BfvError> {
+    ) -> Result<RnsBggPrivateRhs, RnsBggError> {
         let next = level + 1;
         let ring = self.ring(next)?;
         let r = self.payload_at(secret, next)?;
         let mut tag = tag.into();
-        tag.push("bfv-private-rhs");
+        tag.push("rns_bgg-private-rhs");
         tag.push(mxx_ir_core::IntExpr::constant(level));
-        let top = BfvRow::hash(&ring, hash_key, tag);
+        let top = RnsBggRow::hash(&ring, hash_key, tag, self.parameters.component_columns(next)?);
         let target =
             self.scalar(next, self.parameters.scale(next)?.clone())? * rhs.payload * r.clone();
-        let bottom = -r.entry(0, 0).clone() * top.clone() + target + self.small_error_row(next)?;
-        Ok(BfvPrivateRhs {
-            ciphertext: BfvMatrix::from_rows(top, bottom),
+        let gadget = self.state_gadget(next)?;
+        let target = target.map(|entry| entry * gadget.clone());
+        let bottom = -r.entry(0, 0).clone() * top.clone() +
+            target +
+            self.small_error_row(next, self.parameters.component_columns(next)?)?;
+        Ok(RnsBggPrivateRhs {
+            ciphertext: RnsBggMatrix::from_rows(top, bottom),
             lifted_ciphertext: (),
             level,
             context: self.context,
@@ -488,31 +503,32 @@ impl BfvScheme {
     /// One sampled ciphertext per member, with a single structural graph body.
     pub fn sample_private_rhs_family(
         &self,
-        secret: &BfvPayloadSecret,
+        secret: &RnsBggPayloadSecret,
         level: usize,
-        rhs: &BfvRhsPlaintextFamily,
+        rhs: &RnsBggRhsPlaintextFamily,
         hash_key: mxx_dsl::Bytes,
         tag: impl Into<mxx_dsl::HashTag>,
         id: [u8; 32],
-    ) -> Result<BfvPrivateRhs<mxx_dsl::Family<BfvMatrix>>, BfvError> {
-        let next = level + 1;
-        let ring = self.ring(next)?;
-        let r = self.payload_at(secret, next)?;
-        let scale = self.scalar(next, self.parameters.scale(next)?.clone())?;
+    ) -> Result<RnsBggPrivateRhs<mxx_dsl::Family<RnsBggMatrix>>, RnsBggError> {
         let mut root = tag.into();
-        root.push("bfv-private-rhs-family");
+        root.push("rns_bgg-private-rhs-family");
         root.push(mxx_ir_core::IntExpr::constant(level));
         let ciphertext = mxx_dsl::parallel(rhs.payloads.count().clone(), |index| {
             let mut tag = root.clone();
             tag.push(index.clone());
-            let top = BfvRow::hash(&ring, hash_key.clone(), tag);
-            let target = scale.clone() * rhs.payloads.at(&index) * r.clone();
-            let error = self.small_error_row(next).map_err(|_| mxx_dsl::DslError::Schema)?;
-            let bottom = -r.entry(0, 0).clone() * top.clone() + target + error;
-            Ok(BfvMatrix::from_rows(top, bottom))
+            self.sample_private_rhs(
+                secret,
+                level,
+                RnsBggRhsPlaintext { payload: rhs.payloads.at(&index), id: rhs.id },
+                hash_key.clone(),
+                tag,
+                id,
+            )
+            .map(|value| value.ciphertext)
+            .map_err(|_| DslError::Schema)
         })
-        .map_err(|error| BfvError::Graph(error.to_string()))?;
-        Ok(BfvPrivateRhs {
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        Ok(RnsBggPrivateRhs {
             ciphertext,
             lifted_ciphertext: (),
             rhs_id: rhs.id,
@@ -527,41 +543,44 @@ impl BfvScheme {
     /// This caller contract avoids hashing ciphertext coefficients online.
     pub fn sample_lut_material(
         &self,
-        secret: &BfvPayloadSecret,
+        secret: &RnsBggPayloadSecret,
         table: Option<&LutTable>,
-        rhs: Option<BfvRhsPlaintext>,
-        bank: &BfvMaskBank,
+        rhs: Option<RnsBggRhsPlaintext>,
+        bank: &RnsBggMaskBank,
         hash_key: Bytes,
         tag: impl Into<HashTag>,
         id: [u8; 32],
-    ) -> Result<BfvLutMaterial, BfvError> {
+    ) -> Result<RnsBggLutMaterial, RnsBggError> {
         if bank.context != self.context || secret.context != self.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let level = bank.level;
         let next = level + 1;
         let ring = self.ring(next)?;
         if table.is_some_and(|table| table.rhs_width().is_some() != rhs.is_some()) {
-            return Err(BfvError::Lut);
+            return Err(RnsBggError::Lut);
         }
         if rhs.as_ref().is_some_and(|rhs| rhs.payload.matrix_type() != &ring.matrix_type((1, 1))) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let width = table.map_or(1, |table| table.values().len());
         let layout = ExpLayout { stride_log2: 0, width_log2: width.trailing_zeros() };
         let sigmas = layout
             .automorphism_indices(self.parameters.level(next)?.ring_dimension() as usize)
-            .map_err(|_| BfvError::Lut)?;
+            .map_err(|_| RnsBggError::Lut)?;
         let r = self.payload_at(secret, next)?;
         let prefix = r.entry(0, 0).clone();
         let root = tag.into();
         let mut branches = Vec::with_capacity(width);
         for sigma in sigmas {
-            let mask =
-                bank.branches.iter().find(|branch| branch.sigma == sigma).ok_or(BfvError::Lut)?;
+            let mask = bank
+                .branches
+                .iter()
+                .find(|branch| branch.sigma == sigma)
+                .ok_or(RnsBggError::Lut)?;
             let coefficient = match table {
                 Some(table) => crate::utils::lut_coefficient(&ring, &layout, sigma, table.values())
-                    .map_err(|_| BfvError::Lut)?,
+                    .map_err(|_| RnsBggError::Lut)?,
                 None => ring.identity(1),
             };
             let multiplier = rhs.as_ref().map_or_else(
@@ -572,17 +591,24 @@ impl BfvScheme {
                 coefficient *
                 multiplier *
                 r.clone();
+            let gadget = self.state_gadget(next)?;
+            let target = target.map(|entry| entry * gadget.clone());
             let mut tag = root.clone();
-            tag.push("bfv-rhs");
+            tag.push("rns_bgg-rhs");
             tag.push(mxx_ir_core::IntExpr::constant(level));
             tag.push(mxx_ir_core::IntExpr::constant(sigma));
-            let top = BfvRow::hash(&ring, hash_key.clone(), tag);
+            let columns = target.entry(0, 0).matrix_type().columns.clone();
+            let columns = usize::try_from(
+                columns.evaluate(&ParamEnv::default()).expect("concrete target width"),
+            )
+            .expect("target width fits usize");
+            let top = RnsBggRow::hash(&ring, hash_key.clone(), tag, columns);
             let last = -prefix.clone().ring_automorphism(sigma) * top.clone() +
                 target +
-                self.small_error_row(next)?;
-            branches.push((mask.clone(), BfvMatrix::from_rows(top, last)));
+                self.small_error_row(next, columns)?;
+            branches.push((mask.clone(), RnsBggMatrix::from_rows(top, last)));
         }
-        Ok(BfvLutMaterial {
+        Ok(RnsBggLutMaterial {
             mask_bank: bank.id,
             id,
             level,
@@ -594,16 +620,19 @@ impl BfvScheme {
     }
     /// A refresh preserves the native monomial and changes its terminal scale.
     /// The payload secret enters fresh targets only during preprocessing.
+    /// Encode a CRT channel's data target with spacing H. The resumable state
+    /// scale p_ref and gadget are supplied by this scheme's output level.
     pub fn sample_refresh_data_material(
         &self,
-        secret: &BfvPayloadSecret,
+        secret: &RnsBggPayloadSecret,
         layout: crate::layout::ExpLayout,
         scale: &num_bigint::BigUint,
-        bank: &BfvMaskBank,
+        bank: &RnsBggMaskBank,
         hash_key: mxx_dsl::Bytes,
         tag: impl Into<mxx_dsl::HashTag>,
         id: [u8; 32],
-    ) -> Result<ProgramValue<BfvTerminalMaterial, Family<BfvTerminalMaterial>>, BfvError> {
+    ) -> Result<ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>, RnsBggError>
+    {
         let level = bank.level + 1;
         let ring = self.ring(level)?;
         let table = crate::readout::RowLutTable::new(
@@ -617,11 +646,13 @@ impl BfvScheme {
                 .collect(),
             Some(layout),
         )
-        .map_err(|_| BfvError::Lut)?;
-        let transform = BfvMatrix::from_rows(
-            self.scalar(level, -BigInt::from(scale.clone()))? * self.payload_at(secret, level)?,
-            BfvRow::new([[ring.zero((1, 1)), ring.zero((1, 1))]])
-                .map_err(|e| BfvError::Graph(e.to_string()))?,
+        .map_err(|_| RnsBggError::Lut)?;
+        let columns = self.parameters.component_columns(level)?;
+        let gadget = self.state_gadget(level)?;
+        let payload = self.payload_at(secret, level)?.map(|entry| entry * gadget.clone());
+        let transform = RnsBggMatrix::from_rows(
+            self.scalar(level, -BigInt::from(scale * self.parameters.scale(level)?))? * payload,
+            RnsBggRow::new([[ring.zero((1, columns)), ring.zero((1, columns))]])?,
         );
         self.sample_terminal_material(
             secret,
@@ -640,30 +671,34 @@ impl BfvScheme {
     /// when regenerating the material, even for the same table and RHS.
     pub fn sample_lut_material_family(
         &self,
-        secret: &BfvPayloadSecret,
+        secret: &RnsBggPayloadSecret,
         table: Option<&LutTable>,
-        rhs: Option<&BfvRhsPlaintextFamily>,
-        bank: &BfvMaskBank,
+        rhs: Option<&RnsBggRhsPlaintextFamily>,
+        bank: &RnsBggMaskBank,
         count: IntExpr,
         hash_key: Bytes,
         tag: impl Into<HashTag>,
         id: [u8; 32],
-    ) -> Result<BfvLutMaterialFamily, BfvError> {
+    ) -> Result<RnsBggLutMaterialFamily, RnsBggError> {
         let rhs_type = self.ring(bank.level + 1)?.matrix_type((1, 1));
         if rhs.is_some_and(|rhs| {
             rhs.payloads.count() != &count || rhs.payloads.element_type() != &rhs_type
         }) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let width = table.map_or(1, |table| table.values().len());
         let layout =
             crate::layout::ExpLayout { stride_log2: 0, width_log2: width.trailing_zeros() };
         let masks = layout
             .automorphism_indices(self.parameters.level(bank.level)?.ring_dimension() as usize)
-            .map_err(|_| BfvError::Lut)?
+            .map_err(|_| RnsBggError::Lut)?
             .into_iter()
             .map(|sigma| {
-                bank.branches.iter().find(|mask| mask.sigma == sigma).cloned().ok_or(BfvError::Lut)
+                bank.branches
+                    .iter()
+                    .find(|mask| mask.sigma == sigma)
+                    .cloned()
+                    .ok_or(RnsBggError::Lut)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let root = tag.into();
@@ -674,20 +709,23 @@ impl BfvScheme {
                 .sample_lut_material(
                     secret,
                     table,
-                    rhs.map(|rhs| BfvRhsPlaintext { payload: rhs.payloads.at(&index), id: rhs.id }),
+                    rhs.map(|rhs| RnsBggRhsPlaintext {
+                        payload: rhs.payloads.at(&index),
+                        id: rhs.id,
+                    }),
                     bank,
                     hash_key,
                     tag,
                     id,
                 )
                 .map_err(|_| DslError::Schema)?;
-            Ok(BfvBranches(
+            Ok(RnsBggBranches(
                 material.branches.into_iter().map(|(_, ciphertext)| ciphertext).collect(),
             ))
         })
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
-        Ok(BfvLutMaterialFamily {
-            binding: BfvLutBinding {
+        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
+        Ok(RnsBggLutMaterialFamily {
+            binding: RnsBggLutBinding {
                 mask_bank: bank.id,
                 material_id: id,
                 level: bank.level,
@@ -704,52 +742,58 @@ impl BfvScheme {
     /// Each member covers its complete native subring domain.
     pub fn sample_readout_material(
         &self,
-        secret: &BfvPayloadSecret,
+        secret: &RnsBggPayloadSecret,
         readout: &ValueReadout,
-        bank: &BfvMaskBank,
+        bank: &RnsBggMaskBank,
         hash_key: Bytes,
         tag: impl Into<HashTag>,
         id: [u8; 32],
-        weight: Option<BfvReadoutWeights>,
-        mode: Option<BfvTerminalFamilyMode>,
-    ) -> Result<BfvReadoutMaterial, BfvError> {
+        weight: Option<RnsBggReadoutWeights>,
+        mode: Option<RnsBggTerminalFamilyMode>,
+    ) -> Result<RnsBggReadoutMaterial, RnsBggError> {
         let n = self.parameters.level(bank.level)?.ring_dimension() as usize;
         if readout.layout.width() != n / readout.layout.stride() {
-            return Err(BfvError::Parameters("native readout requires full subring width"));
+            return Err(RnsBggError::Parameters("native readout requires full subring width"));
         }
-        readout.validate(&self.ring(bank.level)?).map_err(|_| BfvError::Lut)?;
+        readout.validate(&self.ring(bank.level)?).map_err(|_| RnsBggError::Lut)?;
         let weight =
-            weight.unwrap_or_else(|| BfvReadoutWeights::Shared([vec![1u8.into()], vec![]]));
+            weight.unwrap_or_else(|| RnsBggReadoutWeights::Shared([vec![1u8.into()], vec![]]));
         let base_weight = match &weight {
-            BfvReadoutWeights::Shared(value) => value.clone(),
-            BfvReadoutWeights::Indexed { .. } => [vec![1u8.into()], vec![]],
+            RnsBggReadoutWeights::Shared(value) => value.clone(),
+            RnsBggReadoutWeights::Indexed { .. } => [vec![1u8.into()], vec![]],
         };
         let modulus =
             BigInt::from(self.parameters.level(bank.level + 1)?.modulus().as_ref().clone());
-        let (table, digit_bound) =
-            readout.weighted_centered_table(&base_weight, &modulus).map_err(|_| BfvError::Lut)?;
+        let (table, digit_bound) = readout
+            .weighted_centered_table(&base_weight, &modulus)
+            .map_err(|_| RnsBggError::Lut)?;
         let target_bound = match &weight {
-            BfvReadoutWeights::Shared(weight) => {
+            RnsBggReadoutWeights::Shared(weight) => {
                 weight.iter().flatten().map(|v| v.magnitude()).max().cloned().unwrap_or_default() *
                     &digit_bound
             }
-            BfvReadoutWeights::Indexed { coefficient_bound, .. } => {
+            RnsBggReadoutWeights::Indexed { coefficient_bound, .. } => {
                 &digit_bound * coefficient_bound
             }
         };
         let terminal = match &weight {
-            BfvReadoutWeights::Shared(_) => ProgramValue::Scalar(
+            RnsBggReadoutWeights::Shared(_) => ProgramValue::Scalar(
                 self.sample_terminal_material(secret, &table, None, None, bank, hash_key, tag, id)?,
             ),
-            BfvReadoutWeights::Indexed { rows, .. } => {
+            RnsBggReadoutWeights::Indexed { rows, .. } => {
                 let ring = self.ring(bank.level + 1)?;
                 let transforms = mxx_dsl::parallel(rows.count().clone(), |index| {
-                    Ok(BfvMatrix::from_rows(
-                        rows.at(index),
-                        BfvRow::new([[ring.zero((1, 1)), ring.zero((1, 1))]])?,
+                    let row = rows.at(index);
+                    let columns = row.entry(0, 0).matrix_type().columns.clone();
+                    Ok(RnsBggMatrix::from_rows(
+                        row,
+                        RnsBggRow::new([[
+                            ring.zero((1, columns.clone())),
+                            ring.zero((1, columns)),
+                        ]])?,
                     ))
                 })
-                .map_err(|e| BfvError::Graph(e.to_string()))?;
+                .map_err(|e| RnsBggError::Graph(e.to_string()))?;
                 self.sample_terminal_material_family(
                     secret,
                     &table,
@@ -761,8 +805,8 @@ impl BfvScheme {
                 )?
             }
         };
-        Ok(BfvReadoutMaterial {
-            mode: mode.unwrap_or(BfvTerminalFamilyMode::Independent),
+        Ok(RnsBggReadoutMaterial {
+            mode: mode.unwrap_or(RnsBggTerminalFamilyMode::Independent),
             identity: readout.identity(),
             weight,
             target_bound,
@@ -778,52 +822,52 @@ impl BfvScheme {
     /// transformed target bound to noise planning. It never scales fresh error.
     pub fn sample_terminal_material(
         &self,
-        secret: &BfvPayloadSecret,
+        secret: &RnsBggPayloadSecret,
         table: &RowLutTable<2>,
-        rhs: Option<BfvRhsPlaintext>,
-        output_transform: Option<&BfvMatrix>,
-        bank: &BfvMaskBank,
+        rhs: Option<RnsBggRhsPlaintext>,
+        output_transform: Option<&RnsBggMatrix>,
+        bank: &RnsBggMaskBank,
         hash_key: Bytes,
         tag: impl Into<HashTag>,
         id: [u8; 32],
-    ) -> Result<BfvTerminalMaterial, BfvError> {
+    ) -> Result<RnsBggTerminalMaterial, RnsBggError> {
         if bank.context != self.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let next = bank.level + 1;
         let ring = self.ring(next)?;
         let n = self.parameters.level(next)?.ring_dimension() as usize;
         if table.values.iter().flatten().any(|p| p.len() > n) {
-            return Err(BfvError::Lut);
+            return Err(RnsBggError::Lut);
         }
         if rhs.as_ref().is_some_and(|rhs| rhs.payload.matrix_type() != &ring.matrix_type((1, 1))) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let layout = table.layout;
-        let sigmas = layout.automorphism_indices(n).map_err(|_| BfvError::Lut)?;
+        let sigmas = layout.automorphism_indices(n).map_err(|_| RnsBggError::Lut)?;
         let r = self.payload_at(secret, next)?;
         let modulus = BigInt::from(self.parameters.level(next)?.modulus().as_ref().clone());
         let inverse =
-            modular_inverse(&BigInt::from(table.width()), &modulus).ok_or(BfvError::Lut)?;
+            modular_inverse(&BigInt::from(table.width()), &modulus).ok_or(RnsBggError::Lut)?;
         let values = table
             .values
             .iter()
             .map(|row| {
-                BfvRow::new([row.each_ref().map(|p| {
+                RnsBggRow::new([row.each_ref().map(|p| {
                     if p.is_empty() {
                         ring.zero((1, 1))
                     } else {
                         ring.polynomial(p.iter().cloned().map(IntExpr::constant))
                     }
                 })])
-                .map_err(|e| BfvError::Graph(e.to_string()))
+                .map_err(|e| RnsBggError::Graph(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let root = tag.into();
         let mut branches = Vec::with_capacity(sigmas.len());
         for sigma in sigmas {
-            let mask = bank.branches.iter().find(|b| b.sigma == sigma).ok_or(BfvError::Lut)?;
-            let sum = table.sieve_sum(&ring, sigma, &values).map_err(|_| BfvError::Lut)?;
+            let mask = bank.branches.iter().find(|b| b.sigma == sigma).ok_or(RnsBggError::Lut)?;
+            let sum = table.sieve_sum(&ring, sigma, &values).map_err(|_| RnsBggError::Lut)?;
             let multiplier = rhs.as_ref().map_or_else(
                 || ring.identity(1),
                 |rhs| rhs.payload.clone().ring_automorphism(sigma),
@@ -836,23 +880,27 @@ impl BfvScheme {
                 None => target,
             };
             let mut tag = root.clone();
-            tag.push("bfv-terminal-rhs");
+            tag.push("rns_bgg-terminal-rhs");
             tag.push(IntExpr::constant(bank.level));
             tag.push(IntExpr::constant(sigma));
-            let top = BfvRow::hash(&ring, hash_key.clone(), tag);
+            let columns = target.entry(0, 0).matrix_type().columns.clone();
+            let columns = usize::try_from(
+                columns.evaluate(&ParamEnv::default()).expect("concrete target width"),
+            )
+            .expect("target width fits usize");
+            let top = RnsBggRow::hash(&ring, hash_key.clone(), tag, columns);
             let last = -r.entry(0, 0).clone().ring_automorphism(sigma) * top.clone() +
                 target +
-                self.small_error_row(next)?;
-            branches.push((mask.clone(), BfvMatrix::from_rows(top, last)));
+                self.small_error_row(next, columns)?;
+            branches.push((mask.clone(), RnsBggMatrix::from_rows(top, last)));
         }
-        let high = BigInt::from(self.parameters.level(bank.level)?.modulus().as_ref().clone());
         let lifted_ciphertexts = branches
             .iter()
-            .map(|(_, ciphertext)| ciphertext.clone().centered_extend(high.clone()))
-            .collect();
-        Ok(BfvTerminalMaterial {
+            .map(|(_, ciphertext)| self.prepare_digits(bank.level, ciphertext.clone()))
+            .collect::<Result<_, _>>()?;
+        Ok(RnsBggTerminalMaterial {
             lifted_ciphertexts,
-            material: BfvLutMaterial {
+            material: RnsBggLutMaterial {
                 mask_bank: bank.id,
                 id,
                 level: bank.level,
@@ -868,14 +916,15 @@ impl BfvScheme {
     /// Payload-secret-dependent ciphertexts are generated during preprocessing.
     pub fn sample_terminal_material_family(
         &self,
-        secret: &crate::bfv::BfvPayloadSecret,
+        secret: &crate::rns_bgg::RnsBggPayloadSecret,
         table: &RowLutTable<2>,
-        transforms: &Family<BfvMatrix>,
-        bank: &BfvMaskBank,
+        transforms: &Family<RnsBggMatrix>,
+        bank: &RnsBggMaskBank,
         hash_key: mxx_dsl::Bytes,
         tag: impl Into<mxx_dsl::HashTag>,
         id: [u8; 32],
-    ) -> Result<ProgramValue<BfvTerminalMaterial, Family<BfvTerminalMaterial>>, BfvError> {
+    ) -> Result<ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>, RnsBggError>
+    {
         let root = tag.into();
         let materials = mxx_dsl::parallel(transforms.count().clone(), |index| {
             let transform = transforms.at(&index);
@@ -893,26 +942,28 @@ impl BfvScheme {
             )
             .map_err(|_| DslError::Schema)
         })
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
+        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
         Ok(ProgramValue::Family(materials))
     }
 }
 
-impl crate::scheme::PreparedProgram<BfvScheme> {
+impl crate::scheme::PreparedProgram<RnsBggScheme> {
     /// Sample s-dependent rows once per bank, outside every indexed gate
     /// body. Only public masks live in this cache, including after import.
     pub fn prepare_online_helpers(
         &self,
-        secret: &crate::bfv::BfvMaskSecret,
+        secret: &crate::rns_bgg::RnsBggMaskSecret,
     ) -> Result<
         BTreeMap<
             ProgramGateInstance,
-            ProgramValue<BfvOnlineLutHelpers, (Family<BfvOnlineLutHelpers>, FamilyRange)>,
+            ProgramValue<RnsBggOnlineLutHelpers, (Family<RnsBggOnlineLutHelpers>, FamilyRange)>,
         >,
-        BfvError,
+        RnsBggError,
     > {
-        let mut banks =
-            BTreeMap::<[u8; 32], (usize, [u8; 32], BTreeMap<usize, crate::bfv::MaskBranch>)>::new();
+        let mut banks = BTreeMap::<
+            [u8; 32],
+            (usize, [u8; 32], BTreeMap<usize, crate::rns_bgg::MaskBranch>),
+        >::new();
         let mut bindings = BTreeMap::new();
         // The public mask fields are captures in the cache family, so selecting
         // a member preserves their original handles; no mask is sampled per member.
@@ -930,7 +981,7 @@ impl crate::scheme::PreparedProgram<BfvScheme> {
             let target =
                 banks.entry(bank.id).or_insert_with(|| (bank.level, bank.context, BTreeMap::new()));
             if target.0 != bank.level || target.1 != bank.context {
-                return Err(BfvError::Context);
+                return Err(RnsBggError::Context);
             }
             // Gate tables can use different subsets of one setup bank.
             for branch in bank.branches {
@@ -941,7 +992,7 @@ impl crate::scheme::PreparedProgram<BfvScheme> {
         let masks = banks
             .into_iter()
             .map(|(id, (level, context, branches))| {
-                let bank = crate::bfv::BfvMaskBank {
+                let bank = crate::rns_bgg::RnsBggMaskBank {
                     id,
                     level,
                     context,
@@ -949,30 +1000,30 @@ impl crate::scheme::PreparedProgram<BfvScheme> {
                 };
                 Ok((id, self.scheme.prepare_online_masks(secret, &bank)?))
             })
-            .collect::<Result<BTreeMap<_, _>, BfvError>>()?;
+            .collect::<Result<BTreeMap<_, _>, RnsBggError>>()?;
         Ok(bindings
             .into_iter()
             .map(|(gate, binding)| {
                 let helpers = masks[&binding.mask_bank].clone();
-                (gate, ProgramValue::Scalar(BfvOnlineLutHelpers { binding, masks: helpers }))
+                (gate, ProgramValue::Scalar(RnsBggOnlineLutHelpers { binding, masks: helpers }))
             })
             .collect())
     }
 }
 
-impl ExponentProgramLowering for BfvEncodingEvaluator<'_> {
+impl ExponentProgramLowering for RnsBggEncodingEvaluator<'_> {
     fn mul_private(
         &mut self,
         input: &Self::Wire,
         rhs: &Self::Rhs,
         _: Option<&Self::HelperSet>,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
+    ) -> Result<Self::Wire, RnsBggError> {
         let Some(PreparedGate::MulPrivate(prepared)) = self.cache.gates.get(&gate) else {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         };
         if prepared.rhs.rhs_id != rhs.id() {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         Ok((self.scheme.evaluate_mul_private(&input.0, prepared)?, None))
     }
@@ -981,7 +1032,7 @@ impl ExponentProgramLowering for BfvEncodingEvaluator<'_> {
         private: &Self::Wire,
         public: &Self::Wire,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
+    ) -> Result<Self::Wire, RnsBggError> {
         self.evaluate_linear(private, public, gate)
     }
     fn add(
@@ -989,7 +1040,7 @@ impl ExponentProgramLowering for BfvEncodingEvaluator<'_> {
         lhs: &Self::Wire,
         rhs: &Self::Wire,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
+    ) -> Result<Self::Wire, RnsBggError> {
         self.evaluate_linear(lhs, rhs, gate)
     }
     fn lut(
@@ -1000,21 +1051,21 @@ impl ExponentProgramLowering for BfvEncodingEvaluator<'_> {
         helpers: Option<&Self::HelperSet>,
         rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
+    ) -> Result<Self::Wire, RnsBggError> {
         let Some(PreparedGate::Lut(prepared)) = self.cache.gates.get(&gate) else {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         };
         let binding = &prepared.binding;
-        let helpers = helpers.ok_or(BfvError::Context)?;
+        let helpers = helpers.ok_or(RnsBggError::Context)?;
         if helpers.binding != *binding {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         check_lut_binding(
             self.scheme,
             program,
             lut,
             input.0.level,
-            rhs.map(BfvPublicRhs::id).as_ref(),
+            rhs.map(RnsBggPublicRhs::id).as_ref(),
             binding,
         )?;
         Ok((
@@ -1023,15 +1074,15 @@ impl ExponentProgramLowering for BfvEncodingEvaluator<'_> {
         ))
     }
 }
-impl BfvEncodingEvaluator<'_> {
+impl RnsBggEncodingEvaluator<'_> {
     fn evaluate_linear(
         &mut self,
-        private: &(BfvEncoding, Option<Mat>),
-        public: &(BfvEncoding, Option<Mat>),
+        private: &(RnsBggEncoding, Option<Mat>),
+        public: &(RnsBggEncoding, Option<Mat>),
         gate: ProgramGateInstance,
-    ) -> Result<(BfvEncoding, Option<Mat>), BfvError> {
+    ) -> Result<(RnsBggEncoding, Option<Mat>), RnsBggError> {
         let Some(PreparedGate::Linear(prepared)) = self.cache.gates.get(&gate) else {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         };
         Ok((
             self.scheme.evaluate_linear(&private.0, &public.0, prepared)?,
@@ -1047,6 +1098,7 @@ pub(crate) mod private_mul_tests {
     use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::{
         element::PolyElem,
+        matrix::PolyMatrix,
         poly::{Poly, PolyParams},
     };
     use mxx_runtime::{
@@ -1057,12 +1109,12 @@ pub(crate) mod private_mul_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_scalar_prepared_caches_cross_parallel_scope() {
+    fn test_rns_bgg_scalar_prepared_caches_cross_parallel_scope() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
@@ -1074,7 +1126,7 @@ pub(crate) mod private_mul_tests {
             terminal_value_bound: 1u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secrets = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -1091,7 +1143,7 @@ pub(crate) mod private_mul_tests {
             .sample_private_rhs(
                 &secrets.payload,
                 0,
-                BfvRhsPlaintext {
+                RnsBggRhsPlaintext {
                     payload: scheme.ring(1).unwrap().polynomial([1.into()]),
                     id: rand::random(),
                 },
@@ -1154,7 +1206,7 @@ pub(crate) mod private_mul_tests {
                 let (wires, rhs_bindings) = body.bind_inputs(
                     |_| Ok((key.clone(), None)),
                     |_| Err(DslError::Schema),
-                    |_| Ok(BfvPublicRhs::Fixed(rhs.clone())),
+                    |_| Ok(RnsBggPublicRhs::Fixed(rhs.clone())),
                     |_| Err(DslError::Schema),
                 )?;
                 Ok((
@@ -1162,7 +1214,7 @@ pub(crate) mod private_mul_tests {
                     rhs_bindings,
                     BTreeMap::new(),
                     BTreeMap::new(),
-                    BfvProgramCache::default(),
+                    RnsBggProgramCache::default(),
                 ))
             },
             |value, mut cache| {
@@ -1192,7 +1244,7 @@ pub(crate) mod private_mul_tests {
             &ranges,
             |index| {
                 let (_, private_output, linear) = caches.at(index);
-                let private = BfvPreparedPrivateMul {
+                let private = RnsBggPreparedPrivateMul {
                     input: key.clone(),
                     output: private_output,
                     rhs: rhs.clone(),
@@ -1200,7 +1252,7 @@ pub(crate) mod private_mul_tests {
                 let (wires, rhs_bindings) = body.bind_inputs(
                     |_| Ok((input.clone(), None)),
                     |_| Err(DslError::Schema),
-                    |_| Ok(BfvPublicRhs::Lut(rhs.rhs_id)),
+                    |_| Ok(RnsBggPublicRhs::Lut(rhs.rhs_id)),
                     |_| Err(DslError::Schema),
                 )?;
                 Ok((
@@ -1208,14 +1260,14 @@ pub(crate) mod private_mul_tests {
                     rhs_bindings,
                     BTreeMap::new(),
                     BTreeMap::new(),
-                    BfvProgramCache {
+                    RnsBggProgramCache {
                         gates: BTreeMap::from([
                             (private_gate, PreparedGate::MulPrivate(private)),
                             (linear_gate, PreparedGate::Linear(linear)),
                         ]),
-                        ..BfvProgramCache::default()
+                        ..RnsBggProgramCache::default()
                     },
-                    BfvProgramCache::default(),
+                    RnsBggProgramCache::default(),
                 ))
             },
             |value| {
@@ -1230,7 +1282,7 @@ pub(crate) mod private_mul_tests {
             scheme.prepare_add(direct.output_key(), direct.output_key(), schema.0.id).unwrap();
         let expected =
             scheme.evaluate_linear(&expected_product, &expected_product, &expected_linear).unwrap();
-        let mut graph = DslContext::new("bfv-scalar-cache-parallel");
+        let mut graph = DslContext::new("rns_bgg-scalar-cache-parallel");
         for member in 0..2 {
             let actual = outputs.at(member);
             let (public, _, _) = caches.at(member);
@@ -1248,14 +1300,19 @@ pub(crate) mod private_mul_tests {
             scope
                 .nodes()
                 .iter()
-                .filter(|node| matches!(node.kind(), NodeKind::CenteredExtend { .. }))
+                .filter(|node| {
+                    matches!(node.kind(), NodeKind::CenteredExtend { .. }) &&
+                        node.output_types()
+                            .iter()
+                            .any(|ty| matches!(ty, WireType::Preimage { .. }))
+                })
                 .count()
         };
         assert_eq!(count_lifts(graph.graph.root_scope()), 4);
         assert_eq!(
             graph.graph.scopes().values().map(count_lifts).sum::<usize>(),
             4,
-            "one shared two-by-two lift, with no conversions inside either family body"
+            "one shared two-by-two bounded lift, with no digit conversions inside either family body"
         );
         let count_switches = |scope: &mxx_ir_core::graph::GraphScope| {
             scope
@@ -1292,11 +1349,15 @@ pub(crate) mod private_mul_tests {
     }
 
     #[test]
-    fn test_bfv_direct_private_mul_relation_rounding_and_graph() {
+    fn test_rns_bgg_direct_private_mul_relation_rounding_and_graph() {
         check_private_mul(
             |parameters| cpu_backend(parameters.levels().to_vec()),
             |matrix, q, bound| {
-                for polynomial in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
+                for polynomial in matrix
+                    .block_entries(0..matrix.row_size(), 0..matrix.col_size())
+                    .into_iter()
+                    .flatten()
+                {
                     for coefficient in polynomial.coeffs() {
                         let absolute = coefficient.value().clone().min(q - coefficient.value());
                         assert!(&absolute <= bound, "direct error {absolute} exceeds {bound}");
@@ -1307,26 +1368,21 @@ pub(crate) mod private_mul_tests {
     }
 
     pub(crate) fn check_private_mul<B: mxx_runtime::Backend>(
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &BigUint, &BigUint),
     ) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let request = BfvPlanRequest {
-            ring_dimension: n,
-            widths: vec![1, 1],
-            slots: vec![1, 1],
-            eta: 2,
-            crt_bits: 30,
-            terminal_depth: 1,
-            max_crt_depth: 10,
-            memory_budget_bytes: u64::MAX,
-            terminal_value_bound: 1u8.into(),
-        };
-        let (parameters, _) = BfvParameters::plan(&request).unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let high_parameters = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let primes = high_parameters.to_crt().0;
+        let levels = [3, 2, 1]
+            .into_iter()
+            .map(|depth| DCRTPolyParams::new(n, depth, 17, 4, Some(primes[..depth].to_vec()), None))
+            .collect();
+        let parameters = RnsBggParameters::new(levels, 2).unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secrets = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
@@ -1351,7 +1407,7 @@ pub(crate) mod private_mul_tests {
             .sample_private_rhs(
                 &secrets.payload,
                 0,
-                BfvRhsPlaintext { payload: nu.clone(), id: rand::random() },
+                RnsBggRhsPlaintext { payload: nu.clone(), id: rand::random() },
                 seed.clone(),
                 b"rhs".as_slice(),
                 rand::random(),
@@ -1361,7 +1417,7 @@ pub(crate) mod private_mul_tests {
         let prepared = scheme.prepare_mul_private(&key, &rhs, rand::random()).unwrap();
         let output = scheme.evaluate_mul_private(&input, &prepared).unwrap();
 
-        let graph = DslContext::new("bfv-direct-private-shape")
+        let graph = DslContext::new("rns_bgg-direct-private-shape")
             .public_output("a", prepared.output.matrix.clone())
             .unwrap()
             .output("c", output.row.clone())
@@ -1380,26 +1436,38 @@ pub(crate) mod private_mul_tests {
         );
         assert!(!nodes.iter().any(|node| matches!(
             node.kind(),
-            NodeKind::RingAutomorphism { .. } |
-                NodeKind::Concat { .. } |
-                NodeKind::Slice { .. } |
-                NodeKind::MatrixMulSmallRhs
+            NodeKind::RingAutomorphism { .. } | NodeKind::Concat { .. } | NodeKind::Slice { .. }
         )));
+        assert_eq!(
+            nodes.iter().filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)).count(),
+            12
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. }))
+                .count(),
+            4
+        );
         assert_eq!(output.level, 1);
 
         let s = scheme.mask_at(&secrets.mask, 0).unwrap();
         let r = scheme.payload_at(&secrets.payload, 0).unwrap();
         let r_low = scheme.payload_at(&secrets.payload, 1).unwrap();
+        let input_gadget = scheme.state_gadget(0).unwrap();
+        let output_gadget = scheme.state_gadget(1).unwrap();
+        let r = r.map(|entry| entry * input_gadget.clone());
+        let payload_row = r_low.clone().map(|entry| entry * output_gadget.clone());
         let error_in =
             input.row.clone() - s.clone() * key.matrix.clone() + p.clone() * mu.clone() * r;
         let error_rhs = r_low.clone() * rhs.ciphertext.clone() -
-            next_scale.clone() * nu.clone() * r_low.clone();
+            next_scale.clone() * nu.clone() * payload_row.clone();
         let error_out = output.row.clone() -
             scheme.mask_at(&secrets.mask, 1).unwrap() * prepared.output.matrix.clone() +
             next_scale.clone() *
                 mu.clone().reduce_modulus(q_low.clone()) *
                 nu.clone() *
-                r_low.clone();
+                payload_row.clone();
         // rho(z) = z - p*lift(MD(z)), using the executed output and public key.
         let public_remainder = key.matrix.clone() * prepared.rhs.lifted_ciphertext.clone() -
             p.clone() * prepared.output.matrix.clone().centered_extend(q_high.clone());
@@ -1412,7 +1480,7 @@ pub(crate) mod private_mul_tests {
         let relation = p * error_out.clone().centered_extend(q_high) - signed_terms;
         let count = n as usize;
         let range = crate::program::FamilyRange::full(count).unwrap();
-        let public_family = BfvPublicKeyFamily {
+        let public_family = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(count, |_| Ok(key.matrix.clone())).unwrap(),
             ),
@@ -1421,7 +1489,7 @@ pub(crate) mod private_mul_tests {
             context: scheme.context,
             range: range.clone(),
         };
-        let encoding_family = BfvEncodingFamily {
+        let encoding_family = RnsBggEncodingFamily {
             rows: ProgramValue::Family(
                 mxx_dsl::parallel(count, |_| Ok(input.row.clone())).unwrap(),
             ),
@@ -1434,7 +1502,7 @@ pub(crate) mod private_mul_tests {
             .sample_private_rhs_family(
                 &secrets.payload,
                 0,
-                &BfvRhsPlaintextFamily {
+                &RnsBggRhsPlaintextFamily {
                     payloads: mxx_dsl::parallel(count, |_| Ok(nu.clone())).unwrap(),
                     id: rand::random(),
                 },
@@ -1454,7 +1522,7 @@ pub(crate) mod private_mul_tests {
             .unwrap();
         let family_output =
             scheme.evaluate_mul_private_family(&encoding_family, &family_prepared).unwrap();
-        let shape = DslContext::new("bfv-direct-family-shape")
+        let shape = DslContext::new("rns_bgg-direct-family-shape")
             .public_output("a", family_prepared.output.matrices.clone())
             .unwrap()
             .output("c", family_output.rows.clone())
@@ -1470,14 +1538,14 @@ pub(crate) mod private_mul_tests {
             .count();
         assert_eq!(switches, 6, "family size must not expand the operation body");
         let s_low = scheme.mask_at(&secrets.mask, 1).unwrap();
-        let payload_term = next_scale * mu.reduce_modulus(q_low.clone()) * nu * r_low;
+        let payload_term = next_scale * mu.reduce_modulus(q_low.clone()) * nu * payload_row;
         let family_error = mxx_dsl::parallel(count, |index| {
             Ok(family_output.rows.at(&index) -
                 s_low.clone() * family_prepared.output.matrices.at(&index) +
                 payload_term.clone())
         })
         .unwrap();
-        let mut verifier = DslContext::new("bfv-direct-private-relation")
+        let mut verifier = DslContext::new("rns_bgg-direct-private-relation")
             .output("relation", relation)
             .unwrap()
             .output("error", error_out)
@@ -1501,7 +1569,7 @@ pub(crate) mod private_mul_tests {
         )
         .unwrap();
         let input_bound =
-            BfvNoiseBound { error: request.eta.into(), payload_l1: BigUint::from(2 * n) };
+            RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: BigUint::from(2 * n) };
         let bound = parameters
             .private_mul_noise_bound(0, &input_bound, &1u8.into(), BigUint::from(2 * n).pow(2))
             .unwrap();
@@ -1543,7 +1611,7 @@ pub(super) mod prf_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_composed_prf_two_steps_active_range_and_signed_labels() {
+    fn test_rns_bgg_composed_prf_two_steps_active_range_and_signed_labels() {
         check_prf_selection(
             |parameters| cpu_backend(parameters.levels().to_vec()),
             |matrix, q, bound| {
@@ -1557,26 +1625,26 @@ pub(super) mod prf_tests {
     }
 
     pub(crate) fn check_prf_selection<B: mxx_runtime::Backend>(
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &BigUint, &BigUint),
     ) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse::<u32>().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1, 1],
             slots: vec![2, 2],
             eta: 2,
-            crt_bits: 30,
+            crt_bits: 17,
             terminal_depth: 1,
-            max_crt_depth: 12,
+            max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secrets = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -1595,7 +1663,7 @@ pub(super) mod prf_tests {
                 .sample_private_rhs_family(
                     &secrets.payload,
                     level,
-                    &BfvRhsPlaintextFamily {
+                    &RnsBggRhsPlaintextFamily {
                         // Inactive slots are deliberately nonzero.
                         payloads: Family::pack(
                             (0..4)
@@ -1635,7 +1703,7 @@ pub(super) mod prf_tests {
         let (public, prepared) = PreparedSparseLwrPrf::new(
             &scheme,
             program,
-            BfvPublicProgramValue::Scalar((key.clone(), None)),
+            RnsBggPublicProgramValue::Scalar((key.clone(), None)),
             &blocks,
         )
         .unwrap();
@@ -1646,11 +1714,14 @@ pub(super) mod prf_tests {
                 &scheme.prepare_input(&secrets.payload, &key, high.polynomial([1.into()])).unwrap(),
             )
             .unwrap();
-        let output =
-            prepared.evaluate(&scheme, BfvEncodingProgramValue::Scalar((initial, None))).unwrap();
-        let BfvPublicProgramValue::Family(key) = public else { panic!("batched key") };
-        let BfvEncodingProgramValue::Family(encoding) = output else { panic!("batched encoding") };
-        let shape = DslContext::new("bfv-composed-prf-shape")
+        let output = prepared
+            .evaluate(&scheme, RnsBggEncodingProgramValue::Scalar((initial, None)))
+            .unwrap();
+        let RnsBggPublicProgramValue::Family(key) = public else { panic!("batched key") };
+        let RnsBggEncodingProgramValue::Family(encoding) = output else {
+            panic!("batched encoding")
+        };
+        let shape = DslContext::new("rns_bgg-composed-prf-shape")
             .public_output("a", key.field(|value| value.0.matrix).unwrap())
             .unwrap()
             .output("c", encoding.field(|value| value.0.row).unwrap())
@@ -1669,13 +1740,14 @@ pub(super) mod prf_tests {
         );
         assert!(!nodes.iter().any(|node| matches!(
             node.kind(),
-            NodeKind::RingAutomorphism { .. } |
-                NodeKind::Concat { .. } |
-                NodeKind::Slice { .. } |
-                NodeKind::MatrixMulSmallRhs { .. }
+            NodeKind::RingAutomorphism { .. } | NodeKind::Concat { .. } | NodeKind::Slice { .. }
         )));
+        assert_eq!(
+            nodes.iter().filter(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)).count(),
+            24
+        );
         let low = scheme.ring(2).unwrap();
-        let mut graph = DslContext::new("bfv-composed-prf-relations");
+        let mut graph = DslContext::new("rns_bgg-composed-prf-relations");
         for (label, exponent) in expected.into_iter().enumerate() {
             let error = encoding.at(label).0.row -
                 scheme.mask_at(&secrets.mask, 2).unwrap() * key.at(label).0.matrix +
@@ -1696,7 +1768,7 @@ pub(super) mod prf_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let mut bound = BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() };
+        let mut bound = RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() };
         for level in 0..2 {
             bound =
                 parameters.private_mul_noise_bound(level, &bound, &2u8.into(), 1u8.into()).unwrap();
@@ -1711,7 +1783,7 @@ pub(super) mod prf_tests {
 #[cfg(test)]
 mod linear_tests {
     use super::*;
-    use crate::bfv::{BfvNoiseBound, BfvParameters, BfvPlanRequest};
+    use crate::rns_bgg::{RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest};
     use mxx_dsl::DslContext;
     use mxx_ir_core::ParamEnv;
     use mxx_primitives::{matrix::dcrt_poly::DCRTPolyMatrix, poly::PolyParams};
@@ -1723,12 +1795,12 @@ mod linear_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_linear_operations_preserve_exact_error_and_level() {
+    fn test_rns_bgg_linear_operations_preserve_exact_error_and_level() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let request = BfvPlanRequest {
+        let request = RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
@@ -1739,8 +1811,8 @@ mod linear_tests {
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
         };
-        let (parameters, _) = BfvParameters::plan(&request).unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let (parameters, _) = RnsBggParameters::plan(&request).unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
         let ring = scheme.ring(0).unwrap();
         let hash_key = ring.bytes_input("hash-key", 32);
@@ -1774,7 +1846,8 @@ mod linear_tests {
         let scale = scheme.scalar(0, parameters.scale(0).unwrap().clone()).unwrap();
         let q = BigInt::from(parameters.level(0).unwrap().modulus().as_ref().clone());
         let s = secret.mask.row.clone().reduce_modulus(q.clone());
-        let r = secret.payload.row.clone().reduce_modulus(q);
+        let gadget = scheme.state_gadget(0).unwrap();
+        let r = secret.payload.row.clone().reduce_modulus(q).map(|entry| entry * gadget.clone());
         let lhs_error = lhs.row.clone() - s.clone() * lhs_key.matrix.clone() +
             scale.clone() * mu.clone() * r.clone();
         let rhs_error = rhs.row.clone() - s.clone() * rhs_key.matrix.clone() +
@@ -1796,9 +1869,9 @@ mod linear_tests {
                 .is_err()
         );
         assert!(scheme.evaluate_linear(&rhs, &lhs, &add).is_err());
-        let other = BfvScheme::new(parameters.clone(), rand::random());
+        let other = RnsBggScheme::new(parameters.clone(), rand::random());
         assert!(other.evaluate_linear(&lhs, &rhs, &mul).is_err());
-        let graph = DslContext::new("bfv-linear-error-relations")
+        let graph = DslContext::new("rns_bgg-linear-error-relations")
             .output(
                 "add",
                 added.row - s.clone() * add.output_key().matrix.clone() +
@@ -1828,12 +1901,16 @@ mod linear_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let zero = DCRTPolyMatrix::zero(parameters.level(0).unwrap(), 1, 1);
+        let zero = DCRTPolyMatrix::zero(
+            parameters.level(0).unwrap(),
+            1,
+            parameters.component_columns(0).unwrap(),
+        );
         for value in results.outputs.values() {
             let RuntimeValue::Matrix(matrix) = value else { panic!("matrix residual") };
             assert_eq!(matrix.as_ref(), &zero);
         }
-        let input_bound = BfvNoiseBound { error: 2u8.into(), payload_l1: 3u8.into() };
+        let input_bound = RnsBggNoiseBound { error: 2u8.into(), payload_l1: 3u8.into() };
         let sum_bound = input_bound.add(&input_bound);
         assert_eq!(sum_bound.error, BigUint::from(4u8));
         assert_eq!(sum_bound.payload_l1, BigUint::from(6u8));
@@ -1846,7 +1923,7 @@ mod linear_tests {
 #[cfg(test)]
 pub(crate) mod encoding_tests {
     use super::*;
-    use crate::bfv::{BfvNoiseBound, BfvPlanRequest};
+    use crate::rns_bgg::{RnsBggNoiseBound, RnsBggPlanRequest};
     use mxx_dsl::DslContext;
     use mxx_ir_core::ParamEnv;
     use mxx_primitives::{element::PolyElem, poly::Poly};
@@ -1861,7 +1938,7 @@ pub(crate) mod encoding_tests {
     /// Golden round-trip fixtures persist their online preparation separately
     /// from the public cache, so comparison uses the same sampled helper error.
     pub(crate) fn export_online_masks(
-        masks: &BfvOnlineMasks,
+        masks: &RnsBggOnlineMasks,
         mut graph: DslContext,
         prefix: &str,
     ) -> DslContext {
@@ -1878,11 +1955,11 @@ pub(crate) mod encoding_tests {
         graph
     }
     pub(crate) fn import_online_masks(
-        scheme: &BfvScheme,
-        template: &BfvOnlineMasks,
+        scheme: &RnsBggScheme,
+        template: &RnsBggOnlineMasks,
         production: &mxx_ir_core::artifact::ProductionId,
         prefix: &str,
-    ) -> BfvOnlineMasks {
+    ) -> RnsBggOnlineMasks {
         let ring = scheme.ring(template.level).unwrap();
         let rows = template
             .rows
@@ -1890,11 +1967,11 @@ pub(crate) mod encoding_tests {
             .map(|sigma| {
                 (
                     *sigma,
-                    BfvRow::new([std::array::from_fn(|column| {
+                    RnsBggRow::new([std::array::from_fn(|column| {
                         ring.artifact_input(
                             production.clone(),
                             format!("{prefix}-{sigma}-{column}"),
-                            (1, 1),
+                            (1, scheme.parameters.component_columns(template.level).unwrap()),
                             mxx_ir_core::artifact::ArtifactConfidentiality::Private,
                         )
                     })])
@@ -1902,11 +1979,11 @@ pub(crate) mod encoding_tests {
                 )
             })
             .collect();
-        BfvOnlineMasks { rows: Arc::new(rows), ..template.clone() }
+        RnsBggOnlineMasks { rows: Arc::new(rows), ..template.clone() }
     }
 
     #[test]
-    fn test_bfv_preprocessing_is_reused_with_independent_online_secrets() {
+    fn test_rns_bgg_preprocessing_is_reused_with_independent_online_secrets() {
         check_preprocessing_phases(
             |parameters| cpu_backend(parameters.levels().iter().cloned()),
             |matrix, name, q, bound| {
@@ -1921,12 +1998,12 @@ pub(crate) mod encoding_tests {
     }
 
     pub(crate) fn check_preprocessing_phases<B: mxx_runtime::Backend>(
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
     ) {
         use crate::{
-            bfv::{BfvEncodingFamily, BfvPublicKeyFamily, BfvRhsPlaintextFamily},
             program::FamilyRange,
+            rns_bgg::{RnsBggEncodingFamily, RnsBggPublicKeyFamily, RnsBggRhsPlaintextFamily},
         };
         use mxx_ir_core::artifact::ArtifactConfidentiality;
         use mxx_runtime::artifact::{ArtifactStore, FileArtifactStore};
@@ -1934,7 +2011,7 @@ pub(crate) mod encoding_tests {
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
@@ -1946,7 +2023,7 @@ pub(crate) mod encoding_tests {
             terminal_value_bound: 1u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let seed = high.bytes_input("hash-key", 32);
         let payload_secret = scheme.sample_payload_secret().unwrap();
@@ -1954,7 +2031,7 @@ pub(crate) mod encoding_tests {
             scheme.sample_input_key(0, seed.clone(), b"input".as_slice(), rand::random()).unwrap();
         let mu = high.polynomial([2.into(), (-3).into()]);
         let material = scheme.prepare_input(&payload_secret, &key, mu.clone()).unwrap();
-        let mut producer = DslContext::new("bfv-input-preprocessing");
+        let mut producer = DslContext::new("rns_bgg-input-preprocessing");
         let (graph, input_descriptor) =
             scheme.export_input_material(&key, &material, producer, "input").unwrap();
         producer = graph;
@@ -1988,7 +2065,7 @@ pub(crate) mod encoding_tests {
             scheme.export_prepared_lut(&prepared_lut, producer, "lut").unwrap();
         producer = graph;
         let range = FamilyRange::bounded(0, 2, 2).unwrap();
-        let public_family = BfvPublicKeyFamily {
+        let public_family = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
             ),
@@ -1998,7 +2075,7 @@ pub(crate) mod encoding_tests {
             range: range.clone(),
         };
         let low = scheme.ring(1).unwrap();
-        let rhs = BfvRhsPlaintextFamily {
+        let rhs = RnsBggRhsPlaintextFamily {
             payloads: Family::pack(vec![low.identity(1), low.zero((1, 1))]).unwrap(),
             id: rand::random(),
         };
@@ -2030,8 +2107,8 @@ pub(crate) mod encoding_tests {
                 .unwrap();
         }
         let producer = producer.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        std::fs::create_dir_all("test_data/bfv_input_phases").unwrap();
-        let directory = tempfile::tempdir_in("test_data/bfv_input_phases").unwrap();
+        std::fs::create_dir_all("test_data/rns_bgg_input_phases").unwrap();
+        let directory = tempfile::tempdir_in("test_data/rns_bgg_input_phases").unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let mut backend = make_backend(&parameters);
         let produced = execute(
@@ -2061,7 +2138,7 @@ pub(crate) mod encoding_tests {
             }
         }
         let private_row = |prefix: &str| {
-            BfvRow::new([std::array::from_fn(|column| {
+            RnsBggRow::new([std::array::from_fn(|column| {
                 high.artifact_input(
                     production.clone(),
                     format!("{prefix}-{column}"),
@@ -2108,7 +2185,7 @@ pub(crate) mod encoding_tests {
         let lut_bound = parameters
             .lut_noise_bound(
                 0,
-                &BfvNoiseBound { error: parameters.eta().into(), payload_l1: 5u8.into() },
+                &RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 5u8.into() },
                 1,
                 &1u8.into(),
                 5u8.into(),
@@ -2118,7 +2195,7 @@ pub(crate) mod encoding_tests {
         let oracle_r = private_row("oracle-r");
         let q = parameters.level(0).unwrap().modulus();
 
-        let mut online = DslContext::new("bfv-independent-online-secrets");
+        let mut online = DslContext::new("rns_bgg-independent-online-secrets");
         for index in 0..2 {
             // s is sampled only after the preprocessing production was closed.
             let s = scheme.sample_mask_secret().unwrap();
@@ -2128,7 +2205,7 @@ pub(crate) mod encoding_tests {
             let mut wrong_masks = online_masks.clone();
             wrong_masks.id[0] ^= 1;
             assert!(scheme.evaluate_lut(&encoding, &prepared_lut, &wrong_masks).is_err());
-            let input_family = BfvEncodingFamily {
+            let input_family = RnsBggEncodingFamily {
                 rows: ProgramValue::Family(
                     mxx_dsl::parallel(2, |_| Ok(encoding.row.clone())).unwrap(),
                 ),
@@ -2140,9 +2217,13 @@ pub(crate) mod encoding_tests {
             let selected_family =
                 scheme.evaluate_lut_family(&input_family, &prepared_family, &online_masks).unwrap();
             let low_s = s.row.clone().reduce_modulus(low_modulus.clone());
-            let low_r = oracle_r.clone().reduce_modulus(low_modulus.clone());
+            let low_gadget = scheme.state_gadget(1).unwrap();
+            let low_r = oracle_r
+                .clone()
+                .reduce_modulus(low_modulus.clone())
+                .map(|entry| entry * low_gadget.clone());
             let low_mu = mu.clone().reduce_modulus(low_modulus.clone());
-            let low_error = |row: BfvRow, public: BfvMatrix, payload: Mat| {
+            let low_error = |row: RnsBggRow, public: RnsBggMatrix, payload: Mat| {
                 row - low_s.clone() * public +
                     scheme.scalar(1, parameters.scale(1).unwrap().clone()).unwrap() *
                         payload *
@@ -2170,7 +2251,7 @@ pub(crate) mod encoding_tests {
             let error = encoding.row - s.row * key.matrix.clone() +
                 scheme.scalar(0, parameters.scale(0).unwrap().clone()).unwrap() *
                     mu.clone() *
-                    oracle_r.clone();
+                    oracle_r.clone().map(|entry| entry * scheme.state_gadget(0).unwrap());
             online = online.output(format!("error-{index}"), error).unwrap();
         }
         let mut wrong_key = key.clone();
@@ -2201,12 +2282,12 @@ pub(crate) mod encoding_tests {
     }
 
     #[test]
-    fn test_bfv_mul_private_preserves_coefficient_selectors_and_alignment() {
+    fn test_rns_bgg_mul_private_preserves_coefficient_selectors_and_alignment() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let request = BfvPlanRequest {
+        let request = RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
@@ -2217,8 +2298,8 @@ pub(crate) mod encoding_tests {
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
         };
-        let (parameters, _) = BfvParameters::plan(&request).unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let (parameters, _) = RnsBggParameters::plan(&request).unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
         let hash_key = high.bytes_input("hash-key", 32);
@@ -2261,13 +2342,13 @@ pub(crate) mod encoding_tests {
         let s = scheme.mask_at(&secret.mask, 1).unwrap();
         let r = scheme.payload_at(&secret.payload, 1).unwrap();
 
-        let mut graph = DslContext::new("bfv-identity-selectors");
+        let mut graph = DslContext::new("rns_bgg-identity-selectors");
         for (case, selector) in [Some(0u8), Some(1), None].into_iter().enumerate() {
             let material = scheme
                 .sample_lut_material(
                     &secret.payload,
                     None,
-                    selector.map(|bit| BfvRhsPlaintext {
+                    selector.map(|bit| RnsBggRhsPlaintext {
                         payload: scheme.scalar(1, bit).unwrap(),
                         id: rand::random(),
                     }),
@@ -2306,7 +2387,7 @@ pub(crate) mod encoding_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let input_bound = BfvNoiseBound { error: request.eta.into(), payload_l1: n.into() };
+        let input_bound = RnsBggNoiseBound { error: request.eta.into(), payload_l1: n.into() };
         let selected_bound =
             parameters.lut_noise_bound(0, &input_bound, 1, &1u8.into(), n.into()).unwrap();
         assert_eq!(selected_bound.payload_l1, BigUint::from(n));
@@ -2324,27 +2405,27 @@ pub(crate) mod encoding_tests {
     }
 
     #[test]
-    fn test_bfv_flat_lut_two_levels_all_binary_inputs() {
+    fn test_rns_bgg_flat_lut_two_levels_all_binary_inputs() {
+        use mxx_primitives::matrix::PolyMatrix;
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(32);
-        let request = BfvPlanRequest {
-            ring_dimension: n,
-            widths: vec![4, 2],
-            slots: vec![1, 1],
-            eta: 2,
-            crt_bits: 30,
-            terminal_depth: 1,
-            max_crt_depth: 16,
-            memory_budget_bytes: u64::MAX,
-            terminal_value_bound: BigUint::one(),
-        };
-        let (parameters, manifest) = BfvParameters::plan(&request).unwrap();
-        assert!(!manifest.security_certified);
+        let pool = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let primes = pool.to_crt().0;
+        let parameters = RnsBggParameters::new(
+            [3, 2, 1]
+                .into_iter()
+                .map(|depth| {
+                    DCRTPolyParams::new(n, depth, 17, 4, Some(primes[..depth].to_vec()), None)
+                })
+                .collect(),
+            2,
+        )
+        .unwrap();
         assert_eq!(parameters.scale(2).unwrap(), &BigUint::one());
         assert!(parameters.scale(1).unwrap() > &BigUint::one());
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
         let hash_key = scheme.ring(0).unwrap().bytes_input("hash-key", 32);
         let input_key = scheme
@@ -2389,7 +2470,7 @@ pub(crate) mod encoding_tests {
                 rand::random(),
             )
             .unwrap();
-        let mut graph = DslContext::new("bfv-two-level-binary-lut");
+        let mut graph = DslContext::new("rns_bgg-two-level-binary-lut");
         let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
         for y in 0..2 {
             let rhs = layout.mono(&scheme.ring(1).unwrap(), &BigInt::from(2 * y)).unwrap();
@@ -2397,7 +2478,7 @@ pub(crate) mod encoding_tests {
                 .sample_lut_material(
                     &secret.payload,
                     Some(&table),
-                    Some(BfvRhsPlaintext { payload: rhs, id: rand::random() }),
+                    Some(RnsBggRhsPlaintext { payload: rhs, id: rand::random() }),
                     &mask0,
                     hash_key.clone(),
                     format!("rhs-{y}").into_bytes(),
@@ -2443,7 +2524,8 @@ pub(crate) mod encoding_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let mut bound = BfvNoiseBound { error: request.eta.into(), payload_l1: BigUint::one() };
+        let mut bound =
+            RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: BigUint::one() };
         bound = parameters.lut_noise_bound(0, &bound, 4, &1u8.into(), BigUint::one()).unwrap();
         bound = parameters.lut_noise_bound(1, &bound, 2, &1u8.into(), BigUint::one()).unwrap();
         let q = parameters.level(2).unwrap().modulus();
@@ -2451,7 +2533,11 @@ pub(crate) mod encoding_tests {
             let RuntimeValue::Matrix(matrix) = value else {
                 panic!("matrix error output");
             };
-            for polynomial in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
+            for polynomial in matrix
+                .block_entries(0..matrix.row_size(), 0..matrix.col_size())
+                .into_iter()
+                .flatten()
+            {
                 for coefficient in polynomial.coeffs() {
                     let magnitude =
                         coefficient.value().clone().min(q.as_ref() - coefficient.value());
@@ -2470,14 +2556,18 @@ pub(crate) mod encoding_tests {
 pub(crate) mod refresh_tests {
     use super::*;
     use crate::{
-        bfv::{BfvEncodingProgramValue, BfvNoiseBound, BfvParameters, BfvPublicProgramValue},
         layout::ExpLayout,
         noise_refresh::refresh::PreparedDirectRefreshSlot,
+        rns_bgg::{
+            RnsBggEncodingProgramValue, RnsBggNoiseBound, RnsBggParameters,
+            RnsBggPublicProgramValue,
+        },
     };
     use mxx_dsl::DslContext;
     use mxx_ir_core::ParamEnv;
     use mxx_primitives::{
         element::PolyElem,
+        matrix::PolyMatrix,
         poly::{Poly, dcrt::params::DCRTPolyParams},
     };
     use mxx_runtime::{
@@ -2489,26 +2579,29 @@ pub(crate) mod refresh_tests {
 
     /// The same production terminal/decoder/CRT path used by the application.
     /// Known digit values make this an arithmetic oracle, not a PRF claim.
-    pub(crate) fn refresh_fixture() -> (mxx_ir_core::ValidatedGraph, BfvParameters, BfvNoiseBound) {
+    pub(crate) fn refresh_fixture()
+    -> (mxx_ir_core::ValidatedGraph, RnsBggParameters, RnsBggNoiseBound) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(4);
         let bits = std::env::var("MXX_PRIMITIVE_TEST_CRT_BITS")
             .map(|value| value.parse().unwrap())
-            .unwrap_or(10);
+            .unwrap_or(12);
         let depth = std::env::var("MXX_PRIMITIVE_TEST_CRT_DEPTH")
             .map(|value| value.parse().unwrap())
             .unwrap_or(4);
-        let high = DCRTPolyParams::new(n, depth, bits, 1, None, None);
+        // Four refreshed coordinates need enough CRT spacing for every routed
+        // digit's rounding error; 12-bit primes suffice without weakening it.
+        let high = DCRTPolyParams::new(n, depth, bits, (bits / 2).min(31) as u32, None, None);
         let primes = high.to_crt().0;
         let middle =
             high.select_modulus(&primes[..2].iter().copied().map(BigUint::from).product()).unwrap();
         let last = high.select_modulus(&BigUint::from(primes[0])).unwrap();
         // CBD(0) removes sampling errors. Exact RNS ModDown and its rounding
         // residues remain part of the production arithmetic being tested.
-        let parameters = BfvParameters::new(vec![high, middle, last], 0).unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let parameters = RnsBggParameters::new(vec![high, middle, last], 0).unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -2521,7 +2614,7 @@ pub(crate) mod refresh_tests {
             .unwrap();
         let input =
             scheme.prepare_input(&r, &input_key, high.polynomial([0.into(), 1.into()])).unwrap();
-        let public = BfvPublicProgramValue::Scalar((input_key.clone(), None));
+        let public = RnsBggPublicProgramValue::Scalar((input_key.clone(), None));
         let bank = scheme
             .sample_mask_bank(
                 0,
@@ -2532,20 +2625,16 @@ pub(crate) mod refresh_tests {
             )
             .unwrap();
         let q = parameters.level(1).unwrap().modulus();
-        let payload = scheme.payload_at(&r, 1).unwrap();
-        let zero = || BfvRow::new([[low.zero((1, 1)), low.zero((1, 1))]]).unwrap();
-        let data_table = crate::readout::RowLutTable::new(
-            vec![[vec![1.into()], vec![]], [vec![0.into(), 1.into()], vec![]]],
-            None,
-        )
-        .unwrap();
+        let columns = parameters.component_columns(1).unwrap();
+        let gadget = scheme.state_gadget(1).unwrap();
+        let payload = scheme.payload_at(&r, 1).unwrap().map(|entry| entry * gadget.clone());
         use crate::{
-            bfv::BfvInputMaterial,
             noise_refresh::{
                 ExponentLUTRefreshDirectScheme,
                 prf::SparseLwrPrfProfile,
                 refresh::{RefreshDigitPlan, RefreshDigitRouting},
             },
+            rns_bgg::RnsBggInputMaterial,
         };
         let plan = RefreshDigitPlan::new(
             4,
@@ -2561,7 +2650,7 @@ pub(crate) mod refresh_tests {
         let readout = profile.canonical_readout().unwrap();
         let digit_inputs = |count: usize, tag: &[u8]| {
             let id = rand::random();
-            let entries = mxx_dsl::parallel(2 * n as usize * count, |index| {
+            let entries = mxx_dsl::parallel(2 * columns * n as usize * count, |index| {
                 let mut tag = mxx_dsl::HashTag::from(tag);
                 tag.push(index);
                 let key = scheme.sample_input_key(0, seed.clone(), tag, id).unwrap();
@@ -2573,10 +2662,10 @@ pub(crate) mod refresh_tests {
             let matrices = entries.field(|entry| entry.0).unwrap();
             let input_rows = entries.field(|entry| entry.1).unwrap();
             (
-                BfvPublicProgramValue::Family(
+                RnsBggPublicProgramValue::Family(
                     mxx_dsl::parallel(matrices.count().clone(), |index| {
                         Ok((
-                            BfvPublicKey {
+                            RnsBggPublicKey {
                                 matrix: matrices.at(index),
                                 level: 0,
                                 id,
@@ -2595,25 +2684,17 @@ pub(crate) mod refresh_tests {
         let mut slots = Vec::new();
         for prime in parameters.level(1).unwrap().to_crt().0 {
             let h = q.as_ref() / prime;
-            let data_transform = BfvMatrix::from_rows(
-                scheme.scalar(1, -BigInt::from(&h * parameters.scale(1).unwrap())).unwrap() *
-                    payload.clone(),
-                zero(),
-            );
-            let data = ProgramValue::Scalar(
-                scheme
-                    .sample_terminal_material(
-                        &r,
-                        &data_table,
-                        None,
-                        Some(&data_transform),
-                        &bank,
-                        seed.clone(),
-                        b"refresh-data".as_slice(),
-                        rand::random(),
-                    )
-                    .unwrap(),
-            );
+            let data = scheme
+                .sample_refresh_data_material(
+                    &r,
+                    ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() },
+                    &h,
+                    &bank,
+                    seed.clone(),
+                    b"refresh-data".as_slice(),
+                    rand::random(),
+                )
+                .unwrap();
             let (mask, mask_offset) = scheme
                 .sample_refresh_digit_material(
                     &r,
@@ -2651,21 +2732,22 @@ pub(crate) mod refresh_tests {
                 &[(&public, &data), (&mask_public, &mask), (&fresh_public, &fresh)],
                 output_key.matrix.clone(),
                 scheme.scalar(1, h.clone()).unwrap(),
-                BfvRefreshLevel { output_level: 1, prime: prime.into() },
+                RnsBggRefreshLevel { output_level: 1, prime: prime.into() },
                 mask_offset + fresh_offset,
             )
             .unwrap();
             slots.push(slot);
-            let input_bound = BfvNoiseBound { error: 0u8.into(), payload_l1: 1u8.into() };
+            let input_bound = RnsBggNoiseBound { error: 0u8.into(), payload_l1: 1u8.into() };
             let bound = parameters
                 .terminal_noise_bound(
                     0,
                     [(
                         &input_bound,
-                        2 + 2 *
-                            (n as usize) *
-                            (n as usize) *
-                            (plan.mask_counts[0] + plan.fresh_count),
+                        n as usize +
+                            2 * columns *
+                                (n as usize) *
+                                (n as usize) *
+                                (plan.mask_counts[0] + plan.fresh_count),
                         &1u8.into(),
                     )],
                     0u8.into(),
@@ -2703,14 +2785,14 @@ pub(crate) mod refresh_tests {
         // Online secret is first sampled after all public preparation above.
         let s = scheme.sample_mask_secret().unwrap();
         let encoding = scheme.encode(&s, &input_key, &input).unwrap();
-        let encoding = BfvEncodingProgramValue::Scalar((encoding, None));
+        let encoding = RnsBggEncodingProgramValue::Scalar((encoding, None));
         let helpers = scheme.prepare_online_masks(&s, &bank).unwrap();
-        let encode_digits = |public: &BfvPublicProgramValue, rows: &Family<BfvRow>| {
-            let BfvPublicProgramValue::Family(keys) = public else { panic!("digit family") };
-            BfvEncodingProgramValue::Family(
+        let encode_digits = |public: &RnsBggPublicProgramValue, rows: &Family<RnsBggRow>| {
+            let RnsBggPublicProgramValue::Family(keys) = public else { panic!("digit family") };
+            RnsBggEncodingProgramValue::Family(
                 mxx_dsl::parallel(rows.count().clone(), |index| {
                     let (key, _) = keys.at(&index);
-                    let input = BfvInputMaterial {
+                    let input = RnsBggInputMaterial {
                         row: rows.at(index),
                         level: 0,
                         context: scheme.context,
@@ -2739,7 +2821,9 @@ pub(crate) mod refresh_tests {
         let refreshed = value;
         let digit = BigInt::from(2 / n as usize + 1);
         let fresh_polynomial = low.polynomial((0..n).map(|_| digit.clone().into()));
-        let desired_fresh = BfvRow::new([[fresh_polynomial.clone(), fresh_polynomial]]).unwrap();
+        let fresh_polynomial =
+            Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![fresh_polynomial; columns]);
+        let desired_fresh = RnsBggRow::new([[fresh_polynomial.clone(), fresh_polynomial]]).unwrap();
         let relation = refreshed.row.clone() - scheme.mask_at(&s, 1).unwrap() * output_key.matrix +
             scheme.scalar(1, parameters.scale(1).unwrap().clone()).unwrap() *
                 low.polynomial([0.into(), 1.into()]) *
@@ -2753,7 +2837,7 @@ pub(crate) mod refresh_tests {
             scheme.scalar(2, parameters.scale(2).unwrap().clone()).unwrap() *
                 next_ring.polynomial([0.into(), 1.into()]) *
                 scheme.payload_at(&r, 2).unwrap();
-        let mut graph = DslContext::new("bfv-direct-refresh-and-continuation");
+        let mut graph = DslContext::new("rns_bgg-direct-refresh-and-continuation");
         for column in 0..2 {
             graph = graph
                 .output(format!("exact-{column}"), relation.entry(0, column).clone())
@@ -2765,7 +2849,7 @@ pub(crate) mod refresh_tests {
         let bound = parameters
             .lut_noise_bound(
                 1,
-                &BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                &RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                 1,
                 &1u8.into(),
                 1u8.into(),
@@ -2775,7 +2859,7 @@ pub(crate) mod refresh_tests {
     }
 
     #[test]
-    fn test_bfv_noiseless_refresh_reconstructs_fresh_error_and_continues() {
+    fn test_rns_bgg_noiseless_refresh_reconstructs_fresh_error_and_continues() {
         let (graph, parameters, bound) = refresh_fixture();
         let result = execute(
             &graph,
@@ -2799,7 +2883,11 @@ pub(crate) mod refresh_tests {
             let level = if name.starts_with("exact") { 1 } else { 2 };
             let q = parameters.level(level).unwrap().modulus();
             let expected_bound = if level == 1 { BigUint::from(0u8) } else { bound.error.clone() };
-            for poly in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
+            for poly in matrix
+                .block_entries(0..matrix.row_size(), 0..matrix.col_size())
+                .into_iter()
+                .flatten()
+            {
                 for coefficient in poly.coeffs() {
                     let magnitude =
                         coefficient.value().clone().min(q.as_ref() - coefficient.value());
@@ -2812,7 +2900,7 @@ pub(crate) mod refresh_tests {
 
 #[cfg(test)]
 mod common_prf_tests {
-    use super::{BfvEncoding, BfvPrivateRhs, BfvPublicRhs, ProgramFamilyBindings};
+    use super::{ProgramFamilyBindings, RnsBggEncoding, RnsBggPrivateRhs, RnsBggPublicRhs};
     use crate::{
         layout::ExpLayout,
         noise_refresh::{
@@ -2823,27 +2911,28 @@ mod common_prf_tests {
     };
     use std::collections::BTreeMap;
     #[test]
-    fn test_sparse_lwr_common_interpreter_accepts_bfv_two_block_inputs() {
-        check_bfv_two_block_inputs(0);
+    fn test_sparse_lwr_common_interpreter_accepts_rns_bgg_two_block_inputs() {
+        check_rns_bgg_two_block_inputs(0);
     }
 
     #[test]
-    fn test_sparse_lwr_common_interpreter_accepts_strided_bfv_two_block_inputs() {
-        check_bfv_two_block_inputs(1);
+    fn test_sparse_lwr_common_interpreter_accepts_strided_rns_bgg_two_block_inputs() {
+        check_rns_bgg_two_block_inputs(1);
     }
 
-    fn check_bfv_two_block_inputs(stride_log2: u32) {
+    fn check_rns_bgg_two_block_inputs(stride_log2: u32) {
         use crate::{
-            bfv::{
-                BfvEncodingProgramValue, BfvNoiseBound, BfvParameters, BfvPlanRequest,
-                BfvPublicProgramValue, BfvRhsPlaintextFamily, BfvScheme,
-            },
             noise_refresh::pbc::{PbcCell, PbcParameters, PbcRootSeed, derive_attempt_seed},
+            rns_bgg::{
+                RnsBggEncodingProgramValue, RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest,
+                RnsBggPublicProgramValue, RnsBggRhsPlaintextFamily, RnsBggScheme,
+            },
         };
         use mxx_dsl::{DslContext, Family};
         use mxx_ir_core::ParamEnv;
         use mxx_primitives::{
             element::PolyElem,
+            matrix::PolyMatrix,
             poly::{Poly, PolyParams},
         };
         use mxx_runtime::{
@@ -2900,7 +2989,7 @@ mod common_prf_tests {
         let family_program = builder.build().unwrap();
 
         let widths = active.bucket_active_widths().collect::<Vec<_>>();
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1, 1, native_width],
             slots: widths.iter().copied().chain([1]).collect(),
@@ -2912,7 +3001,7 @@ mod common_prf_tests {
             terminal_value_bound: (native_width - 1).into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -2927,8 +3016,9 @@ mod common_prf_tests {
             1,
         )
         .unwrap();
-        assert_eq!(topology.component_columns, 2);
-        assert_eq!(topology.joint_event_count().unwrap(), 8 * n as usize);
+        let columns = 2 * parameters.component_columns(0).unwrap();
+        assert_eq!(topology.component_columns, columns);
+        assert_eq!(topology.joint_event_count().unwrap(), 4 * columns * n as usize);
         let labels =
             crate::noise_refresh::refresh::RefreshPrfLabelIndex::new(rand::random(), &topology)
                 .unwrap();
@@ -3006,7 +3096,7 @@ mod common_prf_tests {
                     (0..block_entries.len())
                         .map(|index| {
                             (
-                                BfvEncoding {
+                                RnsBggEncoding {
                                     row: rows.at(index),
                                     level: block + 1,
                                     key_id: key.id,
@@ -3022,13 +3112,13 @@ mod common_prf_tests {
             ));
         }
 
-        let mut bound = BfvNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let mut bound = RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
         for (block, count) in widths.iter().enumerate() {
             let branch =
                 parameters.private_mul_noise_bound(block, &bound, &1u8.into(), 1u8.into()).unwrap();
             // One-hot is a payload contract. Every active selector ciphertext
             // still contributes its inherited and fresh error.
-            bound = BfvNoiseBound { error: branch.error * count, payload_l1: 1u8.into() };
+            bound = RnsBggNoiseBound { error: branch.error * count, payload_l1: 1u8.into() };
         }
         assert!(parameters.noise_fits(2, &bound).unwrap());
         let rounding_values = program.readout.canonical_coefficients().unwrap();
@@ -3069,8 +3159,14 @@ mod common_prf_tests {
         let low = scheme.ring(2).unwrap();
         let q = parameters.level(2).unwrap().modulus();
         let s = secret.mask.row.clone().reduce_modulus(BigInt::from(q.as_ref().clone()));
-        let r = secret.payload.row.clone().reduce_modulus(BigInt::from(q.as_ref().clone()));
-        let mut graph = DslContext::new("generic-sparse-lwr-bfv");
+        let gadget = scheme.state_gadget(2).unwrap();
+        let r = secret
+            .payload
+            .row
+            .clone()
+            .reduce_modulus(BigInt::from(q.as_ref().clone()))
+            .map(|entry| entry * gadget.clone());
+        let mut graph = DslContext::new("generic-sparse-lwr-rns_bgg");
         let mut seen_halves = [false; 2];
         for choice in 0..4 {
             let selected = (0..2)
@@ -3088,7 +3184,7 @@ mod common_prf_tests {
             for block in 0..2 {
                 let ring = scheme.ring(block + 1).unwrap();
                 let rhs_id = rand::random();
-                let selectors = BfvRhsPlaintextFamily {
+                let selectors = RnsBggRhsPlaintextFamily {
                     payloads: Family::pack(
                         entries
                             .iter()
@@ -3117,7 +3213,7 @@ mod common_prf_tests {
                 let rhs_values = Family::pack(
                     (0..positions.len())
                         .map(|local| {
-                            BfvPublicRhs::Fixed(BfvPrivateRhs {
+                            RnsBggPublicRhs::Fixed(RnsBggPrivateRhs {
                                 ciphertext: material.ciphertext.at(local),
                                 lifted_ciphertext: material.lifted_ciphertext.at(local),
                                 level: material.level,
@@ -3133,7 +3229,7 @@ mod common_prf_tests {
                 online_blocks.push((
                     selector_families[block],
                     (
-                        Family::pack(vec![BfvPublicRhs::Lut(rhs_id); positions.len()]).unwrap(),
+                        Family::pack(vec![RnsBggPublicRhs::Lut(rhs_id); positions.len()]).unwrap(),
                         range,
                     ),
                 ));
@@ -3188,8 +3284,8 @@ mod common_prf_tests {
                 ))
                 .unwrap();
             let output_key =
-                BfvPublicProgramValue::Scalar(prepared.public_values()[&family_output].clone());
-            let output = BfvEncodingProgramValue::Scalar(evaluated[&family_output].clone());
+                RnsBggPublicProgramValue::Scalar(prepared.public_values()[&family_output].clone());
+            let output = RnsBggEncodingProgramValue::Scalar(evaluated[&family_output].clone());
             let readout_artifacts =
                 program.prepare_readout(&scheme, &output_key, &readout_material).unwrap();
             let readout_public =
@@ -3206,7 +3302,7 @@ mod common_prf_tests {
             } else {
                 BigInt::from(1u8) - &rounding_values[exponent - rounding_values.len()]
             };
-            let expected_row = crate::bfv::BfvRow::new([[
+            let expected_row = crate::rns_bgg::RnsBggRow::new([[
                 scheme.scalar(3, expected).unwrap(),
                 scheme.scalar(3, 0).unwrap(),
             ]])
@@ -3216,10 +3312,10 @@ mod common_prf_tests {
                 terminal_s.clone() * readout_public.values.scalar().unwrap().clone() -
                 expected_row;
             graph = graph.output(format!("terminal-error-{choice}"), terminal_error).unwrap();
-            let BfvPublicProgramValue::Scalar((output_key, _)) = output_key else {
+            let RnsBggPublicProgramValue::Scalar((output_key, _)) = output_key else {
                 panic!("scalar key")
             };
-            let BfvEncodingProgramValue::Scalar((output, _)) = output else {
+            let RnsBggEncodingProgramValue::Scalar((output, _)) = output else {
                 panic!("scalar encoding")
             };
             let ideal = exponent_layout.mono(&low, &BigInt::from(exponent)).unwrap();
@@ -3249,7 +3345,11 @@ mod common_prf_tests {
                 (q.as_ref(), &bound.error)
             };
             let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial") };
-            for polynomial in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
+            for polynomial in matrix
+                .block_entries(0..matrix.row_size(), 0..matrix.col_size())
+                .into_iter()
+                .flatten()
+            {
                 for coefficient in polynomial.coeffs() {
                     let absolute: BigUint =
                         coefficient.value().clone().min(q - coefficient.value());
@@ -3263,7 +3363,7 @@ mod common_prf_tests {
 #[cfg(test)]
 pub(crate) mod family_tests {
     use super::*;
-    use crate::bfv::{BfvNoiseBound, BfvParameters, BfvPlanRequest};
+    use crate::rns_bgg::{RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest};
     use mxx_dsl::DslContext;
     use mxx_primitives::{element::PolyElem, poly::Poly};
     use mxx_runtime::{
@@ -3274,12 +3374,12 @@ pub(crate) mod family_tests {
     use std::collections::BTreeMap;
 
     pub(crate) fn composed_rhs_fixture()
-    -> (mxx_ir_core::ValidatedGraph, BfvParameters, BfvNoiseBound) {
+    -> (mxx_ir_core::ValidatedGraph, RnsBggParameters, RnsBggNoiseBound) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![4],
             slots: vec![2],
@@ -3291,7 +3391,7 @@ pub(crate) mod family_tests {
             terminal_value_bound: 1u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
         let hash_key = scheme.ring(0).unwrap().bytes_input("hash-key", 32);
         let key = scheme
@@ -3312,7 +3412,7 @@ pub(crate) mod family_tests {
         let online_bank = scheme.prepare_online_masks(&secret.mask, &bank).unwrap();
         // The active slots are 1 and 2. Nonzero selectors outside that range
         // must not enter the RHS composition. Both active ciphertext errors do.
-        let selectors = BfvRhsPlaintextFamily {
+        let selectors = RnsBggRhsPlaintextFamily {
             payloads: Family::pack(
                 [1u8, 0, 1, 1].into_iter().map(|bit| scheme.scalar(1, bit).unwrap()).collect(),
             )
@@ -3337,7 +3437,7 @@ pub(crate) mod family_tests {
         let q = parameters.level(1).unwrap().modulus();
         let modulus = BigInt::from(q.as_ref().clone());
 
-        let mut graph = DslContext::new("bfv-composed-rhs-wrap");
+        let mut graph = DslContext::new("rns_bgg-composed-rhs-wrap");
         for label in 0..2 {
             let labels = Family::pack(vec![
                 layout.mono(&scheme.ring(1).unwrap(), &1.into()).unwrap(),
@@ -3369,7 +3469,7 @@ pub(crate) mod family_tests {
         }
         let graph = graph.build().unwrap().validate(&ParamEnv::default()).unwrap();
         let (noise_material, noise_rhs) =
-            crate::bfv::noise::BfvGateNoiseMaterial::from_one_hot_labels(
+            crate::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
                 0,
                 Some(table.commitment()),
                 &[
@@ -3381,7 +3481,7 @@ pub(crate) mod family_tests {
         let bound = parameters
             .lut_noise_bound(
                 0,
-                &BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                &RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                 4,
                 &noise_material.fresh_error_gain.l1,
                 noise_rhs.payload_l1,
@@ -3391,7 +3491,7 @@ pub(crate) mod family_tests {
     }
 
     #[test]
-    fn test_bfv_composed_rhs_wraps_selected_public_label() {
+    fn test_rns_bgg_composed_rhs_wraps_selected_public_label() {
         let (graph, parameters, bound) = composed_rhs_fixture();
         let q = parameters.level(1).unwrap().modulus();
         let results = execute(
@@ -3419,12 +3519,12 @@ pub(crate) mod family_tests {
     }
 
     pub(crate) fn structural_selection_fixture()
-    -> (mxx_ir_core::ValidatedGraph, BfvParameters, BfvNoiseBound) {
+    -> (mxx_ir_core::ValidatedGraph, RnsBggParameters, RnsBggNoiseBound) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
@@ -3436,7 +3536,7 @@ pub(crate) mod family_tests {
             terminal_value_bound: 3u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
         let hash_key = scheme.ring(0).unwrap().bytes_input("hash-key", 32);
         let key = scheme
@@ -3451,7 +3551,7 @@ pub(crate) mod family_tests {
             )
             .unwrap();
         let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let input_key = BfvPublicKeyFamily {
+        let input_key = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
             ),
@@ -3460,7 +3560,7 @@ pub(crate) mod family_tests {
             context: scheme.context,
             range: range.clone(),
         };
-        let input = BfvEncodingFamily {
+        let input = RnsBggEncodingFamily {
             rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
             level: 0,
             key_id: key.id,
@@ -3469,7 +3569,7 @@ pub(crate) mod family_tests {
         };
         // The last selector is outside the active range and must not affect
         // either output payload or the active-member aggregation.
-        let rhs = BfvRhsPlaintextFamily {
+        let rhs = RnsBggRhsPlaintextFamily {
             payloads: Family::pack(
                 [0u8, 1, 0, 1].into_iter().map(|bit| scheme.scalar(1, bit).unwrap()).collect(),
             )
@@ -3498,7 +3598,7 @@ pub(crate) mod family_tests {
         let public_key = scheme
             .sample_input_key(1, hash_key.clone(), b"public".as_slice(), rand::random())
             .unwrap();
-        let public_family = BfvPublicKeyFamily {
+        let public_family = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(2, |_| Ok(public_key.matrix.clone())).unwrap(),
             ),
@@ -3523,7 +3623,7 @@ pub(crate) mod family_tests {
                 .map_err(|_| DslError::Schema)
         })
         .unwrap();
-        let public_encodings = BfvEncodingFamily {
+        let public_encodings = RnsBggEncodingFamily {
             rows: ProgramValue::Family(public_rows),
             level: 1,
             key_id: public_key.id,
@@ -3583,7 +3683,7 @@ pub(crate) mod family_tests {
         let rhs_values = Family::pack(
             (0..2)
                 .map(|index| {
-                    BfvPublicRhs::Fixed(BfvPrivateRhs {
+                    RnsBggPublicRhs::Fixed(RnsBggPrivateRhs {
                         ciphertext: material.ciphertext.at(index),
                         lifted_ciphertext: material.lifted_ciphertext.at(index),
                         level: material.level,
@@ -3598,7 +3698,7 @@ pub(crate) mod family_tests {
         let rhs_bindings = BTreeMap::from([(rhs_family, (rhs_values, range.clone()))]);
         let online_rhs_bindings = BTreeMap::from([(
             rhs_family,
-            (Family::pack(vec![BfvPublicRhs::Lut(rhs.id); 2]).unwrap(), range.clone()),
+            (Family::pack(vec![RnsBggPublicRhs::Lut(rhs.id); 2]).unwrap(), range.clone()),
         )]);
         let at = ProgramGateInstance::FamilyGate {
             step: 0,
@@ -3659,7 +3759,7 @@ pub(crate) mod family_tests {
         let online_inputs = BTreeMap::from([(
             input_id,
             (
-                BfvEncoding {
+                RnsBggEncoding {
                     row: input.rows.at(0),
                     level: 0,
                     key_id: key.id,
@@ -3675,7 +3775,7 @@ pub(crate) mod family_tests {
                     (0..2)
                         .map(|index| {
                             (
-                                BfvEncoding {
+                                RnsBggEncoding {
                                     row: public_encodings.rows.at(index),
                                     level: 1,
                                     key_id: public_key.id,
@@ -3714,7 +3814,7 @@ pub(crate) mod family_tests {
                 reduction.output_key().matrix.clone() +
             expected * secret.payload.row.clone().reduce_modulus(modulus);
 
-        let graph = DslContext::new("bfv-structural-selection")
+        let graph = DslContext::new("rns_bgg-structural-selection")
             .output("repeated-difference", repeated_difference)
             .unwrap()
             .output("program-difference", program_difference)
@@ -3730,7 +3830,7 @@ pub(crate) mod family_tests {
         let bound = parameters
             .private_mul_noise_bound(
                 0,
-                &BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                &RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                 &1u8.into(),
                 1u8.into(),
             )
@@ -3744,7 +3844,7 @@ pub(crate) mod family_tests {
         (graph, parameters, bound)
     }
     #[test]
-    fn test_bfv_structural_selection_respects_active_range() {
+    fn test_rns_bgg_structural_selection_respects_active_range() {
         let (graph, parameters, bound) = structural_selection_fixture();
         let q = parameters.level(1).unwrap().modulus();
         let results = execute(
@@ -3779,12 +3879,12 @@ pub(crate) mod family_tests {
 mod program_tests {
     use super::*;
     use crate::{
-        bfv::{BfvNoiseBound, BfvParameters, BfvPlanRequest, BfvRhsPlaintext},
         layout::ExpLayout,
         program::{
             AttributeKnowledge, ExponentLutProgramBuilder, LutTable, ProgramBindings,
             ProgramWireType,
         },
+        rns_bgg::{RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest, RnsBggRhsPlaintext},
         scheme::PreparedProgram,
     };
     use mxx_dsl::DslContext;
@@ -3800,12 +3900,12 @@ mod program_tests {
     use num_bigint::{BigInt, BigUint};
 
     #[test]
-    fn test_bfv_scheme_program_all_gates_and_rhs_binding() {
+    fn test_rns_bgg_scheme_program_all_gates_and_rhs_binding() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![4],
             slots: vec![1],
@@ -3817,7 +3917,7 @@ mod program_tests {
             terminal_value_bound: 4u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
         let hash_key = scheme.ring(0).unwrap().bytes_input("hash-key", 32);
         let input_key = scheme
@@ -3873,14 +3973,14 @@ mod program_tests {
         let r = secret.payload.row.clone().reduce_modulus(modulus);
         let t_inverse =
             mxx_primitives::utils::mod_inverse_biguints(&2u8.into(), q.as_ref()).unwrap();
-        let mut graph = DslContext::new("bfv-generic-program");
+        let mut graph = DslContext::new("rns_bgg-generic-program");
         for y in 0..2 {
             let rhs_id = rand::random();
             let material = scheme
                 .sample_lut_material(
                     &secret.payload,
                     Some(&table),
-                    Some(BfvRhsPlaintext {
+                    Some(RnsBggRhsPlaintext {
                         payload: layout
                             .mono(&scheme.ring(1).unwrap(), &BigInt::from(2 * y))
                             .unwrap(),
@@ -3894,14 +3994,14 @@ mod program_tests {
                 .unwrap();
             let online_helpers = BTreeMap::from([(
                 gate,
-                ProgramValue::Scalar(BfvOnlineLutHelpers {
+                ProgramValue::Scalar(RnsBggOnlineLutHelpers {
                     binding: material.binding(),
                     masks: online_bank.clone(),
                 }),
             )]);
             let helpers = BTreeMap::from([(gate, ProgramValue::Scalar(material))]);
-            let rhs = BTreeMap::from([(rhs_input, BfvPublicRhs::Lut(rhs_id))]);
-            let public_rhs = BTreeMap::from([(rhs_input, BfvPublicRhs::Lut(rhs_id))]);
+            let rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Lut(rhs_id))]);
+            let public_rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Lut(rhs_id))]);
             let public_inputs = BTreeMap::from([
                 (input, (input_key.clone(), None)),
                 (weight_input, (weight_key.clone(), Some(weight.clone()))),
@@ -3972,7 +4072,7 @@ mod program_tests {
                         .is_err(),
                     "a helper from another artifact must not match by table/RHS alone"
                 );
-                let wrong_rhs = BTreeMap::from([(rhs_input, BfvPublicRhs::Lut(rand::random()))]);
+                let wrong_rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Lut(rand::random()))]);
                 assert!(
                     prepared
                         .evaluate(&ProgramBindings::new(
@@ -4014,7 +4114,7 @@ mod program_tests {
         let lut_bound = parameters
             .lut_noise_bound(
                 0,
-                &BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                &RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                 4,
                 &1u8.into(),
                 1u8.into(),
@@ -4038,7 +4138,9 @@ mod program_tests {
 #[cfg(test)]
 pub(crate) mod terminal_tests {
     use super::*;
-    use crate::bfv::{BfvNoiseBound, BfvParameters, BfvPlanRequest, noise::BfvTerminalNoise};
+    use crate::rns_bgg::{
+        RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest, noise::RnsBggTerminalNoise,
+    };
     use mxx_dsl::DslContext;
     use mxx_ir_core::{ParamEnv, ValidatedGraph};
     use mxx_primitives::{element::PolyElem, poly::Poly};
@@ -4048,7 +4150,7 @@ pub(crate) mod terminal_tests {
     };
     use std::collections::BTreeMap;
 
-    pub(crate) fn terminal_fixture() -> (ValidatedGraph, BfvParameters, BfvTerminalNoise) {
+    pub(crate) fn terminal_fixture() -> (ValidatedGraph, RnsBggParameters, RnsBggTerminalNoise) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
@@ -4075,7 +4177,7 @@ pub(crate) mod terminal_tests {
         )
         .unwrap();
         let value_bound = table_a.coefficient_bound() + table_b.coefficient_bound();
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![4],
             slots: vec![1],
@@ -4087,7 +4189,7 @@ pub(crate) mod terminal_tests {
             terminal_value_bound: value_bound.clone(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -4127,7 +4229,7 @@ pub(crate) mod terminal_tests {
             .sample_terminal_material(
                 &secret.payload,
                 &table_b,
-                Some(BfvRhsPlaintext {
+                Some(RnsBggRhsPlaintext {
                     payload: low.polynomial([0.into(), 1.into()]),
                     id: rand::random(),
                 }),
@@ -4155,7 +4257,7 @@ pub(crate) mod terminal_tests {
         }
         let public = prepared.public();
         assert_eq!(public.level(), 1);
-        let bound = BfvNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let bound = RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
         let gain = BigUint::from(1u8);
         let noise = parameters
             .terminal_noise_bound(0, [(&bound, 4, &gain), (&bound, 4, &gain)], value_bound)
@@ -4173,7 +4275,7 @@ pub(crate) mod terminal_tests {
         let q = parameters.level(1).unwrap().modulus();
 
         let s = secret.mask.row.clone().reduce_modulus(BigInt::from(q.as_ref().clone()));
-        let mut graph = DslContext::new("bfv-weighted-terminal-batch");
+        let mut graph = DslContext::new("rns_bgg-weighted-terminal-batch");
         for x in 0..4 {
             for y in 0..3 {
                 let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
@@ -4210,7 +4312,7 @@ pub(crate) mod terminal_tests {
                 // Expected values use the public table entries directly, not
                 // the automorphism decomposition used to generate ciphertexts.
                 let row = |values: &[Vec<BigInt>; 2]| {
-                    BfvRow::new([values.each_ref().map(|p| {
+                    RnsBggRow::new([values.each_ref().map(|p| {
                         if p.is_empty() {
                             low.zero((1, 1))
                         } else {
@@ -4260,13 +4362,14 @@ pub(crate) mod terminal_tests {
         (graph, parameters, noise)
     }
 
-    pub(crate) fn routed_terminal_fixture() -> (ValidatedGraph, BfvParameters, BfvTerminalNoise) {
+    pub(crate) fn routed_terminal_fixture()
+    -> (ValidatedGraph, RnsBggParameters, RnsBggTerminalNoise) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(8);
         let weight = BigInt::from(1u8) << 40usize;
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
@@ -4278,7 +4381,7 @@ pub(crate) mod terminal_tests {
             terminal_value_bound: weight.magnitude().clone(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secrets = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
@@ -4305,9 +4408,12 @@ pub(crate) mod terminal_tests {
         // Distinct destinations and signs exercise coefficient routing inside
         // one structural body, with the ordinary unweighted error bound.
         let destinations = Family::pack(vec![
-            BfvRow::new([[low.polynomial([weight.clone().into()]), low.zero((1, 1))]]).unwrap(),
-            BfvRow::new([[low.zero((1, 1)), low.polynomial([0.into(), (-weight.clone()).into()])]])
-                .unwrap(),
+            RnsBggRow::new([[low.polynomial([weight.clone().into()]), low.zero((1, 1))]]).unwrap(),
+            RnsBggRow::new([[
+                low.zero((1, 1)),
+                low.polynomial([0.into(), (-weight.clone()).into()]),
+            ]])
+            .unwrap(),
         ])
         .unwrap();
         let q = BigInt::from(parameters.level(1).unwrap().modulus().as_ref().clone());
@@ -4315,9 +4421,9 @@ pub(crate) mod terminal_tests {
 
         let errors = mxx_dsl::parallel(2, |index| {
             let destination = destinations.at(&index);
-            let transform = BfvMatrix::from_rows(
+            let transform = RnsBggMatrix::from_rows(
                 destination.clone(),
-                BfvRow::new([[low.zero((1, 1)), low.zero((1, 1))]])?,
+                RnsBggRow::new([[low.zero((1, 1)), low.zero((1, 1))]])?,
             );
             let mut tag = HashTag::from(b"routed-terminal".as_slice());
             tag.push(index);
@@ -4347,7 +4453,7 @@ pub(crate) mod terminal_tests {
             Ok(output.row().clone() - mask_secret * public.matrix - destination)
         })
         .unwrap();
-        let graph = DslContext::new("bfv-indexed-terminal-routing")
+        let graph = DslContext::new("rns_bgg-indexed-terminal-routing")
             .output("route-0", errors.at(0))
             .unwrap()
             .output("route-1", errors.at(1))
@@ -4356,7 +4462,8 @@ pub(crate) mod terminal_tests {
             .unwrap()
             .validate(&ParamEnv::default())
             .unwrap();
-        let input_bound = BfvNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let input_bound =
+            RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
         let gain = 1u8.into();
         let noise = parameters
             .terminal_noise_bound(0, [(&input_bound, 2, &gain)], weight.magnitude().clone())
@@ -4365,10 +4472,10 @@ pub(crate) mod terminal_tests {
     }
 
     #[test]
-    fn test_bfv_terminal_noise_groups_match_expanded_members() {
+    fn test_rns_bgg_terminal_noise_groups_match_expanded_members() {
         let (_, parameters, _) = routed_terminal_fixture();
-        let left = BfvNoiseBound { error: 3u8.into(), payload_l1: 1u8.into() };
-        let right = BfvNoiseBound { error: 7u8.into(), payload_l1: 3u8.into() };
+        let left = RnsBggNoiseBound { error: 3u8.into(), payload_l1: 1u8.into() };
+        let right = RnsBggNoiseBound { error: 7u8.into(), payload_l1: 3u8.into() };
         let left_gain = 1u8.into();
         let right_gain = 5u8.into();
         for (left_members, right_members) in [(1, 1), (3, 5), (9, 2)] {
@@ -4398,7 +4505,7 @@ pub(crate) mod terminal_tests {
     }
 
     #[test]
-    fn test_bfv_terminal_indexed_routing_keeps_fresh_error_unscaled() {
+    fn test_rns_bgg_terminal_indexed_routing_keeps_fresh_error_unscaled() {
         let (graph, parameters, noise) = routed_terminal_fixture();
         let results = execute(
             &graph,
@@ -4425,7 +4532,7 @@ pub(crate) mod terminal_tests {
     }
 
     #[test]
-    fn test_bfv_terminal_rows_large_weights_and_raw_batch_relations() {
+    fn test_rns_bgg_terminal_rows_large_weights_and_raw_batch_relations() {
         let (graph, parameters, noise) = terminal_fixture();
         let results = execute(
             &graph,

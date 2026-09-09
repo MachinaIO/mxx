@@ -39,7 +39,7 @@ pub trait ExponentLUTRefreshScheme: ExponentLUTEncodingScheme {
         switched: Self::RefreshRow,
         decoder: Self::RefreshDecoder,
     ) -> Self::RefreshRow;
-    /// Extract a decoded CRT residue. BFV rounds after decoder subtraction;
+    /// Extract a decoded CRT residue. RNS-BGG rounds after decoder subtraction;
     /// BGG has already converted its carrier before subtraction.
     fn extract_refresh_residue(
         &self,

@@ -1,0 +1,7 @@
+date,crt_bits,base_bits,max_crt_depth,correctness_accepted,initial_modulus_bits,prf_end_depth,refreshed_depth,refreshed_columns,distinct_prf_outputs,continuation_worst_error_bound
+2026-09-09,50,25,27,True,1350,6,5,16,163577856,67147330
+2026-09-09,40,20,27,True,1080,6,5,16,163577856,67165186
+2026-09-09,32,16,28,True,896,7,6,20,245104640,67516160
+2026-09-09,28,14,29,True,810,8,7,24,342884352,68963234
+2026-09-09,26,13,30,False,,,,,,
+2026-09-09,25,12,31,False,,,,,,

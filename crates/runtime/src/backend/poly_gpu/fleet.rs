@@ -2366,6 +2366,36 @@ impl Backend for GpuDcrtBackend {
         self.unary_columns(value, |backend, input| backend.centered_extend(input, destination))
     }
 
+    fn centered_extend_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        let pieces = self
+            .devices
+            .par_iter_mut()
+            .map(|(device_id, backend)| {
+                value
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.device_id == *device_id)
+                    .map(|shard| {
+                        backend.centered_extend_small(&shard.value, destination).map(|value| {
+                            GpuColumnShard {
+                                device_id: *device_id,
+                                global_column_start: shard.global_column_start,
+                                value,
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut shards = pieces.into_iter().flatten().collect::<Vec<_>>();
+        shards.sort_by_key(|shard| shard.global_column_start);
+        Ok(GpuFleetSmallMatrix::new(value.rows, value.columns, shards))
+    }
+
     fn block_mod_switch(
         &mut self,
         value: &Self::Matrix,

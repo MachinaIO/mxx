@@ -331,6 +331,11 @@ pub trait Backend {
         value: &Self::Matrix,
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
+    fn centered_extend_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
     fn block_mod_switch(
         &mut self,
         value: &Self::Matrix,

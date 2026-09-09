@@ -69,7 +69,7 @@ transcripts, sessions, artifacts, and bounded parallel waves.
 slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
 
 `mxx-exponent-lut` owns the native mod-Q Program traversal and the
-`ExponentLUTEncodingScheme` interface. Its BGG and BFV implementations supply
+`ExponentLUTEncodingScheme` interface. Its BGG and RNS-BGG implementations supply
 concrete keys, encodings, preparation, and gate operations. Its `PublicKey` and
 `Encoding` associated types are scalar graph values with any known-plaintext
 metadata. The interface does not expose separate `PublicValue` or
@@ -89,7 +89,7 @@ supplies the scheme binding; import compares it with the trusted descriptor
 identity before restoring graph ports. Backend adapters define the concrete
 GraphValue schemas, not the Program artifact traversal. This API does not
 require a new cryptographic artifact trait.
-Both BFV and BGG instantiate this transport in their file-artifact tests.
+Both RNS-BGG and BGG instantiate this transport in their file-artifact tests.
 BGG cache schemas serialize structured gate identities as ordered entries, and
 its public-key schema preserves the public-plaintext flag. The shared-RHS BGG
 consumer imports the complete prepared Program instead of injecting a manually
@@ -102,22 +102,23 @@ their source identity and reductions account for shared-source multiplicity.
 Direct refresh schedules scalar terminal operations in the common application.
 Preparation returns the online cache separately from its raw public result;
 only the cache is persisted per member. The application reduces raw members and
-logical terms before the final refresh ModDown. BFV material retains prepared
+logical terms before the final refresh ModDown. RNS-BGG material retains prepared
 ciphertext lifts and imported evaluation consumes those cached fields. Generic
-GraphValue schemas drive direct-slot term artifact transport. Standalone BFV
+GraphValue schemas drive direct-slot term artifact transport. Standalone RNS-BGG
 Family readout also uses the same terminal scheduler. Independent projection
 is fused into its member loop; aggregate projection runs after raw reduction.
 Its adapter retains output mode/range metadata, while member caches and
 artifact transport use the same scalar prepared records. Shared LUT algebra lives in
-`crates/exponent-lut/src/utils.rs`; BFV does not call the BGG encoding implementation.
+`crates/exponent-lut/src/utils.rs`; RNS-BGG does not call the BGG encoding implementation.
 The shared interpreter dispatches `Add`, `MulPublic`, `MulPrivate`, and explicit
 `Lut` gates for both scalar and family scopes. `private_mul` emits `MulPrivate`;
 LUT declarations require a table ID. BGG caches one gadget decomposition for a
-direct product. BFV caches the fixed low-base two-column ciphertext and its
-lift, and performs only one public block ModDown and one online row ModDown.
+direct product. RNS-BGG caches the exact low-level gadget decomposition transported as bounded
+digits to the input modulus, and performs one public block ModDown and one
+online row ModDown.
 The ordinary Program-driven PRF route uses these direct operations.
 Within a family, a shared fixed RHS uses one cached BGG decomposition or one
-cached BFV block lift outside the indexed products. Artifact descriptors retain
+cached RNS-BGG bounded decomposition outside the indexed products. Artifact descriptors retain
 this member-sharing distinction independently of sharing across PRF outputs.
 Program preparation and binding require matching exponent layouts and ring
 dimensions, plus plaintext metadata for every public input. Lowering relies
@@ -135,14 +136,14 @@ backend; its Program error boundary carries a diagnostic string mapped by the
 backend adapter. Production setup still has concrete BGG dependencies.
 
 BGG preprocessing stores gadget decompositions as generic preimage artifacts;
-BFV uses polynomial blocks and exact RNS level transitions. Their online
+RNS-BGG uses rectangular polynomial blocks, bounded preimages, and exact RNS level transitions. Their online
 encoding operations consume prepared public data. The primitives, IR, DSL,
 and runtime layers own executable basis conversion, not application semantics.
 
 The sparse-LWR accumulation interpreter uses scheme-associated values and
 helpers. The common PRF owns PBC active block ranges, used by both ordinary
 Program bindings and cached batch preparation. `ExponentLUTReadoutScheme` exposes value readout with structural batch
-carriers and prepared witnesses. BFV public preparation and artifact operations
+carriers and prepared witnesses. RNS-BGG public preparation and artifact operations
 live in `public_key.rs`; sampling and online operations live in `encoding.rs`.
 Its shared relation/cache carriers and capability implementations live in
 `mod.rs`, alongside `noise.rs` and `gpu.rs` as the remaining backend files.
@@ -156,24 +157,25 @@ manifest-based storage accounting belongs to `noise_refresh/simulation.rs`.
 The optional
 `ExponentLUTTerminalScheme` exposes raw row-output terms and finalization.
 Its common `PreparedTerminal` evaluator builds an ordered balanced sum and
-finalizes once, preserving the BFV aggregate-before-switch requirement.
+finalizes once, preserving the RNS-BGG aggregate-before-switch requirement.
 The common readout module owns RowLutTable<C>, the public exponent-indexed
-table of polynomial rows. Its column count is static; BFV consumes
-RowLutTable<2> through its existing terminal samplers. Table identity and selected
+table of polynomial rows. Its block-component count is static; RNS-BGG consumes
+RowLutTable<2> through its terminal samplers, with rectangular polynomial rows
+inside each block when routing to a reusable state. Table identity and selected
 coefficient bounds are independent of ciphertext representation. ValueReadout
 also constructs weighted centered rows and their signed-domain digit bound;
 backends supply the target modulus and consume the resulting public table.
 RowLutTable also owns the public monomial/automorphism sieve sum over lowered
 graph-value rows, preserving the structural balanced reduction and reusing
 rows across branches.
-BFV implements scalar and structural-family native digit readout. Fresh terminal
+RNS-BGG implements scalar and structural-family native digit readout. Fresh terminal
 row targets contain `w*(f-1/2)`, and public offsets produce `w*f` in the first
 native half and `w*(1-f)` in the second. The inverse of two is inside the fresh
 target, so encoding errors remain unscaled, including odd errors. Public matrices
 and completed encodings are never divided by two. The adapter preserves the
 full native subring width `N/2^m` for stride `2^m`.
-Indexed targets route base-p digits into either polynomial and any coefficient
-before sampling fresh RHS errors. BFV readout weights use the same shared/indexed
+Indexed targets route base-p digits into either block, any column, and any coefficient
+before sampling fresh RHS errors. RNS-BGG readout weights use the same shared/indexed
 enum for runtime values and descriptor metadata; only runtime values retain
 indexed graph rows. Descriptors store those rows separately as public artifacts,
 with the coefficient bound belonging to the indexed variant. Scalar and family readout artifacts persist
@@ -184,8 +186,10 @@ error families before the single outer ordinary ModDown.
 `ExponentLUTRefreshScheme` refreshes the selected scheme's own `Encoding`.
 The base scheme exposes encoding dimensions from public-key metadata.
 `RefreshTranscriptTopology::new` uses these dimensions to count mask and
-shared fresh-error PRF outputs; BFV contributes two polynomial columns,
-while BGG contributes its actual gadget-dependent key columns.
+shared fresh-error PRF outputs; both schemes contribute their actual
+gadget-dependent key columns. RNS-BGG resumable states have `2D` columns,
+where `D` is the next level's exact per-prime radix digit count; only the
+terminal chain endpoint has two polynomial columns.
 `noise_refresh/refresh.rs` contains no concrete backend types; matrix routing
 uses the segmented reduction in `utils.rs`, and backend adapters assemble their
 own cryptographic wires. Its common online evaluator owns homogeneous slot
@@ -214,7 +218,7 @@ half-offset vector construction remains in `bgg/mod.rs`.
 `RefreshVerification<V>` retains the backend's `GraphValue` carrier and the
 exact scalar residual operands used by threshold decoders. Relation arithmetic
 and component extraction belong to the backend: BGG's builder is in `bgg/mod.rs`;
-the common container can export BFV polynomial blocks without concatenating or
+the common container can export RNS-BGG polynomial blocks without concatenating or
 slicing them. This graph boundary does not itself prove the supplied relation.
 BGG supplies the individual arithmetic operations in `bgg/mod.rs`;
 its production refresh entrypoint uses this evaluator.
@@ -226,21 +230,24 @@ The three refresh contracts are `ExponentLUTRefreshScheme` for common public
 and encoding arithmetic, `ExponentLUTRefreshWitnessScheme` for witness-based
 anchor and online decoder-base preparation, and `ExponentLUTRefreshDirectScheme`
 for direct decoder issuance and weighted terminal/digit preparation. BGG supplies
-the witness capability; BFV supplies the direct capability. Neither implements
+the witness capability; RNS-BGG supplies the direct capability. Neither implements
 dummy operations for the other decoder construction. The shared application
 continues to own preprocessing, online preparation and evaluation scheduling.
-BFV constructs the two-polynomial decoder
+RNS-BGG constructs the output-key-shaped decoder
 `s*(A_sum-H*A_out)+e_dec`, bound to the combined masked target.
 `PreparedDirectRefreshSlot` prepares and evaluates scalar or structural terminal
 families through traits, sums raw terms, applies ordinary ModDown, subtracts the
-decoder, and only then extracts a CRT residue. BFV reconstructs the output from
-single-tower residues using exact extension and public CRT idempotents; it does
-not restore consumed modulus levels. Runtime parameter registration includes
-`BfvParameters::refresh_residue_parameters` for the selected output level.
+decoder, and only then extracts a CRT residue. RNS-BGG rounds each masked channel at spacing `H = q_ref / prime` before
+reconstructing the output with exact residue extension and public CRT
+idempotents. Its data targets contain `H * p_ref * mu * t * G_ref`, so the
+refreshed state can enter the next private product or LUT directly. The common
+preterminal modulus retains every output prime; recomposition does not restore
+consumed modulus levels. Runtime parameter registration includes
+`RnsBggParameters::refresh_residue_parameters` for the selected output level.
 `RefreshDigitPlan` computes mask and fresh counts independently using exact
 base-p support widths. Its fixed-point search includes the digit-dependent
 exposed-error bound. Fresh digit inputs are shared across CRT channels while
-mask labels are channel-specific. BFV's digit sampler generates structural
+mask labels are channel-specific. RNS-BGG's digit sampler generates structural
 fresh targets weighted by `p^j` or `H*p^j`, plus exact public distribution offsets.
 `PreparedDirectRefresh` in `noise_refresh/refresh.rs` owns each slot together
 with its public affine offset and connects the complete
@@ -249,18 +256,19 @@ recomposition sequence using these traits. `PreparedSparseLwrPrf` in
 `noise_refresh/prf.rs` connects structural selection steps through
 `ExponentLUTFixedRhsScheme` from the encoding interface. The application
 explicitly composes the publicly weighted fixed RHS and then prepares the
-private product. Both BGG and BFV delegate structural weighted-family summation
+private product. Both BGG and RNS-BGG delegate structural weighted-family summation
 to the common graph-value utility. BGG decomposes each composed GSW family
 in public preparation and keeps `Family<Preimage>` for online external products;
-BFV applies its existing low-base direct product. Neither adapter owns the PRF
+RNS-BGG decomposes at the output level, transports bounded digits to the input
+level, and applies its prepared product followed by ModDown. Neither adapter owns the PRF
 step traversal.
 The capability has no PRF or one-hot-specific methods. It also exports/imports
 one fixed-product cache and exposes its concrete descriptor and scheme binding.
 `PreparedSparseLwrPrfDescriptor` owns the ordered step descriptors and a single
 scheme binding; common PRF export/import authenticates that descriptor against
-the caller's expected identity and restores each step. BFV no longer has a
+the caller's expected identity and restores each step. RNS-BGG no longer has a
 separate PRF descriptor or a specialized PRF transport implementation. Public label vectors are bound in
-preprocessing. BFV exports and reopens both prepared PRF batches and complete
+preprocessing. RNS-BGG exports and reopens both prepared PRF batches and complete
 refresh bundles through the runtime artifact store. Online evaluation performs
 encoding ModDown but does not rerun public aggregation or public ModDown.
 The BGG witness-based setup driver retains its backend-specific sampler and
@@ -275,12 +283,12 @@ reconstructs each readout preimage or stores a duplicate helper list.
 linkage. The anchor constructor always builds its target product; decoder
 bindings retain the exact target identity.
 
-BFV uses distinct `BfvPayloadSecret` and `BfvMaskSecret` types. Input
-preprocessing computes a private `BfvInputMaterial` using only the payload
+RNS-BGG uses distinct `RnsBggPayloadSecret` and `RnsBggMaskSecret` types. Input
+preprocessing computes a private `RnsBggInputMaterial` using only the payload
 secret; online input generation adds the mask-secret term and fresh error.
 Ordinary/family/terminal RHS samplers take only the payload-secret type. The
 public mask sampler and prepared scalar/family/Program caches are independent
-of the mask secret. Online preparation generates separate `BfvOnlineMasks`
+of the mask secret. Online preparation generates separate `RnsBggOnlineMasks`
 from the public matrices and `s`; gates sharing a bank reuse its rows.
 Scalar, family, and terminal evaluation consume these helpers explicitly.
 Linear Program caches retain scalar/family layout once and use the prepared
@@ -290,31 +298,31 @@ Serialized linear operation metadata carries the RHS identity only in its
 Add/MulPublic variants. Reduction has no RHS field and requires an input family
 range; its output is scalar. Input/output ranges derive from the operation.
 These bindings and their transport live beside Program cache artifact dispatch
-in `bfv/public_key.rs`. Input-material and scalar/family LUT artifact
+in `rns_bgg/public_key.rs`. Input-material and scalar/family LUT artifact
 bindings share that owner, as does the remaining direct-refresh adapter after
 slot transport moved to the common refresh layer. The separate
 `linear_artifacts.rs`, `artifacts.rs` and `refresh_artifacts.rs` modules are removed.
-Basic block imports live beside the BFV block types and
+Basic block imports live beside the RNS-BGG block types and
 use `GraphValueSchema` without depending on Program cache transport.
 Prepared LUTs own their binding metadata; Program cache entries refer directly
 to that metadata for helper preparation and online checks, rather than retaining
 a second scalar/family binding copy.
 Public artifact exporters persist the mask matrices and bindings, not the
 online rows. Input artifact transport preserves private payload contributions
-separately from public keys. Public BFV blocks use the same `GraphValue` flattened
+separately from public keys. Public RNS-BGG blocks use the same `GraphValue` flattened
 ports as structural families; schema-based imports reopen those ports without
 backend-specific row/column artifact naming. `DslContext::public_outputs` owns
-ordered public field emission for scalar and structural values; BFV direct,
+ordered public field emission for scalar and structural values; RNS-BGG direct,
 linear and LUT-branch exporters supply their named fields to that common path.
 Scalar/family terminal and native digit readout operations follow the same
-BFV public-preparation versus online-evaluation ownership split. The former
+RNS-BGG public-preparation versus online-evaluation ownership split. The former
 `family.rs`, `program.rs`, `program_artifacts.rs`, and `readout.rs` modules are
 removed rather than retained as compatibility namespaces. Prepared terminal
 families derive binding metadata from their scalar member cache rather than
 keeping a second copy; this performs no polynomial computation. Terminal material
 uses the common `ProgramValue` scalar/Family carrier directly. Indexed sampling
 returns complete scalar material from one structural loop, including captured
-mask handles and cached high-base lifts, without a manual port adapter. Common terminal
+mask handles and cached bounded decompositions, without a manual port adapter. Common terminal
 scheduling handles both standalone readout and direct refresh. Independent
 outputs finalize inside the member loop; aggregate outputs finalize once after
 raw reduction. Terminal stage and batch artifacts preserve the finalized public
@@ -325,13 +333,13 @@ terms together, replacing parallel arrays. Cached terminal values reopen without
 public aggregation or switching. Refresh label routing also owns structural
 slicing of public and encoding digit families; schemes do not implement range
 selection. The fresh group is selected once and reused across CRT channels. See
-`docs/plans/exponent-lut-bfv-double-scale.md`.
+`docs/plans/exponent-lut-rns-bgg-implementation-plan.md`.
 
 The BGG Program interpreter traces worst-case bounds and average-case variances
 per wire; the existing noise-refresh application applies that interpreter to the LWR PRF and checks the
 decoder and mask thresholds. This application-specific simulator does not
 depend on the removed generic noise-simulator crate or replace the generic
-operational checker used by other applications. BFV has a separate deterministic
+operational checker used by other applications. RNS-BGG has a separate deterministic
 noise interpreter over the same Program traversal; its parameter audits run
 at setup time using public payload contracts. Both reports retain a common
 `NoiseDependencyGraph`, recorded by a decorator during that same traversal.
@@ -339,7 +347,7 @@ The flat arena preserves repeated wire references, RHS/helper binding reuse,
 broadcast ancestors and active family reductions without expanding members.
 Binding identities do not assert sampler independence; distributions and
 per-source covariance transfers still need explicit model contracts.
-`BfvParameters::plan_refresh` takes data and PRF noise values produced with
+`RnsBggParameters::plan_refresh` takes data and PRF noise values produced with
 the selected parameters. They may come from separate Program traces or an input
 sampling contract. It derives their
 common terminal level and bounds without separate copies in the workload request,

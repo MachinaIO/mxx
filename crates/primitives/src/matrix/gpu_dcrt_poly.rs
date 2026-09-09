@@ -715,6 +715,30 @@ impl GpuSmallMatrix {
 impl SmallPolyMatrix for GpuSmallMatrix {
     type Params = GpuDCRTPolyParams;
 
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String> {
+        let source_primes = self.params.to_crt().0;
+        let target_primes = destination.to_crt().0;
+        if self.params.ring_dimension() != destination.ring_dimension() ||
+            self.params.gpu_ids() != destination.gpu_ids() ||
+            source_primes.iter().any(|prime| !target_primes.contains(prime))
+        {
+            return Err("bounded extension requires a containing basis on the same device".into());
+        }
+        // The compact payload contains signed integers, not CRT residues.
+        // Copy into the destination owner while retaining the exact bound;
+        // expansion into its limbs happens only inside bounded multiplication.
+        let out = Self::new_empty(
+            destination,
+            self.rows,
+            self.columns,
+            self.max_coefficient_bound.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let status = unsafe { gpu_small_matrix_copy(out.raw, self.raw) };
+        check_status(status, "gpu_small_matrix_copy(centered_extend)");
+        Ok(out)
+    }
+
     fn params(&self) -> &Self::Params {
         &self.params
     }

@@ -5,11 +5,11 @@
 use std::{env, path::PathBuf};
 use tracing_subscriber::EnvFilter;
 
-fn use_bfv() -> bool {
+fn use_rns_bgg() -> bool {
     match std::env::var("MXX_EXPONENT_LUT_TEST_SCHEME").as_deref().unwrap_or("bgg") {
         "bgg" => false,
-        "bfv" => true,
-        other => panic!("MXX_EXPONENT_LUT_TEST_SCHEME must be bgg or bfv, got {other}"),
+        "rns-bgg" => true,
+        other => panic!("MXX_EXPONENT_LUT_TEST_SCHEME must be bgg or rns-bgg, got {other}"),
     }
 }
 
@@ -412,13 +412,224 @@ fn selected_average_config() -> Option<AverageCaseConfig> {
     })
 }
 
+/// Host-only numerical search: no ciphertext, artifact, or benchmark graph is built.
+#[test]
+fn test_rns_bgg_average_refresh_noise_simulation() {
+    use mxx_exponent_lut::{
+        layout::ExpLayout,
+        noise_refresh::{
+            pbc::{PbcActiveCellIndex, PbcLayoutSeed, PbcParameters, PbcPublicLayout},
+            prf::{SparseLwrPrfProfile, SparseLwrPrfProgram},
+        },
+        noise_utils::{NonnegativeRational, RightActionNoiseGain},
+        rns_bgg::{RnsBggParameters, noise::RnsBggRefreshPlanRequest},
+    };
+    use std::collections::BTreeMap;
+    let n = optional_usize("MXX_PRIMITIVE_TEST_RING_DIMENSION", 65536) as u32;
+    let bits = optional_usize("MXX_EXPONENT_LUT_REFRESH_CRT_BITS", 50);
+    let max_depth = optional_usize("MXX_EXPONENT_LUT_REFRESH_MAX_CRT_DEPTH", 26);
+    let universe = optional_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_UNIVERSE", 8192);
+    let weight = optional_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_WEIGHT", 18);
+    let q_lwr = optional_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_MODULUS", 4096);
+    let average = AverageCaseConfig {
+        failure_exponent: optional_usize("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS", 100) as u32,
+        allow_average_acceptance: true,
+        ..Default::default()
+    };
+    let layout = PbcPublicLayout::build(
+        &PbcParameters::paper_evaluation(universe, weight),
+        PbcLayoutSeed(rand::random()),
+        0,
+    )
+    .unwrap();
+    let active = PbcActiveCellIndex::build(&layout).unwrap();
+    let selector_counts = active.bucket_active_widths().collect::<Vec<_>>();
+    let stages = selector_counts.len();
+    let width_log2 = q_lwr.trailing_zeros() - 1;
+    let program = SparseLwrPrfProgram::new(
+        SparseLwrPrfProfile::new(
+            ExpLayout { stride_log2: n.trailing_zeros() - width_log2, width_log2 },
+            16,
+        )
+        .unwrap(),
+        layout.bucket_width,
+        stages,
+    )
+    .unwrap();
+    let pool = DCRTPolyParams::try_new(n, max_depth, bits, (bits / 2) as u32, None, None).unwrap();
+    let mut modulus = BigUint::one();
+    let levels = pool
+        .to_crt()
+        .0
+        .iter()
+        .map(|prime| {
+            modulus *= *prime;
+            pool.select_modulus(&modulus).unwrap()
+        })
+        .collect::<Vec<_>>();
+    // The minimum variance at each (step, remaining depth) dominates every
+    // larger variance: the production transfer is affine and increasing.
+    // Start at every allowed initial depth. Ignore intermediate acceptance
+    // constraints, making rejection a necessary-condition result for ALL
+    // nested prefix chains in this pool, not just a failed greedy allocation.
+    let mut states = BTreeMap::new();
+    for depth in stages + 3..=max_depth {
+        if levels[depth - 1].modulus().bits() > 1400 {
+            continue;
+        }
+        states.insert(
+            depth,
+            (NonnegativeRational::new(1u8.into(), 1u8.into()).unwrap(), vec![depth]),
+        );
+    }
+    for (step, count) in selector_counts.iter().enumerate() {
+        let mut next_states: BTreeMap<usize, (NonnegativeRational, Vec<usize>)> = BTreeMap::new();
+        let gain = RightActionNoiseGain { l1: (*count).into(), l2_squared: (*count).into() };
+        for (depth, (variance, path)) in states {
+            for next in stages - step + 2..depth {
+                let parameters = RnsBggParameters::new(
+                    vec![levels[depth - 1].clone(), levels[next - 1].clone()],
+                    2,
+                )
+                .unwrap();
+                let candidate = parameters
+                    .private_mul_noise_variance(0, &variance, &RightActionNoiseGain::unit(), &gain)
+                    .unwrap();
+                let better = next_states.get(&next).is_none_or(|(current, _)| {
+                    &candidate.numerator * &current.denominator <
+                        &current.numerator * &candidate.denominator
+                });
+                if better {
+                    let mut next_path = path.clone();
+                    next_path.push(next);
+                    next_states.insert(next, (candidate, next_path));
+                }
+            }
+        }
+        states = next_states;
+    }
+    let z = average.z_squared_for_events(&BigUint::one()).unwrap();
+    let mut reports = Vec::new();
+    for (depth, (variance, mut path)) in states {
+        // Keep the remaining chain: continuation is a reusable state, not
+        // merely the terminal two-column endpoint.
+        path.extend((1..depth).rev());
+        let parameters =
+            RnsBggParameters::new(path.iter().map(|d| levels[d - 1].clone()).collect(), 2).unwrap();
+        let trace = rns_bgg::trace_prf(&parameters, &program.accumulation, &selector_counts);
+        let output = &trace.wires[&program.accumulation.outputs()[0]];
+        assert_eq!(output.moments.as_ref().unwrap().variance, variance);
+        let optimistic_fits = output.moments.as_ref().unwrap().fits(
+            &NonnegativeRational::new(levels[depth - 1].modulus().as_ref().clone(), 8u8.into())
+                .unwrap(),
+            &z,
+        );
+        // Refresh data with the same error envelope as a completed application
+        // PRF, rather than assuming optimistically fresh data at this level.
+        let data = output.clone();
+        let observations = BigUint::from(2 * n as usize) *
+            parameters.component_columns(stages + 1).unwrap() *
+            parameters.levels()[stages + 1].crt_depth();
+        let refresh = parameters.plan_refresh(
+            &RnsBggRefreshPlanRequest {
+                data_branches: n as usize,
+                prf_branches: q_lwr / 2,
+                base: 32,
+                fresh_support: 32u8.into(),
+                fresh_bound: 16u8.into(),
+                decoder_eta: 2,
+                observations,
+                statistical_bits: average.failure_exponent as usize,
+            },
+            &data,
+            output,
+            Some(&average),
+        );
+        let log2 = |value: &BigUint| {
+            let shift = value.bits().saturating_sub(53) as usize;
+            (value >> shift).to_f64().unwrap().log2() + shift as f64
+        };
+        let joint_z = refresh.as_ref().ok().and_then(|plan| plan.z_squared.as_ref());
+        let audit_z = joint_z.unwrap_or(&z);
+        let first_failure = trace.gates.iter().find_map(|(gate, value)| {
+            let moments = value.moments.as_ref().unwrap();
+            let q = parameters.levels()[value.level].modulus();
+            let scale = parameters.scale(value.level).unwrap();
+            let modulus_fits = moments.fits(&NonnegativeRational::new(q.as_ref().clone(), 8u8.into()).unwrap(), audit_z);
+            let scale_fits = moments.fits(&NonnegativeRational::new(scale.clone(), 2u8.into()).unwrap(), audit_z);
+            (!modulus_fits || !scale_fits).then(|| serde_json::json!({
+                "gate": format!("{gate:?}"), "output_level": value.level,
+                "input_log2_q": log2(parameters.levels()[value.level - 1].modulus().as_ref()),
+                "moddown_log2_divisor": log2(parameters.scale(value.level - 1).unwrap()),
+                "output_log2_q": log2(q.as_ref()), "output_log2_scale": log2(scale),
+                "unreduced_model_log2_stddev": (log2(&moments.variance.numerator) - log2(&moments.variance.denominator)) / 2.0,
+                "optimistic_log2_tail_bound": log2(&moments.tail_bound(audit_z)),
+                "modulus_fits": modulus_fits, "scale_fits": scale_fits,
+            }))
+        });
+        let input_moments = trace.wires
+            [program.accumulation.input_wires().values().next().unwrap()]
+        .moments
+        .as_ref()
+        .unwrap();
+        let input_fits = input_moments.fits(
+            &NonnegativeRational::new(parameters.scale(0).unwrap().clone(), 2u8.into()).unwrap(),
+            audit_z,
+        );
+        let correctness_accepted =
+            refresh.is_ok() && joint_z.is_some() && first_failure.is_none() && input_fits;
+        let continuation = parameters
+            .lut_noise_bound(
+                stages + 1,
+                &mxx_exponent_lut::rns_bgg::RnsBggNoiseBound {
+                    error: 16u8.into(),
+                    payload_l1: 1u8.into(),
+                },
+                q_lwr / 2,
+                &BigUint::one(),
+                BigUint::one(),
+            )
+            .unwrap();
+        let continuation_fits = parameters.noise_fits(stages + 2, &continuation).unwrap();
+        reports.push(serde_json::json!({
+            "correctness_accepted": correctness_accepted && continuation_fits,
+            "continuation_fits": continuation_fits,
+            "continuation_worst_error_bound": continuation.error.to_string(),
+            "level_primes": parameters.levels().iter().map(|level| level.to_crt().0).collect::<Vec<_>>(),
+            "initial_modulus": parameters.levels()[0].modulus().to_string(),
+            "state_columns": (0..parameters.levels().len()).map(|level| 2 * parameters.component_columns(level).unwrap()).collect::<Vec<_>>(),
+            "joint_prf_and_refresh_audit": joint_z.is_some(),
+            "chain_depths": path, "initial_modulus_bits": parameters.levels()[0].modulus().bits(),
+            "prf_output_log2_q": log2(levels[depth - 1].modulus().as_ref()),
+            "unreduced_model_log2_stddev": (log2(&variance.numerator) - log2(&variance.denominator)) / 2.0,
+            "first_state_failure": first_failure,
+            "prf_variance_numerator_bits": variance.numerator.bits(),
+            "prf_variance_denominator_bits": variance.denominator.bits(),
+            "optimistic_single_event_prf_fits": optimistic_fits,
+            "refresh": refresh.map_err(|e| e.to_string()),
+        }));
+    }
+    let report = serde_json::json!({
+        "n": n, "crt_bits": bits, "base_bits": bits / 2, "max_crt_depth": max_depth,
+        "initial_log2_q_limit": 1400,
+        "lwr_q": q_lwr, "lwr_p": 32, "lwr_dimension": universe, "lwr_weight": weight,
+        "pbc_blocks": stages, "pbc_seed": layout.seed, "pbc_layout_id": layout.layout_id, "selector_counts": selector_counts,
+        "noise_model": "average-case", "failure_exponent": average.failure_exponent,
+        "security_verified": false, "candidates": reports,
+    });
+    println!("rns_bgg_noise_simulation={report}");
+    if let Some(path) = env::var_os("MXX_EXPONENT_LUT_REFRESH_SEARCH_OUTPUT") {
+        fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+}
+
 #[test]
 fn test_gpu_exponent_lut_benchmark_estimate() {
     install_tracing();
 
-    if use_bfv() {
+    if use_rns_bgg() {
         let average = selected_average_config();
-        let fixture = bfv::refresh(average.as_ref());
+        let fixture = rns_bgg::refresh(average.as_ref());
         let devices = detected_gpu_device_ids();
         assert!(!devices.is_empty(), "benchmark estimate requires CUDA");
         let mut levels = fixture.parameters.levels().to_vec();
@@ -442,7 +653,7 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
                 ..MeasurementHarnessConfig::default()
             },
         );
-        println!("bfv_noise_simulation={}", fixture.noise_report);
+        println!("rns_bgg_noise_simulation={}", fixture.noise_report);
         let stages = [
             ("preprocess", &fixture.benchmark_preprocessing),
             ("online_eval", &fixture.benchmark_online),
@@ -7021,14 +7232,10 @@ mod bgg_refresh_artifact_tests {
     }
 }
 
-mod bfv {
-    //! Shared graph fixtures for BFV integration and backend regression tests.
-    use mxx_dsl::{DslContext, Family};
+mod rns_bgg {
+    //! Shared graph fixtures for RNS-BGG integration and backend regression tests.
+    use mxx_dsl::{DslContext, Family, Mat};
     use mxx_exponent_lut::{
-        bfv::{
-            BfvEncodingProgramValue, BfvNoiseBound, BfvParameters, BfvPlanRequest,
-            BfvPublicProgramValue, BfvRefreshLevel, BfvRhsPlaintextFamily, BfvRow, BfvScheme,
-        },
         layout::ExpLayout,
         noise_refresh::{
             pbc::{PbcLayoutId, derive_lwr_vector},
@@ -7038,6 +7245,11 @@ mod bfv {
             refresh::{DirectRefreshChannel, PreparedDirectRefresh, RefreshPrfLabelIndex},
         },
         program::{FamilyRange, ProgramValue},
+        rns_bgg::{
+            RnsBggEncodingProgramValue, RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest,
+            RnsBggPublicProgramValue, RnsBggRefreshLevel, RnsBggRhsPlaintextFamily, RnsBggRow,
+            RnsBggScheme,
+        },
     };
     use mxx_ir_core::{
         ParamEnv, ValidatedGraph,
@@ -7053,8 +7265,8 @@ mod bfv {
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
 
-    pub struct BfvRoundTrip {
-        pub parameters: BfvParameters,
+    pub struct RnsBggRoundTrip {
+        pub parameters: RnsBggParameters,
         pub producer: ValidatedGraph,
         pub benchmark_preprocessing: ValidatedGraph,
         pub benchmark_online: ValidatedGraph,
@@ -7066,25 +7278,93 @@ mod bfv {
 
     pub fn refresh(
         average: Option<&mxx_exponent_lut::noise_refresh::simulation::AverageCaseConfig>,
-    ) -> BfvRoundTrip {
+    ) -> RnsBggRoundTrip {
         let n: u32 = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(4);
         let layout = ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() };
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
-            ring_dimension: n,
-            widths: vec![1, n as usize, 1],
-            slots: vec![2, 1, 1],
-            eta: 2,
-            crt_bits: 17,
-            terminal_depth: 2,
-            max_crt_depth: 32,
-            memory_budget_bytes: 1 << 30,
-            terminal_value_bound: 32u8.into(),
-        })
-        .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let eta: usize = 2;
+        let profile = SparseLwrPrfProfile::new(layout, 2).unwrap();
+        let program = SparseLwrPrfProgram::new(profile, 2, 1).unwrap();
+        // Trace the exact frozen product schedule consumed by preparation and
+        // cached evaluation, including every ciphertext in the composed RHS.
+        let execution = program.accumulation.clone();
+        let data_noise = mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
+            level: 1,
+            bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+            payload_l2_squared: 1u8.into(),
+            moments: Some(mxx_exponent_lut::noise_utils::NoiseMoments {
+                mean_numerator: 0.into(),
+                mean_denominator: 1u8.into(),
+                mean_radius: mxx_exponent_lut::noise_utils::NonnegativeRational::zero(),
+                variance: mxx_exponent_lut::noise_utils::NonnegativeRational::new(
+                    eta.into(),
+                    2u8.into(),
+                )
+                .unwrap(),
+            }),
+            public: false,
+            range: None,
+            one_hot: false,
+        };
+        let refresh_request = mxx_exponent_lut::rns_bgg::noise::RnsBggRefreshPlanRequest {
+            data_branches: n as usize,
+            prf_branches: n as usize,
+            base: 4,
+            fresh_support: 4u8.into(),
+            fresh_bound: 2u8.into(),
+            decoder_eta: 2,
+            observations: 8u8.into(),
+            statistical_bits: std::env::var(
+                "MXX_EXPONENT_LUT_REFRESH_MASK_STATISTICAL_SECURITY_BITS",
+            )
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(16),
+        };
+        let mut chosen = None;
+        let mut last_error = None;
+        // The refresh output must fit its full wide-coordinate mask fixed point,
+        // in addition to the preceding PRF and following LUT. Choose before
+        // constructing ciphertext graphs so rejected candidates allocate no graph.
+        for terminal_depth in 2..=29 {
+            let candidate = RnsBggParameters::plan(&RnsBggPlanRequest {
+                ring_dimension: n,
+                widths: vec![1, n as usize, 1],
+                slots: vec![2, 1, 1],
+                eta,
+                crt_bits: 17,
+                terminal_depth,
+                max_crt_depth: 32,
+                memory_budget_bytes: 1 << 30,
+                terminal_value_bound: 32u8.into(),
+            });
+            let (parameters, _) = match candidate {
+                Ok(value) => value,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let trace = trace_prf(&parameters, &execution, &[2]);
+            match parameters.plan_refresh(
+                &refresh_request,
+                &data_noise,
+                &trace.wires[&execution.outputs()[0]],
+                average,
+            ) {
+                Ok(refresh_plan) => {
+                    chosen = Some((parameters, refresh_plan));
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let (parameters, refresh_plan) = chosen.unwrap_or_else(|| {
+            panic!("no RNS-BGG refresh chain within the fixture budget: {last_error:?}")
+        });
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let terminal_ring = scheme.ring(1).unwrap();
         let output_ring = scheme.ring(2).unwrap();
@@ -7102,52 +7382,6 @@ mod bfv {
             .unwrap();
         let output_key =
             scheme.sample_input_key(2, seed.clone(), b"output".as_slice(), rand::random()).unwrap();
-        let profile = SparseLwrPrfProfile::new(layout, 2).unwrap();
-        let program = SparseLwrPrfProgram::new(profile, 2, 1).unwrap();
-        // Trace the exact frozen product schedule consumed by preparation and
-        // cached evaluation, including every ciphertext in the composed RHS.
-        let execution = program.accumulation.clone();
-        let trace = trace_prf(&parameters, &execution);
-        let data_noise = mxx_exponent_lut::bfv::noise::BfvNoiseValue {
-            level: 1,
-            bound: BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
-            payload_l2_squared: 1u8.into(),
-            moments: Some(mxx_exponent_lut::noise_utils::NoiseMoments {
-                mean_numerator: 0.into(),
-                mean_denominator: 1u8.into(),
-                mean_radius: mxx_exponent_lut::noise_utils::NonnegativeRational::zero(),
-                variance: mxx_exponent_lut::noise_utils::NonnegativeRational::new(
-                    parameters.eta().into(),
-                    2u8.into(),
-                )
-                .unwrap(),
-            }),
-            public: false,
-            range: None,
-            one_hot: false,
-        };
-        let refresh_plan = parameters
-            .plan_refresh(
-                &mxx_exponent_lut::bfv::noise::BfvRefreshPlanRequest {
-                    data_branches: n as usize,
-                    prf_branches: n as usize,
-                    base: 4,
-                    fresh_support: 4u8.into(),
-                    fresh_bound: 2u8.into(),
-                    decoder_eta: 2,
-                    observations: 8u8.into(),
-                    statistical_bits: std::env::var(
-                        "MXX_EXPONENT_LUT_REFRESH_MASK_STATISTICAL_SECURITY_BITS",
-                    )
-                    .ok()
-                    .map(|value| value.parse().unwrap())
-                    .unwrap_or(16),
-                },
-                &data_noise,
-                &trace.wires[&execution.outputs()[0]],
-                average,
-            )
-            .unwrap();
         let plan = &refresh_plan.digits;
         let data_bound = &data_noise.bound;
         let topology =
@@ -7176,7 +7410,7 @@ mod bfv {
                 .collect(),
         )
         .unwrap();
-        let rhs = BfvRhsPlaintextFamily {
+        let rhs = RnsBggRhsPlaintextFamily {
             payloads: Family::pack(
                 (0..2).map(|slot| scheme.scalar(1, u8::from(slot == selected)).unwrap()).collect(),
             )
@@ -7196,7 +7430,7 @@ mod bfv {
         let (prf_public, prepared_prf) = PreparedSparseLwrPrf::new(
             &scheme,
             program.clone(),
-            BfvPublicProgramValue::Scalar((initial_key.clone(), None)),
+            RnsBggPublicProgramValue::Scalar((initial_key.clone(), None)),
             &[PrfSelectionInputs {
                 selectors,
                 labels: labels_family,
@@ -7218,13 +7452,13 @@ mod bfv {
             .map(|prime| {
                 let h = q.as_ref() / prime;
                 DirectRefreshChannel {
-                    level: BfvRefreshLevel { output_level: 2, prime: prime.into() },
+                    level: RnsBggRefreshLevel { output_level: 2, prime: prime.into() },
                     output_scale: scheme.scalar(2, h.clone()).unwrap(),
                     data: scheme
                         .sample_refresh_data_material(
                             &r,
                             layout,
-                            &(&h * parameters.scale(2).unwrap()),
+                            &h,
                             &terminal_bank,
                             seed.clone(),
                             format!("data-{prime}").into_bytes(),
@@ -7235,7 +7469,7 @@ mod bfv {
                 }
             })
             .collect();
-        let public_data = BfvPublicProgramValue::Scalar((data_key.clone(), None));
+        let public_data = RnsBggPublicProgramValue::Scalar((data_key.clone(), None));
         let prepared = PreparedDirectRefresh::new(
             &scheme,
             &public_data,
@@ -7281,8 +7515,9 @@ mod bfv {
         let next = scheme.prepare_lut(&output_key, &next_material, rand::random()).unwrap();
         let next_binding = next.binding().clone();
         let next_output_id = *next.output_key().id();
-        let (producer, refresh_descriptor) =
-            prepared.export(&scheme, DslContext::new("bfv-refresh-preprocess"), "refresh").unwrap();
+        let (producer, refresh_descriptor) = prepared
+            .export(&scheme, DslContext::new("rns_bgg-refresh-preprocess"), "refresh")
+            .unwrap();
         let (producer, prf_descriptor) = prepared_prf.export(&scheme, producer, "prf").unwrap();
         let (producer, initial_descriptor) = scheme
             .export_input_material(&initial_key, &initial_material, producer, "initial")
@@ -7296,9 +7531,25 @@ mod bfv {
         // Private correctness oracle, separate from the public refresh bundle.
         for level in [2, 3] {
             let ring = scheme.ring(level).unwrap();
+            let payload = scheme.payload_at(&r, level).unwrap();
+            let gadget = if level == 2 {
+                let low = parameters.level(level + 1).unwrap();
+                scheme
+                    .ring(level + 1)
+                    .unwrap()
+                    .gadget(1, 1u64 << low.base_bits(), low.modulus_digits())
+                    .centered_extend(BigInt::from(
+                        parameters.level(level).unwrap().modulus().as_ref().clone(),
+                    ))
+            } else {
+                ring.identity(1)
+            };
             let expected = scheme.scalar(level, parameters.scale(level).unwrap().clone()).unwrap() *
                 ring.polynomial([0.into(), 1.into()]) *
-                scheme.payload_at(&r, level).unwrap();
+                RnsBggRow::new([std::array::from_fn(|c| {
+                    payload.entry(0, c).clone() * gadget.clone()
+                })])
+                .unwrap();
             for c in 0..2 {
                 producer = producer
                     .private_output(format!("oracle-{level}-{c}"), expected.entry(0, c).clone())
@@ -7314,6 +7565,10 @@ mod bfv {
         let manifest =
             mxx_ir_core::artifact::export_validated_manifest(production.clone(), &producer)
                 .unwrap();
+        let oracle_columns =
+            [parameters.component_columns(2).unwrap(), parameters.component_columns(3).unwrap()];
+        let fresh_count = topology.fresh_digit_count;
+        let fresh_weights = refresh_plan.digits.weights(fresh_count);
         let online = Box::new(move |production: ProductionId, manifest: Manifest| {
             for (name, artifact) in &manifest.artifacts {
                 if name.starts_with("refresh") || name.starts_with("prf") {
@@ -7359,12 +7614,12 @@ mod bfv {
                 .unwrap();
             // No online secret exists before this point.
             let s = scheme.sample_mask_secret().unwrap();
-            let initial = BfvEncodingProgramValue::Scalar((
+            let initial = RnsBggEncodingProgramValue::Scalar((
                 scheme.encode(&s, &initial_key, &initial_material).unwrap(),
                 None,
             ));
             let digits = prf.evaluate(&scheme, initial).unwrap();
-            let data = BfvEncodingProgramValue::Scalar((
+            let data = RnsBggEncodingProgramValue::Scalar((
                 scheme.encode(&s, &data_key, &data_material).unwrap(),
                 None,
             ));
@@ -7381,22 +7636,41 @@ mod bfv {
             let refreshed = refreshed;
             let (fresh_start, _) = labels.group_range(None);
             let table = program.readout.canonical_coefficients().unwrap();
+            let columns = oracle_columns[0];
             let expected_fresh = (0..2)
-                .map(|component| {
-                    output_ring.polynomial((0..n as usize).map(|coefficient| {
-                        let exponent =
-                            vectors[fresh_start + component * n as usize + coefficient][selected];
-                        let value = &table[exponent % n as usize];
-                        (if exponent < n as usize {
-                            value.clone()
-                        } else {
-                            BigInt::from(1u8) - value
-                        })
-                        .into()
-                    }))
+                .map(|block| {
+                    Mat::concat(
+                        mxx_ir_core::node::ConcatAxis::Columns,
+                        (0..columns)
+                            .map(|column| {
+                                let component = block * columns + column;
+                                output_ring.polynomial((0..n as usize).map(|coefficient| {
+                                    fresh_weights
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(digit, weight)| {
+                                            let index = fresh_start +
+                                                (component * n as usize + coefficient) *
+                                                    fresh_count +
+                                                digit;
+                                            let exponent = vectors[index][selected];
+                                            let value = &table[exponent % n as usize];
+                                            let value = if exponent < n as usize {
+                                                value.clone()
+                                            } else {
+                                                BigInt::from(1u8) - value
+                                            };
+                                            value * BigInt::from(weight.clone())
+                                        })
+                                        .sum::<BigInt>()
+                                        .into()
+                                }))
+                            })
+                            .collect(),
+                    )
                 })
                 .collect::<Vec<_>>();
-            let benchmark_online = DslContext::new("bfv-refresh-online-benchmark")
+            let benchmark_online = DslContext::new("rns_bgg-refresh-online-benchmark")
                 .output("refreshed", refreshed.row().clone())
                 .unwrap()
                 .build()
@@ -7413,17 +7687,17 @@ mod bfv {
                     &scheme.prepare_online_masks(&s, &next.mask_bank()).unwrap(),
                 )
                 .unwrap();
-            let mut consumer = DslContext::new("bfv-refresh-online");
+            let mut consumer = DslContext::new("rns_bgg-refresh-online");
             for (level, encoding, key) in [
                 (2, &refreshed, &refresh.recomposition().output_key),
                 (3, &continued, next.output_key()),
             ] {
                 let ring = scheme.ring(level).unwrap();
-                let expected = BfvRow::new([std::array::from_fn(|c| {
+                let expected = RnsBggRow::new([std::array::from_fn(|c| {
                     ring.artifact_input(
                         production.clone(),
                         format!("oracle-{level}-{c}"),
-                        (1, 1),
+                        (1, oracle_columns[level - 2]),
                         ArtifactConfidentiality::Private,
                     )
                 })])
@@ -7470,7 +7744,42 @@ mod bfv {
                 ]
             })
             .collect();
-        BfvRoundTrip {
+        let mut noise_report = serde_json::to_value(&refresh_plan).unwrap();
+        noise_report["levels"] = serde_json::Value::Array(
+            parameters
+                .levels()
+                .iter()
+                .enumerate()
+                .map(|(level, ring)| {
+                    let mut report = serde_json::json!({
+                        "level": level,
+                        "ring_dimension": ring.ring_dimension(),
+                        "modulus_bits": ring.modulus().bits(),
+                        "crt_depth": ring.crt_depth(),
+                        "base_bits": ring.base_bits(),
+                        "state_columns": 2 * parameters.component_columns(level).unwrap(),
+                    });
+                    if let Some(low) = parameters.levels().get(level + 1) {
+                        // Fixed-chain algebraic polynomial-product counts, not kernel
+                        // launches or an end-to-end timing ratio. The terminal endpoint
+                        // has one column per secret component in both constructions.
+                        report["private_row_product_terms"] = (4 *
+                            low.modulus_digits() *
+                            parameters.component_columns(level + 1).unwrap())
+                        .into();
+                        report["one_prime_digit_row_product_terms"] = (4 *
+                            low.crt_depth() *
+                            parameters
+                                .levels()
+                                .get(level + 2)
+                                .map_or(1, |next| next.crt_depth()))
+                        .into();
+                    }
+                    report
+                })
+                .collect(),
+        );
+        RnsBggRoundTrip {
             parameters,
             producer,
             online,
@@ -7478,17 +7787,17 @@ mod bfv {
             benchmark_preprocessing,
             benchmark_online,
             residue_level: Some(2),
-            noise_report: serde_json::to_value(&refresh_plan).unwrap(),
+            noise_report,
         }
     }
 
     pub fn run<B: Backend>(
-        fixture: BfvRoundTrip,
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        fixture: RnsBggRoundTrip,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
     ) {
-        std::fs::create_dir_all("test_data/bfv_round_trip").unwrap();
-        let directory = tempfile::tempdir_in("test_data/bfv_round_trip").unwrap();
+        std::fs::create_dir_all("test_data/rns_bgg_round_trip").unwrap();
+        let directory = tempfile::tempdir_in("test_data/rns_bgg_round_trip").unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let mut backend = make_backend(&fixture.parameters);
         let produced = execute(
@@ -7518,14 +7827,15 @@ mod bfv {
     }
 
     pub fn trace_prf(
-        parameters: &BfvParameters,
+        parameters: &RnsBggParameters,
         execution: &mxx_exponent_lut::program::ExponentLutProgram,
-    ) -> mxx_exponent_lut::bfv::noise::BfvNoiseTrace {
+        selector_counts: &[usize],
+    ) -> mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseTrace {
         let inputs = BTreeMap::from([(
             *execution.inputs().keys().next().unwrap(),
-            mxx_exponent_lut::bfv::noise::BfvNoiseValue {
+            mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
                 level: 0,
-                bound: BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                 payload_l2_squared: 1u8.into(),
                 moments: Some(mxx_exponent_lut::noise_utils::NoiseMoments {
                     mean_numerator: 0.into(),
@@ -7552,12 +7862,12 @@ mod bfv {
                 panic!("composed PRF must contain direct products")
             };
             let (material, bound) =
-                mxx_exponent_lut::bfv::noise::BfvGateNoiseMaterial::from_one_hot_labels(
+                mxx_exponent_lut::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
                     step,
                     None,
-                    &[
-                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit(),
-                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit(),
+                    &vec![
+                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit();
+                        selector_counts[step]
                     ],
                 )
                 .unwrap();
@@ -7565,7 +7875,7 @@ mod bfv {
             materials
                 .insert(mxx_exponent_lut::program::ProgramGateInstance::Gate { step }, material);
         }
-        mxx_exponent_lut::bfv::noise::trace_program(
+        mxx_exponent_lut::rns_bgg::noise::trace_program(
             parameters,
             execution,
             &mxx_exponent_lut::program::ProgramBindings::new(
@@ -7583,16 +7893,16 @@ mod bfv {
 }
 
 #[test]
-fn test_gpu_bfv_refresh_artifacts_with_native_prf_digits() {
-    use mxx_primitives::{element::PolyElem, poly::Poly};
+fn test_gpu_rns_bgg_refresh_artifacts_with_native_prf_digits() {
+    use mxx_primitives::{element::PolyElem, matrix::PolyMatrix, poly::Poly};
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     let average = selected_average_config();
-    println!("bfv_refresh_average_case_config={average:?}");
+    println!("rns_bgg_refresh_average_case_config={average:?}");
     for device in devices {
-        let fixture = bfv::refresh(average.as_ref());
-        println!("bfv_noise_simulation={}", fixture.noise_report);
-        bfv::run(
+        let fixture = rns_bgg::refresh(average.as_ref());
+        println!("rns_bgg_noise_simulation={}", fixture.noise_report);
+        rns_bgg::run(
             fixture,
             |parameters| {
                 let levels = parameters
@@ -7604,7 +7914,7 @@ fn test_gpu_bfv_refresh_artifacts_with_native_prf_digits() {
                         GpuDCRTPolyParams::new_with_gpu(
                             level.ring_dimension(),
                             level.to_crt().0,
-                            1,
+                            level.base_bits(),
                             vec![device],
                             None,
                             None,
@@ -7615,8 +7925,11 @@ fn test_gpu_bfv_refresh_artifacts_with_native_prf_digits() {
             },
             |matrix, name, q, bound| {
                 for shard in matrix.shards() {
-                    for poly in
-                        shard.value.to_cpu_matrix().block_entries(0..1, 0..1).into_iter().flatten()
+                    let cpu = shard.value.to_cpu_matrix();
+                    for poly in cpu
+                        .block_entries(0..cpu.row_size(), 0..cpu.col_size())
+                        .into_iter()
+                        .flatten()
                     {
                         for coefficient in poly.coeffs() {
                             let magnitude =

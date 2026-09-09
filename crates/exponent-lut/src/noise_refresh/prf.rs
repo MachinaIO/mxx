@@ -362,7 +362,7 @@ impl<S: ExponentLUTFixedRhsScheme> PrfSelectionInputs<S> {
     /// `labels` contains [output][selector capacity], whereas the prepared
     /// selection retains only [output][active member]. The construction
     /// contract requires complete rows and a nonempty valid active range.
-    /// BFV callers supply labels in this block's RHS ring; BGG may share one
+    /// RNS-BGG callers supply labels in this block's RHS ring; BGG may share one
     /// global label family and selector family across blocks.
     pub fn new(
         selectors: S::FixedRhs,

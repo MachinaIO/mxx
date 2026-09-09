@@ -1,6 +1,6 @@
-//! GPU fixtures for BFV operations, artifact reuse, and refresh continuation.
+//! GPU fixtures for RNS-BGG operations, artifact reuse, and refresh continuation.
 use super::{
-    BfvNoiseBound, BfvParameters,
+    RnsBggNoiseBound, RnsBggParameters,
     encoding::{
         encoding_tests::check_preprocessing_phases,
         family_tests::{composed_rhs_fixture, structural_selection_fixture},
@@ -8,7 +8,7 @@ use super::{
         refresh_tests::refresh_fixture,
         terminal_tests::{routed_terminal_fixture, terminal_fixture},
     },
-    noise::BfvTerminalNoise,
+    noise::RnsBggTerminalNoise,
     public_key::{
         program_artifacts_tests::check_program_artifacts, readout_tests::check_full_domain,
         terminal_artifact_tests::check_terminal_artifacts, terminal_family_tests::fixture,
@@ -16,6 +16,7 @@ use super::{
 };
 use mxx_primitives::{
     element::PolyElem,
+    matrix::PolyMatrix,
     poly::{
         Poly, PolyParams,
         dcrt::{
@@ -36,7 +37,7 @@ fn gpu_parameters(level: &DCRTPolyParams, device: i32) -> GpuDCRTPolyParams {
     GpuDCRTPolyParams::new_with_gpu(
         level.ring_dimension(),
         level.to_crt().0,
-        1,
+        level.base_bits(),
         vec![device],
         None,
         None,
@@ -45,7 +46,7 @@ fn gpu_parameters(level: &DCRTPolyParams, device: i32) -> GpuDCRTPolyParams {
 }
 
 #[test]
-fn test_gpu_bfv_direct_private_mul_relation_rounding_and_graph() {
+fn test_gpu_rns_bgg_direct_private_mul_relation_rounding_and_graph() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -58,7 +59,11 @@ fn test_gpu_bfv_direct_private_mul_relation_rounding_and_graph() {
                 for shard in matrix.shards() {
                     // Observation only; all products and ModDown execute on GPU.
                     let cpu = shard.value.to_cpu_matrix();
-                    for polynomial in cpu.block_entries(0..1, 0..1).into_iter().flatten() {
+                    for polynomial in cpu
+                        .block_entries(0..cpu.row_size(), 0..cpu.col_size())
+                        .into_iter()
+                        .flatten()
+                    {
                         for coefficient in polynomial.coeffs() {
                             let absolute = coefficient.value().clone().min(q - coefficient.value());
                             assert!(&absolute <= bound, "GPU {device}: {absolute} exceeds {bound}");
@@ -71,7 +76,7 @@ fn test_gpu_bfv_direct_private_mul_relation_rounding_and_graph() {
 }
 
 #[test]
-fn test_gpu_bfv_preprocessing_reused_with_independent_online_secrets() {
+fn test_gpu_rns_bgg_preprocessing_reused_with_independent_online_secrets() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -85,7 +90,11 @@ fn test_gpu_bfv_preprocessing_reused_with_independent_online_secrets() {
                     // Observation only: both phases and artifact reload have
                     // already executed on the GPU, without CPU arithmetic.
                     let cpu = shard.value.to_cpu_matrix();
-                    for polynomial in cpu.block_entries(0..1, 0..1).into_iter().flatten() {
+                    for polynomial in cpu
+                        .block_entries(0..cpu.row_size(), 0..cpu.col_size())
+                        .into_iter()
+                        .flatten()
+                    {
                         for coefficient in polynomial.coeffs() {
                             let absolute = coefficient.value().clone().min(q - coefficient.value());
                             assert!(&absolute <= bound, "{name} on GPU {device}: {absolute}");
@@ -98,16 +107,18 @@ fn test_gpu_bfv_preprocessing_reused_with_independent_online_secrets() {
 }
 
 #[test]
-fn test_gpu_bfv_structural_program_preserves_relations() {
+fn test_gpu_rns_bgg_structural_program_preserves_relations() {
     check_fixture(structural_selection_fixture);
 }
 
 #[test]
-fn test_gpu_bfv_composed_rhs_preserves_relations() {
+fn test_gpu_rns_bgg_composed_rhs_preserves_relations() {
     check_fixture(composed_rhs_fixture);
 }
 
-fn check_fixture(fixture: fn() -> (mxx_ir_core::ValidatedGraph, BfvParameters, BfvNoiseBound)) {
+fn check_fixture(
+    fixture: fn() -> (mxx_ir_core::ValidatedGraph, RnsBggParameters, RnsBggNoiseBound),
+) {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -135,7 +146,11 @@ fn check_fixture(fixture: fn() -> (mxx_ir_core::ValidatedGraph, BfvParameters, B
                 // Test-only observation after device execution; production
                 // conversion and evaluation never transfer coefficients here.
                 let polynomial = shard.value.to_cpu_matrix();
-                for entry in polynomial.block_entries(0..1, 0..1).into_iter().flatten() {
+                for entry in polynomial
+                    .block_entries(0..polynomial.row_size(), 0..polynomial.col_size())
+                    .into_iter()
+                    .flatten()
+                {
                     for coefficient in entry.coeffs() {
                         if name.contains("difference") {
                             assert_eq!(coefficient.value(), &BigUint::from(0u8));
@@ -153,7 +168,7 @@ fn check_fixture(fixture: fn() -> (mxx_ir_core::ValidatedGraph, BfvParameters, B
 }
 
 #[test]
-fn test_gpu_bfv_program_artifacts_restore_all_gate_kinds_and_public_values() {
+fn test_gpu_rns_bgg_program_artifacts_restore_all_gate_kinds_and_public_values() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -180,21 +195,26 @@ fn test_gpu_bfv_program_artifacts_restore_all_gate_kinds_and_public_values() {
 }
 
 #[test]
-fn test_gpu_bfv_affine_readout_covers_full_native_domain() {
+fn test_gpu_rns_bgg_affine_readout_covers_full_native_domain() {
     check_gpu_domain(0, [vec![1.into()], vec![]], false, false);
 }
 
 #[test]
-fn test_gpu_bfv_affine_readout_covers_strided_native_domain() {
+fn test_gpu_rns_bgg_affine_readout_covers_strided_native_domain() {
     check_gpu_domain(1, [vec![1.into()], vec![]], false, false);
 }
 
 #[test]
-fn test_gpu_bfv_weighted_readout_preserves_noise_multiplier() {
+fn test_gpu_rns_bgg_weighted_readout_preserves_noise_multiplier() {
     check_gpu_domain(1, [vec![], vec![0.into(), 17.into()]], false, false);
 }
 
-fn check_gpu_domain(stride_log2: u32, weight: super::BfvReadoutWeight, indexed: bool, sum: bool) {
+fn check_gpu_domain(
+    stride_log2: u32,
+    weight: super::RnsBggReadoutWeight,
+    indexed: bool,
+    sum: bool,
+) {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -211,7 +231,11 @@ fn check_gpu_domain(stride_log2: u32, weight: super::BfvReadoutWeight, indexed: 
                 for shard in matrix.shards() {
                     // Observation only, after all readout arithmetic executes on the GPU.
                     let cpu = shard.value.to_cpu_matrix();
-                    for polynomial in cpu.block_entries(0..1, 0..1).into_iter().flatten() {
+                    for polynomial in cpu
+                        .block_entries(0..cpu.row_size(), 0..cpu.col_size())
+                        .into_iter()
+                        .flatten()
+                    {
                         for coefficient in polynomial.coeffs() {
                             let absolute = coefficient.value().clone().min(q - coefficient.value());
                             assert!(&absolute <= bound, "{name} on GPU {device}: {absolute}");
@@ -224,19 +248,19 @@ fn check_gpu_domain(stride_log2: u32, weight: super::BfvReadoutWeight, indexed: 
 }
 
 #[test]
-fn test_gpu_bfv_indexed_readout_weights_survive_artifact_reopen() {
+fn test_gpu_rns_bgg_indexed_readout_weights_survive_artifact_reopen() {
     check_gpu_domain(1, [vec![17.into()], vec![]], true, false);
 }
 
 #[test]
-fn test_gpu_bfv_aggregate_readout_survives_artifact_reopen() {
+fn test_gpu_rns_bgg_aggregate_readout_survives_artifact_reopen() {
     for indexed in [false, true] {
         check_gpu_domain(2, [vec![17.into()], vec![]], indexed, true);
     }
 }
 
 #[test]
-fn test_gpu_bfv_noiseless_refresh_reconstructs_fresh_error_and_continues() {
+fn test_gpu_rns_bgg_noiseless_refresh_reconstructs_fresh_error_and_continues() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -264,8 +288,9 @@ fn test_gpu_bfv_noiseless_refresh_reconstructs_fresh_error_and_continues() {
             let q = parameters.level(level).unwrap().modulus();
             let limit = if level == 1 { BigUint::from(0u8) } else { bound.error.clone() };
             for shard in matrix.shards() {
+                let cpu = shard.value.to_cpu_matrix();
                 for poly in
-                    shard.value.to_cpu_matrix().block_entries(0..1, 0..1).into_iter().flatten()
+                    cpu.block_entries(0..cpu.row_size(), 0..cpu.col_size()).into_iter().flatten()
                 {
                     for coefficient in poly.coeffs() {
                         let magnitude =
@@ -279,7 +304,7 @@ fn test_gpu_bfv_noiseless_refresh_reconstructs_fresh_error_and_continues() {
 }
 
 #[test]
-fn test_gpu_bfv_terminal_artifacts_reused_with_independent_online_secrets() {
+fn test_gpu_rns_bgg_terminal_artifacts_reused_with_independent_online_secrets() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -293,7 +318,11 @@ fn test_gpu_bfv_terminal_artifacts_reused_with_independent_online_secrets() {
                     // Observation only: both phases and artifact reload have
                     // already executed on the GPU, without CPU arithmetic.
                     let cpu = shard.value.to_cpu_matrix();
-                    for polynomial in cpu.block_entries(0..1, 0..1).into_iter().flatten() {
+                    for polynomial in cpu
+                        .block_entries(0..cpu.row_size(), 0..cpu.col_size())
+                        .into_iter()
+                        .flatten()
+                    {
                         for coefficient in polynomial.coeffs() {
                             let absolute = coefficient.value().clone().min(q - coefficient.value());
                             assert!(&absolute <= bound, "{name} on GPU {device}: {absolute}");
@@ -306,7 +335,7 @@ fn test_gpu_bfv_terminal_artifacts_reused_with_independent_online_secrets() {
 }
 
 #[test]
-fn test_gpu_bfv_terminal_family_matches_scalar_members() {
+fn test_gpu_rns_bgg_terminal_family_matches_scalar_members() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -329,7 +358,9 @@ fn test_gpu_bfv_terminal_family_matches_scalar_members() {
                 // Test-only observation; all target generation, accumulations,
                 // and exact modulus switches have already executed on GPU.
                 let cpu = shard.value.to_cpu_matrix();
-                for polynomial in cpu.block_entries(0..1, 0..1).into_iter().flatten() {
+                for polynomial in
+                    cpu.block_entries(0..cpu.row_size(), 0..cpu.col_size()).into_iter().flatten()
+                {
                     for coefficient in polynomial.coeffs() {
                         assert!(coefficient.value().is_zero(), "{name} on GPU {device}");
                     }
@@ -340,7 +371,7 @@ fn test_gpu_bfv_terminal_family_matches_scalar_members() {
 }
 
 #[test]
-fn test_gpu_bfv_indexed_terminal_artifacts_reopen_with_new_online_secrets() {
+fn test_gpu_rns_bgg_indexed_terminal_artifacts_reopen_with_new_online_secrets() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -353,7 +384,11 @@ fn test_gpu_bfv_indexed_terminal_artifacts_reopen_with_new_online_secrets() {
                 for shard in matrix.shards() {
                     // Observe only after GPU generation, artifact I/O, and evaluation.
                     let cpu = shard.value.to_cpu_matrix();
-                    for polynomial in cpu.block_entries(0..1, 0..1).into_iter().flatten() {
+                    for polynomial in cpu
+                        .block_entries(0..cpu.row_size(), 0..cpu.col_size())
+                        .into_iter()
+                        .flatten()
+                    {
                         for coefficient in polynomial.coeffs() {
                             let absolute = coefficient.value().clone().min(q - coefficient.value());
                             assert!(
@@ -369,17 +404,17 @@ fn test_gpu_bfv_indexed_terminal_artifacts_reopen_with_new_online_secrets() {
 }
 
 #[test]
-fn test_gpu_bfv_terminal_rows_large_weights_and_raw_batch_relations() {
+fn test_gpu_rns_bgg_terminal_rows_large_weights_and_raw_batch_relations() {
     check_terminal_fixture(terminal_fixture);
 }
 
 #[test]
-fn test_gpu_bfv_terminal_indexed_routing_keeps_fresh_error_unscaled() {
+fn test_gpu_rns_bgg_terminal_indexed_routing_keeps_fresh_error_unscaled() {
     check_terminal_fixture(routed_terminal_fixture);
 }
 
 fn check_terminal_fixture(
-    fixture: fn() -> (mxx_ir_core::ValidatedGraph, BfvParameters, BfvTerminalNoise),
+    fixture: fn() -> (mxx_ir_core::ValidatedGraph, RnsBggParameters, RnsBggTerminalNoise),
 ) {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
@@ -404,7 +439,9 @@ fn check_terminal_fixture(
                 // Test-only observation; all target generation, accumulations,
                 // and exact modulus switches have already executed on GPU.
                 let cpu = shard.value.to_cpu_matrix();
-                for polynomial in cpu.block_entries(0..1, 0..1).into_iter().flatten() {
+                for polynomial in
+                    cpu.block_entries(0..cpu.row_size(), 0..cpu.col_size()).into_iter().flatten()
+                {
                     for coefficient in polynomial.coeffs() {
                         let absolute =
                             coefficient.value().clone().min(q.as_ref() - coefficient.value());
@@ -421,7 +458,7 @@ fn check_terminal_fixture(
 }
 
 #[test]
-fn test_gpu_bfv_composed_prf_two_steps_active_range_and_signed_labels() {
+fn test_gpu_rns_bgg_composed_prf_two_steps_active_range_and_signed_labels() {
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU test requires a detected device");
     for device in devices {
@@ -435,8 +472,11 @@ fn test_gpu_bfv_composed_prf_two_steps_active_range_and_signed_labels() {
             |matrix, q, bound| {
                 for shard in matrix.shards() {
                     // Observe only after both composed selections run on GPU.
-                    for polynomial in
-                        shard.value.to_cpu_matrix().block_entries(0..1, 0..1).into_iter().flatten()
+                    let cpu = shard.value.to_cpu_matrix();
+                    for polynomial in cpu
+                        .block_entries(0..cpu.row_size(), 0..cpu.col_size())
+                        .into_iter()
+                        .flatten()
                     {
                         for coefficient in polynomial.coeffs() {
                             let absolute = coefficient.value().clone().min(q - coefficient.value());

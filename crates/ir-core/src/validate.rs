@@ -719,8 +719,13 @@ fn validate_node(
         }
         NodeKind::CenteredExtend { modulus } | NodeKind::BlockModSwitch { modulus, .. } => {
             require_arity(scope, node, 1)?;
-            let input = match argument(scope, values, node, 0)? {
-                ConcreteWireType::Matrix(matrix) => matrix.clone(),
+            let (input, bound) = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => (matrix.clone(), None),
+                ConcreteWireType::Preimage { matrix, max_coefficient_bound }
+                    if matches!(node.kind, NodeKind::CenteredExtend { .. }) =>
+                {
+                    (matrix.clone(), Some(max_coefficient_bound.clone()))
+                }
                 _ => {
                     return node_error(
                         scope,
@@ -758,7 +763,13 @@ fn validate_node(
                     "invalid exact RNS modulus inclusion or plaintext modulus",
                 );
             }
-            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]
+            let matrix = ConcreteMatrixType { modulus, ..input };
+            vec![match bound {
+                Some(max_coefficient_bound) => {
+                    ConcreteWireType::Preimage { matrix, max_coefficient_bound }
+                }
+                None => ConcreteWireType::Matrix(matrix),
+            }]
         }
         NodeKind::RingAutomorphism { index } => {
             require_arity(scope, node, 1)?;

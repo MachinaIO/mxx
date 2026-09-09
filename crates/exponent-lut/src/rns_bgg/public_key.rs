@@ -1,15 +1,15 @@
-//! BFV public preparation and prepared artifact transport.
+//! RNS-BGG public preparation and prepared artifact transport.
 use super::*;
 
-impl<M: GraphValue> GraphValue for BfvPublicKeyFamily<M> {
-    type Schema = BfvPublicKeyFamily<M::Schema>;
+impl<M: GraphValue> GraphValue for RnsBggPublicKeyFamily<M> {
+    type Schema = RnsBggPublicKeyFamily<M::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         self.matrices.flatten()
     }
 
     fn schema(&self) -> Self::Schema {
-        BfvPublicKeyFamily {
+        RnsBggPublicKeyFamily {
             matrices: self.matrices.schema(),
             level: self.level,
             id: self.id,
@@ -29,11 +29,11 @@ impl<M: GraphValue> GraphValue for BfvPublicKeyFamily<M> {
     }
 }
 
-impl<M: GraphValueSchema> GraphValueSchema for BfvPublicKeyFamily<M> {
-    type Value = BfvPublicKeyFamily<M::Value>;
+impl<M: GraphValueSchema> GraphValueSchema for RnsBggPublicKeyFamily<M> {
+    type Value = RnsBggPublicKeyFamily<M::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPublicKeyFamily {
+        RnsBggPublicKeyFamily {
             matrices: self.matrices.placeholders_from(next),
             level: self.level,
             id: self.id,
@@ -47,15 +47,15 @@ impl<M: GraphValueSchema> GraphValueSchema for BfvPublicKeyFamily<M> {
     }
 }
 
-impl<M: GraphValue> GraphValue for BfvPublicKey<M> {
-    type Schema = BfvPublicKey<M::Schema>;
+impl<M: GraphValue> GraphValue for RnsBggPublicKey<M> {
+    type Schema = RnsBggPublicKey<M::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         self.matrix.flatten()
     }
 
     fn schema(&self) -> Self::Schema {
-        BfvPublicKey {
+        RnsBggPublicKey {
             matrix: self.matrix.schema(),
             level: self.level,
             id: self.id,
@@ -73,11 +73,11 @@ impl<M: GraphValue> GraphValue for BfvPublicKey<M> {
     }
 }
 
-impl<M: GraphValueSchema> GraphValueSchema for BfvPublicKey<M> {
-    type Value = BfvPublicKey<M::Value>;
+impl<M: GraphValueSchema> GraphValueSchema for RnsBggPublicKey<M> {
+    type Value = RnsBggPublicKey<M::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPublicKey {
+        RnsBggPublicKey {
             matrix: self.matrix.placeholders_from(next),
             level: self.level,
             id: self.id,
@@ -90,13 +90,13 @@ impl<M: GraphValueSchema> GraphValueSchema for BfvPublicKey<M> {
     }
 }
 
-impl<C: GraphValue, L: GraphValue> GraphValue for BfvPrivateRhs<C, L> {
-    type Schema = BfvPrivateRhs<C::Schema, L::Schema>;
+impl<C: GraphValue, L: GraphValue> GraphValue for RnsBggPrivateRhs<C, L> {
+    type Schema = RnsBggPrivateRhs<C::Schema, L::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.ciphertext.flatten(), self.lifted_ciphertext.flatten()].concat()
     }
     fn schema(&self) -> Self::Schema {
-        BfvPrivateRhs {
+        RnsBggPrivateRhs {
             ciphertext: self.ciphertext.schema(),
             lifted_ciphertext: self.lifted_ciphertext.schema(),
             rhs_id: self.rhs_id,
@@ -120,10 +120,10 @@ impl<C: GraphValue, L: GraphValue> GraphValue for BfvPrivateRhs<C, L> {
         })
     }
 }
-impl<C: GraphValueSchema, L: GraphValueSchema> GraphValueSchema for BfvPrivateRhs<C, L> {
-    type Value = BfvPrivateRhs<C::Value, L::Value>;
+impl<C: GraphValueSchema, L: GraphValueSchema> GraphValueSchema for RnsBggPrivateRhs<C, L> {
+    type Value = RnsBggPrivateRhs<C::Value, L::Value>;
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPrivateRhs {
+        RnsBggPrivateRhs {
             ciphertext: self.ciphertext.placeholders_from(next),
             lifted_ciphertext: self.lifted_ciphertext.placeholders_from(next),
             rhs_id: self.rhs_id,
@@ -137,8 +137,8 @@ impl<C: GraphValueSchema, L: GraphValueSchema> GraphValueSchema for BfvPrivateRh
     }
 }
 
-impl<K: GraphValue, C: GraphValue> GraphValue for BfvPreparedPrivateMul<K, C> {
-    type Schema = BfvPreparedPrivateMul<K::Schema, C::Schema>;
+impl<K: GraphValue, C: GraphValue, D: GraphValue> GraphValue for RnsBggPreparedPrivateMul<K, C, D> {
+    type Schema = RnsBggPreparedPrivateMul<K::Schema, C::Schema, D::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.input.flatten(), self.output.flatten(), self.rhs.flatten()]
@@ -148,7 +148,7 @@ impl<K: GraphValue, C: GraphValue> GraphValue for BfvPreparedPrivateMul<K, C> {
     }
 
     fn schema(&self) -> Self::Schema {
-        BfvPreparedPrivateMul {
+        RnsBggPreparedPrivateMul {
             input: self.input.schema(),
             output: self.output.schema(),
             rhs: self.rhs.schema(),
@@ -156,7 +156,7 @@ impl<K: GraphValue, C: GraphValue> GraphValue for BfvPreparedPrivateMul<K, C> {
     }
 
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (input, output, rhs) = <(K, K, BfvPrivateRhs<C, C>)>::from_values(
+        let (input, output, rhs) = <(K, K, RnsBggPrivateRhs<C, D>)>::from_values(
             &(schema.input.clone(), schema.output.clone(), schema.rhs.clone()),
             values,
         )?;
@@ -164,11 +164,13 @@ impl<K: GraphValue, C: GraphValue> GraphValue for BfvPreparedPrivateMul<K, C> {
     }
 }
 
-impl<K: GraphValueSchema, C: GraphValueSchema> GraphValueSchema for BfvPreparedPrivateMul<K, C> {
-    type Value = BfvPreparedPrivateMul<K::Value, C::Value>;
+impl<K: GraphValueSchema, C: GraphValueSchema, D: GraphValueSchema> GraphValueSchema
+    for RnsBggPreparedPrivateMul<K, C, D>
+{
+    type Value = RnsBggPreparedPrivateMul<K::Value, C::Value, D::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPreparedPrivateMul {
+        RnsBggPreparedPrivateMul {
             input: self.input.placeholders_from(next),
             output: self.output.placeholders_from(next),
             rhs: self.rhs.placeholders_from(next),
@@ -183,8 +185,8 @@ impl<K: GraphValueSchema, C: GraphValueSchema> GraphValueSchema for BfvPreparedP
     }
 }
 
-impl<K: GraphValue, M: GraphValue> GraphValue for BfvPreparedLinear<K, M> {
-    type Schema = BfvPreparedLinear<K::Schema, M::Schema>;
+impl<K: GraphValue, M: GraphValue> GraphValue for RnsBggPreparedLinear<K, M> {
+    type Schema = RnsBggPreparedLinear<K::Schema, M::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.lhs.flatten(), self.rhs.flatten(), self.output.flatten(), self.operation.flatten()]
@@ -194,7 +196,7 @@ impl<K: GraphValue, M: GraphValue> GraphValue for BfvPreparedLinear<K, M> {
     }
 
     fn schema(&self) -> Self::Schema {
-        BfvPreparedLinear {
+        RnsBggPreparedLinear {
             lhs: self.lhs.schema(),
             rhs: self.rhs.schema(),
             output: self.output.schema(),
@@ -216,11 +218,11 @@ impl<K: GraphValue, M: GraphValue> GraphValue for BfvPreparedLinear<K, M> {
     }
 }
 
-impl<K: GraphValueSchema, M: GraphValueSchema> GraphValueSchema for BfvPreparedLinear<K, M> {
-    type Value = BfvPreparedLinear<K::Value, M::Value>;
+impl<K: GraphValueSchema, M: GraphValueSchema> GraphValueSchema for RnsBggPreparedLinear<K, M> {
+    type Value = RnsBggPreparedLinear<K::Value, M::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPreparedLinear {
+        RnsBggPreparedLinear {
             lhs: self.lhs.placeholders_from(next),
             rhs: self.rhs.placeholders_from(next),
             output: self.output.placeholders_from(next),
@@ -241,14 +243,12 @@ impl<K: GraphValueSchema, M: GraphValueSchema> GraphValueSchema for BfvPreparedL
     }
 }
 
-impl<M: GraphValue> GraphValue for PreparedBranch<M> {
-    type Schema = PreparedBranch<M::Schema>;
+impl<M: GraphValue, D: GraphValue> GraphValue for PreparedBranch<M, D> {
+    type Schema = PreparedBranch<M::Schema, D::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         [
             self.lifted_ciphertext.flatten(),
-            self.ciphertext.flatten(),
-            self.intermediate.flatten(),
             self.lifted_intermediate.flatten(),
             self.mask_public.flatten(),
         ]
@@ -260,8 +260,6 @@ impl<M: GraphValue> GraphValue for PreparedBranch<M> {
     fn schema(&self) -> Self::Schema {
         PreparedBranch {
             lifted_ciphertext: self.lifted_ciphertext.schema(),
-            ciphertext: self.ciphertext.schema(),
-            intermediate: self.intermediate.schema(),
             lifted_intermediate: self.lifted_intermediate.schema(),
             mask_public: self.mask_public.schema(),
             sigma: self.sigma,
@@ -269,36 +267,24 @@ impl<M: GraphValue> GraphValue for PreparedBranch<M> {
     }
 
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (lifted_ciphertext, ciphertext, intermediate, lifted_intermediate, mask_public) =
-            <(M, M, M, M, M)>::from_values(
-                &(
-                    schema.lifted_ciphertext.clone(),
-                    schema.ciphertext.clone(),
-                    schema.intermediate.clone(),
-                    schema.lifted_intermediate.clone(),
-                    schema.mask_public.clone(),
-                ),
-                values,
-            )?;
-        Ok(Self {
-            lifted_ciphertext,
-            ciphertext,
-            intermediate,
-            lifted_intermediate,
-            mask_public,
-            sigma: schema.sigma,
-        })
+        let (lifted_ciphertext, lifted_intermediate, mask_public) = <(D, D, M)>::from_values(
+            &(
+                schema.lifted_ciphertext.clone(),
+                schema.lifted_intermediate.clone(),
+                schema.mask_public.clone(),
+            ),
+            values,
+        )?;
+        Ok(Self { lifted_ciphertext, lifted_intermediate, mask_public, sigma: schema.sigma })
     }
 }
 
-impl<M: GraphValueSchema> GraphValueSchema for PreparedBranch<M> {
-    type Value = PreparedBranch<M::Value>;
+impl<M: GraphValueSchema, D: GraphValueSchema> GraphValueSchema for PreparedBranch<M, D> {
+    type Value = PreparedBranch<M::Value, D::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
         PreparedBranch {
             lifted_ciphertext: self.lifted_ciphertext.placeholders_from(next),
-            ciphertext: self.ciphertext.placeholders_from(next),
-            intermediate: self.intermediate.placeholders_from(next),
             lifted_intermediate: self.lifted_intermediate.placeholders_from(next),
             mask_public: self.mask_public.placeholders_from(next),
             sigma: self.sigma,
@@ -308,8 +294,6 @@ impl<M: GraphValueSchema> GraphValueSchema for PreparedBranch<M> {
     fn wire_types(&self) -> Vec<WireType> {
         [
             self.lifted_ciphertext.wire_types(),
-            self.ciphertext.wire_types(),
-            self.intermediate.wire_types(),
             self.lifted_intermediate.wire_types(),
             self.mask_public.wire_types(),
         ]
@@ -319,8 +303,8 @@ impl<M: GraphValueSchema> GraphValueSchema for PreparedBranch<M> {
     }
 }
 
-impl<K: GraphValue, M: GraphValue> GraphValue for BfvPreparedLut<K, M> {
-    type Schema = BfvPreparedLut<K::Schema, M::Schema>;
+impl<K: GraphValue, M: GraphValue, D: GraphValue> GraphValue for RnsBggPreparedLut<K, M, D> {
+    type Schema = RnsBggPreparedLut<K::Schema, M::Schema, D::Schema>;
 
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.input.flatten(), self.output.flatten(), self.branches.flatten()]
@@ -330,7 +314,7 @@ impl<K: GraphValue, M: GraphValue> GraphValue for BfvPreparedLut<K, M> {
     }
 
     fn schema(&self) -> Self::Schema {
-        BfvPreparedLut {
+        RnsBggPreparedLut {
             input: self.input.schema(),
             output: self.output.schema(),
             branches: self.branches.schema(),
@@ -339,7 +323,7 @@ impl<K: GraphValue, M: GraphValue> GraphValue for BfvPreparedLut<K, M> {
     }
 
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (input, output, branches) = <(K, K, Vec<PreparedBranch<M>>)>::from_values(
+        let (input, output, branches) = <(K, K, Vec<PreparedBranch<M, D>>)>::from_values(
             &(schema.input.clone(), schema.output.clone(), schema.branches.clone()),
             values,
         )?;
@@ -347,11 +331,13 @@ impl<K: GraphValue, M: GraphValue> GraphValue for BfvPreparedLut<K, M> {
     }
 }
 
-impl<K: GraphValueSchema, M: GraphValueSchema> GraphValueSchema for BfvPreparedLut<K, M> {
-    type Value = BfvPreparedLut<K::Value, M::Value>;
+impl<K: GraphValueSchema, M: GraphValueSchema, D: GraphValueSchema> GraphValueSchema
+    for RnsBggPreparedLut<K, M, D>
+{
+    type Value = RnsBggPreparedLut<K::Value, M::Value, D::Value>;
 
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPreparedLut {
+        RnsBggPreparedLut {
             input: self.input.placeholders_from(next),
             output: self.output.placeholders_from(next),
             branches: self.branches.placeholders_from(next),
@@ -415,8 +401,10 @@ impl<M: GraphValueSchema> GraphValueSchema for LinearOperation<M> {
     }
 }
 
-impl<K: GraphValue, M: GraphValue, P: GraphValue> GraphValue for PreparedGate<K, M, P> {
-    type Schema = PreparedGate<K::Schema, M::Schema, P::Schema>;
+impl<K: GraphValue, M: GraphValue, P: GraphValue, D: GraphValue> GraphValue
+    for PreparedGate<K, M, P, D>
+{
+    type Schema = PreparedGate<K::Schema, M::Schema, P::Schema, D::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         match self {
             Self::MulPrivate(value) => value.flatten(),
@@ -436,20 +424,20 @@ impl<K: GraphValue, M: GraphValue, P: GraphValue> GraphValue for PreparedGate<K,
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         Ok(match schema {
             PreparedGate::MulPrivate(schema) => {
-                Self::MulPrivate(BfvPreparedPrivateMul::from_values(schema, values)?)
+                Self::MulPrivate(RnsBggPreparedPrivateMul::from_values(schema, values)?)
             }
             PreparedGate::Linear(schema) => {
-                Self::Linear(BfvPreparedLinear::from_values(schema, values)?)
+                Self::Linear(RnsBggPreparedLinear::from_values(schema, values)?)
             }
-            PreparedGate::Lut(schema) => Self::Lut(BfvPreparedLut::from_values(schema, values)?),
+            PreparedGate::Lut(schema) => Self::Lut(RnsBggPreparedLut::from_values(schema, values)?),
             PreparedGate::Reduction(schema) => Self::Reduction(K::from_values(schema, values)?),
         })
     }
 }
-impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema> GraphValueSchema
-    for PreparedGate<K, M, P>
+impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema, D: GraphValueSchema>
+    GraphValueSchema for PreparedGate<K, M, P, D>
 {
-    type Value = PreparedGate<K::Value, M::Value, P::Value>;
+    type Value = PreparedGate<K::Value, M::Value, P::Value, D::Value>;
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
         match self {
             Self::MulPrivate(value) => PreparedGate::MulPrivate(value.placeholders_from(next)),
@@ -467,13 +455,13 @@ impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema> GraphValueSc
         }
     }
 }
-impl<G: GraphValue, P: GraphValue> GraphValue for BfvProgramCache<G, P> {
-    type Schema = BfvProgramCache<G::Schema, P::Schema>;
+impl<G: GraphValue, P: GraphValue> GraphValue for RnsBggProgramCache<G, P> {
+    type Schema = RnsBggProgramCache<G::Schema, P::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.gates.flatten(), self.plaintexts.flatten()].concat()
     }
     fn schema(&self) -> Self::Schema {
-        BfvProgramCache { gates: self.gates.schema(), plaintexts: self.plaintexts.schema() }
+        RnsBggProgramCache { gates: self.gates.schema(), plaintexts: self.plaintexts.schema() }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let (gates, plaintexts) =
@@ -484,10 +472,10 @@ impl<G: GraphValue, P: GraphValue> GraphValue for BfvProgramCache<G, P> {
         Ok(Self { gates, plaintexts })
     }
 }
-impl<G: GraphValueSchema, P: GraphValueSchema> GraphValueSchema for BfvProgramCache<G, P> {
-    type Value = BfvProgramCache<G::Value, P::Value>;
+impl<G: GraphValueSchema, P: GraphValueSchema> GraphValueSchema for RnsBggProgramCache<G, P> {
+    type Value = RnsBggProgramCache<G::Value, P::Value>;
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvProgramCache {
+        RnsBggProgramCache {
             gates: self.gates.placeholders_from(next),
             plaintexts: self.plaintexts.placeholders_from(next),
         }
@@ -518,13 +506,13 @@ impl<M: GraphValueSchema> GraphValueSchema for MaskBranch<M> {
         MaskBranch { public: self.public.placeholders_from(next), sigma: self.sigma }
     }
 }
-impl<M: GraphValue> GraphValue for BfvLutMaterial<M> {
-    type Schema = BfvLutMaterial<M::Schema>;
+impl<M: GraphValue> GraphValue for RnsBggLutMaterial<M> {
+    type Schema = RnsBggLutMaterial<M::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         self.branches.flatten()
     }
     fn schema(&self) -> Self::Schema {
-        BfvLutMaterial {
+        RnsBggLutMaterial {
             branches: self.branches.schema(),
             mask_bank: self.mask_bank,
             id: self.id,
@@ -546,13 +534,13 @@ impl<M: GraphValue> GraphValue for BfvLutMaterial<M> {
         })
     }
 }
-impl<M: GraphValueSchema> GraphValueSchema for BfvLutMaterial<M> {
-    type Value = BfvLutMaterial<M::Value>;
+impl<M: GraphValueSchema> GraphValueSchema for RnsBggLutMaterial<M> {
+    type Value = RnsBggLutMaterial<M::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         self.branches.wire_types()
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvLutMaterial {
+        RnsBggLutMaterial {
             branches: self.branches.placeholders_from(next),
             mask_bank: self.mask_bank,
             id: self.id,
@@ -563,8 +551,8 @@ impl<M: GraphValueSchema> GraphValueSchema for BfvLutMaterial<M> {
         }
     }
 }
-impl<M: GraphValue> GraphValue for BfvPublicRhs<M> {
-    type Schema = BfvPublicRhs<M::Schema>;
+impl<M: GraphValue, D: GraphValue> GraphValue for RnsBggPublicRhs<M, D> {
+    type Schema = RnsBggPublicRhs<M::Schema, D::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         match self {
             Self::Fixed(rhs) => rhs.flatten(),
@@ -573,20 +561,22 @@ impl<M: GraphValue> GraphValue for BfvPublicRhs<M> {
     }
     fn schema(&self) -> Self::Schema {
         match self {
-            Self::Fixed(rhs) => BfvPublicRhs::Fixed(rhs.schema()),
-            Self::Lut(id) => BfvPublicRhs::Lut(*id),
+            Self::Fixed(rhs) => RnsBggPublicRhs::Fixed(rhs.schema()),
+            Self::Lut(id) => RnsBggPublicRhs::Lut(*id),
         }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         match schema {
-            BfvPublicRhs::Fixed(rhs) => Ok(Self::Fixed(BfvPrivateRhs::from_values(rhs, values)?)),
-            BfvPublicRhs::Lut(id) if values.is_empty() => Ok(Self::Lut(*id)),
+            RnsBggPublicRhs::Fixed(rhs) => {
+                Ok(Self::Fixed(RnsBggPrivateRhs::from_values(rhs, values)?))
+            }
+            RnsBggPublicRhs::Lut(id) if values.is_empty() => Ok(Self::Lut(*id)),
             _ => Err(DslError::Schema),
         }
     }
 }
-impl<M: GraphValueSchema> GraphValueSchema for BfvPublicRhs<M> {
-    type Value = BfvPublicRhs<M::Value>;
+impl<M: GraphValueSchema, D: GraphValueSchema> GraphValueSchema for RnsBggPublicRhs<M, D> {
+    type Value = RnsBggPublicRhs<M::Value, D::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         match self {
             Self::Fixed(rhs) => rhs.wire_types(),
@@ -595,18 +585,18 @@ impl<M: GraphValueSchema> GraphValueSchema for BfvPublicRhs<M> {
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
         match self {
-            Self::Fixed(rhs) => BfvPublicRhs::Fixed(rhs.placeholders_from(next)),
-            Self::Lut(id) => BfvPublicRhs::Lut(*id),
+            Self::Fixed(rhs) => RnsBggPublicRhs::Fixed(rhs.placeholders_from(next)),
+            Self::Lut(id) => RnsBggPublicRhs::Lut(*id),
         }
     }
 }
-impl<R: GraphValue> GraphValue for BfvOnlineMasks<R> {
-    type Schema = BfvOnlineMasks<R::Schema>;
+impl<R: GraphValue> GraphValue for RnsBggOnlineMasks<R> {
+    type Schema = RnsBggOnlineMasks<R::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         self.rows.as_ref().flatten()
     }
     fn schema(&self) -> Self::Schema {
-        BfvOnlineMasks {
+        RnsBggOnlineMasks {
             rows: Arc::new(self.rows.as_ref().schema()),
             id: self.id,
             level: self.level,
@@ -622,13 +612,13 @@ impl<R: GraphValue> GraphValue for BfvOnlineMasks<R> {
         })
     }
 }
-impl<R: GraphValueSchema> GraphValueSchema for BfvOnlineMasks<R> {
-    type Value = BfvOnlineMasks<R::Value>;
+impl<R: GraphValueSchema> GraphValueSchema for RnsBggOnlineMasks<R> {
+    type Value = RnsBggOnlineMasks<R::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         self.rows.as_ref().wire_types()
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvOnlineMasks {
+        RnsBggOnlineMasks {
             rows: Arc::new(self.rows.as_ref().placeholders_from(next)),
             id: self.id,
             level: self.level,
@@ -636,40 +626,40 @@ impl<R: GraphValueSchema> GraphValueSchema for BfvOnlineMasks<R> {
         }
     }
 }
-impl<R: GraphValue> GraphValue for BfvOnlineLutHelpers<R> {
-    type Schema = BfvOnlineLutHelpers<R::Schema>;
+impl<R: GraphValue> GraphValue for RnsBggOnlineLutHelpers<R> {
+    type Schema = RnsBggOnlineLutHelpers<R::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         self.masks.flatten()
     }
     fn schema(&self) -> Self::Schema {
-        BfvOnlineLutHelpers { masks: self.masks.schema(), binding: self.binding.clone() }
+        RnsBggOnlineLutHelpers { masks: self.masks.schema(), binding: self.binding.clone() }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         Ok(Self {
-            masks: BfvOnlineMasks::from_values(&schema.masks, values)?,
+            masks: RnsBggOnlineMasks::from_values(&schema.masks, values)?,
             binding: schema.binding.clone(),
         })
     }
 }
-impl<R: GraphValueSchema> GraphValueSchema for BfvOnlineLutHelpers<R> {
-    type Value = BfvOnlineLutHelpers<R::Value>;
+impl<R: GraphValueSchema> GraphValueSchema for RnsBggOnlineLutHelpers<R> {
+    type Value = RnsBggOnlineLutHelpers<R::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         self.masks.wire_types()
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvOnlineLutHelpers {
+        RnsBggOnlineLutHelpers {
             masks: self.masks.placeholders_from(next),
             binding: self.binding.clone(),
         }
     }
 }
-impl<I: GraphValue, K: GraphValue> GraphValue for BfvPreparedReduction<I, K> {
-    type Schema = BfvPreparedReduction<I::Schema, K::Schema>;
+impl<I: GraphValue, K: GraphValue> GraphValue for RnsBggPreparedReduction<I, K> {
+    type Schema = RnsBggPreparedReduction<I::Schema, K::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.input.flatten(), self.output.flatten()].concat()
     }
     fn schema(&self) -> Self::Schema {
-        BfvPreparedReduction { input: self.input.schema(), output: self.output.schema() }
+        RnsBggPreparedReduction { input: self.input.schema(), output: self.output.schema() }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
         let (input, output) =
@@ -677,25 +667,25 @@ impl<I: GraphValue, K: GraphValue> GraphValue for BfvPreparedReduction<I, K> {
         Ok(Self { input, output })
     }
 }
-impl<I: GraphValueSchema, K: GraphValueSchema> GraphValueSchema for BfvPreparedReduction<I, K> {
-    type Value = BfvPreparedReduction<I::Value, K::Value>;
+impl<I: GraphValueSchema, K: GraphValueSchema> GraphValueSchema for RnsBggPreparedReduction<I, K> {
+    type Value = RnsBggPreparedReduction<I::Value, K::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         [self.input.wire_types(), self.output.wire_types()].concat()
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPreparedReduction {
+        RnsBggPreparedReduction {
             input: self.input.placeholders_from(next),
             output: self.output.placeholders_from(next),
         }
     }
 }
-impl<T: GraphValue> GraphValue for BfvTerminalAccumulator<T> {
-    type Schema = BfvTerminalAccumulator<T::Schema>;
+impl<T: GraphValue> GraphValue for RnsBggTerminalAccumulator<T> {
+    type Schema = RnsBggTerminalAccumulator<T::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         self.value.flatten()
     }
     fn schema(&self) -> Self::Schema {
-        BfvTerminalAccumulator {
+        RnsBggTerminalAccumulator {
             value: self.value.schema(),
             level: self.level,
             context: self.context,
@@ -711,13 +701,13 @@ impl<T: GraphValue> GraphValue for BfvTerminalAccumulator<T> {
         })
     }
 }
-impl<T: GraphValueSchema> GraphValueSchema for BfvTerminalAccumulator<T> {
-    type Value = BfvTerminalAccumulator<T::Value>;
+impl<T: GraphValueSchema> GraphValueSchema for RnsBggTerminalAccumulator<T> {
+    type Value = RnsBggTerminalAccumulator<T::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         self.value.wire_types()
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvTerminalAccumulator {
+        RnsBggTerminalAccumulator {
             value: self.value.placeholders_from(next),
             level: self.level,
             context: self.context,
@@ -725,13 +715,13 @@ impl<T: GraphValueSchema> GraphValueSchema for BfvTerminalAccumulator<T> {
         }
     }
 }
-impl<M: GraphValue, L: GraphValue> GraphValue for BfvTerminalMaterial<M, L> {
-    type Schema = BfvTerminalMaterial<M::Schema, L::Schema>;
+impl<M: GraphValue, L: GraphValue> GraphValue for RnsBggTerminalMaterial<M, L> {
+    type Schema = RnsBggTerminalMaterial<M::Schema, L::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.material.flatten(), self.lifted_ciphertexts.flatten()].concat()
     }
     fn schema(&self) -> Self::Schema {
-        BfvTerminalMaterial {
+        RnsBggTerminalMaterial {
             material: self.material.schema(),
             lifted_ciphertexts: self.lifted_ciphertexts.schema(),
         }
@@ -744,25 +734,27 @@ impl<M: GraphValue, L: GraphValue> GraphValue for BfvTerminalMaterial<M, L> {
         Ok(Self { material, lifted_ciphertexts })
     }
 }
-impl<M: GraphValueSchema, L: GraphValueSchema> GraphValueSchema for BfvTerminalMaterial<M, L> {
-    type Value = BfvTerminalMaterial<M::Value, L::Value>;
+impl<M: GraphValueSchema, L: GraphValueSchema> GraphValueSchema for RnsBggTerminalMaterial<M, L> {
+    type Value = RnsBggTerminalMaterial<M::Value, L::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         [self.material.wire_types(), self.lifted_ciphertexts.wire_types()].concat()
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvTerminalMaterial {
+        RnsBggTerminalMaterial {
             material: self.material.placeholders_from(next),
             lifted_ciphertexts: self.lifted_ciphertexts.placeholders_from(next),
         }
     }
 }
-impl<K: GraphValue, M: GraphValue, P: GraphValue> GraphValue for BfvPreparedTerminal<K, M, P> {
-    type Schema = BfvPreparedTerminal<K::Schema, M::Schema, P::Schema>;
+impl<K: GraphValue, M: GraphValue, P: GraphValue, D: GraphValue> GraphValue
+    for RnsBggPreparedTerminal<K, M, P, D>
+{
+    type Schema = RnsBggPreparedTerminal<K::Schema, M::Schema, P::Schema, D::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
         [self.input.flatten(), self.branches.flatten(), self.raw_public.flatten()].concat()
     }
     fn schema(&self) -> Self::Schema {
-        BfvPreparedTerminal {
+        RnsBggPreparedTerminal {
             input: self.input.schema(),
             branches: self.branches.schema(),
             raw_public: self.raw_public.schema(),
@@ -771,22 +763,22 @@ impl<K: GraphValue, M: GraphValue, P: GraphValue> GraphValue for BfvPreparedTerm
         }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (input, branches, raw_public) = <(K, Vec<PreparedBranch<M>>, P)>::from_values(
+        let (input, branches, raw_public) = <(K, Vec<PreparedBranch<M, D>>, P)>::from_values(
             &(schema.input.clone(), schema.branches.clone(), schema.raw_public.clone()),
             values,
         )?;
         Ok(Self { input, branches, raw_public, binding: schema.binding.clone(), id: schema.id })
     }
 }
-impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema> GraphValueSchema
-    for BfvPreparedTerminal<K, M, P>
+impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema, D: GraphValueSchema>
+    GraphValueSchema for RnsBggPreparedTerminal<K, M, P, D>
 {
-    type Value = BfvPreparedTerminal<K::Value, M::Value, P::Value>;
+    type Value = RnsBggPreparedTerminal<K::Value, M::Value, P::Value, D::Value>;
     fn wire_types(&self) -> Vec<WireType> {
         [self.input.wire_types(), self.branches.wire_types(), self.raw_public.wire_types()].concat()
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        BfvPreparedTerminal {
+        RnsBggPreparedTerminal {
             input: self.input.placeholders_from(next),
             branches: self.branches.placeholders_from(next),
             raw_public: self.raw_public.placeholders_from(next),
@@ -795,37 +787,43 @@ impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema> GraphValueSc
         }
     }
 }
-impl BfvScheme {
-    /// Prepare the fixed high-base lift once, independently of an input key.
+impl RnsBggScheme {
+    /// Decompose in the low ring once, then transport bounded digits to the
+    /// input ring. The decomposition is independent of the input public key.
     pub fn prepare_private_rhs(
         &self,
-        rhs: &BfvPrivateRhs,
-    ) -> Result<BfvPrivateRhs<BfvMatrix, BfvMatrix>, BfvError> {
-        let high = BigInt::from(self.parameters.level(rhs.level)?.modulus().as_ref().clone());
-        Ok(BfvPrivateRhs {
+        rhs: &RnsBggPrivateRhs,
+    ) -> Result<RnsBggPrivateRhs<RnsBggMatrix, RnsBggDigits>, RnsBggError> {
+        Ok(RnsBggPrivateRhs {
             ciphertext: rhs.ciphertext.clone(),
-            lifted_ciphertext: rhs.ciphertext.clone().centered_extend(high),
+            lifted_ciphertext: self.prepare_digits(rhs.level, rhs.ciphertext.clone())?,
             level: rhs.level,
             context: rhs.context,
             id: rhs.id,
             rhs_id: rhs.rhs_id,
         })
     }
-    /// Select the active external range before lifting. Both returned families
+    /// Select the active external range before decomposing. Both returned families
     /// use packed local indices; the scope's input range owns the external offset.
     pub fn prepare_private_rhs_family(
         &self,
-        rhs: &BfvPrivateRhs<Family<BfvMatrix>>,
+        rhs: &RnsBggPrivateRhs<Family<RnsBggMatrix>>,
         range: &FamilyRange,
-    ) -> Result<BfvPrivateRhs<Family<BfvMatrix>, Family<BfvMatrix>>, BfvError> {
-        let high = BigInt::from(self.parameters.level(rhs.level)?.modulus().as_ref().clone());
+    ) -> Result<RnsBggPrivateRhs<Family<RnsBggMatrix>, Family<RnsBggDigits>>, RnsBggError> {
         let values = mxx_dsl::parallel(range.count().clone(), |index| {
-            let ciphertext = rhs.ciphertext.at(index.add(Int::evaluate(range.start().clone())));
-            Ok((ciphertext.clone(), ciphertext.centered_extend(high.clone())))
+            let element = RnsBggPrivateRhs {
+                ciphertext: rhs.ciphertext.at(index.add(Int::evaluate(range.start().clone()))),
+                lifted_ciphertext: (),
+                level: rhs.level,
+                context: rhs.context,
+                id: rhs.id,
+                rhs_id: rhs.rhs_id,
+            };
+            self.prepare_private_rhs(&element).map_err(|_| DslError::Schema)
         })?;
-        Ok(BfvPrivateRhs {
-            ciphertext: values.field(|value| value.0)?,
-            lifted_ciphertext: values.field(|value| value.1)?,
+        Ok(RnsBggPrivateRhs {
+            ciphertext: values.field(|value| value.ciphertext)?,
+            lifted_ciphertext: values.field(|value| value.lifted_ciphertext)?,
             level: rhs.level,
             context: rhs.context,
             id: rhs.id,
@@ -833,52 +831,54 @@ impl BfvScheme {
         })
     }
 
-    /// At Q=p*q, prepare MD(A*lift(C)) once. No internal public rounding,
+    /// At Q=p*q, prepare MD(A*Dec(C)) once. No internal public rounding,
     /// automorphism bank, or mask-secret-dependent helper enters this operation.
     pub fn prepare_mul_private(
         &self,
-        input: &BfvPublicKey,
-        rhs: &BfvPrivateRhs<BfvMatrix, BfvMatrix>,
+        input: &RnsBggPublicKey,
+        rhs: &RnsBggPrivateRhs<RnsBggMatrix, RnsBggDigits>,
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedPrivateMul, BfvError> {
+    ) -> Result<RnsBggPreparedPrivateMul, RnsBggError> {
         use mxx_primitives::poly::PolyParams;
         self.check_key(input)?;
         if input.level != rhs.level || input.context != rhs.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let next = num_bigint::BigInt::from(
             self.parameters.level(input.level + 1)?.modulus().as_ref().clone(),
         );
-        let output = BfvPublicKey {
+        let output = RnsBggPublicKey {
             matrix: (input.matrix.clone() * rhs.lifted_ciphertext.clone()).block_mod_switch(next),
             level: input.level + 1,
             id: output_id,
             context: self.context,
         };
-        Ok(BfvPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
+        Ok(RnsBggPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
     }
     pub fn prepare_mul_private_family(
         &self,
-        input: &BfvPublicKeyFamily,
+        input: &RnsBggPublicKeyFamily,
         rhs: &ProgramValue<
-            BfvPrivateRhs<BfvMatrix, BfvMatrix>,
-            BfvPrivateRhs<Family<BfvMatrix>, Family<BfvMatrix>>,
+            RnsBggPrivateRhs<RnsBggMatrix, RnsBggDigits>,
+            RnsBggPrivateRhs<Family<RnsBggMatrix>, Family<RnsBggDigits>>,
         >,
         output_id: [u8; 32],
     ) -> Result<
-        BfvPreparedPrivateMul<BfvPublicKeyFamily, ProgramValue<BfvMatrix, Family<BfvMatrix>>>,
-        BfvError,
+        RnsBggPreparedPrivateMul<
+            RnsBggPublicKeyFamily,
+            ProgramValue<RnsBggMatrix, Family<RnsBggMatrix>>,
+            ProgramValue<RnsBggDigits, Family<RnsBggDigits>>,
+        >,
+        RnsBggError,
     > {
-        use mxx_primitives::poly::PolyParams;
         self.check_public_family(input)?;
         let (level, context, id, rhs_id) = match rhs {
             ProgramValue::Scalar(rhs) => (rhs.level, rhs.context, rhs.id, rhs.rhs_id),
             ProgramValue::Family(rhs) => (rhs.level, rhs.context, rhs.id, rhs.rhs_id),
         };
         if input.level != level || input.context != context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
-        let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
         let (ciphertext, lifted_ciphertext) = match rhs {
             ProgramValue::Scalar(rhs) => (
                 ProgramValue::Scalar(rhs.ciphertext.clone()),
@@ -889,36 +889,51 @@ impl BfvScheme {
                 ProgramValue::Family(rhs.lifted_ciphertext.clone()),
             ),
         };
-        let rhs = BfvPrivateRhs { ciphertext, lifted_ciphertext, level, context, id, rhs_id };
+        let rhs = RnsBggPrivateRhs { ciphertext, lifted_ciphertext, level, context, id, rhs_id };
         let matrices = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            Ok((input.matrices.at(&index) * rhs.lifted_ciphertext.at(&index))
-                .block_mod_switch(next.clone()))
+            let input = RnsBggPublicKey {
+                matrix: input.matrices.at(&index),
+                level: input.level,
+                context: input.context,
+                id: input.id,
+            };
+            let rhs = RnsBggPrivateRhs {
+                ciphertext: rhs.ciphertext.at(&index),
+                lifted_ciphertext: rhs.lifted_ciphertext.at(&index),
+                level: rhs.level,
+                context: rhs.context,
+                id: rhs.id,
+                rhs_id: rhs.rhs_id,
+            };
+            self.prepare_mul_private(&input, &rhs, output_id)
+                .map(|prepared| prepared.output.matrix)
+                .map_err(|_| DslError::Schema)
         })
-        .map_err(|error| BfvError::Graph(error.to_string()))?;
-        let output = BfvPublicKeyFamily {
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        let output = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(matrices),
             level: input.level + 1,
             id: output_id,
             context: self.context,
             range: input.range.clone(),
         };
-        Ok(BfvPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
+        Ok(RnsBggPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
     }
     pub fn prepare_add(
         &self,
-        lhs: &BfvPublicKey,
-        rhs: &BfvPublicKey,
+        lhs: &RnsBggPublicKey,
+        rhs: &RnsBggPublicKey,
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedLinear, BfvError> {
+    ) -> Result<RnsBggPreparedLinear, RnsBggError> {
         self.check_key(lhs)?;
         self.check_key(rhs)?;
         if lhs.level != rhs.level {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
-        Ok(BfvPreparedLinear {
+        Ok(RnsBggPreparedLinear {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
-            output: BfvPublicKey {
+            output: RnsBggPublicKey {
                 matrix: lhs.matrix.clone() + rhs.matrix.clone(),
                 level: lhs.level,
                 id: output_id,
@@ -931,22 +946,22 @@ impl BfvScheme {
     /// Its key is checked even though its mask does not enter the output formula.
     pub fn prepare_mul_public(
         &self,
-        private: &BfvPublicKey,
-        public: &BfvPublicKey,
+        private: &RnsBggPublicKey,
+        public: &RnsBggPublicKey,
         multiplier: Mat,
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedLinear, BfvError> {
+    ) -> Result<RnsBggPreparedLinear, RnsBggError> {
         self.check_key(private)?;
         self.check_key(public)?;
         if private.level != public.level ||
             multiplier.matrix_type() != &self.ring(private.level)?.matrix_type((1, 1))
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
-        Ok(BfvPreparedLinear {
+        Ok(RnsBggPreparedLinear {
             lhs: private.clone(),
             rhs: public.clone(),
-            output: BfvPublicKey {
+            output: RnsBggPublicKey {
                 matrix: multiplier.clone() * private.matrix.clone(),
                 level: private.level,
                 id: output_id,
@@ -961,9 +976,14 @@ impl BfvScheme {
         hash_key: Bytes,
         tag: impl Into<HashTag>,
         id: [u8; 32],
-    ) -> Result<BfvPublicKey, BfvError> {
-        Ok(BfvPublicKey {
-            matrix: BfvMatrix::hash(&self.ring(level)?, hash_key, tag),
+    ) -> Result<RnsBggPublicKey, RnsBggError> {
+        Ok(RnsBggPublicKey {
+            matrix: RnsBggMatrix::hash(
+                &self.ring(level)?,
+                hash_key,
+                tag,
+                self.parameters.component_columns(level)?,
+            ),
             level,
             id,
             context: self.context,
@@ -971,24 +991,29 @@ impl BfvScheme {
     }
     pub fn prepare_input(
         &self,
-        secret: &BfvPayloadSecret,
-        key: &BfvPublicKey,
+        secret: &RnsBggPayloadSecret,
+        key: &RnsBggPublicKey,
         payload: Mat,
-    ) -> Result<BfvInputMaterial, BfvError> {
+    ) -> Result<RnsBggInputMaterial, RnsBggError> {
         self.check_key(key)?;
         if payload.matrix_type() != &self.ring(key.level)?.matrix_type((1, 1)) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let r = self.payload_at(secret, key.level)?;
         let scale = -BigInt::from(self.parameters.scale(key.level)?.clone());
-        let row = self.scalar(key.level, scale)? * payload * r;
-        Ok(BfvInputMaterial { row, level: key.level, key_id: key.id, context: self.context })
+        let gadget = self.state_gadget(key.level)?;
+        let row =
+            (self.scalar(key.level, scale)? * payload * r).map(|entry| entry * gadget.clone());
+        Ok(RnsBggInputMaterial { row, level: key.level, key_id: key.id, context: self.context })
     }
-    pub(crate) fn check_key(&self, key: &BfvPublicKey) -> Result<(), BfvError> {
+    pub(crate) fn check_key(&self, key: &RnsBggPublicKey) -> Result<(), RnsBggError> {
         if key.context != self.context ||
-            key.matrix.matrix_type() != &self.ring(key.level)?.matrix_type((2, 2))
+            key.matrix.matrix_type() !=
+                &self
+                    .ring(key.level)?
+                    .matrix_type((2, 2 * self.parameters.component_columns(key.level)?))
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         Ok(())
     }
@@ -1001,85 +1026,91 @@ impl BfvScheme {
         hash_key: Bytes,
         tag: impl Into<HashTag>,
         id: [u8; 32],
-    ) -> Result<BfvMaskBank, BfvError> {
+    ) -> Result<RnsBggMaskBank, RnsBggError> {
         let ring = self.ring(level)?;
         self.parameters.level(level + 1)?;
         let sigmas = layout
             .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
-            .map_err(|_| BfvError::Lut)?;
+            .map_err(|_| RnsBggError::Lut)?;
         let root = tag.into();
         let mut branches = Vec::with_capacity(layout.width());
         for sigma in sigmas {
             let mut tag = root.clone();
-            tag.push("bfv-mask");
+            tag.push("rns_bgg-mask");
             tag.push(mxx_ir_core::IntExpr::constant(level));
             tag.push(mxx_ir_core::IntExpr::constant(sigma));
-            let public = BfvMatrix::hash(&ring, hash_key.clone(), tag);
+            let public = RnsBggMatrix::hash(
+                &ring,
+                hash_key.clone(),
+                tag,
+                self.parameters.component_columns(level)?,
+            );
             branches.push(MaskBranch { sigma, public });
         }
-        Ok(BfvMaskBank { id, level, context: self.context, branches })
+        Ok(RnsBggMaskBank { id, level, context: self.context, branches })
     }
     pub fn prepare_lut(
         &self,
-        input: &BfvPublicKey,
-        material: &BfvLutMaterial,
+        input: &RnsBggPublicKey,
+        material: &RnsBggLutMaterial,
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedLut, BfvError> {
-        let high = BigInt::from(self.parameters.level(input.level)?.modulus().as_ref().clone());
+    ) -> Result<RnsBggPreparedLut, RnsBggError> {
         let lifted = material
             .branches
             .iter()
-            .map(|(_, ciphertext)| ciphertext.clone().centered_extend(high.clone()))
-            .collect::<Vec<_>>();
+            .map(|(_, ciphertext)| self.prepare_digits(input.level, ciphertext.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
         let (raw_public, branches) = self.prepare_lut_raw(input, material, &lifted)?;
         let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
-        let output = BfvPublicKey {
+        let output = RnsBggPublicKey {
             matrix: raw_public.block_mod_switch(next),
             level: input.level + 1,
             id: output_id,
             context: self.context,
         };
-        Ok(BfvPreparedLut { binding: material.binding(), input: input.clone(), output, branches })
+        Ok(RnsBggPreparedLut {
+            binding: material.binding(),
+            input: input.clone(),
+            output,
+            branches,
+        })
     }
     /// Shared branch preparation; terminal batches retain K before its outer switch.
     pub(super) fn prepare_lut_raw(
         &self,
-        input: &BfvPublicKey,
-        material: &BfvLutMaterial,
-        lifted_ciphertexts: &[BfvMatrix],
-    ) -> Result<(BfvMatrix, Vec<PreparedBranch>), BfvError> {
+        input: &RnsBggPublicKey,
+        material: &RnsBggLutMaterial,
+        lifted_ciphertexts: &[RnsBggDigits],
+    ) -> Result<(RnsBggMatrix, Vec<PreparedBranch>), RnsBggError> {
         self.check_key(input)?;
         if input.level != material.level || input.context != material.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let level = input.level;
-        let high = BigInt::from(self.parameters.level(level)?.modulus().as_ref().clone());
         let next = BigInt::from(self.parameters.level(level + 1)?.modulus().as_ref().clone());
         let mut public_terms = Vec::with_capacity(material.branches.len());
         let mut branches = Vec::with_capacity(material.branches.len());
-        for ((mask, ciphertext), lifted) in material.branches.iter().zip(lifted_ciphertexts) {
+        for ((mask, _), lifted) in material.branches.iter().zip(lifted_ciphertexts) {
             let intermediate = (input.matrix.clone().ring_automorphism(mask.sigma) *
                 lifted.clone())
             .block_mod_switch(next.clone());
-            let lifted_intermediate = intermediate.clone().centered_extend(high.clone());
+            let lifted_intermediate = self.prepare_digits(level, intermediate.clone())?;
             public_terms.push(mask.public.clone() * lifted_intermediate.clone());
             branches.push(PreparedBranch {
                 sigma: mask.sigma,
                 lifted_ciphertext: lifted.clone(),
-                ciphertext: ciphertext.clone(),
-                intermediate,
                 lifted_intermediate,
                 mask_public: mask.public.clone(),
             });
         }
         let raw_public =
-            sum(Family::pack(public_terms).map_err(|e| BfvError::Graph(e.to_string()))?)?;
+            sum(Family::pack(public_terms).map_err(|e| RnsBggError::Graph(e.to_string()))?)?;
         Ok((raw_public, branches))
     }
     pub fn prepare_refresh_recomposition(
         &self,
-        output_key: BfvPublicKey,
-    ) -> Result<BfvRefreshRecomposition, BfvError> {
+        output_key: RnsBggPublicKey,
+    ) -> Result<RnsBggRefreshRecomposition, RnsBggError> {
         let parameters = self.parameters.level(output_key.level)?;
         let q = BigInt::from(parameters.modulus().as_ref().clone());
         let coefficients = parameters
@@ -1090,32 +1121,31 @@ impl BfvScheme {
                 let prime = BigInt::from(prime);
                 let h = &q / &prime;
                 let inverse = crate::utils::modular_inverse(&h, &prime)
-                    .ok_or(BfvError::Parameters("non-coprime CRT basis"))?;
+                    .ok_or(RnsBggError::Parameters("non-coprime CRT basis"))?;
                 self.scalar(output_key.level, h * inverse)
             })
             .collect::<Result<_, _>>()?;
-        Ok(BfvRefreshRecomposition { output_key, coefficients })
+        Ok(RnsBggRefreshRecomposition { output_key, coefficients })
     }
     pub fn export_prepared_terminal(
         &self,
-        prepared: &BfvPreparedTerminal,
+        prepared: &RnsBggPreparedTerminal,
         mut graph: mxx_dsl::DslContext,
         prefix: &str,
-    ) -> Result<(mxx_dsl::DslContext, BfvPreparedTerminalDescriptor), BfvError> {
+    ) -> Result<(mxx_dsl::DslContext, RnsBggPreparedTerminalDescriptor), RnsBggError> {
         self.check_key(&prepared.input)?;
-        graph = graph.public_output(&format!("{prefix}.input"), (prepared.input.matrix).clone())?;
-        graph = graph.public_output(&format!("{prefix}.raw"), (prepared.raw_public).clone())?;
-        graph = export_prepared_branches(graph, prefix, &prepared.branches)?;
+        graph = graph.public_output(prefix, prepared.clone())?;
         Ok((
             graph,
-            BfvPreparedTerminalDescriptor {
-                prepared: BfvPreparedLutDescriptor {
+            RnsBggPreparedTerminalDescriptor {
+                prepared: RnsBggPreparedLutDescriptor {
                     prefix: prefix.into(),
                     parameters: self.parameter_identity(),
                     binding: prepared.binding.clone(),
                     input_id: prepared.input.id,
                     output_id: prepared.id,
                     sigmas: prepared.branches.iter().map(|branch| branch.sigma).collect(),
+                    schema: prepared.schema(),
                 },
             },
         ))
@@ -1124,45 +1154,30 @@ impl BfvScheme {
     /// later, by prepare_online_masks on the restored public mask bank.
     pub fn import_prepared_terminal(
         &self,
-        descriptor: &BfvPreparedTerminalDescriptor,
+        descriptor: &RnsBggPreparedTerminalDescriptor,
         production: mxx_ir_core::artifact::ProductionId,
-        binding: &BfvLutBinding,
+        binding: &RnsBggLutBinding,
         input_id: [u8; 32],
         stage_id: [u8; 32],
-    ) -> Result<BfvPreparedTerminal, BfvError> {
+    ) -> Result<RnsBggPreparedTerminal, RnsBggError> {
         let data = &descriptor.prepared;
         self.check_prepared_descriptor(data, binding, input_id, stage_id)?;
-        let ring = self.ring(binding.level)?;
-        Ok(BfvPreparedTerminal {
-            binding: binding.clone(),
-            input: BfvPublicKey {
-                matrix: import_blocks(&ring, &production, &format!("{}.input", data.prefix)),
-                level: binding.level,
-                id: input_id,
-                context: self.context,
-            },
-            id: stage_id,
-            branches: self.import_prepared_branches(
-                binding.level,
-                &production,
-                &data.prefix,
-                &data.sigmas,
-            )?,
-            raw_public: import_blocks(&ring, &production, &format!("{}.raw", data.prefix)),
-        })
+        Ok(data.schema.artifact_input(production, &data.prefix, ArtifactConfidentiality::Public)?)
     }
-    pub(super) fn artifact_binding(&self) -> BfvArtifactBinding {
-        BfvArtifactBinding { parameters: self.parameter_identity(), context: self.context }
+
+    pub(super) fn artifact_binding(&self) -> RnsBggArtifactBinding {
+        RnsBggArtifactBinding { parameters: self.parameter_identity(), context: self.context }
     }
     pub(super) fn parameter_identity(&self) -> [u8; 32] {
         *self.parameter_identity.get_or_init(|| {
             use sha2::Digest;
             let mut hash = sha2::Sha256::new();
-            hash.update(b"bfv-prepared-parameters");
+            hash.update(b"rns_bgg-prepared-parameters");
             hash.update((self.parameters.eta() as u64).to_le_bytes());
             hash.update((self.parameters.levels().len() as u64).to_le_bytes());
             for level in self.parameters.levels() {
                 hash.update(level.ring_dimension().to_le_bytes());
+                hash.update(level.base_bits().to_le_bytes());
                 let primes = level.to_crt().0;
                 hash.update((primes.len() as u64).to_le_bytes());
                 for prime in primes {
@@ -1172,13 +1187,17 @@ impl BfvScheme {
             hash.finalize().into()
         })
     }
-    pub(super) fn check_public_family(&self, family: &BfvPublicKeyFamily) -> Result<(), BfvError> {
+    pub(super) fn check_public_family(
+        &self,
+        family: &RnsBggPublicKeyFamily,
+    ) -> Result<(), RnsBggError> {
         if family.context != self.context ||
             matches!(&family.matrices, ProgramValue::Family(values) if values.count() != family.range.count()) ||
             family.matrices.element_schema().matrix_type() !=
-                self.ring(family.level)?.matrix_type((2, 2))
+                self.ring(family.level)?
+                    .matrix_type((2, 2 * self.parameters.component_columns(family.level)?))
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         Ok(())
     }
@@ -1192,18 +1211,18 @@ impl BfvScheme {
     /// the source material and active range, and is also its material identity.
     pub fn compose_lut_material(
         &self,
-        material: &BfvLutMaterialFamily,
+        material: &RnsBggLutMaterialFamily,
         multipliers: &Family<Mat>,
         range: &FamilyRange,
         rhs_id: [u8; 32],
-    ) -> Result<BfvLutMaterial, BfvError> {
+    ) -> Result<RnsBggLutMaterial, RnsBggError> {
         if material.binding.context != self.context ||
             material.binding.rhs.is_none() ||
             multipliers.count() != range.count() ||
             multipliers.element_type() !=
                 &self.ring(material.binding.level + 1)?.matrix_type((1, 1))
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         if let (Ok(start), Ok(count), Ok(capacity)) = (
             range.start().evaluate(&ParamEnv::default()),
@@ -1211,7 +1230,7 @@ impl BfvScheme {
             material.ciphertexts.count().evaluate(&ParamEnv::default()),
         ) {
             if start < 0.into() || count <= 0.into() || start + count > capacity {
-                return Err(BfvError::Context);
+                return Err(RnsBggError::Context);
             }
         }
         let branches = material
@@ -1224,13 +1243,13 @@ impl BfvScheme {
                     Ok(multipliers.at(&index).ring_automorphism(mask.sigma) *
                         material.ciphertexts.at(external).0[branch].clone())
                 })
-                .map_err(|e| BfvError::Graph(e.to_string()))?;
+                .map_err(|e| RnsBggError::Graph(e.to_string()))?;
                 let ciphertext = crate::utils::balanced_sum_family(terms)
-                    .map_err(|e| BfvError::Graph(e.to_string()))?;
+                    .map_err(|e| RnsBggError::Graph(e.to_string()))?;
                 Ok((mask.clone(), ciphertext))
             })
-            .collect::<Result<Vec<_>, BfvError>>()?;
-        Ok(BfvLutMaterial {
+            .collect::<Result<Vec<_>, RnsBggError>>()?;
+        Ok(RnsBggLutMaterial {
             mask_bank: material.binding.mask_bank,
             id: rhs_id,
             level: material.binding.level,
@@ -1242,13 +1261,13 @@ impl BfvScheme {
     }
     pub fn prepare_lut_family(
         &self,
-        input: &BfvPublicKeyFamily,
-        material: &BfvLutMaterialFamily,
+        input: &RnsBggPublicKeyFamily,
+        material: &RnsBggLutMaterialFamily,
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedLutFamily, BfvError> {
+    ) -> Result<RnsBggPreparedLutFamily, RnsBggError> {
         self.check_public_family(input)?;
         if input.level != material.binding.level || input.context != material.binding.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         // Check concrete ranges here; symbolic bounds remain graph-validated.
         if let (Ok(start), Ok(count), Ok(capacity)) = (
@@ -1257,67 +1276,56 @@ impl BfvScheme {
             material.ciphertexts.count().evaluate(&ParamEnv::default()),
         ) {
             if start < 0.into() || count <= 0.into() || start + count > capacity {
-                return Err(BfvError::Context);
+                return Err(RnsBggError::Context);
             }
         }
         let prepared = mxx_dsl::parallel(input.range.count().clone(), |index| {
             let external = index.clone().add(Int::evaluate(input.range.start().clone()));
             let scalar_material = material.at(external);
-            let key = BfvPublicKey {
+            let key = RnsBggPublicKey {
                 matrix: input.matrices.at(&index),
                 level: input.level,
                 id: input.id,
                 context: input.context,
             };
-            let prepared = self
-                .prepare_lut(&key, &scalar_material, output_id)
-                .map_err(|_| DslError::Schema)?;
-            Ok((
-                prepared.output.matrix,
-                BfvBranches(
-                    prepared.branches.into_iter().map(|branch| branch.intermediate).collect(),
-                ),
-            ))
-        })
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
-        let matrices =
-            prepared.field(|value| value.0).map_err(|e| BfvError::Graph(e.to_string()))?;
-        let intermediates =
-            prepared.field(|value| value.1).map_err(|e| BfvError::Graph(e.to_string()))?;
-        Ok(BfvPreparedLutFamily {
+            self.prepare_lut(&key, &scalar_material, output_id).map_err(|_| DslError::Schema)
+        })?;
+        let matrices = prepared.field(|value| value.output.matrix)?;
+        Ok(RnsBggPreparedLutFamily {
             input: input.clone(),
-            output: BfvPublicKeyFamily {
+            output: RnsBggPublicKeyFamily {
                 matrices: ProgramValue::Family(matrices),
                 level: input.level + 1,
                 id: output_id,
                 context: self.context,
                 range: input.range.clone(),
             },
-            material: material.clone(),
-            intermediates,
+            prepared,
         })
     }
     /// A supplied multiplier selects public multiplication; absence selects
     /// addition. The resulting prepared operation fixes the online formula.
     pub fn prepare_linear_family(
         &self,
-        lhs: &BfvPublicKeyFamily,
-        rhs: &BfvPublicKeyFamily,
+        lhs: &RnsBggPublicKeyFamily,
+        rhs: &RnsBggPublicKeyFamily,
         multiplier: Option<ProgramValue<Mat, Family<Mat>>>,
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedLinear<BfvPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>, BfvError>
-    {
+    ) -> Result<
+        RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
+        RnsBggError,
+    > {
         self.check_public_family(lhs)?;
         self.check_public_family(rhs)?;
         if lhs.level != rhs.level || lhs.range != rhs.range {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let scalar_type = self.ring(lhs.level)?.matrix_type((1, 1));
         if multiplier.as_ref().is_some_and(|value| {
             matches!(value, ProgramValue::Family(values) if values.count() != lhs.range.count()) ||
                 value.element_schema() != MatType(scalar_type.clone())
         }) {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let matrices = mxx_dsl::parallel(lhs.range.count().clone(), |index| {
             let left = lhs.matrices.at(&index);
@@ -1326,12 +1334,12 @@ impl BfvScheme {
                 None => left + rhs.matrices.at(&index),
             })
         })
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
-        Ok(BfvPreparedLinear {
+        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
+        Ok(RnsBggPreparedLinear {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
             operation: multiplier.map_or(LinearOperation::Add, LinearOperation::MulPublic),
-            output: BfvPublicKeyFamily {
+            output: RnsBggPublicKeyFamily {
                 matrices: ProgramValue::Family(matrices),
                 level: lhs.level,
                 id: output_id,
@@ -1342,9 +1350,9 @@ impl BfvScheme {
     }
     pub fn prepare_reduce_family(
         &self,
-        value: &BfvPublicKeyFamily,
+        value: &RnsBggPublicKeyFamily,
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedReduction, BfvError> {
+    ) -> Result<RnsBggPreparedReduction, RnsBggError> {
         self.check_public_family(value)?;
         let matrix = match &value.matrices {
             ProgramValue::Scalar(matrix) => {
@@ -1352,9 +1360,9 @@ impl BfvScheme {
             }
             ProgramValue::Family(matrices) => sum(matrices.clone())?,
         };
-        Ok(BfvPreparedReduction {
+        Ok(RnsBggPreparedReduction {
             input: value.clone(),
-            output: BfvPublicKey {
+            output: RnsBggPublicKey {
                 matrix,
                 level: value.level,
                 id: output_id,
@@ -1364,30 +1372,31 @@ impl BfvScheme {
     }
     pub(super) fn check_linear_descriptor(
         &self,
-        descriptor: &BfvPreparedLinearDescriptor,
-        expected: &BfvLinearBinding,
-    ) -> Result<(), BfvError> {
+        descriptor: &RnsBggPreparedLinearDescriptor,
+        expected: &RnsBggLinearBinding,
+    ) -> Result<(), RnsBggError> {
         if descriptor.parameters != self.parameter_identity() ||
             descriptor.binding != *expected ||
             expected.context != self.context
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         self.ring(expected.level)?;
         Ok(())
     }
     pub(super) fn import_linear_key(
         &self,
-        descriptor: &BfvPreparedLinearDescriptor,
+        descriptor: &RnsBggPreparedLinearDescriptor,
         production: &ProductionId,
         role: &str,
         id: [u8; 32],
-    ) -> Result<BfvPublicKey, BfvError> {
-        Ok(BfvPublicKey {
+    ) -> Result<RnsBggPublicKey, RnsBggError> {
+        Ok(RnsBggPublicKey {
             matrix: import_blocks(
                 &self.ring(descriptor.binding.level)?,
                 production,
                 &format!("{}.{role}", descriptor.prefix),
+                self.parameters.component_columns(descriptor.binding.level)?,
             ),
             level: descriptor.binding.level,
             id,
@@ -1396,18 +1405,27 @@ impl BfvScheme {
     }
     pub(super) fn import_linear_key_family(
         &self,
-        descriptor: &BfvPreparedLinearDescriptor,
+        descriptor: &RnsBggPreparedLinearDescriptor,
         production: &ProductionId,
         role: &str,
         id: [u8; 32],
-    ) -> Result<BfvPublicKeyFamily, BfvError> {
-        let range = descriptor.binding.operation.input_range().ok_or(BfvError::Context)?;
+    ) -> Result<RnsBggPublicKeyFamily, RnsBggError> {
+        let range = descriptor.binding.operation.input_range().ok_or(RnsBggError::Context)?;
         let ring = self.ring(descriptor.binding.level)?;
         let schema = BlocksType::<2, 2>(std::array::from_fn(|_| {
-            std::array::from_fn(|_| MatType(ring.matrix_type((1, 1))))
+            std::array::from_fn(|_| {
+                MatType(
+                    ring.matrix_type((
+                        1,
+                        self.parameters
+                            .component_columns(descriptor.binding.level)
+                            .expect("validated key level"),
+                    )),
+                )
+            })
         }));
         let output_storage = ProgramValue::Family(vec![false; 4]);
-        Ok(BfvPublicKeyFamily {
+        Ok(RnsBggPublicKeyFamily {
             matrices: import_family_value(
                 schema,
                 range.count().clone(),
@@ -1427,10 +1445,10 @@ impl BfvScheme {
     }
     pub fn export_prepared_linear(
         &self,
-        prepared: &BfvPreparedLinear,
+        prepared: &RnsBggPreparedLinear,
         mut graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvPreparedLinearDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggPreparedLinearDescriptor), RnsBggError> {
         let keys = [("lhs", &prepared.lhs), ("rhs", &prepared.rhs), ("output", &prepared.output)];
         for (_, key) in &keys {
             self.check_key(key)?;
@@ -1441,12 +1459,12 @@ impl BfvScheme {
         let (graph, operation) = prepared.operation.export(graph, prefix, prepared.rhs.id, None)?;
         Ok((
             graph,
-            BfvPreparedLinearDescriptor {
+            RnsBggPreparedLinearDescriptor {
                 key_storage: [ProgramValue::Scalar(()), ProgramValue::Scalar(())],
                 multiplier_storage: ProgramValue::Scalar(()),
                 prefix: prefix.into(),
                 parameters: self.parameter_identity(),
-                binding: BfvLinearBinding {
+                binding: RnsBggLinearBinding {
                     context: self.context,
                     level: prepared.lhs.level,
                     lhs: prepared.lhs.id,
@@ -1460,13 +1478,13 @@ impl BfvScheme {
     /// production manifest must also be supplied when freezing that graph.
     pub fn import_prepared_linear(
         &self,
-        descriptor: &BfvPreparedLinearDescriptor,
+        descriptor: &RnsBggPreparedLinearDescriptor,
         production: ProductionId,
-        expected: &BfvLinearBinding,
-    ) -> Result<BfvPreparedLinear, BfvError> {
+        expected: &RnsBggLinearBinding,
+    ) -> Result<RnsBggPreparedLinear, RnsBggError> {
         self.check_linear_descriptor(descriptor, expected)?;
         if expected.operation.input_range().is_some() {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let (operation, rhs_id) = LinearOperation::import(
             &expected.operation,
@@ -1474,7 +1492,7 @@ impl BfvScheme {
             production.clone(),
             &descriptor.prefix,
         )?;
-        Ok(BfvPreparedLinear {
+        Ok(RnsBggPreparedLinear {
             lhs: self.import_linear_key(descriptor, &production, "lhs", expected.lhs)?,
             rhs: self.import_linear_key(descriptor, &production, "rhs", rhs_id)?,
             output: self.import_linear_key(descriptor, &production, "output", expected.output)?,
@@ -1483,10 +1501,10 @@ impl BfvScheme {
     }
     pub fn export_prepared_linear_family(
         &self,
-        prepared: &BfvPreparedLinear<BfvPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
+        prepared: &RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
         mut graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvPreparedLinearDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggPreparedLinearDescriptor), RnsBggError> {
         let keys = [("lhs", &prepared.lhs), ("rhs", &prepared.rhs), ("output", &prepared.output)];
         for (_, key) in &keys {
             self.check_public_family(key)?;
@@ -1502,7 +1520,7 @@ impl BfvScheme {
         )?;
         Ok((
             graph,
-            BfvPreparedLinearDescriptor {
+            RnsBggPreparedLinearDescriptor {
                 key_storage: [
                     family_storage(&prepared.lhs.matrices),
                     family_storage(&prepared.rhs.matrices),
@@ -1513,7 +1531,7 @@ impl BfvScheme {
                 },
                 prefix: prefix.into(),
                 parameters: self.parameter_identity(),
-                binding: BfvLinearBinding {
+                binding: RnsBggLinearBinding {
                     context: self.context,
                     level: prepared.lhs.level,
                     lhs: prepared.lhs.id,
@@ -1525,13 +1543,15 @@ impl BfvScheme {
     }
     pub fn import_prepared_linear_family(
         &self,
-        descriptor: &BfvPreparedLinearDescriptor,
+        descriptor: &RnsBggPreparedLinearDescriptor,
         production: ProductionId,
-        expected: &BfvLinearBinding,
-    ) -> Result<BfvPreparedLinear<BfvPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>, BfvError>
-    {
+        expected: &RnsBggLinearBinding,
+    ) -> Result<
+        RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
+        RnsBggError,
+    > {
         self.check_linear_descriptor(descriptor, expected)?;
-        let range = expected.operation.input_range().ok_or(BfvError::Context)?;
+        let range = expected.operation.input_range().ok_or(RnsBggError::Context)?;
         let ring = self.ring(expected.level)?;
         let (operation, rhs_id) = LinearOperation::import(
             &expected.operation,
@@ -1546,7 +1566,7 @@ impl BfvScheme {
             production.clone(),
             &descriptor.prefix,
         )?;
-        Ok(BfvPreparedLinear {
+        Ok(RnsBggPreparedLinear {
             lhs: self.import_linear_key_family(descriptor, &production, "lhs", expected.lhs)?,
             rhs: self.import_linear_key_family(descriptor, &production, "rhs", rhs_id)?,
             output: self.import_linear_key_family(
@@ -1560,45 +1580,47 @@ impl BfvScheme {
     }
     pub fn export_prepared_reduction(
         &self,
-        prepared: &BfvPreparedReduction,
+        prepared: &RnsBggPreparedReduction,
         graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvPreparedLinearDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggPreparedLinearDescriptor), RnsBggError> {
         self.check_public_family(&prepared.input)?;
         self.check_key(&prepared.output)?;
         let graph = graph
             .public_output(format!("{prefix}.lhs"), prepared.input.matrices.clone())
-            .map_err(|e| BfvError::Graph(e.to_string()))?;
+            .map_err(|e| RnsBggError::Graph(e.to_string()))?;
         let graph =
             graph.public_output(&format!("{prefix}.output"), (prepared.output.matrix).clone())?;
         Ok((
             graph,
-            BfvPreparedLinearDescriptor {
+            RnsBggPreparedLinearDescriptor {
                 key_storage: [family_storage(&prepared.input.matrices), ProgramValue::Scalar(())],
                 multiplier_storage: ProgramValue::Scalar(()),
                 prefix: prefix.into(),
                 parameters: self.parameter_identity(),
-                binding: BfvLinearBinding {
+                binding: RnsBggLinearBinding {
                     context: self.context,
                     level: prepared.input.level,
                     lhs: prepared.input.id,
                     output: prepared.output.id,
-                    operation: BfvLinearOperation::Reduce { range: prepared.input.range.clone() },
+                    operation: RnsBggLinearOperation::Reduce {
+                        range: prepared.input.range.clone(),
+                    },
                 },
             },
         ))
     }
     pub fn import_prepared_reduction(
         &self,
-        descriptor: &BfvPreparedLinearDescriptor,
+        descriptor: &RnsBggPreparedLinearDescriptor,
         production: ProductionId,
-        expected: &BfvLinearBinding,
-    ) -> Result<BfvPreparedReduction, BfvError> {
+        expected: &RnsBggLinearBinding,
+    ) -> Result<RnsBggPreparedReduction, RnsBggError> {
         self.check_linear_descriptor(descriptor, expected)?;
-        if !matches!(expected.operation, BfvLinearOperation::Reduce { .. }) {
-            return Err(BfvError::Context);
+        if !matches!(expected.operation, RnsBggLinearOperation::Reduce { .. }) {
+            return Err(RnsBggError::Context);
         }
-        Ok(BfvPreparedReduction {
+        Ok(RnsBggPreparedReduction {
             input: self.import_linear_key_family(descriptor, &production, "lhs", expected.lhs)?,
             output: self.import_linear_key(descriptor, &production, "output", expected.output)?,
         })
@@ -1607,17 +1629,17 @@ impl BfvScheme {
     /// This graph needs no online mask secret and exports neither secret key.
     pub fn export_input_material(
         &self,
-        key: &BfvPublicKey,
-        material: &BfvInputMaterial,
+        key: &RnsBggPublicKey,
+        material: &RnsBggInputMaterial,
         mut graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvInputMaterialDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggInputMaterialDescriptor), RnsBggError> {
         self.check_key(key)?;
         if material.context != self.context ||
             material.level != key.level ||
             material.key_id != key.id
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         graph = graph.public_output(&format!("{prefix}.key"), (key.matrix).clone())?;
         for column in 0..2 {
@@ -1626,11 +1648,11 @@ impl BfvScheme {
                     format!("{prefix}.payload.{column}"),
                     material.row.entry(0, column).clone(),
                 )
-                .map_err(|e| BfvError::Graph(e.to_string()))?;
+                .map_err(|e| RnsBggError::Graph(e.to_string()))?;
         }
         Ok((
             graph,
-            BfvInputMaterialDescriptor {
+            RnsBggInputMaterialDescriptor {
                 prefix: prefix.into(),
                 scheme: self.artifact_binding(),
                 level: key.level,
@@ -1643,42 +1665,48 @@ impl BfvScheme {
     /// the runtime manifest enforces the declared confidentiality and shapes.
     pub fn import_input_material(
         &self,
-        descriptor: &BfvInputMaterialDescriptor,
+        descriptor: &RnsBggInputMaterialDescriptor,
         production: ProductionId,
         key_id: [u8; 32],
         level: usize,
-    ) -> Result<(BfvPublicKey, BfvInputMaterial), BfvError> {
+    ) -> Result<(RnsBggPublicKey, RnsBggInputMaterial), RnsBggError> {
         if descriptor.scheme != self.artifact_binding() ||
             descriptor.key_id != key_id ||
             descriptor.level != level
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let ring = self.ring(level)?;
-        let key = BfvPublicKey {
-            matrix: import_blocks(&ring, &production, &format!("{}.key", descriptor.prefix)),
+        let columns = self.parameters.component_columns(level)?;
+        let key = RnsBggPublicKey {
+            matrix: import_blocks(
+                &ring,
+                &production,
+                &format!("{}.key", descriptor.prefix),
+                columns,
+            ),
             level,
             id: key_id,
             context: self.context,
         };
-        let row = crate::bfv::BfvRow::new([std::array::from_fn(|column| {
+        let row = crate::rns_bgg::RnsBggRow::new([std::array::from_fn(|column| {
             ring.artifact_input(
                 production.clone(),
                 format!("{}.payload.{column}", descriptor.prefix),
-                (1, 1),
+                (1, columns),
                 ArtifactConfidentiality::Private,
             )
         })])
-        .map_err(|e| BfvError::Graph(e.to_string()))?;
-        Ok((key, BfvInputMaterial { row, level, key_id, context: self.context }))
+        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
+        Ok((key, RnsBggInputMaterial { row, level, key_id, context: self.context }))
     }
-    pub(super) fn check_prepared_descriptor(
+    pub(super) fn check_prepared_descriptor<S>(
         &self,
-        descriptor: &BfvPreparedLutDescriptor,
-        binding: &BfvLutBinding,
+        descriptor: &RnsBggPreparedLutDescriptor<S>,
+        binding: &RnsBggLutBinding,
         input_id: [u8; 32],
         output_id: [u8; 32],
-    ) -> Result<(), BfvError> {
+    ) -> Result<(), RnsBggError> {
         if descriptor.parameters != self.parameter_identity() ||
             descriptor.binding != *binding ||
             binding.context != self.context ||
@@ -1686,11 +1714,11 @@ impl BfvScheme {
             descriptor.output_id != output_id ||
             descriptor.sigmas.is_empty()
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let width = descriptor.sigmas.len();
         if !width.is_power_of_two() || (binding.table.is_none() && width != 1) {
-            return Err(BfvError::Lut);
+            return Err(RnsBggError::Lut);
         }
         // Branch indices come from the selected preprocessing descriptor.
         // Its table binding commits the layout, including terminal strides;
@@ -1701,40 +1729,28 @@ impl BfvScheme {
     /// existing runtime streams each polynomial family into its artifact store.
     pub fn export_prepared_lut_family(
         &self,
-        prepared: &BfvPreparedLutFamily,
+        prepared: &RnsBggPreparedLutFamily,
         mut graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvPreparedLutFamilyDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggPreparedLutFamilyDescriptor), RnsBggError> {
         self.check_public_family(&prepared.input)?;
         self.check_public_family(&prepared.output)?;
-        graph = graph
-            .public_output(format!("{prefix}.input"), prepared.input.matrices.clone())
-            .and_then(|g| {
-                g.public_output(format!("{prefix}.output"), prepared.output.matrices.clone())
-            })
-            .and_then(|g| {
-                g.public_output(format!("{prefix}.C"), prepared.material.ciphertexts.clone())
-            })
-            .and_then(|g| g.public_output(format!("{prefix}.b"), prepared.intermediates.clone()))
-            .map_err(|e| BfvError::Graph(e.to_string()))?;
-        for (index, mask) in prepared.material.masks.iter().enumerate() {
-            graph =
-                graph.public_output(&format!("{prefix}.mask.{index}"), (mask.public).clone())?;
-        }
+        let schema = prepared.prepared.schema();
+        graph = graph.public_output(prefix, prepared.prepared.clone())?;
+        let element = prepared.prepared.schema().element;
         Ok((
             graph,
-            BfvPreparedLutFamilyDescriptor {
-                input_storage: family_storage(&prepared.input.matrices),
-                prepared: BfvPreparedLutDescriptor {
+            RnsBggPreparedLutFamilyDescriptor {
+                prepared: RnsBggPreparedLutDescriptor {
                     prefix: prefix.into(),
                     parameters: self.parameter_identity(),
-                    binding: prepared.material.binding.clone(),
+                    binding: element.binding,
                     input_id: prepared.input.id,
                     output_id: prepared.output.id,
-                    sigmas: prepared.material.masks.iter().map(|m| m.sigma).collect(),
+                    sigmas: element.branches.iter().map(|branch| branch.sigma).collect(),
+                    schema,
                 },
                 range: prepared.input.range.clone(),
-                ciphertext_count: prepared.material.ciphertexts.count().clone(),
             },
         ))
     }
@@ -1742,223 +1758,108 @@ impl BfvScheme {
     /// checked once here, while slot payloads remain runtime-managed artifacts.
     pub fn import_prepared_lut_family(
         &self,
-        descriptor: &BfvPreparedLutFamilyDescriptor,
+        descriptor: &RnsBggPreparedLutFamilyDescriptor,
         production: ProductionId,
-        binding: &BfvLutBinding,
+        binding: &RnsBggLutBinding,
         input_id: [u8; 32],
         output_id: [u8; 32],
         range: &FamilyRange,
-    ) -> Result<BfvPreparedLutFamily, BfvError> {
+    ) -> Result<RnsBggPreparedLutFamily, RnsBggError> {
         let data = &descriptor.prepared;
         self.check_prepared_descriptor(data, binding, input_id, output_id)?;
         if descriptor.range != *range {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
-        let high = self.ring(binding.level)?;
-        let low = self.ring(binding.level + 1)?;
-        let matrix_schema = |ring: &Ring| {
-            BlocksType::<2, 2>(std::array::from_fn(|_| {
-                std::array::from_fn(|_| MatType(ring.matrix_type((1, 1))))
-            }))
-        };
-        let branch_schema = BfvBranchesType(vec![matrix_schema(&low); data.sigmas.len()]);
-        let input = BfvPublicKeyFamily {
-            matrices: import_family_value(
-                matrix_schema(&high),
-                range.count().clone(),
-                &descriptor.input_storage,
-                production.clone(),
-                &format!("{}.input", data.prefix),
-            )?,
+        let prepared = data.schema.artifact_input(
+            production,
+            &data.prefix,
+            ArtifactConfidentiality::Public,
+        )?;
+        let input = RnsBggPublicKeyFamily {
+            matrices: ProgramValue::Family(prepared.field(|value| value.input.matrix)?),
             level: binding.level,
             id: input_id,
             context: self.context,
             range: range.clone(),
         };
-        let output = BfvPublicKeyFamily {
-            matrices: ProgramValue::Family(
-                FamilyType {
-                    element: matrix_schema(&low),
-                    count: range.count().clone(),
-                    shared: vec![false; 4],
-                }
-                .artifact_input(
-                    production.clone(),
-                    &format!("{}.output", data.prefix),
-                    mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-                )?,
-            ),
+        let output = RnsBggPublicKeyFamily {
+            matrices: ProgramValue::Family(prepared.field(|value| value.output.matrix)?),
             level: binding.level + 1,
             id: output_id,
             context: self.context,
             range: range.clone(),
         };
-        let material = BfvLutMaterialFamily {
-            binding: binding.clone(),
-            ciphertexts: FamilyType {
-                element: branch_schema.clone(),
-                shared: vec![false; branch_schema.wire_types().len()],
-                count: descriptor.ciphertext_count.clone(),
-            }
-            .artifact_input(
-                production.clone(),
-                &format!("{}.C", data.prefix),
-                mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-            )?,
-            masks: data
-                .sigmas
-                .iter()
-                .enumerate()
-                .map(|(index, sigma)| MaskBranch {
-                    sigma: *sigma,
-                    public: import_blocks(
-                        &high,
-                        &production,
-                        &format!("{}.mask.{index}", data.prefix),
-                    ),
-                })
-                .collect(),
-        };
-        let intermediates = FamilyType {
-            shared: vec![false; branch_schema.wire_types().len()],
-            element: branch_schema,
-            count: range.count().clone(),
-        }
-        .artifact_input(
-            production.clone(),
-            &format!("{}.b", data.prefix),
-            mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-        )?;
-        Ok(BfvPreparedLutFamily { input, output, material, intermediates })
+        Ok(RnsBggPreparedLutFamily { input, output, prepared })
     }
     /// Export existing public helper values. Low-base C/b remain low-base;
     /// no dense concatenation, coefficient extraction, or extra lift is used.
     pub fn export_prepared_lut(
         &self,
-        prepared: &BfvPreparedLut,
+        prepared: &RnsBggPreparedLut,
         mut graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvPreparedLutDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggPreparedLutDescriptor), RnsBggError> {
         self.check_key(&prepared.input)?;
         self.check_key(&prepared.output)?;
-        graph = graph.public_output(&format!("{prefix}.input"), (prepared.input.matrix).clone())?;
-        graph =
-            graph.public_output(&format!("{prefix}.output"), (prepared.output.matrix).clone())?;
-        graph = export_prepared_branches(graph, prefix, &prepared.branches)?;
+        graph = graph.public_output(prefix, prepared.clone())?;
         Ok((
             graph,
-            BfvPreparedLutDescriptor {
+            RnsBggPreparedLutDescriptor {
                 prefix: prefix.into(),
                 parameters: self.parameter_identity(),
                 binding: prepared.binding.clone(),
                 input_id: prepared.input.id,
                 output_id: prepared.output.id,
                 sigmas: prepared.branches.iter().map(|branch| branch.sigma).collect(),
+                schema: prepared.schema(),
             },
         ))
-    }
-    pub(super) fn import_prepared_branches(
-        &self,
-        level: usize,
-        production: &ProductionId,
-        prefix: &str,
-        sigmas: &[usize],
-    ) -> Result<Vec<PreparedBranch>, BfvError> {
-        let high = self.ring(level)?;
-        let low = self.ring(level + 1)?;
-        let branches = sigmas
-            .iter()
-            .enumerate()
-            .map(|(index, sigma)| {
-                let ciphertext =
-                    import_blocks::<2, 2>(&low, production, &format!("{prefix}.C.{index}"));
-                let intermediate =
-                    import_blocks::<2, 2>(&low, production, &format!("{prefix}.b.{index}"));
-                PreparedBranch {
-                    sigma: *sigma,
-                    lifted_ciphertext: import_blocks(
-                        &high,
-                        production,
-                        &format!("{prefix}.lifted-C.{index}"),
-                    ),
-                    ciphertext,
-                    lifted_intermediate: import_blocks(
-                        &high,
-                        production,
-                        &format!("{prefix}.lifted-b.{index}"),
-                    ),
-                    intermediate,
-                    mask_public: import_blocks(
-                        &high,
-                        production,
-                        &format!("{prefix}.mask.{index}"),
-                    ),
-                }
-            })
-            .collect();
-        Ok(branches)
     }
     /// Expected identities come from the setup contract. Freeze the resulting
     /// graph with the runtime production manifest before executing it. The
     /// imported online graph has no public-key preprocessing multiplications.
     pub fn import_prepared_lut(
         &self,
-        descriptor: &BfvPreparedLutDescriptor,
+        descriptor: &RnsBggPreparedLutDescriptor,
         production: ProductionId,
-        binding: &BfvLutBinding,
+        binding: &RnsBggLutBinding,
         input_id: [u8; 32],
         output_id: [u8; 32],
-    ) -> Result<BfvPreparedLut, BfvError> {
+    ) -> Result<RnsBggPreparedLut, RnsBggError> {
         self.check_prepared_descriptor(descriptor, binding, input_id, output_id)?;
-        let high = self.ring(binding.level)?;
-        let low = self.ring(binding.level + 1)?;
-        let input = BfvPublicKey {
-            matrix: import_blocks(&high, &production, &format!("{}.input", descriptor.prefix)),
-            level: binding.level,
-            id: input_id,
-            context: self.context,
-        };
-        let output = BfvPublicKey {
-            matrix: import_blocks(&low, &production, &format!("{}.output", descriptor.prefix)),
-            level: binding.level + 1,
-            id: output_id,
-            context: self.context,
-        };
-        let branches = self.import_prepared_branches(
-            binding.level,
-            &production,
+        Ok(descriptor.schema.artifact_input(
+            production,
             &descriptor.prefix,
-            &descriptor.sigmas,
-        )?;
-        Ok(BfvPreparedLut { binding: binding.clone(), input, output, branches })
+            ArtifactConfidentiality::Public,
+        )?)
     }
     pub fn export_prepared_readout(
         &self,
-        prepared: &BfvPreparedReadout,
+        prepared: &RnsBggPreparedReadout,
         graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvPreparedReadoutDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggPreparedReadoutDescriptor), RnsBggError> {
         let (graph, terminal) = match &prepared.terminal {
-            BfvReadoutTerminal::Scalar { terminal, offset } => {
+            RnsBggReadoutTerminal::Scalar { terminal, offset } => {
                 let (graph, terminal) =
                     self.export_prepared_terminal(terminal, graph, &format!("{prefix}.terminal"))?;
                 let graph = graph.public_output(
                     &format!("{prefix}.output"),
-                    (prepared.public.values.scalar().ok_or(BfvError::Context)?).clone(),
+                    (prepared.public.values.scalar().ok_or(RnsBggError::Context)?).clone(),
                 )?;
                 let graph = graph.public_output(format!("{prefix}.offset"), offset.clone())?;
                 (graph, ProgramValue::Scalar(terminal))
             }
-            BfvReadoutTerminal::Family { terminal, offset } => {
+            RnsBggReadoutTerminal::Family { terminal, offset } => {
                 let (mut graph, terminal) = self.export_prepared_terminal_family(
                     terminal,
                     graph,
                     &format!("{prefix}.terminal"),
                 )?;
-                if let BfvReadoutWeights::Indexed { rows, .. } = &prepared.public.weight {
+                if let RnsBggReadoutWeights::Indexed { rows, .. } = &prepared.public.weight {
                     graph = graph
                         .public_output(format!("{prefix}.weights"), rows.clone())
-                        .map_err(|e| BfvError::Graph(e.to_string()))?;
+                        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
                 }
                 let graph = match offset {
                     ProgramValue::Scalar(row) => {
@@ -1972,15 +1873,17 @@ impl BfvScheme {
             }
         };
         let weight = match &prepared.public.weight {
-            BfvReadoutWeights::Shared(weight) => BfvReadoutWeights::Shared(weight.clone()),
-            BfvReadoutWeights::Indexed { coefficient_bound, .. } => BfvReadoutWeights::Indexed {
-                rows: (),
-                coefficient_bound: coefficient_bound.clone(),
-            },
+            RnsBggReadoutWeights::Shared(weight) => RnsBggReadoutWeights::Shared(weight.clone()),
+            RnsBggReadoutWeights::Indexed { coefficient_bound, .. } => {
+                RnsBggReadoutWeights::Indexed {
+                    rows: (),
+                    coefficient_bound: coefficient_bound.clone(),
+                }
+            }
         };
         Ok((
             graph,
-            BfvPreparedReadoutDescriptor {
+            RnsBggPreparedReadoutDescriptor {
                 prefix: prefix.into(),
                 identity: prepared.identity,
                 terminal,
@@ -1992,15 +1895,15 @@ impl BfvScheme {
     /// Expected bindings come from preprocessing; no online secret is needed.
     pub fn import_prepared_readout(
         &self,
-        descriptor: &BfvPreparedReadoutDescriptor,
+        descriptor: &RnsBggPreparedReadoutDescriptor,
         production: ProductionId,
         readout: &ValueReadout,
-        binding: &crate::bfv::BfvLutBinding,
+        binding: &crate::rns_bgg::RnsBggLutBinding,
         input_id: [u8; 32],
         stage_id: [u8; 32],
-    ) -> Result<BfvPreparedReadout, BfvError> {
+    ) -> Result<RnsBggPreparedReadout, RnsBggError> {
         if descriptor.identity != readout.identity() {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let data = match &descriptor.terminal {
             ProgramValue::Scalar(data) => data,
@@ -2014,13 +1917,17 @@ impl BfvScheme {
                 )?;
                 let level = terminal.level();
                 let ring = self.ring(level)?;
-                let row_schema = crate::bfv::BlocksType::<1, 2>([[
-                    mxx_dsl::MatType(ring.matrix_type((1, 1))),
-                    mxx_dsl::MatType(ring.matrix_type((1, 1))),
+                let columns = terminal.public_matrices().schema().element.matrix_type().columns /
+                    IntExpr::constant(2);
+                let row_schema = crate::rns_bgg::BlocksType::<1, 2>([[
+                    mxx_dsl::MatType(ring.matrix_type((1, columns.clone()))),
+                    mxx_dsl::MatType(ring.matrix_type((1, columns.clone()))),
                 ]]);
                 let weight = match &descriptor.weight {
-                    BfvReadoutWeights::Shared(weight) => BfvReadoutWeights::Shared(weight.clone()),
-                    BfvReadoutWeights::Indexed { coefficient_bound, .. } => {
+                    RnsBggReadoutWeights::Shared(weight) => {
+                        RnsBggReadoutWeights::Shared(weight.clone())
+                    }
+                    RnsBggReadoutWeights::Indexed { coefficient_bound, .. } => {
                         let rows = FamilyType {
                             element: row_schema.clone(),
                             shared: vec![false; 2],
@@ -2031,19 +1938,20 @@ impl BfvScheme {
                             &format!("{}.weights", descriptor.prefix),
                             mxx_ir_core::artifact::ArtifactConfidentiality::Public,
                         )?;
-                        BfvReadoutWeights::Indexed {
+                        RnsBggReadoutWeights::Indexed {
                             rows,
                             coefficient_bound: coefficient_bound.clone(),
                         }
                     }
                 };
-                let offset = if terminal.mode() == BfvTerminalFamilyMode::Sum ||
-                    matches!(&weight, BfvReadoutWeights::Shared(_))
+                let offset = if terminal.mode() == RnsBggTerminalFamilyMode::Sum ||
+                    matches!(&weight, RnsBggReadoutWeights::Shared(_))
                 {
-                    ProgramValue::Scalar(crate::bfv::import_blocks(
+                    ProgramValue::Scalar(crate::rns_bgg::import_blocks(
                         &ring,
                         &production,
                         &format!("{}.offset", descriptor.prefix),
+                        columns.clone(),
                     ))
                 } else {
                     ProgramValue::Family(
@@ -2059,7 +1967,7 @@ impl BfvScheme {
                         )?,
                     )
                 };
-                let public = BfvReadoutPublicOutput {
+                let public = RnsBggReadoutPublicOutput {
                     values: ProgramValue::Family((
                         terminal.public_matrices().clone(),
                         terminal.output_range(),
@@ -2067,50 +1975,55 @@ impl BfvScheme {
                     level,
                     weight,
                 };
-                return Ok(BfvPreparedReadout {
+                return Ok(RnsBggPreparedReadout {
                     identity: descriptor.identity,
                     public,
-                    terminal: BfvReadoutTerminal::Family { terminal, offset },
+                    terminal: RnsBggReadoutTerminal::Family { terminal, offset },
                 });
             }
         };
-        let BfvReadoutWeights::Shared(weight) = &descriptor.weight else {
-            return Err(BfvError::Context);
+        let RnsBggReadoutWeights::Shared(weight) = &descriptor.weight else {
+            return Err(RnsBggError::Context);
         };
         let terminal =
             self.import_prepared_terminal(data, production.clone(), binding, input_id, stage_id)?;
         let level = binding.level + 1;
         let ring = self.ring(level)?;
-        let public = BfvReadoutPublicOutput {
-            values: ProgramValue::Scalar(crate::bfv::import_blocks(
+        let public = RnsBggReadoutPublicOutput {
+            values: ProgramValue::Scalar(crate::rns_bgg::import_blocks(
                 &ring,
                 &production,
                 &format!("{}.output", descriptor.prefix),
+                1,
             )),
             level,
-            weight: BfvReadoutWeights::Shared(weight.clone()),
+            weight: RnsBggReadoutWeights::Shared(weight.clone()),
         };
-        let offset =
-            crate::bfv::import_blocks(&ring, &production, &format!("{}.offset", descriptor.prefix));
-        Ok(BfvPreparedReadout {
+        let offset = crate::rns_bgg::import_blocks(
+            &ring,
+            &production,
+            &format!("{}.offset", descriptor.prefix),
+            1,
+        );
+        Ok(RnsBggPreparedReadout {
             identity: descriptor.identity,
             public,
-            terminal: BfvReadoutTerminal::Scalar { terminal, offset },
+            terminal: RnsBggReadoutTerminal::Scalar { terminal, offset },
         })
     }
     pub fn prepare_terminal(
         &self,
-        input: &BfvPublicKey,
-        material: &BfvTerminalMaterial,
-    ) -> Result<BfvPreparedTerminal, BfvError> {
+        input: &RnsBggPublicKey,
+        material: &RnsBggTerminalMaterial,
+    ) -> Result<RnsBggPreparedTerminal, RnsBggError> {
         let (raw_public, branches) =
             self.prepare_lut_raw(input, &material.material, &material.lifted_ciphertexts)?;
         let mut hash = Sha256::new();
-        hash.update(b"bfv-terminal-stage");
+        hash.update(b"rns_bgg-terminal-stage");
         hash.update(self.context);
         hash.update(input.id);
         hash.update(material.material.id);
-        Ok(BfvPreparedTerminal {
+        Ok(RnsBggPreparedTerminal {
             binding: material.material.binding(),
             input: input.clone(),
             id: hash.finalize().into(),
@@ -2120,13 +2033,13 @@ impl BfvScheme {
     }
     pub fn finalize_terminal_public(
         &self,
-        raw: BfvTerminalAccumulator<BfvMatrix>,
-    ) -> Result<BfvTerminalPublicKey, BfvError> {
+        raw: RnsBggTerminalAccumulator<RnsBggMatrix>,
+    ) -> Result<RnsBggTerminalPublicKey, RnsBggError> {
         if raw.context != self.context {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let next = BigInt::from(self.parameters.level(raw.level + 1)?.modulus().as_ref().clone());
-        Ok(BfvTerminalPublicKey {
+        Ok(RnsBggTerminalPublicKey {
             matrix: raw.value.block_mod_switch(next),
             level: raw.level + 1,
             context: self.context,
@@ -2137,11 +2050,11 @@ impl BfvScheme {
     /// No member is enumerated on the host; key-dependent work stays structural.
     pub fn prepare_terminal_family(
         &self,
-        input: &BfvPublicKeyFamily,
-        material: &ProgramValue<BfvTerminalMaterial, Family<BfvTerminalMaterial>>,
-        mode: BfvTerminalFamilyMode,
+        input: &RnsBggPublicKeyFamily,
+        material: &ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>,
+        mode: RnsBggTerminalFamilyMode,
         finalize: Option<bool>,
-    ) -> Result<BfvPreparedTerminalFamily, BfvError> {
+    ) -> Result<RnsBggPreparedTerminalFamily, RnsBggError> {
         self.check_public_family(input)?;
         let finalize = finalize.unwrap_or(true);
         let binding = material.element_schema().material.binding();
@@ -2150,29 +2063,29 @@ impl BfvScheme {
             self,
             &input.clone().into_program()?,
             material,
-            mode == BfvTerminalFamilyMode::Sum,
+            mode == RnsBggTerminalFamilyMode::Sum,
             |raw| Ok(if finalize { raw.value.block_mod_switch(next) } else { raw.value }),
         )
         .map_err(|error| match error {
             crate::readout::TerminalError::Scheme(error) => error,
-            error => BfvError::Graph(error.to_string()),
+            error => RnsBggError::Graph(error.to_string()),
         })?;
-        let ProgramValue::Family(cache) = cache else { return Err(BfvError::Context) };
+        let ProgramValue::Family(cache) = cache else { return Err(RnsBggError::Context) };
         let public = match public {
             ProgramValue::Scalar(value) => Family::pack(vec![value])?,
             ProgramValue::Family(values) => values,
         };
         let mut hash = Sha256::new();
-        hash.update(b"bfv-terminal-stage");
+        hash.update(b"rns_bgg-terminal-stage");
         hash.update(self.context);
         hash.update(input.id);
         hash.update(binding.material_id);
         hash.update([u8::from(finalize)]);
         hash.update([match mode {
-            BfvTerminalFamilyMode::Independent => 0,
-            BfvTerminalFamilyMode::Sum => 1,
+            RnsBggTerminalFamilyMode::Independent => 0,
+            RnsBggTerminalFamilyMode::Sum => 1,
         }]);
-        Ok(BfvPreparedTerminalFamily {
+        Ok(RnsBggPreparedTerminalFamily {
             mode,
             finalize,
             input: input.clone(),
@@ -2183,15 +2096,15 @@ impl BfvScheme {
     }
     pub fn export_prepared_terminal_family(
         &self,
-        prepared: &BfvPreparedTerminalFamily,
+        prepared: &RnsBggPreparedTerminalFamily,
         graph: DslContext,
         prefix: &str,
-    ) -> Result<(DslContext, BfvPreparedTerminalFamilyDescriptor), BfvError> {
+    ) -> Result<(DslContext, RnsBggPreparedTerminalFamilyDescriptor), RnsBggError> {
         let graph =
             graph.public_output(prefix, (prepared.cache.clone(), prepared.public.clone()))?;
         Ok((
             graph,
-            BfvPreparedTerminalFamilyDescriptor {
+            RnsBggPreparedTerminalFamilyDescriptor {
                 prefix: prefix.to_owned(),
                 parameters: self.parameter_identity(),
                 mode: prepared.mode,
@@ -2206,12 +2119,12 @@ impl BfvScheme {
     /// The descriptor carries actual graph schemas, including captured shared ports.
     pub fn import_prepared_terminal_family(
         &self,
-        descriptor: &BfvPreparedTerminalFamilyDescriptor,
+        descriptor: &RnsBggPreparedTerminalFamilyDescriptor,
         production: ProductionId,
-        binding: &BfvLutBinding,
+        binding: &RnsBggLutBinding,
         input_id: [u8; 32],
         stage_id: [u8; 32],
-    ) -> Result<BfvPreparedTerminalFamily, BfvError> {
+    ) -> Result<RnsBggPreparedTerminalFamily, RnsBggError> {
         let metadata = &descriptor.cache.element;
         if descriptor.parameters != self.parameter_identity() ||
             metadata.binding != *binding ||
@@ -2219,17 +2132,17 @@ impl BfvScheme {
             descriptor.id != stage_id ||
             metadata.input.context != self.context
         {
-            return Err(BfvError::Context);
+            return Err(RnsBggError::Context);
         }
         let (cache, public) = (descriptor.cache.clone(), descriptor.public.clone())
             .artifact_input(production, &descriptor.prefix, ArtifactConfidentiality::Public)?;
         let keys = cache.field(|term| (term.input, None))?;
-        let mut input = BfvPublicKeyFamily::from_program(
+        let mut input = RnsBggPublicKeyFamily::from_program(
             &ProgramValue::Family(keys),
             descriptor.range.count().clone(),
         )?;
         input.range = descriptor.range.clone();
-        Ok(BfvPreparedTerminalFamily {
+        Ok(RnsBggPreparedTerminalFamily {
             mode: descriptor.mode,
             finalize: descriptor.finalize,
             id: descriptor.id,
@@ -2240,17 +2153,17 @@ impl BfvScheme {
     }
 }
 
-impl ExponentProgramLowering for BfvPublicEvaluator<'_> {
+impl ExponentProgramLowering for RnsBggPublicEvaluator<'_> {
     fn mul_private(
         &mut self,
         input: &Self::Wire,
         rhs: &Self::Rhs,
         _: Option<&Self::HelperSet>,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
+    ) -> Result<Self::Wire, RnsBggError> {
         let (key, _) = input;
-        let BfvPublicRhs::Fixed(material) = rhs else {
-            return Err(BfvError::Context);
+        let RnsBggPublicRhs::Fixed(material) = rhs else {
+            return Err(RnsBggError::Context);
         };
         let prepared = self.scheme.prepare_mul_private(
             key,
@@ -2266,10 +2179,10 @@ impl ExponentProgramLowering for BfvPublicEvaluator<'_> {
         private: &Self::Wire,
         public: &Self::Wire,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
+    ) -> Result<Self::Wire, RnsBggError> {
         let (a, a_plaintext) = private;
         let (b, b_plaintext) = public;
-        let multiplier = b_plaintext.clone().ok_or(BfvError::Context)?;
+        let multiplier = b_plaintext.clone().ok_or(RnsBggError::Context)?;
         let prepared = self.scheme.prepare_mul_public(
             a,
             b,
@@ -2289,7 +2202,7 @@ impl ExponentProgramLowering for BfvPublicEvaluator<'_> {
         lhs: &Self::Wire,
         rhs: &Self::Wire,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
+    ) -> Result<Self::Wire, RnsBggError> {
         let (a, a_plaintext) = lhs;
         let (b, b_plaintext) = rhs;
         let prepared = self.scheme.prepare_add(
@@ -2313,10 +2226,10 @@ impl ExponentProgramLowering for BfvPublicEvaluator<'_> {
         helpers: Option<&Self::HelperSet>,
         rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, BfvError> {
-        let rhs_identity = rhs.map(BfvPublicRhs::id);
+    ) -> Result<Self::Wire, RnsBggError> {
+        let rhs_identity = rhs.map(RnsBggPublicRhs::id);
         let (input, input_plaintext) = input;
-        let helpers = helpers.ok_or(BfvError::Context)?;
+        let helpers = helpers.ok_or(RnsBggError::Context)?;
         let material = helpers;
         let binding = material.binding();
         check_lut_binding(self.scheme, program, lut, input.level, rhs_identity.as_ref(), &binding)?;
@@ -2355,13 +2268,13 @@ impl ExponentProgramLowering for BfvPublicEvaluator<'_> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BfvLinearOperation {
+pub enum RnsBggLinearOperation {
     Add { rhs: [u8; 32], range: Option<FamilyRange> },
     MulPublic { rhs: [u8; 32], range: Option<FamilyRange> },
     Reduce { range: FamilyRange },
 }
 
-impl BfvLinearOperation {
+impl RnsBggLinearOperation {
     pub fn input_range(&self) -> Option<&FamilyRange> {
         match self {
             Self::Add { range, .. } | Self::MulPublic { range, .. } => range.as_ref(),
@@ -2379,14 +2292,14 @@ impl BfvLinearOperation {
 
 impl<M: GraphValue> LinearOperation<M> {
     fn import(
-        operation: &BfvLinearOperation,
+        operation: &RnsBggLinearOperation,
         schema: &M::Schema,
         production: ProductionId,
         prefix: &str,
-    ) -> Result<(Self, [u8; 32]), BfvError> {
+    ) -> Result<(Self, [u8; 32]), RnsBggError> {
         match operation {
-            BfvLinearOperation::Add { rhs, .. } => Ok((Self::Add, *rhs)),
-            BfvLinearOperation::MulPublic { rhs, .. } => Ok((
+            RnsBggLinearOperation::Add { rhs, .. } => Ok((Self::Add, *rhs)),
+            RnsBggLinearOperation::MulPublic { rhs, .. } => Ok((
                 Self::MulPublic(schema.artifact_input(
                     production,
                     format!("{prefix}.multiplier"),
@@ -2394,7 +2307,7 @@ impl<M: GraphValue> LinearOperation<M> {
                 )?),
                 *rhs,
             )),
-            BfvLinearOperation::Reduce { .. } => Err(BfvError::Context),
+            RnsBggLinearOperation::Reduce { .. } => Err(RnsBggError::Context),
         }
     }
 
@@ -2404,12 +2317,12 @@ impl<M: GraphValue> LinearOperation<M> {
         prefix: &str,
         rhs: [u8; 32],
         range: Option<FamilyRange>,
-    ) -> Result<(DslContext, BfvLinearOperation), BfvError> {
+    ) -> Result<(DslContext, RnsBggLinearOperation), RnsBggError> {
         match self {
-            Self::Add => Ok((graph, BfvLinearOperation::Add { rhs, range })),
+            Self::Add => Ok((graph, RnsBggLinearOperation::Add { rhs, range })),
             Self::MulPublic(multiplier) => Ok((
                 graph.public_output(format!("{prefix}.multiplier"), multiplier.clone())?,
-                BfvLinearOperation::MulPublic { rhs, range },
+                RnsBggLinearOperation::MulPublic { rhs, range },
             )),
         }
     }
@@ -2419,25 +2332,25 @@ impl<M: GraphValue> LinearOperation<M> {
 /// multiplier, if any, by the same caller contract as public preparation.
 /// A range denotes active family members; reduction has a scalar output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BfvLinearBinding {
+pub struct RnsBggLinearBinding {
     pub context: [u8; 32],
     pub level: usize,
     pub lhs: [u8; 32],
     pub output: [u8; 32],
-    pub operation: BfvLinearOperation,
+    pub operation: RnsBggLinearOperation,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct BfvPreparedLinearDescriptor {
+pub struct RnsBggPreparedLinearDescriptor {
     key_storage: [ProgramValue<(), Vec<bool>>; 2],
     multiplier_storage: ProgramValue<(), Vec<bool>>,
     prefix: String,
     parameters: [u8; 32],
-    binding: BfvLinearBinding,
+    binding: RnsBggLinearBinding,
 }
 
-impl BfvPreparedLinearDescriptor {
-    pub fn binding(&self) -> &BfvLinearBinding {
+impl RnsBggPreparedLinearDescriptor {
+    pub fn binding(&self) -> &RnsBggLinearBinding {
         &self.binding
     }
 }
@@ -2446,9 +2359,9 @@ impl BfvPreparedLinearDescriptor {
 /// Keep the descriptor bound to the selected production and payload at setup;
 /// key identity alone does not distinguish different payloads for that key.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct BfvInputMaterialDescriptor {
+pub struct RnsBggInputMaterialDescriptor {
     prefix: String,
-    scheme: crate::bfv::BfvArtifactBinding,
+    scheme: crate::rns_bgg::RnsBggArtifactBinding,
     level: usize,
     key_id: [u8; 32],
 }
@@ -2458,43 +2371,27 @@ pub struct BfvInputMaterialDescriptor {
 /// runtime manifest supplies artifact shapes/confidentiality and production
 /// binding; this descriptor is not a separate authentication protocol.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct BfvPreparedLutDescriptor {
+pub struct RnsBggPreparedLutDescriptor<S = <RnsBggPreparedLut as GraphValue>::Schema> {
     pub(super) prefix: String,
     pub(super) parameters: [u8; 32],
-    pub(super) binding: BfvLutBinding,
+    pub(super) binding: RnsBggLutBinding,
     pub(super) input_id: [u8; 32],
     pub(super) output_id: [u8; 32],
     pub(super) sigmas: Vec<usize>,
+    schema: S,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct BfvPreparedLutFamilyDescriptor {
-    input_storage: ProgramValue<(), Vec<bool>>,
-    pub(super) prepared: BfvPreparedLutDescriptor,
+pub struct RnsBggPreparedLutFamilyDescriptor {
+    pub(super) prepared:
+        RnsBggPreparedLutDescriptor<<Family<RnsBggPreparedLut> as GraphValue>::Schema>,
     pub(super) range: FamilyRange,
-    pub(super) ciphertext_count: IntExpr,
-}
-
-pub(super) fn export_prepared_branches(
-    graph: DslContext,
-    prefix: &str,
-    branches: &[PreparedBranch],
-) -> Result<DslContext, BfvError> {
-    Ok(graph.public_outputs(branches.iter().enumerate().flat_map(|(index, branch)| {
-        [
-            (format!("{prefix}.C.{index}"), branch.ciphertext.clone()),
-            (format!("{prefix}.lifted-C.{index}"), branch.lifted_ciphertext.clone()),
-            (format!("{prefix}.lifted-b.{index}"), branch.lifted_intermediate.clone()),
-            (format!("{prefix}.b.{index}"), branch.intermediate.clone()),
-            (format!("{prefix}.mask.{index}"), branch.mask_public.clone()),
-        ]
-    }))?)
 }
 
 #[cfg(test)]
 pub(crate) mod terminal_artifact_tests {
     use super::*;
-    use crate::bfv::{BfvNoiseBound, BfvParameters, BfvPlanRequest, BfvRow};
+    use crate::rns_bgg::{RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest, RnsBggRow};
     use mxx_dsl::DslContext;
     use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality};
     use mxx_primitives::{
@@ -2512,14 +2409,14 @@ pub(crate) mod terminal_artifact_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_fixed_product_schema_preserves_family_bindings() {
+    fn test_rns_bgg_fixed_product_schema_preserves_family_bindings() {
         let ring = mxx_dsl::Ring::new(257, 8);
-        let matrix = BfvMatrix::new(std::array::from_fn(|row| {
+        let matrix = RnsBggMatrix::new(std::array::from_fn(|row| {
             std::array::from_fn(|column| ring.input(format!("key-{row}-{column}"), (1, 1)))
         }))
         .unwrap();
         let context = rand::random();
-        let key = BfvPublicKeyFamily {
+        let key = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Scalar(matrix.clone()),
             level: 0,
             id: rand::random(),
@@ -2530,8 +2427,8 @@ pub(crate) mod terminal_artifact_tests {
         output.matrices = ProgramValue::Family(Family::pack(vec![matrix.clone(), matrix]).unwrap());
         output.level = 1;
         output.id = rand::random();
-        let prepared = BfvPreparedPrivateMul {
-            rhs: BfvPrivateRhs {
+        let prepared = RnsBggPreparedPrivateMul {
+            rhs: RnsBggPrivateRhs {
                 ciphertext: output.matrices.clone(),
                 lifted_ciphertext: key.matrices.clone(),
                 level: 0,
@@ -2577,7 +2474,7 @@ pub(crate) mod terminal_artifact_tests {
     }
 
     #[test]
-    fn test_bfv_terminal_artifacts_reused_with_independent_online_secrets() {
+    fn test_rns_bgg_terminal_artifacts_reused_with_independent_online_secrets() {
         check_terminal_artifacts(
             |parameters| cpu_backend(parameters.levels().iter().cloned()),
             |matrix, name, q, bound| {
@@ -2592,7 +2489,7 @@ pub(crate) mod terminal_artifact_tests {
     }
 
     pub(crate) fn check_terminal_artifacts<B: Backend>(
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
     ) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
@@ -2606,7 +2503,7 @@ pub(crate) mod terminal_artifact_tests {
         let tables =
             values.clone().map(|values| crate::readout::RowLutTable::new(values, None).unwrap());
         let value_bound = tables[0].coefficient_bound() + tables[1].coefficient_bound();
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
@@ -2618,7 +2515,7 @@ pub(crate) mod terminal_artifact_tests {
             terminal_value_bound: value_bound.clone(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -2668,9 +2565,9 @@ pub(crate) mod terminal_artifact_tests {
             .map(|term| (term.binding().clone(), key.id, term.id()))
             .collect::<Vec<_>>();
         let (mut producer, descriptor) =
-            prepared.export(DslContext::new("bfv-terminal-preprocessing"), "terminal").unwrap();
+            prepared.export(DslContext::new("rns_bgg-terminal-preprocessing"), "terminal").unwrap();
         let descriptor: crate::readout::PreparedTerminalDescriptor<
-            <BfvScheme as ExponentLUTTerminalScheme>::TerminalDescriptor,
+            <RnsBggScheme as ExponentLUTTerminalScheme>::TerminalDescriptor,
         > = serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
         let mut inputs = Vec::new();
         for x in 0..2 {
@@ -2683,8 +2580,8 @@ pub(crate) mod terminal_artifact_tests {
             inputs.push(descriptor);
         }
         let producer = producer.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        std::fs::create_dir_all("test_data/bfv_terminal_artifacts").unwrap();
-        let directory = tempfile::tempdir_in("test_data/bfv_terminal_artifacts").unwrap();
+        std::fs::create_dir_all("test_data/rns_bgg_terminal_artifacts").unwrap();
+        let directory = tempfile::tempdir_in("test_data/rns_bgg_terminal_artifacts").unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let mut backend = make_backend(&parameters);
         let produced = execute(
@@ -2737,7 +2634,7 @@ pub(crate) mod terminal_artifact_tests {
                 scheme.import_input_material(descriptor, production.clone(), key.id, 0).unwrap()
             })
             .collect::<Vec<_>>();
-        let bound = BfvNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let bound = RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
         let gain = BigUint::from(1u8);
         let noise = parameters
             .terminal_noise_bound(0, [(&bound, 2, &gain), (&bound, 2, &gain)], value_bound)
@@ -2745,7 +2642,7 @@ pub(crate) mod terminal_artifact_tests {
         assert!(parameters.terminal_noise_fits(1, &noise).unwrap());
         let q = parameters.level(1).unwrap().modulus();
         let modulus = BigInt::from(q.as_ref().clone());
-        let mut online = DslContext::new("bfv-terminal-independent-online-secrets");
+        let mut online = DslContext::new("rns_bgg-terminal-independent-online-secrets");
         // No s exists before the preprocessing production is finished/reopened.
         for run in 0..2 {
             let secret = scheme.sample_mask_secret().unwrap();
@@ -2758,7 +2655,7 @@ pub(crate) mod terminal_artifact_tests {
                 let input = (encoding, None);
                 let result = prepared.evaluate(&[(&input, &helpers), (&input, &helpers)]).unwrap();
                 let row = |coefficients: &[Vec<BigInt>; 2]| {
-                    BfvRow::new([coefficients.each_ref().map(|p| {
+                    RnsBggRow::new([coefficients.each_ref().map(|p| {
                         if p.is_empty() {
                             low.zero((1, 1))
                         } else {
@@ -2782,9 +2679,13 @@ pub(crate) mod terminal_artifact_tests {
             .unwrap();
         assert!(
             online.source.scopes().values().flat_map(|scope| scope.nodes()).all(|node| {
-                !matches!(node.kind(), mxx_ir_core::node::NodeKind::CenteredExtend { .. })
+                !matches!(node.kind(), mxx_ir_core::node::NodeKind::GadgetDecompose { .. }) &&
+                    !(matches!(node.kind(), mxx_ir_core::node::NodeKind::CenteredExtend { .. }) &&
+                        node.output_types()
+                            .iter()
+                            .any(|ty| matches!(ty, WireType::Preimage { .. })))
             }),
-            "online terminal evaluation must reuse persisted ciphertext and intermediate lifts"
+            "online terminal evaluation must reuse persisted bounded ciphertext and intermediate actions"
         );
         let switches = online
             .source
@@ -2814,12 +2715,15 @@ pub(crate) mod terminal_artifact_tests {
 pub(crate) mod program_artifacts_tests {
     use super::*;
     use crate::{
-        bfv::{BfvEncoding, BfvParameters, BfvPlanRequest, BfvRhsPlaintextFamily, BfvRow},
         layout::ExpLayout,
         program::{
             AttributeKnowledge, ExponentLutProgramBuilder, FamilyProgram, FamilyRhsSource,
             FamilyWireSource, Gate, LutTable, ProgramBindings, ProgramFamilyId, ProgramWireType,
             RhsId,
+        },
+        rns_bgg::{
+            RnsBggEncoding, RnsBggParameters, RnsBggPlanRequest, RnsBggRhsPlaintextFamily,
+            RnsBggRow,
         },
     };
     use mxx_ir_core::ParamEnv;
@@ -2833,8 +2737,8 @@ pub(crate) mod program_artifacts_tests {
 
     fn observed_outputs(
         mut graph: DslContext,
-        program: &PreparedProgram<BfvScheme>,
-        online: &BTreeMap<WireId, (BfvEncoding, Option<Mat>)>,
+        program: &PreparedProgram<RnsBggScheme>,
+        online: &BTreeMap<WireId, (RnsBggEncoding, Option<Mat>)>,
     ) -> DslContext {
         for (index, (wire, value)) in online.iter().enumerate() {
             let (value, value_plaintext) = value;
@@ -2852,7 +2756,7 @@ pub(crate) mod program_artifacts_tests {
     }
 
     #[test]
-    fn test_bfv_program_artifacts_restore_all_gate_kinds_and_public_values() {
+    fn test_rns_bgg_program_artifacts_restore_all_gate_kinds_and_public_values() {
         check_program_artifacts(
             |parameters| cpu_backend(parameters.levels().iter().cloned()),
             |actual, expected, name| assert_eq!(actual, expected, "{name}"),
@@ -2860,14 +2764,14 @@ pub(crate) mod program_artifacts_tests {
     }
 
     pub(crate) fn check_program_artifacts<B: mxx_runtime::Backend>(
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &B::Matrix, &str),
     ) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![4],
@@ -2879,7 +2783,7 @@ pub(crate) mod program_artifacts_tests {
             terminal_value_bound: 16u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -2953,7 +2857,7 @@ pub(crate) mod program_artifacts_tests {
             .sample_private_rhs_family(
                 &secret.payload,
                 0,
-                &BfvRhsPlaintextFamily {
+                &RnsBggRhsPlaintextFamily {
                     payloads: mxx_dsl::parallel(4, |_| Ok(low.polynomial([1.into()]))).unwrap(),
                     id: rhs_id,
                 },
@@ -2978,7 +2882,10 @@ pub(crate) mod program_artifacts_tests {
             .sample_private_rhs(
                 &secret.payload,
                 0,
-                crate::bfv::BfvRhsPlaintext { payload: low.polynomial([1.into()]), id: rhs_id },
+                crate::rns_bgg::RnsBggRhsPlaintext {
+                    payload: low.polynomial([1.into()]),
+                    id: rhs_id,
+                },
                 seed.clone(),
                 b"scalar-private".as_slice(),
                 rand::random(),
@@ -3109,12 +3016,12 @@ pub(crate) mod program_artifacts_tests {
             },
         };
         let scalar_rhs_bindings =
-            BTreeMap::from([(scalar_rhs, BfvPublicRhs::Fixed(private_material))]);
+            BTreeMap::from([(scalar_rhs, RnsBggPublicRhs::Fixed(private_material))]);
         let rhs_bindings = BTreeMap::from([(
             rhs_family,
             (
                 mxx_dsl::parallel(2, |index| {
-                    Ok(BfvPublicRhs::Fixed(BfvPrivateRhs {
+                    Ok(RnsBggPublicRhs::Fixed(RnsBggPrivateRhs {
                         ciphertext: family_material.ciphertext.at(&index),
                         lifted_ciphertext: family_material.lifted_ciphertext.at(&index),
                         rhs_id: family_material.rhs_id,
@@ -3127,10 +3034,11 @@ pub(crate) mod program_artifacts_tests {
                 range.clone(),
             ),
         )]);
-        let online_scalar_rhs_bindings = BTreeMap::from([(scalar_rhs, BfvPublicRhs::Lut(rhs_id))]);
+        let online_scalar_rhs_bindings =
+            BTreeMap::from([(scalar_rhs, RnsBggPublicRhs::Lut(rhs_id))]);
         let online_rhs_bindings = BTreeMap::from([(
             rhs_family,
-            (mxx_dsl::parallel(2, |_| Ok(BfvPublicRhs::Lut(rhs_id))).unwrap(), range.clone()),
+            (mxx_dsl::parallel(2, |_| Ok(RnsBggPublicRhs::Lut(rhs_id))).unwrap(), range.clone()),
         )]);
         let public_helpers = BTreeMap::from([
             (
@@ -3184,7 +3092,7 @@ pub(crate) mod program_artifacts_tests {
         };
         assert_eq!(shared.rhs.ciphertext.flatten(), other.rhs.ciphertext.flatten());
         assert_eq!(shared.rhs.lifted_ciphertext.flatten(), other.rhs.lifted_ciphertext.flatten());
-        let lift_graph = DslContext::new("bfv-shared-rhs-lift")
+        let lift_graph = DslContext::new("rns_bgg-shared-rhs-lift")
             .public_output("lift", shared.rhs.lifted_ciphertext.clone())
             .unwrap()
             .build()
@@ -3243,7 +3151,11 @@ pub(crate) mod program_artifacts_tests {
             ))
             .unwrap();
         let (mut producer, descriptor) = prepared
-            .export(scheme.artifact_binding(), DslContext::new("bfv-program-producer"), "program")
+            .export(
+                scheme.artifact_binding(),
+                DslContext::new("rns_bgg-program-producer"),
+                "program",
+            )
             .unwrap();
         let identity = descriptor.identity().unwrap();
         for (name, value) in [("private", &private), ("public", &public), ("member", &member)] {
@@ -3256,7 +3168,7 @@ pub(crate) mod program_artifacts_tests {
                     .unwrap();
             }
         }
-        let producer = crate::bfv::encoding::encoding_tests::export_online_masks(
+        let producer = crate::rns_bgg::encoding::encoding_tests::export_online_masks(
             &online_bank,
             producer,
             "online-mask",
@@ -3301,7 +3213,7 @@ pub(crate) mod program_artifacts_tests {
             );
         }
         let production = produced.production_id.clone().unwrap();
-        let online_bank = crate::bfv::encoding::encoding_tests::import_online_masks(
+        let online_bank = crate::rns_bgg::encoding::encoding_tests::import_online_masks(
             &scheme,
             &online_bank,
             &production,
@@ -3314,9 +3226,9 @@ pub(crate) mod program_artifacts_tests {
         drop(store);
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let descriptor: crate::scheme::PreparedProgramDescriptor<
-            <BfvProgramCache as GraphValue>::Schema,
-            <(BfvPublicKey, Option<Mat>) as GraphValue>::Schema,
-            BfvArtifactBinding,
+            <RnsBggProgramCache as GraphValue>::Schema,
+            <(RnsBggPublicKey, Option<Mat>) as GraphValue>::Schema,
+            RnsBggArtifactBinding,
         > = serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
         let restored = PreparedProgram::import(
             scheme.artifact_binding(),
@@ -3339,14 +3251,14 @@ pub(crate) mod program_artifacts_tests {
         };
         assert_eq!(shared.rhs.ciphertext.flatten(), other.rhs.ciphertext.flatten());
         assert_eq!(shared.rhs.lifted_ciphertext.flatten(), other.rhs.lifted_ciphertext.flatten());
-        let import_input = |name: &str, key: &BfvPublicKey| {
+        let import_input = |name: &str, key: &RnsBggPublicKey| {
             let ring = scheme.ring(key.level).unwrap();
-            BfvEncoding {
-                row: BfvRow::new([std::array::from_fn(|column| {
+            RnsBggEncoding {
+                row: RnsBggRow::new([std::array::from_fn(|column| {
                     ring.artifact_input(
                         production.clone(),
                         format!("input-{name}-{column}"),
-                        (1, 1),
+                        (1, parameters.component_columns(key.level).unwrap()),
                         ArtifactConfidentiality::Private,
                     )
                 })])
@@ -3382,7 +3294,7 @@ pub(crate) mod program_artifacts_tests {
             ))
             .unwrap();
         let consumer =
-            observed_outputs(DslContext::new("bfv-program-consumer"), &restored, &actual)
+            observed_outputs(DslContext::new("rns_bgg-program-consumer"), &restored, &actual)
                 .build()
                 .unwrap()
                 .validate_with_manifests(
@@ -3462,7 +3374,7 @@ pub(crate) mod program_artifacts_tests {
             )
             .is_err()
         );
-        let other = BfvScheme::new(parameters, rand::random());
+        let other = RnsBggScheme::new(parameters, rand::random());
         assert!(
             PreparedProgram::import(
                 other.artifact_binding(),
@@ -3481,7 +3393,9 @@ pub(crate) mod program_artifacts_tests {
 #[cfg(test)]
 mod linear_artifact_tests {
     use super::*;
-    use crate::bfv::{BfvEncoding, BfvEncodingFamily, BfvParameters, BfvPlanRequest, BfvRow};
+    use crate::rns_bgg::{
+        RnsBggEncoding, RnsBggEncodingFamily, RnsBggParameters, RnsBggPlanRequest, RnsBggRow,
+    };
     use mxx_ir_core::ParamEnv;
     use mxx_runtime::{
         RuntimeValue,
@@ -3493,12 +3407,12 @@ mod linear_artifact_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_linear_artifacts_roundtrip_preserves_outputs_and_bindings() {
+    fn test_rns_bgg_linear_artifacts_roundtrip_preserves_outputs_and_bindings() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
@@ -3510,7 +3424,7 @@ mod linear_artifact_tests {
             terminal_value_bound: 1u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let ring = scheme.ring(0).unwrap();
         let key = scheme
             .sample_input_key(
@@ -3533,7 +3447,7 @@ mod linear_artifact_tests {
         let multiplier =
             ring.uniform_interval((1, 1), -1, 1) + ring.uniform_interval((1, 1), -1, 1);
         let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let family_key = BfvPublicKeyFamily {
+        let family_key = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
             ),
@@ -3542,14 +3456,14 @@ mod linear_artifact_tests {
             context: scheme.context,
             range: range.clone(),
         };
-        let family_input = BfvEncodingFamily {
+        let family_input = RnsBggEncodingFamily {
             rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
             level: 0,
             key_id: key.id,
             context: scheme.context,
             range: range.clone(),
         };
-        let mut graph = DslContext::new("bfv-linear-artifact-producer");
+        let mut graph = DslContext::new("rns_bgg-linear-artifact-producer");
         let mut descriptors = Vec::new();
         for (name, is_mul) in [("add", false), ("mul", true)] {
             let prepared = if is_mul {
@@ -3631,12 +3545,12 @@ mod linear_artifact_tests {
         let production = produced.production_id.clone().unwrap();
         drop(store);
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let input = BfvEncoding {
-            row: BfvRow::new([std::array::from_fn(|column| {
+        let input = RnsBggEncoding {
+            row: RnsBggRow::new([std::array::from_fn(|column| {
                 ring.artifact_input(
                     production.clone(),
                     format!("input-{column}"),
-                    (1, 1),
+                    (1, parameters.component_columns(0).unwrap()),
                     ArtifactConfidentiality::Private,
                 )
             })])
@@ -3645,19 +3559,19 @@ mod linear_artifact_tests {
             key_id: key.id,
             context: scheme.context,
         };
-        let family_input = BfvEncodingFamily {
+        let family_input = RnsBggEncodingFamily {
             rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
             level: 0,
             key_id: key.id,
             context: scheme.context,
             range,
         };
-        let mut consumer = DslContext::new("bfv-linear-artifact-consumer");
+        let mut consumer = DslContext::new("rns_bgg-linear-artifact-consumer");
         for (name, original) in descriptors {
-            let descriptor: BfvPreparedLinearDescriptor =
+            let descriptor: RnsBggPreparedLinearDescriptor =
                 serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
             let binding = original.binding();
-            if matches!(binding.operation, BfvLinearOperation::Reduce { .. }) {
+            if matches!(binding.operation, RnsBggLinearOperation::Reduce { .. }) {
                 let prepared = scheme
                     .import_prepared_reduction(&descriptor, production.clone(), binding)
                     .unwrap();
@@ -3690,11 +3604,11 @@ mod linear_artifact_tests {
                 }
                 let mut wrong = binding.clone();
                 match &mut wrong.operation {
-                    BfvLinearOperation::Add { range, .. } |
-                    BfvLinearOperation::MulPublic { range, .. } => {
+                    RnsBggLinearOperation::Add { range, .. } |
+                    RnsBggLinearOperation::MulPublic { range, .. } => {
                         *range = Some(FamilyRange::bounded(0, 2, 4).unwrap());
                     }
-                    BfvLinearOperation::Reduce { .. } => unreachable!("binary family operation"),
+                    RnsBggLinearOperation::Reduce { .. } => unreachable!("binary family operation"),
                 }
                 assert!(
                     scheme
@@ -3717,14 +3631,14 @@ mod linear_artifact_tests {
             assert!(scheme.check_linear_descriptor(&descriptor, &wrong).is_err());
             wrong = binding.clone();
             wrong.operation = match &binding.operation {
-                BfvLinearOperation::Add { rhs, range } => {
-                    BfvLinearOperation::MulPublic { rhs: *rhs, range: range.clone() }
+                RnsBggLinearOperation::Add { rhs, range } => {
+                    RnsBggLinearOperation::MulPublic { rhs: *rhs, range: range.clone() }
                 }
-                BfvLinearOperation::MulPublic { rhs, range } => {
-                    BfvLinearOperation::Add { rhs: *rhs, range: range.clone() }
+                RnsBggLinearOperation::MulPublic { rhs, range } => {
+                    RnsBggLinearOperation::Add { rhs: *rhs, range: range.clone() }
                 }
-                BfvLinearOperation::Reduce { range } => {
-                    BfvLinearOperation::Add { rhs: binding.lhs, range: Some(range.clone()) }
+                RnsBggLinearOperation::Reduce { range } => {
+                    RnsBggLinearOperation::Add { rhs: binding.lhs, range: Some(range.clone()) }
                 }
             };
             assert!(scheme.check_linear_descriptor(&descriptor, &wrong).is_err());
@@ -3754,8 +3668,8 @@ mod linear_artifact_tests {
 mod lut_artifact_tests {
     use super::*;
     use crate::{
-        bfv::{BfvEncoding, BfvParameters, BfvPlanRequest, BfvRow},
         program::LutTable,
+        rns_bgg::{RnsBggEncoding, RnsBggParameters, RnsBggRow},
     };
     use mxx_ir_core::ParamEnv;
     use mxx_runtime::{
@@ -3768,24 +3682,16 @@ mod lut_artifact_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_prepared_artifacts_roundtrip_preserves_online_outputs() {
+    fn test_rns_bgg_prepared_artifacts_roundtrip_preserves_online_outputs() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(16);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
-            ring_dimension: n,
-            widths: vec![2],
-            slots: vec![1],
-            eta: 2,
-            crt_bits: 17,
-            terminal_depth: 1,
-            max_crt_depth: 8,
-            memory_budget_bytes: u64::MAX,
-            terminal_value_bound: 1u8.into(),
-        })
-        .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let high_parameters = DCRTPolyParams::new(n, 2, 17, 4, None, None);
+        let prime = high_parameters.to_crt().0[0];
+        let low_parameters = DCRTPolyParams::new(n, 1, 17, 4, Some(vec![prime]), None);
+        let parameters = RnsBggParameters::new(vec![high_parameters, low_parameters], 2).unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let seed = high.bytes_input("hash-key", 32);
         let secret = scheme.test_secrets().unwrap();
@@ -3828,10 +3734,10 @@ mod lut_artifact_tests {
         let prepared = scheme.prepare_lut(&key, &material, rand::random()).unwrap();
         let expected = scheme.evaluate_lut(&input, &prepared, &online_bank).unwrap();
         let (mut graph, descriptor) = scheme
-            .export_prepared_lut(&prepared, DslContext::new("bfv-prepared-producer"), "lut")
+            .export_prepared_lut(&prepared, DslContext::new("rns_bgg-prepared-producer"), "lut")
             .unwrap();
         let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let family_key = BfvPublicKeyFamily {
+        let family_key = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
             ),
@@ -3840,7 +3746,7 @@ mod lut_artifact_tests {
             context: scheme.context,
             range: range.clone(),
         };
-        let family_input = crate::bfv::BfvEncodingFamily {
+        let family_input = crate::rns_bgg::RnsBggEncodingFamily {
             rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
             level: 0,
             key_id: key.id,
@@ -3876,7 +3782,7 @@ mod lut_artifact_tests {
                 .private_output(format!("input-{column}"), input.row.entry(0, column).clone())
                 .unwrap();
         }
-        let graph = crate::bfv::encoding::encoding_tests::export_online_masks(
+        let graph = crate::rns_bgg::encoding::encoding_tests::export_online_masks(
             &online_bank,
             graph,
             "online-mask",
@@ -3903,7 +3809,7 @@ mod lut_artifact_tests {
         )
         .unwrap();
         let production = produced.production_id.clone().unwrap();
-        let online_bank = crate::bfv::encoding::encoding_tests::import_online_masks(
+        let online_bank = crate::rns_bgg::encoding::encoding_tests::import_online_masks(
             &scheme,
             &online_bank,
             &production,
@@ -3911,7 +3817,7 @@ mod lut_artifact_tests {
         );
         drop(store);
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let descriptor: BfvPreparedLutDescriptor =
+        let descriptor: RnsBggPreparedLutDescriptor =
             serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
         let imported = scheme
             .import_prepared_lut(
@@ -3922,12 +3828,12 @@ mod lut_artifact_tests {
                 prepared.output.id,
             )
             .unwrap();
-        let input = BfvEncoding {
-            row: BfvRow::new([std::array::from_fn(|column| {
+        let input = RnsBggEncoding {
+            row: RnsBggRow::new([std::array::from_fn(|column| {
                 high.artifact_input(
                     production.clone(),
                     format!("input-{column}"),
-                    (1, 1),
+                    (1, parameters.component_columns(0).unwrap()),
                     ArtifactConfidentiality::Private,
                 )
             })])
@@ -3937,7 +3843,7 @@ mod lut_artifact_tests {
             context: scheme.context,
         };
         let actual = scheme.evaluate_lut(&input, &imported, &online_bank).unwrap();
-        let graph = DslContext::new("bfv-prepared-consumer")
+        let graph = DslContext::new("rns_bgg-prepared-consumer")
             .output("actual", actual.row)
             .unwrap()
             .build()
@@ -3973,7 +3879,7 @@ mod lut_artifact_tests {
             };
             assert_eq!(actual.as_ref(), expected.as_ref());
         }
-        let family_descriptor: BfvPreparedLutFamilyDescriptor =
+        let family_descriptor: RnsBggPreparedLutFamilyDescriptor =
             serde_json::from_slice(&serde_json::to_vec(&family_descriptor).unwrap()).unwrap();
         let family_imported = scheme
             .import_prepared_lut_family(
@@ -3985,7 +3891,7 @@ mod lut_artifact_tests {
                 &range,
             )
             .unwrap();
-        let family_input = crate::bfv::BfvEncodingFamily {
+        let family_input = crate::rns_bgg::RnsBggEncodingFamily {
             rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
             level: 0,
             key_id: key.id,
@@ -3994,7 +3900,7 @@ mod lut_artifact_tests {
         };
         let result =
             scheme.evaluate_lut_family(&family_input, &family_imported, &online_bank).unwrap();
-        let mut consumer = DslContext::new("bfv-prepared-family-consumer");
+        let mut consumer = DslContext::new("rns_bgg-prepared-family-consumer");
         for member in 0..2 {
             consumer =
                 consumer.output(format!("actual-family-{member}"), result.rows.at(member)).unwrap();
@@ -4078,9 +3984,9 @@ mod lut_artifact_tests {
 pub(crate) mod readout_tests {
     use super::*;
     use crate::{
-        bfv::{BfvNoiseBound, BfvParameters, BfvPlanRequest},
         layout::ExpLayout,
         noise_refresh::prf::SparseLwrPrfProfile,
+        rns_bgg::{RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest},
     };
     use mxx_dsl::DslContext;
     use mxx_ir_core::ParamEnv;
@@ -4095,33 +4001,33 @@ pub(crate) mod readout_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_affine_readout_covers_full_native_domain() {
+    fn test_rns_bgg_affine_readout_covers_full_native_domain() {
         check_cpu_domain(0, [vec![1.into()], vec![]], false, false);
     }
 
     #[test]
-    fn test_bfv_affine_readout_covers_strided_native_domain() {
+    fn test_rns_bgg_affine_readout_covers_strided_native_domain() {
         check_cpu_domain(1, [vec![1.into()], vec![]], false, false);
     }
 
     #[test]
-    fn test_bfv_weighted_readout_preserves_noise_multiplier() {
+    fn test_rns_bgg_weighted_readout_preserves_noise_multiplier() {
         check_cpu_domain(1, [vec![], vec![0.into(), 17.into()]], false, false);
     }
 
     #[test]
-    fn test_bfv_indexed_readout_weights_survive_artifact_reopen() {
+    fn test_rns_bgg_indexed_readout_weights_survive_artifact_reopen() {
         check_cpu_domain(1, [vec![17.into()], vec![]], true, false);
     }
 
     #[test]
-    fn test_bfv_aggregate_readout_survives_artifact_reopen() {
+    fn test_rns_bgg_aggregate_readout_survives_artifact_reopen() {
         for indexed in [false, true] {
             check_cpu_domain(2, [vec![17.into()], vec![]], indexed, true);
         }
     }
 
-    fn check_cpu_domain(stride_log2: u32, weight: BfvReadoutWeight, indexed: bool, sum: bool) {
+    fn check_cpu_domain(stride_log2: u32, weight: RnsBggReadoutWeight, indexed: bool, sum: bool) {
         check_full_domain(
             stride_log2,
             weight,
@@ -4141,10 +4047,10 @@ pub(crate) mod readout_tests {
 
     pub(crate) fn check_full_domain<B: Backend>(
         stride_log2: u32,
-        weight: BfvReadoutWeight,
+        weight: RnsBggReadoutWeight,
         indexed: bool,
         sum: bool,
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
     ) {
         let n: u32 = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
@@ -4158,7 +4064,7 @@ pub(crate) mod readout_tests {
         .unwrap();
         let width = profile.layout.width();
         let readout = profile.canonical_readout().unwrap();
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![width],
             slots: vec![1],
@@ -4171,7 +4077,7 @@ pub(crate) mod readout_tests {
                 weight.iter().flatten().map(|x| x.magnitude()).max().unwrap().clone(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secrets = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
@@ -4189,23 +4095,23 @@ pub(crate) mod readout_tests {
                 seed.clone(),
                 b"readout".as_slice(),
                 rand::random(),
-                Some(BfvReadoutWeights::Shared(weight.clone())),
+                Some(RnsBggReadoutWeights::Shared(weight.clone())),
                 None,
             )
             .unwrap();
-        let public_input = BfvPublicProgramValue::Scalar((key.clone(), None));
+        let public_input = RnsBggPublicProgramValue::Scalar((key.clone(), None));
         let prepared = scheme.prepare_readout(&readout, &public_input, &material).unwrap();
         let (mut producer, descriptor) = scheme
             .export_prepared_readout(
                 &prepared,
-                DslContext::new("bfv-readout-preprocess"),
+                DslContext::new("rns_bgg-readout-preprocess"),
                 "readout",
             )
             .unwrap();
-        let descriptor: BfvPreparedReadoutDescriptor =
+        let descriptor: RnsBggPreparedReadoutDescriptor =
             serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
         let range = crate::program::FamilyRange::bounded(1, 2 * width, 2 * width + 2).unwrap();
-        let family_input = crate::bfv::BfvPublicKeyFamily {
+        let family_input = crate::rns_bgg::RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(range.count().clone(), |_| Ok(key.matrix.clone())).unwrap(),
             ),
@@ -4223,7 +4129,7 @@ pub(crate) mod readout_tests {
                     row
                 } else {
                     // Swap destinations and rotate one coefficient, preserving the bound.
-                    BfvRow::new([[
+                    RnsBggRow::new([[
                         low.polynomial([0.into(), (-1).into()]) * row.entry(0, 1).clone(),
                         low.polynomial([0.into(), (-1).into()]) * row.entry(0, 0).clone(),
                     ]])
@@ -4233,7 +4139,7 @@ pub(crate) mod readout_tests {
             .collect::<Vec<_>>();
         let family_material = if indexed || sum {
             let weights = if indexed {
-                BfvReadoutWeights::Indexed {
+                RnsBggReadoutWeights::Indexed {
                     rows: Family::pack(routed_weights.clone()).unwrap(),
                     coefficient_bound: weight
                         .iter()
@@ -4244,7 +4150,7 @@ pub(crate) mod readout_tests {
                         .unwrap_or_default(),
                 }
             } else {
-                BfvReadoutWeights::Shared(weight.clone())
+                RnsBggReadoutWeights::Shared(weight.clone())
             };
             Some(
                 scheme
@@ -4257,9 +4163,9 @@ pub(crate) mod readout_tests {
                         rand::random(),
                         Some(weights),
                         Some(if sum {
-                            crate::bfv::BfvTerminalFamilyMode::Sum
+                            crate::rns_bgg::RnsBggTerminalFamilyMode::Sum
                         } else {
-                            crate::bfv::BfvTerminalFamilyMode::Independent
+                            crate::rns_bgg::RnsBggTerminalFamilyMode::Independent
                         }),
                     )
                     .unwrap(),
@@ -4275,7 +4181,7 @@ pub(crate) mod readout_tests {
         let (next, family_descriptor) =
             scheme.export_prepared_readout(&family_prepared, producer, "family-readout").unwrap();
         producer = next;
-        let family_descriptor: BfvPreparedReadoutDescriptor =
+        let family_descriptor: RnsBggPreparedReadoutDescriptor =
             serde_json::from_slice(&serde_json::to_vec(&family_descriptor).unwrap()).unwrap();
 
         let binding = prepared.binding();
@@ -4291,8 +4197,8 @@ pub(crate) mod readout_tests {
             input_descriptors.push(descriptor);
         }
         let mut backend = make_backend(&parameters);
-        std::fs::create_dir_all("test_data/bfv_readout_artifacts").unwrap();
-        let directory = tempfile::tempdir_in("test_data/bfv_readout_artifacts").unwrap();
+        std::fs::create_dir_all("test_data/rns_bgg_readout_artifacts").unwrap();
+        let directory = tempfile::tempdir_in("test_data/rns_bgg_readout_artifacts").unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let produced = execute(
             &producer.build().unwrap().validate(&ParamEnv::default()).unwrap(),
@@ -4346,13 +4252,15 @@ pub(crate) mod readout_tests {
         let family_public =
             scheme.project_readout(&readout, &family_input, &family_prepared, &()).unwrap();
 
-        assert!(matches!(public.weight(), BfvReadoutWeights::Shared(actual) if actual == &weight));
+        assert!(
+            matches!(public.weight(), RnsBggReadoutWeights::Shared(actual) if actual == &weight)
+        );
         let masks = scheme.prepare_online_masks(&secrets.mask, &prepared.mask_bank()).unwrap();
         let noise = parameters
             .terminal_noise_bound(
                 0,
                 [(
-                    &BfvNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() },
+                    &RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() },
                     width,
                     &1u8.into(),
                 )],
@@ -4362,7 +4270,7 @@ pub(crate) mod readout_tests {
         assert!(parameters.terminal_noise_fits(1, &noise).unwrap());
         let q = parameters.level(1).unwrap().modulus();
         let s = secrets.mask.row.clone().reduce_modulus(BigInt::from(q.as_ref().clone()));
-        let mut graph = DslContext::new("bfv-affine-full-native-domain");
+        let mut graph = DslContext::new("rns_bgg-affine-full-native-domain");
         let mut input_rows = Vec::new();
         let mut scalar_rows = Vec::new();
         for (x, descriptor) in input_descriptors.iter().enumerate() {
@@ -4370,7 +4278,7 @@ pub(crate) mod readout_tests {
                 scheme.import_input_material(descriptor, production.clone(), key.id, 0).unwrap();
             let input = scheme.encode(&secrets.mask, &key, &material).unwrap();
             input_rows.push(input.row.clone());
-            let input = BfvEncodingProgramValue::Scalar((input, None));
+            let input = RnsBggEncodingProgramValue::Scalar((input, None));
             let value = scheme.evaluate_readout(&readout, &input, &prepared, &masks).unwrap();
             scalar_rows.push(value.values.scalar().unwrap().clone());
             // The canonical PRF definition, independent of the affine target construction.
@@ -4383,7 +4291,7 @@ pub(crate) mod readout_tests {
                 expected;
             graph = graph.output(format!("error-{x}"), error).unwrap();
         }
-        let family_encodings = crate::bfv::BfvEncodingFamily {
+        let family_encodings = crate::rns_bgg::RnsBggEncodingFamily {
             rows: ProgramValue::Family(Family::pack(input_rows).unwrap()),
             level: key.level,
             key_id: key.id,
@@ -4470,7 +4378,7 @@ pub(crate) mod readout_tests {
             let RuntimeValue::Matrix(matrix) = value else { panic!("matrix") };
             let bound = if name == "aggregate-error" {
                 let input_bound =
-                    BfvNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+                    RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
                 let gain = 1u8.into();
                 parameters
                     .terminal_noise_bound(
@@ -4494,8 +4402,8 @@ pub(crate) mod readout_tests {
 pub(crate) mod terminal_family_tests {
     use super::*;
     use crate::{
-        bfv::{BfvParameters, BfvPlanRequest},
         program::FamilyRange,
+        rns_bgg::{RnsBggParameters, RnsBggPlanRequest},
     };
     use mxx_dsl::DslContext;
     use mxx_ir_core::ParamEnv;
@@ -4508,7 +4416,7 @@ pub(crate) mod terminal_family_tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_bfv_terminal_family_matches_scalar_members() {
+    fn test_rns_bgg_terminal_family_matches_scalar_members() {
         let (graph, parameters) = fixture();
         let result = execute(
             &graph,
@@ -4530,7 +4438,7 @@ pub(crate) mod terminal_family_tests {
     }
 
     pub(crate) fn check_indexed_artifacts<B: mxx_runtime::Backend>(
-        make_backend: impl Fn(&BfvParameters) -> B,
+        make_backend: impl Fn(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &str, &num_bigint::BigUint, &num_bigint::BigUint),
     ) {
         use mxx_runtime::artifact::{ArtifactStore, FileArtifactStore};
@@ -4538,7 +4446,7 @@ pub(crate) mod terminal_family_tests {
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(8);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![2],
@@ -4550,7 +4458,7 @@ pub(crate) mod terminal_family_tests {
             terminal_value_bound: 18u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let low = scheme.ring(1).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -4572,17 +4480,17 @@ pub(crate) mod terminal_family_tests {
         let table =
             RowLutTable::new(vec![[vec![], vec![]], [vec![1.into()], vec![]]], None).unwrap();
         let destinations = [
-            BfvRow::new([[low.identity(1), low.zero((1, 1))]]).unwrap(),
-            BfvRow::new([[low.zero((1, 1)), low.polynomial([0.into(), 17.into()])]]).unwrap(),
+            RnsBggRow::new([[low.identity(1), low.zero((1, 1))]]).unwrap(),
+            RnsBggRow::new([[low.zero((1, 1)), low.polynomial([0.into(), 17.into()])]]).unwrap(),
         ];
         let transforms = Family::pack(
             destinations
                 .iter()
                 .cloned()
                 .map(|row| {
-                    BfvMatrix::from_rows(
+                    RnsBggMatrix::from_rows(
                         row,
-                        BfvRow::new([[low.zero((1, 1)), low.zero((1, 1))]]).unwrap(),
+                        RnsBggRow::new([[low.zero((1, 1)), low.zero((1, 1))]]).unwrap(),
                     )
                 })
                 .collect(),
@@ -4612,7 +4520,7 @@ pub(crate) mod terminal_family_tests {
             }
         }
         let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let input = BfvPublicKeyFamily {
+        let input = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(
                 mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
             ),
@@ -4631,19 +4539,20 @@ pub(crate) mod terminal_family_tests {
             .unwrap();
         let mut descriptors = Vec::new();
         for (mode, prefix) in [
-            (BfvTerminalFamilyMode::Independent, "independent"),
-            (BfvTerminalFamilyMode::Sum, "sum"),
+            (RnsBggTerminalFamilyMode::Independent, "independent"),
+            (RnsBggTerminalFamilyMode::Sum, "sum"),
         ] {
             let prepared = scheme.prepare_terminal_family(&input, &material, mode, None).unwrap();
             let (next, descriptor) =
                 scheme.export_prepared_terminal_family(&prepared, producer, prefix).unwrap();
             producer = next;
-            let descriptor: BfvPreparedTerminalFamilyDescriptor =
+            let descriptor: RnsBggPreparedTerminalFamilyDescriptor =
                 serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
             descriptors.push((descriptor, prepared.binding(), prepared.id()));
         }
-        std::fs::create_dir_all("test_data/bfv_indexed_terminal_artifacts").unwrap();
-        let directory = tempfile::tempdir_in("test_data/bfv_indexed_terminal_artifacts").unwrap();
+        std::fs::create_dir_all("test_data/rns_bgg_indexed_terminal_artifacts").unwrap();
+        let directory =
+            tempfile::tempdir_in("test_data/rns_bgg_indexed_terminal_artifacts").unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let mut backend = make_backend(&parameters);
         let produced = execute(
@@ -4668,7 +4577,7 @@ pub(crate) mod terminal_family_tests {
                 .import_input_material(&input_descriptor, production.clone(), key.id, 0)
                 .unwrap();
             let encoding = scheme.encode(&mask_secret, &imported_key, &imported_input).unwrap();
-            let inputs = BfvEncodingFamily {
+            let inputs = RnsBggEncodingFamily {
                 rows: ProgramValue::Family(
                     mxx_dsl::parallel(2, |_| Ok(encoding.row.clone())).unwrap(),
                 ),
@@ -4695,8 +4604,8 @@ pub(crate) mod terminal_family_tests {
                     scheme.prepare_online_masks(&mask_secret, &prepared.mask_bank()).unwrap();
                 let rows = scheme.evaluate_terminal_family(&inputs, &prepared, &masks).unwrap();
                 let expected = match prepared.mode() {
-                    BfvTerminalFamilyMode::Independent => destinations.to_vec(),
-                    BfvTerminalFamilyMode::Sum => {
+                    RnsBggTerminalFamilyMode::Independent => destinations.to_vec(),
+                    RnsBggTerminalFamilyMode::Sum => {
                         vec![destinations[0].clone() + destinations[1].clone()]
                     }
                 };
@@ -4723,7 +4632,7 @@ pub(crate) mod terminal_family_tests {
                     )]),
                 )
                 .unwrap();
-            let input_bound = crate::bfv::BfvNoiseBound {
+            let input_bound = crate::rns_bgg::RnsBggNoiseBound {
                 error: parameters.eta().into(),
                 payload_l1: 1u8.into(),
             };
@@ -4751,7 +4660,7 @@ pub(crate) mod terminal_family_tests {
     }
 
     #[test]
-    fn test_bfv_indexed_terminal_artifacts_reopen_with_new_online_secrets() {
+    fn test_rns_bgg_indexed_terminal_artifacts_reopen_with_new_online_secrets() {
         check_indexed_artifacts(
             |parameters| cpu_backend(parameters.levels().iter().cloned()),
             |matrix, name, q, bound| {
@@ -4765,12 +4674,12 @@ pub(crate) mod terminal_family_tests {
         );
     }
 
-    pub(crate) fn fixture() -> (mxx_ir_core::ValidatedGraph, BfvParameters) {
+    pub(crate) fn fixture() -> (mxx_ir_core::ValidatedGraph, RnsBggParameters) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|s| s.parse().unwrap())
             .unwrap_or(8);
-        let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![2],
@@ -4782,7 +4691,7 @@ pub(crate) mod terminal_family_tests {
             terminal_value_bound: 3u8.into(),
         })
         .unwrap();
-        let scheme = BfvScheme::new(parameters.clone(), rand::random());
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secrets = scheme.test_secrets().unwrap();
         let ring = scheme.ring(0).unwrap();
         let seed = ring.bytes_input("hash-key", 32);
@@ -4820,8 +4729,9 @@ pub(crate) mod terminal_family_tests {
         let mut encodings = Vec::new();
         let mut scalar_public = Vec::new();
         let mut scalar_rows = Vec::new();
-        let mut aggregate_public: Option<crate::bfv::BfvTerminalAccumulator<BfvMatrix>> = None;
-        let mut aggregate_rows: Option<crate::bfv::BfvTerminalAccumulator<BfvRow>> = None;
+        let mut aggregate_public: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggMatrix>> =
+            None;
+        let mut aggregate_rows: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggRow>> = None;
         let key_id = rand::random();
         for x in 0..2 {
             let key = scheme
@@ -4859,14 +4769,14 @@ pub(crate) mod terminal_family_tests {
             scalar_rows.push(value.row().clone());
         }
         let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let public_input = BfvPublicKeyFamily {
+        let public_input = RnsBggPublicKeyFamily {
             matrices: ProgramValue::Family(Family::pack(keys).unwrap()),
             level: 0,
             id: key_id,
             context: scheme.context,
             range: range.clone(),
         };
-        let encoding_input = BfvEncodingFamily {
+        let encoding_input = RnsBggEncodingFamily {
             rows: ProgramValue::Family(Family::pack(encodings).unwrap()),
             level: 0,
             key_id,
@@ -4877,7 +4787,7 @@ pub(crate) mod terminal_family_tests {
             .prepare_terminal_family(
                 &public_input,
                 &ProgramValue::Scalar(material.clone()),
-                BfvTerminalFamilyMode::Independent,
+                RnsBggTerminalFamilyMode::Independent,
                 None,
             )
             .unwrap();
@@ -4886,7 +4796,7 @@ pub(crate) mod terminal_family_tests {
             .prepare_terminal_family(
                 &public_input,
                 &ProgramValue::Scalar(material.clone()),
-                BfvTerminalFamilyMode::Sum,
+                RnsBggTerminalFamilyMode::Sum,
                 None,
             )
             .unwrap();
@@ -4898,7 +4808,7 @@ pub(crate) mod terminal_family_tests {
         assert_eq!(aggregate.public_matrices().count(), &1.into());
         assert_eq!(aggregate_encoding.count(), &1.into());
         assert_ne!(prepared.id(), aggregate.id());
-        let mut graph = DslContext::new("bfv-terminal-family")
+        let mut graph = DslContext::new("rns_bgg-terminal-family")
             .output("aggregate-public", aggregate.public_matrices().at(0) - expected_public.matrix)
             .unwrap()
             .output("aggregate-row", aggregate_encoding.at(0) - expected_row.row().clone())
@@ -4911,12 +4821,12 @@ pub(crate) mod terminal_family_tests {
         }
         let low = scheme.ring(1).unwrap();
         let transforms = Family::pack(vec![
-            BfvMatrix::new([
+            RnsBggMatrix::new([
                 [low.identity(1), low.zero((1, 1))],
                 [low.zero((1, 1)), low.identity(1)],
             ])
             .unwrap(),
-            BfvMatrix::new([
+            RnsBggMatrix::new([
                 [low.zero((1, 1)), low.polynomial([0.into(), 17.into()])],
                 [low.identity(1), low.zero((1, 1))],
             ])
@@ -4938,7 +4848,7 @@ pub(crate) mod terminal_family_tests {
             .prepare_terminal_family(
                 &public_input,
                 &indexed_material,
-                BfvTerminalFamilyMode::Independent,
+                RnsBggTerminalFamilyMode::Independent,
                 None,
             )
             .unwrap();
@@ -4948,22 +4858,23 @@ pub(crate) mod terminal_family_tests {
             .prepare_terminal_family(
                 &public_input,
                 &indexed_material,
-                BfvTerminalFamilyMode::Sum,
+                RnsBggTerminalFamilyMode::Sum,
                 None,
             )
             .unwrap();
         let indexed_sum_rows =
             scheme.evaluate_terminal_family(&encoding_input, &indexed_sum, &masks).unwrap();
-        let mut raw_public_sum: Option<crate::bfv::BfvTerminalAccumulator<BfvMatrix>> = None;
-        let mut raw_row_sum: Option<crate::bfv::BfvTerminalAccumulator<BfvRow>> = None;
+        let mut raw_public_sum: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggMatrix>> =
+            None;
+        let mut raw_row_sum: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggRow>> = None;
         for index in 0..2 {
-            let key = BfvPublicKey {
+            let key = RnsBggPublicKey {
                 matrix: public_input.matrices.at(index),
                 level: 0,
                 id: key_id,
                 context: scheme.context,
             };
-            let encoding = BfvEncoding {
+            let encoding = RnsBggEncoding {
                 row: encoding_input.rows.at(index),
                 level: 0,
                 key_id,
@@ -5024,7 +4935,7 @@ fn import_family_value<T: GraphValue>(
     storage: &ProgramValue<(), Vec<bool>>,
     production: ProductionId,
     name: impl Into<String>,
-) -> Result<ProgramValue<T, Family<T>>, BfvError> {
+) -> Result<ProgramValue<T, Family<T>>, RnsBggError> {
     let schema = match storage {
         ProgramValue::Scalar(()) => ProgramValue::Scalar(element),
         ProgramValue::Family(shared) => {

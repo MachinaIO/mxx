@@ -978,6 +978,14 @@ where
         value.centered_extend(self.parameters(destination)?).map_err(PolyBackendError::ExactRns)
     }
 
+    fn centered_extend_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        value.centered_extend(self.parameters(destination)?).map_err(PolyBackendError::ExactRns)
+    }
+
     fn block_mod_switch(
         &mut self,
         value: &M,

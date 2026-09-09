@@ -1,12 +1,12 @@
 #![cfg(feature = "gpu")]
 
 //! One actual normalized LWR PRF output, without any refresh label expansion.
-//! Select BGG or BFV with MXX_EXPONENT_LUT_TEST_SCHEME; CPU simulation precedes GPU execution.
-fn use_bfv() -> bool {
+//! Select BGG or RNS-BGG with MXX_EXPONENT_LUT_TEST_SCHEME; CPU simulation precedes GPU execution.
+fn use_rns_bgg() -> bool {
     match std::env::var("MXX_EXPONENT_LUT_TEST_SCHEME").as_deref().unwrap_or("bgg") {
         "bgg" => false,
-        "bfv" => true,
-        other => panic!("MXX_EXPONENT_LUT_TEST_SCHEME must be bgg or bfv, got {other}"),
+        "rns-bgg" => true,
+        other => panic!("MXX_EXPONENT_LUT_TEST_SCHEME must be bgg or rns-bgg, got {other}"),
     }
 }
 use mxx_bgg::BggSamplerLayout;
@@ -267,10 +267,10 @@ fn monomial_input<B: Backend>(
 #[test]
 #[serial_test::serial]
 fn test_gpu_lwr_prf_one_output_round_trip() {
-    if use_bfv() {
-        let fixture = bfv_prf();
+    if use_rns_bgg() {
+        let fixture = rns_bgg_prf();
         println!("prf_noise_simulation={}", fixture.noise_report);
-        run_bfv(fixture);
+        run_rns_bgg(fixture);
         return;
     }
     let _ = tracing_subscriber::fmt()
@@ -729,7 +729,7 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
     }
 }
 
-fn run_bfv(fixture: bfv::BfvRoundTrip) {
+fn run_rns_bgg(fixture: rns_bgg::RnsBggRoundTrip) {
     use mxx_primitives::{
         matrix::PolyMatrix,
         poly::{
@@ -739,7 +739,7 @@ fn run_bfv(fixture: bfv::BfvRoundTrip) {
     };
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU round trip requires a detected device");
-    bfv::run(
+    rns_bgg::run(
         fixture,
         |p| {
             let rings = p.levels().iter().map(|p| {
@@ -765,20 +765,20 @@ fn run_bfv(fixture: bfv::BfvRoundTrip) {
 
 /// One PRF output, including its terminal digit readout, with the actual
 /// executed Program as the noise authority and a reopened artifact store.
-fn bfv_prf() -> bfv::BfvRoundTrip {
-    use bfv::{BfvRoundTrip, trace_prf};
+fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
     use mxx_dsl::Family;
     use mxx_exponent_lut::{
-        bfv::{
-            BfvParameters, BfvPlanRequest, BfvReadoutWeights, BfvRhsPlaintextFamily, BfvRow,
-            BfvScheme,
-        },
         layout::ExpLayout,
         noise_refresh::pbc::{PbcLayoutId, derive_lwr_vector},
         program::FamilyRange,
         readout::ExponentLUTReadoutScheme,
+        rns_bgg::{
+            RnsBggParameters, RnsBggPlanRequest, RnsBggReadoutWeights, RnsBggRhsPlaintextFamily,
+            RnsBggRow, RnsBggScheme,
+        },
     };
     use mxx_ir_core::artifact::Manifest;
+    use rns_bgg::{RnsBggRoundTrip, trace_prf};
     let n: u32 = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
         .ok()
         .map(|v| v.parse().unwrap())
@@ -786,7 +786,7 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
     let layout = ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() };
     let profile = SparseLwrPrfProfile::new(layout, 2).unwrap();
     let program = SparseLwrPrfProgram::new(profile, 2, 1).unwrap();
-    let (parameters, _) = BfvParameters::plan(&BfvPlanRequest {
+    let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
         ring_dimension: n,
         widths: vec![1, n as usize],
         slots: vec![2, 1],
@@ -798,7 +798,7 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
         terminal_value_bound: 4u8.into(),
     })
     .unwrap();
-    let scheme = BfvScheme::new(parameters.clone(), rand::random());
+    let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
     let high = scheme.ring(0).unwrap();
     let middle = scheme.ring(1).unwrap();
     let seed = high.bytes_input("hash-key", 32);
@@ -814,7 +814,7 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
         .sample_private_rhs_family(
             &r,
             0,
-            &BfvRhsPlaintextFamily {
+            &RnsBggRhsPlaintextFamily {
                 payloads: Family::pack(
                     (0..2).map(|i| middle.polynomial([u8::from(i == selected).into()])).collect(),
                 )
@@ -853,7 +853,7 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
             seed,
             b"readout".as_slice(),
             rand::random(),
-            Some(BfvReadoutWeights::Shared([vec![1.into()], vec![]])),
+            Some(RnsBggReadoutWeights::Shared([vec![1.into()], vec![]])),
             None,
         )
         .unwrap();
@@ -887,7 +887,7 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
     }
     assert!(parameters.terminal_noise_fits(2, &terminal_noise).unwrap());
     let (producer, prf_descriptor) =
-        prepared.export(&scheme, DslContext::new("bfv-prf-preprocess"), "prf").unwrap();
+        prepared.export(&scheme, DslContext::new("rns_bgg-prf-preprocess"), "prf").unwrap();
     let (producer, input_descriptor) =
         scheme.export_input_material(&key, &material, producer, "initial").unwrap();
     let (producer, readout_descriptor) =
@@ -931,11 +931,12 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
         let expected = if e < n as usize { d.clone() } else { BigInt::from(1u8) - d };
         let low = scheme.ring(2).unwrap();
         let expected =
-            BfvRow::new([[low.polynomial([expected.into()]), low.polynomial([0.into()])]]).unwrap();
+            RnsBggRow::new([[low.polynomial([expected.into()]), low.polynomial([0.into()])]])
+                .unwrap();
         let error = value.values.scalar().unwrap().clone() -
             scheme.mask_at(&s, 2).unwrap() * public_result.values.scalar().unwrap().clone() -
             expected;
-        let consumer = DslContext::new("bfv-prf-online")
+        let consumer = DslContext::new("rns_bgg-prf-online")
             .output("error", error)
             .unwrap()
             .build()
@@ -947,7 +948,7 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
             .unwrap();
         consumer
     });
-    let noise_report = serde_json::json!({"scheme": "bfv", "model": model, "worst_bound": worst_bound.to_string(), "output_count": 1, "readout_error_bound": terminal_noise.error.to_string(), "readout_value_bound": terminal_noise.coefficient_bound.to_string()});
+    let noise_report = serde_json::json!({"scheme": "rns-bgg", "model": model, "worst_bound": worst_bound.to_string(), "output_count": 1, "readout_error_bound": terminal_noise.error.to_string(), "readout_value_bound": terminal_noise.coefficient_bound.to_string()});
     let bounds = (0..2)
         .map(|column| {
             (
@@ -959,11 +960,11 @@ fn bfv_prf() -> bfv::BfvRoundTrip {
             )
         })
         .collect();
-    BfvRoundTrip { parameters, producer, online, bounds, noise_report }
+    RnsBggRoundTrip { parameters, producer, online, bounds, noise_report }
 }
 
-mod bfv {
-    use mxx_exponent_lut::bfv::{BfvNoiseBound, BfvParameters};
+mod rns_bgg {
+    use mxx_exponent_lut::rns_bgg::{RnsBggNoiseBound, RnsBggParameters};
     use mxx_ir_core::{
         ValidatedGraph,
         artifact::{Manifest, ProductionId},
@@ -976,8 +977,8 @@ mod bfv {
     };
     use num_bigint::BigUint;
     use std::collections::BTreeMap;
-    pub struct BfvRoundTrip {
-        pub parameters: BfvParameters,
+    pub struct RnsBggRoundTrip {
+        pub parameters: RnsBggParameters,
         pub producer: ValidatedGraph,
         pub online: Box<dyn Fn(ProductionId, Manifest) -> ValidatedGraph>,
         pub bounds: BTreeMap<String, (BigUint, BigUint)>,
@@ -985,12 +986,12 @@ mod bfv {
     }
 
     pub fn run<B: Backend>(
-        fixture: BfvRoundTrip,
-        make_backend: impl FnOnce(&BfvParameters) -> B,
+        fixture: RnsBggRoundTrip,
+        make_backend: impl FnOnce(&RnsBggParameters) -> B,
         check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
     ) {
-        std::fs::create_dir_all("test_data/bfv_round_trip").unwrap();
-        let directory = tempfile::tempdir_in("test_data/bfv_round_trip").unwrap();
+        std::fs::create_dir_all("test_data/rns_bgg_round_trip").unwrap();
+        let directory = tempfile::tempdir_in("test_data/rns_bgg_round_trip").unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let mut backend = make_backend(&fixture.parameters);
         let produced = execute(
@@ -1020,14 +1021,14 @@ mod bfv {
     }
 
     pub fn trace_prf(
-        parameters: &BfvParameters,
+        parameters: &RnsBggParameters,
         execution: &mxx_exponent_lut::program::ExponentLutProgram,
-    ) -> mxx_exponent_lut::bfv::noise::BfvNoiseTrace {
+    ) -> mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseTrace {
         let inputs = BTreeMap::from([(
             *execution.inputs().keys().next().unwrap(),
-            mxx_exponent_lut::bfv::noise::BfvNoiseValue {
+            mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
                 level: 0,
-                bound: BfvNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
                 payload_l2_squared: 1u8.into(),
                 moments: Some(mxx_exponent_lut::noise_utils::NoiseMoments {
                     mean_numerator: 0.into(),
@@ -1054,7 +1055,7 @@ mod bfv {
                 panic!("composed PRF must contain direct products")
             };
             let (material, bound) =
-                mxx_exponent_lut::bfv::noise::BfvGateNoiseMaterial::from_one_hot_labels(
+                mxx_exponent_lut::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
                     step,
                     None,
                     &[
@@ -1067,7 +1068,7 @@ mod bfv {
             materials
                 .insert(mxx_exponent_lut::program::ProgramGateInstance::Gate { step }, material);
         }
-        mxx_exponent_lut::bfv::noise::trace_program(
+        mxx_exponent_lut::rns_bgg::noise::trace_program(
             parameters,
             execution,
             &mxx_exponent_lut::program::ProgramBindings::new(

@@ -54,7 +54,8 @@ int gpu_device_get_identity(
 
 /// Transfers ownership of pinned host pointers to the context-owned
 /// reclaimer. The reclaimer records a completion event on `stream`, waits
-/// for that event on its worker thread, and only then calls cudaFreeHost.
+/// for that event on its worker thread, then recycles a managed transfer buffer
+/// or calls cudaFreeHost for an external allocation.
 /// A non-zero return means that ownership was retained as a fail-closed leak.
 int gpu_defer_pinned_frees(
     GpuContext *ctx,
@@ -62,6 +63,9 @@ int gpu_defer_pinned_frees(
     cudaStream_t stream,
     void *const *ptrs,
     size_t count);
+
+/// Consumes both the event set and pinned pointer without a host wait.
+int gpu_event_set_defer_pinned_free(GpuContext *ctx, GpuEventSet *events, void *pointer);
 
 int gpu_event_set_wait(GpuEventSet *events);
 void gpu_event_set_destroy(GpuEventSet *events);

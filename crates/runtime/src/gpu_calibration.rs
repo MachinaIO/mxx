@@ -207,6 +207,16 @@ pub fn gpu_calibration_operation_identity(
                     *index = IntExpr::constant(0);
                 }
                 ConstantMatrix::Rotation { exponent } => *exponent = IntExpr::constant(0),
+                // Coefficient values change the uploaded contents, not the
+                // full-ring GPU allocation or NTT path. Keep the variant and
+                // coefficient count, and erase only its numerical data.
+                ConstantMatrix::Polynomial { coefficients } => {
+                    coefficients.fill(IntExpr::constant(0));
+                }
+                ConstantMatrix::PowerOfBase { base, exponent } => {
+                    *base = IntExpr::constant(2);
+                    *exponent = IntExpr::constant(0);
+                }
                 _ => {}
             }
         }
@@ -1221,7 +1231,7 @@ mod tests {
             constant_identity(ConstantMatrix::UnitColumn { index: IntExpr::constant(1) }),
             constant_identity(ConstantMatrix::UnitColumn { index: IntExpr::constant(7) })
         );
-        assert_ne!(
+        assert_eq!(
             constant_identity(ConstantMatrix::PowerOfBase {
                 base: IntExpr::constant(4),
                 exponent: IntExpr::constant(1),
@@ -1231,7 +1241,7 @@ mod tests {
                 exponent: IntExpr::constant(2),
             })
         );
-        assert_ne!(
+        assert_eq!(
             constant_identity(ConstantMatrix::Polynomial {
                 coefficients: vec![IntExpr::constant(1)],
             }),

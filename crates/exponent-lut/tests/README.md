@@ -24,9 +24,29 @@ MXX_EXPONENT_LUT_TEST_SCHEME=rns-bgg cargo test -r -p mxx-exponent-lut --feature
 
 Run these commands in a GPU-visible environment. Runtime execution requires the
 `gpu` feature. Simulation constructs noise bounds on the host before GPU work;
-there is no intermediate plan file to generate or load.
+the default fixtures do not require an intermediate plan file.
 
-RNS-BGG uses a small correctness fixture (one two-member selector block, base-4
+To measure an already accepted RNS-BGG parameter search, pass its report:
+
+```sh
+MXX_EXPONENT_LUT_TEST_SCHEME=rns-bgg \
+MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL=average-case \
+MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT="$(pwd)/docs/plans/exponent-lut-rns-bgg-refresh-security100.json" \
+cargo test -r -p mxx-exponent-lut --features gpu --test noise_refresh \
+  test_gpu_exponent_lut_benchmark_estimate -- --exact --nocapture
+```
+
+This uses the report's exact CRT primes, PRF block sizes, and mask/fresh digit
+counts. Public monomial labels and trusted one-hot bits remain structural setup
+inputs, as in the BGG estimator; hash-to-LWR-vector generation is outside this
+GPU estimate. `MXX_EXPONENT_LUT_BENCH_STAGE=preprocess` or `online_eval` selects
+one measured stage, allowing separate pods to share the work. Without that
+variable both stages are measured. `MXX_EXPONENT_LUT_BENCH_STAGE=graph` only
+builds and validates both graphs, reports their node counts and construction
+time, and returns before initializing CUDA. No PRF output family is materialized
+on the host for this input binding.
+
+Without an accepted report, RNS-BGG uses a small correctness fixture (one two-member selector block, base-4
 digits, and a variable-width gadget encoding). `MXX_PRIMITIVE_TEST_RING_DIMENSION` controls
 its ring dimension; `MXX_EXPONENT_LUT_REFRESH_MASK_STATISTICAL_SECURITY_BITS`
 controls mask coverage. Parameter selection checks the PRF, the full refresh
@@ -75,3 +95,20 @@ can be selected individually from the GPU-enabled integration target.
 
 Integration tests have no `#[ignore]` attributes. Select a test name to run
 only one workflow or parameter-search regression.
+
+The RNS-BGG `lwr_prf.rs` round trip also accepts
+`MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT`. It reuses the archived CRT chain and PBC
+layout for one PRF output, with CBD noise and a scaled terminal digit so the
+error check implies exact digit recovery. The fixture samples a valid weight-h
+key on that layout; this timing test does not certify the key distribution.
+`MXX_EXPONENT_LUT_BENCH_STAGE=graph` builds and simulates without CUDA execution,
+and reports the exported artifact payload size.
+
+For actual timing, `MXX_EXPONENT_LUT_BENCH_WARMUPS` selects full unmeasured round
+trips before exactly one measured round trip (default: zero warmups).
+`MXX_EXPONENT_LUT_MAX_PARALLEL_INSTANCES` bounds sibling loop instances (default
+64), independently of matrix column distribution across all detected GPUs.
+Timings separate preprocessing including artifact writes, manifest reopening,
+online graph construction, online execution including residual construction,
+and host verification. Matrix outputs are fenced before stopping execution
+timers. Graph construction and backend initialization are outside those timers.

@@ -628,14 +628,39 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     install_tracing();
 
     if use_rns_bgg() {
+        let graph_started = std::time::Instant::now();
         let average = selected_average_config();
-        let fixture = rns_bgg::refresh(average.as_ref());
+        let (parameters, residue_level, preprocessing, online, noise_report) =
+            if let Some(path) = std::env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT") {
+                rns_bgg::benchmark_refresh(std::path::Path::new(&path))
+            } else {
+                let fixture = rns_bgg::refresh(average.as_ref());
+                (
+                    fixture.parameters,
+                    fixture.residue_level.unwrap(),
+                    fixture.benchmark_preprocessing,
+                    fixture.benchmark_online,
+                    fixture.noise_report,
+                )
+            };
+        let (preprocess_scopes, preprocess_nodes) =
+            graph_scope_and_node_counts(&preprocessing.source);
+        let (online_scopes, online_nodes) = graph_scope_and_node_counts(&online.source);
+        info!(
+            elapsed_seconds = graph_started.elapsed().as_secs_f64(),
+            preprocess_scopes,
+            preprocess_nodes,
+            online_scopes,
+            online_nodes,
+            "RNS-BGG benchmark graphs validated"
+        );
+        if std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("graph") {
+            return;
+        }
         let devices = detected_gpu_device_ids();
         assert!(!devices.is_empty(), "benchmark estimate requires CUDA");
-        let mut levels = fixture.parameters.levels().to_vec();
-        levels.extend(
-            fixture.parameters.refresh_residue_parameters(fixture.residue_level.unwrap()).unwrap(),
-        );
+        let mut levels = parameters.levels().to_vec();
+        levels.extend(parameters.refresh_residue_parameters(residue_level).unwrap());
         let backends = devices
             .into_iter()
             .map(|device| {
@@ -653,11 +678,14 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
                 ..MeasurementHarnessConfig::default()
             },
         );
-        println!("rns_bgg_noise_simulation={}", fixture.noise_report);
-        let stages = [
-            ("preprocess", &fixture.benchmark_preprocessing),
-            ("online_eval", &fixture.benchmark_online),
-        ];
+        println!("rns_bgg_noise_simulation={noise_report}");
+        // Separate pods may measure the two stages without duplicating GPU work.
+        let selected_stage = std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").ok();
+        let stages = [("preprocess", &preprocessing), ("online_eval", &online)]
+            .into_iter()
+            .filter(|(name, _)| selected_stage.as_deref().is_none_or(|stage| stage == *name))
+            .collect::<Vec<_>>();
+        assert!(!stages.is_empty(), "unknown benchmark stage");
         for ((stage, _), report) in stages.iter().zip(measure_stages(&stages, &mut backend)) {
             log_report(stage, &report);
         }
@@ -7274,6 +7302,248 @@ mod rns_bgg {
         pub bounds: BTreeMap<String, (BigUint, BigUint)>,
         pub residue_level: Option<usize>,
         pub noise_report: serde_json::Value,
+    }
+
+    /// Construct the production refresh graphs from an accepted numerical search.
+    /// Public label polynomials and one-hot bits are structural inputs, as in the
+    /// BGG estimator; no host vector is allocated per PRF output or coefficient.
+    pub fn benchmark_refresh(
+        path: &std::path::Path,
+    ) -> (RnsBggParameters, usize, ValidatedGraph, ValidatedGraph, serde_json::Value) {
+        use mxx_exponent_lut::rns_bgg::noise::RnsBggRefreshPlan;
+        use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let meta = &report["numerical_run"];
+        let candidate = &report["selected_candidate"];
+        assert_eq!(candidate["correctness_accepted"], true);
+        let n = meta["n"].as_u64().unwrap() as u32;
+        let bits = meta["crt_bits"].as_u64().unwrap() as usize;
+        let base_bits = meta["base_bits"].as_u64().unwrap() as u32;
+        let primes: Vec<Vec<u64>> =
+            serde_json::from_value(candidate["level_primes"].clone()).unwrap();
+        let parameters = RnsBggParameters::new(
+            primes
+                .into_iter()
+                .map(|p| DCRTPolyParams::new(n, p.len(), bits, base_bits, Some(p), None))
+                .collect(),
+            2,
+        )
+        .unwrap();
+        let counts: Vec<usize> = serde_json::from_value(meta["selector_counts"].clone()).unwrap();
+        let terminal = counts.len();
+        let output_level = terminal + 1;
+        let q_lwr = meta["lwr_q"].as_u64().unwrap() as usize;
+        let p_lwr = meta["lwr_p"].as_u64().unwrap() as usize;
+        let width_log2 = q_lwr.trailing_zeros() - 1;
+        let layout = ExpLayout { stride_log2: n.trailing_zeros() - width_log2, width_log2 };
+        let data_layout = ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() };
+        let profile = SparseLwrPrfProfile::new(layout, p_lwr / 2).unwrap();
+        let program =
+            SparseLwrPrfProgram::new(profile, *counts.iter().max().unwrap(), terminal).unwrap();
+        let refresh_plan: RnsBggRefreshPlan =
+            serde_json::from_value(candidate["refresh"]["Ok"].clone()).unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
+        let seed = scheme.ring(0).unwrap().bytes_input("hash-key", 32);
+        let r = scheme.sample_payload_secret().unwrap();
+        let initial_key = scheme
+            .sample_input_key(0, seed.clone(), b"initial".as_slice(), rand::random())
+            .unwrap();
+        let initial_material =
+            scheme.prepare_input(&r, &initial_key, scheme.scalar(0, 1).unwrap()).unwrap();
+        let data_key = scheme
+            .sample_input_key(terminal, seed.clone(), b"data".as_slice(), rand::random())
+            .unwrap();
+        let data_material = scheme
+            .prepare_input(
+                &r,
+                &data_key,
+                scheme.ring(terminal).unwrap().polynomial([0.into(), 1.into()]),
+            )
+            .unwrap();
+        let output_key = scheme
+            .sample_input_key(output_level, seed.clone(), b"output".as_slice(), rand::random())
+            .unwrap();
+        let topology = refresh_plan
+            .digits
+            .topology(&scheme, &(output_key.clone(), None), &ParamEnv::default())
+            .unwrap();
+        let labels = RefreshPrfLabelIndex::new(rand::random(), &topology).unwrap();
+        assert_eq!(BigUint::from(labels.len()), refresh_plan.distinct_prf_outputs);
+        let blocks = counts
+            .iter()
+            .enumerate()
+            .map(|(step, count)| {
+                let ring = scheme.ring(step + 1).unwrap();
+                let rhs = RnsBggRhsPlaintextFamily {
+                    payloads: ring.input_family(format!("selector-bits-{step}"), *count, (1, 1)),
+                    id: rand::random(),
+                };
+                let selectors = scheme
+                    .sample_private_rhs_family(
+                        &r,
+                        step,
+                        &rhs,
+                        seed.clone(),
+                        format!("selectors-{step}").into_bytes(),
+                        rand::random(),
+                    )
+                    .unwrap();
+                PrfSelectionInputs {
+                    selectors,
+                    labels: ring.input_family(
+                        format!("prf-labels-{step}"),
+                        labels.len() * count,
+                        (1, 1),
+                    ),
+                    active: FamilyRange::bounded(0, *count, *count).unwrap(),
+                    id: rand::random(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let (prf_public, prf) = PreparedSparseLwrPrf::new(
+            &scheme,
+            program.clone(),
+            RnsBggPublicProgramValue::Scalar((initial_key.clone(), None)),
+            &blocks,
+        )
+        .unwrap();
+        let data_bank = scheme
+            .sample_mask_bank(
+                terminal,
+                data_layout,
+                seed.clone(),
+                b"data-bank".as_slice(),
+                rand::random(),
+            )
+            .unwrap();
+        let prf_bank = scheme
+            .sample_mask_bank(
+                terminal,
+                layout,
+                seed.clone(),
+                b"prf-bank".as_slice(),
+                rand::random(),
+            )
+            .unwrap();
+        let q = parameters.level(output_level).unwrap().modulus();
+        let channels = parameters
+            .level(output_level)
+            .unwrap()
+            .to_crt()
+            .0
+            .into_iter()
+            .map(|prime| {
+                let h = q.as_ref() / prime;
+                DirectRefreshChannel {
+                    level: RnsBggRefreshLevel { output_level, prime: prime.into() },
+                    output_scale: scheme.scalar(output_level, h.clone()).unwrap(),
+                    data: scheme
+                        .sample_refresh_data_material(
+                            &r,
+                            data_layout,
+                            &h,
+                            &data_bank,
+                            seed.clone(),
+                            format!("data-{prime}").into_bytes(),
+                            rand::random(),
+                        )
+                        .unwrap(),
+                    spacing: h,
+                }
+            })
+            .collect();
+        let prepared = PreparedDirectRefresh::new(
+            &scheme,
+            &RnsBggPublicProgramValue::Scalar((data_key.clone(), None)),
+            &prf_public,
+            &program.readout,
+            &refresh_plan.digits,
+            labels,
+            &r,
+            &prf_bank,
+            channels,
+            output_key.matrix().clone(),
+            scheme.prepare_refresh_recomposition(output_key).unwrap(),
+            seed,
+            b"refresh".as_slice().into(),
+            rand::random(),
+        )
+        .unwrap();
+        let (producer, refresh_descriptor) = prepared
+            .export(&scheme, DslContext::new("rns-bgg-refresh-benchmark"), "refresh")
+            .unwrap();
+        let (producer, prf_descriptor) = prf.export(&scheme, producer, "prf").unwrap();
+        let (producer, initial_descriptor) = scheme
+            .export_input_material(&initial_key, &initial_material, producer, "initial")
+            .unwrap();
+        let (producer, data_descriptor) =
+            scheme.export_input_material(&data_key, &data_material, producer, "data").unwrap();
+        let producer = producer.build().unwrap().validate(&ParamEnv::default()).unwrap();
+        let production = ProductionId {
+            spec_hash: mxx_ir_core::encoding::spec_hash(&producer.source, &producer.bindings)
+                .unwrap(),
+            execution_nonce: rand::random(),
+        };
+        let manifest =
+            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &producer)
+                .unwrap();
+        let refresh = PreparedDirectRefresh::import(
+            &scheme,
+            &refresh_descriptor,
+            production.clone(),
+            refresh_descriptor.identity().unwrap(),
+        )
+        .unwrap();
+        let prf = PreparedSparseLwrPrf::import(
+            &scheme,
+            program,
+            &prf_descriptor,
+            production.clone(),
+            prf_descriptor.identity().unwrap(),
+        )
+        .unwrap();
+        let (initial_key, initial_material) = scheme
+            .import_input_material(&initial_descriptor, production.clone(), *initial_key.id(), 0)
+            .unwrap();
+        let (data_key, data_material) = scheme
+            .import_input_material(&data_descriptor, production.clone(), *data_key.id(), terminal)
+            .unwrap();
+        let s = scheme.sample_mask_secret().unwrap();
+        let digits = prf
+            .evaluate(
+                &scheme,
+                RnsBggEncodingProgramValue::Scalar((
+                    scheme.encode(&s, &initial_key, &initial_material).unwrap(),
+                    None,
+                )),
+            )
+            .unwrap();
+        let data = RnsBggEncodingProgramValue::Scalar((
+            scheme.encode(&s, &data_key, &data_material).unwrap(),
+            None,
+        ));
+        let bank = |index: usize| match &refresh.slots()[0].terms()[index] {
+            ProgramValue::Scalar(term) => term.mask_bank(),
+            ProgramValue::Family(terms) => terms.at(0).mask_bank(),
+        };
+        let data_helpers = scheme.prepare_online_masks(&s, &bank(0)).unwrap();
+        let prf_helpers = scheme.prepare_online_masks(&s, &bank(1)).unwrap();
+        let decoders = refresh.prepare_decoders(&scheme, &s, &2);
+        let (refreshed, _) = refresh
+            .evaluate(&scheme, &data, &digits, &data_helpers, &prf_helpers, decoders)
+            .unwrap();
+        let online = DslContext::new("rns-bgg-refresh-online-benchmark")
+            .output("refreshed", refreshed.row().clone())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        (parameters, output_level, producer, online, candidate.clone())
     }
 
     pub fn refresh(

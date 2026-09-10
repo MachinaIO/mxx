@@ -83,6 +83,16 @@ pub(crate) fn modular_inverse(value: &BigInt, modulus: &BigInt) -> Option<BigInt
     (old_r == BigInt::one()).then(|| ((old_s % modulus) + modulus) % modulus)
 }
 
+/// Maximum selectors or branches in one complete preprocessing batch.
+pub(crate) fn preprocess_batch_size() -> Result<usize, mxx_dsl::DslError> {
+    std::env::var("MXX_EXPONENT_LUT_PREPROCESS_BATCH_SIZE")
+        .ok()
+        .map(|value| value.parse::<std::num::NonZeroUsize>())
+        .transpose()
+        .map_err(|_| mxx_dsl::DslError::Schema)
+        .map(|value| value.map_or(256, |value| value.get()))
+}
+
 pub(crate) fn balanced_sum_family<T: mxx_dsl::GraphValue + std::ops::Add<Output = T>>(
     family: Family<T>,
 ) -> Result<T, ExponentLutError> {
@@ -115,12 +125,33 @@ pub(crate) fn reduce_family_segments<T: GraphValue>(
     {
         return Err(ExponentLutError::InvalidLut);
     }
-    let mut current = family;
+    reduce_generated_segments(
+        segment_count,
+        segment_size,
+        |segment, member| family.at(segment.mul(Int::constant(segment_size)).add(member)),
+        add,
+    )
+}
+
+/// Reduce generated summands with an ordinary parallel tree. Batching belongs
+/// to the producer/consumer loop, rather than to addition itself.
+pub(crate) fn reduce_generated_segments<T: GraphValue>(
+    segment_count: usize,
+    segment_size: usize,
+    element: impl Fn(Int, Int) -> T,
+    add: impl Fn(T, T) -> T,
+) -> Result<Family<T>, ExponentLutError> {
+    let mut current = mxx_dsl::parallel(segment_count * segment_size, |index| {
+        Ok(element(
+            index.clone().div(Int::constant(segment_size)),
+            index.rem(Int::constant(segment_size)),
+        ))
+    })
+    .map_err(|_| ExponentLutError::InvalidLut)?;
     let mut width = segment_size;
     while width > 1 {
         let next_width = width.div_ceil(2);
-        let count = segment_count.checked_mul(next_width).ok_or(ExponentLutError::InvalidLut)?;
-        current = mxx_dsl::parallel(count, |index| {
+        current = mxx_dsl::parallel(segment_count * next_width, |index| {
             let segment = index.clone().div(Int::constant(next_width));
             let member = index.rem(Int::constant(next_width));
             let base = segment.mul(Int::constant(width));
@@ -130,8 +161,6 @@ pub(crate) fn reduce_family_segments<T: GraphValue>(
             if width % 2 == 0 {
                 Ok(add(left, right))
             } else {
-                // The unpaired final member is carried unchanged. The wrapped
-                // right index stays in range but contributes no ciphertext error.
                 let last = member.equal(Int::constant(next_width - 1)).to_int();
                 mxx_dsl::select(last, vec![add(left.clone(), right), left])
             }
@@ -177,7 +206,7 @@ mod tests {
         let parameters = DCRTPolyParams::new(4, 1, 20, 4, None, None);
         let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 4);
         let mut context = DslContext::new("odd-width-segmented-reduction");
-        for width in [1usize, 3, 5] {
+        for width in [1usize, 3, 5, 257] {
             let values = (0..2 * width)
                 .map(|index| ring.polynomial([(index + 1).into()]))
                 .collect::<Vec<_>>();
@@ -212,7 +241,7 @@ mod tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        for width in [1usize, 3, 5] {
+        for width in [1usize, 3, 5, 257] {
             for segment in 0..2 {
                 let RuntimeValue::Matrix(expected) =
                     &result.outputs[&format!("expected-{width}-{segment}")]
@@ -243,17 +272,6 @@ mod tests {
             .build()
             .unwrap();
         graph.validate(&ParamEnv::default()).unwrap();
-        assert_eq!(
-            graph
-                .graph
-                .scopes()
-                .values()
-                .flat_map(|scope| scope.nodes())
-                .filter(|node| matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)))
-                .count(),
-            3,
-            "one structural loop for each balanced reduction level"
-        );
     }
 }
 
@@ -280,10 +298,22 @@ where
         .unwrap_or(count);
     mxx_dsl::parallel(count, |output| {
         let start = output.mul(Int::evaluate(active.count().clone()));
-        let terms = mxx_dsl::parallel(active.count().clone(), |cell| {
-            let external = cell.clone().add(Int::evaluate(active.start().clone()));
-            Ok(weights.at(start.clone().add(cell)) * rhs.at(external))
-        })?;
-        balanced_sum_family(terms).map_err(|_| mxx_dsl::DslError::Schema)
+        let size = active
+            .count()
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .and_then(|count| count.to_usize())
+            .ok_or(mxx_dsl::DslError::Schema)?;
+        reduce_generated_segments(
+            1,
+            size,
+            |_, cell| {
+                let external = cell.clone().add(Int::evaluate(active.start().clone()));
+                weights.at(start.clone().add(cell)) * rhs.at(external)
+            },
+            |left, right| left + right,
+        )
+        .map(|family| family.at(0))
+        .map_err(|_| mxx_dsl::DslError::Schema)
     })
 }

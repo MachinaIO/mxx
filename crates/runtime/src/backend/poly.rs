@@ -891,6 +891,14 @@ where
         Ok(M::multiply_batch_out_of_place(inputs))
     }
 
+    fn matrix_mul_accumulate(
+        &mut self,
+        request: MatrixMulAccumulateRequest<M>,
+    ) -> Result<M, Self::Error> {
+        // Keep singleton fleet shards on the same fused primitive as batches.
+        Ok(self.matrix_mul_accumulate_batch(vec![request])?.remove(0))
+    }
+
     fn matrix_mul_accumulate_batch(
         &mut self,
         requests: Vec<MatrixMulAccumulateRequest<M>>,

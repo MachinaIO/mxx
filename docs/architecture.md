@@ -61,6 +61,54 @@ structural loops; lexical reads become explicit core dependencies with inferred 
 
 Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
 transcripts, sessions, artifacts, and bounded parallel waves.
+Temporary families never spill to disk. The GPU fleet completes one family member
+before starting the next and stages intermediate family results in host RAM. Device
+parallelism is internal to primitives: calibrated column widths share the configured
+VRAM percentage and are recalculated against current residency for each invocation.
+CPU backends retain bounded sibling waves, including across subgraph calls. Values
+are released at their final live reference, including captures and member aliases.
+Root Family exports stream directly to their final artifact paths; the manifest is published
+only after execution succeeds. Other exports write their RAM payloads to final storage.
+Durable exported artifacts remain available for online execution.
+The RNS-BGG PRF round-trip integration warms representative primitives and host transfers
+at every actual CRT level, then measures one full preprocess/export/reopen/online execution.
+`MXX_EXPONENT_LUT_BENCH_WARMUPS` counts primitive warmups, not full round trips.
+For the RNS-BGG one-output PRF test, `MXX_EXPONENT_LUT_BENCH_STAGE=estimate`
+runs GPU-calibrated estimates of that exact producer and production-online
+graph instead of the round trip. Selector setup is charged to the single
+output; the online correctness oracle is excluded. The common estimator now tracks runtime storage boundaries across
+Family, capture, subgraph, and sequential-loop values. It measures raw-RNS RAM
+staging/reloading and compact artifact encoding/writing/reading/decoding with the
+production backend and artifact store, then adds their invocation-weighted wall
+times to `total_time_seconds`. GPU-resident edges have no added transfer charge;
+`total_work_seconds` remains primitive GPU work. The runtime and estimator share
+the matrix-Family staging rule and artifact codecs.
+
+`dataflow` and `transfers` report the extra costs and counts separately. CPU IR
+dispatch is a measured scalar-node proxy, not a full protocol execution trace.
+Artifact import calibration includes public content-hash verification (also
+charged conservatively to private imports). Measurements sum boundary costs;
+they do not predict overlap with unrelated operations, cold-cache storage
+behavior, or contention in a complete execution. Large transfer shapes use a
+VRAM-bounded representative wave and round the final partial wave upward.
+`MXX_EXPONENT_LUT_BENCH_ITERATIONS` controls measured repetitions in this mode.
+No protocol-specific selector-loop sampling is used.
+
+Exponent-LUT addition uses ordinary parallel reduction trees. RNS-BGG preprocessing uses
+`MXX_EXPONENT_LUT_PREPROCESS_BATCH_SIZE` (positive integer, default 256) for complete selector
+and branch batches. Selector generation runs inside the consuming loop, once per active
+selector; all output sums share that ciphertext before the batch is released. Output
+accumulators remain in RAM across batches. Their matrix payloads use raw-RNS host
+snapshots, including intermediate reduction families.
+Compact serialization remains the durable-export format. GPU RNS transfers expose D2H
+start/completion separately, and H2D sources are owned by the existing event-based pinned
+memory reclaimer. This permits a previous output store and next input load to overlap.
+Fleet snapshots pipeline two shards and reuse two pinned buffers, bounding transfer
+scratch independently of the number of column chunks. Mask and terminal sampling use
+matching branch batches, and public preparation finishes each batch before advancing its accumulated sum.
+Completed scalar exports are written immediately and retained as artifact handles, including
+members projected from batch families. Remaining live input values and output accumulators
+are separate from the bounded per-batch working set.
 
 ### `mxx-gadgets` and `mxx-bgg`
 

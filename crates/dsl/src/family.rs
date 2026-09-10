@@ -53,6 +53,35 @@ impl<T: GraphValue> Family<T> {
         let count = IntExpr::constant(elements.len());
 
         let flattened = elements.iter().map(GraphValue::flatten).collect::<Vec<_>>();
+        // Packing all ordered members of an existing family is a structural
+        // identity. Keep its producer instead of retaining one getter per
+        // member and then introducing a large pack node for each field.
+        let sources = flattened[0]
+            .iter()
+            .enumerate()
+            .map(|(port, first)| {
+                let [source] = first.node().arguments() else { return None };
+                let WireType::IndexedFamily { count: source_count, .. } = source.wire_type() else {
+                    return None;
+                };
+                if source_count != &count {
+                    return None;
+                }
+                flattened.iter().enumerate().all(|(index, member)| {
+                matches!(member[port].node().kind(), NodeKind::FamilyGetStatic { index: actual }
+                    if actual == &IntExpr::constant(index)) &&
+                    member[port].node().arguments() == std::slice::from_ref(source)
+            }).then(|| source.clone())
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(values) = sources {
+            return Ok(Self {
+                shared: vec![false; types.len()],
+                values,
+                element_schema: schema,
+                count,
+            });
+        }
         let values = types
             .into_iter()
             .enumerate()
@@ -113,16 +142,17 @@ impl<T: GraphValue> Family<T> {
     ) -> Result<Family<U>, DslError> {
         with_new_construction_scope(|_| {
             let placeholder = self.element_schema.placeholders();
-            let inputs = placeholder.flatten();
+            // Wide cryptographic records can have thousands of ports. Index
+            // source handles once instead of rescanning them for every field.
+            let mut inputs = std::collections::HashMap::new();
+            for (position, input) in placeholder.flatten().into_iter().enumerate() {
+                inputs.entry(input).or_insert(position);
+            }
             let result = project(placeholder);
             let positions = result
                 .flatten()
                 .iter()
-                .map(|value| {
-                    let position =
-                        inputs.iter().position(|input| input == value).ok_or(DslError::Schema)?;
-                    Ok(position)
-                })
+                .map(|value| inputs.get(value).copied().ok_or(DslError::Schema))
                 .collect::<Result<Vec<_>, DslError>>()?;
             Ok(Family {
                 values: positions.iter().map(|position| self.values[*position].clone()).collect(),
@@ -414,10 +444,25 @@ mod tests {
         let values =
             parallel(3, |_| Ok((ring.gaussian((1, 1), 1, 4), ring.uniform_residue((1, 1)))))
                 .unwrap();
+        let repacked = Family::pack((0..3).map(|index| values.at(index)).collect()).unwrap();
+        assert_eq!(repacked.flatten(), values.flatten());
+        let reversed = Family::pack((0..3).rev().map(|index| values.at(index)).collect()).unwrap();
+        assert_ne!(reversed.flatten(), values.flatten());
+        let subset = Family::pack(vec![values.at(0), values.at(1)]).unwrap();
+        assert_eq!(subset.count(), &IntExpr::constant(2));
         let first = values.field(|value| value.0).unwrap();
         let second = values.field(|value| value.1).unwrap();
         assert_eq!(first.flatten()[0], values.flatten()[0]);
         assert_eq!(second.flatten()[0], values.flatten()[1]);
+        let reordered = values.field(|(a, b)| (b, a.clone(), a)).unwrap();
+        assert_eq!(
+            reordered.flatten(),
+            vec![
+                values.flatten()[1].clone(),
+                values.flatten()[0].clone(),
+                values.flatten()[0].clone()
+            ]
+        );
         assert!(matches!(values.field(|value| value.0 + value.1), Err(DslError::Schema)));
         let built = DslContext::new("field-projection")
             .output("a", first)

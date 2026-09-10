@@ -267,16 +267,128 @@ fn monomial_input<B: Backend>(
 #[test]
 #[serial_test::serial]
 fn test_gpu_lwr_prf_one_output_round_trip() {
-    if use_rns_bgg() {
-        let fixture = rns_bgg_prf();
-        println!("prf_noise_simulation={}", fixture.noise_report);
-        run_rns_bgg(fixture);
-        return;
-    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+    if use_rns_bgg() {
+        let started = std::time::Instant::now();
+        let fixture = rns_bgg_prf();
+        println!("prf_graph_seconds={}", started.elapsed().as_secs_f64());
+        println!("prf_noise_simulation={}", fixture.noise_report);
+        let manifest = mxx_ir_core::artifact::export_validated_manifest(
+            ProductionId {
+                spec_hash: spec_hash(&fixture.producer.source, &fixture.producer.bindings).unwrap(),
+                execution_nonce: rand::random(),
+            },
+            &fixture.producer,
+        )
+        .unwrap();
+        let artifact_payload_bytes: u128 = manifest
+            .artifacts
+            .values()
+            .map(|artifact| {
+                let bytes = match &artifact.artifact_type {
+                    ArtifactType::Matrix(matrix) => {
+                        let parameters = fixture
+                            .parameters
+                            .levels()
+                            .iter()
+                            .find(|p| BigInt::from(p.modulus().as_ref().clone()) == matrix.modulus)
+                            .unwrap();
+                        matrix.rows as u128 *
+                            matrix.columns as u128 *
+                            matrix.ring_dimension as u128 *
+                            parameters.to_crt().0.len() as u128 *
+                            8
+                    }
+                    ArtifactType::SmallMatrix { matrix, max_coefficient_bound } |
+                    ArtifactType::Preimage { matrix, max_coefficient_bound } => {
+                        matrix.rows as u128 *
+                            matrix.columns as u128 *
+                            matrix.ring_dimension as u128 *
+                            (1 + max_coefficient_bound
+                                .to_biguint()
+                                .unwrap()
+                                .bits()
+                                .div_ceil(8)
+                                .max(1)) as u128
+                    }
+                    ArtifactType::Bytes { length } => *length as u128,
+                    other => panic!("unexpected PRF artifact: {other:?}"),
+                };
+                bytes * artifact.family_count.unwrap_or(1) as u128
+            })
+            .sum();
+        println!("prf_artifact_payload_bytes={artifact_payload_bytes}");
+        if std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("graph") {
+            return;
+        }
+        if std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("estimate") {
+            use mxx_bench_estimator::{
+                estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
+            };
+            use mxx_primitives::poly::dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids};
+            let online = (fixture.online)(manifest.production_id.clone(), manifest, false);
+            let devices = detected_gpu_device_ids();
+            assert!(!devices.is_empty(), "benchmark estimate requires CUDA");
+            println!("prf_estimate_gpu_devices={devices:?}");
+            let backends = devices
+                .into_iter()
+                .map(|device| {
+                    let rings = fixture.parameters.levels().iter().map(|p| {
+                        GpuDCRTPolyParams::new(
+                            p.ring_dimension(),
+                            p.to_crt().0,
+                            p.base_bits(),
+                            None,
+                        )
+                    });
+                    (gpu_backend_on(rings, [device]), device)
+                })
+                .collect();
+            let mut estimator = GpuNodeMeasurementBackend::new(
+                backends,
+                MeasurementHarnessConfig {
+                    warm_up_iterations: std::env::var("MXX_EXPONENT_LUT_BENCH_WARMUPS")
+                        .map(|v| v.parse().unwrap())
+                        .unwrap_or(1),
+                    measured_iterations: std::env::var("MXX_EXPONENT_LUT_BENCH_ITERATIONS")
+                        .map(|v| v.parse().unwrap())
+                        .unwrap_or(1),
+                    ..Default::default()
+                },
+            );
+            let stages = [("preprocess", &fixture.producer), ("online_eval", &online)];
+            for (_, graph) in stages {
+                estimate(graph, &mut estimator).expect("collect one-output PRF operations");
+            }
+            estimator.measure_collected().expect("measure one-output PRF operations");
+            let bits = fixture.noise_report["lwr_p"].as_u64().unwrap().ilog2();
+            for (stage, graph) in stages {
+                let report = estimate(graph, &mut estimator).expect("estimate one-output PRF");
+                println!(
+                    "prf_one_output_estimate={}",
+                    serde_json::json!({
+                        "scheme": "rns-bgg", "stage": stage, "output_count": 1,
+                        "information_bits": bits,
+                        "work_seconds_per_information_bit": report.total_work_seconds / f64::from(bits),
+                        "estimated_seconds_per_information_bit": report.total_time_seconds / f64::from(bits),
+                        "selector_setup_amortized": false,
+                        "verification_oracle_included": false,
+                        "runtime_family_staging_timed": true,
+                        "artifact_io_timed": true,
+                        "executor_dispatch_model": "measured scalar IR node proxy",
+                        "report": report,
+                    })
+                );
+            }
+            return;
+        }
+        run_rns_bgg(fixture);
+        return;
+    }
+
     let parameters = PrfTestParameters::from_env();
     let plan = simulate_prf(parameters);
     let (params, setup, profile) = parameters.build();
@@ -739,6 +851,7 @@ fn run_rns_bgg(fixture: rns_bgg::RnsBggRoundTrip) {
     };
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "GPU round trip requires a detected device");
+    println!("prf_runtime_gpu_devices={devices:?}");
     rns_bgg::run(
         fixture,
         |p| {
@@ -746,6 +859,11 @@ fn run_rns_bgg(fixture: rns_bgg::RnsBggRoundTrip) {
                 GpuDCRTPolyParams::new(p.ring_dimension(), p.to_crt().0, p.base_bits(), None)
             });
             mxx_runtime::backend::poly::gpu::gpu_backend_on(rings, devices)
+        },
+        |matrix| {
+            for shard in matrix.shards() {
+                shard.value.wait_until_ready();
+            }
         },
         |matrix, name, q, bound| {
             for shard in matrix.shards() {
@@ -779,72 +897,194 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
     };
     use mxx_ir_core::artifact::Manifest;
     use rns_bgg::{RnsBggRoundTrip, trace_prf};
-    let n: u32 = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-        .ok()
-        .map(|v| v.parse().unwrap())
-        .unwrap_or(4);
-    let layout = ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() };
-    let profile = SparseLwrPrfProfile::new(layout, 2).unwrap();
-    let program = SparseLwrPrfProgram::new(profile, 2, 1).unwrap();
-    let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
-        ring_dimension: n,
-        widths: vec![1, n as usize],
-        slots: vec![2, 1],
-        eta: 2,
-        crt_bits: 17,
-        terminal_depth: 2,
-        max_crt_depth: 32,
-        memory_budget_bytes: 1 << 30,
-        terminal_value_bound: 4u8.into(),
-    })
-    .unwrap();
+    let (parameters, layout, counts, selected, labels, p_lwr) = if let Some(path) =
+        std::env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT")
+    {
+        use mxx_exponent_lut::noise_refresh::pbc::{PbcLayoutSeed, PbcPublicLayout};
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let meta = &report["numerical_run"];
+        let n = meta["n"].as_u64().unwrap() as u32;
+        let primes: Vec<Vec<u64>> =
+            serde_json::from_value(report["selected_candidate"]["level_primes"].clone()).unwrap();
+        let parameters = RnsBggParameters::new(
+            primes
+                .into_iter()
+                .map(|primes| {
+                    DCRTPolyParams::new(
+                        n,
+                        primes.len(),
+                        meta["crt_bits"].as_u64().unwrap() as usize,
+                        meta["base_bits"].as_u64().unwrap() as u32,
+                        Some(primes),
+                        None,
+                    )
+                })
+                .collect(),
+            2,
+        )
+        .unwrap();
+        let q = meta["lwr_q"].as_u64().unwrap() as usize;
+        let p = meta["lwr_p"].as_u64().unwrap() as usize;
+        let width_log2 = q.trailing_zeros() - 1;
+        let layout = ExpLayout { stride_log2: n.trailing_zeros() - width_log2, width_log2 };
+        let universe = meta["lwr_dimension"].as_u64().unwrap() as usize;
+        let weight = meta["lwr_weight"].as_u64().unwrap() as usize;
+        let public = PbcPublicLayout::build(
+            &PbcParameters::paper_evaluation(universe, weight),
+            PbcLayoutSeed(serde_json::from_value(meta["pbc_seed"].clone()).unwrap()),
+            0,
+        )
+        .unwrap();
+        let active = PbcActiveCellIndex::build(&public).unwrap();
+        let counts = active.bucket_active_widths().collect::<Vec<_>>();
+        assert_eq!(
+            counts,
+            serde_json::from_value::<Vec<usize>>(meta["selector_counts"].clone()).unwrap()
+        );
+        let vector =
+            derive_lwr_vector(public.layout_id, &rand::random::<[u8; 32]>(), universe, q).unwrap();
+        // Sample a valid weight-h test key on the archived public layout.
+        // Distinct real coordinates occupy distinct selected buckets; other
+        // buckets select their dummy. This fixture does not resample layout parameters.
+        let mut rng = rand::rng();
+        let occupied = sample(&mut rng, counts.len(), weight).into_vec();
+        let mut support = std::collections::BTreeSet::new();
+        let mut selected = Vec::new();
+        let mut labels = Vec::new();
+        for step in 0..counts.len() {
+            let cells = active
+                .bucket_iter(step)
+                .unwrap()
+                .map(|(bucket, slot, _)| &public.cells[bucket][slot])
+                .collect::<Vec<_>>();
+            let index = if occupied.contains(&step) {
+                let choices = cells
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, cell)| match cell {
+                        PbcCell::Real { coordinate, .. } if !support.contains(coordinate) => {
+                            Some((i, *coordinate))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let (index, coordinate) = choices[rng.random_range(0..choices.len())];
+                support.insert(coordinate);
+                index
+            } else {
+                cells.iter().position(|cell| matches!(cell, PbcCell::Dummy)).unwrap()
+            };
+            selected.push(index);
+            labels.push(
+                cells
+                    .iter()
+                    .map(|cell| match cell {
+                        PbcCell::Real { coordinate, .. } => vector[*coordinate],
+                        _ => 0,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(support.len(), weight);
+        let selected_sum: usize = labels.iter().zip(&selected).map(|(values, i)| values[*i]).sum();
+        assert_eq!(selected_sum % q, support.iter().map(|i| vector[*i]).sum::<usize>() % q);
+        (parameters, layout, counts, selected, labels, p)
+    } else {
+        let n: u32 = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(4);
+        let layout = ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() };
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
+            ring_dimension: n,
+            widths: vec![1, n as usize],
+            slots: vec![2, 1],
+            eta: 2,
+            crt_bits: 17,
+            terminal_depth: 2,
+            max_crt_depth: 32,
+            memory_budget_bytes: 1 << 30,
+            terminal_value_bound: 4u8.into(),
+        })
+        .unwrap();
+        let vector =
+            derive_lwr_vector(PbcLayoutId(rand::random()), b"one-output", 2, 2 * n as usize)
+                .unwrap();
+        (parameters, layout, vec![2], vec![usize::from(rand::random::<bool>())], vec![vector], 4)
+    };
+    let n = parameters.level(0).unwrap().ring_dimension();
+    let terminal = counts.len();
+    let output_level = terminal + 1;
+    let profile = SparseLwrPrfProfile::new(layout, p_lwr / 2).unwrap();
+    let program =
+        SparseLwrPrfProgram::new(profile, *counts.iter().max().unwrap(), terminal).unwrap();
+    let exponent = labels.iter().zip(&selected).map(|(values, i)| values[*i]).sum::<usize>() %
+        profile.q().unwrap();
     let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
     let high = scheme.ring(0).unwrap();
-    let middle = scheme.ring(1).unwrap();
     let seed = high.bytes_input("hash-key", 32);
     let r = scheme.sample_payload_secret().unwrap();
     let key =
         scheme.sample_input_key(0, seed.clone(), b"initial".as_slice(), rand::random()).unwrap();
     let material = scheme.prepare_input(&r, &key, high.polynomial([1.into()])).unwrap();
-    let selected = usize::from(rand::random::<bool>());
-    let vector =
-        derive_lwr_vector(PbcLayoutId(rand::random()), b"one-output", 2, profile.q().unwrap())
-            .unwrap();
-    let selectors = scheme
-        .sample_private_rhs_family(
-            &r,
-            0,
-            &RnsBggRhsPlaintextFamily {
-                payloads: Family::pack(
-                    (0..2).map(|i| middle.polynomial([u8::from(i == selected).into()])).collect(),
+    let blocks = counts
+        .iter()
+        .enumerate()
+        .map(|(step, count)| {
+            let ring = scheme.ring(step + 1).unwrap();
+            let selectors = scheme
+                .sample_private_rhs_family(
+                    &r,
+                    step,
+                    &RnsBggRhsPlaintextFamily {
+                        payloads: Family::pack(
+                            (0..*count)
+                                .map(|i| ring.polynomial([u8::from(i == selected[step]).into()]))
+                                .collect(),
+                        )
+                        .unwrap(),
+                        id: rand::random(),
+                    },
+                    seed.clone(),
+                    format!("selectors-{step}").into_bytes(),
+                    rand::random(),
+                )
+                .unwrap();
+            PrfSelectionInputs {
+                selectors,
+                labels: Family::pack(
+                    labels[step]
+                        .iter()
+                        .map(|v| layout.mono(&ring, &BigInt::from(*v)).unwrap())
+                        .collect(),
                 )
                 .unwrap(),
+                active: FamilyRange::bounded(0, *count, *count).unwrap(),
                 id: rand::random(),
-            },
-            seed.clone(),
-            b"selectors".as_slice(),
-            rand::random(),
-        )
-        .unwrap();
+            }
+        })
+        .collect::<Vec<_>>();
     let (public, prepared) = PreparedSparseLwrPrf::new(
         &scheme,
         program.clone(),
         ProgramValue::Scalar((key.clone(), None)),
-        &[PrfSelectionInputs {
-            selectors,
-            labels: Family::pack(
-                vector.iter().map(|v| layout.mono(&middle, &BigInt::from(*v)).unwrap()).collect(),
-            )
-            .unwrap(),
-            active: FamilyRange::bounded(0, 2, 2).unwrap(),
-            id: rand::random(),
-        }],
+        &blocks,
     )
     .unwrap();
     let public = ProgramValue::Scalar(public.at(0));
     let bank = scheme
-        .sample_mask_bank(1, layout, seed.clone(), b"readout-bank".as_slice(), rand::random())
+        .sample_mask_bank(
+            terminal,
+            layout,
+            seed.clone(),
+            b"readout-bank".as_slice(),
+            rand::random(),
+        )
         .unwrap();
+    // Separate all p possible digits by far more than the simulated error.
+    // Target scaling is applied before fresh encryption and does not amplify noise.
+    let digit_scale = parameters.level(output_level).unwrap().modulus().as_ref() / (2 * p_lwr);
     let readout_material = scheme
         .sample_readout_material(
             &r,
@@ -853,16 +1093,16 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
             seed,
             b"readout".as_slice(),
             rand::random(),
-            Some(RnsBggReadoutWeights::Shared([vec![1.into()], vec![]])),
+            Some(RnsBggReadoutWeights::Shared([vec![BigInt::from(digit_scale.clone())], vec![]])),
             None,
         )
         .unwrap();
     let readout = scheme.prepare_readout(&program.readout, &public, &readout_material).unwrap();
-    let trace = trace_prf(&parameters, prepared.program());
+    let trace = trace_prf(&parameters, prepared.program(), &counts);
     let mut terminal_noise = parameters
         .terminal_noise_bound(
-            1,
-            [(&trace.wires[&program.accumulation.outputs()[0]].bound, n as usize, &1u8.into())],
+            terminal,
+            [(&trace.wires[&program.accumulation.outputs()[0]].bound, layout.width(), &1u8.into())],
             readout_material.target_bound().clone(),
         )
         .unwrap();
@@ -878,14 +1118,19 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
         };
         let moments = parameters
             .terminal_noise_moments(
-                1,
-                [(&trace.wires[&program.accumulation.outputs()[0]], n as usize)],
+                terminal,
+                [(&trace.wires[&program.accumulation.outputs()[0]], layout.width())],
             )
             .unwrap();
         let z = config.z_squared_for_events(&BigUint::from(2 * n)).unwrap();
         terminal_noise.error = moments.tail_bound(&z);
     }
-    assert!(parameters.terminal_noise_fits(2, &terminal_noise).unwrap());
+    assert!(parameters.terminal_noise_fits(output_level, &terminal_noise).unwrap());
+    assert!(
+        &terminal_noise.error * 2u8 < digit_scale,
+        "digit rounding must recover the exact output"
+    );
+    let reported_scale = digit_scale.to_string();
     let (producer, prf_descriptor) =
         prepared.export(&scheme, DslContext::new("rns_bgg-prf-preprocess"), "prf").unwrap();
     let (producer, input_descriptor) =
@@ -893,7 +1138,7 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
     let (producer, readout_descriptor) =
         scheme.export_prepared_readout(&readout, producer, "readout").unwrap();
     let producer = producer.build().unwrap().validate(&ParamEnv::default()).unwrap();
-    let online = Box::new(move |production: ProductionId, manifest: Manifest| {
+    let online = Box::new(move |production: ProductionId, manifest: Manifest, verify: bool| {
         let prf_descriptor =
             serde_json::from_slice(&serde_json::to_vec(&prf_descriptor).unwrap()).unwrap();
         let prepared = PreparedSparseLwrPrf::import(
@@ -926,15 +1171,30 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
         let encoded = ProgramValue::Scalar(prepared.evaluate(&scheme, input).unwrap().at(0));
         let masks = scheme.prepare_online_masks(&s, &readout.mask_bank()).unwrap();
         let value = scheme.evaluate_readout(&program.readout, &encoded, &readout, &masks).unwrap();
-        let e = vector[selected];
-        let d = &program.readout.canonical_coefficients().unwrap()[e % n as usize];
-        let expected = if e < n as usize { d.clone() } else { BigInt::from(1u8) - d };
-        let low = scheme.ring(2).unwrap();
+        if !verify {
+            // Estimate the same production output, excluding the secret-key
+            // correctness oracle that the round trip evaluates separately.
+            return DslContext::new("rns_bgg-prf-production-online")
+                .output("value", value.values.scalar().unwrap().clone())
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production, manifest)]),
+                )
+                .unwrap();
+        }
+        let d = &program.readout.canonical_coefficients().unwrap()[exponent % layout.width()];
+        let expected = if exponent < layout.width() { d.clone() } else { BigInt::from(1u8) - d };
+        let expected = expected * BigInt::from(digit_scale.clone());
+        let low = scheme.ring(output_level).unwrap();
         let expected =
             RnsBggRow::new([[low.polynomial([expected.into()]), low.polynomial([0.into()])]])
                 .unwrap();
         let error = value.values.scalar().unwrap().clone() -
-            scheme.mask_at(&s, 2).unwrap() * public_result.values.scalar().unwrap().clone() -
+            scheme.mask_at(&s, output_level).unwrap() *
+                public_result.values.scalar().unwrap().clone() -
             expected;
         let consumer = DslContext::new("rns_bgg-prf-online")
             .output("error", error)
@@ -948,13 +1208,13 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
             .unwrap();
         consumer
     });
-    let noise_report = serde_json::json!({"scheme": "rns-bgg", "model": model, "worst_bound": worst_bound.to_string(), "output_count": 1, "readout_error_bound": terminal_noise.error.to_string(), "readout_value_bound": terminal_noise.coefficient_bound.to_string()});
+    let noise_report = serde_json::json!({"scheme": "rns-bgg", "model": model, "worst_bound": worst_bound.to_string(), "output_count": 1, "n": n, "selector_counts": counts, "lwr_p": p_lwr, "output_level": output_level, "digit_scale": reported_scale, "readout_error_bound": terminal_noise.error.to_string(), "readout_value_bound": terminal_noise.coefficient_bound.to_string()});
     let bounds = (0..2)
         .map(|column| {
             (
                 format!("error.{column}"),
                 (
-                    parameters.level(2).unwrap().modulus().as_ref().clone(),
+                    parameters.level(output_level).unwrap().modulus().as_ref().clone(),
                     terminal_noise.error.clone(),
                 ),
             )
@@ -970,9 +1230,9 @@ mod rns_bgg {
         artifact::{Manifest, ProductionId},
     };
     use mxx_runtime::{
-        Backend, RuntimeValue,
+        Backend, ExecutionConfig, RuntimeValue,
         artifact::{ArtifactStore, FileArtifactStore},
-        execute,
+        execute_with_config,
         transcript::SamplingMode,
     };
     use num_bigint::BigUint;
@@ -980,7 +1240,7 @@ mod rns_bgg {
     pub struct RnsBggRoundTrip {
         pub parameters: RnsBggParameters,
         pub producer: ValidatedGraph,
-        pub online: Box<dyn Fn(ProductionId, Manifest) -> ValidatedGraph>,
+        pub online: Box<dyn Fn(ProductionId, Manifest, bool) -> ValidatedGraph>,
         pub bounds: BTreeMap<String, (BigUint, BigUint)>,
         pub noise_report: serde_json::Value,
     }
@@ -988,41 +1248,176 @@ mod rns_bgg {
     pub fn run<B: Backend>(
         fixture: RnsBggRoundTrip,
         make_backend: impl FnOnce(&RnsBggParameters) -> B,
+        finish_matrix: impl Fn(&B::Matrix),
         check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
     ) {
         std::fs::create_dir_all("test_data/rns_bgg_round_trip").unwrap();
-        let directory = tempfile::tempdir_in("test_data/rns_bgg_round_trip").unwrap();
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let mut backend = make_backend(&fixture.parameters);
-        let produced = execute(
-            &fixture.producer,
-            &mut backend,
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let production = produced.production_id.unwrap();
-        drop(store);
-        let mut store = FileArtifactStore::open(directory.path()).unwrap();
-        let manifest = store.load_manifest(&production).unwrap();
-        let consumer = (fixture.online)(production, manifest);
-        let result =
-            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+        let warmups: usize = std::env::var("MXX_EXPONENT_LUT_BENCH_WARMUPS")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(0);
+        // Bound sibling working sets independently of column distribution across GPUs.
+        let parallel_instances = std::env::var("MXX_EXPONENT_LUT_MAX_PARALLEL_INSTANCES")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(64);
+        let config = ExecutionConfig {
+            max_parallel_instances: std::num::NonZeroUsize::new(parallel_instances).unwrap(),
+            ..ExecutionConfig::default()
+        };
+        println!(
+            "prf_runtime_parallel_instances={parallel_instances} primitive_warmups={warmups} measured_iterations=1"
+        );
+        // Warm the real ring/CRT contexts and transfer/primitive paths without
+        // producing and saving an entire PRF's helper bank twice.
+        use mxx_ir_core::{ParamEnv, types::ConcreteMatrixType};
+        use mxx_primitives::poly::PolyParams;
+        use num_bigint::BigInt;
+        for repetition in 0..warmups {
+            let started = std::time::Instant::now();
+            for (level, pair) in fixture.parameters.levels().windows(2).enumerate() {
+                let high_q = BigInt::from(pair[0].modulus().as_ref().clone());
+                let low_q = BigInt::from(pair[1].modulus().as_ref().clone());
+                let n = pair[0].ring_dimension() as usize;
+                let high = mxx_dsl::Ring::new(high_q.clone(), n);
+                let low = mxx_dsl::Ring::new(low_q.clone(), n);
+                let seed = high.bytes_input("hash-key", 32);
+                let a = high.hash_matrix(seed.clone(), b"warmup-a".as_slice(), (1, 1));
+                let error =
+                    high.uniform_interval((1, 1), 0, 1) - high.uniform_interval((1, 1), 0, 1);
+                let source = low.hash_matrix(seed.clone(), b"warmup-digits".as_slice(), (1, 1));
+                let digits = source
+                    .clone()
+                    .decompose(1u64 << pair[1].base_bits(), pair[1].modulus_digits())
+                    .centered_extend(high_q.clone());
+                let left = high.hash_matrix(
+                    seed,
+                    b"warmup-left".as_slice(),
+                    (1, pair[1].modulus_digits()),
+                );
+                let value = ((a.clone() + error) * a +
+                    digits.mul_small_rhs(left) +
+                    source.centered_extend(high_q.clone()))
+                .ring_automorphism(3)
+                .block_mod_switch(low_q.clone(), 1)
+                .centered_extend(high_q)
+                .reduce_modulus(low_q.clone());
+                let graph = mxx_dsl::DslContext::new(format!("prf-primitive-warmup-{level}"))
+                    .output("value", value)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate(&ParamEnv::default())
+                    .unwrap();
+                let result = execute_with_config(
+                    &graph,
+                    &mut backend,
+                    BTreeMap::from([(
+                        "hash-key".into(),
+                        RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
+                    )]),
+                    &mut mxx_runtime::artifact::MemoryArtifactStore::default(),
+                    SamplingMode::Fresh,
+                    config,
+                )
                 .unwrap();
-        for (name, value) in result.outputs {
-            let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial output") };
-            let (q, bound) = &fixture.bounds[&name];
-            check_matrix(&matrix, &name, q, bound);
+                let RuntimeValue::Matrix(matrix) = &result.outputs["value"] else {
+                    panic!("matrix")
+                };
+                let bytes = backend.matrix_to_bytes(matrix);
+                let restored = backend
+                    .matrix_from_bytes(
+                        &ConcreteMatrixType {
+                            modulus: low_q,
+                            ring_dimension: n,
+                            rows: 1,
+                            columns: 1,
+                        },
+                        &bytes,
+                    )
+                    .unwrap();
+                finish_matrix(&restored);
+            }
+            backend.fence_released_memory().unwrap();
+            println!(
+                "prf_primitive_warmup_complete repetition={repetition} seconds={}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        {
+            let iteration = 0;
+            let measured = true;
+            println!("prf_round_trip_start iteration={iteration} measured={measured}");
+            let directory = tempfile::tempdir_in("test_data/rns_bgg_round_trip").unwrap();
+            let mut store = FileArtifactStore::new(directory.path()).unwrap();
+            let round_trip_started = std::time::Instant::now();
+            let started = std::time::Instant::now();
+            let produced = execute_with_config(
+                &fixture.producer,
+                &mut backend,
+                BTreeMap::from([(
+                    "hash-key".into(),
+                    RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
+                )]),
+                &mut store,
+                SamplingMode::Fresh,
+                config,
+            )
+            .unwrap();
+            for value in produced.outputs.values() {
+                if let RuntimeValue::Matrix(matrix) = value {
+                    finish_matrix(matrix);
+                }
+            }
+            let preprocess_seconds = started.elapsed().as_secs_f64();
+            println!(
+                "prf_preprocess_complete iteration={iteration} measured={measured} seconds={preprocess_seconds}"
+            );
+            let production = produced.production_id.unwrap();
+            drop(produced.outputs);
+            drop(store);
+            let started = std::time::Instant::now();
+            let mut store = FileArtifactStore::open(directory.path()).unwrap();
+            let manifest = store.load_manifest(&production).unwrap();
+            let reopen_seconds = started.elapsed().as_secs_f64();
+            let started = std::time::Instant::now();
+            let consumer = (fixture.online)(production, manifest, true);
+            let online_graph_seconds = started.elapsed().as_secs_f64();
+            let started = std::time::Instant::now();
+            let result = execute_with_config(
+                &consumer,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                SamplingMode::Fresh,
+                config,
+            )
+            .unwrap();
+            for value in result.outputs.values() {
+                if let RuntimeValue::Matrix(matrix) = value {
+                    finish_matrix(matrix);
+                }
+            }
+            let online_eval_seconds = started.elapsed().as_secs_f64();
+            let started = std::time::Instant::now();
+            for (name, value) in result.outputs {
+                let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial output") };
+                let (q, bound) = &fixture.bounds[&name];
+                check_matrix(&matrix, &name, q, bound);
+            }
+            let verification_seconds = started.elapsed().as_secs_f64();
+            let round_trip_seconds = round_trip_started.elapsed().as_secs_f64();
+            println!(
+                "prf_round_trip_timing iteration={iteration} measured={measured} preprocess_seconds={preprocess_seconds} reopen_seconds={reopen_seconds} online_graph_seconds={online_graph_seconds} online_eval_seconds={online_eval_seconds} verification_seconds={verification_seconds} round_trip_seconds={round_trip_seconds} correctness=true"
+            );
         }
     }
 
     pub fn trace_prf(
         parameters: &RnsBggParameters,
         execution: &mxx_exponent_lut::program::ExponentLutProgram,
+        counts: &[usize],
     ) -> mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseTrace {
         let inputs = BTreeMap::from([(
             *execution.inputs().keys().next().unwrap(),
@@ -1058,9 +1453,9 @@ mod rns_bgg {
                 mxx_exponent_lut::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
                     step,
                     None,
-                    &[
-                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit(),
-                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit(),
+                    &vec![
+                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit();
+                        counts[step]
                     ],
                 )
                 .unwrap();

@@ -176,6 +176,14 @@ __device__ __forceinline__ uint64_t compact_mod_magnitude(
     uint64_t modulus)
 {
     uint64_t value = 0;
+    if (width <= sizeof(uint64_t))
+    {
+        // Typical gadget digits fit in one word and are already smaller than
+        // each CRT prime. Avoid a 128-bit remainder for every input byte.
+        for (size_t i = 0; i < width; ++i)
+            value |= static_cast<uint64_t>(magnitude[i]) << (8 * i);
+        return value < modulus ? value : value % modulus;
+    }
     for (size_t i = width; i-- > 0;)
     {
         value = static_cast<uint64_t>(

@@ -4,6 +4,9 @@
 //! backend operations as the runtime. It measures operation cost; it is not a
 //! second graph executor and does not define node semantics.
 
+#[path = "dataflow_gpu.rs"]
+mod dataflow;
+
 use crate::{
     MeasurementBackend, MeasurementNode, NodeMeasurement,
     harness::{MeasurementHarnessConfig, MemoryProbe, measure_batch_operation},
@@ -374,6 +377,7 @@ pub struct GpuNodeMeasurementBackend {
     measurements: HashMap<[u8; 32], NodeMeasurement>,
     pending: HashMap<[u8; 32], PendingMeasurement>,
     collecting: bool,
+    transfers: dataflow::TransferMeasurements,
 }
 
 impl GpuNodeMeasurementBackend {
@@ -405,6 +409,7 @@ impl GpuNodeMeasurementBackend {
             measurements: HashMap::new(),
             pending: HashMap::new(),
             collecting: true,
+            transfers: dataflow::TransferMeasurements::default(),
         }
     }
 
@@ -443,6 +448,7 @@ impl GpuNodeMeasurementBackend {
             let measurement = self.measure_fleet_request(&request)?;
             self.measurements.insert(request.key, measurement);
         }
+        self.transfers.measure(&mut self.workers, &self.harness)?;
         Ok(())
     }
 
@@ -1754,16 +1760,31 @@ impl GpuNodeMeasurementBackend {
             }
             match family_leaf_type(wire_type) {
                 ConcreteWireType::Matrix(matrix) => {
+                    // Match ordinary full-modulus inputs: zero-only operands
+                    // can take cheaper integer-reduction paths inside kernels.
                     let value = backend
-                        .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
+                        .sample_uniform(
+                            matrix,
+                            &SampleRange {
+                                minimum: BigInt::from(0),
+                                maximum: &matrix.modulus - BigInt::from(1),
+                            },
+                        )
                         .map_err(|error| GpuMeasurementError(error.to_string()))?;
                     arguments.push(Some(Arc::new(value)));
                     small_arguments.push(None);
                 }
                 ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
                 ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                    // Only the ring parameters are needed. A full RNS placeholder
+                    // scales as rows * columns * CRT depth despite this operand's
+                    // compact representation, and pollutes the transfer-buffer cache.
                     let parameters = backend
-                        .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
+                        .constant_matrix(
+                            &ConcreteMatrixType { rows: 1, columns: 1, ..matrix.clone() },
+                            &ConstantMatrix::Zero,
+                            bindings,
+                        )
                         .map_err(|error| GpuMeasurementError(error.to_string()))?;
                     let max_coefficient_bound =
                         max_coefficient_bound.to_biguint().ok_or_else(|| {
@@ -1788,6 +1809,15 @@ impl GpuNodeMeasurementBackend {
                                 "compact matrix payload length overflows".to_owned(),
                             )
                         })?;
+                    let mut payload = vec![0; payload_len];
+                    if max_coefficient_bound.bits() != 0 {
+                        payload.par_chunks_mut(1 + magnitude_bytes).enumerate().for_each(
+                            |(index, coefficient)| {
+                                coefficient[0] = (index % 3) as u8;
+                                coefficient[1] = u8::from(coefficient[0] != 0);
+                            },
+                        );
+                    }
                     let value = GpuSmallMatrix::from_canonical_coefficients(
                         parameters
                             .shards()
@@ -1798,7 +1828,7 @@ impl GpuNodeMeasurementBackend {
                         matrix.rows,
                         matrix.columns,
                         max_coefficient_bound,
-                        &vec![0u8; payload_len],
+                        &payload,
                     )
                     .map_err(|error| GpuMeasurementError(error.to_string()))?;
                     arguments.push(None);
@@ -2414,6 +2444,20 @@ impl GpuNodeMeasurementBackend {
                         .collect(),
                 )
             }
+            NodeKind::CenteredExtend { .. }
+                if prepared.small_arguments.first().is_some_and(Option::is_some) =>
+            {
+                let destination = output_matrix_type()?;
+                let source = small_matrix_arc(0)?;
+                (0..batch_size)
+                    .map(|_| {
+                        backend
+                            .centered_extend_small(&source, &destination)
+                            .map(GpuMeasurementOutput::SmallMatrix)
+                            .map_err(backend_error)
+                    })
+                    .collect()
+            }
             NodeKind::CenteredExtend { .. } | NodeKind::BlockModSwitch { .. } => {
                 let destination = output_matrix_type()?;
                 let plaintext_modulus = match node.kind {
@@ -2917,6 +2961,20 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
             preimage_sample: matches!(node.kind, NodeKind::PreimageSample { .. }),
         });
         Ok(NodeMeasurement::default())
+    }
+
+    fn models_dataflow(&self) -> bool {
+        true
+    }
+    fn executor_dispatch_seconds(&self) -> f64 {
+        self.transfers.dispatch_seconds
+    }
+    fn measure_transfer(
+        &mut self,
+        kind: crate::dataflow::TransferKind,
+        ty: &ConcreteWireType,
+    ) -> Result<f64, Self::Error> {
+        self.transfers.get(kind, ty, self.collecting)
     }
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
@@ -3470,6 +3528,24 @@ mod tests {
             },
         );
         let report = backend.measure_fleet_request(&request).unwrap();
+        assert!(report.work_seconds > 0.0);
+        // Decomposition outputs retain their compact representation across levels,
+        // just as they do in the runtime executor.
+        let mut compact_request = request;
+        for wire_type in compact_request
+            .concrete_argument_types
+            .iter_mut()
+            .chain(&mut compact_request.concrete_output_types)
+        {
+            let ConcreteWireType::Matrix(matrix) = wire_type else { unreachable!() };
+            *wire_type = ConcreteWireType::Preimage {
+                // The parameter probe is 1x1; the actual compact operand must
+                // retain its independently requested, larger dimensions.
+                matrix: ConcreteMatrixType { rows: 2, columns: 3, ..matrix.clone() },
+                max_coefficient_bound: BigInt::from(1),
+            };
+        }
+        let report = backend.measure_fleet_request(&compact_request).unwrap();
         assert!(report.work_seconds > 0.0);
     }
 

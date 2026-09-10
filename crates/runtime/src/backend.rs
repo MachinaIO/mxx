@@ -126,6 +126,11 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Limit sibling bodies when the backend parallelizes within primitives.
+    fn parallel_wave_size(&self, limit: usize) -> usize {
+        limit
+    }
+
     fn placement_count(&self) -> usize {
         1
     }
@@ -612,11 +617,15 @@ pub enum RuntimeValue<B: Backend> {
         name: String,
         index: usize,
         descriptor: mxx_ir_core::artifact::ManifestArtifact,
+        /// Shared ownership of this execution's temporary family storage.
+        lifetime: Arc<()>,
     },
     StagedArtifactFamily {
         production: mxx_ir_core::artifact::ProductionId,
         name: String,
         descriptor: mxx_ir_core::artifact::ManifestArtifact,
+        /// Shared ownership of this execution's temporary family storage.
+        lifetime: Arc<()>,
     },
     IndexedFamily(Vec<RuntimeValue<B>>),
 }
@@ -662,17 +671,21 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                 name: name.clone(),
                 descriptor: descriptor.clone(),
             },
-            Self::StagedArtifact { production, name, index, descriptor } => Self::StagedArtifact {
-                production: production.clone(),
-                name: name.clone(),
-                index: *index,
-                descriptor: descriptor.clone(),
-            },
-            Self::StagedArtifactFamily { production, name, descriptor } => {
+            Self::StagedArtifact { production, name, index, descriptor, lifetime } => {
+                Self::StagedArtifact {
+                    production: production.clone(),
+                    name: name.clone(),
+                    index: *index,
+                    descriptor: descriptor.clone(),
+                    lifetime: lifetime.clone(),
+                }
+            }
+            Self::StagedArtifactFamily { production, name, descriptor, lifetime } => {
                 Self::StagedArtifactFamily {
                     production: production.clone(),
                     name: name.clone(),
                     descriptor: descriptor.clone(),
+                    lifetime: lifetime.clone(),
                 }
             }
             Self::IndexedFamily(values) => Self::IndexedFamily(values.clone()),

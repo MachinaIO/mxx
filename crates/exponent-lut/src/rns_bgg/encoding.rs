@@ -147,12 +147,18 @@ impl RnsBggScheme {
         if self.parameters.eta() == 0 {
             return Ok(ring.zero((rows, columns)));
         }
-        let bits = mxx_dsl::parallel(self.parameters.eta(), |_| {
-            Ok(ring.uniform_interval((rows, columns), 0, 1) -
-                ring.uniform_interval((rows, columns), 0, 1))
-        })
-        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-        sum(bits)
+        // Eta is a small scheme parameter, not an application family. Keep
+        // its independent Bernoulli differences in one scalar dataflow so the
+        // executor does not stage each summand through host RAM.
+        let difference = || {
+            ring.uniform_interval((rows, columns), 0, 1) -
+                ring.uniform_interval((rows, columns), 0, 1)
+        };
+        let mut error = difference();
+        for _ in 1..self.parameters.eta() {
+            error = error + difference();
+        }
+        Ok(error)
     }
     pub fn sample_payload_secret(&self) -> Result<RnsBggPayloadSecret, RnsBggError> {
         let ring = self.ring(0)?;
@@ -258,17 +264,31 @@ impl RnsBggScheme {
         let s = self.mask_at(secret, level)?;
         let p = self.scalar(level, self.parameters.scale(level)?.clone())?;
         let gadget = self.state_gadget(level)?;
+        let columns = self.parameters.component_columns(level)?;
+        let public =
+            Family::pack(bank.branches.iter().map(|branch| branch.public.clone()).collect())
+                .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        let rows = mxx_dsl::parallel(bank.branches.len(), |index| {
+            let sigma = IntExpr::Select {
+                selector: Box::new(index.expression()?),
+                branches: bank
+                    .branches
+                    .iter()
+                    .map(|branch| IntExpr::constant(branch.sigma))
+                    .collect(),
+            };
+            Ok(s.clone() * public.at(&index) -
+                (p.clone() * s.clone().ring_automorphism(sigma))
+                    .map(|entry| entry * gadget.clone()) +
+                self.small_error_row(level, columns).map_err(|_| DslError::Schema)?)
+        })
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
         let rows = bank
             .branches
             .iter()
-            .map(|branch| {
-                let row = s.clone() * branch.public.clone() -
-                    (p.clone() * s.clone().ring_automorphism(branch.sigma))
-                        .map(|entry| entry * gadget.clone()) +
-                    self.small_error_row(level, self.parameters.component_columns(level)?)?;
-                Ok((branch.sigma, row))
-            })
-            .collect::<Result<_, RnsBggError>>()?;
+            .enumerate()
+            .map(|(index, branch)| (branch.sigma, rows.at(index)))
+            .collect();
         Ok(RnsBggOnlineMasks { id: bank.id, level, context: self.context, rows: Arc::new(rows) })
     }
     pub fn evaluate_lut(
@@ -305,17 +325,29 @@ impl RnsBggScheme {
         if masks.id != bank_id || masks.context != self.context || masks.level != input.level {
             return Err(RnsBggError::Context);
         }
-        let terms = branches
+        let inputs = branches
             .iter()
             .map(|branch| {
-                Ok(masks.rows.get(&branch.sigma).ok_or(RnsBggError::Context)?.clone() *
-                    branch.lifted_intermediate.clone() +
-                    input.row.clone().ring_automorphism(branch.sigma) *
-                        branch.lifted_ciphertext.clone())
+                Ok((
+                    masks.rows.get(&branch.sigma).ok_or(RnsBggError::Context)?.clone(),
+                    branch.lifted_intermediate.clone(),
+                    branch.lifted_ciphertext.clone(),
+                ))
             })
-            .collect::<Result<_, RnsBggError>>()?;
-        sum(Family::pack(terms).map_err(|e| RnsBggError::Graph(e.to_string()))?)
+            .collect::<Result<Vec<_>, RnsBggError>>()?;
+        let inputs = Family::pack(inputs).map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        let terms = mxx_dsl::parallel(branches.len(), |index| {
+            let sigma = IntExpr::Select {
+                selector: Box::new(index.expression()?),
+                branches: branches.iter().map(|branch| IntExpr::constant(branch.sigma)).collect(),
+            };
+            let (mask, intermediate, ciphertext) = inputs.at(&index);
+            Ok(mask * intermediate + input.row.clone().ring_automorphism(sigma) * ciphertext)
+        })
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        sum(terms)
     }
+
     pub(super) fn check_encoding_family(
         &self,
         value: &RnsBggEncodingFamily,
@@ -477,28 +509,61 @@ impl RnsBggScheme {
         tag: impl Into<mxx_dsl::HashTag>,
         id: [u8; 32],
     ) -> Result<RnsBggPrivateRhs, RnsBggError> {
-        let next = level + 1;
-        let ring = self.ring(next)?;
-        let r = self.payload_at(secret, next)?;
-        let mut tag = tag.into();
-        tag.push("rns_bgg-private-rhs");
-        tag.push(mxx_ir_core::IntExpr::constant(level));
-        let top = RnsBggRow::hash(&ring, hash_key, tag, self.parameters.component_columns(next)?);
-        let target =
-            self.scalar(next, self.parameters.scale(next)?.clone())? * rhs.payload * r.clone();
-        let gadget = self.state_gadget(next)?;
-        let target = target.map(|entry| entry * gadget.clone());
-        let bottom = -r.entry(0, 0).clone() * top.clone() +
-            target +
-            self.small_error_row(next, self.parameters.component_columns(next)?)?;
+        let (prefix, target) = self.private_rhs_basis(secret, level)?;
+        let ciphertext =
+            self.encrypt_private_rhs(level, rhs.payload, &prefix, &target, hash_key, tag)?;
         Ok(RnsBggPrivateRhs {
-            ciphertext: RnsBggMatrix::from_rows(top, bottom),
+            ciphertext,
             lifted_ciphertext: (),
             level,
             context: self.context,
             rhs_id: rhs.id,
             id,
         })
+    }
+    // These values are independent of the selector. Capture them once in a
+    // generated family instead of rebuilding the gadget and secret per member.
+    fn private_rhs_basis(
+        &self,
+        secret: &RnsBggPayloadSecret,
+        level: usize,
+    ) -> Result<(Mat, RnsBggRow), RnsBggError> {
+        let next = level + 1;
+        let r = self.payload_at(secret, next)?;
+        let prefix = -r.entry(0, 0).clone();
+        let scaled = self.scalar(next, self.parameters.scale(next)?.clone())? * r;
+        let gadget = self.state_gadget(next)?;
+        Ok((prefix, scaled.map(|entry| entry * gadget.clone())))
+    }
+    fn encrypt_private_rhs(
+        &self,
+        level: usize,
+        payload: Mat,
+        prefix: &Mat,
+        target: &RnsBggRow,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let next = level + 1;
+        let ring = self.ring(next)?;
+        let columns = self.parameters.component_columns(next)?;
+        let mut tag = tag.into();
+        tag.push("rns_bgg-private-rhs");
+        tag.push(mxx_ir_core::IntExpr::constant(level));
+        let top = RnsBggRow::hash(&ring, hash_key, tag, columns);
+        // Ring scalars commute: payload * (scale * r * gadget) is the
+        // original target, with fresh independent errors for every member.
+        let error = self.small_error_row(next, columns)?;
+        let bottom = RnsBggRow::new([std::array::from_fn(|column| {
+            Mat::multi_row_gemm_accumulate(
+                vec![
+                    (1usize, prefix.clone(), top.entry(0, column).clone()),
+                    (1usize, payload.clone(), target.entry(0, column).clone()),
+                ],
+                Some(error.entry(0, column).clone()),
+            )
+        })])?;
+        Ok(RnsBggMatrix::from_rows(top, bottom))
     }
     /// One sampled ciphertext per member, with a single structural graph body.
     pub fn sample_private_rhs_family(
@@ -509,27 +574,31 @@ impl RnsBggScheme {
         hash_key: mxx_dsl::Bytes,
         tag: impl Into<mxx_dsl::HashTag>,
         id: [u8; 32],
-    ) -> Result<RnsBggPrivateRhs<mxx_dsl::Family<RnsBggMatrix>>, RnsBggError> {
+    ) -> Result<RnsBggPrivateRhs<RnsBggRhsFamily>, RnsBggError> {
+        let (prefix, target) = self.private_rhs_basis(secret, level)?;
         let mut root = tag.into();
         root.push("rns_bgg-private-rhs-family");
         root.push(mxx_ir_core::IntExpr::constant(level));
-        let ciphertext = mxx_dsl::parallel(rhs.payloads.count().clone(), |index| {
-            let mut tag = root.clone();
-            tag.push(index.clone());
-            self.sample_private_rhs(
-                secret,
-                level,
-                RnsBggRhsPlaintext { payload: rhs.payloads.at(&index), id: rhs.id },
-                hash_key.clone(),
-                tag,
-                id,
-            )
-            .map(|value| value.ciphertext)
-            .map_err(|_| DslError::Schema)
-        })
+        let body = mxx_dsl::Subgraph::define(
+            format!("rns-bgg-selector-{id:02x?}"),
+            mxx_dsl::Int::constant(0).schema(),
+            |index: Int| {
+                let mut tag = root.clone();
+                tag.push(index.clone());
+                self.encrypt_private_rhs(
+                    level,
+                    rhs.payloads.at(&index),
+                    &prefix,
+                    &target,
+                    hash_key.clone(),
+                    tag,
+                )
+                .map_err(|_| DslError::Schema)
+            },
+        )
         .map_err(|error| RnsBggError::Graph(error.to_string()))?;
         Ok(RnsBggPrivateRhs {
-            ciphertext,
+            ciphertext: RnsBggRhsFamily::Generated { body, count: rhs.payloads.count().clone() },
             lifted_ciphertext: (),
             rhs_id: rhs.id,
             level,
@@ -635,18 +704,10 @@ impl RnsBggScheme {
     {
         let level = bank.level + 1;
         let ring = self.ring(level)?;
-        let table = crate::readout::RowLutTable::new(
-            (0..layout.width())
-                .map(|index| {
-                    let exponent = index << layout.stride_log2;
-                    let mut polynomial = vec![BigInt::from(0u8); exponent + 1];
-                    polynomial[exponent] = 1u8.into();
-                    [polynomial, Vec::new()]
-                })
-                .collect(),
-            Some(layout),
-        )
-        .map_err(|_| RnsBggError::Lut)?;
+        // For the identity row table, sum_i sigma(X^(-s*i))*X^(s*i)
+        // is width in the identity branch and zero in every other branch.
+        // Keep every fresh ciphertext/error; only avoid the dense O(N^2) table.
+        debug_assert_eq!(layout.width(), bank.branches.len());
         let columns = self.parameters.component_columns(level)?;
         let gadget = self.state_gadget(level)?;
         let payload = self.payload_at(secret, level)?.map(|entry| entry * gadget.clone());
@@ -654,17 +715,8 @@ impl RnsBggScheme {
             self.scalar(level, -BigInt::from(scale * self.parameters.scale(level)?))? * payload,
             RnsBggRow::new([[ring.zero((1, columns)), ring.zero((1, columns))]])?,
         );
-        self.sample_terminal_material(
-            secret,
-            &table,
-            None,
-            Some(&transform),
-            bank,
-            hash_key,
-            tag,
-            id,
-        )
-        .map(ProgramValue::Scalar)
+        self.sample_terminal_material(secret, None, None, Some(&transform), bank, hash_key, tag, id)
+            .map(ProgramValue::Scalar)
     }
     /// `id` identifies the complete generated family and its mask bank.
     /// Preserve it across artifact storage/import; allocate a new identity
@@ -777,9 +829,18 @@ impl RnsBggScheme {
             }
         };
         let terminal = match &weight {
-            RnsBggReadoutWeights::Shared(_) => ProgramValue::Scalar(
-                self.sample_terminal_material(secret, &table, None, None, bank, hash_key, tag, id)?,
-            ),
+            RnsBggReadoutWeights::Shared(_) => {
+                ProgramValue::Scalar(self.sample_terminal_material(
+                    secret,
+                    Some(&table),
+                    None,
+                    None,
+                    bank,
+                    hash_key,
+                    tag,
+                    id,
+                )?)
+            }
             RnsBggReadoutWeights::Indexed { rows, .. } => {
                 let ring = self.ring(bank.level + 1)?;
                 let transforms = mxx_dsl::parallel(rows.count().clone(), |index| {
@@ -813,6 +874,7 @@ impl RnsBggScheme {
             terminal,
         })
     }
+    /// `table=None` is the identity row [X^v, 0] on the mask bank domain.
     /// Fresh target is -D_k (or -sigma_k(rhs)*D_k). In particular, neither
     /// p_next nor the payload secret r multiplies the row table (PDF 10.1).
     /// The caller guarantees the combined exponent is in the table domain;
@@ -823,7 +885,7 @@ impl RnsBggScheme {
     pub fn sample_terminal_material(
         &self,
         secret: &RnsBggPayloadSecret,
-        table: &RowLutTable<2>,
+        table: Option<&RowLutTable<2>>,
         rhs: Option<RnsBggRhsPlaintext>,
         output_transform: Option<&RnsBggMatrix>,
         bank: &RnsBggMaskBank,
@@ -837,21 +899,43 @@ impl RnsBggScheme {
         let next = bank.level + 1;
         let ring = self.ring(next)?;
         let n = self.parameters.level(next)?.ring_dimension() as usize;
-        if table.values.iter().flatten().any(|p| p.len() > n) {
+        if table.is_some_and(|table| table.values.iter().flatten().any(|p| p.len() > n)) {
             return Err(RnsBggError::Lut);
         }
         if rhs.as_ref().is_some_and(|rhs| rhs.payload.matrix_type() != &ring.matrix_type((1, 1))) {
             return Err(RnsBggError::Context);
         }
-        let layout = table.layout;
-        let sigmas = layout.automorphism_indices(n).map_err(|_| RnsBggError::Lut)?;
+        let sigmas = match table {
+            Some(table) => table.layout.automorphism_indices(n).map_err(|_| RnsBggError::Lut)?,
+            None => bank.branches.iter().map(|branch| branch.sigma).collect(),
+        };
+        let masks =
+            bank.branches.iter().map(|branch| (branch.sigma, branch)).collect::<BTreeMap<_, _>>();
         let r = self.payload_at(secret, next)?;
         let modulus = BigInt::from(self.parameters.level(next)?.modulus().as_ref().clone());
         let inverse =
-            modular_inverse(&BigInt::from(table.width()), &modulus).ok_or(RnsBggError::Lut)?;
+            modular_inverse(&BigInt::from(sigmas.len()), &modulus).ok_or(RnsBggError::Lut)?;
+        // Scalar digit rows are a single polynomial evaluated at X^(-sigma).
+        // Compile it once instead of emitting width^2 monomial products.
+        let scalar_rows = table
+            .filter(|table| table.values.iter().flatten().all(|p| p.len() <= 1))
+            .map(|table| {
+                RnsBggRow::new([std::array::from_fn(|column| {
+                    let mut coefficients =
+                        vec![BigInt::from(0u8); table.layout.stride() * (table.width() - 1) + 1];
+                    for (index, row) in table.values.iter().enumerate() {
+                        if let Some(value) = row[column].first() {
+                            coefficients[index * table.layout.stride()] = value.clone();
+                        }
+                    }
+                    ring.polynomial(coefficients.into_iter().map(IntExpr::constant))
+                })])
+            })
+            .transpose()?;
         let values = table
-            .values
-            .iter()
+            .filter(|_| scalar_rows.is_none())
+            .into_iter()
+            .flat_map(|table| table.values.iter())
             .map(|row| {
                 RnsBggRow::new([row.each_ref().map(|p| {
                     if p.is_empty() {
@@ -863,41 +947,92 @@ impl RnsBggScheme {
                 .map_err(|e| RnsBggError::Graph(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let normalized_rows = table
+            .filter(|_| scalar_rows.is_none())
+            .map(|table| {
+                sigmas
+                    .iter()
+                    .map(|sigma| {
+                        let sum = table
+                            .sieve_sum(&ring, *sigma, &values)
+                            .map_err(|_| RnsBggError::Lut)?;
+                        Ok(self.scalar(next, inverse.clone())? * sum)
+                    })
+                    .collect::<Result<Vec<_>, RnsBggError>>()
+                    .and_then(|rows| {
+                        Family::pack(rows).map_err(|error| RnsBggError::Graph(error.to_string()))
+                    })
+            })
+            .transpose()?;
         let root = tag.into();
         let mut branches = Vec::with_capacity(sigmas.len());
-        for sigma in sigmas {
-            let mask = bank.branches.iter().find(|b| b.sigma == sigma).ok_or(RnsBggError::Lut)?;
-            let sum = table.sieve_sum(&ring, sigma, &values).map_err(|_| RnsBggError::Lut)?;
-            let multiplier = rhs.as_ref().map_or_else(
-                || ring.identity(1),
-                |rhs| rhs.payload.clone().ring_automorphism(sigma),
-            );
-            let target = -self.scalar(next, inverse.clone())? * multiplier * sum;
-            // Apply public routing only to the plaintext target, before the
-            // fresh ciphertext error. Scaling C afterward would scale its error.
-            let target = match output_transform {
-                Some(transform) => target * transform.clone(),
-                None => target,
-            };
-            let mut tag = root.clone();
-            tag.push("rns_bgg-terminal-rhs");
-            tag.push(IntExpr::constant(bank.level));
-            tag.push(IntExpr::constant(sigma));
-            let columns = target.entry(0, 0).matrix_type().columns.clone();
-            let columns = usize::try_from(
-                columns.evaluate(&ParamEnv::default()).expect("concrete target width"),
-            )
-            .expect("target width fits usize");
-            let top = RnsBggRow::hash(&ring, hash_key.clone(), tag, columns);
-            let last = -r.entry(0, 0).clone().ring_automorphism(sigma) * top.clone() +
-                target +
-                self.small_error_row(next, columns)?;
-            branches.push((mask.clone(), RnsBggMatrix::from_rows(top, last)));
+        let mut lifted_ciphertexts = Vec::with_capacity(sigmas.len());
+        let batch = crate::utils::preprocess_batch_size()?;
+        for start in (0..sigmas.len()).step_by(batch) {
+            let len = batch.min(sigmas.len() - start);
+            let sampled = mxx_dsl::parallel(len, |local| {
+                let index = local.add(Int::constant(start));
+                let sigma = IntExpr::Select {
+                    selector: Box::new(index.expression()?),
+                    branches: sigmas.iter().copied().map(IntExpr::constant).collect(),
+                };
+                let normalized = if let Some(rows) = &scalar_rows {
+                    ring.polynomial([IntExpr::constant(inverse.clone())]) *
+                        rows.clone().ring_automorphism(IntExpr::constant(2 * n) - sigma.clone())
+                } else if let Some(rows) = &normalized_rows {
+                    rows.at(&index)
+                } else {
+                    let identity = IntExpr::Select {
+                        selector: Box::new(index.expression()?),
+                        branches: sigmas
+                            .iter()
+                            .map(|sigma| IntExpr::constant(u8::from(*sigma == 1)))
+                            .collect(),
+                    };
+                    RnsBggRow::new([[ring.polynomial([identity]), ring.zero((1, 1))]])?
+                };
+                let multiplier = rhs.as_ref().map_or_else(
+                    || ring.identity(1),
+                    |rhs| rhs.payload.clone().ring_automorphism(sigma.clone()),
+                );
+                let target = -multiplier * normalized;
+                // Routing multiplies plaintext before independent fresh branch error.
+                let target = match output_transform {
+                    Some(transform) => target * transform.clone(),
+                    None => target,
+                };
+                let mut tag = root.clone();
+                tag.push("rns_bgg-terminal-rhs");
+                tag.push(IntExpr::constant(bank.level));
+                tag.push(sigma.clone());
+                let columns = usize::try_from(
+                    target
+                        .entry(0, 0)
+                        .matrix_type()
+                        .columns
+                        .evaluate(&ParamEnv::default())
+                        .expect("concrete target width"),
+                )
+                .expect("target width fits usize");
+                let top = RnsBggRow::hash(&ring, hash_key.clone(), tag, columns);
+                let last = -r.entry(0, 0).clone().ring_automorphism(sigma) * top.clone() +
+                    target +
+                    self.small_error_row(next, columns).map_err(|_| DslError::Schema)?;
+                let ciphertext = RnsBggMatrix::from_rows(top, last);
+                let lifted = self
+                    .prepare_digits(bank.level, ciphertext.clone())
+                    .map_err(|_| DslError::Schema)?;
+                Ok((ciphertext, lifted))
+            })?;
+            let ciphertexts = sampled.field(|(ciphertext, _)| ciphertext)?;
+            let digits = sampled.field(|(_, digits)| digits)?;
+            for local in 0..len {
+                let sigma = sigmas[start + local];
+                let mask = *masks.get(&sigma).ok_or(RnsBggError::Lut)?;
+                branches.push((mask.clone(), ciphertexts.at(local)));
+                lifted_ciphertexts.push(digits.at(local));
+            }
         }
-        let lifted_ciphertexts = branches
-            .iter()
-            .map(|(_, ciphertext)| self.prepare_digits(bank.level, ciphertext.clone()))
-            .collect::<Result<_, _>>()?;
         Ok(RnsBggTerminalMaterial {
             lifted_ciphertexts,
             material: RnsBggLutMaterial {
@@ -905,7 +1040,7 @@ impl RnsBggScheme {
                 id,
                 level: bank.level,
                 context: self.context,
-                table: Some(table.id),
+                table: table.map(|table| table.id),
                 rhs_id: rhs.map(|rhs| rhs.id),
                 branches,
             },
@@ -932,7 +1067,7 @@ impl RnsBggScheme {
             tag.push(index);
             self.sample_terminal_material(
                 secret,
-                table,
+                Some(table),
                 None,
                 Some(&transform),
                 bank,
@@ -1609,6 +1744,99 @@ pub(super) mod prf_tests {
     };
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_rns_bgg_selector_batches_share_fresh_ciphertexts_across_outputs() {
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
+            ring_dimension: 8,
+            widths: vec![1, 1],
+            slots: vec![2, 2],
+            eta: 2,
+            crt_bits: 17,
+            terminal_depth: 1,
+            max_crt_depth: 4,
+            memory_budget_bytes: u64::MAX,
+            terminal_value_bound: 1u8.into(),
+        })
+        .unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
+        let secret = scheme.sample_payload_secret().unwrap();
+        let high = scheme.ring(0).unwrap();
+        let ring = scheme.ring(1).unwrap();
+        let rhs = scheme
+            .sample_private_rhs_family(
+                &secret,
+                0,
+                &RnsBggRhsPlaintextFamily {
+                    payloads: Family::pack(
+                        (0..5)
+                            .map(|index| ring.polynomial([usize::from(index == 2).into()]))
+                            .collect(),
+                    )
+                    .unwrap(),
+                    id: rand::random(),
+                },
+                high.bytes_input("hash-key", 32),
+                b"shared-selector".as_slice(),
+                rand::random(),
+            )
+            .unwrap();
+        let weights = Family::pack(
+            (0..2)
+                .flat_map(|_| (0..5).map(|index| ring.polynomial([(index + 1).into()])))
+                .collect(),
+        )
+        .unwrap();
+        let combined = scheme
+            .combine_fixed_rhs(
+                &rhs,
+                &weights,
+                &FamilyRange::bounded(0, 5, 5).unwrap(),
+                rand::random(),
+            )
+            .unwrap();
+        let RnsBggRhsFamily::Values(values) = combined.ciphertext else {
+            panic!("combined family")
+        };
+        let difference = values.at(0) - values.at(1);
+        let columns = parameters.component_columns(1).unwrap();
+        let mut graph = DslContext::new("shared-selector-errors")
+            .output("zero", ring.zero((1, columns)))
+            .unwrap();
+        for row in 0..2 {
+            for column in 0..2 {
+                graph = graph
+                    .output(
+                        format!("difference-{row}-{column}"),
+                        difference.entry(row, column).clone(),
+                    )
+                    .unwrap();
+            }
+        }
+        let graph = graph.build().unwrap().validate(&ParamEnv::default()).unwrap();
+        let result = execute(
+            &graph,
+            &mut cpu_backend(parameters.levels().to_vec()),
+            BTreeMap::from([(
+                "hash-key".into(),
+                RuntimeValue::Bytes((0..32).map(|_| rand::random()).collect()),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(zero) = &result.outputs["zero"] else { panic!("zero matrix") };
+        for row in 0..2 {
+            for column in 0..2 {
+                let RuntimeValue::Matrix(value) =
+                    &result.outputs[&format!("difference-{row}-{column}")]
+                else {
+                    panic!("matrix")
+                };
+                assert_eq!(value, zero, "both outputs must use the same fresh selector errors");
+            }
+        }
+    }
 
     #[test]
     fn test_rns_bgg_composed_prf_two_steps_active_range_and_signed_labels() {
@@ -4216,7 +4444,7 @@ pub(crate) mod terminal_tests {
         let material_a = scheme
             .sample_terminal_material(
                 &secret.payload,
-                &table_a,
+                Some(&table_a),
                 None,
                 None,
                 &bank,
@@ -4228,7 +4456,7 @@ pub(crate) mod terminal_tests {
         let material_b = scheme
             .sample_terminal_material(
                 &secret.payload,
-                &table_b,
+                Some(&table_b),
                 Some(RnsBggRhsPlaintext {
                     payload: low.polynomial([0.into(), 1.into()]),
                     id: rand::random(),
@@ -4327,15 +4555,38 @@ pub(crate) mod terminal_tests {
             }
         }
         let graph = graph.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        let switches = graph
-            .source
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| {
-                matches!(node.kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
-            })
-            .count();
+        fn switch_count(
+            graph: &mxx_ir_core::Graph,
+            scope: &mxx_ir_core::graph::FrozenGraphScopeId,
+        ) -> usize {
+            graph
+                .scope(scope)
+                .unwrap()
+                .nodes()
+                .iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    use mxx_ir_core::node::NodeKind;
+                    let own = usize::from(matches!(node.kind(), NodeKind::BlockModSwitch { .. }));
+                    let Some(child) =
+                        graph.child_scope_id(scope, mxx_ir_core::types::NodeId(index as u64))
+                    else {
+                        return own;
+                    };
+                    let count = match node.kind() {
+                        NodeKind::ParallelLoop(spec) => {
+                            spec.count.evaluate(&ParamEnv::default()).unwrap()
+                        }
+                        NodeKind::SequentialLoop(spec) => {
+                            spec.count.evaluate(&ParamEnv::default()).unwrap()
+                        }
+                        _ => 1.into(),
+                    };
+                    own + usize::try_from(count).unwrap() * switch_count(graph, &child)
+                })
+                .sum()
+        }
+        let switches = switch_count(&graph.source, &mxx_ir_core::graph::FrozenGraphScopeId::Root);
         assert_eq!(
             switches,
             2 * 4 * 4 + 4 + 12 * 2,
@@ -4430,7 +4681,7 @@ pub(crate) mod terminal_tests {
             let material = scheme
                 .sample_terminal_material(
                     &secrets.payload,
-                    &table,
+                    Some(&table),
                     None,
                     Some(&transform),
                     &bank,

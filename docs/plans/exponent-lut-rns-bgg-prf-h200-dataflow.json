@@ -1,0 +1,57 @@
+{
+  "pod": "g4fkmavzy4o6sp",
+  "gpu_count": 4,
+  "revision": "dataflow-r5",
+  "peak_vram_mib_by_device": {
+    "0": 63939,
+    "1": 18819,
+    "2": 17317,
+    "3": 17061
+  },
+  "stages": {
+    "preprocess": {
+      "estimated_seconds": 66534.31187486267,
+      "gpu_work_seconds": 95406.96235806022,
+      "primitive_wave_seconds": 27792.63903445411,
+      "transfer_seconds": 38730.70301558201,
+      "executor_dispatch_seconds": 10.969824826552529,
+      "node_instances": 2198648,
+      "transfer_seconds_by_kind": {
+        "Export": 1248.5036780179998,
+        "Import": 519.1008599800001,
+        "Load": 28474.240765832,
+        "Stage": 8488.857711752002
+      },
+      "transfer_count": 319240
+    },
+    "online_eval": {
+      "estimated_seconds": 3873.292513588857,
+      "gpu_work_seconds": 7486.275300306999,
+      "primitive_wave_seconds": 2785.922365427001,
+      "transfer_seconds": 1086.17235985,
+      "executor_dispatch_seconds": 1.197788311856031,
+      "node_instances": 240069,
+      "transfer_seconds_by_kind": {
+        "Import": 615.9350173620002,
+        "Load": 412.425451922,
+        "Stage": 57.81189056600002
+      },
+      "transfer_count": 61610
+    }
+  },
+  "combined_estimated_seconds": 70407.60438845152,
+  "source_manifest_sha256": "8cfabb92166385bda35ed14bae8d6661aa8ee419d896f321d1cc4eecc5fdc7b2",
+  "base_commit": "919fa899116a09471b9686c510049805d9bdd307",
+  "date_jst": "2026-09-10",
+  "information_bits_per_output": 5,
+  "measured_test_seconds": 928.92,
+  "test_exit_status": 0,
+  "pod_final_status": "EXITED",
+  "log": "g4fkmavzy4o6sp-4h200-919fa899-20260910-dataflow-r5.log",
+  "limitations": [
+    "Summed primitive and boundary wall-time measurements, not a full PRF round trip.",
+    "CPU dispatch uses a scalar-node proxy.",
+    "No prediction of cross-operation overlap, cold-cache storage, or full-execution contention.",
+    "The earlier two-GPU run used different hardware allocation and CPU affinity; primitive timing changes are not isolated."
+  ]
+}

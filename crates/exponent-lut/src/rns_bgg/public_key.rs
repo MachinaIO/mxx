@@ -807,12 +807,12 @@ impl RnsBggScheme {
     /// use packed local indices; the scope's input range owns the external offset.
     pub fn prepare_private_rhs_family(
         &self,
-        rhs: &RnsBggPrivateRhs<Family<RnsBggMatrix>>,
+        rhs: &RnsBggPrivateRhs<RnsBggRhsFamily>,
         range: &FamilyRange,
     ) -> Result<RnsBggPrivateRhs<Family<RnsBggMatrix>, Family<RnsBggDigits>>, RnsBggError> {
         let values = mxx_dsl::parallel(range.count().clone(), |index| {
             let element = RnsBggPrivateRhs {
-                ciphertext: rhs.ciphertext.at(index.add(Int::evaluate(range.start().clone()))),
+                ciphertext: rhs.ciphertext.at(index.add(Int::evaluate(range.start().clone())))?,
                 lifted_ciphertext: (),
                 level: rhs.level,
                 context: rhs.context,
@@ -1033,19 +1033,29 @@ impl RnsBggScheme {
             .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
         let root = tag.into();
-        let mut branches = Vec::with_capacity(layout.width());
-        for sigma in sigmas {
-            let mut tag = root.clone();
-            tag.push("rns_bgg-mask");
-            tag.push(mxx_ir_core::IntExpr::constant(level));
-            tag.push(mxx_ir_core::IntExpr::constant(sigma));
-            let public = RnsBggMatrix::hash(
-                &ring,
-                hash_key.clone(),
-                tag,
-                self.parameters.component_columns(level)?,
-            );
-            branches.push(MaskBranch { sigma, public });
+        let columns = self.parameters.component_columns(level)?;
+        let batch = crate::utils::preprocess_batch_size()?;
+        let mut branches = Vec::with_capacity(sigmas.len());
+        for start in (0..sigmas.len()).step_by(batch) {
+            let len = batch.min(sigmas.len() - start);
+            let public = mxx_dsl::parallel(len, |local| {
+                let index = local.add(Int::constant(start));
+                let sigma = layout
+                    .automorphism_index_expression(
+                        self.parameters.level(level).unwrap().ring_dimension() as usize,
+                        index.expression()?,
+                    )
+                    .map_err(|_| DslError::Schema)?;
+                let mut tag = root.clone();
+                tag.push("rns_bgg-mask");
+                tag.push(mxx_ir_core::IntExpr::constant(level));
+                tag.push(sigma);
+                Ok(RnsBggMatrix::hash(&ring, hash_key.clone(), tag, columns))
+            })?;
+            for local in 0..len {
+                branches
+                    .push(MaskBranch { sigma: sigmas[start + local], public: public.at(local) });
+            }
         }
         Ok(RnsBggMaskBank { id, level, context: self.context, branches })
     }
@@ -1088,23 +1098,66 @@ impl RnsBggScheme {
         }
         let level = input.level;
         let next = BigInt::from(self.parameters.level(level + 1)?.modulus().as_ref().clone());
-        let mut public_terms = Vec::with_capacity(material.branches.len());
+        let batch = crate::utils::preprocess_batch_size()?;
+        let ring = self.ring(level)?;
+        let first = &material.branches[0].1;
+        let mut raw_public = RnsBggMatrix::new(std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                ring.zero((1, first.entry(row, column).matrix_type().columns.clone()))
+            })
+        }))?;
         let mut branches = Vec::with_capacity(material.branches.len());
-        for ((mask, _), lifted) in material.branches.iter().zip(lifted_ciphertexts) {
-            let intermediate = (input.matrix.clone().ring_automorphism(mask.sigma) *
-                lifted.clone())
-            .block_mod_switch(next.clone());
-            let lifted_intermediate = self.prepare_digits(level, intermediate.clone())?;
-            public_terms.push(mask.public.clone() * lifted_intermediate.clone());
-            branches.push(PreparedBranch {
-                sigma: mask.sigma,
-                lifted_ciphertext: lifted.clone(),
-                lifted_intermediate,
-                mask_public: mask.public.clone(),
-            });
+        for start in (0..material.branches.len()).step_by(batch) {
+            let end = (start + batch).min(material.branches.len());
+            let members = &material.branches[start..end];
+            let lifted = &lifted_ciphertexts[start..end];
+            let operation = mxx_dsl::Subgraph::define(
+                format!("rns-bgg-branch-{:02x?}-{:02x?}-{start}", material.id, input.id),
+                raw_public.schema(),
+                |accumulated: RnsBggMatrix| {
+                    let inputs = Family::pack(
+                        members
+                            .iter()
+                            .zip(lifted)
+                            .map(|((mask, _), lifted)| (mask.public.clone(), lifted.clone()))
+                            .collect(),
+                    )?;
+                    let prepared = mxx_dsl::parallel(members.len(), |index| {
+                        let sigma = IntExpr::Select {
+                            selector: Box::new(index.expression()?),
+                            branches: members
+                                .iter()
+                                .map(|(mask, _)| IntExpr::constant(mask.sigma))
+                                .collect(),
+                        };
+                        let (mask, lifted) = inputs.at(index);
+                        let intermediate = (input.matrix.clone().ring_automorphism(sigma) *
+                            lifted.clone())
+                        .block_mod_switch(next.clone());
+                        let intermediate = self
+                            .prepare_digits(level, intermediate)
+                            .map_err(|_| DslError::Schema)?;
+                        let public = mask.clone() * intermediate.clone();
+                        Ok(((mask, lifted, intermediate), public))
+                    })?;
+                    let sum =
+                        crate::utils::balanced_sum_family(prepared.field(|(_, public)| public)?)
+                            .map_err(|_| DslError::Schema)?;
+                    Ok((prepared.field(|(cache, _)| cache)?, accumulated + sum))
+                },
+            )?;
+            let (cache, accumulated) = operation.call(raw_public)?;
+            raw_public = accumulated;
+            for (index, (mask, _)) in members.iter().enumerate() {
+                let (mask_public, lifted_ciphertext, lifted_intermediate) = cache.at(index);
+                branches.push(PreparedBranch {
+                    sigma: mask.sigma,
+                    mask_public,
+                    lifted_ciphertext,
+                    lifted_intermediate,
+                });
+            }
         }
-        let raw_public =
-            sum(Family::pack(public_terms).map_err(|e| RnsBggError::Graph(e.to_string()))?)?;
         Ok((raw_public, branches))
     }
     pub fn prepare_refresh_recomposition(
@@ -1238,14 +1291,24 @@ impl RnsBggScheme {
             .iter()
             .enumerate()
             .map(|(branch, mask)| {
-                let terms = mxx_dsl::parallel(range.count().clone(), |index| {
-                    let external = index.clone().add(Int::evaluate(range.start().clone()));
-                    Ok(multipliers.at(&index).ring_automorphism(mask.sigma) *
-                        material.ciphertexts.at(external).0[branch].clone())
-                })
-                .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-                let ciphertext = crate::utils::balanced_sum_family(terms)
-                    .map_err(|e| RnsBggError::Graph(e.to_string()))?;
+                let count = range
+                    .count()
+                    .evaluate(&ParamEnv::default())
+                    .ok()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(RnsBggError::Context)?;
+                let ciphertext = crate::utils::reduce_generated_segments(
+                    1,
+                    count,
+                    |_, index| {
+                        let external = index.clone().add(Int::evaluate(range.start().clone()));
+                        multipliers.at(&index).ring_automorphism(mask.sigma) *
+                            material.ciphertexts.at(external).0[branch].clone()
+                    },
+                    |left, right| left + right,
+                )
+                .map_err(|error| RnsBggError::Graph(error.to_string()))?
+                .at(0);
                 Ok((mask.clone(), ciphertext))
             })
             .collect::<Result<Vec<_>, RnsBggError>>()?;
@@ -2542,7 +2605,7 @@ pub(crate) mod terminal_artifact_tests {
                 scheme
                     .sample_terminal_material(
                         &payload_secret,
-                        table,
+                        Some(table),
                         None,
                         None,
                         &bank,
@@ -4715,7 +4778,7 @@ pub(crate) mod terminal_family_tests {
         let material = scheme
             .sample_terminal_material(
                 &secrets.payload,
-                &table,
+                Some(&table),
                 None,
                 None,
                 &bank,

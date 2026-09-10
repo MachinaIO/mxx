@@ -647,6 +647,36 @@ extern "C" int gpu_matrix_create(
     return 0;
 }
 
+extern "C" int gpu_matrix_zero(GpuMatrix *mat)
+{
+    // The caller owns the matrix exclusively. Clear each device allocation
+    // once, retaining its coefficient/evaluation format and asynchronous lifetime.
+    for (size_t partition = 0; partition < mat->shared_limb_buffers.size(); ++partition)
+    {
+        const auto &buffer = mat->shared_limb_buffers[partition];
+        if (buffer.bytes_total == 0) continue;
+        auto &states = mat->exec_limb_states[partition];
+        cudaError_t error = cudaSetDevice(buffer.device);
+        if (error != cudaSuccess) return set_error(error);
+        const cudaStream_t stream = states[0].stream;
+        for (const auto &state : states)
+        {
+            if (!state.write_done_valid) continue;
+            error = cudaStreamWaitEvent(stream, state.write_done, 0);
+            if (error != cudaSuccess) return set_error(error);
+        }
+        error = cudaMemsetAsync(buffer.ptr, 0, buffer.bytes_total, stream);
+        if (error != cudaSuccess) return set_error(error);
+        for (auto &state : states)
+        {
+            error = cudaEventRecord(state.write_done, stream);
+            if (error != cudaSuccess) return set_error(error);
+            state.write_done_valid = true;
+        }
+    }
+    return 0;
+}
+
 extern "C" void gpu_matrix_destroy(GpuMatrix *mat)
 {
     if (!mat)

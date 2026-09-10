@@ -81,6 +81,28 @@ pub struct RnsBggPrivateRhs<C = RnsBggMatrix, L = ()> {
     pub(crate) id: [u8; 32],
 }
 
+/// A selector generator is invoked once per member inside its consuming batch.
+/// Combined RHS values are already materialized graph families.
+#[derive(Clone)]
+pub enum RnsBggRhsFamily {
+    Generated { body: mxx_dsl::Subgraph<Int, RnsBggMatrix>, count: IntExpr },
+    Values(Family<RnsBggMatrix>),
+}
+impl RnsBggRhsFamily {
+    fn count(&self) -> &IntExpr {
+        match self {
+            Self::Generated { count, .. } => count,
+            Self::Values(values) => values.count(),
+        }
+    }
+    fn at(&self, index: Int) -> Result<RnsBggMatrix, DslError> {
+        match self {
+            Self::Generated { body, .. } => body.call(index),
+            Self::Values(values) => Ok(values.at(index)),
+        }
+    }
+}
+
 /// Cached direct product. Both ordinary states retain their key/level identity;
 /// the bounded RHS action is shared with public preparation, without LUT helpers.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -216,7 +238,7 @@ impl RnsBggEncodingFamily {
     }
 }
 impl ExponentLUTFixedRhsScheme for RnsBggScheme {
-    type FixedRhs = RnsBggPrivateRhs<Family<RnsBggMatrix>>;
+    type FixedRhs = RnsBggPrivateRhs<RnsBggRhsFamily>;
     type PreparedFixedProduct = RnsBggPreparedPrivateMul<
         RnsBggPublicKeyFamily,
         ProgramValue<RnsBggMatrix, Family<RnsBggMatrix>>,
@@ -235,8 +257,61 @@ impl ExponentLUTFixedRhsScheme for RnsBggScheme {
         active: &FamilyRange,
         id: [u8; 32],
     ) -> Result<Self::FixedRhs, RnsBggError> {
-        let ciphertext =
-            crate::utils::weighted_family_combinations(&rhs.ciphertext, weights, active)?;
+        let size = active
+            .count()
+            .evaluate(&ParamEnv::default())
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(RnsBggError::Context)?;
+        let batch = crate::utils::preprocess_batch_size()?;
+        let outputs =
+            Int::evaluate(weights.count().clone()).div(Int::constant(size)).expression()?;
+        let ring = self.ring(rhs.level + 1)?;
+        let columns = self.parameters.component_columns(rhs.level + 1)?;
+        let initial = mxx_dsl::parallel(outputs.clone(), |_| {
+            RnsBggMatrix::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| ring.zero((1, columns)))
+            }))
+        })?;
+        let process = |start: Int, len: usize, accumulated: Family<RnsBggMatrix>| {
+            // Finish each selector's consumers before generating the next.
+            // Every output shares the same fresh ciphertext/error, while only
+            // the accumulated output family crosses the host-RAM boundary.
+            mxx_dsl::iterate(len, accumulated, |index, accumulated| {
+                let selector = rhs.ciphertext.at(Int::evaluate(active.start().clone())
+                    .add(start.clone())
+                    .add(index.clone()))?;
+                mxx_dsl::parallel(outputs.clone(), |output| {
+                    let weight = output
+                        .clone()
+                        .mul(Int::constant(size))
+                        .add(start.clone())
+                        .add(index.clone());
+                    let previous = accumulated.at(output);
+                    let weight = weights.at(weight);
+                    RnsBggMatrix::new(std::array::from_fn(|row| {
+                        std::array::from_fn(|column| {
+                            Mat::multi_row_gemm_accumulate(
+                                vec![(1usize, weight.clone(), selector.entry(row, column).clone())],
+                                Some(previous.entry(row, column).clone()),
+                            )
+                        })
+                    }))
+                })
+            })
+        };
+        let full = size / batch;
+        let mut ciphertext = if full > 0 {
+            mxx_dsl::iterate(full, initial, |index, accumulated| {
+                process(index.mul(Int::constant(batch)), batch, accumulated)
+            })?
+        } else {
+            initial
+        };
+        if size % batch != 0 {
+            ciphertext = process(Int::constant(full * batch), size % batch, ciphertext)?;
+        }
+        let ciphertext = RnsBggRhsFamily::Values(ciphertext);
         Ok(RnsBggPrivateRhs {
             ciphertext,
             lifted_ciphertext: (),

@@ -480,7 +480,6 @@ impl GpuDeviceCalibration {
         self,
         memory: GpuDeviceMemory,
         vram_percent: u32,
-        role: GpuDeviceRole,
     ) -> Result<usize, GpuCalibrationError> {
         memory.validate()?;
         if !(1..=100).contains(&vram_percent) {
@@ -496,15 +495,10 @@ impl GpuDeviceCalibration {
             })
             .ok_or(GpuCalibrationError::ArithmeticOverflow)?;
         let available_bytes = budget_bytes.saturating_sub(memory.resident_bytes);
-        let width = available_bytes / self.bytes_per_column;
-        if width == 0 {
-            return Err(GpuCalibrationError::InsufficientMemory {
-                role,
-                budget_bytes,
-                resident_bytes: memory.resident_bytes,
-                bytes_per_column: self.bytes_per_column,
-            });
-        }
+        // The configured percentage controls parallelism, not admission.
+        // Continue with one column when resident values reach that target;
+        // actual allocation failures remain CUDA errors.
+        let width = (available_bytes / self.bytes_per_column).max(1);
         usize::try_from(width).map_err(|_| GpuCalibrationError::ArithmeticOverflow)
     }
 }
@@ -548,16 +542,15 @@ impl GpuCalibrationProfile {
         nonzero_memory: Option<GpuDeviceMemory>,
         vram_percent: u32,
     ) -> Result<GpuColumnWidths, GpuCalibrationError> {
-        let gpu0 = self.gpu0.derive_width(gpu0_memory, vram_percent, GpuDeviceRole::Gpu0)?;
-        let nonzero =
-            match nonzero_memory {
-                Some(memory) => Some(
-                    self.nonzero
-                        .ok_or(GpuCalibrationError::MissingNonzeroCalibration)?
-                        .derive_width(memory, vram_percent, GpuDeviceRole::Nonzero)?,
-                ),
-                None => None,
-            };
+        let gpu0 = self.gpu0.derive_width(gpu0_memory, vram_percent)?;
+        let nonzero = match nonzero_memory {
+            Some(memory) => Some(
+                self.nonzero
+                    .ok_or(GpuCalibrationError::MissingNonzeroCalibration)?
+                    .derive_width(memory, vram_percent)?,
+            ),
+            None => None,
+        };
         Ok(GpuColumnWidths { gpu0, nonzero })
     }
 }
@@ -681,15 +674,6 @@ pub enum GpuCalibrationError {
     InvalidVramPercent(u32),
     #[error("resident GPU memory {resident_bytes} exceeds total memory {total_bytes}")]
     ResidentMemoryExceedsTotal { total_bytes: u64, resident_bytes: u64 },
-    #[error(
-        "{role:?} cannot fit one calibrated column: budget={budget_bytes}, resident={resident_bytes}, bytes_per_column={bytes_per_column}"
-    )]
-    InsufficientMemory {
-        role: GpuDeviceRole,
-        budget_bytes: u64,
-        resident_bytes: u64,
-        bytes_per_column: u64,
-    },
     #[error("nonzero GPUs require a representative nonzero-GPU calibration")]
     MissingNonzeroCalibration,
     #[error("GPU fleet must contain at least one device")]
@@ -1297,23 +1281,36 @@ mod tests {
     }
 
     #[test]
-    fn pilot_cost_rounds_up_and_width_derivation_fails_closed() {
+    fn pilot_cost_rounds_up_and_vram_target_limits_parallelism() {
         let calibration = calibration(3, 10);
         assert_eq!(calibration.bytes_per_column(), 4);
-        let profile = GpuCalibrationProfile { gpu0: calibration, nonzero: None };
-        assert_eq!(
-            profile.derive_widths(
-                GpuDeviceMemory { total_bytes: 100, resident_bytes: 78 },
-                None,
-                80,
-            ),
-            Err(GpuCalibrationError::InsufficientMemory {
-                role: GpuDeviceRole::Gpu0,
-                budget_bytes: 80,
-                resident_bytes: 78,
-                bytes_per_column: 4,
-            })
+        let profile = GpuCalibrationProfile { gpu0: calibration, nonzero: Some(calibration) };
+        for resident_bytes in [78, 80, 90, 100] {
+            assert_eq!(
+                profile.derive_widths(
+                    GpuDeviceMemory { total_bytes: 100, resident_bytes },
+                    Some(GpuDeviceMemory { total_bytes: 100, resident_bytes: 40 }),
+                    80,
+                ),
+                Ok(GpuColumnWidths { gpu0: 1, nonzero: Some(10) })
+            );
+        }
+        assert!(
+            profile
+                .derive_widths(GpuDeviceMemory { total_bytes: 100, resident_bytes: 101 }, None, 80)
+                .is_err()
         );
+        for percent in [0, 101] {
+            assert!(
+                profile
+                    .derive_widths(
+                        GpuDeviceMemory { total_bytes: 100, resident_bytes: 0 },
+                        None,
+                        percent
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

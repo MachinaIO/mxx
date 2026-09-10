@@ -75,8 +75,8 @@ use mxx_primitives::{
     },
 };
 
-mod fleet;
-pub use fleet::{
+mod fleet_gpu;
+pub use fleet_gpu::{
     GpuColumnShard, GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
 };
 

@@ -309,6 +309,11 @@ impl Analysis<'_> {
                             cost.add(&steady, count - 1);
                         }
                     }
+                    if matches!(id, FrozenGraphScopeId::Root) {
+                        for value in &mut carried {
+                            value.store(&mut cost, false);
+                        }
+                    }
                     result = carried;
                 }
                 NodeKind::ParallelLoop(spec) => {
@@ -344,12 +349,10 @@ impl Analysis<'_> {
                             });
                             let artifact = all_exported ||
                                 matches!(value, Value::Leaf(ty, _) if ArtifactType::from_wire_type(ty).is_some() && !matches!(ty, ConcreteWireType::Matrix(_)));
-                            let retained = scope.outputs().contains(&wire);
                             let stage = mxx_runtime::executor::stage_matrix_family_output(
                                 id,
                                 count,
                                 self.wave_size,
-                                retained,
                             );
                             let mut overrides = BTreeMap::new();
                             if !all_exported && let Some(Some(indices)) = exported {
@@ -631,8 +634,8 @@ mod tests {
             .validate(&ParamEnv::default())
             .unwrap();
         let counts = counts(&graph);
-        assert!(counts.contains(&(TransferKind::Stage, 4)), "{counts:?}");
-        assert!(counts.contains(&(TransferKind::Load, 3)), "{counts:?}");
+        assert!(counts.contains(&(TransferKind::Stage, 2)), "{counts:?}");
+        assert!(counts.contains(&(TransferKind::Load, 1)), "{counts:?}");
         assert_eq!(counts.len(), 2);
     }
 }

@@ -251,6 +251,8 @@ pub enum PolyBackendError {
     InvalidSmallMatrixArtifact(&'static str),
     #[error("GPU fleet calibration failed: {0}")]
     GpuCalibration(String),
+    #[error("GPU preparation yielded to its explicit completion boundary")]
+    GpuPreparationYield,
     #[error("the requested GPU placement is unavailable through a direct device or peer copy")]
     UnsupportedPlacement,
     #[error(
@@ -473,11 +475,11 @@ where
     #[cfg(feature = "gpu")]
     pub(super) fn matrix_to_active_placement_peer_only(
         &self,
-        value: &M,
+        value: M,
     ) -> Result<M, PolyBackendError> {
-        let target = self.parameters_for_matrix(value)?;
+        let target = self.parameters_for_matrix(&value)?;
         if value.params() == target {
-            return Ok(value.clone());
+            return Ok(value);
         }
         value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
     }
@@ -529,7 +531,7 @@ where
         (base, digits)
     }
 
-    fn parameters_for_matrix(
+    pub(super) fn parameters_for_matrix(
         &self,
         matrix: &M,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {

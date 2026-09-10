@@ -76,11 +76,8 @@ pub fn stage_matrix_family_output(
     scope: &FrozenGraphScopeId,
     count: usize,
     wave_size: usize,
-    retained: bool,
 ) -> bool {
-    matches!(scope, FrozenGraphScopeId::Root) ||
-        count > wave_size ||
-        (matches!(scope, FrozenGraphScopeId::SequentialBody { .. }) && retained)
+    matches!(scope, FrozenGraphScopeId::Root) || count > wave_size
 }
 
 pub struct ExecutionResult<B: Backend> {
@@ -171,6 +168,8 @@ struct ExecutableNode<'a> {
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
+    #[error("GPU preparation dispatch yielded to its completion boundary")]
+    GpuPreparationYield,
     #[error("backend operation failed: {0}")]
     Backend(String),
     #[error("preimage progress expected {expected} generated preimages but observed {actual}")]
@@ -727,9 +726,58 @@ where
             let calibration_groups: Vec<(Option<[u8; 32]>, Vec<usize>)> =
                 vec![(None, (0..envs.len()).collect())];
 
-            for (operation, indices) in calibration_groups {
+            for (operation, mut indices) in calibration_groups {
                 if let Some(operation) = operation {
                     self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
+                    if self.backend.begin_gpu_preparation().map_err(Self::backend_error)? {
+                        let index = indices[0];
+                        self.set_placement(placements[index])?;
+                        let mut preparation_values = values[index].clone();
+                        loop {
+                            // The preparation wrapper never returns a production value:
+                            // inputs and pilot outputs remain owned by the backend until
+                            // the explicit completion boundary has observed their events.
+                            let dispatch = self.execute_node(
+                                scope_id,
+                                &envs[index],
+                                &paths[index],
+                                &node,
+                                &inputs[index],
+                                &mut preparation_values,
+                            );
+                            match dispatch {
+                                Err(ExecutionError::GpuPreparationYield) => {
+                                    match self.backend.advance_gpu_preparation() {
+                                        Ok(true) => {
+                                            values[index] = preparation_values;
+                                            break;
+                                        }
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            self.backend.cancel_gpu_preparation();
+                                            return Err(Self::backend_error(error));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    self.backend.cancel_gpu_preparation();
+                                    return Err(error);
+                                }
+                                Ok(()) => {
+                                    self.backend.cancel_gpu_preparation();
+                                    // Some nodes (e.g. transcript replay and whole
+                                    // trapdoor construction) do not need a column pilot.
+                                    // Keep their actual result and never draw twice.
+                                    values[index] = preparation_values;
+                                    indices.remove(0);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if indices.is_empty() {
+                    continue;
                 }
                 if matches!(node.kind, NodeKind::PreimageSample { .. }) && indices.len() > 1 {
                     self.execute_preimage_batch(
@@ -2375,9 +2423,9 @@ where
                 })?;
                 let count = self.eval_usize(node.id, &loop_node.count, env)?;
                 // A bounded family inside a body is consumed on the
-                // device. Only the carried outputs cross the host-RAM boundary;
-                // staging every reduction level would transfer the same data
-                // repeatedly. Large families still stream to host memory.
+                // device, including loop-carried accumulators. Completed root
+                // loops return their state to RAM; large families still stream
+                // to RAM one wave at a time.
                 let wave_size =
                     self.backend.parallel_wave_size(self.config.max_parallel_instances.get());
                 let staged = (0..child.outputs().len())
@@ -2528,22 +2576,7 @@ where
                                             declarations.clone(),
                                         )?
                                     } else if !stage_matrix_family_output(
-                                        scope_id,
-                                        count,
-                                        wave_size,
-                                        matches!(
-                                            scope_id,
-                                            FrozenGraphScopeId::SequentialBody { .. }
-                                        ) && self
-                                            .validated
-                                            .source
-                                            .scope(scope_id)
-                                            .expect("scope")
-                                            .outputs()
-                                            .contains(&WireRef {
-                                                node: node.id,
-                                                port: Port(port as u32),
-                                            }),
+                                        scope_id, count, wave_size,
                                     ) {
                                         value
                                     } else if let RuntimeValue::Matrix(matrix) = value {
@@ -2676,6 +2709,16 @@ where
                 }
                 self.set_placement(parent_placement)?;
                 for (port, value) in carried.into_iter().enumerate() {
+                    let value = if matches!(scope_id, FrozenGraphScopeId::Root) {
+                        let wire = WireRef { node: node.id, port: Port(port as u32) };
+                        let ty = self
+                            .validated_wire_type(scope_id, wire)
+                            .ok_or(ExecutionError::ValueKind(wire))?
+                            .clone();
+                        self.stage_matrix_value(value, &ty)?
+                    } else {
+                        value
+                    };
                     self.put(values, node.id, port as u32, value);
                 }
             }
@@ -2796,6 +2839,31 @@ where
                 values.get(index).cloned().ok_or(ExecutionError::ValueKind(wire))
             }
             _ => Err(ExecutionError::ValueKind(wire)),
+        }
+    }
+
+    fn stage_matrix_value(
+        &mut self,
+        value: RuntimeValue<B>,
+        ty: &ConcreteWireType,
+    ) -> Result<RuntimeValue<B>, ExecutionError> {
+        match (value, ty) {
+            (RuntimeValue::Matrix(matrix), ConcreteWireType::Matrix(matrix_type)) => {
+                let (_, bytes) =
+                    self.backend.preimage_target(matrix).map_err(Self::backend_error)?;
+                Ok(RuntimeValue::HostMatrix { matrix_type: matrix_type.clone(), bytes })
+            }
+            (
+                RuntimeValue::IndexedFamily(members),
+                ConcreteWireType::IndexedFamily { element, .. },
+            ) => {
+                let members = members
+                    .into_iter()
+                    .map(|value| self.stage_matrix_value(value, element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(RuntimeValue::IndexedFamily(members))
+            }
+            (value, _) => Ok(value),
         }
     }
 
@@ -4105,7 +4173,11 @@ where
     }
 
     fn backend_error(error: B::Error) -> ExecutionError {
-        ExecutionError::Backend(error.to_string())
+        if B::is_gpu_preparation_yield(&error) {
+            ExecutionError::GpuPreparationYield
+        } else {
+            ExecutionError::Backend(error.to_string())
+        }
     }
 
     fn artifact_error(error: S::Error) -> ExecutionError {
@@ -6391,6 +6463,44 @@ mod tests {
                 matrix_output(&replayed, "shared")
             );
         }
+    }
+
+    #[test]
+    fn iteration_returns_completed_matrix_state_to_ram() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring =
+            Ring::new(BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()), 8);
+        let input = parallel(1, |_| Ok(ring.identity(1))).unwrap();
+        let output = iterate(3, input, |_, state| {
+            parallel(1, |index| Ok(state.at(index) + ring.identity(1)))
+        })
+        .unwrap();
+        let graph = DslContext::new("matrix-loop-state")
+            .output("state", output)
+            .unwrap()
+            .output("expected", ring.identity(1) * 4usize)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let RuntimeValue::IndexedFamily(members) = &result.outputs["state"] else {
+            panic!("family")
+        };
+        assert!(matches!(&members[0], RuntimeValue::HostMatrix { .. }));
+        let expected = matrix_output(&result, "expected").clone();
+        let RuntimeValue::IndexedFamily(members) =
+            result.materialize_output("state", &backend, &mut store).unwrap()
+        else {
+            panic!("family")
+        };
+        let RuntimeValue::Matrix(actual) = &members[0] else { panic!("matrix") };
+        assert_eq!(actual.as_ref(), &expected);
     }
 
     #[test]

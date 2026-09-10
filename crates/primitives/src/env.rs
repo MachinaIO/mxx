@@ -28,8 +28,9 @@ fn positive_usize(name: &str, default: usize) -> Result<usize, String> {
     }
 }
 
-/// `MXX_GPU_VRAM_PERCENT`: percentage of each GPU's total VRAM available to
-/// one GPU operation. Default: 80.
+/// `MXX_GPU_VRAM_PERCENT`: target percentage of each GPU's total VRAM used to
+/// size operation waves. Calibrated runtime waves retain a one-column minimum
+/// when resident inputs reach this target. Default: 80.
 pub fn gpu_vram_percent() -> Result<u32, String> {
     let percent = positive_usize("MXX_GPU_VRAM_PERCENT", 80)?;
     if percent <= 100 {
@@ -58,6 +59,16 @@ pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
     assert!(dimension >= 16 && dimension.is_power_of_two());
     assert!(depth >= 4);
     (u32::try_from(dimension).unwrap(), depth, bits, u32::try_from(base_bits).unwrap())
+}
+
+#[cfg(test)]
+pub fn matrix_batch_test_shape() -> (usize, usize, usize) {
+    // Bound the benchmark wave independently of ring/CRT parameter overrides.
+    (
+        positive_usize("MXX_PRIMITIVE_TEST_BATCH_SIZE", 3).unwrap(),
+        positive_usize("MXX_PRIMITIVE_TEST_INNER", 3).unwrap(),
+        positive_usize("MXX_PRIMITIVE_TEST_COLUMNS", 5).unwrap(),
+    )
 }
 
 #[cfg(test)]

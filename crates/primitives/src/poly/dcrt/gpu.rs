@@ -1148,6 +1148,11 @@ impl GpuDCRTPolyParams {
         self.ctx.vram_budget_bytes
     }
 
+    /// Minimum physical VRAM across this context's devices, cached at creation.
+    pub fn physical_vram_bytes(&self) -> usize {
+        self.ctx.physical_vram_bytes
+    }
+
     /// Percentage fixed when this parameter set's GPU context was created.
     pub fn vram_percent(&self) -> u32 {
         self.vram_percent
@@ -1211,6 +1216,7 @@ pub struct GpuContext {
     pub gpu_ids: Vec<i32>,
     pub dnum: u32,
     pub vram_budget_bytes: usize,
+    pub physical_vram_bytes: usize,
 }
 
 /// # Safety
@@ -1235,6 +1241,19 @@ impl GpuContext {
             )
         );
         let l = moduli.len().saturating_sub(1) as u32;
+        let physical_vram_bytes = related.map_or_else(
+            || {
+                let devices = if gpu_ids.is_empty() { &[0][..] } else { gpu_ids };
+                devices
+                    .par_iter()
+                    .map(|device| {
+                        gpu_memory_info(*device).expect("query physical GPU memory").total
+                    })
+                    .min()
+                    .expect("GPU context requires a device")
+            },
+            |context| context.physical_vram_bytes,
+        );
         let mut ctx_ptr: *mut GpuContextOpaque = ptr::null_mut();
         let (gpu_ids_ptr, gpu_ids_len) = if gpu_ids.is_empty() {
             (ptr::null(), 0usize)
@@ -1274,6 +1293,7 @@ impl GpuContext {
             gpu_ids: gpu_ids.to_vec(),
             dnum,
             vram_budget_bytes,
+            physical_vram_bytes,
         }
     }
 
@@ -2011,10 +2031,16 @@ mod tests {
             None => unsafe { std::env::remove_var(name) },
         }
 
-        let device = *params.gpu_ids().first().expect("GPU test requires one device");
-        let total_bytes = gpu_memory_info(device).expect("query device memory").total;
+        let total_bytes = params
+            .gpu_ids()
+            .iter()
+            .map(|device| gpu_memory_info(*device).expect("query device memory").total)
+            .min()
+            .expect("GPU test requires one device");
         let expected_budget = (total_bytes / 100) * 37 + ((total_bytes % 100) * 37) / 100;
         assert_eq!(params.vram_budget_bytes(), expected_budget);
+        assert_eq!(params.physical_vram_bytes(), total_bytes);
+        assert!(params.physical_vram_bytes() > params.vram_budget_bytes());
     }
 
     #[test]

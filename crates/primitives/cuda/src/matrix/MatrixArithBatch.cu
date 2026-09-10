@@ -1,11 +1,21 @@
 namespace
 {
+    using MatrixDescriptor = GpuMatrix::SharedLimbBuffer::DeviceDescriptor;
+
+    // Allocation-owned descriptors are initialized once with the matrix. A
+    // submission names each independent allocation once; kernels resolve CRT
+    // limbs through these persistent descriptors rather than host-built tables.
+    __device__ __forceinline__ uint8_t *batch_limb(
+        const MatrixDescriptor *const *matrices, size_t index, size_t limbs)
+    {
+        const auto *descriptors = matrices[index / limbs];
+        return descriptors ? descriptors[index % limbs].base : nullptr;
+    }
+
     __global__ void matrix_binary_batch_kernel(
-        const uint8_t *const *left,
-        const uint8_t *const *right,
-        uint8_t *const *outputs,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
+        const MatrixDescriptor *const *left,
+        const MatrixDescriptor *const *right,
+        const MatrixDescriptor *const *outputs,
         const uint64_t *moduli,
         size_t limb_count,
         size_t coefficients_per_limb,
@@ -23,24 +33,22 @@ namespace
         const size_t limb = matrix_limb % limb_count;
         const size_t poly_idx = local / n;
         const size_t coefficient_idx = local % n;
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
+        const size_t stride = left[0][limb].stride;
+        const uint8_t bytes = left[0][limb].width;
         const uint64_t lhs = matrix_load_limb_u64(
-            left[matrix_limb], poly_idx, coefficient_idx, stride, bytes);
+            batch_limb(left, matrix_limb, limb_count), poly_idx, coefficient_idx, stride, bytes);
         const uint64_t rhs = matrix_load_limb_u64(
-            right[matrix_limb], poly_idx, coefficient_idx, stride, bytes);
+            batch_limb(right, matrix_limb, limb_count), poly_idx, coefficient_idx, stride, bytes);
         const uint64_t value = operation == 0
                                    ? add_mod_u64(lhs, rhs, moduli[limb])
                                    : sub_mod_u64(lhs, rhs, moduli[limb]);
         matrix_store_limb_u64(
-            outputs[matrix_limb], poly_idx, coefficient_idx, stride, bytes, value);
+            batch_limb(outputs, matrix_limb, limb_count), poly_idx, coefficient_idx, stride, bytes, value);
     }
 
     __global__ void matrix_negate_batch_kernel(
-        const uint8_t *const *inputs,
-        uint8_t *const *outputs,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
+        const MatrixDescriptor *const *inputs,
+        const MatrixDescriptor *const *outputs,
         const uint64_t *moduli,
         size_t limb_count,
         size_t coefficients_per_limb,
@@ -57,20 +65,18 @@ namespace
         const size_t limb = matrix_limb % limb_count;
         const size_t poly_idx = local / n;
         const size_t coefficient_idx = local % n;
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
+        const size_t stride = inputs[0][limb].stride;
+        const uint8_t bytes = inputs[0][limb].width;
         const uint64_t value = matrix_load_limb_u64(
-            inputs[matrix_limb], poly_idx, coefficient_idx, stride, bytes);
+            batch_limb(inputs, matrix_limb, limb_count), poly_idx, coefficient_idx, stride, bytes);
         const uint64_t negated = value == 0 ? 0 : moduli[limb] - value;
         matrix_store_limb_u64(
-            outputs[matrix_limb], poly_idx, coefficient_idx, stride, bytes, negated);
+            batch_limb(outputs, matrix_limb, limb_count), poly_idx, coefficient_idx, stride, bytes, negated);
     }
 
     __global__ void matrix_ring_automorphism_batch_kernel(
-        const uint8_t *const *inputs,
-        uint8_t *const *outputs,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
+        const MatrixDescriptor *const *inputs,
+        const MatrixDescriptor *const *outputs,
         const uint64_t *moduli,
         const size_t *indices,
         size_t limb_count,
@@ -88,20 +94,18 @@ namespace
         const size_t source = local % n;
         const size_t exponent = (source * indices[matrix_idx]) % (2 * n);
         const size_t target = exponent < n ? exponent : exponent - n;
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
+        const size_t stride = inputs[0][limb].stride;
+        const uint8_t bytes = inputs[0][limb].width;
         const uint64_t modulus = moduli[limb];
-        uint64_t value = matrix_load_limb_u64(inputs[matrix_limb], polynomial, source, stride, bytes);
+        uint64_t value = matrix_load_limb_u64(batch_limb(inputs, matrix_limb, limb_count), polynomial, source, stride, bytes);
         if (exponent >= n && value != 0) value = modulus - value;
-        matrix_store_limb_u64(outputs[matrix_limb], polynomial, target, stride, bytes, value);
+        matrix_store_limb_u64(batch_limb(outputs, matrix_limb, limb_count), polynomial, target, stride, bytes, value);
     }
 
     __global__ void matrix_scalar_mul_batch_kernel(
-        const uint8_t *const *matrices,
-        const uint8_t *const *scalars,
-        uint8_t *const *outputs,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
+        const MatrixDescriptor *const *matrices,
+        const MatrixDescriptor *const *scalars,
+        const MatrixDescriptor *const *outputs,
         const uint64_t *moduli,
         size_t limb_count,
         size_t coefficients_per_limb,
@@ -115,14 +119,14 @@ namespace
         const size_t limb = matrix_limb % limb_count;
         const size_t poly_idx = local / n;
         const size_t coefficient_idx = local % n;
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
+        const size_t stride = matrices[0][limb].stride;
+        const uint8_t bytes = matrices[0][limb].width;
         const uint64_t value = matrix_load_limb_u64(
-            matrices[matrix_limb], poly_idx, coefficient_idx, stride, bytes);
+            batch_limb(matrices, matrix_limb, limb_count), poly_idx, coefficient_idx, stride, bytes);
         const uint64_t scalar = matrix_load_limb_u64(
-            scalars[matrix_limb], 0, coefficient_idx, stride, bytes);
+            batch_limb(scalars, matrix_limb, limb_count), 0, coefficient_idx, stride, bytes);
         matrix_store_limb_u64(
-            outputs[matrix_limb],
+            batch_limb(outputs, matrix_limb, limb_count),
             poly_idx,
             coefficient_idx,
             stride,
@@ -131,11 +135,9 @@ namespace
     }
 
     __global__ void matrix_matmul_batch_kernel(
-        const uint8_t *const *left,
-        const uint8_t *const *right,
-        uint8_t *const *outputs,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
+        const MatrixDescriptor *const *left,
+        const MatrixDescriptor *const *right,
+        const MatrixDescriptor *const *outputs,
         const uint64_t *moduli,
         size_t limb_count,
         size_t rows,
@@ -149,11 +151,11 @@ namespace
         const size_t matrix_limb = static_cast<size_t>(blockIdx.z) / coefficient_groups;
         const size_t first_coefficient = static_cast<size_t>(blockIdx.z) % coefficient_groups;
         const size_t limb = matrix_limb % limb_count;
-        const uint8_t *left_base = left[matrix_limb];
-        const uint8_t *right_base = right[matrix_limb];
-        uint8_t *output_base = outputs[matrix_limb];
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
+        const uint8_t *left_base = batch_limb(left, matrix_limb, limb_count);
+        const uint8_t *right_base = batch_limb(right, matrix_limb, limb_count);
+        uint8_t *output_base = batch_limb(outputs, matrix_limb, limb_count);
+        const size_t stride = left[0][limb].stride;
+        const uint8_t bytes = left[0][limb].width;
         const uint64_t modulus = moduli[limb];
         const size_t row_base = static_cast<size_t>(blockIdx.y) * kMatmulTileM;
         const size_t column_base = static_cast<size_t>(blockIdx.x) * kMatmulTileN;
@@ -230,11 +232,9 @@ namespace
     }
 
     __global__ void matrix_thin_row_matmul_batch_kernel(
-        const uint8_t *const *left,
-        const uint8_t *const *right,
-        uint8_t *const *outputs,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
+        const MatrixDescriptor *const *left,
+        const MatrixDescriptor *const *right,
+        const MatrixDescriptor *const *outputs,
         const uint64_t *moduli,
         const uint64_t *reciprocals,
         size_t limb_count,
@@ -254,11 +254,11 @@ namespace
             return;
         }
 
-        const uint8_t *left_base = left[matrix_limb];
-        const uint8_t *right_base = right[matrix_limb];
-        uint8_t *output_base = outputs[matrix_limb];
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
+        const uint8_t *left_base = batch_limb(left, matrix_limb, limb_count);
+        const uint8_t *right_base = batch_limb(right, matrix_limb, limb_count);
+        uint8_t *output_base = batch_limb(outputs, matrix_limb, limb_count);
+        const size_t stride = left[0][limb].stride;
+        const uint8_t bytes = left[0][limb].width;
         const uint64_t modulus = moduli[limb];
         const uint64_t reciprocal = reciprocals[limb];
         for (size_t coefficient_idx = first_coefficient * kThinMatmulWarpSize + threadIdx.x;
@@ -304,15 +304,34 @@ namespace
         }
     }
 
+    // For canonical a,b and a k-bit modulus (33 <= k <= 62), mu is
+    // floor(2^(2k)/modulus). Truncating the product at k-1 bits underestimates
+    // the quotient by at most two, so 0 <= remainder < 3*modulus < 2^64.
+    // The low-word subtraction is exact modulo 2^64 and needs two corrections.
+    __device__ __forceinline__ uint64_t matrix_mul_accumulate_residue(
+        uint64_t a, uint64_t b, uint64_t modulus, uint64_t reciprocal)
+    {
+        if (modulus <= UINT32_MAX)
+            return mul_mod_barrett_u32(a, b, modulus, reciprocal);
+        if (reciprocal == 0) return mul_mod_u64(a, b, modulus);
+        const unsigned int bits = 64U - __clzll(modulus);
+        const unsigned __int128 product = static_cast<unsigned __int128>(a) * b;
+        const uint64_t high = static_cast<uint64_t>(product >> (bits - 1));
+        const uint64_t quotient = static_cast<uint64_t>(
+            (static_cast<unsigned __int128>(high) * reciprocal) >> (bits + 1));
+        uint64_t remainder = static_cast<uint64_t>(product) - quotient * modulus;
+        if (remainder >= modulus) remainder -= modulus;
+        if (remainder >= modulus) remainder -= modulus;
+        return remainder;
+    }
+
     __global__ void matrix_thin_row_mul_accumulate_batch_kernel(
-        const uint8_t *const *left,
-        const uint8_t *const *right,
-        const uint8_t *const *coefficients,
-        const uint8_t *const *biases,
-        uint8_t *const *outputs,
+        const MatrixDescriptor *const *left,
+        const MatrixDescriptor *const *right,
+        const MatrixDescriptor *const *coefficients,
+        const MatrixDescriptor *const *biases,
+        const MatrixDescriptor *const *outputs,
         const size_t *inner_dimensions,
-        const size_t *strides,
-        const uint8_t *coefficient_bytes,
         const uint64_t *moduli,
         const uint64_t *reciprocals,
         size_t limb_count,
@@ -329,8 +348,8 @@ namespace
         const size_t column =
             static_cast<size_t>(blockIdx.x) * kThinMatmulColumnsPerBlock + threadIdx.y;
         if (column >= columns) return;
-        const size_t stride = strides[limb];
-        const uint8_t bytes = coefficient_bytes[limb];
+        const size_t stride = left[0][limb].stride;
+        const uint8_t bytes = left[0][limb].width;
         const uint64_t modulus = moduli[limb];
         const uint64_t reciprocal = reciprocals[limb];
         for (size_t coefficient_idx = first_coefficient * kThinMatmulWarpSize + threadIdx.x;
@@ -347,9 +366,9 @@ namespace
                 for (size_t k = 0; k < inner; ++k)
                 {
                     const uint64_t lhs = matrix_load_limb_u64(
-                        left[pointer_index], k, coefficient_idx, stride, bytes);
+                        batch_limb(left, pointer_index, limb_count), k, coefficient_idx, stride, bytes);
                     const uint64_t rhs = matrix_load_limb_u64(
-                        right[pointer_index], k * columns + column, coefficient_idx, stride, bytes);
+                        batch_limb(right, pointer_index, limb_count), k * columns + column, coefficient_idx, stride, bytes);
                     if (lazy_reduction)
                     {
                         dot += lhs * rhs;
@@ -357,19 +376,19 @@ namespace
                     else
                     {
                         dot = add_mod_u64(
-                            dot, mul_mod_barrett_u32(lhs, rhs, modulus, reciprocal), modulus);
+                            dot, matrix_mul_accumulate_residue(lhs, rhs, modulus, reciprocal), modulus);
                     }
                 }
                 if (lazy_reduction) dot = reduce_barrett_u32(dot, modulus, reciprocal);
-                if (coefficients[pointer_index])
+                if (batch_limb(coefficients, pointer_index, limb_count))
                 {
                     const uint64_t scalar = matrix_load_limb_u64(
-                        coefficients[pointer_index], 0, coefficient_idx, stride, bytes);
-                    dot = mul_mod_u64(dot, scalar, modulus);
+                        batch_limb(coefficients, pointer_index, limb_count), 0, coefficient_idx, stride, bytes);
+                    dot = matrix_mul_accumulate_residue(dot, scalar, modulus, reciprocal);
                 }
                 total = add_mod_u64(total, dot, modulus);
             }
-            const uint8_t *bias = biases[matrix_limb];
+            const uint8_t *bias = batch_limb(biases, matrix_limb, limb_count);
             if (bias)
             {
                 total = add_mod_u64(
@@ -378,7 +397,7 @@ namespace
                     modulus);
             }
             matrix_store_limb_u64(
-                outputs[matrix_limb], column, coefficient_idx, stride, bytes, total);
+                batch_limb(outputs, matrix_limb, limb_count), column, coefficient_idx, stride, bytes, total);
         }
     }
 
@@ -397,10 +416,65 @@ namespace
         std::vector<dim3> limb_ids;
         std::vector<size_t> strides;
         std::vector<uint8_t> coefficient_bytes;
-        std::vector<uint64_t> moduli;
-        std::vector<const uint8_t *> left;
-        std::vector<const uint8_t *> right;
-        std::vector<uint8_t *> outputs;
+        std::vector<const MatrixDescriptor *> left;
+        std::vector<const MatrixDescriptor *> right;
+        std::vector<const MatrixDescriptor *> outputs;
+    };
+
+    struct MatrixBatchUpload
+    {
+        struct Segment
+        {
+            void **device;
+            const void *host;
+            size_t bytes;
+        };
+        void *device = nullptr;
+        cudaStream_t stream = nullptr;
+
+        ~MatrixBatchUpload()
+        {
+            if (device) cudaFreeAsync(device, stream);
+        }
+
+        int initialize(const MatrixBatchMetadata &metadata,
+                       std::initializer_list<Segment> segments)
+        {
+            stream = metadata.stream;
+            size_t bytes = 0;
+            for (const auto &segment : segments)
+            {
+                if (segment.bytes > SIZE_MAX - bytes)
+                    return set_error("matrix batch submission size overflow");
+                bytes += segment.bytes;
+            }
+            void *host = gpu_pinned_alloc(bytes);
+            if (!host) return set_error("matrix batch submission staging allocation failed");
+            cudaError_t error = cudaMallocAsync(&device, bytes, stream);
+            if (error != cudaSuccess)
+            {
+                gpu_pinned_free(host);
+                return set_error(error);
+            }
+            size_t offset = 0;
+            for (const auto &segment : segments)
+            {
+                if (segment.bytes != 0)
+                {
+                    std::memcpy(static_cast<uint8_t *>(host) + offset, segment.host, segment.bytes);
+                    *segment.device = static_cast<uint8_t *>(device) + offset;
+                    offset += segment.bytes;
+                }
+            }
+            // One logical submission packet, never a matrix-by-limb pointer
+            // table. Pinned storage remains owned until this stream completes
+            // the upload, including error paths; the caller does not wait.
+            error = cudaMemcpyAsync(device, host, bytes, cudaMemcpyHostToDevice, stream);
+            const int reclaim_status = gpu_defer_pinned_frees(
+                metadata.context, metadata.device, stream, &host, 1);
+            if (error != cudaSuccess) return set_error(error);
+            return reclaim_status;
+        }
     };
 
     int prepare_matrix_batch(
@@ -447,14 +521,16 @@ namespace
         metadata->limb_ids.assign(
             first_left->ctx->limb_gpu_ids.begin(),
             first_left->ctx->limb_gpu_ids.begin() + metadata->limb_count);
+        const size_t constants_slot = metadata->limb_ids[0].x;
+        if (constants_slot >= metadata->context->ntt_device_constants.size() ||
+            !metadata->context->ntt_device_constants[constants_slot].moduli ||
+            metadata->context->ntt_device_constants[constants_slot].limb_count < metadata->limb_count)
+            return set_error("missing matrix batch device constants");
         metadata->strides.resize(metadata->limb_count);
         metadata->coefficient_bytes.resize(metadata->limb_count);
-        metadata->moduli.assign(
-            first_left->ctx->moduli.begin(),
-            first_left->ctx->moduli.begin() + metadata->limb_count);
-        metadata->left.resize(matrix_count * metadata->limb_count);
-        if (right) metadata->right.resize(matrix_count * metadata->limb_count);
-        metadata->outputs.resize(matrix_count * metadata->limb_count);
+        metadata->left.resize(matrix_count);
+        if (right) metadata->right.resize(matrix_count);
+        metadata->outputs.resize(matrix_count);
         for (size_t matrix_idx = 0; matrix_idx < matrix_count; ++matrix_idx)
         {
             const GpuMatrix *lhs = left[matrix_idx];
@@ -477,9 +553,24 @@ namespace
             {
                 return set_error("matrix batch is not homogeneous");
             }
+            const size_t slot = metadata->limb_ids[0].x;
+            if (slot >= lhs->shared_limb_buffers.size() || slot >= out->shared_limb_buffers.size() ||
+                (rhs && slot >= rhs->shared_limb_buffers.size()))
+                return set_error("missing matrix batch descriptors");
+            metadata->left[matrix_idx] = lhs->shared_limb_buffers[slot].device_descriptors;
+            metadata->outputs[matrix_idx] = out->shared_limb_buffers[slot].device_descriptors;
+            if (rhs) metadata->right[matrix_idx] = rhs->shared_limb_buffers[slot].device_descriptors;
+            if (!metadata->left[matrix_idx] || !metadata->outputs[matrix_idx] ||
+                lhs->shared_limb_buffers[slot].limb_count < metadata->limb_count ||
+                out->shared_limb_buffers[slot].limb_count < metadata->limb_count ||
+                (rhs && (!metadata->right[matrix_idx] ||
+                         rhs->shared_limb_buffers[slot].limb_count < metadata->limb_count)))
+                return set_error("missing matrix batch descriptors");
             for (size_t limb = 0; limb < metadata->limb_count; ++limb)
             {
                 const dim3 limb_id = metadata->limb_ids[limb];
+                if (limb_id.x != slot || limb_id.y != limb)
+                    return set_error("matrix batch requires ordered limbs in one allocation");
                 int lhs_device = -1;
                 int out_device = -1;
                 cudaStream_t out_stream = nullptr;
@@ -487,10 +578,7 @@ namespace
                 size_t out_stride = 0;
                 uint8_t lhs_bytes = 0;
                 uint8_t out_bytes = 0;
-                const uint8_t *lhs_pointer = matrix_limb_ptr_by_id(lhs, 0, limb_id);
-                uint8_t *out_pointer = matrix_limb_ptr_by_id(out, 0, limb_id);
-                if (!lhs_pointer || !out_pointer ||
-                    matrix_limb_device(lhs, limb_id, &lhs_device) != 0 ||
+                if (matrix_limb_device(lhs, limb_id, &lhs_device) != 0 ||
                     matrix_limb_device(out, limb_id, &out_device) != 0 ||
                     matrix_limb_stream(out, limb_id, &out_stream) != 0 ||
                     !matrix_limb_metadata_by_id(lhs, limb_id, &lhs_stride, &lhs_bytes) ||
@@ -518,22 +606,18 @@ namespace
                 {
                     return set_error("matrix batch limb layout differs");
                 }
-                const size_t flat = matrix_idx * metadata->limb_count + limb;
-                metadata->left[flat] = lhs_pointer;
-                metadata->outputs[flat] = out_pointer;
                 if (rhs)
                 {
                     int rhs_device = -1;
                     size_t rhs_stride = 0;
                     uint8_t rhs_bytes = 0;
-                    const uint8_t *rhs_pointer = matrix_limb_ptr_by_id(rhs, 0, limb_id);
-                    if (!rhs_pointer || matrix_limb_device(rhs, limb_id, &rhs_device) != 0 ||
+                    if (matrix_limb_device(rhs, limb_id, &rhs_device) != 0 ||
                         !matrix_limb_metadata_by_id(rhs, limb_id, &rhs_stride, &rhs_bytes) ||
                         rhs_device != metadata->device || rhs_stride != lhs_stride || rhs_bytes != lhs_bytes)
                     {
                         return set_error("invalid right matrix batch limb");
                     }
-                    metadata->right[flat] = rhs_pointer;
+
                 }
             }
         }
@@ -551,6 +635,13 @@ namespace
                 if (status == 0 && right)
                 {
                     status = matrix_wait_limb_stream(right[matrix_idx], limb_id, metadata->device, metadata->stream);
+                }
+                if (status == 0)
+                {
+                    // Other outputs can initialize their persistent descriptors
+                    // on independent allocation streams. Order those writes
+                    // before this batch reads the descriptors and writes data.
+                    status = matrix_wait_limb_stream(outputs[matrix_idx], limb_id, metadata->device, metadata->stream);
                 }
                 if (status != 0)
                 {
@@ -607,52 +698,30 @@ extern "C" int gpu_matrix_binary_batch(
     if (status != 0) return status;
     const size_t coefficients_per_limb = metadata.inner * metadata.n;
     const size_t total_coefficients = matrix_count * metadata.limb_count * coefficients_per_limb;
-    const size_t pointer_count = matrix_count * metadata.limb_count;
-    const uint8_t **d_left = nullptr;
-    const uint8_t **d_right = nullptr;
-    uint8_t **d_outputs = nullptr;
-    size_t *d_strides = nullptr;
-    uint8_t *d_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
-    auto release = [&]() {
-        if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
-        if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
-        if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
-        if (d_outputs) cudaFreeAsync(d_outputs, metadata.stream);
-        if (d_right) cudaFreeAsync(d_right, metadata.stream);
-        if (d_left) cudaFreeAsync(d_left, metadata.stream);
-    };
-    cudaError_t error = cudaMallocAsync(reinterpret_cast<void **>(&d_left), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_right), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_outputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_left, metadata.left.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_right, metadata.right.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_outputs, metadata.outputs.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count, cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error != cudaSuccess)
-    {
-        release();
-        return set_error(error);
-    }
+    const MatrixDescriptor **d_left = nullptr;
+    const MatrixDescriptor **d_right = nullptr;
+    const MatrixDescriptor **d_outputs = nullptr;
+    const uint64_t *d_moduli = metadata.context->ntt_device_constants[metadata.limb_ids[0].x].moduli;
+    MatrixBatchUpload upload;
+    status = upload.initialize(metadata, {
+        {reinterpret_cast<void **>(&d_left), metadata.left.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_right), metadata.right.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_outputs), metadata.outputs.data(), matrix_count * sizeof(MatrixDescriptor *)},
+    });
+    if (status != 0) return status;
+    cudaError_t error = cudaSuccess;
     const int threads = 256;
     const int blocks = static_cast<int>((total_coefficients + threads - 1) / threads);
     matrix_binary_batch_kernel<<<blocks, threads, 0, metadata.stream>>>(
-        d_left, d_right, d_outputs, d_strides, d_bytes, d_moduli, metadata.limb_count,
+        d_left, d_right, d_outputs, d_moduli, metadata.limb_count,
         coefficients_per_limb, total_coefficients, metadata.n, operation);
     error = cudaGetLastError();
     if (error != cudaSuccess)
     {
-        release();
         return set_error(error);
     }
     status = finish_matrix_batch(metadata, outputs, left, right);
     for (size_t matrix_idx = 0; matrix_idx < matrix_count; ++matrix_idx) outputs[matrix_idx]->format = left[matrix_idx]->format;
-    release();
     return status;
 }
 
@@ -666,48 +735,28 @@ extern "C" int gpu_matrix_negate_batch(
     if (status != 0) return status;
     const size_t coefficients_per_limb = metadata.inner * metadata.n;
     const size_t total_coefficients = matrix_count * metadata.limb_count * coefficients_per_limb;
-    const size_t pointer_count = matrix_count * metadata.limb_count;
-    const uint8_t **d_inputs = nullptr;
-    uint8_t **d_outputs = nullptr;
-    size_t *d_strides = nullptr;
-    uint8_t *d_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
-    auto release = [&]() {
-        if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
-        if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
-        if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
-        if (d_outputs) cudaFreeAsync(d_outputs, metadata.stream);
-        if (d_inputs) cudaFreeAsync(d_inputs, metadata.stream);
-    };
-    cudaError_t error = cudaMallocAsync(reinterpret_cast<void **>(&d_inputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_outputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_inputs, metadata.left.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_outputs, metadata.outputs.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count, cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error != cudaSuccess)
-    {
-        release();
-        return set_error(error);
-    }
+    const MatrixDescriptor **d_inputs = nullptr;
+    const MatrixDescriptor **d_outputs = nullptr;
+    const uint64_t *d_moduli = metadata.context->ntt_device_constants[metadata.limb_ids[0].x].moduli;
+    MatrixBatchUpload upload;
+    status = upload.initialize(metadata, {
+        {reinterpret_cast<void **>(&d_inputs), metadata.left.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_outputs), metadata.outputs.data(), matrix_count * sizeof(MatrixDescriptor *)},
+    });
+    if (status != 0) return status;
+    cudaError_t error = cudaSuccess;
     const int threads = 256;
     const int blocks = static_cast<int>((total_coefficients + threads - 1) / threads);
     matrix_negate_batch_kernel<<<blocks, threads, 0, metadata.stream>>>(
-        d_inputs, d_outputs, d_strides, d_bytes, d_moduli, metadata.limb_count,
+        d_inputs, d_outputs, d_moduli, metadata.limb_count,
         coefficients_per_limb, total_coefficients, metadata.n);
-    cudaError_t launch_error = cudaGetLastError();
-    if (launch_error != cudaSuccess)
+    error = cudaGetLastError();
+    if (error != cudaSuccess)
     {
-        release();
-        return set_error(launch_error);
+        return set_error(error);
     }
     status = finish_matrix_batch(metadata, outputs, inputs, nullptr);
     for (size_t matrix_idx = 0; matrix_idx < matrix_count; ++matrix_idx) outputs[matrix_idx]->format = inputs[matrix_idx]->format;
-    release();
     return status;
 }
 
@@ -745,44 +794,27 @@ extern "C" int gpu_matrix_ring_automorphism_batch(
     if (status != 0) return status;
     const size_t coefficients_per_limb = metadata.inner * metadata.n;
     const size_t total_coefficients = matrix_count * metadata.limb_count * coefficients_per_limb;
-    const size_t pointer_count = matrix_count * metadata.limb_count;
-    const uint8_t **d_inputs = nullptr;
-    uint8_t **d_outputs = nullptr;
-    size_t *d_strides = nullptr;
-    uint8_t *d_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
+    const MatrixDescriptor **d_inputs = nullptr;
+    const MatrixDescriptor **d_outputs = nullptr;
+    const uint64_t *d_moduli = metadata.context->ntt_device_constants[metadata.limb_ids[0].x].moduli;
     size_t *d_indices = nullptr;
-    auto release = [&]() {
-        if (d_indices) cudaFreeAsync(d_indices, metadata.stream);
-        if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
-        if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
-        if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
-        if (d_outputs) cudaFreeAsync(d_outputs, metadata.stream);
-        if (d_inputs) cudaFreeAsync(d_inputs, metadata.stream);
-    };
-    cudaError_t error = cudaMallocAsync(reinterpret_cast<void **>(&d_inputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_outputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_indices), matrix_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_inputs, metadata.left.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_outputs, metadata.outputs.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count, cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_indices, indices, matrix_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error != cudaSuccess) { release(); return set_error(error); }
+    MatrixBatchUpload upload;
+    status = upload.initialize(metadata, {
+        {reinterpret_cast<void **>(&d_inputs), metadata.left.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_outputs), metadata.outputs.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_indices), indices, matrix_count * sizeof(size_t)},
+    });
+    if (status != 0) return status;
+    cudaError_t error = cudaSuccess;
     constexpr int threads = 256;
     const int blocks = static_cast<int>((total_coefficients + threads - 1) / threads);
     matrix_ring_automorphism_batch_kernel<<<blocks, threads, 0, metadata.stream>>>(
-        d_inputs, d_outputs, d_strides, d_bytes, d_moduli, d_indices,
+        d_inputs, d_outputs, d_moduli, d_indices,
         metadata.limb_count, coefficients_per_limb, total_coefficients, metadata.n);
     error = cudaGetLastError();
-    if (error != cudaSuccess) { release(); return set_error(error); }
+    if (error != cudaSuccess) { return set_error(error); }
     status = finish_matrix_batch(metadata, outputs, inputs, nullptr);
     for (size_t matrix = 0; matrix < matrix_count; ++matrix) outputs[matrix]->format = GPU_POLY_FORMAT_COEFF;
-    release();
     return status;
 }
 
@@ -798,64 +830,24 @@ extern "C" int gpu_matrix_mul_scalar_batch(
     const size_t coefficients_per_limb = metadata.inner * metadata.n;
     const size_t total_coefficients = matrix_count * metadata.limb_count * coefficients_per_limb;
     if (total_coefficients == 0) return 0;
-    const size_t pointer_count = matrix_count * metadata.limb_count;
-    const uint8_t **d_matrices = nullptr;
-    const uint8_t **d_scalars = nullptr;
-    uint8_t **d_outputs = nullptr;
-    size_t *d_strides = nullptr;
-    uint8_t *d_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
-    auto release = [&]() {
-        if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
-        if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
-        if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
-        if (d_outputs) cudaFreeAsync(d_outputs, metadata.stream);
-        if (d_scalars) cudaFreeAsync(d_scalars, metadata.stream);
-        if (d_matrices) cudaFreeAsync(d_matrices, metadata.stream);
-    };
-    cudaError_t error = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_matrices), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_scalars), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_outputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(
-        d_matrices, metadata.left.data(), pointer_count * sizeof(uint8_t *),
-        cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(
-        d_scalars, metadata.right.data(), pointer_count * sizeof(uint8_t *),
-        cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(
-        d_outputs, metadata.outputs.data(), pointer_count * sizeof(uint8_t *),
-        cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(
-        d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t),
-        cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(
-        d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count,
-        cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(
-        d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t),
-        cudaMemcpyHostToDevice, metadata.stream);
-    if (error != cudaSuccess)
-    {
-        release();
-        return set_error(error);
-    }
+    const MatrixDescriptor **d_matrices = nullptr;
+    const MatrixDescriptor **d_scalars = nullptr;
+    const MatrixDescriptor **d_outputs = nullptr;
+    const uint64_t *d_moduli = metadata.context->ntt_device_constants[metadata.limb_ids[0].x].moduli;
+    MatrixBatchUpload upload;
+    status = upload.initialize(metadata, {
+        {reinterpret_cast<void **>(&d_matrices), metadata.left.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_scalars), metadata.right.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_outputs), metadata.outputs.data(), matrix_count * sizeof(MatrixDescriptor *)},
+    });
+    if (status != 0) return status;
+    cudaError_t error = cudaSuccess;
     constexpr int threads = 256;
     const int blocks = static_cast<int>((total_coefficients + threads - 1) / threads);
     matrix_scalar_mul_batch_kernel<<<blocks, threads, 0, metadata.stream>>>(
         d_matrices,
         d_scalars,
         d_outputs,
-        d_strides,
-        d_bytes,
         d_moduli,
         metadata.limb_count,
         coefficients_per_limb,
@@ -864,7 +856,6 @@ extern "C" int gpu_matrix_mul_scalar_batch(
     error = cudaGetLastError();
     if (error != cudaSuccess)
     {
-        release();
         return set_error(error);
     }
     status = finish_matrix_batch(metadata, outputs, matrices, scalars);
@@ -872,7 +863,6 @@ extern "C" int gpu_matrix_mul_scalar_batch(
     {
         outputs[matrix_idx]->format = matrices[matrix_idx]->format;
     }
-    release();
     return status;
 }
 
@@ -890,12 +880,10 @@ extern "C" int gpu_matrix_mul_batch(
     {
         return set_error("matrix multiplication batch exceeds CUDA grid depth");
     }
-    const uint8_t **d_left = nullptr;
-    const uint8_t **d_right = nullptr;
-    uint8_t **d_outputs = nullptr;
-    size_t *d_strides = nullptr;
-    uint8_t *d_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
+    const MatrixDescriptor **d_left = nullptr;
+    const MatrixDescriptor **d_right = nullptr;
+    const MatrixDescriptor **d_outputs = nullptr;
+    const uint64_t *d_moduli = metadata.context->ntt_device_constants[metadata.limb_ids[0].x].moduli;
     uint64_t *d_reciprocals = nullptr;
     std::vector<uint64_t> reciprocals(metadata.limb_count);
     bool use_thin_row_kernel = metadata.rows == 1;
@@ -904,13 +892,13 @@ extern "C" int gpu_matrix_mul_batch(
     {
         for (size_t limb = 0; limb < metadata.limb_count; ++limb)
         {
-            if (!matrix_barrett_u32_reciprocal(metadata.moduli[limb], &reciprocals[limb]))
+            if (!matrix_barrett_u32_reciprocal(metadata.context->moduli[limb], &reciprocals[limb]))
             {
                 use_thin_row_kernel = false;
                 break;
             }
             lazy_reduction =
-                lazy_reduction && matrix_lazy_dot_u64(metadata.inner, metadata.moduli[limb]);
+                lazy_reduction && matrix_lazy_dot_u64(metadata.inner, metadata.context->moduli[limb]);
         }
     }
     const size_t groups_per_matrix = use_thin_row_kernel
@@ -919,34 +907,15 @@ extern "C" int gpu_matrix_mul_batch(
                                          : metadata.n;
     const size_t coefficient_groups =
         std::min(groups_per_matrix, static_cast<size_t>(65535) / pointer_count);
-    auto release = [&]() {
-        if (d_reciprocals) cudaFreeAsync(d_reciprocals, metadata.stream);
-        if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
-        if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
-        if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
-        if (d_outputs) cudaFreeAsync(d_outputs, metadata.stream);
-        if (d_right) cudaFreeAsync(d_right, metadata.stream);
-        if (d_left) cudaFreeAsync(d_left, metadata.stream);
-    };
-    cudaError_t error = cudaMallocAsync(reinterpret_cast<void **>(&d_left), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_right), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_outputs), pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess && use_thin_row_kernel) error = cudaMallocAsync(reinterpret_cast<void **>(&d_reciprocals), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_left, metadata.left.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_right, metadata.right.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_outputs, metadata.outputs.data(), pointer_count * sizeof(uint8_t *), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count, cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error == cudaSuccess && use_thin_row_kernel) error = cudaMemcpyAsync(d_reciprocals, reciprocals.data(), metadata.limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, metadata.stream);
-    if (error != cudaSuccess)
-    {
-        release();
-        return set_error(error);
-    }
+    MatrixBatchUpload upload;
+    status = upload.initialize(metadata, {
+        {reinterpret_cast<void **>(&d_left), metadata.left.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_right), metadata.right.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_outputs), metadata.outputs.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_reciprocals), reciprocals.data(), use_thin_row_kernel ? metadata.limb_count * sizeof(uint64_t) : 0},
+    });
+    if (status != 0) return status;
+    cudaError_t error = cudaSuccess;
     if (use_thin_row_kernel)
     {
         const dim3 block(kThinMatmulWarpSize, kThinMatmulColumnsPerBlock, 1);
@@ -957,7 +926,7 @@ extern "C" int gpu_matrix_mul_batch(
             1,
             static_cast<unsigned int>(pointer_count * coefficient_groups));
         matrix_thin_row_matmul_batch_kernel<<<grid, block, 0, metadata.stream>>>(
-            d_left, d_right, d_outputs, d_strides, d_bytes, d_moduli, d_reciprocals,
+            d_left, d_right, d_outputs, d_moduli, d_reciprocals,
             metadata.limb_count, metadata.inner, metadata.columns, metadata.n,
             coefficient_groups, lazy_reduction);
     }
@@ -969,18 +938,16 @@ extern "C" int gpu_matrix_mul_batch(
             static_cast<unsigned int>((metadata.rows + kMatmulTileM - 1) / kMatmulTileM),
             static_cast<unsigned int>(pointer_count * coefficient_groups));
         matrix_matmul_batch_kernel<<<grid, block, 0, metadata.stream>>>(
-            d_left, d_right, d_outputs, d_strides, d_bytes, d_moduli, metadata.limb_count,
+            d_left, d_right, d_outputs, d_moduli, metadata.limb_count,
             metadata.rows, metadata.inner, metadata.columns, metadata.n, coefficient_groups);
     }
     error = cudaGetLastError();
     if (error != cudaSuccess)
     {
-        release();
         return set_error(error);
     }
     status = finish_matrix_batch(metadata, outputs, left, right);
     for (size_t matrix_idx = 0; matrix_idx < matrix_count; ++matrix_idx) outputs[matrix_idx]->format = GPU_POLY_FORMAT_EVAL;
-    release();
     return status;
 }
 
@@ -1012,16 +979,15 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
     if (status != 0) return status;
     if (metadata.rows != 1) return set_error("multiply-accumulate requires row matrices");
     const size_t product_total = matrix_count * product_count;
-    const size_t product_pointer_count = product_total * metadata.limb_count;
     const size_t output_pointer_count = matrix_count * metadata.limb_count;
     if (output_pointer_count > 65535)
     {
         return set_error("multiply-accumulate batch exceeds CUDA grid depth");
     }
-    std::vector<const uint8_t *> host_left(product_pointer_count);
-    std::vector<const uint8_t *> host_right(product_pointer_count);
-    std::vector<const uint8_t *> host_coefficients(product_pointer_count, nullptr);
-    std::vector<const uint8_t *> host_biases(output_pointer_count, nullptr);
+    std::vector<const MatrixDescriptor *> host_left(product_total);
+    std::vector<const MatrixDescriptor *> host_right(product_total);
+    std::vector<const MatrixDescriptor *> host_coefficients(product_total, nullptr);
+    std::vector<const MatrixDescriptor *> host_biases(matrix_count, nullptr);
     size_t maximum_inner = 0;
     for (size_t matrix = 0; matrix < matrix_count; ++matrix)
     {
@@ -1045,22 +1011,29 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
             {
                 return set_error("invalid multiply-accumulate product layout");
             }
+            const size_t slot = metadata.limb_ids[0].x;
+            if (slot >= lhs->shared_limb_buffers.size() || slot >= rhs->shared_limb_buffers.size() ||
+                (coefficient && slot >= coefficient->shared_limb_buffers.size()))
+                return set_error("missing multiply-accumulate descriptors");
+            host_left[product_index] = lhs->shared_limb_buffers[slot].device_descriptors;
+            host_right[product_index] = rhs->shared_limb_buffers[slot].device_descriptors;
+            if (coefficient)
+                host_coefficients[product_index] = coefficient->shared_limb_buffers[slot].device_descriptors;
+            if (lhs->shared_limb_buffers[slot].limb_count < metadata.limb_count ||
+                rhs->shared_limb_buffers[slot].limb_count < metadata.limb_count ||
+                (coefficient && coefficient->shared_limb_buffers[slot].limb_count < metadata.limb_count))
+                return set_error("incomplete multiply-accumulate descriptors");
             for (size_t limb = 0; limb < metadata.limb_count; ++limb)
             {
                 const dim3 limb_id = metadata.limb_ids[limb];
-                const size_t pointer_index = product_index * metadata.limb_count + limb;
-                host_left[pointer_index] = matrix_limb_ptr_by_id(lhs, 0, limb_id);
-                host_right[pointer_index] = matrix_limb_ptr_by_id(rhs, 0, limb_id);
-                if (coefficient)
-                    host_coefficients[pointer_index] = matrix_limb_ptr_by_id(coefficient, 0, limb_id);
                 int lhs_device = -1;
                 int rhs_device = -1;
                 size_t lhs_stride = 0;
                 size_t rhs_stride = 0;
                 uint8_t lhs_bytes = 0;
                 uint8_t rhs_bytes = 0;
-                if (!host_left[pointer_index] || !host_right[pointer_index] ||
-                    (coefficient && !host_coefficients[pointer_index]) ||
+                if (!host_left[product_index] || !host_right[product_index] ||
+                    (coefficient && !host_coefficients[product_index]) ||
                     matrix_limb_device(lhs, limb_id, &lhs_device) != 0 ||
                     matrix_limb_device(rhs, limb_id, &rhs_device) != 0 ||
                     !matrix_limb_metadata_by_id(lhs, limb_id, &lhs_stride, &lhs_bytes) ||
@@ -1085,13 +1058,18 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
                      bias->format != GPU_POLY_FORMAT_EVAL || bias->rows != 1 ||
                      bias->cols != metadata.columns))
             return set_error("invalid multiply-accumulate bias layout");
+        if (bias)
+        {
+            const size_t slot = metadata.limb_ids[0].x;
+            if (slot >= bias->shared_limb_buffers.size())
+                return set_error("missing multiply-accumulate bias descriptors");
+            host_biases[matrix] = bias->shared_limb_buffers[slot].device_descriptors;
+            if (!host_biases[matrix] || bias->shared_limb_buffers[slot].limb_count < metadata.limb_count)
+                return set_error("missing multiply-accumulate bias descriptors");
+        }
         for (size_t limb = 0; limb < metadata.limb_count && bias; ++limb)
         {
             const dim3 limb_id = metadata.limb_ids[limb];
-            host_biases[matrix * metadata.limb_count + limb] =
-                matrix_limb_ptr_by_id(bias, 0, limb_id);
-            if (!host_biases[matrix * metadata.limb_count + limb])
-                return set_error("invalid multiply-accumulate bias pointer");
             status = matrix_wait_limb_stream(bias, limb_id, metadata.device, metadata.stream);
             if (status != 0) return status;
         }
@@ -1100,56 +1078,39 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
     bool lazy_reduction = true;
     for (size_t limb = 0; limb < metadata.limb_count; ++limb)
     {
-        if (!matrix_barrett_u32_reciprocal(metadata.moduli[limb], &reciprocals[limb]))
-            return set_error("multiply-accumulate requires 32-bit CRT moduli");
-        lazy_reduction = lazy_reduction &&
-            matrix_lazy_dot_u64(maximum_inner, metadata.moduli[limb]);
+        const bool small_modulus =
+            matrix_barrett_u32_reciprocal(metadata.context->moduli[limb], &reciprocals[limb]);
+        if (!small_modulus)
+        {
+            const unsigned int bits = 64U - __builtin_clzll(metadata.context->moduli[limb]);
+            reciprocals[limb] = bits <= 62
+                ? static_cast<uint64_t>((static_cast<unsigned __int128>(1) << (2 * bits)) /
+                                        metadata.context->moduli[limb])
+                : 0;
+        }
+        lazy_reduction = lazy_reduction && small_modulus &&
+            matrix_lazy_dot_u64(maximum_inner, metadata.context->moduli[limb]);
     }
-    const uint8_t **d_left = nullptr;
-    const uint8_t **d_right = nullptr;
-    const uint8_t **d_coefficients = nullptr;
-    const uint8_t **d_biases = nullptr;
-    uint8_t **d_outputs = nullptr;
+    const MatrixDescriptor **d_left = nullptr;
+    const MatrixDescriptor **d_right = nullptr;
+    const MatrixDescriptor **d_coefficients = nullptr;
+    const MatrixDescriptor **d_biases = nullptr;
+    const MatrixDescriptor **d_outputs = nullptr;
     size_t *d_inner = nullptr;
-    size_t *d_strides = nullptr;
-    uint8_t *d_bytes = nullptr;
-    uint64_t *d_moduli = nullptr;
+    const uint64_t *d_moduli = metadata.context->ntt_device_constants[metadata.limb_ids[0].x].moduli;
     uint64_t *d_reciprocals = nullptr;
-    auto release = [&]() {
-        if (d_reciprocals) cudaFreeAsync(d_reciprocals, metadata.stream);
-        if (d_moduli) cudaFreeAsync(d_moduli, metadata.stream);
-        if (d_bytes) cudaFreeAsync(d_bytes, metadata.stream);
-        if (d_strides) cudaFreeAsync(d_strides, metadata.stream);
-        if (d_inner) cudaFreeAsync(d_inner, metadata.stream);
-        if (d_outputs) cudaFreeAsync(d_outputs, metadata.stream);
-        if (d_biases) cudaFreeAsync(d_biases, metadata.stream);
-        if (d_coefficients) cudaFreeAsync(d_coefficients, metadata.stream);
-        if (d_right) cudaFreeAsync(d_right, metadata.stream);
-        if (d_left) cudaFreeAsync(d_left, metadata.stream);
-    };
-    cudaError_t error = cudaMallocAsync(reinterpret_cast<void **>(&d_left), product_pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_right), product_pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_coefficients), product_pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_biases), output_pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_outputs), output_pointer_count * sizeof(uint8_t *), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_inner), product_total * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_strides), metadata.limb_count * sizeof(size_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_bytes), metadata.limb_count, metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_moduli), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-    if (error == cudaSuccess) error = cudaMallocAsync(reinterpret_cast<void **>(&d_reciprocals), metadata.limb_count * sizeof(uint64_t), metadata.stream);
-#define COPY_ASYNC(dst, src, bytes) if (error == cudaSuccess) error = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, metadata.stream)
-    COPY_ASYNC(d_left, host_left.data(), product_pointer_count * sizeof(uint8_t *));
-    COPY_ASYNC(d_right, host_right.data(), product_pointer_count * sizeof(uint8_t *));
-    COPY_ASYNC(d_coefficients, host_coefficients.data(), product_pointer_count * sizeof(uint8_t *));
-    COPY_ASYNC(d_biases, host_biases.data(), output_pointer_count * sizeof(uint8_t *));
-    COPY_ASYNC(d_outputs, metadata.outputs.data(), output_pointer_count * sizeof(uint8_t *));
-    COPY_ASYNC(d_inner, inner_dimensions, product_total * sizeof(size_t));
-    COPY_ASYNC(d_strides, metadata.strides.data(), metadata.limb_count * sizeof(size_t));
-    COPY_ASYNC(d_bytes, metadata.coefficient_bytes.data(), metadata.limb_count);
-    COPY_ASYNC(d_moduli, metadata.moduli.data(), metadata.limb_count * sizeof(uint64_t));
-    COPY_ASYNC(d_reciprocals, reciprocals.data(), metadata.limb_count * sizeof(uint64_t));
-#undef COPY_ASYNC
-    if (error != cudaSuccess) { release(); return set_error(error); }
+    MatrixBatchUpload upload;
+    status = upload.initialize(metadata, {
+        {reinterpret_cast<void **>(&d_left), host_left.data(), product_total * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_right), host_right.data(), product_total * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_coefficients), host_coefficients.data(), product_total * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_biases), host_biases.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_outputs), metadata.outputs.data(), matrix_count * sizeof(MatrixDescriptor *)},
+        {reinterpret_cast<void **>(&d_inner), inner_dimensions, product_total * sizeof(size_t)},
+        {reinterpret_cast<void **>(&d_reciprocals), reciprocals.data(), metadata.limb_count * sizeof(uint64_t)},
+    });
+    if (status != 0) return status;
+    cudaError_t error = cudaSuccess;
     const size_t groups_per_matrix = (metadata.n + kThinMatmulWarpSize - 1) / kThinMatmulWarpSize;
     const size_t coefficient_groups =
         std::min(groups_per_matrix, static_cast<size_t>(65535) / output_pointer_count);
@@ -1160,11 +1121,11 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
         1,
         static_cast<unsigned int>(output_pointer_count * coefficient_groups));
     matrix_thin_row_mul_accumulate_batch_kernel<<<grid, block, 0, metadata.stream>>>(
-        d_left, d_right, d_coefficients, d_biases, d_outputs, d_inner, d_strides, d_bytes,
+        d_left, d_right, d_coefficients, d_biases, d_outputs, d_inner,
         d_moduli, d_reciprocals, metadata.limb_count, product_count, metadata.columns,
         metadata.n, coefficient_groups, lazy_reduction);
     error = cudaGetLastError();
-    if (error != cudaSuccess) { release(); return set_error(error); }
+    if (error != cudaSuccess) { return set_error(error); }
     for (size_t matrix = 0; matrix < matrix_count; ++matrix)
     {
         for (size_t limb = 0; limb < metadata.limb_count; ++limb)
@@ -1176,18 +1137,17 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
                 status = matrix_track_limb_consumer(left[index], limb_id, metadata.device, metadata.stream);
                 if (status == 0) status = matrix_track_limb_consumer(right[index], limb_id, metadata.device, metadata.stream);
                 if (status == 0 && coefficients[index]) status = matrix_track_limb_consumer(coefficients[index], limb_id, metadata.device, metadata.stream);
-                if (status != 0) { release(); return status; }
+                if (status != 0) { return status; }
             }
             if (biases[matrix])
             {
                 status = matrix_track_limb_consumer(biases[matrix], limb_id, metadata.device, metadata.stream);
-                if (status != 0) { release(); return status; }
+                if (status != 0) { return status; }
             }
             status = matrix_record_limb_write(outputs[matrix], limb_id, metadata.stream);
-            if (status != 0) { release(); return status; }
+            if (status != 0) { return status; }
         }
         outputs[matrix]->format = GPU_POLY_FORMAT_EVAL;
     }
-    release();
     return 0;
 }

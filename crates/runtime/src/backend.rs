@@ -126,6 +126,20 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Explicit preparation boundary for a missing GPU execution profile.
+    /// A preparation dispatch yields before waiting; the caller then advances
+    /// this boundary until the measured profile is ready for normal execution.
+    fn begin_gpu_preparation(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+    fn advance_gpu_preparation(&mut self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+    fn cancel_gpu_preparation(&mut self) {}
+    fn is_gpu_preparation_yield(_error: &Self::Error) -> bool {
+        false
+    }
+
     /// Limit sibling bodies when the backend parallelizes within primitives.
     fn parallel_wave_size(&self, limit: usize) -> usize {
         limit

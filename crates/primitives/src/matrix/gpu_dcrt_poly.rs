@@ -881,7 +881,9 @@ impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
         if self.level + 1 != self.params.crt_depth() || !self.is_ntt {
             return Err(SmallMatrixError::InvalidConfig);
         }
-        let budget = self.params.vram_budget_bytes();
+        // Wave sizing uses the configured percentage; primitive admission is
+        // bounded only by physical capacity, with CUDA reporting actual OOM.
+        let budget = self.params.physical_vram_bytes();
         let report = rhs.allocation_report(self)?;
         validate_small_rhs_budget(&report, budget)?;
         let out =
@@ -2587,16 +2589,25 @@ impl GpuDCRTPolyMatrix {
     }
 
     pub fn concat_rows_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
         let refs = others.iter().collect::<Vec<_>>();
         self.concat_rows_consume_with_refs(&refs)
     }
 
     pub fn concat_columns_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
         let refs = others.iter().collect::<Vec<_>>();
         self.concat_columns_consume_with_refs(&refs)
     }
 
     pub fn concat_diag_owned(self, others: Vec<Self>) -> Self {
+        if others.is_empty() {
+            return self;
+        }
         let refs = others.iter().collect::<Vec<_>>();
         self.concat_diag_consume_with_refs(&refs)
     }
@@ -4468,6 +4479,97 @@ mod tests {
 
         assert_eq!(actual.size(), (1, 4));
         assert_eq!(actual.to_cpu_matrix(), expected);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_multiply_accumulate_full_modulus_matches_cpu() {
+        gpu_device_sync();
+        let mut random = rng();
+        for crt_bits in [17, 33, 40, 50, 60] {
+            let cpu_params = DCRTPolyParams::new(32, 2, crt_bits, 8, None, None);
+            let gpu_params = gpu_params_from_cpu(&cpu_params);
+            let mut requests = Vec::new();
+            let mut expected = Vec::new();
+            for _ in 0..3 {
+                let left = random_cpu_matrix(&cpu_params, 1, 3, &mut random);
+                let right = random_cpu_matrix(&cpu_params, 3, 5, &mut random);
+                let bias = random_cpu_matrix(&cpu_params, 1, 5, &mut random);
+                expected.push(&(&left * &right) + &bias);
+                requests.push((
+                    vec![(
+                        None,
+                        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left)),
+                        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &right)),
+                    )],
+                    Some(Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &bias))),
+                ));
+            }
+            let actual = GpuDCRTPolyMatrix::multiply_accumulate_batch_out_of_place(requests);
+            assert_eq!(
+                actual.iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_batch_submission_timing_matches_cpu() {
+        let (n, depth, crt_bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let (batch_size, inner, columns) = crate::env::matrix_batch_test_shape();
+        let cpu_params = DCRTPolyParams::new(n, depth, crt_bits, base_bits, None, None);
+        let gpu_params = gpu_params_from_cpu(&cpu_params);
+        let mut random = rng();
+        let mut requests = Vec::with_capacity(batch_size);
+        let mut expected = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let left = random_cpu_matrix(&cpu_params, 1, inner, &mut random);
+            let right = random_cpu_matrix(&cpu_params, inner, columns, &mut random);
+            let bias = random_cpu_matrix(&cpu_params, 1, columns, &mut random);
+            let second_left = random_cpu_matrix(&cpu_params, 1, inner + 1, &mut random);
+            let second_right = random_cpu_matrix(&cpu_params, inner + 1, columns, &mut random);
+            let scalar = random.random_range(1..8);
+            let coefficient = DCRTPoly::from_usize_to_constant(&cpu_params, scalar);
+            let second_product =
+                (&second_left * &second_right).multiply_poly_out_of_place(&coefficient);
+            expected.push(&(&(&left * &right) + &second_product) + &bias);
+            requests.push((
+                vec![
+                    (
+                        None,
+                        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left)),
+                        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &right)),
+                    ),
+                    (
+                        Some(GpuDCRTPoly::from_usize_to_constant(&gpu_params, scalar)),
+                        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &second_left)),
+                        Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &second_right)),
+                    ),
+                ],
+                Some(Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &bias))),
+            ));
+        }
+        // Complete setup and one production warmup before starting the matched
+        // timer. Result-event waits are included; D2H and CPU oracle are not.
+        let warmup = GpuDCRTPolyMatrix::multiply_accumulate_batch_out_of_place(requests.clone());
+        for output in &warmup {
+            output.wait_until_ready();
+        }
+        drop(warmup);
+        let started = std::time::Instant::now();
+        let actual = GpuDCRTPolyMatrix::multiply_accumulate_batch_out_of_place(requests);
+        for output in &actual {
+            output.wait_until_ready();
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "gpu_matrix_batch_submission_timing seconds={seconds:.9} n={n} crt_depth={depth} crt_bits={crt_bits} batch_size={batch_size} inner={inner} columns={columns} products=2 warmups=1 iterations=1"
+        );
+        assert_eq!(
+            actual.iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

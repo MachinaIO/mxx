@@ -841,6 +841,26 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
     }
 }
 
+#[test]
+fn test_cpu_rns_bgg_lwr_prf_one_output_round_trip() {
+    use mxx_primitives::matrix::PolyMatrix;
+    rns_bgg::run(
+        rns_bgg_prf(),
+        |parameters| mxx_runtime::backend::poly::cpu_backend(parameters.levels().iter().cloned()),
+        |_| {},
+        |matrix, name, q, bound| {
+            for row in 0..matrix.row_size() {
+                for col in 0..matrix.col_size() {
+                    for value in matrix.entry(row, col).coeffs_biguints() {
+                        let magnitude = value.clone().min(q - &value);
+                        assert!(&magnitude <= bound, "{name}: {magnitude} > {bound}");
+                    }
+                }
+            }
+        },
+    );
+}
+
 fn run_rns_bgg(fixture: rns_bgg::RnsBggRoundTrip) {
     use mxx_primitives::{
         matrix::PolyMatrix,
@@ -1245,6 +1265,84 @@ mod rns_bgg {
         pub noise_report: serde_json::Value,
     }
 
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OnlineCheckpoint {
+        source: mxx_ir_core::Graph,
+        bindings: mxx_ir_core::ParamEnv,
+        levels: Vec<mxx_primitives::poly::dcrt::params::DCRTPolyParams>,
+        eta: usize,
+        production_id: ProductionId,
+        bounds: BTreeMap<String, (BigUint, BigUint)>,
+        noise_report: serde_json::Value,
+        preprocess_seconds: f64,
+        reopen_seconds: f64,
+        online_graph_seconds: f64,
+    }
+
+    #[test]
+    #[ignore = "requires an existing online checkpoint in MXX_EXPONENT_LUT_BENCH_CHECKPOINT"]
+    fn test_gpu_rns_bgg_saved_online_checkpoint() {
+        use mxx_primitives::{
+            matrix::PolyMatrix,
+            poly::{
+                Poly, PolyParams,
+                dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+            },
+        };
+        let path = std::path::PathBuf::from(
+            std::env::var_os("MXX_EXPONENT_LUT_BENCH_CHECKPOINT")
+                .expect("MXX_EXPONENT_LUT_BENCH_CHECKPOINT must name an existing checkpoint"),
+        );
+        let checkpoint: OnlineCheckpoint =
+            serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(&path).unwrap()))
+                .unwrap();
+        let parameters = RnsBggParameters::new(checkpoint.levels, checkpoint.eta).unwrap();
+        let mut store = FileArtifactStore::open(path.parent().unwrap()).unwrap();
+        let manifest = store.load_manifest(&checkpoint.production_id).unwrap();
+        let graph = mxx_ir_core::validate_with_manifests(
+            &checkpoint.source,
+            &checkpoint.bindings,
+            &BTreeMap::from([(checkpoint.production_id, manifest)]),
+        )
+        .unwrap();
+        let devices = detected_gpu_device_ids();
+        assert!(!devices.is_empty(), "saved online checkpoint requires a detected GPU");
+        let rings = parameters.levels().iter().map(|parameters| {
+            GpuDCRTPolyParams::new(
+                parameters.ring_dimension(),
+                parameters.to_crt().0,
+                parameters.base_bits(),
+                None,
+            )
+        });
+        let mut backend = mxx_runtime::backend::poly::gpu::gpu_backend_on(rings, devices);
+        let result = execute_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        for (name, value) in result.outputs {
+            let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial output") };
+            let (q, bound) = &checkpoint.bounds[&name];
+            for shard in matrix.shards() {
+                let host = shard.value.to_cpu_matrix();
+                for row in 0..host.row_size() {
+                    for col in 0..host.col_size() {
+                        for value in host.entry(row, col).coeffs_biguints() {
+                            let magnitude = value.clone().min(q - &value);
+                            assert!(&magnitude <= bound, "{name}: {magnitude} > {bound}");
+                        }
+                    }
+                }
+            }
+        }
+        println!("prf_saved_online_checkpoint_gpu correctness=true path={}", path.display());
+    }
+
     pub fn run<B: Backend>(
         fixture: RnsBggRoundTrip,
         make_backend: impl FnOnce(&RnsBggParameters) -> B,
@@ -1350,7 +1448,15 @@ mod rns_bgg {
             let measured = true;
             println!("prf_round_trip_start iteration={iteration} measured={measured}");
             let directory = tempfile::tempdir_in("test_data/rns_bgg_round_trip").unwrap();
-            let mut store = FileArtifactStore::new(directory.path()).unwrap();
+            let durable =
+                std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("roundtrip");
+            let (directory_path, _temporary_directory) = if durable {
+                (directory.keep(), None)
+            } else {
+                (directory.path().to_path_buf(), Some(directory))
+            };
+            println!("prf_artifact_directory={}", directory_path.display());
+            let mut store = FileArtifactStore::new(&directory_path).unwrap();
             let round_trip_started = std::time::Instant::now();
             let started = std::time::Instant::now();
             let produced = execute_with_config(
@@ -1378,12 +1484,63 @@ mod rns_bgg {
             drop(produced.outputs);
             drop(store);
             let started = std::time::Instant::now();
-            let mut store = FileArtifactStore::open(directory.path()).unwrap();
+            let mut store = FileArtifactStore::open(&directory_path).unwrap();
             let manifest = store.load_manifest(&production).unwrap();
             let reopen_seconds = started.elapsed().as_secs_f64();
             let started = std::time::Instant::now();
-            let consumer = (fixture.online)(production, manifest, true);
+            let consumer = (fixture.online)(production.clone(), manifest.clone(), true);
             let online_graph_seconds = started.elapsed().as_secs_f64();
+            let mut checkpoint_seconds = 0.0;
+            let consumer = if durable {
+                let started = std::time::Instant::now();
+                let checkpoint = OnlineCheckpoint {
+                    source: consumer.source,
+                    bindings: consumer.bindings,
+                    levels: fixture.parameters.levels().to_vec(),
+                    eta: fixture.parameters.eta(),
+                    production_id: production.clone(),
+                    bounds: fixture.bounds.clone(),
+                    noise_report: fixture.noise_report.clone(),
+                    preprocess_seconds,
+                    reopen_seconds,
+                    online_graph_seconds,
+                };
+                let checkpoint_path = directory_path.join("online-checkpoint.json");
+                let mut temporary = tempfile::NamedTempFile::new_in(&directory_path).unwrap();
+                {
+                    let mut writer = std::io::BufWriter::new(temporary.as_file_mut());
+                    serde_json::to_writer(&mut writer, &checkpoint).unwrap();
+                    std::io::Write::flush(&mut writer).unwrap();
+                }
+                temporary.as_file().sync_all().unwrap();
+                temporary.persist(&checkpoint_path).unwrap();
+                std::fs::File::open(&directory_path).unwrap().sync_all().unwrap();
+                drop(checkpoint);
+                let restored: OnlineCheckpoint = serde_json::from_reader(std::io::BufReader::new(
+                    std::fs::File::open(&checkpoint_path).unwrap(),
+                ))
+                .unwrap();
+                assert_eq!(restored.production_id, production);
+                assert_eq!(restored.bounds, fixture.bounds);
+                assert_eq!(restored.noise_report, fixture.noise_report);
+                let parameters = RnsBggParameters::new(restored.levels, restored.eta).unwrap();
+                assert_eq!(parameters.levels(), fixture.parameters.levels());
+                assert_eq!(parameters.eta(), fixture.parameters.eta());
+                let consumer = mxx_ir_core::validate_with_manifests(
+                    &restored.source,
+                    &restored.bindings,
+                    &BTreeMap::from([(production, manifest)]),
+                )
+                .unwrap();
+                checkpoint_seconds = started.elapsed().as_secs_f64();
+                println!(
+                    "prf_online_checkpoint={} checkpoint_seconds={checkpoint_seconds}",
+                    checkpoint_path.display()
+                );
+                consumer
+            } else {
+                consumer
+            };
             let started = std::time::Instant::now();
             let result = execute_with_config(
                 &consumer,
@@ -1409,7 +1566,7 @@ mod rns_bgg {
             let verification_seconds = started.elapsed().as_secs_f64();
             let round_trip_seconds = round_trip_started.elapsed().as_secs_f64();
             println!(
-                "prf_round_trip_timing iteration={iteration} measured={measured} preprocess_seconds={preprocess_seconds} reopen_seconds={reopen_seconds} online_graph_seconds={online_graph_seconds} online_eval_seconds={online_eval_seconds} verification_seconds={verification_seconds} round_trip_seconds={round_trip_seconds} correctness=true"
+                "prf_round_trip_timing iteration={iteration} measured={measured} preprocess_seconds={preprocess_seconds} reopen_seconds={reopen_seconds} online_graph_seconds={online_graph_seconds} checkpoint_seconds={checkpoint_seconds} online_eval_seconds={online_eval_seconds} verification_seconds={verification_seconds} round_trip_seconds={round_trip_seconds} correctness=true"
             );
         }
     }

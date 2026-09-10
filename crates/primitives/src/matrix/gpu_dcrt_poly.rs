@@ -10,12 +10,13 @@ use crate::{
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
                 GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GpuP1CovarianceCacheOpaque,
                 GpuRngSeed, GpuSmallMatrixAllocationReportRaw, GpuSmallMatrixOpaque,
-                PinnedHostBuffer, check_status, gpu_event_set_destroy, gpu_event_set_wait,
-                gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_add_row_blocks,
-                gpu_matrix_binary_batch, gpu_matrix_centered_rebase, gpu_matrix_convert_modulus,
-                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
-                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
-                gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
+                PinnedHostBuffer, check_status, gpu_event_set_defer_pinned_free,
+                gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
+                gpu_matrix_add_row_blocks, gpu_matrix_binary_batch, gpu_matrix_centered_rebase,
+                gpu_matrix_convert_modulus, gpu_matrix_copy, gpu_matrix_copy_block,
+                gpu_matrix_copy_peer, gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
+                gpu_matrix_crt_recompose, gpu_matrix_decompose_base,
+                gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
                 gpu_matrix_fill_gadget_columns, gpu_matrix_fill_identity_columns,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_unit_row_columns,
@@ -31,7 +32,7 @@ use crate::{
                 gpu_matrix_store_compact_bytes, gpu_matrix_store_compact_bytes_batch,
                 gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
                 gpu_matrix_sum_rows, gpu_matrix_tensor, gpu_matrix_tensor_sum_rows,
-                gpu_matrix_transpose, gpu_matrix_wait, gpu_small_matrix_copy,
+                gpu_matrix_transpose, gpu_matrix_wait, gpu_matrix_zero, gpu_small_matrix_copy,
                 gpu_small_matrix_copy_columns, gpu_small_matrix_create,
                 gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
                 gpu_small_matrix_load_coefficients, gpu_small_matrix_prepare_preimage_hard_cutoff,
@@ -492,36 +493,49 @@ impl GpuSmallMatrix {
         if payload.len() != expected {
             return Err(SmallMatrixError::PayloadLength);
         }
-        let modulus: BigUint = params.modulus().as_ref().clone();
-        for coefficient in payload.chunks_exact(width) {
-            let sign = coefficient[0];
-            let magnitude = BigUint::from_bytes_le(&coefficient[1..]);
-            if magnitude > *bound {
-                return Err(SmallMatrixError::BoundExceeded);
+        // Bounds are shared by every coefficient. Compare canonical bytes directly
+        // instead of allocating multiple big integers per coefficient on import/export.
+        let limit_bytes = |limit: BigUint| {
+            let mut bytes = limit.to_bytes_le();
+            if bytes.len() > magnitude_bytes {
+                None // Every representable magnitude is below this limit.
+            } else {
+                bytes.resize(magnitude_bytes, 0);
+                Some(bytes)
             }
+        };
+        let bound_bytes = limit_bytes(bound.clone());
+        let modulus: BigUint = params.modulus().as_ref().clone();
+        let modulus_limit = limit_bytes(&modulus - BigUint::from(1u8));
+        let positive_limit = limit_bytes(&modulus >> 1usize);
+        let negative_limit = limit_bytes((&modulus - BigUint::from(1u8)) >> 1usize);
+        let exceeds = |magnitude: &[u8], limit: &Option<Vec<u8>>| {
+            limit
+                .as_ref()
+                .is_some_and(|limit| magnitude.iter().rev().cmp(limit.iter().rev()).is_gt())
+        };
+        let error = payload.par_chunks_exact(width).find_map_first(|coefficient| {
+            let sign = coefficient[0];
+            let magnitude = &coefficient[1..];
+            if exceeds(magnitude, &bound_bytes) {
+                return Some(SmallMatrixError::BoundExceeded);
+            }
+            let zero = magnitude.iter().all(|byte| *byte == 0);
             match sign {
-                0 if !magnitude.is_zero() => return Err(SmallMatrixError::NonCanonicalCoefficient),
-                0 => {}
-                1 | 2 if magnitude.is_zero() => {
-                    return Err(SmallMatrixError::NonCanonicalCoefficient)
-                }
-                1 | 2 if magnitude >= modulus => {
-                    return Err(SmallMatrixError::CoefficientOutOfRange)
+                0 if !zero => return Some(SmallMatrixError::NonCanonicalCoefficient),
+                0 => return None,
+                1 | 2 if zero => return Some(SmallMatrixError::NonCanonicalCoefficient),
+                1 | 2 if exceeds(magnitude, &modulus_limit) => {
+                    return Some(SmallMatrixError::CoefficientOutOfRange);
                 }
                 1 | 2 => {}
-                _ => return Err(SmallMatrixError::InvalidSign),
+                _ => return Some(SmallMatrixError::InvalidSign),
             }
-            if !magnitude.is_zero() {
-                let doubled = &magnitude * 2u8;
-                let non_canonical = match sign {
-                    1 => doubled > modulus,
-                    2 => doubled >= modulus,
-                    _ => false,
-                };
-                if non_canonical {
-                    return Err(SmallMatrixError::NonCanonicalCoefficient);
-                }
-            }
+            let limit = if sign == 1 { &positive_limit } else { &negative_limit };
+            exceeds(magnitude, limit).then_some(SmallMatrixError::NonCanonicalCoefficient)
+        });
+        if let Some(error) = error {
+            return Err(error);
         }
         Ok(magnitude_bytes)
     }
@@ -716,6 +730,30 @@ impl GpuSmallMatrix {
 
 impl SmallPolyMatrix for GpuSmallMatrix {
     type Params = GpuDCRTPolyParams;
+
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String> {
+        let source_primes = self.params.to_crt().0;
+        let target_primes = destination.to_crt().0;
+        if self.params.ring_dimension() != destination.ring_dimension() ||
+            self.params.gpu_ids() != destination.gpu_ids() ||
+            source_primes.iter().any(|prime| !target_primes.contains(prime))
+        {
+            return Err("bounded extension requires a containing basis on the same device".into());
+        }
+        // The compact payload contains signed integers, not CRT residues.
+        // Copy into the destination owner while retaining the exact bound;
+        // expansion into its limbs happens only inside bounded multiplication.
+        let out = Self::new_empty(
+            destination,
+            self.rows,
+            self.columns,
+            self.max_coefficient_bound.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let status = unsafe { gpu_small_matrix_copy(out.raw, self.raw) };
+        check_status(status, "gpu_small_matrix_copy(centered_extend)");
+        Ok(out)
+    }
 
     fn params(&self) -> &Self::Params {
         &self.params
@@ -975,6 +1013,50 @@ impl Drop for GpuP1CovarianceCache {
     }
 }
 
+/// An in-flight D2H chunk. The source and pinned destination stay alive until
+/// completion; consumers may enqueue the next H2D chunk before calling `finish`.
+pub struct GpuRnsSnapshotTransfer<'a> {
+    snapshot: Option<GpuDCRTMatrixRnsSnapshot>,
+    events: *mut GpuEventSetOpaque,
+    _source: &'a GpuDCRTPolyMatrix,
+}
+
+impl GpuRnsSnapshotTransfer<'_> {
+    pub fn finish(mut self) -> GpuDCRTMatrixRnsSnapshot {
+        check_status(self.wait(), "GPU RNS D2H completion");
+        self.snapshot.take().expect("snapshot transfer owns its buffer")
+    }
+
+    fn wait(&mut self) -> i32 {
+        if self.events.is_null() {
+            return 0;
+        }
+        let status = unsafe { gpu_event_set_wait(self.events) };
+        if status == 0 {
+            unsafe { gpu_event_set_destroy(self.events) };
+        } else {
+            // An unsuccessful wait cannot prove that DMA stopped. Retain both
+            // the event and pinned destination instead of returning it to the pool.
+            if let Some(snapshot) = self.snapshot.take() {
+                std::mem::forget(snapshot);
+            }
+        }
+        self.events = ptr::null_mut();
+        status
+    }
+}
+
+impl Drop for GpuRnsSnapshotTransfer<'_> {
+    fn drop(&mut self) {
+        let status = self.wait();
+        // An earlier failure may already be unwinding this transfer's owner.
+        // Preserve uncertain buffers above without causing a second panic.
+        if !std::thread::panicking() {
+            check_status(status, "GPU RNS D2H completion");
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuDCRTMatrixRnsSnapshot {
     nrow: usize,
@@ -1175,6 +1257,8 @@ impl GpuDCRTPolyMatrix {
                 i32::from(round_scale),
                 division_inverses.as_ptr(),
                 division_inverses.len(),
+                0,
+                std::ptr::null(),
             )
         };
         check_status(status, "gpu_matrix_convert_modulus");
@@ -1824,19 +1908,12 @@ impl GpuDCRTPolyMatrix {
         level: usize,
         is_ntt: bool,
     ) -> Self {
-        let mut out = Self::new_empty_with_state(params, nrow, ncol, level, is_ntt, None);
+        let out = Self::new_empty_with_state(params, nrow, ncol, level, is_ntt, None);
         if nrow == 0 || ncol == 0 {
             return out;
         }
-        let bytes_per_poly =
-            (level + 1).saturating_mul(params.ring_dimension() as usize).saturating_mul(8);
-        if bytes_per_poly == 0 {
-            return out;
-        }
-        let total = nrow.saturating_mul(ncol);
-        let bytes = vec![0u8; total.saturating_mul(bytes_per_poly)];
-        let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        out.load_rns_bytes(&bytes, bytes_per_poly, format);
+        let status = unsafe { gpu_matrix_zero(out.raw) };
+        check_status(status, "gpu_matrix_zero");
         out
     }
 
@@ -2335,14 +2412,24 @@ impl GpuDCRTPolyMatrix {
     }
 
     pub(crate) fn load_rns_bytes(&mut self, bytes: &[u8], bytes_per_poly: usize, format: i32) {
-        if bytes.is_empty() || bytes_per_poly == 0 {
+        self.load_rns_pinned(PinnedHostBuffer::from_slice(bytes), bytes_per_poly, format);
+    }
+
+    fn load_rns_pinned(
+        &mut self,
+        pinned: PinnedHostBuffer<u8>,
+        bytes_per_poly: usize,
+        format: i32,
+    ) {
+        if pinned.as_slice().is_empty() || bytes_per_poly == 0 {
             return;
         }
+        // Transfer ownership instead of copying an already pinned chunk.
         let mut events: *mut GpuEventSetOpaque = ptr::null_mut();
         let status = unsafe {
             gpu_matrix_load_rns_batch(
                 self.raw,
-                bytes.as_ptr(),
+                pinned.as_slice().as_ptr(),
                 bytes_per_poly,
                 format,
                 &mut events as *mut *mut GpuEventSetOpaque,
@@ -2355,34 +2442,72 @@ impl GpuDCRTPolyMatrix {
             self.level,
             self.is_ntt,
             format,
-            bytes.len(),
+            pinned.as_slice().len(),
             bytes_per_poly,
             self.params.ring_dimension(),
             self.params.crt_depth()
         );
         debug!("{context}");
-        check_status(status, &context);
+        if status != 0 {
+            // The native call may have enqueued DMA before failing to create
+            // completion events. Never recycle its source while completion is unknown.
+            std::mem::forget(pinned);
+            check_status(status, &context);
+            return;
+        }
         if !events.is_null() {
-            let wait_status = unsafe { gpu_event_set_wait(events) };
-            unsafe { gpu_event_set_destroy(events) };
-            check_status(wait_status, "gpu_event_set_wait");
+            let status = unsafe {
+                gpu_event_set_defer_pinned_free(self.params.ctx_raw(), events, pinned.into_raw())
+            };
+            check_status(status, "gpu_event_set_defer_pinned_free");
         }
         self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
     }
 
     pub fn to_rns_snapshot(&self) -> GpuDCRTMatrixRnsSnapshot {
+        self.start_rns_snapshot(None).finish()
+    }
+
+    pub fn start_rns_snapshot(
+        &self,
+        reusable: Option<GpuDCRTMatrixRnsSnapshot>,
+    ) -> GpuRnsSnapshotTransfer<'_> {
         let bytes_per_poly = rns_bytes_len_for_level(&self.params, self.level);
         let poly_count = self.nrow.checked_mul(self.ncol).expect("matrix shape overflow");
-        let mut bytes = PinnedHostBuffer::zeroed(poly_count.saturating_mul(bytes_per_poly));
+        let mut bytes =
+            reusable.map(|snapshot| snapshot.bytes).unwrap_or_else(PinnedHostBuffer::new);
+        bytes.resize_for_overwrite(poly_count.saturating_mul(bytes_per_poly));
         let format = if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
-        self.store_rns_bytes(bytes.as_mut_slice(), bytes_per_poly, format);
-        GpuDCRTMatrixRnsSnapshot {
-            nrow: self.nrow,
-            ncol: self.ncol,
-            level: self.level,
-            is_ntt: self.is_ntt,
-            bytes_per_poly,
-            bytes,
+        let mut events = ptr::null_mut();
+        if !bytes.as_slice().is_empty() {
+            let status = unsafe {
+                gpu_matrix_store_rns_batch(
+                    self.raw,
+                    bytes.as_mut_slice().as_mut_ptr(),
+                    bytes_per_poly,
+                    format,
+                    &mut events,
+                )
+            };
+            if status != 0 {
+                // Partial submission can leave D2H DMA using this destination
+                // without a completion event. Keep it out of the reuse pool.
+                std::mem::forget(bytes);
+                check_status(status, "gpu_matrix_store_rns_batch");
+                unreachable!("nonzero GPU status must panic");
+            }
+        }
+        GpuRnsSnapshotTransfer {
+            snapshot: Some(GpuDCRTMatrixRnsSnapshot {
+                nrow: self.nrow,
+                ncol: self.ncol,
+                level: self.level,
+                is_ntt: self.is_ntt,
+                bytes_per_poly,
+                bytes,
+            }),
+            events,
+            _source: self,
         }
     }
 
@@ -3389,50 +3514,40 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let columns = end - start;
         let row_bytes = columns.checked_mul(bytes_per_poly).expect("RNS tile row overflow");
         let tile_bytes = nrow.checked_mul(row_bytes).expect("RNS tile byte length overflow");
-        let mut tile = PinnedHostBuffer::zeroed(tile_bytes);
-        // The serialized RNS payload is polynomial-major and row-major. Only
-        // selected columns enter pinned staging and device storage.
-        if row_bytes != 0 {
-            tile.as_mut_slice().par_chunks_mut(row_bytes).enumerate().for_each(|(row, target)| {
-                let offset = (row * ncol + start) * bytes_per_poly;
-                target.copy_from_slice(&payload[offset..offset + row_bytes]);
-            });
-        }
-        Self::from_rns_snapshot(
-            params,
-            &GpuDCRTMatrixRnsSnapshot {
-                nrow,
-                ncol: columns,
-                level,
-                is_ntt,
-                bytes_per_poly,
-                bytes: tile,
-            },
-        )
+        // Create the destination first so pinned allocation uses its active
+        // device and can reuse that device's completed transfer buffers.
+        let mut out = Self::new_empty_with_state(params, nrow, columns, level, is_ntt, None);
+        // A row or a full-column selection is contiguous. Initialize pinned
+        // storage directly from it, without first zeroing the same large span.
+        let tile = if nrow == 1 || (start == 0 && end == ncol) {
+            let offset = start * bytes_per_poly;
+            PinnedHostBuffer::from_slice(&payload[offset..offset + tile_bytes])
+        } else {
+            let mut tile = PinnedHostBuffer::zeroed(tile_bytes);
+            if row_bytes != 0 {
+                tile.as_mut_slice().par_chunks_mut(bytes_per_poly).enumerate().for_each(
+                    |(index, target)| {
+                        let row = index / columns;
+                        let column = index % columns;
+                        let offset = (row * ncol + start + column) * bytes_per_poly;
+                        target.copy_from_slice(&payload[offset..offset + bytes_per_poly]);
+                    },
+                );
+            }
+            tile
+        };
+        let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        out.load_rns_pinned(tile, bytes_per_poly, format);
+        out
     }
 
     fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
-        let (version, nrow, ncol, level, is_ntt, bytes_per_poly, payload): (
-            u8,
+        let ((_, _, columns, _, _, _, _), _): (
+            (u8, usize, usize, usize, bool, usize, &[u8]),
             usize,
-            usize,
-            usize,
-            bool,
-            usize,
-            Vec<u8>,
-        ) = bincode::decode_from_slice(bytes, bincode::config::standard())
-            .expect("Failed to deserialize GPU matrix RNS staging bytes")
-            .0;
-        assert_eq!(version, 1, "Unsupported GPU matrix RNS staging version: {version}");
-        let snapshot = GpuDCRTMatrixRnsSnapshot {
-            nrow,
-            ncol,
-            level,
-            is_ntt,
-            bytes_per_poly,
-            bytes: PinnedHostBuffer::from_slice(&payload),
-        };
-        Self::from_rns_snapshot(params, &snapshot)
+        ) = bincode::borrow_decode_from_slice(bytes, bincode::config::standard())
+            .expect("GPU matrix RNS staging header");
+        Self::from_cpu_staging_columns(params, bytes, 0, columns)
     }
 
     fn copy_to_params_direct(&self, params: &<Self::P as Poly>::Params) -> Option<Self> {
@@ -3877,6 +3992,18 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         }
         output.ntt_all_in_place();
         Ok(output)
+    }
+
+    fn centered_extend(&self, destination: &GpuDCRTPolyParams) -> Result<Self, String> {
+        self.exact_centered_conversion(destination, None)
+    }
+
+    fn block_mod_switch(
+        &self,
+        destination: &GpuDCRTPolyParams,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String> {
+        self.exact_centered_conversion(destination, Some(plaintext_modulus))
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
@@ -4349,6 +4476,44 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_rns_transfer_pipeline_round_trip() {
+        for cpu in [gpu_test_params(), DCRTPolyParams::new(128, 3, 40, 4, None, None)] {
+            let params = gpu_params_from_cpu(&cpu);
+            let mut random = rng();
+            let matrices =
+                (0..3).map(|_| random_cpu_matrix(&cpu, 2, 5, &mut random)).collect::<Vec<_>>();
+            let inputs = matrices
+                .iter()
+                .map(|matrix| {
+                    GpuDCRTPolyMatrix::from_cpu_matrix(&params, matrix).into_cpu_staging_bytes()
+                })
+                .collect::<Vec<_>>();
+            let mut current = GpuDCRTPolyMatrix::from_cpu_staging_bytes(&params, &inputs[0]);
+            for index in 0..inputs.len() {
+                let output = -&current;
+                let store = output.start_rns_snapshot(None);
+                // Previous output D2H and next input H2D are enqueued before either
+                // is awaited. Only two input/output chunks are kept live.
+                let next = inputs
+                    .get(index + 1)
+                    .map(|bytes| GpuDCRTPolyMatrix::from_cpu_staging_bytes(&params, bytes));
+                let snapshot = store.finish();
+                let restored = GpuDCRTPolyMatrix::from_rns_snapshot(&params, &snapshot);
+                assert_eq!(
+                    restored.to_cpu_matrix(),
+                    DCRTPolyMatrix::zero(&cpu, 2, 5) - matrices[index].clone()
+                );
+                if let Some(next) = next {
+                    current = next;
+                }
+            }
+            // Dropping a pending transfer must also protect its pinned destination.
+            drop(current.start_rns_snapshot(None));
+        }
     }
 
     fn signed_cycle_cpu_matrix(
@@ -5739,6 +5904,42 @@ mod tests {
         let cpu_params = DCRTPolyParams::new(32, 1, 17, 2, None, None);
         let gpu_params = gpu_params_from_cpu(&cpu_params);
         let bound = BigUint::from(255u32);
+        let modulus = gpu_params.modulus().as_ref().clone();
+        for limit in [BigUint::from(3u8), bound.clone(), modulus.clone()] {
+            let width = 1 + limit.bits().div_ceil(8).max(1) as usize;
+            for magnitude in [
+                BigUint::ZERO,
+                BigUint::from(1u8),
+                limit.clone(),
+                &limit + BigUint::from(1u8),
+                &modulus >> 1usize,
+                (&modulus >> 1usize) + BigUint::from(1u8),
+                modulus.clone(),
+            ] {
+                let bytes = magnitude.to_bytes_le();
+                if bytes.len() >= width {
+                    continue;
+                }
+                let mut payload = vec![0; cpu_params.ring_dimension() as usize * width];
+                payload[1..1 + bytes.len()].copy_from_slice(&bytes);
+                for sign in 0..=3 {
+                    payload[0] = sign;
+                    let expected = CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+                        &cpu_params,
+                        1,
+                        1,
+                        limit.clone(),
+                        &payload,
+                    );
+                    assert_eq!(
+                        GpuSmallMatrix::validate_payload(&gpu_params, 1, 1, &limit, &payload)
+                            .map(|_| ()),
+                        expected.map(|_| ()),
+                        "bound={limit}, magnitude={magnitude}, sign={sign}",
+                    );
+                }
+            }
+        }
         let width = 1usize;
         let ring_dimension = gpu_params.ring_dimension() as usize;
         let mut payload = vec![0u8; 2 * ring_dimension * (1 + width)];

@@ -148,6 +148,11 @@ unsafe extern "C" {
     ) -> c_int;
     fn gpu_context_fence_releases(ctx: *const GpuContextOpaque) -> c_int;
 
+    pub(crate) fn gpu_event_set_defer_pinned_free(
+        ctx: *mut GpuContextOpaque,
+        events: *mut GpuEventSetOpaque,
+        pointer: *mut u8,
+    ) -> c_int;
     pub(crate) fn gpu_event_set_wait(events: *mut GpuEventSetOpaque) -> c_int;
     pub(crate) fn gpu_event_set_destroy(events: *mut GpuEventSetOpaque);
 
@@ -342,9 +347,11 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_convert_modulus(
         out: *mut GpuMatrixOpaque,
         source: *const GpuMatrixOpaque,
-        round_scale: c_int,
+        conversion: c_int,
         division_inverses: *const u64,
         inverse_count: usize,
+        plaintext_modulus: u64,
+        input_scales: *const u64,
     ) -> c_int;
     pub(crate) fn gpu_matrix_crt_recompose(
         out: *mut GpuMatrixOpaque,
@@ -364,6 +371,7 @@ unsafe extern "C" {
         rows: usize,
         cols: usize,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_zero(out: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_fill_identity_columns(
         out: *mut GpuMatrixOpaque,
         full_size: usize,
@@ -754,6 +762,12 @@ impl<T> PinnedHostBuffer<T> {
         Self { ptr: NonNull::dangling(), len: 0, cap: 0 }
     }
 
+    pub(crate) fn into_raw(self) -> *mut T {
+        let pointer = self.ptr.as_ptr();
+        mem::forget(self);
+        pointer
+    }
+
     pub(crate) fn as_slice(&self) -> &[T] {
         if self.len == 0 {
             &[]
@@ -771,7 +785,7 @@ impl<T> PinnedHostBuffer<T> {
     }
 }
 
-impl<T: Copy> PinnedHostBuffer<T> {
+impl<T: Copy + Send + Sync> PinnedHostBuffer<T> {
     pub(crate) fn zeroed(len: usize) -> Self {
         if len == 0 {
             return Self::new();
@@ -781,14 +795,32 @@ impl<T: Copy> PinnedHostBuffer<T> {
         Self { ptr, len, cap: len }
     }
 
+    pub(crate) fn resize_for_overwrite(&mut self, len: usize) {
+        if len > self.cap {
+            *self = Self::zeroed(len);
+        } else {
+            self.len = len;
+        }
+    }
+
     pub(crate) fn from_slice(slice: &[T]) -> Self {
         if slice.is_empty() {
             return Self::new();
         }
         let ptr = pinned_alloc::<T>(slice.len());
-        unsafe {
-            ptr::copy_nonoverlapping(slice.as_ptr(), ptr.as_ptr(), slice.len());
-        }
+        let destination = ptr.as_ptr() as usize;
+        let chunk = (1 << 20) / mem::size_of::<T>().max(1);
+        slice.par_chunks(chunk.max(1)).enumerate().for_each(|(index, source)| {
+            // Each worker initializes a disjoint part of the allocation.
+            // The buffer is published only after all copies have joined.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    (destination as *mut T).add(index * chunk.max(1)),
+                    source.len(),
+                );
+            }
+        });
         Self { ptr, len: slice.len(), cap: slice.len() }
     }
 }
@@ -799,7 +831,7 @@ impl<T: Debug> Debug for PinnedHostBuffer<T> {
     }
 }
 
-impl<T: Copy> Clone for PinnedHostBuffer<T> {
+impl<T: Copy + Send + Sync> Clone for PinnedHostBuffer<T> {
     fn clone(&self) -> Self {
         Self::from_slice(self.as_slice())
     }
@@ -1475,12 +1507,13 @@ impl GpuDCRTPoly {
 
     fn constant_with_value(params: &Arc<GpuDCRTPolyParams>, value: &BigUint) -> Self {
         let n = params.ring_dimension as usize;
-        let q = params.modulus();
-        let mut coeffs = vec![FinRingElem::zero(&q); n];
-        if n > 0 {
-            coeffs[0] = FinRingElem::new(value.clone(), q.clone());
+        // A constant has only one nonzero coefficient. Reduce it once per
+        // RNS limb instead of constructing and reducing N big integers.
+        let mut flat = vec![0u64; n * params.crt_depth()];
+        for (limb, modulus) in params.moduli().iter().enumerate() {
+            flat[limb * n] = (value % BigUint::from(*modulus)).to_u64().expect("residue");
         }
-        Self::from_coeffs(params.as_ref(), &coeffs)
+        Self::from_flat(params.clone(), params.crt_depth() - 1, flat, false)
     }
 
     fn residues_from_biguints(params: &GpuDCRTPolyParams, coeffs: &[BigUint]) -> Vec<Vec<u64>> {
@@ -1618,6 +1651,18 @@ impl Poly for GpuDCRTPoly {
 
     fn evals_biguints(&self) -> Vec<BigUint> {
         self.residue_values(true)
+    }
+
+    fn const_rotate_poly(params: &Self::Params, shift: usize) -> Self {
+        let n = params.ring_dimension() as usize;
+        assert!(shift < n, "monomial exponent exceeds the ring dimension");
+        // The generic constructor reads a GPU zero polynomial back to the CPU.
+        // Construct the known RNS residues directly, without that round trip.
+        let mut flat = vec![0u64; n * params.crt_depth()];
+        for limb in 0..params.crt_depth() {
+            flat[limb * n + shift] = 1;
+        }
+        Self::from_flat(Arc::new(params.clone()), params.crt_depth() - 1, flat, false)
     }
 
     fn const_zero(params: &Self::Params) -> Self {
@@ -2161,6 +2206,39 @@ mod tests {
             allocation.aux_bytes,
             2 * per_partition_aux,
             "each nonempty partition must query its complete no-fallback aux slab"
+        );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_pinned_parallel_copy_preserves_chunk_boundaries() {
+        use rand::RngCore;
+        let mut source = vec![0u8; 3 * (1 << 20) + 17];
+        rand::rng().fill_bytes(&mut source);
+        let pinned = PinnedHostBuffer::from_slice(&source);
+        assert_eq!(pinned.as_slice(), source);
+        let pointer = pinned.as_slice().as_ptr();
+        drop(pinned);
+        rand::rng().fill_bytes(&mut source);
+        let reused = PinnedHostBuffer::from_slice(&source);
+        assert_eq!(reused.as_slice().as_ptr(), pointer, "completed host buffer is reusable");
+        assert_eq!(reused.as_slice(), source, "reuse must replace the entire payload");
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_sparse_constants_match_cpu() {
+        let cpu_params = gpu_test_params();
+        let params = gpu_params_from_cpu(&cpu_params);
+        let shift = rand::random::<u64>() as usize % params.ring_dimension() as usize;
+        assert_eq!(
+            GpuDCRTPoly::const_rotate_poly(&params, shift).coeffs(),
+            DCRTPoly::const_rotate_poly(&cpu_params, shift).coeffs(),
+        );
+        let value = (params.modulus().as_ref() >> 1usize) + BigUint::from(7u32);
+        assert_eq!(
+            GpuDCRTPoly::from_biguint_to_constant(&params, value.clone()).coeffs(),
+            DCRTPoly::from_biguint_to_constant(&cpu_params, value).coeffs(),
         );
     }
 

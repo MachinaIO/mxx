@@ -16,12 +16,75 @@ pub trait GraphValueSchema: Clone + PartialEq {
     #[doc(hidden)]
     fn placeholders_from(&self, next: &mut usize) -> Self::Value;
     fn wire_types(&self) -> Vec<WireType>;
+
+    /// Reopen the fields emitted by `DslContext::public_output` or
+    /// `private_output`, preserving their exact scalar/family schemas.
+    #[track_caller]
+    fn artifact_input(
+        &self,
+        production_id: ProductionId,
+        name: impl Into<String>,
+        confidentiality: ArtifactConfidentiality,
+    ) -> Result<Self::Value, DslError> {
+        let name = name.into();
+        let types = self.wire_types();
+        let arity = types.len();
+        let values = types
+            .into_iter()
+            .enumerate()
+            .map(|(port, wire_type)| {
+                let name = if arity == 1 { name.clone() } else { format!("{name}.{port}") };
+                NodeHandle::new(
+                    NodeKind::Input {
+                        name: name.clone(),
+                        wire_type: wire_type.clone(),
+                        artifact: Some(ArtifactInput {
+                            production_id: production_id.clone(),
+                            artifact_name: name,
+                            confidentiality,
+                        }),
+                    },
+                    vec![],
+                    vec![wire_type],
+                )
+                .output(0)
+                .expect("schema artifact field")
+            })
+            .collect::<Vec<_>>();
+        Self::Value::from_values(self, &values)
+    }
 }
 
 pub(super) fn argument_name(next: &mut usize, role: &str) -> String {
     let index = *next;
     *next += 1;
     format!("arg-{index}-{role}")
+}
+
+// A statically absent field contributes no graph ports. This lets a record
+// retain its preparation phase in its type without inventing a runtime value.
+impl GraphValue for () {
+    type Schema = ();
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        Vec::new()
+    }
+
+    fn schema(&self) -> Self::Schema {}
+
+    fn from_values(_: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
+        if values.is_empty() { Ok(()) } else { Err(DslError::Schema) }
+    }
+}
+
+impl GraphValueSchema for () {
+    type Value = ();
+
+    fn placeholders_from(&self, _: &mut usize) -> Self::Value {}
+
+    fn wire_types(&self) -> Vec<WireType> {
+        Vec::new()
+    }
 }
 
 impl GraphValue for Mat {
@@ -435,5 +498,79 @@ impl<T: GraphValueSchema> GraphValueSchema for Vec<T> {
 
     fn wire_types(&self) -> Vec<WireType> {
         self.iter().flat_map(GraphValueSchema::wire_types).collect()
+    }
+}
+
+// Optional graph fields keep presence in the static schema. No dummy matrix
+// or runtime tag is emitted for an absent field inside a composite value.
+impl<T: GraphValue> GraphValue for Option<T> {
+    type Schema = Option<T::Schema>;
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        self.as_ref().map_or_else(Vec::new, GraphValue::flatten)
+    }
+
+    fn schema(&self) -> Self::Schema {
+        self.as_ref().map(GraphValue::schema)
+    }
+
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
+        match schema {
+            Some(schema) => T::from_values(schema, values).map(Some),
+            None if values.is_empty() => Ok(None),
+            None => Err(DslError::Schema),
+        }
+    }
+}
+
+impl<S: GraphValueSchema> GraphValueSchema for Option<S> {
+    type Value = Option<S::Value>;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        self.as_ref().map(|schema| schema.placeholders_from(next))
+    }
+
+    fn wire_types(&self) -> Vec<WireType> {
+        self.as_ref().map_or_else(Vec::new, GraphValueSchema::wire_types)
+    }
+}
+
+// Prepared operation maps use their stable keys as schema metadata; their
+// graph fields are explicit outputs of the structural body in key order.
+impl<K: Clone + Ord, T: GraphValue> GraphValue for std::collections::BTreeMap<K, T> {
+    type Schema = std::collections::BTreeMap<K, T::Schema>;
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        self.values().flat_map(GraphValue::flatten).collect()
+    }
+
+    fn schema(&self) -> Self::Schema {
+        self.iter().map(|(key, value)| (key.clone(), value.schema())).collect()
+    }
+
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
+        let mut offset = 0;
+        let result = schema
+            .iter()
+            .map(|(key, schema)| {
+                let count = schema.wire_types().len();
+                let fields = values.get(offset..offset + count).ok_or(DslError::Schema)?;
+                offset += count;
+                Ok((key.clone(), T::from_values(schema, fields)?))
+            })
+            .collect::<Result<Self, DslError>>()?;
+        (offset == values.len()).then_some(result).ok_or(DslError::Schema)
+    }
+}
+
+impl<K: Clone + Ord, S: GraphValueSchema> GraphValueSchema for std::collections::BTreeMap<K, S> {
+    type Value = std::collections::BTreeMap<K, S::Value>;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        self.iter().map(|(key, schema)| (key.clone(), schema.placeholders_from(next))).collect()
+    }
+
+    fn wire_types(&self) -> Vec<WireType> {
+        self.values().flat_map(GraphValueSchema::wire_types).collect()
     }
 }

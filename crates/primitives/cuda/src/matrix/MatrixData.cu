@@ -681,6 +681,46 @@ extern "C" int gpu_matrix_create(
     return 0;
 }
 
+extern "C" int gpu_matrix_zero(GpuMatrix *mat)
+{
+    // The caller owns the matrix exclusively. Clear each device allocation
+    // once, retaining its coefficient/evaluation format and asynchronous lifetime.
+    for (size_t partition = 0; partition < mat->shared_limb_buffers.size(); ++partition)
+    {
+        const auto &buffer = mat->shared_limb_buffers[partition];
+        if (buffer.bytes_total == 0) continue;
+        auto &states = mat->exec_limb_states[partition];
+        cudaError_t error = cudaSetDevice(buffer.device);
+        if (error != cudaSuccess) return set_error(error);
+        const cudaStream_t stream = states[0].stream;
+        // Small matrices alias a single owned completion event. Resolve those
+        // aliases through the common helpers instead of recording null limb events.
+        for (size_t limb = 0; limb < states.size(); ++limb)
+        {
+            const int status = matrix_wait_limb_stream(
+                mat, dim3(partition, limb, 0), buffer.device, stream, true);
+            if (status != 0) return status;
+        }
+        error = cudaMemsetAsync(buffer.ptr, 0, buffer.bytes_total, stream);
+        if (error != cudaSuccess) return set_error(error);
+        if (mat->shared_limb_buffers.size() == 1)
+        {
+            const int status = matrix_record_all_limb_writes(mat, stream, true);
+            if (status != 0) return status;
+        }
+        else
+        {
+            for (size_t limb = 0; limb < states.size(); ++limb)
+            {
+                const int status = matrix_record_limb_write(
+                    mat, dim3(partition, limb, 0), stream, true);
+                if (status != 0) return status;
+            }
+        }
+    }
+    return 0;
+}
+
 extern "C" void gpu_matrix_destroy(GpuMatrix *mat)
 {
     if (!mat)

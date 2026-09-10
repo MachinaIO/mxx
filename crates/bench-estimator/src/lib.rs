@@ -1,5 +1,6 @@
 //! Cost estimation over validated scoped execution plans.
 
+pub mod dataflow;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod harness;
@@ -72,6 +73,24 @@ pub trait MeasurementBackend {
         bindings: &ParamEnv,
     ) -> Result<NodeMeasurement, Self::Error>;
 
+    /// GPU backends model runtime staging separately from GPU-resident primitive work.
+    fn models_dataflow(&self) -> bool {
+        false
+    }
+    fn family_wave_size(&self) -> usize {
+        1
+    }
+    fn executor_dispatch_seconds(&self) -> f64 {
+        0.0
+    }
+    fn measure_transfer(
+        &mut self,
+        _kind: dataflow::TransferKind,
+        _ty: &ConcreteWireType,
+    ) -> Result<f64, Self::Error> {
+        Ok(0.0)
+    }
+
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64;
     fn persistent_bytes_for_node(&self, _kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         self.persistent_bytes(wire_type)
@@ -123,9 +142,15 @@ pub trait MeasurementBackend {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
+    /// Runtime boundary costs, added to total_time_seconds, not to GPU work.
+    #[serde(default)]
+    pub dataflow: dataflow::DataflowCost,
+    #[serde(default)]
+    pub transfers: Vec<dataflow::TransferCost>,
     pub total_work_seconds: f64,
-    /// Cumulative measured wave latencies including every logical invocation.
-    /// This work-like sum is distinct from the unlimited-resource critical path.
+    /// Cumulative primitive wave latencies plus measured runtime transfer boundaries and
+    /// modeled executor dispatch, including every logical invocation. This is distinct
+    /// from the unlimited-resource GPU critical path; dataflow costs are reported separately.
     pub total_time_seconds: f64,
     /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
     pub preimage_sampling_work_seconds: f64,
@@ -251,6 +276,12 @@ pub fn estimate<B: MeasurementBackend>(
                 },
             );
         }
+    }
+    if estimator.backend.models_dataflow() {
+        let (dataflow, transfers) = dataflow::estimate(validated, estimator.backend)?;
+        report.total_time_seconds += dataflow.transfer_seconds + dataflow.executor_dispatch_seconds;
+        report.dataflow = dataflow;
+        report.transfers = transfers;
     }
     Ok(report)
 }

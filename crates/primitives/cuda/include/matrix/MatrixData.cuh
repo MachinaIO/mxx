@@ -32,6 +32,7 @@ extern "C"
         GpuMatrix **out,
         bool initialize_descriptors = true);
     void gpu_matrix_destroy(GpuMatrix *mat);
+    int gpu_matrix_zero(GpuMatrix *mat);
     int gpu_matrix_wait(const GpuMatrix *mat);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);
     int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied);

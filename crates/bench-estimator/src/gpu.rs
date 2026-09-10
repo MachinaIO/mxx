@@ -4,6 +4,9 @@
 //! backend operations as the runtime. It measures operation cost; it is not a
 //! second graph executor and does not define node semantics.
 
+#[path = "dataflow_gpu.rs"]
+mod dataflow;
+
 use crate::{
     MeasurementBackend, MeasurementNode, NodeMeasurement,
     harness::{MeasurementHarnessConfig, MemoryProbe, measure_batch_operation},
@@ -374,6 +377,7 @@ pub struct GpuNodeMeasurementBackend {
     measurements: HashMap<[u8; 32], NodeMeasurement>,
     pending: HashMap<[u8; 32], PendingMeasurement>,
     collecting: bool,
+    transfers: dataflow::TransferMeasurements,
 }
 
 impl GpuNodeMeasurementBackend {
@@ -405,6 +409,7 @@ impl GpuNodeMeasurementBackend {
             measurements: HashMap::new(),
             pending: HashMap::new(),
             collecting: true,
+            transfers: dataflow::TransferMeasurements::default(),
         }
     }
 
@@ -443,6 +448,7 @@ impl GpuNodeMeasurementBackend {
             let measurement = self.measure_fleet_request(&request)?;
             self.measurements.insert(request.key, measurement);
         }
+        self.transfers.measure(&mut self.workers, &self.harness)?;
         Ok(())
     }
 
@@ -900,6 +906,25 @@ impl GpuNodeMeasurementBackend {
         request: &PendingMeasurement,
     ) -> Result<NodeMeasurement, GpuMeasurementError> {
         let Some(total_columns) = Self::request_columns(request) else {
+            // A full-shape operation can be the first measured request. Its
+            // synthetic operands still use the fleet's column allocator; do
+            // not inherit an unrelated earlier request's active width.
+            let columns = request
+                .concrete_argument_types
+                .iter()
+                .chain(&request.concrete_output_types)
+                .filter_map(Self::matrix_columns)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            self.workers[0].backend.set_column_widths_for_operation(
+                request.key,
+                GpuColumnWidths { gpu0: columns, nonzero: None },
+            );
+            self.workers[0]
+                .backend
+                .select_operation(request.key)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?;
             let representative = RepresentativeMeasurement {
                 kind: request.kind.clone(),
                 concrete_argument_types: request.concrete_argument_types.clone(),
@@ -1451,6 +1476,8 @@ impl GpuNodeMeasurementBackend {
             NodeKind::CenteredRebase { .. } |
             NodeKind::RnsModUp { .. } |
             NodeKind::RnsModDown { .. } |
+            NodeKind::CenteredExtend { .. } |
+            NodeKind::BlockModSwitch { .. } |
             NodeKind::MatrixNegate => {
                 let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
                     ConcreteWireType::Matrix(matrix) |
@@ -1736,16 +1763,31 @@ impl GpuNodeMeasurementBackend {
             }
             match family_leaf_type(wire_type) {
                 ConcreteWireType::Matrix(matrix) => {
+                    // Match ordinary full-modulus inputs: zero-only operands
+                    // can take cheaper integer-reduction paths inside kernels.
                     let value = backend
-                        .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
+                        .sample_uniform(
+                            matrix,
+                            &SampleRange {
+                                minimum: BigInt::from(0),
+                                maximum: &matrix.modulus - BigInt::from(1),
+                            },
+                        )
                         .map_err(|error| GpuMeasurementError(error.to_string()))?;
                     arguments.push(Some(Arc::new(value)));
                     small_arguments.push(None);
                 }
                 ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
                 ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                    // Only the ring parameters are needed. A full RNS placeholder
+                    // scales as rows * columns * CRT depth despite this operand's
+                    // compact representation, and pollutes the transfer-buffer cache.
                     let parameters = backend
-                        .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
+                        .constant_matrix(
+                            &ConcreteMatrixType { rows: 1, columns: 1, ..matrix.clone() },
+                            &ConstantMatrix::Zero,
+                            bindings,
+                        )
                         .map_err(|error| GpuMeasurementError(error.to_string()))?;
                     let max_coefficient_bound =
                         max_coefficient_bound.to_biguint().ok_or_else(|| {
@@ -1770,6 +1812,15 @@ impl GpuNodeMeasurementBackend {
                                 "compact matrix payload length overflows".to_owned(),
                             )
                         })?;
+                    let mut payload = vec![0; payload_len];
+                    if max_coefficient_bound.bits() != 0 {
+                        payload.par_chunks_mut(1 + magnitude_bytes).enumerate().for_each(
+                            |(index, coefficient)| {
+                                coefficient[0] = (index % 3) as u8;
+                                coefficient[1] = u8::from(coefficient[0] != 0);
+                            },
+                        );
+                    }
                     let value = GpuSmallMatrix::from_canonical_coefficients(
                         parameters
                             .shards()
@@ -1780,7 +1831,7 @@ impl GpuNodeMeasurementBackend {
                         matrix.rows,
                         matrix.columns,
                         max_coefficient_bound,
-                        &vec![0u8; payload_len],
+                        &payload,
                     )
                     .map_err(|error| GpuMeasurementError(error.to_string()))?;
                     arguments.push(None);
@@ -2437,6 +2488,41 @@ impl GpuNodeMeasurementBackend {
                         .collect(),
                 )
             }
+            NodeKind::CenteredExtend { .. }
+                if prepared.small_arguments.first().is_some_and(Option::is_some) =>
+            {
+                let destination = output_matrix_type()?;
+                let source = small_matrix_arc(0)?;
+                (0..batch_size)
+                    .map(|_| {
+                        backend
+                            .centered_extend_small(&source, &destination)
+                            .map(GpuMeasurementOutput::SmallMatrix)
+                            .map_err(backend_error)
+                    })
+                    .collect()
+            }
+            NodeKind::CenteredExtend { .. } | NodeKind::BlockModSwitch { .. } => {
+                let destination = output_matrix_type()?;
+                let plaintext_modulus = match node.kind {
+                    NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
+                        Some(evaluate_usize(plaintext_modulus)? as u64)
+                    }
+                    _ => None,
+                };
+                matrix_outputs(
+                    (0..batch_size)
+                        .map(|_| {
+                            let source = matrix(0)?;
+                            match plaintext_modulus {
+                                Some(t) => backend.block_mod_switch(source, &destination, t),
+                                None => backend.centered_extend(source, &destination),
+                            }
+                            .map_err(backend_error)
+                        })
+                        .collect(),
+                )
+            }
             NodeKind::RingAutomorphism { index } => {
                 let index = evaluate_usize(index)?;
                 backend
@@ -2932,6 +3018,20 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
             preimage_sample: matches!(node.kind, NodeKind::PreimageSample { .. }),
         });
         Ok(NodeMeasurement::default())
+    }
+
+    fn models_dataflow(&self) -> bool {
+        true
+    }
+    fn executor_dispatch_seconds(&self) -> f64 {
+        self.transfers.dispatch_seconds
+    }
+    fn measure_transfer(
+        &mut self,
+        kind: crate::dataflow::TransferKind,
+        ty: &ConcreteWireType,
+    ) -> Result<f64, Self::Error> {
+        self.transfers.get(kind, ty, self.collecting)
     }
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
@@ -3432,6 +3532,78 @@ mod tests {
             .expect("cache key");
 
         assert_eq!(first_key, second_key);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_full_shape_measurement_initializes_its_operand_width() {
+        let high = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let low = high.select_modulus(&131_041u32.into()).unwrap();
+        let matrix = |p: &GpuDCRTPolyParams| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                rows: 1,
+                columns: 1,
+                ring_dimension: 4,
+                modulus: BigInt::from(p.modulus().as_ref().clone()),
+            })
+        };
+        let request = PendingMeasurement {
+            scope: FrozenGraphScopeId::Root,
+            id: NodeId(0),
+            kind: NodeKind::CenteredExtend {
+                modulus: BigInt::from(high.modulus().as_ref().clone()).into(),
+            },
+            concrete_argument_types: vec![matrix(&low)],
+            concrete_output_types: vec![matrix(&high)],
+            bindings: ParamEnv::default(),
+            key: [93; 32],
+            preimage_sample: false,
+        };
+        assert!(GpuNodeMeasurementBackend::request_columns(&request).is_none());
+        let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let workers = devices
+            .into_iter()
+            .map(|device| {
+                (
+                    mxx_runtime::backend::poly::gpu::gpu_backend_on(
+                        [low.clone(), high.clone()],
+                        [device],
+                    ),
+                    device,
+                )
+            })
+            .collect();
+        drop(low);
+        drop(high);
+        let mut backend = GpuNodeMeasurementBackend::new(
+            workers,
+            crate::harness::MeasurementHarnessConfig {
+                warm_up_iterations: 1,
+                measured_iterations: 1,
+                ..Default::default()
+            },
+        );
+        let report = backend.measure_fleet_request(&request).unwrap();
+        assert!(report.work_seconds > 0.0);
+        // Decomposition outputs retain their compact representation across levels,
+        // just as they do in the runtime executor.
+        let mut compact_request = request;
+        for wire_type in compact_request
+            .concrete_argument_types
+            .iter_mut()
+            .chain(&mut compact_request.concrete_output_types)
+        {
+            let ConcreteWireType::Matrix(matrix) = wire_type else { unreachable!() };
+            *wire_type = ConcreteWireType::Preimage {
+                // The parameter probe is 1x1; the actual compact operand must
+                // retain its independently requested, larger dimensions.
+                matrix: ConcreteMatrixType { rows: 2, columns: 3, ..matrix.clone() },
+                max_coefficient_bound: BigInt::from(1),
+            };
+        }
+        let report = backend.measure_fleet_request(&compact_request).unwrap();
+        assert!(report.work_seconds > 0.0);
     }
 
     #[test]

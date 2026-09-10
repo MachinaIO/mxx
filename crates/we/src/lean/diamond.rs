@@ -53,8 +53,18 @@ pub fn verify_diamond_certificate(
             radius = %artifact.radius, "Diamond capped numeric gate rejected candidate");
         return Ok(None);
     }
-    crate::lean::check::check_generated_modules(&directory, timeout)
-        .map_err(|error| format!("{error}; proof logs retained at {}", directory.display()))?;
+    let crate_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+    mxx_runtime::lean::check::check_generated_modules(
+        &crate_path.join("../runtime/lean"),
+        &[
+            crate_path.join("../ir-core/lean/.lake/build/lib/lean"),
+            crate_path.join("lean/.lake/build/lib/lean"),
+            crate_path.join("../bgg/lean/.lake/build/lib/lean"),
+        ],
+        &directory,
+        timeout,
+    )
+    .map_err(|error| format!("{error}; proof logs retained at {}", directory.display()))?;
     let log = fs::read_to_string(directory.join("Certificate.log"))?;
     let expected = "'DiamondCertificate.correctness' depends on axioms: \
         [propext, Classical.choice, Quot.sound]";

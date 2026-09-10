@@ -96,6 +96,15 @@ pub enum NodeKind {
         source_moduli: Vec<u64>,
         plaintext_modulus: IntExpr,
     },
+    /// Canonical centered lift to a containing odd coefficient modulus.
+    CenteredExtend {
+        modulus: IntExpr,
+    },
+    /// Exact BFV block division preserving an error multiplier t.
+    BlockModSwitch {
+        modulus: IntExpr,
+        plaintext_modulus: IntExpr,
+    },
     Transpose,
     Slice {
         rows: Option<IndexRange>,

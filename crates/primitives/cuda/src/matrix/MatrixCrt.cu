@@ -13,6 +13,8 @@ namespace
         uint64_t source_moduli[kCrtMaxLimbs];
         uint64_t target_moduli[kCrtMaxLimbs];
         uint64_t division_inverses[kCrtMaxLimbs];
+        uint64_t input_scales[kCrtMaxLimbs];
+        uint64_t plaintext_modulus;
         uint64_t divisor_residues[kCrtMaxLimbs];
         uint64_t garner[kCrtMaxLimbs * kCrtMaxLimbs];
     };
@@ -23,7 +25,7 @@ namespace
         const ModulusConversionMetadata *metadata,
         size_t coefficient_count,
         size_t ring_dimension,
-        bool round_scale)
+        int conversion)
     {
         const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (index >= coefficient_count) return;
@@ -31,7 +33,7 @@ namespace
         const size_t coefficient = index % ring_dimension;
         uint64_t digits[kCrtMaxLimbs];
         bool negative = false;
-        if (round_scale)
+        if (conversion != 0)
         {
             for (size_t limb = 0; limb < metadata->discarded_count; ++limb)
             {
@@ -40,6 +42,7 @@ namespace
                 const uint64_t modulus = metadata->source_moduli[source_index];
                 uint64_t digit = matrix_load_limb_u64(descriptor.base, poly, coefficient,
                     descriptor.stride, descriptor.width) % modulus;
+                digit = mul_mod_u64(digit, metadata->input_scales[source_index], modulus);
                 for (size_t previous = 0; previous < limb; ++previous)
                 {
                     const uint64_t residue = digits[previous] % modulus;
@@ -53,23 +56,23 @@ namespace
             // For odd radices, (J-1)/2 has mixed-radix digits (q_i-1)/2.
             // Comparing from the most significant digit chooses the exact
             // centered representative of x mod J without a large-integer divide.
-            for (size_t limb = metadata->discarded_count; limb-- > 0;)
+            for (size_t limb = 0; limb < metadata->discarded_count; ++limb)
             {
                 const uint64_t half = metadata->source_moduli[metadata->discarded[limb]] / 2;
-                if (digits[limb] != half)
-                {
-                    negative = digits[limb] > half;
-                    break;
-                }
+                negative = (digits[limb] > half) | ((digits[limb] == half) & negative);
             }
         }
         for (size_t limb = 0; limb < metadata->target_count; ++limb)
         {
             const uint64_t modulus = metadata->target_moduli[limb];
-            const auto input = source[metadata->retained[limb]];
-            uint64_t value = matrix_load_limb_u64(input.base, poly, coefficient,
-                input.stride, input.width) % modulus;
-            if (round_scale)
+            uint64_t value = 0;
+            if (conversion != 2)
+            {
+                const auto input = source[metadata->retained[limb]];
+                value = matrix_load_limb_u64(input.base, poly, coefficient,
+                    input.stride, input.width) % modulus;
+            }
+            if (conversion != 0)
             {
                 uint64_t residual = 0;
                 for (size_t digit = metadata->discarded_count; digit-- > 0;)
@@ -78,14 +81,17 @@ namespace
                         metadata->source_moduli[metadata->discarded[digit]] % modulus,
                         modulus), digits[digit] % modulus, modulus);
                 }
-                if (negative)
+                const uint64_t divisor = metadata->divisor_residues[limb] &
+                    (uint64_t{0} - static_cast<uint64_t>(negative));
+                residual = residual >= divisor ? residual - divisor : modulus - (divisor - residual);
+                if (conversion == 2) value = residual;
+                else
                 {
-                    const uint64_t divisor = metadata->divisor_residues[limb];
-                    residual = residual >= divisor ? residual - divisor :
-                        modulus - (divisor - residual);
+                    if (conversion == 3)
+                        residual = mul_mod_u64(residual, metadata->plaintext_modulus % modulus, modulus);
+                    value = value >= residual ? value - residual : modulus - (residual - value);
+                    value = mul_mod_u64(value, metadata->division_inverses[limb], modulus);
                 }
-                value = value >= residual ? value - residual : modulus - (residual - value);
-                value = mul_mod_u64(value, metadata->division_inverses[limb], modulus);
             }
             const auto output = target[limb];
             matrix_store_limb_u64(output.base, poly, coefficient,
@@ -312,32 +318,38 @@ namespace
 extern "C" int gpu_matrix_convert_modulus(
     GpuMatrix *out,
     const GpuMatrix *source,
-    int round_scale,
+    int conversion,
     const uint64_t *division_inverses,
-    size_t inverse_count)
+    size_t inverse_count,
+    uint64_t plaintext_modulus,
+    const uint64_t *input_scales)
 {
     if (!out || !source || !out->ctx || !source->ctx ||
         out->ctx->execution != source->ctx->execution ||
         out->ctx->N != source->ctx->N || out->rows != source->rows || out->cols != source->cols ||
         out->format != source->format ||
-        (round_scale && source->format != GPU_POLY_FORMAT_COEFF) ||
-        (round_scale != 0 && round_scale != 1) || source->level < 0 || out->level < 0 ||
+        (conversion != 0 && source->format != GPU_POLY_FORMAT_COEFF) ||
+        (conversion < 0 || conversion > 3) || source->level < 0 || out->level < 0 ||
         source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1)
         return set_error("invalid coefficient modulus conversion layout");
     const size_t source_count = static_cast<size_t>(source->level) + 1;
     const size_t target_count = static_cast<size_t>(out->level) + 1;
-    if (source_count > kCrtMaxLimbs || target_count > source_count ||
+    if (source_count > kCrtMaxLimbs || target_count > kCrtMaxLimbs || (conversion != 2 && target_count > source_count) ||
         source_count > source->ctx->moduli.size() || target_count > out->ctx->moduli.size() ||
         !division_inverses || inverse_count != target_count)
         return set_error("invalid coefficient modulus conversion basis");
+    if (conversion == 3 && (plaintext_modulus == 0 || !input_scales || target_count >= source_count))
+        return set_error("invalid exact BGV block switch parameters");
     std::vector<ModulusConversionMetadata> host(1);
     auto &metadata = host[0];
+    metadata.plaintext_modulus = plaintext_modulus;
     metadata.source_count = source_count;
     metadata.target_count = target_count;
     bool retained[kCrtMaxLimbs]{};
     for (size_t limb = 0; limb < source_count; ++limb)
     {
         metadata.source_moduli[limb] = source->ctx->moduli[limb];
+        metadata.input_scales[limb] = conversion == 3 ? input_scales[limb] : 1;
         if (metadata.source_moduli[limb] <= 1 || !(metadata.source_moduli[limb] & 1))
             return set_error("nearest conversion requires odd CRT moduli");
     }
@@ -346,15 +358,22 @@ extern "C" int gpu_matrix_convert_modulus(
         const uint64_t modulus = out->ctx->moduli[limb];
         size_t selected = 0;
         while (selected < source_count && metadata.source_moduli[selected] != modulus) ++selected;
-        if (selected == source_count || retained[selected])
+        if (conversion != 2 && (selected == source_count || retained[selected]))
             return set_error("destination CRT basis is not an exact subset");
-        retained[selected] = true;
+        if (selected < source_count) retained[selected] = true;
         metadata.retained[limb] = selected;
         metadata.target_moduli[limb] = modulus;
         metadata.division_inverses[limb] = division_inverses[limb];
     }
     for (size_t limb = 0; limb < source_count; ++limb)
-        if (!retained[limb]) metadata.discarded[metadata.discarded_count++] = limb;
+    {
+        if (conversion == 2 && !retained[limb])
+            return set_error("centered extension requires a containing CRT basis");
+        if (conversion == 3 && (static_cast<unsigned __int128>(plaintext_modulus) *
+            metadata.input_scales[limb]) % metadata.source_moduli[limb] != 1)
+            return set_error("invalid BGV plaintext inverse");
+        if (conversion == 2 || !retained[limb]) metadata.discarded[metadata.discarded_count++] = limb;
+    }
     for (size_t limb = 0; limb < metadata.discarded_count; ++limb)
         for (size_t previous = 0; previous < limb; ++previous)
             metadata.garner[previous * kCrtMaxLimbs + limb] = source->ctx->garner_inverse_table[
@@ -367,7 +386,7 @@ extern "C" int gpu_matrix_convert_modulus(
             divisor = static_cast<uint64_t>((static_cast<unsigned __int128>(divisor) *
                 metadata.source_moduli[metadata.discarded[discarded]]) % modulus);
         metadata.divisor_residues[limb] = divisor;
-        if (round_scale && (static_cast<unsigned __int128>(divisor) * division_inverses[limb]) % modulus != 1)
+        if ((conversion == 1 || conversion == 3) && (static_cast<unsigned __int128>(divisor) * division_inverses[limb]) % modulus != 1)
             return set_error("invalid exact modulus division inverse");
     }
     const auto &input = source->shared_limb_buffers[0];
@@ -410,7 +429,7 @@ extern "C" int gpu_matrix_convert_modulus(
     {
         convert_modulus_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
             input.device_descriptors, output.device_descriptors, device_metadata,
-            coefficient_count, static_cast<size_t>(out->ctx->N), round_scale != 0);
+            coefficient_count, static_cast<size_t>(out->ctx->N), conversion);
         error = cudaGetLastError();
         if (error != cudaSuccess) status = set_error(error);
         // Record consumers even when a launch reports an error: neither ring's

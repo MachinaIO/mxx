@@ -159,6 +159,14 @@ __device__ __forceinline__ uint64_t compact_mod_magnitude(
     uint64_t modulus)
 {
     uint64_t value = 0;
+    if (width <= sizeof(uint64_t))
+    {
+        // Typical gadget digits fit in one word and are already smaller than
+        // each CRT prime. Avoid a 128-bit remainder for every input byte.
+        for (size_t i = 0; i < width; ++i)
+            value |= static_cast<uint64_t>(magnitude[i]) << (8 * i);
+        return value < modulus ? value : value % modulus;
+    }
     for (size_t i = width; i-- > 0;)
     {
         value = static_cast<uint64_t>(
@@ -996,7 +1004,11 @@ extern "C" int gpu_small_matrix_wait(const GpuSmallMatrix *mat)
 
 extern "C" int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src)
 {
-    if (!out || !src || out->ctx != src->ctx || out->rows != src->rows || out->cols != src->cols ||
+    // Compact coefficients are signed integers independent of the CRT basis.
+    // A containing-basis conversion may therefore cross parameter contexts on
+    // the same CUDA device. The destination owns its allocation and stream;
+    // source readiness and consumption are connected by the existing events.
+    if (!out || !src || out->device != src->device || out->rows != src->rows || out->cols != src->cols ||
         out->n != src->n || out->magnitude_bytes != src->magnitude_bytes || out->payload_bytes != src->payload_bytes)
         return set_error("incompatible compact matrix copy");
     if (small_set_device(out) != 0 || small_wait(src, out->stream) != 0) return 1;

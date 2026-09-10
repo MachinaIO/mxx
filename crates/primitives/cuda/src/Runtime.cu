@@ -1,6 +1,8 @@
 #include "Runtime.cuh"
 
 #include <algorithm>
+#include <array>
+#include <unordered_map>
 #include <cerrno>
 #include <condition_variable>
 #include <cstring>
@@ -14,6 +16,86 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+namespace
+{
+    // Two completed transfer buffers per device cover the load/store pipeline.
+    // Capacity follows the largest active chunks, never graph or Family size.
+    // Only bookkeeping holds this lock; allocation, copies and GPU work do not.
+    struct PinnedHostPool
+    {
+        struct Block { void *pointer = nullptr; size_t bytes = 0; int device = 0; };
+        std::mutex mutex;
+        std::unordered_map<void *, Block> allocated;
+        std::unordered_map<int, std::array<Block, 2>> ready;
+
+        ~PinnedHostPool()
+        {
+            for (const auto &device : ready)
+                for (const auto &block : device.second)
+                    if (block.pointer) cudaFreeHost(block.pointer);
+        }
+
+        void *take(int device, size_t bytes)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto &slots = ready[device];
+            Block *best = nullptr;
+            for (auto &slot : slots)
+                if (slot.pointer && slot.bytes >= bytes && (!best || slot.bytes < best->bytes))
+                    best = &slot;
+            if (!best) return nullptr;
+            void *pointer = best->pointer;
+            *best = {};
+            return pointer;
+        }
+
+        cudaError_t release(void *pointer)
+        {
+            void *discard = pointer;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto found = allocated.find(pointer);
+                if (found != allocated.end())
+                {
+                    auto &slots = ready[found->second.device];
+                    auto smallest = std::min_element(slots.begin(), slots.end(),
+                        [](const Block &a, const Block &b) { return a.bytes < b.bytes; });
+                    if (smallest->bytes <= found->second.bytes)
+                    {
+                        discard = smallest->pointer;
+                        *smallest = found->second;
+                    }
+                    if (discard) allocated.erase(discard);
+                }
+            }
+            // Unregistered pointers belong to existing CUDA callers. Their
+            // deferred destruction keeps its original cudaFreeHost behavior.
+            return discard ? cudaFreeHost(discard) : cudaSuccess;
+        }
+
+        void clear(int device)
+        {
+            std::array<Block, 2> blocks{};
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto found = ready.find(device);
+                if (found == ready.end()) return;
+                blocks = found->second;
+                ready.erase(found);
+                for (const auto &block : blocks) allocated.erase(block.pointer);
+            }
+            for (const auto &block : blocks)
+                if (block.pointer) cudaFreeHost(block.pointer);
+        }
+    };
+
+    PinnedHostPool &pinned_host_pool()
+    {
+        static PinnedHostPool pool;
+        return pool;
+    }
+}
 
 struct PinnedHostReclaimer
 {
@@ -143,7 +225,7 @@ private:
             {
                 continue;
             }
-            error = cudaFreeHost(pointer);
+            error = pinned_host_pool().release(pointer);
             if (error != cudaSuccess)
             {
                 // Do not retry an uncertain free. The failed pointer is
@@ -919,7 +1001,10 @@ GpuExecutionOwner::~GpuExecutionOwner()
     {
         for (int device : gpu_ids)
         {
-            live_context_counts[static_cast<size_t>(device)].fetch_sub(1, std::memory_order_relaxed);
+            if (live_context_counts[static_cast<size_t>(device)].fetch_sub(1, std::memory_order_acq_rel) == 1)
+            {
+                pinned_host_pool().clear(device);
+            }
         }
     }
 }
@@ -1471,6 +1556,51 @@ extern "C"
         return 0;
     }
 
+    int gpu_event_set_defer_pinned_free(GpuContext *ctx, GpuEventSet *events, void *pointer)
+    {
+        if (events->entries.size() == 1)
+        {
+            // A whole-matrix H2D copy already has one completion event. Hand
+            // that event to the reclaimer directly, without waiting behind
+            // unrelated device allocations on the release stream.
+            const auto entry = events->entries.front();
+            try
+            {
+                const int status = ctx->execution->pinned_host_reclaimer->enqueue(
+                    entry.device, entry.event, std::vector<void *>{pointer});
+                if (status == 0) delete events; // The reclaimer now owns the CUDA event.
+                return status;
+            }
+            catch (const std::exception &error)
+            {
+                ctx->execution->pinned_host_reclaimer->record_uncertain(error.what());
+                return set_error(error); // Keep the event and pointer owned on failure.
+            }
+        }
+        // Join the H2D events on an existing release stream. Ownership passes
+        // to the existing reclaimer; neither the caller nor a CUDA callback
+        // frees pinned memory while a DMA still references it.
+        const int device = ctx->execution->gpu_ids.front();
+        cudaStream_t stream = ctx->execution->release_streams_by_partition.front();
+        cudaError_t error = cudaSetDevice(device);
+        for (const auto &entry : events->entries)
+        {
+            if (error == cudaSuccess)
+            {
+                error = cudaStreamWaitEvent(stream, entry.event, 0);
+            }
+        }
+        if (error != cudaSuccess)
+        {
+            ctx->execution->pinned_host_reclaimer->record_uncertain(cudaGetErrorString(error));
+            return set_error(cudaGetErrorString(error)); // Keep ownership if completion is uncertain.
+        }
+        void *pointers[] = {pointer};
+        const int status = gpu_defer_pinned_frees(ctx, device, stream, pointers, 1);
+        destroy_event_set(events);
+        return status;
+    }
+
     int gpu_event_set_wait(GpuEventSet *events)
     {
         if (!events)
@@ -1586,12 +1716,31 @@ extern "C"
             {
                 return nullptr;
             }
-            void *ptr = nullptr;
-            cudaError_t err = cudaMallocHost(&ptr, bytes);
+            int device = 0;
+            cudaError_t err = cudaGetDevice(&device);
             if (err != cudaSuccess)
             {
                 set_error(cudaGetErrorString(err));
                 return nullptr;
+            }
+            auto &pool = pinned_host_pool();
+            if (void *cached = pool.take(device, bytes)) return cached;
+            void *ptr = nullptr;
+            err = cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable);
+            if (err != cudaSuccess)
+            {
+                set_error(cudaGetErrorString(err));
+                return nullptr;
+            }
+            try
+            {
+                std::lock_guard<std::mutex> lock(pool.mutex);
+                pool.allocated.emplace(ptr, PinnedHostPool::Block{ptr, bytes, device});
+            }
+            catch (...)
+            {
+                cudaFreeHost(ptr);
+                throw;
             }
             return ptr;
         }
@@ -1613,7 +1762,7 @@ extern "C"
         {
             return;
         }
-        cudaError_t err = cudaFreeHost(ptr);
+        cudaError_t err = pinned_host_pool().release(ptr);
         if (err != cudaSuccess)
         {
             set_error(cudaGetErrorString(err));

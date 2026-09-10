@@ -634,6 +634,15 @@ pub trait PolyMatrix:
         destination: &<Self::P as Poly>::Params,
         plaintext_modulus: u64,
     ) -> Result<Self, String>;
+    /// Canonical centered coefficient lift to a containing CRT basis.
+    /// No full-coefficient big-integer reconstruction is performed.
+    fn centered_extend(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Exact BFV block switch `(z-t*center_P(t^-1*z))/P` to a strict subset.
+    fn block_mod_switch(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String>;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),
@@ -798,6 +807,8 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
 
     fn params(&self) -> &Self::Params;
     fn max_coefficient_bound(&self) -> &BigUint;
+    /// Preserve bounded signed coefficients in a containing modulus.
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String>;
     fn rows(&self) -> usize;
     fn columns(&self) -> usize;
     fn size(&self) -> (usize, usize) {
@@ -871,6 +882,13 @@ where
 
     fn params(&self) -> &Self::Params {
         self.value.params()
+    }
+
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String> {
+        Ok(Self::from_validated(
+            self.value.centered_extend(destination)?,
+            self.max_coefficient_bound.clone(),
+        ))
     }
 
     fn max_coefficient_bound(&self) -> &BigUint {

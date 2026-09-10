@@ -18,7 +18,7 @@ use mxx_ir_core::{
 use mxx_primitives::{
     matrix::{
         PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallPolyMatrix,
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
+        gpu_dcrt_poly::{GpuDCRTMatrixRnsSnapshot, GpuDCRTPolyMatrix, GpuSmallMatrix},
     },
     poly::{
         PolyParams,
@@ -74,10 +74,32 @@ fn copy_packed_bits(
     destination_bit: usize,
     bit_count: usize,
 ) {
-    for bit in 0..bit_count {
-        if (source[(source_bit + bit) / 8] >> ((source_bit + bit) % 8)) & 1 != 0 {
-            destination[(destination_bit + bit) / 8] |= 1 << ((destination_bit + bit) % 8);
+    let mut copied = 0;
+    while copied < bit_count && (destination_bit + copied) % 8 != 0 {
+        let bit = (source[(source_bit + copied) / 8] >> ((source_bit + copied) % 8)) & 1;
+        destination[(destination_bit + copied) / 8] |= bit << ((destination_bit + copied) % 8);
+        copied += 1;
+    }
+    let bytes = (bit_count - copied) / 8;
+    let source_start = (source_bit + copied) / 8;
+    let target_start = (destination_bit + copied) / 8;
+    let shift = (source_bit + copied) % 8;
+    let target = &mut destination[target_start..target_start + bytes];
+    if shift == 0 {
+        for (target, source) in target.iter_mut().zip(&source[source_start..source_start + bytes]) {
+            *target |= source;
         }
+    } else {
+        for (index, target) in target.iter_mut().enumerate() {
+            *target |= (source[source_start + index] >> shift) |
+                (source[source_start + index + 1] << (8 - shift));
+        }
+    }
+    copied += bytes * 8;
+    while copied < bit_count {
+        let bit = (source[(source_bit + copied) / 8] >> ((source_bit + copied) % 8)) & 1;
+        destination[(destination_bit + copied) / 8] |= bit << ((destination_bit + copied) % 8);
+        copied += 1;
     }
 }
 
@@ -449,6 +471,7 @@ pub struct GpuDcrtBackend {
     calibration_registry: FrozenGpuCalibrationRegistry,
     vram_percent: u32,
     matrix_replicas: HashMap<(u64, usize), Weak<GpuDCRTPolyMatrix>>,
+    rns_staging_buffers: Vec<GpuDCRTMatrixRnsSnapshot>,
 }
 
 struct RuntimePilot {
@@ -490,6 +513,7 @@ impl GpuDcrtBackend {
             calibration_registry: FrozenGpuCalibrationRegistry::default(),
             vram_percent,
             matrix_replicas: HashMap::new(),
+            rns_staging_buffers: Vec::new(),
         }
     }
 
@@ -692,7 +716,14 @@ impl GpuDcrtBackend {
     }
 
     fn restart_runtime_pilot_after_fixed_inputs(&mut self) -> Result<(), String> {
-        if let Some((operation, profile)) = self.pending_profile.take() {
+        let profile = self.pending_profile.take().or_else(|| {
+            let operation = self.active_operation?;
+            if self.pending_pilot.is_some() || self.manual_widths.contains(&operation) {
+                return None;
+            }
+            self.operation_profiles.get(&operation).cloned().map(|profile| (operation, profile))
+        });
+        if let Some((operation, profile)) = profile {
             // Fixed operands have already been staged at every placement.  An
             // allocator-aware snapshot is sufficient to rederive a cached
             // profile against their residency; unlike a runtime pilot, this
@@ -1289,6 +1320,32 @@ impl GpuDcrtBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_packed_copy_preserves_offsets_padding_and_existing_bits() {
+        let source: Vec<u8> = (0..272).map(|_| rand::random()).collect();
+        for source_bit in 0..16 {
+            for destination_bit in 0..16 {
+                for bit_count in [0, 1, 7, 8, 9, 15, 16, 31, 63, 1040, 2049] {
+                    let mut expected: Vec<u8> = (0..272).map(|_| rand::random()).collect();
+                    let mut actual = expected.clone();
+                    for bit in 0..bit_count {
+                        expected[(destination_bit + bit) / 8] |=
+                            ((source[(source_bit + bit) / 8] >> ((source_bit + bit) % 8)) & 1) <<
+                                ((destination_bit + bit) % 8);
+                    }
+                    super::copy_packed_bits(
+                        &source,
+                        source_bit,
+                        &mut actual,
+                        destination_bit,
+                        bit_count,
+                    );
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
     use super::*;
     use mxx_ir_core::IntExpr;
     use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
@@ -1745,11 +1802,12 @@ mod tests {
         let staging_scratch =
             gpu_default_mempool_usage(device).unwrap().used_high.saturating_sub(baseline);
         // Raw-RNS serialization has per-limb unpack buffers. Staging six shards
-        // must use at most one shard's measured primitive scratch, never a
-        // full-target gather or six simultaneous snapshots.
+        // pipelines two shards, never a full-target gather or six simultaneous
+        // snapshots. The two-stage transfer contract doubles the one-shard bound.
         assert!(
-            staging_scratch <= snapshot_scratch,
-            "staging scratch {staging_scratch} exceeds one-shard bound {snapshot_scratch}"
+            staging_scratch <= 2 * snapshot_scratch,
+            "staging scratch {staging_scratch} exceeds two-shard bound {}",
+            2 * snapshot_scratch
         );
         assert_eq!(bytes.as_slice(), expected.as_slice());
         assert_eq!(source.row_size(), 2);
@@ -1760,6 +1818,17 @@ mod tests {
         }
         let restored = backend.matrix_from_cpu_staging_bytes(&ty, &bytes).unwrap();
         assert_eq!(restored.shards()[0].value, matrix);
+        assert_eq!(backend.rns_staging_buffers.len(), 2);
+        // Grow a reused slot for a full shard, then reuse it for a smaller one.
+        let (_, repeated) = backend.preimage_target(Arc::new(restored)).unwrap();
+        assert_eq!(repeated.as_slice(), expected.as_slice());
+        let narrow = GpuFleetMatrix::from_matrix(matrix.slice_columns(0, 1));
+        let expected_narrow = backend.matrix_to_bytes(&narrow);
+        let (_, narrow_bytes) = backend.preimage_target(Arc::new(narrow)).unwrap();
+        let narrow_type = ConcreteMatrixType { columns: 1, ..ty };
+        let restored = backend.matrix_from_cpu_staging_bytes(&narrow_type, &narrow_bytes).unwrap();
+        assert_eq!(backend.matrix_to_bytes(&restored), expected_narrow);
+        assert_eq!(backend.rns_staging_buffers.len(), 2);
     }
 
     #[test]
@@ -2042,6 +2111,19 @@ mod tests {
                 .all(|device| fleet_output.shards().iter().any(|shard| shard.device_id == *device))
         );
         let fleet_source_bytes = fleet.matrix_to_bytes(&source);
+        let (_, host_bytes) = fleet.preimage_target(Arc::new(source.clone())).unwrap();
+        // Input staging precedes selection of calibrated output widths.
+        fleet.select_operation(rand::random()).unwrap();
+        let restored = fleet.matrix_from_cpu_staging_bytes(&source_type, &host_bytes).unwrap();
+        assert!(
+            devices
+                .iter()
+                .all(|device| restored.shards().iter().any(|shard| shard.device_id == *device))
+        );
+        assert_eq!(fleet.matrix_to_bytes(&restored), fleet_source_bytes);
+        let doubled = fleet.add(&restored, &restored).unwrap();
+        let expected_doubled = fleet.add(&source, &source).unwrap();
+        assert_eq!(fleet.matrix_to_bytes(&doubled), fleet.matrix_to_bytes(&expected_doubled));
         let fleet_output_bytes = fleet.matrix_to_bytes(&fleet_output);
         assert_eq!(fleet_output_bytes, fleet_source_bytes);
 
@@ -2389,6 +2471,12 @@ impl Backend for GpuDcrtBackend {
 
     fn select_gpu_operation(&mut self, operation: [u8; 32]) -> Result<(), Self::Error> {
         self.select_operation(operation)
+    }
+
+    fn parallel_wave_size(&self, _limit: usize) -> usize {
+        // Complete and stage one family member before starting the next.
+        // All device parallelism belongs to the calibrated column scheduler.
+        1
     }
 
     // A fleet is one production placement. Device parallelism is internal to
@@ -2883,6 +2971,55 @@ impl Backend for GpuDcrtBackend {
         self.unary_columns(value, |backend, input| backend.reduce_modulus(input, destination))
     }
 
+    fn centered_extend(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.centered_extend(input, destination))
+    }
+
+    fn centered_extend_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        let pieces = self
+            .devices
+            .par_iter_mut()
+            .map(|(device_id, backend)| {
+                value
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.device_id == *device_id)
+                    .map(|shard| {
+                        backend.centered_extend_small(&shard.value, destination).map(|value| {
+                            GpuColumnShard {
+                                device_id: *device_id,
+                                global_column_start: shard.global_column_start,
+                                value,
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut shards = pieces.into_iter().flatten().collect::<Vec<_>>();
+        shards.sort_by_key(|shard| shard.global_column_start);
+        Ok(GpuFleetSmallMatrix::new(value.rows, value.columns, shards))
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| {
+            backend.block_mod_switch(input, destination, plaintext_modulus)
+        })
+    }
+
     fn preimage_target(
         &mut self,
         value: Arc<Self::Matrix>,
@@ -2892,13 +3029,27 @@ impl Backend for GpuDcrtBackend {
         let first = value.shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
         let params = first.value.params().clone();
         let mut metadata = None;
-        let mut payload = Vec::new();
-        // Copy existing shards directly to host, one at a time. Gathering on a
+        let mut bytes = Vec::new();
+        let mut payload_start = 0;
+        // Copy existing shards directly to host. Gathering on a
         // device would temporarily allocate the entire logical target there.
-        // Sequential snapshots bound pinned and device unpack scratch to one
-        // existing shard; raw-RNS serialization allocates temporary u64 limbs.
-        for shard in &value.shards {
-            let snapshot = shard.value.to_rns_snapshot();
+        // Two stages overlap transfers while bounding pinned/unpack scratch
+        // to two shards. The next transfer starts before the previous wait.
+        let mut chunks = value.shards.iter();
+        let mut pending = chunks.next().map(|shard| {
+            (
+                shard.global_column_start,
+                shard.value.start_rns_snapshot(self.rns_staging_buffers.pop()),
+            )
+        });
+        while let Some((global_column_start, transfer)) = pending {
+            let next = chunks.next().map(|shard| {
+                (
+                    shard.global_column_start,
+                    shard.value.start_rns_snapshot(self.rns_staging_buffers.pop()),
+                )
+            });
+            let snapshot = transfer.finish();
             let current = (snapshot.level(), snapshot.is_ntt(), snapshot.bytes_per_poly());
             if let Some(expected) = metadata {
                 if current != expected {
@@ -2910,30 +3061,41 @@ impl Backend for GpuDcrtBackend {
                     .checked_mul(columns)
                     .and_then(|size| size.checked_mul(snapshot.bytes_per_poly()))
                     .ok_or(PolyBackendError::InvalidInteger)?;
-                payload.resize(length, 0);
+                // The byte-slice encoding is its length followed by raw bytes.
+                // Allocate the final staging representation once and write
+                // shards directly into it, avoiding a second full-size copy.
+                let header = bincode::encode_to_vec(
+                    (1u8, rows, columns, current.0, current.1, current.2, length),
+                    bincode::config::standard(),
+                )
+                .map_err(|_| PolyBackendError::InvalidInteger)?;
+                payload_start = header.len();
+                bytes = vec![0; payload_start + length];
+                bytes[..payload_start].copy_from_slice(&header);
             }
             let row_bytes = columns * snapshot.bytes_per_poly();
             let shard_row_bytes = snapshot.ncol() * snapshot.bytes_per_poly();
             if row_bytes != 0 {
-                payload.par_chunks_mut(row_bytes).enumerate().for_each(|(row, target)| {
-                    let start = shard.global_column_start * snapshot.bytes_per_poly();
-                    target[start..start + shard_row_bytes].copy_from_slice(
-                        &snapshot.bytes()[row * shard_row_bytes..(row + 1) * shard_row_bytes],
-                    );
-                });
+                bytes[payload_start..].par_chunks_mut(row_bytes).enumerate().for_each(
+                    |(row, target)| {
+                        let start = global_column_start * snapshot.bytes_per_poly();
+                        target[start..start + shard_row_bytes]
+                            .par_chunks_mut(snapshot.bytes_per_poly())
+                            .enumerate()
+                            .for_each(|(column, target)| {
+                                let offset =
+                                    row * shard_row_bytes + column * snapshot.bytes_per_poly();
+                                target.copy_from_slice(
+                                    &snapshot.bytes()[offset..offset + target.len()],
+                                );
+                            });
+                    },
+                );
             }
+            self.rns_staging_buffers.push(snapshot);
+            pending = next;
         }
-        let (level, is_ntt, bytes_per_poly) =
-            metadata.ok_or(PolyBackendError::InvalidConstantShape)?;
-        // Use the primitive raw-RNS staging representation, preserving both
-        // coefficient/evaluation format and the logical row-major layout.
-        let bytes = Arc::new(
-            bincode::encode_to_vec(
-                (1u8, rows, columns, level, is_ntt, bytes_per_poly, payload.as_slice()),
-                bincode::config::standard(),
-            )
-            .map_err(|_| PolyBackendError::InvalidInteger)?,
-        );
+        let bytes = Arc::new(bytes);
         let source = FleetStagedColumnSource { params, rows, columns, bytes: bytes.clone() };
         Ok((Arc::new(source), bytes))
     }
@@ -2943,8 +3105,38 @@ impl Backend for GpuDcrtBackend {
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error> {
-        let params = self.devices[0].1.parameters(ty)?;
-        Ok(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::from_cpu_staging_bytes(params, bytes)))
+        let planned = self
+            .active_operation
+            .is_some_and(|operation| self.operation_widths.contains_key(&operation));
+        let ranges = if planned {
+            self.column_ranges(ty.columns)
+        } else if self.pending_profile.is_some() || self.pending_pilot.is_some() {
+            // Width selection follows input staging. Distribute those inputs
+            // now instead of first loading the entire matrix on GPU 0.
+            let width = ty.columns.div_ceil(self.devices.len()).max(1);
+            fleet_column_ranges(
+                self.devices.len(),
+                ty.columns,
+                GpuColumnWidths { gpu0: width, nonzero: (self.devices.len() > 1).then_some(width) },
+            )
+        } else {
+            let params = self.devices[0].1.parameters(ty)?;
+            return Ok(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::from_cpu_staging_bytes(
+                params, bytes,
+            )));
+        };
+        let shards = ranges
+            .into_par_iter()
+            .map(|(device, start, end)| {
+                let params = self.devices[device].1.parameters(ty)?;
+                Ok(GpuColumnShard {
+                    device_id: self.devices[device].0,
+                    global_column_start: start,
+                    value: GpuDCRTPolyMatrix::from_cpu_staging_columns(params, bytes, start, end),
+                })
+            })
+            .collect::<Result<Vec<_>, PolyBackendError>>()?;
+        Ok(GpuFleetMatrix::new(ty.rows, ty.columns, shards))
     }
 
     fn preimage_target_from_staging(
@@ -4046,6 +4238,21 @@ impl Backend for GpuDcrtBackend {
         for (shard, encoding) in value.shards.iter().zip(&decoded) {
             let local_bits = usize::from(encoding.5);
             for row in 0..value.rows {
+                // Equal-width shards are contiguous rows of packed coefficients.
+                // Copy the entire row, without visiting every coefficient or bit.
+                if local_bits == global_bits {
+                    let row_bits = shard.value.col_size() * ring_dimension * local_bits;
+                    copy_packed_bits(
+                        &encoding.7,
+                        row * row_bits,
+                        &mut payload,
+                        (row * value.columns + shard.global_column_start) *
+                            ring_dimension *
+                            global_bits,
+                        row_bits,
+                    );
+                    continue;
+                }
                 for column in 0..shard.value.col_size() {
                     for coefficient in 0..ring_dimension {
                         let source_index = ((row * shard.value.col_size() + column) *
@@ -4108,24 +4315,14 @@ impl Backend for GpuDcrtBackend {
             let local_count = rows * local_columns * ring_dimension;
             let mut local_payload = vec![0u8; (local_count * coefficient_bits).div_ceil(8)];
             for row in 0..rows {
-                for column in start..end {
-                    for coefficient in 0..ring_dimension {
-                        let source_index = ((row * columns + column) * ring_dimension +
-                            coefficient) *
-                            coefficient_bits;
-                        let local_column = column - start;
-                        let target_index = ((row * local_columns + local_column) * ring_dimension +
-                            coefficient) *
-                            coefficient_bits;
-                        copy_packed_bits(
-                            &payload,
-                            source_index,
-                            &mut local_payload,
-                            target_index,
-                            coefficient_bits,
-                        );
-                    }
-                }
+                let row_bits = local_columns * ring_dimension * coefficient_bits;
+                copy_packed_bits(
+                    &payload,
+                    (row * columns + start) * ring_dimension * coefficient_bits,
+                    &mut local_payload,
+                    row * row_bits,
+                    row_bits,
+                );
             }
             let local_bytes = bincode::encode_to_vec(
                 (

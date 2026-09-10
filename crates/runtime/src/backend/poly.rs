@@ -231,6 +231,8 @@ pub struct RingKey {
 
 #[derive(Debug, Error)]
 pub enum PolyBackendError {
+    #[error("exact RNS conversion failed: {0}")]
+    ExactRns(String),
     #[error("requested preimage bound {requested} is below minimum {minimum}")]
     PreimageBoundTooSmall { requested: BigInt, minimum: BigInt },
     #[error("no concrete polynomial parameters registered for {0:?}")]
@@ -936,6 +938,14 @@ where
         Ok(M::multiply_batch_out_of_place(inputs))
     }
 
+    fn matrix_mul_accumulate(
+        &mut self,
+        request: MatrixMulAccumulateRequest<M>,
+    ) -> Result<M, Self::Error> {
+        // Keep singleton fleet shards on the same fused primitive as batches.
+        Ok(self.matrix_mul_accumulate_batch(vec![request])?.remove(0))
+    }
+
     fn matrix_mul_accumulate_batch(
         &mut self,
         requests: Vec<MatrixMulAccumulateRequest<M>>,
@@ -1062,6 +1072,33 @@ where
         value
             .rns_mod_down(self.parameters(destination)?, plaintext_modulus)
             .map_err(PolyBackendError::BasisConversion)
+    }
+
+    fn centered_extend(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+    ) -> Result<M, Self::Error> {
+        value.centered_extend(self.parameters(destination)?).map_err(PolyBackendError::ExactRns)
+    }
+
+    fn centered_extend_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        value.centered_extend(self.parameters(destination)?).map_err(PolyBackendError::ExactRns)
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        plaintext_modulus: u64,
+    ) -> Result<M, Self::Error> {
+        value
+            .block_mod_switch(self.parameters(destination)?, plaintext_modulus)
+            .map_err(PolyBackendError::ExactRns)
     }
 
     fn ring_automorphism_batch(

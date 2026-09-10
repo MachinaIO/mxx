@@ -12,6 +12,8 @@ gpu = [
     "dep:num-bigint",
     "dep:rayon",
     "dep:tracing",
+    "dep:tempfile",
+    "dep:sha2",
     "mxx-primitives/gpu",
     "mxx-runtime/gpu",
 ]
@@ -25,6 +27,8 @@ num-traits.workspace = true
 rayon = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
+tempfile = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]

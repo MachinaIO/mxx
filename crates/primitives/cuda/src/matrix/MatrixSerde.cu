@@ -107,56 +107,39 @@ namespace
         return static_cast<uint64_t>(prod % static_cast<unsigned __int128>(modulus));
     }
 
-    __global__ void serde_pack_u64_limb_to_packed_kernel(
+    __global__ void serde_pack_u64_limbs_to_packed_kernel(
         const uint64_t *src_words,
-        size_t src_stride_words,
-        uint8_t *dst_base,
-        size_t dst_stride_bytes,
-        uint8_t dst_coeff_bytes,
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *limbs,
+        size_t limb_count,
         size_t poly_count,
         size_t n)
     {
         const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        const size_t total = poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
-        const size_t poly_idx = idx / n;
-        const size_t coeff_idx = idx % n;
-        const uint64_t value = src_words[poly_idx * src_stride_words + coeff_idx];
+        const size_t total = poly_count * limb_count * n;
+        if (idx >= total) return;
+        const size_t poly_limb = idx / n;
+        const size_t poly_idx = poly_limb / limb_count;
+        const auto limb = limbs[poly_limb % limb_count];
         matrix_store_limb_u64(
-            dst_base,
-            poly_idx,
-            coeff_idx,
-            dst_stride_bytes,
-            dst_coeff_bytes,
-            value);
+            limb.base, poly_idx, idx % n, limb.stride, limb.width, src_words[idx]);
     }
 
-    __global__ void serde_unpack_packed_limb_to_u64_kernel(
-        const uint8_t *src_base,
-        size_t src_stride_bytes,
-        uint8_t src_coeff_bytes,
+    __global__ void serde_unpack_packed_limbs_to_u64_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *limbs,
+        size_t limb_count,
         uint64_t *dst_words,
-        size_t dst_stride_words,
         size_t poly_count,
         size_t n)
     {
         const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        const size_t total = poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
-        const size_t poly_idx = idx / n;
-        const size_t coeff_idx = idx % n;
-        dst_words[poly_idx * dst_stride_words + coeff_idx] = matrix_load_limb_u64(
-            src_base,
-            poly_idx,
-            coeff_idx,
-            src_stride_bytes,
-            src_coeff_bytes);
+        const size_t total = poly_count * limb_count * n;
+        if (idx >= total) return;
+        const size_t poly_limb = idx / n;
+        const size_t poly_idx = poly_limb / limb_count;
+        const size_t limb_idx = poly_limb % limb_count;
+        const auto limb = limbs[limb_idx];
+        dst_words[idx] = matrix_load_limb_u64(
+            limb.base, poly_idx, idx % n, limb.stride, limb.width);
     }
 
     __global__ void serde_reconstruct_rns_to_words_kernel(
@@ -779,101 +762,68 @@ extern "C" int gpu_matrix_load_rns_batch(
 
     std::vector<SerdeStreamRef> streams;
     streams.reserve(limb_count);
+    const size_t batch_limbs = mat->shared_limb_buffers.size() == 1 ? limb_count : 1;
     const size_t host_limb_bytes = static_cast<size_t>(N) * sizeof(uint64_t);
-    const size_t host_limb_words = static_cast<size_t>(N);
-    size_t total_coeff = 0;
+    size_t batch_poly_bytes = 0;
     size_t staging_bytes = 0;
-    if (!serde_checked_mul_size(count, host_limb_words, &total_coeff) ||
-        !serde_checked_mul_size(total_coeff, sizeof(uint64_t), &staging_bytes))
-    {
+    if (!serde_checked_mul_size(batch_limbs, host_limb_bytes, &batch_poly_bytes) ||
+        !serde_checked_mul_size(count, batch_poly_bytes, &staging_bytes))
         return set_error("staging size overflow in gpu_matrix_load_rns_batch");
-    }
-    for (size_t limb = 0; limb < limb_count; ++limb)
+    for (size_t limb = 0; limb < limb_count; limb += batch_limbs)
     {
         const dim3 limb_id = limb_map[limb];
-        uint8_t *dst = matrix_limb_ptr_by_id(mat, 0, limb_id);
-        if (!dst)
-        {
-            return set_error("null matrix limb base pointer in gpu_matrix_load_rns_batch");
-        }
-
-        int device = -1;
+        const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+        const int device = buffer.device;
         cudaStream_t stream = nullptr;
-        int status = matrix_limb_device(mat, limb_id, &device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(mat, limb_id, &stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        size_t dst_pitch = 0;
-        uint8_t dst_coeff_bytes = 0;
-        if (!matrix_limb_metadata_by_id(mat, limb_id, &dst_pitch, &dst_coeff_bytes))
-        {
-            return set_error("invalid limb metadata in gpu_matrix_load_rns_batch");
-        }
-        const size_t dst_width = static_cast<size_t>(N) * static_cast<size_t>(dst_coeff_bytes);
-        if (dst_coeff_bytes == 0 || dst_pitch < dst_width)
-        {
-            return set_error("invalid destination stride in gpu_matrix_load_rns_batch");
-        }
-        const uint8_t *src = bytes + limb * host_limb_bytes;
-
+        int status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0) return status;
         cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
+        if (err != cudaSuccess) return set_error(err);
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            return set_error(err);
+            status = matrix_wait_limb_stream(mat, limb_map[limb + index], device, stream);
+            if (status != 0) return status;
         }
         uint64_t *src_words_device = nullptr;
         err = cudaMallocAsync(reinterpret_cast<void **>(&src_words_device), staging_bytes, stream);
-        if (err != cudaSuccess)
+        if (err != cudaSuccess) return set_error(err);
+        if (bytes_per_poly == batch_poly_bytes)
         {
-            return set_error(err);
+            err = cudaMemcpyAsync(
+                src_words_device, bytes, staging_bytes, cudaMemcpyHostToDevice, stream);
         }
-        err = cudaMemcpy2DAsync(
-            src_words_device,
-            host_limb_bytes,
-            src,
-            bytes_per_poly,
-            host_limb_bytes,
-            count,
-            cudaMemcpyHostToDevice,
-            stream);
-        if (err != cudaSuccess)
+        else
         {
-            cudaFreeAsync(src_words_device, stream);
-            return set_error(err);
+            err = cudaMemcpy2DAsync(
+                src_words_device,
+                batch_poly_bytes,
+                bytes + limb * host_limb_bytes,
+                bytes_per_poly,
+                batch_poly_bytes,
+                count,
+                cudaMemcpyHostToDevice,
+                stream);
         }
-        const int threads = 256;
-        const int blocks =
-            static_cast<int>((total_coeff + static_cast<size_t>(threads) - 1) /
-                             static_cast<size_t>(threads));
-        serde_pack_u64_limb_to_packed_kernel<<<blocks, threads, 0, stream>>>(
-            src_words_device,
-            host_limb_words,
-            dst,
-            dst_pitch,
-            dst_coeff_bytes,
-            count,
-            static_cast<size_t>(N));
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
+        if (err == cudaSuccess)
         {
-            cudaFreeAsync(src_words_device, stream);
-            return set_error(err);
+            const size_t total_coeff = staging_bytes / sizeof(uint64_t);
+            const int threads = 256;
+            const int blocks = static_cast<int>((total_coeff + threads - 1) / threads);
+            serde_pack_u64_limbs_to_packed_kernel<<<blocks, threads, 0, stream>>>(
+                src_words_device,
+                buffer.device_descriptors + limb_id.y,
+                batch_limbs,
+                count,
+                static_cast<size_t>(N));
+            err = cudaGetLastError();
         }
-        err = cudaFreeAsync(src_words_device, stream);
-        if (err != cudaSuccess)
+        const cudaError_t free_error = cudaFreeAsync(src_words_device, stream);
+        if (err != cudaSuccess) return set_error(err);
+        if (free_error != cudaSuccess) return set_error(free_error);
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            return set_error(err);
-        }
-        status = matrix_record_limb_write(mat, limb_id, stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_record_limb_write(mat, limb_map[limb + index], stream);
+            if (status != 0) return status;
         }
         serde_append_unique_stream(streams, device, stream);
     }
@@ -958,106 +908,71 @@ extern "C" int gpu_matrix_store_rns_batch(
 
     std::vector<SerdeStreamRef> streams;
     streams.reserve(limb_count);
+    // Fleet matrices keep all CRT limbs on one device. Unpack that complete
+    // allocation in one kernel and transfer each polynomial contiguously,
+    // instead of allocating and scheduling a D2H copy for every CRT limb.
+    const size_t batch_limbs = mat->shared_limb_buffers.size() == 1 ? limb_count : 1;
     const size_t host_limb_bytes = static_cast<size_t>(N) * sizeof(uint64_t);
-    const size_t host_limb_words = static_cast<size_t>(N);
-    size_t total_coeff = 0;
+    size_t batch_poly_bytes = 0;
     size_t staging_bytes = 0;
-    if (!serde_checked_mul_size(count, host_limb_words, &total_coeff) ||
-        !serde_checked_mul_size(total_coeff, sizeof(uint64_t), &staging_bytes))
-    {
+    if (!serde_checked_mul_size(batch_limbs, host_limb_bytes, &batch_poly_bytes) ||
+        !serde_checked_mul_size(count, batch_poly_bytes, &staging_bytes))
         return set_error("staging size overflow in gpu_matrix_store_rns_batch");
-    }
-    for (size_t limb = 0; limb < limb_count; ++limb)
+    for (size_t limb = 0; limb < limb_count; limb += batch_limbs)
     {
         const dim3 limb_id = limb_map[limb];
-        const uint8_t *src = matrix_limb_ptr_by_id(mat, 0, limb_id);
-        if (!src)
-        {
-            return set_error("null matrix limb base pointer in gpu_matrix_store_rns_batch");
-        }
-
-        int device = -1;
+        const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+        const int device = buffer.device;
         cudaStream_t stream = nullptr;
-        int status = matrix_limb_device(mat, limb_id, &device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(mat, limb_id, &stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        size_t src_pitch = 0;
-        uint8_t src_coeff_bytes = 0;
-        if (!matrix_limb_metadata_by_id(mat, limb_id, &src_pitch, &src_coeff_bytes))
-        {
-            return set_error("invalid limb metadata in gpu_matrix_store_rns_batch");
-        }
-        const size_t src_width = static_cast<size_t>(N) * static_cast<size_t>(src_coeff_bytes);
-        if (src_coeff_bytes == 0 || src_pitch < src_width)
-        {
-            return set_error("invalid source stride in gpu_matrix_store_rns_batch");
-        }
-        uint8_t *dst = bytes_out + limb * host_limb_bytes;
-
+        int status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0) return status;
         cudaError_t err = cudaSetDevice(device);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        status = matrix_wait_limb_stream(mat, limb_id, device, stream, false, true);
-        if (status != 0)
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            return status;
+            status = matrix_wait_limb_stream(mat, limb_map[limb + index], device, stream, false, true);
+            if (status != 0) return status;
         }
         uint64_t *dst_words_device = nullptr;
         err = cudaMallocAsync(reinterpret_cast<void **>(&dst_words_device), staging_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
+        if (err != cudaSuccess) return set_error(err);
+        const size_t total_coeff = staging_bytes / sizeof(uint64_t);
         const int threads = 256;
-        const int blocks =
-            static_cast<int>((total_coeff + static_cast<size_t>(threads) - 1) /
-                             static_cast<size_t>(threads));
-        serde_unpack_packed_limb_to_u64_kernel<<<blocks, threads, 0, stream>>>(
-            src,
-            src_pitch,
-            src_coeff_bytes,
+        const int blocks = static_cast<int>((total_coeff + threads - 1) / threads);
+        serde_unpack_packed_limbs_to_u64_kernel<<<blocks, threads, 0, stream>>>(
+            buffer.device_descriptors + limb_id.y,
+            batch_limbs,
             dst_words_device,
-            host_limb_words,
             count,
             static_cast<size_t>(N));
         err = cudaGetLastError();
-        if (err != cudaSuccess)
+        if (err == cudaSuccess && bytes_per_poly == batch_poly_bytes)
         {
-            cudaFreeAsync(dst_words_device, stream);
-            return set_error(err);
+            err = cudaMemcpyAsync(
+                bytes_out, dst_words_device, staging_bytes, cudaMemcpyDeviceToHost, stream);
         }
-        err = cudaMemcpy2DAsync(
-            dst,
-            bytes_per_poly,
-            dst_words_device,
-            host_limb_bytes,
-            host_limb_bytes,
-            count,
-            cudaMemcpyDeviceToHost,
-            stream);
-        if (err != cudaSuccess)
+        else if (err == cudaSuccess)
         {
-            cudaFreeAsync(dst_words_device, stream);
-            return set_error(err);
+            err = cudaMemcpy2DAsync(
+                bytes_out + limb * host_limb_bytes,
+                bytes_per_poly,
+                dst_words_device,
+                batch_poly_bytes,
+                batch_poly_bytes,
+                count,
+                cudaMemcpyDeviceToHost,
+                stream);
         }
-        err = cudaFreeAsync(dst_words_device, stream);
-        if (err != cudaSuccess)
+        const cudaError_t free_error = cudaFreeAsync(dst_words_device, stream);
+        if (err != cudaSuccess) return set_error(err);
+        if (free_error != cudaSuccess) return set_error(free_error);
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            return set_error(err);
-        }
-        status = matrix_track_limb_consumer(mat, limb_id, device, stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_track_limb_consumer(mat, limb_map[limb + index], device, stream);
+            if (status != 0) return status;
         }
         serde_append_unique_stream(streams, device, stream);
     }

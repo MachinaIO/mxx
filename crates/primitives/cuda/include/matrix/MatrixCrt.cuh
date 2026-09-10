@@ -25,9 +25,11 @@ extern "C"
     int gpu_matrix_convert_modulus(
         GpuMatrix *out,
         const GpuMatrix *source,
-        int round_scale,
+        int conversion,
         const uint64_t *division_inverses,
-        size_t inverse_count);
+        size_t inverse_count,
+        uint64_t plaintext_modulus,
+        const uint64_t *input_scales);
 
 #ifdef __cplusplus
 }

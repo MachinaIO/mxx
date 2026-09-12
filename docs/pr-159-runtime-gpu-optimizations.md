@@ -217,9 +217,8 @@ new end-to-end cryptographic security claim.
 ## 9. Repository changes and validation status
 
 `docs/plans/` is removed from Git tracking and added to `.gitignore`; local files
-are retained. The PR also includes the root file `layouts`, a one-line scratch
-note; it is not loaded by the runtime. Documentation should be read against the
-current source, since local historical plans may describe superseded designs.
+are retained. Documentation should be read against the current source, since
+local historical plans may describe superseded designs.
 
 Before the physical run, local validation included warning-free CPU/GPU workspace
 library builds, 61 estimator tests, and 260 applicable runtime tests (259 in the

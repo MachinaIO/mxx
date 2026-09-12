@@ -391,7 +391,7 @@ extern "C" int gpu_prepared_pinned_claim(
 {
     if (!ctx || !ctx->execution || !out || !handled) return fail("invalid prepared pinned claim");
     *out = nullptr;
-    *handled = ctx->execution->pinned_admission_required.load(std::memory_order_acquire) ? 1 : 0;
+    *handled = ((active_permit && ctx->execution->graph_admission_scoped.load(std::memory_order_acquire)) || ctx->execution->pinned_admission_required.load(std::memory_order_acquire)) ? 1 : 0;
     if (!*handled) {
         trace_claim(GPU_PREPARED_PINNED_HOST, 0, 0, -1, -1, bytes, alignment);
         return 0;
@@ -418,6 +418,7 @@ extern "C" int gpu_prepared_pinned_claim(
         if (status != 0) return status;
         occupy(storage, slot, bytes);
         ++reservation->next;
+        slot.pinned_deferred.store(false, std::memory_order_relaxed);
         slot.state.store(leased, std::memory_order_release);
         lease.release();
         note_consumed(GPU_PREPARED_PINNED_HOST, 0, 0, -1, -1, bytes, alignment);
@@ -442,7 +443,9 @@ extern "C" void gpu_prepared_pinned_recycle(GpuPreparedPinnedLease *lease)
     // event. No device-event wait can make an earlier CPU write safe here.
     lease->occupancy->occupied_bytes.fetch_sub(slot.occupied_units, std::memory_order_acq_rel);
     slot.occupied_units = 0;
-    slot.pinned_deferred.store(false, std::memory_order_release);
+    // Keep the deferred marker until the next acquisition. Clearing it before
+    // publishing available would make scheduler queries mistake retirement in
+    // progress for an unreleased CPU owner. The state publication ends all access.
     slot.state.store(available, std::memory_order_release);
     delete lease;
 }
@@ -467,7 +470,7 @@ int GpuCudaResource::acquire(const GpuContext *ctx, int selected_device, GpuPrep
     GpuAllocationActivity activity(execution.get(), device);
     if (execution->unretired_work.load(std::memory_order_acquire))
         return refuse("CUDA resource request has unretired work");
-    if (execution->resource_admission_required.load(std::memory_order_acquire)) {
+    if ((active_permit && execution->graph_admission_scoped.load(std::memory_order_acquire)) || execution->resource_admission_required.load(std::memory_order_acquire)) {
         auto *reservation = active_permit ? active_permit->next_reservation() : nullptr;
         if (!reservation || reservation->storage->context != ctx || reservation->storage->device != device)
             return refuse("CUDA resource requires a matching prepared dispatch permit");
@@ -588,7 +591,7 @@ int GpuDeviceWorkspace::acquire(
     };
     GpuAllocationActivity activity(ctx->execution.get(), device);
     const bool requires_permit = kind == GPU_PREPARED_TRANSFER_WORKSPACE
-        ? ctx->execution->transfer_admission_required.load(std::memory_order_acquire)
+        ? ((active_permit && ctx->execution->graph_admission_scoped.load(std::memory_order_acquire)) || ctx->execution->transfer_admission_required.load(std::memory_order_acquire))
         : (active_permit || gpu_context_admission_is_required(ctx));
     if (requires_permit) {
         auto *next = active_permit ? active_permit->next_reservation() : nullptr;
@@ -948,7 +951,7 @@ extern "C" int gpu_prepared_storage_occupancy(
             if (owned) backing.active_reservations.store(0, std::memory_order_release);
         }
     } boundary{backing};
-    if (reset_peak) {
+    if (reset_peak == 1) {
         size_t expected = 0;
         if (!backing.active_reservations.compare_exchange_strong(
                 expected, resetting, std::memory_order_acq_rel))
@@ -965,13 +968,23 @@ extern "C" int gpu_prepared_storage_occupancy(
     size_t pinned_available = 0;
     size_t resource_available = 0;
     for (auto &slot : backing.slots) {
+        unsigned int restore_state = available;
         unsigned int expected = available;
         if (!slot->state.compare_exchange_strong(
                 expected, inspecting, std::memory_order_acq_rel)) {
-            // Leased outputs are allowed as retained baseline. Another poll or
-            // a failed slot cannot establish a clean calibration boundary.
-            pending |= expected != leased || slot->pinned_deferred.load(std::memory_order_acquire);
-            continue;
+            // Measurement parks reservation owners before entering here. A
+            // reserved slot can still carry its preceding, completed use; poll
+            // that event while preserving the reservation and its exact claims.
+            if (reset_peak == 2 && expected == reserved &&
+                slot->state.compare_exchange_strong(
+                    expected, inspecting, std::memory_order_acq_rel)) {
+                restore_state = reserved;
+            } else {
+                // Leased outputs remain the retained baseline. Failed slots or
+                // concurrent inspection cannot establish a measurement boundary.
+                pending |= expected != leased || slot->pinned_deferred.load(std::memory_order_acquire);
+                continue;
+            }
         }
         if (slot->occupied_units != 0) {
             error = cudaEventQuery(slot->reusable);
@@ -996,7 +1009,7 @@ extern "C" int gpu_prepared_storage_occupancy(
                 pinned_available += slot->identity.requested_backing_bytes;
             else available_bytes += slot->identity.requested_backing_bytes;
         }
-        slot->state.store(available, std::memory_order_release);
+        slot->state.store(restore_state, std::memory_order_release);
     }
     const cudaError_t restored = cudaSetDevice(previous);
     if (restored != cudaSuccess) quarantine(backing);
@@ -1005,12 +1018,12 @@ extern "C" int gpu_prepared_storage_occupancy(
     if (reset_peak && pending)
         return fail("prepared occupancy reset has pending releases or slot inspection");
     const size_t occupied = backing.occupied_bytes.load(std::memory_order_acquire);
-    if (reset_peak)
+    if (reset_peak == 1)
         backing.occupied_high_water_bytes.store(occupied, std::memory_order_release);
     const size_t pinned_occupied = backing.pinned->occupied_bytes.load(std::memory_order_acquire);
-    if (reset_peak) backing.pinned->high_water_bytes.store(pinned_occupied, std::memory_order_release);
+    if (reset_peak == 1) backing.pinned->high_water_bytes.store(pinned_occupied, std::memory_order_release);
     const size_t resource_occupied = backing.resources->occupied.load(std::memory_order_acquire);
-    if (reset_peak) backing.resources->high_water.store(resource_occupied, std::memory_order_release);
+    if (reset_peak == 1) backing.resources->high_water.store(resource_occupied, std::memory_order_release);
     const size_t active = backing.active_reservations.load(std::memory_order_acquire);
     *out = GpuPreparedOccupancy{
         backing.requested_capacity_bytes,
@@ -1052,7 +1065,7 @@ extern "C" int gpu_prepared_storages_occupancy(
                 if (owned) execution.prepared_active_reservations.store(0, std::memory_order_release);
             }
         } boundary{*execution};
-        if (reset_peak) {
+        if (reset_peak == 1) {
             size_t expected = 0;
             if (!execution->prepared_active_reservations.compare_exchange_strong(
                     expected, resetting, std::memory_order_acq_rel))
@@ -1067,11 +1080,53 @@ extern "C" int gpu_prepared_storages_occupancy(
             if (status != 0) return status;
         }
         const size_t occupied = execution->prepared_occupied_bytes.load(std::memory_order_acquire);
+        // Mode 2 is an explicit benchmark boundary. Its caller has completed
+        // preceding releases and parked all reservation/dispatch owners. It
+        // resets only this joint measurement, never calibration's slot peaks or
+        // admission state. Ordinary observation and calibration keep their
+        // original reservation exclusion rules.
         if (reset_peak) execution->prepared_high_water_bytes.store(occupied, std::memory_order_release);
         *out_occupied_bytes = occupied;
         *out_high_water_bytes = execution->prepared_high_water_bytes.load(std::memory_order_acquire);
         return 0;
     } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_graph_admission_begin(GpuContext *ctx)
+{
+    if (!ctx || !ctx->execution) return fail("missing graph execution owner");
+    auto &owner = *ctx->execution;
+    if (owner.prepared_active_reservations.load(std::memory_order_acquire) ||
+        owner.active_allocation_calls.load(std::memory_order_seq_cst) ||
+        owner.unretired_work.load(std::memory_order_acquire))
+        return fail("graph setup has outstanding admission or uncertain work");
+    bool inactive = false;
+    if (!owner.graph_admission_active.compare_exchange_strong(inactive, true, std::memory_order_acq_rel))
+        return fail("graph execution owner is already active");
+    GpuAllocationActivity activity(&owner, -1);
+    owner.graph_admission_scoped.store(true, std::memory_order_release);
+    owner.admission_required.store(false, std::memory_order_release);
+    owner.pinned_admission_required.store(false, std::memory_order_release);
+    owner.transfer_admission_required.store(false, std::memory_order_release);
+    owner.resource_admission_required.store(false, std::memory_order_release);
+    return 0;
+}
+
+extern "C" void gpu_graph_admission_end(GpuContext *ctx)
+{
+    if (!ctx || !ctx->execution) return;
+    auto &owner = *ctx->execution;
+    GpuAllocationActivity activity(&owner, -1);
+    // Failed/pending invocations keep their seal. Never turn an unfinished
+    // native reservation into permission for an unclaimed allocation.
+    if (!owner.prepared_active_reservations.load(std::memory_order_acquire) &&
+        !owner.unretired_work.load(std::memory_order_acquire)) {
+        owner.admission_required.store(false, std::memory_order_release);
+        owner.pinned_admission_required.store(false, std::memory_order_release);
+        owner.transfer_admission_required.store(false, std::memory_order_release);
+        owner.resource_admission_required.store(false, std::memory_order_release);
+    }
+    owner.graph_admission_active.store(false, std::memory_order_release);
 }
 
 extern "C" int gpu_prepared_storages_finish_setup(
@@ -1101,9 +1156,11 @@ extern "C" int gpu_prepared_storages_finish_setup(
                 !identities.insert(storage.identity).second)
                 return fail("managed setup requires distinct stores on the same execution owner");
             for (const auto &slot : storage.slots) {
+                const auto state = slot->state.load(std::memory_order_acquire);
                 if (slot->reservation_owner.load(std::memory_order_acquire) != 0 ||
-                    slot->state.load(std::memory_order_acquire) != available)
-                    return fail("managed setup has a reserved, leased or quarantined slot");
+                    (state != available && !(state == leased &&
+                        execution->graph_admission_scoped.load(std::memory_order_acquire))))
+                    return fail("managed setup has a reserved, untracked leased or quarantined slot");
             }
         }
         if (execution->prepared_storage_count.load(std::memory_order_acquire) != count)
@@ -1160,15 +1217,17 @@ extern "C" int gpu_matrix_reserve(
                 reservation_units(*backing.slots[slot]),
                 std::memory_order_acq_rel);
         }
-        backing.context->execution->admission_required.store(true, std::memory_order_release);
-        for (const auto &claim : reservation->claims) {
-            if (claim.request.kind == GPU_PREPARED_PINNED_HOST) {
-                backing.context->execution->pinned_admission_required.store(true, std::memory_order_release);
+        if (!backing.context->execution->graph_admission_scoped.load(std::memory_order_acquire)) {
+            backing.context->execution->admission_required.store(true, std::memory_order_release);
+            for (const auto &claim : reservation->claims) {
+                if (claim.request.kind == GPU_PREPARED_PINNED_HOST) {
+                    backing.context->execution->pinned_admission_required.store(true, std::memory_order_release);
+                }
+                if (claim.request.kind == GPU_PREPARED_TRANSFER_WORKSPACE)
+                    backing.context->execution->transfer_admission_required.store(true, std::memory_order_release);
+                if (is_resource(claim.request.kind))
+                    backing.context->execution->resource_admission_required.store(true, std::memory_order_release);
             }
-            if (claim.request.kind == GPU_PREPARED_TRANSFER_WORKSPACE)
-                backing.context->execution->transfer_admission_required.store(true, std::memory_order_release);
-            if (is_resource(claim.request.kind))
-                backing.context->execution->resource_admission_required.store(true, std::memory_order_release);
         }
         *out = reservation.release();
         return 0;
@@ -1209,10 +1268,12 @@ extern "C" int gpu_matrix_reservation_require_all_resources(GpuMatrixReservation
         reservation->execution->unretired_work.load(std::memory_order_acquire))
         return fail("complete resource coverage requires an unsubmitted reservation");
     auto &owner = *reservation->execution;
-    owner.admission_required.store(true, std::memory_order_release);
-    owner.pinned_admission_required.store(true, std::memory_order_release);
-    owner.transfer_admission_required.store(true, std::memory_order_release);
-    owner.resource_admission_required.store(true, std::memory_order_release);
+    if (!owner.graph_admission_scoped.load(std::memory_order_acquire)) {
+        owner.admission_required.store(true, std::memory_order_release);
+        owner.pinned_admission_required.store(true, std::memory_order_release);
+        owner.transfer_admission_required.store(true, std::memory_order_release);
+        owner.resource_admission_required.store(true, std::memory_order_release);
+    }
     return 0;
 }
 
@@ -1319,6 +1380,34 @@ extern "C" int gpu_matrix_reservation_rearm(
         reservation->next = 0;
         return 0;
     } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_matrix_reservation_cpu_ready(
+    const GpuMatrixReservation *reservation, int *out_ready)
+{
+    if (!reservation || !out_ready) return fail("invalid CPU staging readiness query");
+    *out_ready = 0;
+    const auto &execution = *reservation->execution;
+    if (execution.unretired_work.load(std::memory_order_acquire) ||
+        execution.memory_release_failed.load(std::memory_order_acquire) ||
+        execution.allocation_activity_unknown.load(std::memory_order_seq_cst))
+        return fail("CPU staging retirement has uncertain allocation or release activity");
+    bool ready = true;
+    for (size_t index : reservation->slots) {
+        const auto &slot = *reservation->storage->slots[index];
+        if (slot.identity.kind != GPU_PREPARED_PINNED_HOST) continue;
+        const auto state = slot.state.load(std::memory_order_acquire);
+        if (state == available || state == reserved) continue;
+        if (state == leased && slot.pinned_deferred.load(std::memory_order_acquire)) {
+            ready = false;
+            continue;
+        }
+        return fail("CPU staging is still owned by the caller or quarantined");
+    }
+    // The reclaimer releases the exact upload completion resource before
+    // publishing its pinned slots available. This does not drain unrelated jobs.
+    *out_ready = ready ? 1 : 0;
+    return 0;
 }
 
 extern "C" int gpu_matrix_reservation_partition(

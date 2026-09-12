@@ -23,14 +23,16 @@ pub struct NodeMeasurement {
     /// Backend work units. The GPU backend uses aggregate execution-owner CUDA-event
     /// spans in device-seconds; the generic host harness uses host elapsed seconds.
     pub work_seconds: f64,
-    /// Ideal dependency latency: maximum measured class time for independent waves.
+    /// Ideal dependency latency: maximum measured class time for independent waves,
+    /// plus separately measured preparation/initialization prerequisites when present.
     pub latency_seconds: f64,
-    /// Sum of all production fleet wave latencies for the full logical operation.
+    /// Sum of production fleet wave latencies and their preparation/initialization
+    /// prerequisites for the full logical operation.
     pub cumulative_wave_seconds: f64,
     /// Number of independent fleet waves needed for the full logical operation.
     pub independent_wave_count: usize,
-    /// Measured incremental allocation for one bounded wave, excluding resident inputs.
-    /// The current GPU adapter includes output allocations; this is not scratch alone.
+    /// Measured incremental allocation, excluding the invocation's resident baseline.
+    /// GPU representative measurements include one wave's outputs, not scratch alone.
     /// This is not the whole-graph runtime peak and is never multiplied by wave count.
     pub measured_wave_workspace_bytes: u64,
     /// Hypothetical workspace when all independent waves execute concurrently.
@@ -73,10 +75,6 @@ pub enum MeasurementScenario {
     BackendDefined,
     /// Synthetic input values and fresh placement; retained runtime owners/budgets are absent.
     SyntheticFreshPlacement,
-    /// Every fleet-wave node was measured over the wave classes of an admitted runtime
-    /// invocation plan: actual owner intervals, admitted widths and exact multiplicities.
-    /// Operand values remain synthetic; timing is not a physical-memory certificate.
-    AdmittedInvocationPlan,
 }
 
 pub trait MeasurementBackend {

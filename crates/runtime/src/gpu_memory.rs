@@ -42,6 +42,14 @@ use std::{
     },
 };
 
+/// Production prepared admission uses native bounds without executing a pilot.
+/// Explicit allocating benchmarks may instead supply a measured profile.
+#[derive(Clone, Copy)]
+pub enum GpuColumnWidthPolicy<'a> {
+    Native(GpuAllocationClass),
+    Calibrated(&'a GpuCalibrationProfile),
+}
+
 static NEXT_LEDGER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -370,6 +378,7 @@ impl GpuColumnMemoryPlan {
         self,
         enqueue: &mut GpuEnqueuePool,
         states: &mut Vec<S>,
+        mut measurement: Option<&mut crate::gpu_measurement::GpuColumnMeasurement<'_>>,
         initialize: impl Fn(
             usize,
             &mut S,
@@ -428,6 +437,8 @@ impl GpuColumnMemoryPlan {
             .map(|(state, leases)| (state, leases, None::<O>, false))
             .collect::<Vec<_>>();
         let result: Result<(), GpuAdmissionError> = (|| {
+            let timer =
+                measurement.as_ref().map(|measurement| measurement.begin(None)).transpose()?;
             enqueue
                 .map(&mut workers, move |device, (state, leases, output, _)| {
                     let Some(leases) = leases else {
@@ -456,11 +467,22 @@ impl GpuColumnMemoryPlan {
                     Ok(())
                 })
                 .map_err(|error| GpuAdmissionError::Worker(error.to_string()))?;
+            if let (Some(measurement), Some(timer)) = (measurement.as_mut(), timer) {
+                measurement.finish(
+                    timer,
+                    crate::gpu_measurement::GpuMeasuredStage::OutputInitialization,
+                )?;
+            }
             let requests = Arc::new(scratch_requests);
             let run = Arc::new(run);
             for jobs in schedule.waves() {
+                let timer = measurement
+                    .as_ref()
+                    .map(|measurement| measurement.begin_wave(&jobs))
+                    .transpose()?
+                    .flatten();
                 let mut ranges = vec![None; workers.len()];
-                for job in jobs {
+                for &job in &jobs {
                     ranges[job.device] = Some(job);
                 }
                 let requests = requests.clone();
@@ -471,6 +493,27 @@ impl GpuColumnMemoryPlan {
                             return Ok::<(), GpuAdmissionError>(());
                         };
                         let leases = leases.as_mut().expect("validated active column owner");
+                        if *submitted {
+                            // Bounded scheduler backpressure before the next
+                            // dispatch: a CPU write cannot use a stream wait to
+                            // protect pinned staging still read by an earlier DMA.
+                            // Upload primitives return after enqueueing; no drain
+                            // follows the final wave, and device-only slots never
+                            // wait here for their GPU readers.
+                            loop {
+                                let ready = leases
+                                    .prepared_scratch
+                                    .iter()
+                                    .try_fold(true, |ready, reservation| {
+                                        reservation.cpu_staging_ready().map(|next| ready & next)
+                                    })
+                                    .map_err(GpuAdmissionError::NativeReservation)?;
+                                if ready {
+                                    break;
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
                         let current = requests(job, &leases.prepared_scratch)?;
                         if current.len() != leases.prepared_scratch.len() {
                             return Err(GpuAdmissionError::InvalidPlan(
@@ -514,6 +557,14 @@ impl GpuColumnMemoryPlan {
                         Ok(())
                     })
                     .map_err(|error| GpuAdmissionError::Worker(error.to_string()))?;
+                if let Some(measurement) = measurement.as_mut() {
+                    if let Some(timer) = timer {
+                        measurement
+                            .finish(timer, crate::gpu_measurement::GpuMeasuredStage::Wave(jobs))?;
+                    } else {
+                        measurement.reuse_wave(jobs);
+                    }
+                }
             }
             Ok(())
         })();
@@ -801,7 +852,7 @@ impl GpuMemoryLedger {
         &mut self,
         columns: usize,
         ownership: GpuOutputOwnership<'_>,
-        profile: &GpuCalibrationProfile,
+        policy: GpuColumnWidthPolicy<'_>,
         requirements: &impl GpuColumnMemoryRequirements,
     ) -> Result<GpuColumnMemoryPlan, GpuAdmissionError> {
         self.poll_releases()?;
@@ -955,65 +1006,133 @@ impl GpuMemoryLedger {
             (move || {
                 let devices = &ledger.devices;
                 let inventory = &ledger.prepared_storages;
-                let owners = active
-                    .par_iter()
-                    .map(|device| {
-                        let calibration = if *device == 0 { profile.gpu0 } else { profile.nonzero }
-                            .ok_or_else(|| {
+                let class_for = |device: usize| -> Result<GpuAllocationClass, GpuAdmissionError> {
+                    match policy {
+                        GpuColumnWidthPolicy::Native(class) => Ok(class),
+                        GpuColumnWidthPolicy::Calibrated(profile) => {
+                            let calibration =
+                                if device == 0 { profile.gpu0 } else { profile.nonzero };
+                            calibration.map(|value| value.class()).ok_or_else(|| {
                                 GpuAdmissionError::InvalidPlan("active owner has no profile".into())
-                            })?;
-                        let candidate_capacity = match calibration.metric() {
-                            GpuCalibrationMetric::PreparedOccupiedSpanBytes { .. } => {
-                                let minimum =
-                                    requirements.minimum_temporary_allocations(*device)?;
-                                let minimum = GpuColumnAllocations::combined(&[&minimum]);
-                                let bytes = minimum
-                                    .prepared
-                                    .par_iter()
-                                    .map(|(storage, _)| {
-                                        validate_prepared_inventory(*device, storage, inventory)?;
-                                        let occupancy = storage
-                                            .occupancy()
-                                            .map_err(GpuAdmissionError::NativeReservation)?;
-                                        u64::try_from(occupancy.available_capacity_bytes())
-                                            .map_err(|_| GpuAdmissionError::Overflow)
-                                    })
-                                    .collect::<Result<Vec<_>, GpuAdmissionError>>()?;
-                                GpuCandidateCapacity::PreparedAvailableBytes(allocation_bytes(
-                                    &bytes,
-                                )?)
-                            }
-                            _ => GpuCandidateCapacity::DefaultPoolHeadroomBytes(
-                                before[*device]
-                                    .budget_bytes
-                                    .saturating_sub(before[*device].charged_bytes())
-                                    .saturating_sub(fixed[*device].managed_bytes()?),
-                            ),
-                        };
-                        let current = &devices[*device];
-                        Ok(GpuWidthAdmission {
-                            device: *device,
-                            remaining_columns: largest_intervals[*device],
-                            candidate_capacity,
-                            budget_bytes: current.budget_bytes,
-                            charged_bytes_after_outputs: current.charged_bytes(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, GpuAdmissionError>>()?;
-                let widths = profile.derive_widths(&owners, |device, class, width| {
-                    let calibration = if device == 0 { profile.gpu0 } else { profile.nonzero }
-                        .ok_or(if device == 0 {
-                            GpuCalibrationError::MissingGpu0Calibration
-                        } else {
-                            GpuCalibrationError::MissingNonzeroCalibration
-                        })?;
-                    let allocations = requirements.temporary_allocations(device, class, width)?;
-                    for (storage, _) in &allocations.prepared {
-                        validate_prepared_inventory(device, storage, inventory)
-                            .map_err(|error| GpuCalibrationError::NativeFit(error.to_string()))?;
+                            })
+                        }
                     }
-                    allocations.temporary(calibration)
-                })?;
+                };
+                let widths = match policy {
+                    GpuColumnWidthPolicy::Native(class) => {
+                        // Retained owners are already leased. Find the largest scratch
+                        // width that fits the actual remaining slots; no GPU work runs.
+                        let capacities = active
+                            .par_iter()
+                            .map(|&device| {
+                                let mut low = 0;
+                                let mut high = largest_intervals[device].min(class.maximum_columns);
+                                while low < high {
+                                    let width = low + (high - low).div_ceil(2);
+                                    let temporary = requirements
+                                        .temporary_allocations(device, &class, width)?;
+                                    if temporary.fits(
+                                        device,
+                                        devices[device].available_bytes(),
+                                        inventory,
+                                    )? {
+                                        low = width;
+                                    } else {
+                                        high = width - 1;
+                                    }
+                                }
+                                if low == 0 {
+                                    return Err(GpuAdmissionError::InvalidPlan(
+                                        "one-column native scratch does not fit".into(),
+                                    ));
+                                }
+                                Ok((device, low))
+                            })
+                            .collect::<Result<Vec<_>, GpuAdmissionError>>()?;
+                        GpuColumnWidths {
+                            gpu0: capacities
+                                .iter()
+                                .find(|(device, _)| *device == 0)
+                                .map(|(_, width)| *width),
+                            nonzero: capacities
+                                .iter()
+                                .filter(|(device, _)| *device != 0)
+                                .map(|(_, width)| *width)
+                                .min(),
+                        }
+                    }
+                    GpuColumnWidthPolicy::Calibrated(profile) => {
+                        let owners = active
+                            .par_iter()
+                            .map(|device| {
+                                let calibration =
+                                    if *device == 0 { profile.gpu0 } else { profile.nonzero }
+                                        .ok_or_else(|| {
+                                            GpuAdmissionError::InvalidPlan(
+                                                "active owner has no profile".into(),
+                                            )
+                                        })?;
+                                let candidate_capacity = match calibration.metric() {
+                                    GpuCalibrationMetric::PreparedOccupiedSpanBytes { .. } => {
+                                        let minimum =
+                                            requirements.minimum_temporary_allocations(*device)?;
+                                        let minimum = GpuColumnAllocations::combined(&[&minimum]);
+                                        let bytes = minimum
+                                            .prepared
+                                            .par_iter()
+                                            .map(|(storage, _)| {
+                                                validate_prepared_inventory(
+                                                    *device, storage, inventory,
+                                                )?;
+                                                let occupancy = storage.occupancy().map_err(
+                                                    GpuAdmissionError::NativeReservation,
+                                                )?;
+                                                u64::try_from(occupancy.available_capacity_bytes())
+                                                    .map_err(|_| GpuAdmissionError::Overflow)
+                                            })
+                                            .collect::<Result<Vec<_>, GpuAdmissionError>>()?;
+                                        GpuCandidateCapacity::PreparedAvailableBytes(
+                                            allocation_bytes(&bytes)?,
+                                        )
+                                    }
+                                    _ => GpuCandidateCapacity::DefaultPoolHeadroomBytes(
+                                        before[*device]
+                                            .budget_bytes
+                                            .saturating_sub(before[*device].charged_bytes())
+                                            .saturating_sub(fixed[*device].managed_bytes()?),
+                                    ),
+                                };
+                                let current = &devices[*device];
+                                Ok(GpuWidthAdmission {
+                                    device: *device,
+                                    remaining_columns: largest_intervals[*device],
+                                    candidate_capacity,
+                                    budget_bytes: current.budget_bytes,
+                                    charged_bytes_after_outputs: current.charged_bytes(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>, GpuAdmissionError>>()?;
+                        let widths = profile.derive_widths(&owners, |device, class, width| {
+                            let calibration =
+                                if device == 0 { profile.gpu0 } else { profile.nonzero }.ok_or(
+                                    if device == 0 {
+                                        GpuCalibrationError::MissingGpu0Calibration
+                                    } else {
+                                        GpuCalibrationError::MissingNonzeroCalibration
+                                    },
+                                )?;
+                            let allocations =
+                                requirements.temporary_allocations(device, class, width)?;
+                            for (storage, _) in &allocations.prepared {
+                                validate_prepared_inventory(device, storage, inventory).map_err(
+                                    |error| GpuCalibrationError::NativeFit(error.to_string()),
+                                )?;
+                            }
+                            allocations.temporary(calibration)
+                        })?;
+                        widths
+                    }
+                };
                 let mut capacities = widths.device_capacities(ledger.devices.len())?;
                 for (capacity, count) in capacities.iter_mut().zip(&counts) {
                     if *count == 0 {
@@ -1021,9 +1140,7 @@ impl GpuMemoryLedger {
                     }
                 }
                 for interval in &intervals {
-                    let class = if interval.device == 0 { profile.gpu0 } else { profile.nonzero }
-                        .expect("active profile was checked")
-                        .class();
+                    let class = class_for(interval.device)?;
                     let width = capacities[interval.device];
                     let columns = interval.end - interval.start;
                     let first = columns.min(width);
@@ -1049,10 +1166,12 @@ impl GpuMemoryLedger {
                 let scratch = active
                     .par_iter()
                     .map(|device| {
-                        let class = if *device == 0 { profile.gpu0 } else { profile.nonzero }
-                            .expect("active profile was checked")
-                            .class();
-                        requirements.temporary_allocations(*device, &class, capacities[*device])
+                        let class = class_for(*device)?;
+                        Ok::<_, GpuAdmissionError>(requirements.temporary_allocations(
+                            *device,
+                            &class,
+                            capacities[*device],
+                        )?)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let scratch_groups = active
@@ -1851,7 +1970,7 @@ mod tests {
                         start: 0,
                         end: columns,
                     }]),
-                    &profile,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
                     &requirements,
                 )
                 .unwrap();
@@ -2497,10 +2616,10 @@ mod tests {
         for run in 0..2 {
             let marker = if run == 1 {
                 let snapshot = backend.calibration_registry().clone();
-                assert_eq!(snapshot.len(), requests.len());
+                assert!(snapshot.is_empty(), "production preflight must not calibrate");
                 // Installing the shared snapshot clears the diagnostic cache.
                 // An unrelated native claim makes a pilot reset invalid, so
-                // successful preflight establishes a real shared-profile hit.
+                // successful preflight proves that production needs no pilot.
                 backend.set_calibration_registry(snapshot);
                 let slot = readbacks[0].slot_identity(0).unwrap();
                 Some(readbacks[0].reserve(&[slot.matrix_request(1, 1, false)]).unwrap())
@@ -4021,7 +4140,12 @@ mod tests {
             unavailable_device: None,
         };
         let plan = ledger
-            .reserve_columns(4, GpuOutputOwnership::Fresh, &column_profile(4), &requirements)
+            .reserve_columns(
+                4,
+                GpuOutputOwnership::Fresh,
+                GpuColumnWidthPolicy::Calibrated(&column_profile(4)),
+                &requirements,
+            )
             .unwrap();
         assert_eq!(plan.widths.gpu0, Some(4));
         assert_eq!(ledger.devices()[0].charged_bytes(), 22);
@@ -4555,7 +4679,7 @@ mod tests {
                 .reserve_columns(
                     columns * count,
                     GpuOutputOwnership::Fresh,
-                    &profile,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
                     &requirements,
                 )
                 .unwrap();
@@ -4564,6 +4688,7 @@ mod tests {
             let result = plan.execute(
                 &mut enqueue,
                 &mut states,
+                None,
                 move |_, (params, calls), fixed, outputs| {
                     assert!(fixed.is_empty() && outputs.is_empty());
                     *calls += 1;
@@ -4665,7 +4790,12 @@ mod tests {
         for output_chunks in [1, 2, 3] {
             let columns = output_chunks * requirements.columns_per_output * devices;
             let plan = ledger
-                .reserve_columns(columns, GpuOutputOwnership::Fresh, &profile, &requirements)
+                .reserve_columns(
+                    columns,
+                    GpuOutputOwnership::Fresh,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
+                    &requirements,
+                )
                 .unwrap();
             let width = requirements.bank - output_chunks;
             assert_eq!(plan.widths.gpu0, Some(width));
@@ -4703,7 +4833,12 @@ mod tests {
         let too_large = (requirements.bank - 1) * requirements.columns_per_output * devices + 1;
         assert!(
             ledger
-                .reserve_columns(too_large, GpuOutputOwnership::Fresh, &profile, &requirements)
+                .reserve_columns(
+                    too_large,
+                    GpuOutputOwnership::Fresh,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
+                    &requirements
+                )
                 .is_err()
         );
         assert_eq!(ledger.devices(), before);
@@ -4722,7 +4857,12 @@ mod tests {
         let before = ledger.devices().to_vec();
         let columns = 2 * requirements.columns_per_output * devices;
         let plan = ledger
-            .reserve_columns(columns, GpuOutputOwnership::Fresh, &profile, &requirements)
+            .reserve_columns(
+                columns,
+                GpuOutputOwnership::Fresh,
+                GpuColumnWidthPolicy::Calibrated(&profile),
+                &requirements,
+            )
             .unwrap();
         let width = 3usize.min(requirements.bank - 2);
         assert_eq!(plan.widths.gpu0, Some(width));
@@ -4737,7 +4877,12 @@ mod tests {
         requirements.invalid_ranges = true;
         assert!(
             ledger
-                .reserve_columns(columns, GpuOutputOwnership::Fresh, &profile, &requirements)
+                .reserve_columns(
+                    columns,
+                    GpuOutputOwnership::Fresh,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
+                    &requirements
+                )
                 .is_err()
         );
         assert_eq!(ledger.devices(), before);
@@ -4750,7 +4895,12 @@ mod tests {
         requirements.wrong_output_format = true;
         assert!(
             ledger
-                .reserve_columns(columns, GpuOutputOwnership::Fresh, &profile, &requirements)
+                .reserve_columns(
+                    columns,
+                    GpuOutputOwnership::Fresh,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
+                    &requirements
+                )
                 .is_err()
         );
         assert_eq!(ledger.devices(), before);
@@ -4770,7 +4920,7 @@ mod tests {
                 .reserve_columns(
                     requirements.columns_per_output,
                     GpuOutputOwnership::Inherited(&intervals),
-                    &profile,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
                     &requirements
                 )
                 .is_err()
@@ -4822,7 +4972,12 @@ mod tests {
             unavailable_device: None,
         };
         let plan = ledger
-            .reserve_columns(16, GpuOutputOwnership::Fresh, &column_profile(16), &requirements)
+            .reserve_columns(
+                16,
+                GpuOutputOwnership::Fresh,
+                GpuColumnWidthPolicy::Calibrated(&column_profile(16)),
+                &requirements,
+            )
             .unwrap();
         // Only 16 bytes remain after retaining all 64 output bytes and preparation.
         assert_eq!(plan.widths.gpu0, Some(5));
@@ -4876,8 +5031,14 @@ mod tests {
         .unwrap();
         let mut profile = column_profile(10);
         profile.gpu0 = None;
-        let plan =
-            ledger.reserve_columns(10, GpuOutputOwnership::Fresh, &profile, &requirements).unwrap();
+        let plan = ledger
+            .reserve_columns(
+                10,
+                GpuOutputOwnership::Fresh,
+                GpuColumnWidthPolicy::Calibrated(&profile),
+                &requirements,
+            )
+            .unwrap();
         assert_eq!(plan.widths, GpuColumnWidths { gpu0: None, nonzero: Some(5) });
         assert_eq!(plan.devices.iter().map(|device| device.device).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(
@@ -4895,7 +5056,7 @@ mod tests {
             ledger.reserve_columns(
                 10,
                 GpuOutputOwnership::Inherited(&inherited),
-                &profile,
+                GpuColumnWidthPolicy::Calibrated(&profile),
                 &requirements
             ),
             Err(GpuAdmissionError::Capacity { device: 0, .. })
@@ -4922,7 +5083,12 @@ mod tests {
         // Each device can retain nine columns, regardless of a one-column job fitting.
         assert!(
             ledger
-                .reserve_columns(19, GpuOutputOwnership::Fresh, &column_profile(19), &requirements)
+                .reserve_columns(
+                    19,
+                    GpuOutputOwnership::Fresh,
+                    GpuColumnWidthPolicy::Calibrated(&column_profile(19)),
+                    &requirements
+                )
                 .is_err()
         );
         assert!(ledger.devices().iter().all(|device| device.charged_bytes() == 0));
@@ -4931,7 +5097,7 @@ mod tests {
             ledger.reserve_columns(
                 10,
                 GpuOutputOwnership::Fresh,
-                &column_profile(10),
+                GpuColumnWidthPolicy::Calibrated(&column_profile(10)),
                 &requirements
             ),
             Err(GpuAdmissionError::InvalidPlan(_))
@@ -4941,7 +5107,10 @@ mod tests {
             .reserve_columns(
                 0,
                 GpuOutputOwnership::Fresh,
-                &GpuCalibrationProfile { gpu0: None, nonzero: None },
+                GpuColumnWidthPolicy::Calibrated(&GpuCalibrationProfile {
+                    gpu0: None,
+                    nonzero: None,
+                }),
                 &requirements,
             )
             .unwrap();
@@ -4975,7 +5144,7 @@ mod tests {
             .reserve_columns(
                 100,
                 GpuOutputOwnership::Inherited(&intervals),
-                &column_profile(10),
+                GpuColumnWidthPolicy::Calibrated(&column_profile(10)),
                 &requirements,
             )
             .unwrap();
@@ -5028,7 +5197,7 @@ mod tests {
                 ledger.reserve_columns(
                     columns,
                     GpuOutputOwnership::Inherited(&intervals),
-                    &profile,
+                    GpuColumnWidthPolicy::Calibrated(&profile),
                     &requirements
                 ),
                 Err(GpuAdmissionError::InvalidPlan(_))
@@ -5044,7 +5213,12 @@ mod tests {
         )
         .unwrap();
         let plan = ledger
-            .reserve_columns(10, GpuOutputOwnership::Inherited(&intervals), &profile, &requirements)
+            .reserve_columns(
+                10,
+                GpuOutputOwnership::Inherited(&intervals),
+                GpuColumnWidthPolicy::Calibrated(&profile),
+                &requirements,
+            )
             .unwrap();
         assert_eq!(
             plan.schedule.waves().flatten().map(|job| job.end - job.start).collect::<Vec<_>>(),
@@ -5072,7 +5246,12 @@ mod tests {
         let mut profile = column_profile(6);
         profile.gpu0 = None;
         let plan = ledger
-            .reserve_columns(6, GpuOutputOwnership::Inherited(&intervals), &profile, &requirements)
+            .reserve_columns(
+                6,
+                GpuOutputOwnership::Inherited(&intervals),
+                GpuColumnWidthPolicy::Calibrated(&profile),
+                &requirements,
+            )
             .unwrap();
         assert_eq!(plan.devices.len(), 1);
         assert_eq!(plan.devices[0].device, 1);
@@ -5104,7 +5283,7 @@ mod tests {
             .reserve_columns(
                 6,
                 GpuOutputOwnership::Inherited(&intervals),
-                &column_profile(3),
+                GpuColumnWidthPolicy::Calibrated(&column_profile(3)),
                 &requirements,
             )
             .unwrap();

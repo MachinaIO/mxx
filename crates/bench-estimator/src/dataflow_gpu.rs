@@ -178,7 +178,7 @@ impl TransferMeasurements {
                 preparation,
                 GpuColumnWidths { gpu0: Some(1), nonzero: None },
             );
-            workers[0].backend.select_operation(preparation).map_err(error)?;
+            workers[0].backend.select_operation(preparation, true).map_err(error)?;
             let probe = workers[0]
                 .backend
                 .constant_matrix(&ty, &ConstantMatrix::Zero, &ParamEnv::default())
@@ -258,7 +258,7 @@ impl TransferMeasurements {
                     nonzero: (devices.len() > 1).then_some(width),
                 },
             );
-            backend.select_operation(operation).map_err(error)?;
+            backend.select_operation(operation, true).map_err(error)?;
             let value = transfer_fixture(&mut backend, &ty)?;
             finish(&value);
             let artifact_type = ArtifactType::from_wire_type(&ty).unwrap();
@@ -508,7 +508,7 @@ mod tests {
             operation,
             GpuColumnWidths { gpu0: Some(width), nonzero: (devices.len() > 1).then_some(width) },
         );
-        fleet.select_operation(operation).unwrap();
+        fleet.select_operation(operation, true).unwrap();
         let value = transfer_fixture(&mut fleet, &compact).unwrap();
         let RuntimeValue::SmallMatrix(owner) = &value else {
             panic!("compact fixture");

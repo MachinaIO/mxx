@@ -136,6 +136,7 @@ const char *gpu_last_error();
 void *gpu_pinned_alloc(GpuContext *ctx, size_t bytes, size_t alignment);
 int gpu_pinned_free(void *ptr);
 
+
 #ifdef __cplusplus
 }
 #endif
@@ -222,6 +223,10 @@ struct GpuExecutionOwner
     std::atomic<bool> timing_active{false};
     // Tracking is certified only after the supported admission surface rejects
     // uninstrumented entrypoints. Counter equality alone never enables it.
+    // Automatic graph admission is scoped to execute calls. Explicit prepared
+    // setup retains the permanent seal used by standalone admission APIs.
+    std::atomic<bool> graph_admission_scoped{false};
+    std::atomic<bool> graph_admission_active{false};
     std::atomic<bool> admission_required{false};
     // A separate resource domain: ordinary prepared storage alone never claims
     // coverage of host transfer buffers. A successful pinned reservation makes
@@ -319,3 +324,7 @@ extern "C" int gpu_context_retire_stream(const GpuContext *ctx, int device, cuda
 
 extern "C" int gpu_set_last_error(const char *msg);
 #endif
+
+// Exclusive host graph/setup boundaries; ending does not wait for GPU work.
+extern "C" int gpu_graph_admission_begin(GpuContext *ctx);
+extern "C" void gpu_graph_admission_end(GpuContext *ctx);

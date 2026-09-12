@@ -233,10 +233,14 @@ impl GpuDCRTPolyMatrix {
         Ok(())
     }
 
-    /// Fill a retained singleton from known signed polynomial coefficients.
+    /// Fill a retained singleton from signed coefficients or native evaluation slots.
     /// CPU residue conversion is parallel; transfer and NTT stay on the GPU.
     /// The existing RNS loader owns pinned staging until DMA completion.
-    pub fn fill_polynomial(&mut self, coefficients: &[BigInt]) -> Result<(), String> {
+    pub fn fill_polynomial(
+        &mut self,
+        coefficients: &[BigInt],
+        input_evaluation: bool,
+    ) -> Result<(), String> {
         let n = self.params.ring_dimension() as usize;
         if self.size() != (1, 1) || coefficients.len() > n {
             return Err("polynomial constant requires a singleton and at most N coefficients".into());
@@ -262,9 +266,17 @@ impl GpuDCRTPolyMatrix {
             target.copy_from_slice(&value.to_le_bytes());
         });
         let evaluation = self.is_ntt;
-        self.load_rns_bytes(&residues, bytes, GPU_POLY_FORMAT_COEFF);
-        if evaluation {
-            self.ntt_all_in_place();
+        self.load_rns_bytes(
+            &residues,
+            bytes,
+            if input_evaluation { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF },
+        );
+        if evaluation != input_evaluation {
+            if evaluation {
+                self.ntt_all_in_place();
+            } else {
+                self.intt_all_in_place();
+            }
         }
         Ok(())
     }
@@ -2954,7 +2966,7 @@ mod tests {
                     }
                     let old_reader = output.transpose();
                     let raw = output.raw;
-                    output.fill_polynomial(&coefficients).unwrap();
+                    output.fill_polynomial(&coefficients, false).unwrap();
                     assert_eq!(output.raw, raw);
                     assert_eq!(output.is_ntt(), evaluation);
                     let reader = output.transpose();

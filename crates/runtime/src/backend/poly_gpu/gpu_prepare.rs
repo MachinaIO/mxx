@@ -10,14 +10,7 @@ pub(super) enum PreparedMatrixValue {
     Matrix(GpuDCRTPolyMatrix),
     Compact(GpuSmallMatrix),
 }
-impl PreparedMatrixValue {
-    pub(super) fn wait_until_ready(&self) {
-        match self {
-            Self::Matrix(v) => v.wait_until_ready(),
-            Self::Compact(v) => v.wait_until_ready(),
-        }
-    }
-}
+
 pub(super) trait PreparedFleetOutput: Sized {
     const COMPACT: bool;
     fn from_prepared(
@@ -69,7 +62,7 @@ impl PreparedFleetOutput for GpuFleetSmallMatrix {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize)]
 pub(super) enum PreparedMatrixSource {
     Shard(usize),
     Replica { device: usize, context: usize, evaluation: bool },
@@ -103,6 +96,16 @@ pub(super) struct MatrixInputPreparation {
     pub request: GpuPreparedRequest,
 }
 
+/// Matrix size classes keep incompatible aspect ratios from consuming one
+/// another's peak capacity. No dimensions are rounded in the native backing.
+pub(super) fn matrix_capacity_class(rows: usize, columns: usize) -> (u32, u32) {
+    (capacity_class(rows), capacity_class(columns))
+}
+
+pub(super) fn capacity_class(size: usize) -> u32 {
+    usize::BITS - size.max(1).saturating_sub(1).leading_zeros()
+}
+
 pub(super) fn select_prepared_matrix(
     inventory: &[(usize, Arc<GpuPreparedStorage>)],
     chosen: &mut HashSet<u64>,
@@ -113,8 +116,8 @@ pub(super) fn select_prepared_matrix(
     evaluation: bool,
     compact_bound: Option<&num_bigint::BigUint>,
 ) -> Result<Option<(Arc<GpuPreparedStorage>, GpuPreparedRequest)>, PolyBackendError> {
-    // Keep exact native fits and choose the smallest fitting backing, so a
-    // small fixed input does not unnecessarily consume the largest output slot.
+    // Prefer the prepared size class. Its slots cover peak simultaneous
+    // demand; taking another class first can starve a later larger output.
     let mut selected = None;
     for (_, storage) in inventory
         .iter()
@@ -143,7 +146,16 @@ pub(super) fn select_prepared_matrix(
                 slot.matrix_request(shape.0, shape.1, evaluation)
             };
             if storage.fits(&[request]).map_err(PolyBackendError::GpuCalibration)? {
-                let size = slot.requested_backing_bytes();
+                let size = (
+                    if compact_bound.is_some() {
+                        capacity_class(slot.requested_backing_bytes()) !=
+                            capacity_class(request.bytes())
+                    } else {
+                        matrix_capacity_class(slot.rows(), slot.columns()) !=
+                            matrix_capacity_class(shape.0, shape.1)
+                    },
+                    slot.requested_backing_bytes(),
+                );
                 if selected.as_ref().is_none_or(|(_, _, _, previous)| size < *previous) {
                     selected = Some((storage.clone(), request, slot.slot_id(), size));
                 }

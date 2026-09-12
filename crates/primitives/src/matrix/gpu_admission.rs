@@ -28,6 +28,38 @@ struct DispatchOpaque {
     _private: [u8; 0],
 }
 
+/// Owns the automatic runtime graph boundary. Native output leases remain
+/// alive independently; dropping this guard only ends the allocation policy.
+pub struct GpuGraphAdmissionGuard {
+    parameters: Vec<crate::poly::dcrt::gpu::GpuDCRTPolyParams>,
+}
+
+impl GpuGraphAdmissionGuard {
+    pub fn new(parameters: Vec<crate::poly::dcrt::gpu::GpuDCRTPolyParams>) -> Result<Self, String> {
+        let mut guard = Self { parameters: Vec::with_capacity(parameters.len()) };
+        for parameters in parameters {
+            if unsafe { gpu_graph_admission_begin(parameters.ctx_raw()) } != 0 {
+                return Err(last_error_string());
+            }
+            guard.parameters.push(parameters);
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for GpuGraphAdmissionGuard {
+    fn drop(&mut self) {
+        for parameters in &self.parameters {
+            unsafe { gpu_graph_admission_end(parameters.ctx_raw()) };
+        }
+    }
+}
+
+unsafe extern "C" {
+    fn gpu_graph_admission_begin(context: *mut crate::poly::dcrt::gpu::GpuContextOpaque) -> i32;
+    fn gpu_graph_admission_end(context: *mut crate::poly::dcrt::gpu::GpuContextOpaque);
+}
+
 /// One native claim recorded by [`trace_native_claims`], in claim order.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,6 +343,10 @@ unsafe extern "C" {
         reservation: *mut ReservationOpaque,
         requests: *const GpuPreparedRequest,
         count: usize,
+    ) -> i32;
+    fn gpu_matrix_reservation_cpu_ready(
+        reservation: *const ReservationOpaque,
+        out_ready: *mut i32,
     ) -> i32;
     fn gpu_matrix_reservation_partition(
         reservation: *mut ReservationOpaque,
@@ -710,6 +746,19 @@ pub struct GpuPreparedOccupancy {
     resource_available_slots: usize,
 }
 
+/// Boundary for the execution owner's joint device-byte high-water counter.
+#[derive(Clone, Copy)]
+#[repr(i32)]
+pub enum GpuPreparedOccupancyMode {
+    Observe = 0,
+    /// Requires no outstanding reservations and no pending releases.
+    ResetCalibration = 1,
+    /// Explicit benchmark boundary with parked reservations and retained outputs.
+    /// The caller must finish preceding releases and exclude all submissions and
+    /// dispatch entry while resetting. This mode never authorizes admission.
+    ResetMeasurement = 2,
+}
+
 impl GpuPreparedOccupancy {
     pub fn resource_capacity_slots(&self) -> usize {
         self.resource_capacity_slots
@@ -940,11 +989,16 @@ impl GpuPreparedStorage {
     /// This does not sum independent peaks. Pinned bytes and opaque resource
     /// counts remain separate from this device-byte metric.
     ///
-    /// A reset rejects any outstanding reservation or pending release across
-    /// that owner. Keep fixed owners alive and exclude unrelated submissions
-    /// throughout calibration. Ordinary observations are diagnostic under
-    /// concurrency; use exact reservations for admission.
-    pub fn joint_occupancy(stores: &[&Self], reset_peak: bool) -> Result<(usize, usize), String> {
+    /// Calibration reset rejects outstanding reservations or pending releases.
+    /// Measurement reset permits parked reservations under the exclusive,
+    /// completed-release contract of `GpuPreparedOccupancyMode::ResetMeasurement`.
+    /// Keep fixed owners alive and exclude unrelated submissions throughout
+    /// measurement. Ordinary observations are diagnostic under concurrency;
+    /// use exact reservations for admission.
+    pub fn joint_occupancy(
+        stores: &[&Self],
+        mode: GpuPreparedOccupancyMode,
+    ) -> Result<(usize, usize), String> {
         let stores = stores.iter().map(|storage| storage.raw.as_ptr()).collect::<Vec<_>>();
         let mut occupied = 0;
         let mut peak = 0;
@@ -952,7 +1006,7 @@ impl GpuPreparedStorage {
             gpu_prepared_storages_occupancy(
                 stores.as_ptr(),
                 stores.len(),
-                i32::from(reset_peak),
+                mode as i32,
                 &mut occupied,
                 &mut peak,
             )
@@ -1070,6 +1124,23 @@ impl GpuMatrixReservation {
     /// Preserved through worker transfer, partition, dispatch and completion.
     pub fn requests(&self) -> &[GpuPreparedRequest] {
         &self.requests
+    }
+
+    /// Nonblocking readiness of this reservation's deferred pinned CPU leases.
+    /// Called by the wave scheduler before reuse, never inside an upload wrapper.
+    /// Device-only scratch retains its existing stream-ordered reuse semantics.
+    pub fn cpu_staging_ready(&self) -> Result<bool, String> {
+        let mut ready = 0;
+        let status = unsafe {
+            gpu_matrix_reservation_cpu_ready(
+                self.raw.expect("live reservation").as_ptr(),
+                &mut ready,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(ready != 0)
     }
 
     /// Narrow an unsubmitted request or prepare another wave within the original
@@ -2540,6 +2611,45 @@ mod tests {
 
     #[test]
     #[serial_test::serial(gpu_context)]
+    fn test_gpu_graph_scope_allows_external_work_but_enforces_dispatch_claims() {
+        use crate::poly::dcrt::gpu::{GpuContextOpaque, PinnedHostBuffer};
+        unsafe extern "C" {
+            fn gpu_pinned_alloc(
+                ctx: *mut GpuContextOpaque,
+                bytes: usize,
+                alignment: usize,
+            ) -> *mut u8;
+        }
+        let (_, params) = parameters();
+        let graph = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
+        let storage =
+            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None).unwrap();
+        GpuPreparedStorage::finish_setup(&[&storage]).unwrap();
+        drop(graph);
+        // Ordinary caller-owned work is legal after execute has returned.
+        drop(PinnedHostBuffer::<u64>::zeroed(&params, 2));
+        let slot = storage.slot_identity(0).unwrap();
+        let mut reservation = storage.reserve(&[slot.matrix_request(1, 1, true)]).unwrap();
+        reservation.require_all_resources().unwrap();
+        let dispatch = reservation.enter(Vec::new()).unwrap();
+        // An active dispatch must not silently allocate unplanned host memory,
+        // even though the surrounding caller's context is currently open.
+        assert!(unsafe { gpu_pinned_alloc(params.ctx_raw(), 16, 8) }.is_null());
+        let output = GpuDCRTPolyMatrix::new_empty_with_state(
+            &params,
+            1,
+            1,
+            params.crt_depth() - 1,
+            true,
+            None,
+        );
+        drop(dispatch.finish().unwrap());
+        drop(output);
+        drop(PinnedHostBuffer::<u64>::zeroed(&params, 2));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
     fn test_gpu_prepared_pinned_cpu_ownership_and_exact_claims() {
         use crate::poly::dcrt::gpu::{GpuContextOpaque, PinnedHostBuffer};
         unsafe extern "C" {
@@ -2646,6 +2756,8 @@ mod tests {
             // Transfer ownership alone blocks host reuse regardless of whether
             // this small DMA happened to finish before this assertion.
             assert!(download_reservation.rearm(&[download_request]).is_err());
+            assert!(download_reservation.cpu_staging_ready().is_err());
+            assert!(matrix_reservation.cpu_staging_ready().unwrap());
             let snapshot = transfer.finish();
             assert_eq!(snapshot.bytes(), reference);
             assert_eq!(matrix.to_cpu_matrix(), original);
@@ -2655,9 +2767,12 @@ mod tests {
             assert_eq!(occupancy.pinned_available_bytes(), 0);
             assert!(download_reservation.rearm(&[download_request]).is_err());
             assert!(!storage.fits(&[upload_request]).unwrap());
+            assert!(upload_reservation.cpu_staging_ready().unwrap());
+            assert!(download_reservation.cpu_staging_ready().is_err());
             drop(snapshot);
             drop(matrix);
             assert_eq!(storage.occupancy().unwrap().pinned_occupied_bytes(), 0);
+            assert!(download_reservation.cpu_staging_ready().unwrap());
             if wave == 0 {
                 matrix_reservation.rearm(&[matrix_request]).unwrap();
                 upload_reservation.rearm(&[upload_request]).unwrap();
@@ -2760,9 +2875,24 @@ mod tests {
             first.slot_identity(1).unwrap().matrix_request(rows, 1, true),
             second.slot_identity(0).unwrap().matrix_request(rows, 1, true),
         ];
-        assert!(GpuPreparedStorage::joint_occupancy(&[], true).is_err());
-        assert!(GpuPreparedStorage::joint_occupancy(&[&first], true).is_err());
-        assert!(GpuPreparedStorage::joint_occupancy(&[&first, &first], true).is_err());
+        assert!(
+            GpuPreparedStorage::joint_occupancy(&[], GpuPreparedOccupancyMode::ResetCalibration)
+                .is_err()
+        );
+        assert!(
+            GpuPreparedStorage::joint_occupancy(
+                &[&first],
+                GpuPreparedOccupancyMode::ResetCalibration
+            )
+            .is_err()
+        );
+        assert!(
+            GpuPreparedStorage::joint_occupancy(
+                &[&first, &first],
+                GpuPreparedOccupancyMode::ResetCalibration
+            )
+            .is_err()
+        );
         let fixed_dispatch = first.reserve(&[fixed_request]).unwrap().enter(Vec::new()).unwrap();
         let fixed = GpuDCRTPolyMatrix::zero(&params, rows, 1);
         drop(fixed_dispatch.finish().unwrap());
@@ -2774,11 +2904,21 @@ mod tests {
             .map(|(store, claim)| store.demand(&[claim]).unwrap().device_bytes)
             .collect::<Vec<_>>();
         assert_eq!(
-            GpuPreparedStorage::joint_occupancy(&stores, true).unwrap(),
+            GpuPreparedStorage::joint_occupancy(
+                &stores,
+                GpuPreparedOccupancyMode::ResetCalibration
+            )
+            .unwrap(),
             (baseline, baseline)
         );
         let reserved = second.reserve(&[claims[1]]).unwrap();
-        assert!(GpuPreparedStorage::joint_occupancy(&stores, true).is_err());
+        assert!(
+            GpuPreparedStorage::joint_occupancy(
+                &stores,
+                GpuPreparedOccupancyMode::ResetCalibration
+            )
+            .is_err()
+        );
         drop(reserved);
         // Non-overlapping actual claims must not add independent storage peaks.
         for (index, parameters) in [&params, &related].into_iter().enumerate() {
@@ -2790,7 +2930,9 @@ mod tests {
             parameters.fence_released_memory();
             stores[index].occupancy().unwrap();
         }
-        let (occupied, peak) = GpuPreparedStorage::joint_occupancy(&stores, false).unwrap();
+        let (occupied, peak) =
+            GpuPreparedStorage::joint_occupancy(&stores, GpuPreparedOccupancyMode::Observe)
+                .unwrap();
         assert_eq!(occupied, baseline);
         assert_eq!(peak, baseline + demands.iter().max().unwrap());
         assert!(
@@ -2800,7 +2942,11 @@ mod tests {
                 .sum()
         );
         assert_eq!(
-            GpuPreparedStorage::joint_occupancy(&stores, true).unwrap(),
+            GpuPreparedStorage::joint_occupancy(
+                &stores,
+                GpuPreparedOccupancyMode::ResetCalibration
+            )
+            .unwrap(),
             (baseline, baseline)
         );
         let reservations = stores
@@ -2820,10 +2966,21 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let total = baseline + demands.iter().sum::<usize>();
-        assert_eq!(GpuPreparedStorage::joint_occupancy(&stores, false).unwrap(), (total, total));
+        assert_eq!(
+            GpuPreparedStorage::joint_occupancy(&stores, GpuPreparedOccupancyMode::Observe)
+                .unwrap(),
+            (total, total)
+        );
         drop((outputs, fixed));
         params.fence_released_memory();
-        assert_eq!(GpuPreparedStorage::joint_occupancy(&stores, true).unwrap(), (0, 0));
+        assert_eq!(
+            GpuPreparedStorage::joint_occupancy(
+                &stores,
+                GpuPreparedOccupancyMode::ResetCalibration
+            )
+            .unwrap(),
+            (0, 0)
+        );
     }
 
     #[test]

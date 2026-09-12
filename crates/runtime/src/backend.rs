@@ -147,6 +147,29 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Supplies IR provenance to an explicitly enabled GPU measurement observer.
+    #[cfg(feature = "gpu")]
+    fn observe_gpu_node(
+        &mut self,
+        _scope: &mxx_ir_core::FrozenGraphScopeId,
+        _node: mxx_ir_core::types::NodeId,
+        _instances: usize,
+        _bindings: &mxx_ir_core::ParamEnv,
+    ) {
+    }
+
+    /// Measurement-only scope nesting; no production synchronization is implied.
+    #[cfg(feature = "gpu")]
+    fn observe_gpu_scope(&mut self, _entering: bool) {}
+
+    #[cfg(feature = "gpu")]
+    fn observe_gpu_omitted_nodes(
+        &mut self,
+        _scope: &mxx_ir_core::FrozenGraphScopeId,
+        _nodes: impl Iterator<Item = mxx_ir_core::types::NodeId>,
+    ) {
+    }
+
     /// Prepares isolated calibration and admission after actual materialization.
     /// Requests are ordered exactly as the following production batch, with each
     /// destination placement explicit. No production sampling state is exposed.
@@ -181,12 +204,19 @@ pub trait Backend {
     }
 
     /// Derive and accept a complete prepared inventory for `validated` before
-    /// any node executes. Backends without prepared admission do nothing.
+    /// any node executes. The returned owner ends automatic admission when
+    /// execution exits, including error paths; returned values retain their own
+    /// resources. Backends without prepared admission return no owner.
     fn prepare_graph_admission(
         &mut self,
         _validated: &mxx_ir_core::ValidatedGraph,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+        _capture_trace: bool,
+        _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
+    ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error>
+    where
+        Self: Sized,
+    {
+        Ok(None)
     }
 
     /// Limit sibling bodies when the backend parallelizes within primitives.

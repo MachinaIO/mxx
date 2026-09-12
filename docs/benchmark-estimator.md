@@ -6,7 +6,7 @@ and an ideal dependency schedule. All times are seconds. The GPU adapter's
 seconds or elapsed time divided by the device count. The generic host harness
 continues to report host elapsed work seconds.
 
-The current GPU measurement API receives concrete shapes and synthesizes its
+The nominal GPU measurement API receives concrete shapes and synthesizes its
 inputs. `CostReport::measurement_scenario` therefore reports
 `SyntheticFreshPlacement`. This scenario assumes prepared synthetic resident
 operands and fresh column placement under the observed capacities. It does not
@@ -32,38 +32,29 @@ outputs are released and reconciled before resetting the memory baseline. Atomic
 operations use the same event and host clock boundaries on their single worker.
 Comparisons must preserve these boundaries and the production ownership waits.
 
-## Admitted invocation plans
+## Bounded representative measurement
 
-`GpuNodeMeasurementBackend::admit_invocation_plan` accepts the runtime's
-`GpuAdmittedPlanSummary` for a node before measurement. The summary is produced
-by `GpuColumnMemoryPlan::summary` and exposed for an admitted, unconsumed batch
-through `GpuDcrtBackend::admitted_invocation_summaries`. It records the actual
-owner intervals, the admitted local width per device, local job counts, the
-actual wave count, the exact wave classes with their multiplicities and
-representative jobs in global coordinates, and the claimed native resource
-classes per device (fixed inputs, retained outputs, per-wave scratch) with their
-kinds, shapes, formats, bytes and alignments.
+Estimation never executes the protocol graph. CPU collection deduplicates requests
+by operation semantics and concrete parameter/shape class before GPU measurement.
+Repeated nodes and loop multiplicities reuse these measurements. GPU work scales
+with distinct measurement classes and harness repetitions, not node count; CPU
+analysis still traverses the IR. Different shapes can legitimately require separate
+representatives, so this is not a bound solely on operation opcode count.
 
-A prepared execution (`ExecutionConfig::prepared_gpu_admission`) records every
-admitted invocation in the fleet backend's `admitted_plan_log`, keyed by the
-operation identity the executor selected. `admit_plans_from_log` maps that log
-onto the graph's root-scope nodes through the same identity, so the estimator's
-classes are exactly the runtime's admitted plans for that graph.
+The graph-execution measurement callback API has been removed. An optional runtime
+observer remains available for explicit diagnostic benchmarks of actual execution;
+it is not an estimator input or enabled by normal runtime execution.
 
-When a node has an admitted plan, the estimator measures one representative
-fleet wave per admitted wave class instead of the nominal full/partial classes,
-and multiplies by the class multiplicity. The wave count is the plan's maximum
-local job count: owners with 90 and 10 columns and widths 10 and 90 yield nine
-waves (one class with both devices active, one class with only the first device
-active eight times), not one nominal fleet wave. Offset-sensitive nodes measure
-every actual wave at its own global offsets. Observation keys include the
-scenario label and the admitted classes, so nominal and admitted observations
-never alias. `CostReport::measurement_scenario` reports `AdmittedInvocationPlan`
-only when every measured fleet-wave node had an admitted plan; otherwise it
-remains `SyntheticFreshPlacement`, and per-node logs name the scenario. Operand
-values are still synthetic, and an admitted plan is not a physical-memory
-certificate; it is a traceable match between the runtime schedule and the
-estimator's wave classes.
+Initial graph preparation is the warmup boundary: native claim tracing for
+polynomial readback, trapdoor and preimage operations can execute GPU work here.
+It recursively covers child scopes before any production node executes.
+
+Prepared runtime admission derives widths from native allocation bounds and current
+reusable slots without running calibration kernels. Low-level allocating execution
+requires a supplied profile or explicit `select_operation(operation, true)` warmup;
+`select_operation(operation, false)` never starts a calibration pilot. The graph
+executor always uses the production form. Benchmark representatives perform their
+calibration during explicit setup before timed production samples.
 
 The nominal placement uses the runtime's `GpuColumnSchedule`. Full and partial
 wave classes retain their own active-device vectors, local widths, and measured

@@ -1,5 +1,5 @@
-//! Prepared matrix preflight: select native output slots, measure an isolated
-//! range, reserve every retained destination, then publish the compiled batch.
+//! Prepared matrix preflight: select native slots, fit scratch using allocation
+//! bounds, reserve every retained destination, then publish the compiled batch.
 
 use super::{
     gpu_compiled::{MatrixInvocation, PreparedClaimBroker},
@@ -9,8 +9,8 @@ use super::{
     *,
 };
 use crate::gpu_memory::{
-    GpuAdmissionError, GpuColumnAllocations, GpuColumnMemoryRequirements, GpuMemoryLedger,
-    GpuOutputOwnership,
+    GpuAdmissionError, GpuColumnAllocations, GpuColumnMemoryRequirements, GpuColumnWidthPolicy,
+    GpuMemoryLedger, GpuOutputOwnership,
 };
 use mxx_primitives::matrix::gpu_dcrt_poly::{
     GpuPreparedRequest, GpuPreparedSlotIdentity, GpuPreparedSlotKind, GpuPreparedStorage,
@@ -19,11 +19,7 @@ use mxx_primitives::matrix::gpu_dcrt_poly::{
 
 struct MatrixDestination {
     interval: GpuColumnInterval,
-    source: Option<PreparedMatrixSource>,
-    right: Vec<PreparedMatrixSource>,
     parameters: GpuDCRTPolyParams,
-    level: usize,
-    evaluation: bool,
     storage: Arc<GpuPreparedStorage>,
     request: GpuPreparedRequest,
 }
@@ -96,7 +92,15 @@ fn select_operation_scratch(
                 if storage.fits(&[request]).map_err(PolyBackendError::GpuCalibration)? &&
                     selected.as_ref().is_none_or(
                         |(_, previous): &(Arc<GpuPreparedStorage>, GpuPreparedSlotIdentity)| {
-                            slot.requested_backing_bytes() < previous.requested_backing_bytes()
+                            let rank = |slot: &GpuPreparedSlotIdentity| {
+                                (
+                                    super::gpu_prepare::capacity_class(
+                                        slot.requested_backing_bytes(),
+                                    ) != super::gpu_prepare::capacity_class(layout.bytes),
+                                    slot.requested_backing_bytes(),
+                                )
+                            };
+                            rank(&slot) < rank(previous)
                         },
                     )
                 {
@@ -126,8 +130,6 @@ fn select_operation_scratch(
 struct MatrixDeviceInputPlan {
     device: usize,
     capacity: usize,
-    source: Option<PreparedMatrixSource>,
-    right: Vec<PreparedMatrixSource>,
     parameters: GpuDCRTPolyParams,
     level: usize,
     evaluation: bool,
@@ -139,7 +141,6 @@ struct MatrixDeviceInputPlan {
 
 struct MatrixRequirements {
     outputs: Vec<MatrixDestination>,
-    representative: Option<MatrixDestination>,
     scratch: Vec<MatrixScratch>,
 }
 
@@ -319,7 +320,7 @@ impl GpuDcrtBackend {
 
     /// Install an accepted setup ledger once. Native epoch receipts remain the
     /// only public way to construct that ledger. Ordinary preflight then selects
-    /// native slots, calibrates supported matrix classes and acquires their plans.
+    /// native slots, fits native allocation bounds and acquires their plans.
     /// This does not provision backing or enable an incomplete physical seal.
     pub fn set_memory_ledger(&mut self, ledger: GpuMemoryLedger) -> Result<(), PolyBackendError> {
         let params = self.device_parameters();
@@ -359,11 +360,6 @@ impl GpuDcrtBackend {
         if requests.is_empty() {
             return Ok(());
         }
-        let environment = crate::gpu_calibration::gpu_calibration_environment(
-            &gpu_device_identity(self.devices[0].0).map_err(PolyBackendError::GpuCalibration)?,
-            self.devices.len(),
-            self.vram_percent,
-        );
         // Keep the ledger owned by the dispatcher across all early returns.
         let mut ledger = self.prepared_ledger.take().expect("prepared preflight has a ledger");
         let result = (|| {
@@ -377,7 +373,7 @@ impl GpuDcrtBackend {
             let mut layouts = Vec::with_capacity(requests.len());
             let mut preparation = Vec::new();
             let mut planned = HashSet::new();
-            // Validate the entire batch and its native fits before any pilot.
+            // Validate the entire batch and its native fits before preparing inputs.
             // Selection is ordered because later outputs must exclude earlier
             // choices; acquiring real reservations below rechecks every slot.
             for (placement, request) in requests {
@@ -391,10 +387,12 @@ impl GpuDcrtBackend {
                 let mut outputs = Vec::new();
                 let mut scratch = Vec::new();
                 let capacity_error = || {
-                    PolyBackendError::GpuSubmission(
-                        "complete matrix inputs and outputs do not fit the prepared inventory"
-                            .into(),
-                    )
+                    PolyBackendError::GpuSubmission(format!(
+                        "{}: complete matrix inputs and {}x{} outputs do not fit the prepared inventory",
+                        operation.kind_name(),
+                        rows,
+                        columns
+                    ))
                 };
                 if columns != 0 &&
                     matches!(
@@ -437,7 +435,7 @@ impl GpuDcrtBackend {
                             let mut chosen = chosen.clone();
                             let mut planned = planned.clone();
                             let mut preparation = Vec::new();
-                            let source = if let Some(left) = left {
+                            if let Some(left) = left {
                                 let Some(source) = select_matrix_input(
                                     left,
                                     0..left.columns,
@@ -510,8 +508,6 @@ impl GpuDcrtBackend {
                             Ok::<_, PolyBackendError>((low != 0).then_some(MatrixDeviceInputPlan {
                                 device,
                                 capacity: low,
-                                source,
-                                right: rhs,
                                 parameters,
                                 level,
                                 evaluation,
@@ -559,11 +555,7 @@ impl GpuDcrtBackend {
                                 start,
                                 end: start + count,
                             },
-                            source: trial.source,
-                            right: trial.right,
                             parameters: trial.parameters,
-                            level: trial.level,
-                            evaluation: trial.evaluation,
                             storage,
                             request,
                         });
@@ -572,7 +564,7 @@ impl GpuDcrtBackend {
                 } else if let Some(compact) = compact {
                     // Compact inputs inherit their resident column ownership. No
                     // replica or fragment preparation exists for compact payloads.
-                    for (index, shard) in compact.shards.iter().enumerate() {
+                    for shard in compact.shards.iter() {
                         let device = self
                             .devices
                             .iter()
@@ -636,11 +628,7 @@ impl GpuDcrtBackend {
                         .ok_or_else(capacity_error)?;
                         outputs.push(MatrixDestination {
                             interval: GpuColumnInterval { device, start, end },
-                            source: Some(PreparedMatrixSource::Shard(index)),
-                            right: rhs,
                             parameters,
-                            level,
-                            evaluation,
                             storage,
                             request,
                         });
@@ -653,11 +641,7 @@ impl GpuDcrtBackend {
                                 None,
                                 right,
                                 None,
-                                Arc::new(MatrixRequirements {
-                                    outputs,
-                                    representative: None,
-                                    scratch,
-                                }),
+                                Arc::new(MatrixRequirements { outputs, scratch }),
                             ));
                             continue;
                         }
@@ -734,7 +718,7 @@ impl GpuDcrtBackend {
                             return Err(PolyBackendError::UnsupportedPlacement);
                         }
                         let evaluation = operation.input_evaluation(input.value.is_ntt());
-                        let source = select_matrix_input(
+                        select_matrix_input(
                             primary,
                             source_columns,
                             device,
@@ -825,666 +809,159 @@ impl GpuDcrtBackend {
                         .ok_or_else(capacity_error)?;
                         outputs.push(MatrixDestination {
                             interval: GpuColumnInterval { device, start, end },
-                            source: Some(source),
-                            right: rhs,
                             parameters,
-                            level,
-                            evaluation,
                             storage,
                             request,
                         });
                     }
                 }
-                // Device 1 remains the nonzero-role representative even when
-                // inherited ownership leaves it idle. Prepare its actual one-column
-                // class separately; no production interval is moved onto it.
-                let representative = if outputs.iter().any(|output| output.interval.device > 0) &&
-                    !outputs.iter().any(|output| output.interval.device == 1)
-                {
-                    let reference =
-                        outputs.iter().find(|output| output.interval.device > 0).unwrap();
-                    let primary = operation.primary(left, &right, reference.interval.start);
-                    let (parameters, level, evaluation) = if let Some(primary) = primary {
-                        let source =
-                            reference.source.ok_or(PolyBackendError::InvalidConstantShape)?;
-                        let exemplar = match source {
-                            PreparedMatrixSource::Shard(index) |
-                            PreparedMatrixSource::Fragment { index, .. } => {
-                                &primary.shards[index].value
-                            }
-                            PreparedMatrixSource::Replica { .. } => &primary.shards[0].value,
-                        };
-                        (
-                            self.devices[1].1.parameters_for_matrix(exemplar)?.clone(),
-                            exemplar.level(),
-                            operation.input_evaluation(source.layout(primary).1),
-                        )
-                    } else if let Some(shard) =
-                        CompiledMatrixInvocation::compact_shard(compact, reference.source)
-                    {
-                        operation.output_layout(
-                            &self.devices[1].1,
-                            shard.value.params(),
-                            shard.value.params().crt_depth() - 1,
-                            false,
-                        )?
-                    } else if let Some(ty) = operation.fresh_type() {
-                        let parameters = self.devices[1].1.parameters(ty)?.clone();
-                        let level = parameters.crt_depth() - 1;
-                        // Fresh ordinary outputs are evaluation-format; a fresh
-                        // compact decomposition samples COEFF scratch instead.
-                        (parameters, level, operation.input_evaluation(true))
-                    } else {
-                        return Err(PolyBackendError::InvalidConstantShape);
-                    };
-                    let start = reference.interval.start;
-                    let source = primary
-                        .map(|primary| {
-                            select_matrix_input(
-                                primary,
-                                operation.source_columns(primary, start, start + 1),
-                                1,
-                                &parameters,
-                                evaluation,
-                                &inventory,
-                                &mut chosen,
-                                &mut planned,
-                                &mut preparation,
-                            )
-                            .and_then(|source| source.ok_or_else(capacity_error))
-                        })
-                        .transpose()?;
-                    let mut rhs = Vec::with_capacity(right.len());
-                    for (index, right) in operation.dependent_inputs(&right).iter().enumerate() {
-                        let input_parameters =
-                            if matches!(operation, PreparedMatrixOperation::CrtRecompose { .. }) {
-                                self.devices[1].1.parameters_for_matrix(
-                                    &right
-                                        .shards
-                                        .first()
-                                        .ok_or(PolyBackendError::InvalidConstantShape)?
-                                        .value,
-                                )?
-                            } else {
-                                &parameters
-                            };
-                        rhs.push(
-                            select_matrix_input(
-                                right,
-                                operation.other_columns(index, right, start, start + 1),
-                                1,
-                                input_parameters,
-                                evaluation,
-                                &inventory,
-                                &mut chosen,
-                                &mut planned,
-                                &mut preparation,
-                            )?
-                            .ok_or_else(capacity_error)?,
-                        );
-                    }
-                    let (parameters, level, evaluation) = operation.output_layout(
-                        &self.devices[1].1,
-                        &parameters,
-                        level,
-                        evaluation,
-                    )?;
-                    scratch.extend(
-                        select_operation_scratch(
-                            &operation,
-                            &inventory,
-                            &mut chosen,
-                            1,
-                            &parameters,
-                            level,
-                            operation.scratch_evaluation(evaluation),
-                        )?
-                        .ok_or_else(capacity_error)?,
-                    );
-                    let (storage, request) = select_prepared_matrix(
-                        &inventory,
-                        &mut chosen,
-                        1,
-                        &parameters,
-                        level,
-                        (rows, 1),
-                        evaluation,
-                        operation.compact_bound(),
-                    )?
-                    .ok_or_else(capacity_error)?;
-                    Some(MatrixDestination {
-                        interval: GpuColumnInterval { device: 1, start, end: start + 1 },
-                        source,
-                        right: rhs,
-                        parameters,
-                        level,
-                        evaluation,
-                        storage,
-                        request,
-                    })
-                } else {
-                    None
-                };
                 layouts.push((
                     operation,
                     left.cloned(),
                     right,
                     compact.cloned(),
-                    Arc::new(MatrixRequirements { outputs, representative, scratch }),
+                    Arc::new(MatrixRequirements { outputs, scratch }),
                 ));
             }
             // All layouts and fixed/output fits are known before preparation.
             // Native owners retain the fixed slots after their tokens retire,
-            // so calibration observes them in its excluded fixed baseline.
-            let prepared = self.prepare_matrix_inputs(&mut ledger, preparation)?;
-            let mut profiles = Vec::with_capacity(layouts.len());
-            // All isolated pilots finish before any production reservation is
-            // held, so joint occupancy resets cannot overlap admitted outputs.
-            for (operation, left, right, compact, requirements) in &layouts {
-                let rows = operation.output_rows(left.as_ref(), right)?;
+            // and remain live while scratch widths are selected.
+            let prepared = if self.admitted_measurement_sink.is_some() && !preparation.is_empty() {
+                let mut sink = self.admitted_measurement_sink.take().unwrap();
+                let measured = (|| {
+                    let device_indices = self
+                        .devices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (device, _))| (*device, index))
+                        .collect::<HashMap<_, _>>();
+                    let active_devices = preparation
+                        .par_iter()
+                        .flat_map_iter(|input| {
+                            let sources = match input.source {
+                                PreparedMatrixSource::Shard(index) |
+                                PreparedMatrixSource::Fragment { index, .. } => {
+                                    &input.matrix.shards[index..index + 1]
+                                }
+                                PreparedMatrixSource::Replica { .. } => {
+                                    input.matrix.shards.as_slice()
+                                }
+                            };
+                            std::iter::once(input.device).chain(
+                                sources.iter().map(|source| device_indices[&source.device_id]),
+                            )
+                        })
+                        .collect::<HashSet<_>>();
+                    let parameters = self
+                        .device_parameters()
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(device, _)| active_devices.contains(device))
+                        .collect();
+                    let stores = inventory.iter().fold(
+                        std::collections::BTreeMap::<usize, Vec<Arc<GpuPreparedStorage>>>::new(),
+                        |mut stores, (device, storage)| {
+                            stores.entry(*device).or_default().push(storage.clone());
+                            stores
+                        },
+                    );
+                    let mut measurement = crate::gpu_measurement::GpuColumnMeasurement::new(
+                        parameters, stores, &mut sink, None, true,
+                    );
+                    let timer = measurement
+                        .begin(None)
+                        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+                    let prepared = self.prepare_matrix_inputs(&mut ledger, preparation)?;
+                    measurement
+                        .finish(
+                            timer,
+                            crate::gpu_measurement::GpuMeasuredStage::InputPreparation(
+                                self.active_operation,
+                            ),
+                        )
+                        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+                    Ok::<_, PolyBackendError>(prepared)
+                })();
+                self.admitted_measurement_sink = Some(sink);
+                measured?
+            } else {
+                self.prepare_matrix_inputs(&mut ledger, preparation)?
+            };
+            let mut classes = Vec::with_capacity(layouts.len());
+            // Native layout bounds determine scratch widths without calibration kernels.
+            for (operation, _, _, _, requirements) in &layouts {
                 if requirements.outputs.is_empty() {
-                    profiles.push(GpuCalibrationProfile { gpu0: None, nonzero: None });
+                    classes.push(GpuAllocationClass {
+                        identity: [0; 32],
+                        bound_identity: None,
+                        minimum_columns: 1,
+                        maximum_columns: 1,
+                    });
                     continue;
                 }
-                let maximum = requirements
+                let mut maximum = requirements
                     .outputs
                     .iter()
                     .map(|output| output.interval.end - output.interval.start)
                     .max()
                     .unwrap();
-                let layout_key = requirements
-                    .outputs
-                    .par_iter()
-                    .chain(requirements.representative.par_iter())
-                    .map(|output| {
-                        (
-                            output.interval,
-                            (rows, output.interval.end - output.interval.start),
-                            output.parameters.ring_dimension(),
-                            output.parameters.moduli().to_vec(),
-                            output.level,
-                            output.evaluation,
-                            operation
-                                .primary(left.as_ref(), right, output.interval.start)
-                                .zip(output.source)
-                                .map(|(primary, source)| {
-                                    let input = &operation.source(&prepared, primary, source).value;
-                                    (
-                                        source.layout(primary),
-                                        input.params().ring_dimension(),
-                                        input.params().moduli().to_vec(),
-                                        input.level(),
-                                    )
-                                }),
-                            output
-                                .right
-                                .iter()
-                                .zip(right)
-                                .map(|(&index, value)| {
-                                    let input = &operation.source(&prepared, value, index).value;
-                                    (
-                                        index.layout(value),
-                                        input.params().ring_dimension(),
-                                        input.params().moduli().to_vec(),
-                                        input.level(),
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                            CompiledMatrixInvocation::compact_shard(
-                                compact.as_ref(),
-                                output.source,
-                            )
-                            .map(|shard| {
-                                (
-                                    shard.value.size(),
-                                    shard.value.params().moduli().to_vec(),
-                                    shard.value.bound().clone(),
-                                )
-                            }),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let inventory_key = inventory
-                    .par_iter()
-                    .map(|(device, storage)| {
-                        (
-                            *device,
-                            (0..storage.slot_count())
-                                .map(|index| {
-                                    let slot = storage.slot_identity(index).unwrap();
-                                    (
-                                        slot.kind() as i32,
-                                        slot.rows(),
-                                        slot.columns(),
-                                        slot.level(),
-                                        slot.requested_backing_bytes(),
-                                        slot.alignment(),
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let configuration = mxx_ir_core::encoding::hash_canonical(&(
-                    "prepared-matrix-inventory/v1",
-                    inventory_key,
-                ))
-                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
-                let identity = mxx_ir_core::encoding::hash_canonical(&(
-                    "prepared-matrix-range/v1",
-                    match operation {
-                        PreparedMatrixOperation::Negate => 0u8,
-                        PreparedMatrixOperation::Constant { .. } => 17,
-                        PreparedMatrixOperation::Sample { .. } => 18,
-                        PreparedMatrixOperation::Hash { .. } => 19,
-                        PreparedMatrixOperation::Polynomial { .. } => 20,
-                        PreparedMatrixOperation::CenteredRebase { .. } => 21,
-                        PreparedMatrixOperation::ModulusConversion {..}=>22,
-                        PreparedMatrixOperation::RnsConversion {..}=>23,
-                        PreparedMatrixOperation::CrtRecompose {..}=>24,
-                        PreparedMatrixOperation::Decompose {..}=>25,
-                        PreparedMatrixOperation::CenteredExtendCompact {..}=>26,
-                        PreparedMatrixOperation::MultiplyCompact {..}=>27,
-                        PreparedMatrixOperation::ImportMatrix {..}=>28,
-                        PreparedMatrixOperation::ImportCompact {..}=>29,
-                        PreparedMatrixOperation::ImportStaging {..}=>30,
-                        PreparedMatrixOperation::Preimage {..}=>31,
-                        PreparedMatrixOperation::Accumulate { .. } => 16,
-                        PreparedMatrixOperation::ConcatRows => 12,
-                        PreparedMatrixOperation::ConcatColumns { diagonal: false, .. } => 14,
-                        PreparedMatrixOperation::ConcatColumns { diagonal: true, .. } => 15,
-                        PreparedMatrixOperation::AddRowBlocks => 13,
-                        PreparedMatrixOperation::Add => 1,
-                        PreparedMatrixOperation::Subtract => 2,
-                        PreparedMatrixOperation::Scale(_) => 3,
-                        PreparedMatrixOperation::Automorphism(_) => 4,
-                        PreparedMatrixOperation::Multiply { scales_left: false } => 5,
-                        PreparedMatrixOperation::Multiply { scales_left: true } => 6,
-                        PreparedMatrixOperation::Transpose => 7,
-                        PreparedMatrixOperation::SumRows(_) => 8,
-                        PreparedMatrixOperation::Slice { .. } => 9,
-                        PreparedMatrixOperation::Tensor { groups: None, .. } => 10,
-                        PreparedMatrixOperation::Tensor { groups: Some(_), .. } => 11,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::SumRows(rows) |
-                        PreparedMatrixOperation::Tensor { groups: Some(rows), .. } => {
-                            rows.as_slice()
+                if let PreparedMatrixOperation::Preimage { ty, bound, public_rows, plan, .. } =
+                    operation
+                {
+                    // Step claims use the same accepted inventory as fixed and
+                    // retained output owners. Bound the native allocation class
+                    // before width selection, including the arbitrary-width tail.
+                    for output in &requirements.outputs {
+                        let params = &output.parameters;
+                        let broker = PreparedClaimBroker::new(
+                            params,
+                            inventory.iter().map(|(_, storage)| storage.clone()).collect(),
+                        );
+                        let mut low = 0usize;
+                        let mut high = maximum;
+                        while low < high {
+                            let width = low + (high - low).div_ceil(2);
+                            let mut claims = plan.destination.clone();
+                            claims.extend(
+                                plan.tile_claims(params, *public_rows, width)
+                                    .map_err(PolyBackendError::GpuCalibration)?,
+                            );
+                            claims.extend(
+                                plan.attempt_claims(params, *public_rows, width, ty.rows, bound)
+                                    .map_err(PolyBackendError::GpuCalibration)?,
+                            );
+                            if broker
+                                .fits(&claims, &chosen)
+                                .map_err(PolyBackendError::GpuCalibration)?
+                            {
+                                low = width;
+                            } else {
+                                high = width - 1;
+                            }
                         }
-                        _ => &[],
-                    },
-                    match operation {
-                        PreparedMatrixOperation::Slice { rows, columns } => {
-                            Some((rows.start, rows.end, columns.start, columns.end))
+                        if low == 0 {
+                            return Err(PolyBackendError::GpuSubmission(
+                                "preimage one-column step demand does not fit the prepared inventory".into()));
                         }
-                        _ => None,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::ConcatColumns {
-                            diagonal,
-                            rows,
-                            columns,
-                            offsets,
-                        } => Some((*diagonal, *rows, *columns, offsets)),
-                        _ => None,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::Accumulate { products, bias, rows } => {
-                            Some((products, *bias, *rows))
-                        }
-                        _ => None,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::Constant { ty, value } => {
-                            use mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixRangeConstant;
-                            let fields = match value {
-                                GpuMatrixRangeConstant::Zero { total_columns } => {
-                                    (0u8, *total_columns, 0, false, None)
-                                }
-                                GpuMatrixRangeConstant::Identity => (1, ty.columns, 0, false, None),
-                                GpuMatrixRangeConstant::UnitRow { total_columns, index } => {
-                                    (2, *total_columns, *index, false, None)
-                                }
-                                GpuMatrixRangeConstant::UnitColumn { index } => {
-                                    (3, 1, *index, false, None)
-                                }
-                                GpuMatrixRangeConstant::Gadget { small, digit_count } => {
-                                    (4, ty.columns, 0, *small, *digit_count)
-                                }
-                            };
-                            Some((ty, fields))
-                        }
-                        _ => None,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::Sample { ty, distribution, sigma_bits, max_coefficient_bound } => {
-                            let kind = match distribution {
-                                mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixSampleDist::Uniform => 0u8,
-                                mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixSampleDist::Gauss => 1,
-                                mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixSampleDist::Bit => 2,
-                                mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixSampleDist::Ternary => 3,
-                            };
-                            Some((ty, kind, sigma_bits, max_coefficient_bound))
-                        }
-                        _ => None,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::Hash { ty, tag_bytes } => Some((ty, tag_bytes)),
-                        _ => None,
-                    },
-                    (
-                    match operation {
-                        PreparedMatrixOperation::Polynomial { ty, coefficients } => Some((ty,Some(coefficients),None)),
-                        PreparedMatrixOperation::CenteredRebase { destination } => Some((destination,None,None)),
-                        PreparedMatrixOperation::ModulusConversion {destination,conversion}=>Some((destination,None,Some(match conversion {
-                            mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixModulusConversion::Reduce=>(0u8,0u64),
-                            mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixModulusConversion::Round=>(1,0),
-                            mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixModulusConversion::CenteredExtend=>(2,0),
-                            mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixModulusConversion::BlockSwitch {plaintext_modulus}=>(3,*plaintext_modulus),
-                        }))),
-                        _ => None,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::RnsConversion { destination, source_moduli, conversion } => Some((destination, source_moduli, match conversion {
-                            mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixRnsConversion::Up { digit_size, normalize } => (0u8, *digit_size, *normalize, 0u64),
-                            mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixRnsConversion::Down { plaintext_modulus } => (1, 0, false, *plaintext_modulus),
-                        })),
-                        _ => None,
-                    }),
-                    ((layout_key, match operation { PreparedMatrixOperation::Decompose {small,digit_count,input_rows,layout,hash} => Some((small,digit_count,input_rows,layout.rows_per_input_row,layout.dropped_moduli,&layout.max_coefficient_bound,hash)), _=>None }), match operation {
-                        PreparedMatrixOperation::CrtRecompose {destination,plaintext_moduli,reconstruction_coefficients} => Some((destination,plaintext_moduli,reconstruction_coefficients)),
-                        _ => None,
-                    }, match operation {
-                        PreparedMatrixOperation::CenteredExtendCompact { destination, bound } => Some((destination, bound)),
-                        _ => None,
-                    }, match operation {
-                        PreparedMatrixOperation::MultiplyCompact { columns, inner } => Some((columns, inner)),
-                        _ => None,
-                    }, match operation {
-                        PreparedMatrixOperation::ImportMatrix { ty, evaluation, max_coefficient_bits } => Some((ty, *evaluation, *max_coefficient_bits, None)),
-                        PreparedMatrixOperation::ImportCompact { ty, bound } => Some((ty, false, 0u16, Some(bound))),
-                        PreparedMatrixOperation::ImportStaging { ty, evaluation, .. } => Some((ty, *evaluation, 0u16, None)),
-                        _ => None,
-                    }),
-                    match operation {
-                        PreparedMatrixOperation::ImportStaging { bytes_per_poly, payload_len, .. } => Some((bytes_per_poly, payload_len)),
-                        _ => None,
-                    },
-                    match operation {
-                        PreparedMatrixOperation::Preimage { ty, bound, sigma_bits, gadget_base, digit_count, public_rows, plan } => Some((ty, bound, sigma_bits, gadget_base, digit_count, public_rows, plan.attempts, plan.attempt.keys().copied().collect::<Vec<_>>())),
-                        _ => None,
-                    },
-                    configuration,
-                ))
-                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
-                let class = GpuAllocationClass {
-                    identity,
-                    bound_identity: Some(identity),
-                    minimum_columns: 1,
-                    maximum_columns: maximum,
-                };
-                let key = GpuCalibrationKey::new(
-                    identity.as_slice(),
-                    environment.clone(),
-                    class,
-                    GpuCalibrationMetric::PreparedOccupiedSpanBytes {
-                        storage_configuration: configuration,
-                    },
-                );
-                if let Some(profile) = self.calibration_registry.get(&key) {
-                    let needs_zero =
-                        requirements.outputs.iter().any(|output| output.interval.device == 0);
-                    let needs_nonzero =
-                        requirements.outputs.iter().any(|output| output.interval.device > 0);
-                    if (!needs_zero || profile.gpu0.is_some()) &&
-                        (!needs_nonzero || profile.nonzero.is_some())
-                    {
-                        // A profile avoids only measurement. The ledger below
-                        // still acquires complete outputs and rechecks every
-                        // active device's live charges and native scratch fit.
-                        profiles.push((*profile).clone());
-                        continue;
+                        maximum = low;
                     }
                 }
-                let operation = operation.clone();
-                let pilot_payload = operation.pilot_payload()?;
-                // The ledger is held locally during admission; brokers see the
-                // same accepted inventory the production runners will use.
-                let brokers = Arc::new(
-                    (0..self.devices.len())
-                        .map(|device| {
-                            PreparedClaimBroker::new(
-                                inventory
-                                    .iter()
-                                    .filter(|(owner, _)| *owner == device)
-                                    .map(|(_, storage)| storage.clone())
-                                    .collect(),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                );
-                let left = left.clone();
-                let right = right.clone();
-                let compact = compact.clone();
-                let requirements = requirements.clone();
-                let inventory = inventory.clone();
-                let prepared = prepared.clone();
-                let measured = self
-                    .enqueue
-                    .map(&mut self.devices, move |device, (_, _)| {
-                        let local = requirements
-                            .outputs
-                            .iter()
-                            .chain(requirements.representative.iter())
-                            .filter(|output| output.interval.device == device)
-                            .collect::<Vec<_>>();
-                        if device > 1 || local.is_empty() {
-                            return Ok(None);
-                        }
-                        let params = &local[0].parameters;
-                        // The only input waits are at the explicit pilot boundary.
-                        let mut ready = HashSet::new();
-                        for output in &local {
-                            if let Some((primary, index)) = operation
-                                .primary(left.as_ref(), &right, output.interval.start)
-                                .zip(output.source)
-                            {
-                                if ready.insert((primary.id, index)) {
-                                    operation
-                                        .source(&prepared, primary, index)
-                                        .value
-                                        .wait_until_ready();
-                                }
-                            }
-                            for (right, &index) in right.iter().zip(&output.right) {
-                                if ready.insert((right.id, index)) {
-                                    operation
-                                        .source(&prepared, right, index)
-                                        .value
-                                        .wait_until_ready();
-                                }
-                            }
-                        }
-                        params.fence_released_memory();
-                        let mut groups = local
-                            .iter()
-                            .map(|output| (&*output.storage, std::slice::from_ref(&output.request)))
-                            .collect::<Vec<_>>();
-                        let scratch = requirements.scratch_allocations(device, 1);
-                        groups.extend(
-                            scratch
-                                .prepared
-                                .iter()
-                                .map(|(storage, requests)| (*storage, requests.as_slice())),
-                        );
-                        // Broker-held pilot steps (trapdoor, target tile,
-                        // destination plan, one attempt) count toward demand.
-                        let step_claims = operation.pilot_step_claims();
-                        let mut step_requests: Vec<(
-                            Arc<GpuPreparedStorage>,
-                            Vec<GpuPreparedRequest>,
-                        )> = Vec::new();
-                        {
-                            let mut taken = HashSet::new();
-                            for claim in &step_claims {
-                                let mut best: Option<(
-                                    usize,
-                                    Arc<GpuPreparedStorage>,
-                                    GpuPreparedRequest,
-                                    u64,
-                                )> = None;
-                                for (owner, storage) in inventory.iter() {
-                                    if *owner != device {
-                                        continue;
-                                    }
-                                    for index in 0..storage.slot_count() {
-                                        let slot = storage.slot_identity(index).unwrap();
-                                        if taken.contains(&slot.slot_id()) ||
-                                            slot.kind() != claim.kind()
-                                        {
-                                            continue;
-                                        }
-                                        let request = if claim.kind() == GpuPreparedSlotKind::Matrix
-                                        {
-                                            if slot.level() != claim.level() {
-                                                continue;
-                                            }
-                                            slot.matrix_request(
-                                                claim.rows(),
-                                                claim.columns(),
-                                                claim.is_evaluation().unwrap_or(true),
-                                            )
-                                        } else {
-                                            slot.workspace_request(
-                                                claim.bytes(),
-                                                claim.alignment().max(1),
-                                            )
-                                        };
-                                        if storage
-                                            .fits(&[request])
-                                            .map_err(PolyBackendError::GpuCalibration)? &&
-                                            best.as_ref().is_none_or(|(bytes, _, _, _)| {
-                                                slot.requested_backing_bytes() < *bytes
-                                            })
-                                        {
-                                            best = Some((
-                                                slot.requested_backing_bytes(),
-                                                storage.clone(),
-                                                request,
-                                                slot.slot_id(),
-                                            ));
-                                        }
-                                    }
-                                }
-                                let (_, storage, request, slot_id) = best.ok_or_else(|| {
-                                    PolyBackendError::GpuSubmission(
-                                        "pilot step claims do not fit the prepared inventory"
-                                            .into(),
-                                    )
-                                })?;
-                                taken.insert(slot_id);
-                                step_requests.push((storage, vec![request]));
-                            }
-                        }
-                        let steps = step_requests
-                            .iter()
-                            .map(|(storage, requests)| (&**storage, requests.as_slice()))
-                            .collect::<Vec<_>>();
-                        for (_, store) in inventory.iter().filter(|(owner, _)| *owner == device) {
-                            if !groups
-                                .iter()
-                                .any(|(included, _)| included.identity() == store.identity())
-                            {
-                                groups.push((store, &[]));
-                            }
-                        }
-                        let measured = GpuDeviceCalibration::measure_prepared_with_steps(
-                            class,
-                            1,
-                            configuration,
-                            &groups,
-                            &steps,
-                            || {
-                                let mut outputs = local
-                                    .iter()
-                                    .map(|output| {
-                                        operation
-                                            .initialize_output(
-                                                &output.parameters,
-                                                output.level,
-                                                output.evaluation,
-                                                rows,
-                                                output.interval.end - output.interval.start,
-                                            )
-                                            .map(Some)
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?;
-                                let first = local[0];
-                                let destination = outputs[0].take().unwrap();
-                                outputs[0] = Some(
-                                    operation.run(
-                                        operation
-                                            .primary(left.as_ref(), &right, first.interval.start)
-                                            .zip(first.source)
-                                            .map(|(primary, index)| {
-                                                operation.source(&prepared, primary, index)
-                                            }),
-                                        &right
-                                            .iter()
-                                            .zip(&first.right)
-                                            .map(|(right, &index)| {
-                                                operation.source(&prepared, right, index)
-                                            })
-                                            .collect::<Vec<_>>(),
-                                        CompiledMatrixInvocation::compact_shard(
-                                            compact.as_ref(),
-                                            first.source,
-                                        ),
-                                        first.interval.start,
-                                        first.interval.start + 1,
-                                        (destination, 0..rows, 0..1),
-                                        &pilot_payload,
-                                        &brokers[device],
-                                    )?,
-                                );
-                                for output in &outputs {
-                                    output.as_ref().unwrap().wait_until_ready();
-                                }
-                                Ok(outputs)
-                            },
-                        );
-                        let result = measured
-                            .map(|(profile, outputs)| {
-                                drop(outputs);
-                                Some(profile)
-                            })
-                            .map_err(PolyBackendError::GpuCalibration);
-                        params.fence_released_memory();
-                        result
-                    })
-                    .map_err(PolyBackendError::from)?;
-                let profile = GpuCalibrationProfile {
-                    gpu0: measured[0],
-                    nonzero: measured.get(1).copied().flatten(),
-                };
-                let registry = crate::gpu_calibration::GpuCalibrationRegistry::from(
-                    self.calibration_registry.clone(),
-                );
-                registry
-                    .insert(key, profile.clone())
-                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
-                self.calibration_registry = registry.freeze();
-                profiles.push(profile);
+                classes.push(GpuAllocationClass {
+                    identity: self.active_operation.unwrap_or([0; 32]),
+                    bound_identity: None,
+                    minimum_columns: 1,
+                    maximum_columns: maximum,
+                });
             }
             let mut admitted = Vec::with_capacity(layouts.len());
-            for ((operation, left, _, _, requirements), profile) in layouts.iter().zip(&profiles) {
+            for ((operation, left, _, _, requirements), class) in layouts.iter().zip(&classes) {
                 let intervals =
                     requirements.outputs.iter().map(|output| output.interval).collect::<Vec<_>>();
                 let plan = ledger
                     .reserve_columns(
                         operation.output_columns(left.as_ref()),
                         GpuOutputOwnership::Inherited(&intervals),
-                        profile,
+                        GpuColumnWidthPolicy::Native(*class),
                         &**requirements,
                     )
                     .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
@@ -1494,12 +971,15 @@ impl GpuDcrtBackend {
                 admitted.push((request, plan));
             }
             self.prepared_invocations = self.compile_matrix_invocations(admitted, prepared)?;
-            // Only an identity the executor selected for this admission keys
-            // the log; admissions without a fresh selection are not logged and
-            // the estimator measures those nodes nominally.
+            // Retain distinct diagnostic plans in first-admission order. The
+            // measurement observer owns execution counts; repeated loop members
+            // must not append identical plan snapshots indefinitely.
             if let Some(operation_identity) = self.unlogged_operation.take() {
                 for summary in self.admitted_invocation_summaries() {
-                    self.admitted_plan_log.push((operation_identity, summary));
+                    let entry = (operation_identity, summary);
+                    if !self.admitted_plan_log.contains(&entry) {
+                        self.admitted_plan_log.push(entry);
+                    }
                 }
             }
             self.prepared_required = true;

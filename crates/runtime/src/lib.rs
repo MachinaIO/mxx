@@ -10,6 +10,8 @@ pub mod gpu_enqueue;
 #[cfg(feature = "gpu")]
 pub mod gpu_invocation;
 #[cfg(feature = "gpu")]
+pub mod gpu_measurement;
+#[cfg(feature = "gpu")]
 pub mod gpu_memory;
 #[cfg(feature = "gpu")]
 pub mod gpu_schedule;

@@ -1451,7 +1451,7 @@ mod tests {
              execute: &dyn Fn(&mut GpuDcrtBackend) -> Result<GpuFleetMatrix, PolyBackendError>,
              expected: GpuDCRTPolyMatrix| {
                 let operation = rand::random();
-                backend.select_operation(operation).unwrap();
+                backend.select_operation(operation, true).unwrap();
                 backend.preflight_gpu_operations(&[(0, invocation)]).unwrap();
                 assert!(backend.pending_pilot.is_none(), "preflight must finish before production");
                 assert!(backend.operation_profiles.contains_key(&operation));
@@ -1531,7 +1531,7 @@ mod tests {
             &|backend| backend.matrix_mul_accumulate(request.clone()),
             &raw * &right_raw,
         );
-        backend.select_operation(rand::random()).unwrap();
+        backend.select_operation(rand::random(), true).unwrap();
         backend
             .preflight_gpu_operations(&[(
                 0,
@@ -1549,7 +1549,7 @@ mod tests {
             .unwrap();
         let upper = GpuFleetMatrix::from_matrix(lhs.slice_rows(0, 1));
         let lower = GpuFleetMatrix::from_matrix(lhs.slice_rows(1, 2));
-        backend.select_operation(rand::random()).unwrap();
+        backend.select_operation(rand::random(), true).unwrap();
         backend
             .preflight_gpu_operations(&[(
                 0,
@@ -1593,7 +1593,7 @@ mod tests {
         let operation = rand::random();
         let key = rand::random();
         let tag = b"production-key-and-tag-are-not-pilot-inputs";
-        backend.select_operation(operation).unwrap();
+        backend.select_operation(operation, true).unwrap();
         backend
             .preflight_gpu_operations(&[(
                 0,
@@ -1617,7 +1617,7 @@ mod tests {
             GpuInvocation::RingAutomorphism { value: &output, index: 3 },
         ] {
             let operation = rand::random();
-            backend.select_operation(operation).unwrap();
+            backend.select_operation(operation, true).unwrap();
             backend.preflight_gpu_operations(&[(0, request)]).unwrap();
             assert!(backend.pending_pilot.is_none());
             assert!(backend.operation_profiles.contains_key(&operation));
@@ -1690,7 +1690,7 @@ mod tests {
         let base = BigInt::from(1u64 << params.base_bits());
         let digits = params.modulus_digits();
         let operation = rand::random();
-        backend.select_operation(operation).unwrap();
+        backend.select_operation(operation, true).unwrap();
         backend
             .preflight_gpu_operations(&[(
                 0,

@@ -246,7 +246,7 @@ private:
         record_failure_locked(message);
     }
 
-    void process(Job &job)
+    int process(Job &job)
     {
         // Retirement runs independently of foreground setup/submission. Track
         // its complete device activity, including event waits and host frees,
@@ -267,7 +267,7 @@ private:
             // The event and pointers are intentionally leaked. Once
             // synchronization is uncertain, freeing host memory could race
             // with an in-flight asynchronous copy.
-            return;
+            return 1;
         }
 
         const int resource_status = job.resource ? job.resource->release() : 0;
@@ -278,9 +278,10 @@ private:
             gpu_device_mark_allocation_unknown(job.device);
             record_failure(resource_status != 0 ? "CUDA completion resource release failed" : cudaGetErrorString(error));
             // Keep the pointers leaked when event destruction is uncertain.
-            return;
+            return 1;
         }
 
+        int status = 0;
         for (void *pointer : job.pointers)
         {
             if (!pointer)
@@ -293,8 +294,10 @@ private:
                 // Do not retry an uncertain free. The failed pointer is
                 // leaked, while independent pointers can still be reclaimed.
                 record_failure(cudaGetErrorString(error));
+                status = 1;
             }
         }
+        return status;
     }
 
     void run()

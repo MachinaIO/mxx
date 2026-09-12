@@ -90,6 +90,72 @@ pub(super) fn prepare(validated: &ValidatedGraph, mut plan: RootBlockAliases) ->
     plan
 }
 
+/// Native owners introduced or retained by the actual dispatch optimizer.
+#[derive(Default)]
+pub(crate) struct InventoryPlan {
+    pub outputs: BTreeMap<NodeId, Vec<(mxx_ir_core::types::ConcreteMatrixType, Vec<WireRef>)>>,
+    pub aliases: BTreeMap<WireRef, WireRef>,
+    pub borrowed_until: BTreeMap<WireRef, usize>,
+    pub omitted: std::collections::BTreeSet<NodeId>,
+}
+
+pub(crate) fn inventory_plan(validated: &ValidatedGraph, capture_trace: bool) -> InventoryPlan {
+    let plan = super::root_block_aliases(validated, &FrozenGraphScopeId::Root, capture_trace);
+    let checked = validated.root_scope();
+    let scope = validated.source.scope(&FrozenGraphScopeId::Root).unwrap();
+    let mut result = InventoryPlan::default();
+    result.outputs = plan
+        .compact_products
+        .iter()
+        .map(|(&id, (_, _, blocks))| {
+            (
+                id,
+                blocks
+                    .iter()
+                    .map(|aliases| {
+                        (
+                            checked.wire_types[&aliases[0]].matrix_type().unwrap().clone(),
+                            aliases.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    result.aliases.extend(plan.concats.values().flatten().copied());
+    for &concat in &plan.row_block_concats {
+        let wire = WireRef { node: concat, port: Port(0) };
+        let end = checked.liveness.last_use[&wire];
+        for argument in scope.arguments(&checked.execution_order[concat.0 as usize]).unwrap() {
+            result
+                .borrowed_until
+                .entry(argument)
+                .and_modify(|previous| *previous = (*previous).max(end))
+                .or_insert(end);
+        }
+    }
+    for (id, row_sum) in &plan.row_sums {
+        for source in row_sum
+            .tensor_operands
+            .as_ref()
+            .map(|sources| sources.as_slice())
+            .unwrap_or(std::slice::from_ref(&row_sum.source))
+        {
+            result
+                .borrowed_until
+                .entry(*source)
+                .and_modify(|previous| *previous = (*previous).max(id.0 as usize))
+                .or_insert(id.0 as usize);
+        }
+    }
+    result.omitted.extend(plan.slices.iter().copied());
+    result.omitted.extend(plan.concats.keys().copied());
+    result.omitted.extend(plan.row_block_concats.iter().copied());
+    result.omitted.extend(plan.row_sum_interiors.iter().copied());
+    result.omitted.extend(plan.compact_products.keys().copied());
+    result
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct ImportProbe {

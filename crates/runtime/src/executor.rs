@@ -39,7 +39,7 @@ use tracing::info;
 use crate::gpu_invocation::{GpuColumnSourceLayout, GpuInvocation, preflight};
 
 #[cfg(feature = "gpu")]
-mod gpu_plan;
+pub(crate) mod gpu_plan;
 mod plan_cache;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +57,7 @@ pub struct ExecutionConfig {
     /// When set, also drain pending releases before returning. With `None`,
     /// releases remain asynchronous and are protected by backend lifetime events.
     pub release_fence_interval: Option<NonZeroUsize>,
-    /// Derive the complete prepared GPU inventory from the graph and accept it
+    /// By default, derive the complete prepared GPU inventory from the graph and accept it
     /// before the first node executes. Graphs containing kinds without a
     /// compiled admitted runner fail before any partial execution. The caller
     /// asserts exclusive device observation during setup.
@@ -70,7 +70,7 @@ impl Default for ExecutionConfig {
             max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
             preimage_progress: None,
             release_fence_interval: None,
-            prepared_gpu_admission: false,
+            prepared_gpu_admission: true,
         }
     }
 }
@@ -945,11 +945,13 @@ where
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
-    if config.prepared_gpu_admission {
+    let graph_admission = if config.prepared_gpu_admission {
         backend
-            .prepare_graph_admission(validated)
-            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
-    }
+            .prepare_graph_admission(validated, capture_trace, &inputs)
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?
+    } else {
+        None
+    };
     let mut executor = Executor {
         validated,
         backend,
@@ -1090,6 +1092,7 @@ where
         artifact_handles,
         staged_family_leases,
     };
+    drop(graph_admission);
     Ok((result, executor.trace.take().unwrap_or_default()))
 }
 
@@ -1217,8 +1220,21 @@ where
         let validated_scope = self.validated.scope(scope_id).ok_or_else(|| {
             ExecutionError::MissingSubgraph { node: NodeId(0), name: format!("{scope_id:?}") }
         })?;
+        #[cfg(feature = "gpu")]
+        self.backend.observe_gpu_scope(true);
         let schedule = &validated_scope.liveness;
         let block_aliases = root_block_aliases(self.validated, scope_id, self.trace.is_some());
+        #[cfg(feature = "gpu")]
+        self.backend.observe_gpu_omitted_nodes(
+            scope_id,
+            block_aliases
+                .slices
+                .iter()
+                .copied()
+                .chain(block_aliases.concats.keys().copied())
+                .chain(block_aliases.row_block_concats.iter().copied())
+                .chain(block_aliases.row_sum_interiors.iter().copied()),
+        );
         if envs.len() == 1 &&
             self.config.release_fence_interval.is_none() &&
             !tracing::enabled!(tracing::Level::INFO)
@@ -1234,6 +1250,8 @@ where
                     })
                     .collect::<Option<Vec<_>>>();
                 if let Some(matrices) = matrices {
+                    #[cfg(feature = "gpu")]
+                    self.backend.observe_gpu_node(scope_id, *node, 1, &envs[0]);
                     #[cfg(feature = "gpu")]
                     if let Some(operation) =
                         block_aliases.calibration[node].clone().map_err(ExecutionError::Backend)?
@@ -1266,6 +1284,8 @@ where
                         .executed_node_count
                         .saturating_add(validated_scope.execution_order.len());
                     self.has_pending_releases = true;
+                    #[cfg(feature = "gpu")]
+                    self.backend.observe_gpu_scope(false);
                     return Ok(vec![InstanceResult { outputs: vec![RuntimeValue::matrix(output)] }]);
                 }
             }
@@ -1481,6 +1501,8 @@ where
                         .map(|(operation, indices)| (*operation, indices.as_slice())),
                 )
             {
+                #[cfg(feature = "gpu")]
+                self.backend.observe_gpu_node(scope_id, node.id, indices.len(), &envs[indices[0]]);
                 if let Some(operation) = operation {
                     self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
                 }
@@ -1793,6 +1815,8 @@ where
             }
             instances.push(InstanceResult { outputs });
         }
+        #[cfg(feature = "gpu")]
+        self.backend.observe_gpu_scope(false);
         Ok(instances)
     }
 

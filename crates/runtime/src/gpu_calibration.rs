@@ -685,7 +685,10 @@ impl GpuDeviceCalibration {
             .iter()
             .filter_map(|(storage, _)| seen.insert(storage.identity()).then_some(*storage))
             .collect::<Vec<_>>();
-        let (baseline, _) = GpuPreparedStorage::joint_occupancy(&stores, true)?;
+        let (baseline, _) = GpuPreparedStorage::joint_occupancy(
+            &stores,
+            mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedOccupancyMode::ResetCalibration,
+        )?;
         let mut reservations = groups
             .iter()
             .map(|(storage, requests)| {
@@ -698,7 +701,10 @@ impl GpuDeviceCalibration {
         let dispatch = first.enter(reservations)?;
         let result = run()?;
         drop(dispatch.finish()?);
-        let (_, observed_peak) = GpuPreparedStorage::joint_occupancy(&stores, false)?;
+        let (_, observed_peak) = GpuPreparedStorage::joint_occupancy(
+            &stores,
+            mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedOccupancyMode::Observe,
+        )?;
         let peak = observed_peak
             .checked_sub(baseline)
             .ok_or("prepared pilot peak is below its retained baseline")?;
@@ -2928,7 +2934,14 @@ mod tests {
         drop(outputs);
         params.fence_released_memory();
         let inventory = stores.iter().collect::<Vec<_>>();
-        assert_eq!(GpuPreparedStorage::joint_occupancy(&inventory, true).unwrap(), (0, 0));
+        assert_eq!(
+            GpuPreparedStorage::joint_occupancy(
+                &inventory,
+                mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedOccupancyMode::ResetCalibration
+            )
+            .unwrap(),
+            (0, 0)
+        );
         assert!(groups.iter().all(|(store, claims)| store.fits(claims).unwrap()));
     }
 

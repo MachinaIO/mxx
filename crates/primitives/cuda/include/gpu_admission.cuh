@@ -134,8 +134,11 @@ int gpu_prepared_storage_occupancy(
 
 // Joint device-span peak across the complete live inventory on one physical
 // execution owner. Duplicate, incomplete and foreign-owner lists are rejected.
-// Reset excludes all reservations on that owner; pending releases reject it.
-// The caller retains fixed baseline owners and excludes unrelated pilot work.
+// Mode 0 observes. Mode 1 resets calibration, excluding all reservations and
+// rejecting pending releases. Mode 2 resets only the joint benchmark peak:
+// the caller must complete preceding releases, park all reservations/dispatches,
+// retain baseline owners and exclude submissions while resetting. It does not
+// change admission state or the per-storage calibration counters.
 int gpu_prepared_storages_occupancy(
     GpuPreparedStorage *const *storages, size_t count, int reset_peak,
     size_t *out_occupied_bytes, size_t *out_high_water_bytes);
@@ -185,6 +188,9 @@ void gpu_matrix_reservation_destroy(GpuMatrixReservation *reservation);
 // Failure preserves the reservation and its complete exclusive footprint.
 int gpu_matrix_reservation_rearm(
     GpuMatrixReservation *reservation, const GpuPreparedRequest *requests, size_t count);
+// Nonblocking scheduler query for this reservation's deferred CPU staging leases.
+// Device-only reuse remains ordered by native events. Errors are not pending.
+int gpu_matrix_reservation_cpu_ready(const GpuMatrixReservation *reservation, int *out_ready);
 // Split a complete unactivated reservation into ordered, disjoint child plans
 // for existing CPU workers. No slot becomes available during the transfer.
 // Consumes the parent only on success; errors leave every claim with it.

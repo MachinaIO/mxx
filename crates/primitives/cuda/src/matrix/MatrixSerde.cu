@@ -902,28 +902,9 @@ extern "C" int gpu_matrix_rns_store_completion_events(const GpuMatrix *mat, size
     const size_t limbs = static_cast<size_t>(mat->level) + 1;
     if (mat->ctx->limb_gpu_ids.size() < limbs)
         return set_error("invalid matrix RNS event query basis");
-    const size_t batch_limbs = mat->shared_limb_buffers.size() == 1 ? limbs : 1;
-    std::vector<SerdeStreamRef> streams;
-    streams.reserve(limbs);
-    // A prepared owner retains the backing's streams even when its requested
-    // shape becomes smaller. Query those immutable streams, not a fresh shape's
-    // allocation class. No device selection, allocation or GPU wait is needed.
-    for (size_t limb = 0; limb < limbs; limb += batch_limbs) {
-        const dim3 id = mat->ctx->limb_gpu_ids[limb];
-        if (id.x >= mat->shared_limb_buffers.size()) return set_error("invalid RNS partition");
-        cudaStream_t stream = nullptr;
-        int status = matrix_limb_stream(mat, id, &stream);
-        if (status != 0) return status;
-        for (size_t i = 0; i < batch_limbs; ++i) {
-            cudaStream_t producer = nullptr;
-            status = matrix_limb_stream(mat, mat->ctx->limb_gpu_ids[limb + i], &producer);
-            if (status != 0) return status;
-            // Each cross-stream consumer join consumes one temporary event.
-            if (producer != stream) ++*out_count;
-        }
-        serde_append_unique_stream(streams, mat->shared_limb_buffers[id.x].device, stream);
-    }
-    *out_count += streams.size(); // One returned completion per D2H stream.
+    // One event per unpack/transfer batch is shared by all limb readers and
+    // the returned snapshot, independently of the backing's producer streams.
+    *out_count = mat->shared_limb_buffers.size() == 1 ? 1 : limbs;
     return 0;
 }
 
@@ -1005,8 +986,10 @@ extern "C" int gpu_matrix_store_rns_batch(
         return set_error("unexpected limb mapping size in gpu_matrix_store_rns_batch");
     }
 
-    std::vector<SerdeStreamRef> streams;
-    streams.reserve(limb_count);
+    std::unique_ptr<GpuEventSet, decltype(&gpu_event_set_destroy)> events(
+        new GpuEventSet(), gpu_event_set_destroy);
+    events->execution = mat->ctx->execution;
+    events->entries.reserve(limb_count);
     // Fleet matrices keep all CRT limbs on one device. Unpack that complete
     // allocation in one kernel and transfer each polynomial contiguously,
     // instead of allocating and scheduling a D2H copy for every CRT limb.
@@ -1070,15 +1053,29 @@ extern "C" int gpu_matrix_store_rns_batch(
         status = staging.release();
         if (err != cudaSuccess) return set_error(err);
         if (status != 0) return status;
+        // The whole batch finishes on this stream. Share its completion event
+        // between the snapshot and all limb readers instead of claiming one
+        // extra event for each limb whose producer uses a different stream.
+        auto completion = std::make_shared<GpuCudaResource>();
+        status = completion->acquire(mat->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+        if (status != 0) return status;
+        err = cudaEventRecord(completion->event, stream);
+        if (err != cudaSuccess) {
+            completion->quarantine();
+            gpu_execution_mark_allocation_unknown(mat->ctx->execution.get());
+            return set_error(err);
+        }
+        events->entries.push_back(GpuEventSet::Entry{completion->event, device, completion});
         for (size_t index = 0; index < batch_limbs; ++index)
         {
-            status = matrix_track_limb_consumer(mat, limb_map[limb + index], device, stream);
+            status = matrix_track_limb_consumer(
+                mat, limb_map[limb + index], device, stream, completion->event);
             if (status != 0) return status;
         }
-        serde_append_unique_stream(streams, device, stream);
     }
 
-    return serde_build_event_set_from_streams(mat->ctx, streams, out_events);
+    *out_events = events.release();
+    return 0;
 }
 
 extern "C" int gpu_matrix_store_const_coeff_batch(

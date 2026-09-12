@@ -3411,7 +3411,7 @@ mod tests {
         poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
     };
     use mxx_runtime::{
-        backend::{poly::PolyBackendError, poly_gpu::gpu_backend},
+        backend::poly::PolyBackendError,
         gpu_calibration::GpuColumnWidths,
         gpu_schedule::{GpuColumnInterval, GpuColumnSchedule},
     };
@@ -3833,7 +3833,8 @@ mod tests {
             .ok()
             .map(|value| value.parse().unwrap())
             .unwrap_or(8);
-        let params = GpuDCRTPolyParams::new(n, vec![131_041], 1, None);
+        let cpu = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(n, 1, 17, 1, None, None);
+        let params = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 1, None);
         let ty = ConcreteWireType::Matrix(ConcreteMatrixType {
             rows: 1,
             columns: 2,
@@ -4373,7 +4374,10 @@ mod tests {
         };
         let range = mxx_runtime::backend::IndexRange { start: 7, end: 12 };
         let operation = [73u8; 32];
-        let mut backend = gpu_backend([params.clone()]);
+        let mut backend = mxx_runtime::backend::poly::gpu::gpu_backend_on(
+            [params.clone()],
+            [params.device_ids()[0]],
+        );
         backend.set_column_widths_for_operation(
             operation,
             GpuColumnWidths { gpu0: Some(range.end - range.start), nonzero: None },

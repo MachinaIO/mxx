@@ -2612,9 +2612,9 @@ impl GpuDCRTPolyMatrix {
     }
 
     /// Exact prepared completion-event claims for storing this owner's current
-    /// format as RNS bytes. A retained backing may have more producer streams
-    /// than a fresh allocation of the same shape. Format-conversion owners and
-    /// the transfer workspace are separate claims. This query does not wait.
+    /// format as RNS bytes. Each transfer batch shares its completion event
+    /// across all limb readers. Format-conversion owners and the transfer
+    /// workspace are separate claims. This query does not wait.
     pub fn rns_store_completion_events(&self) -> Result<usize, String> {
         let mut events = 0;
         let status = unsafe {

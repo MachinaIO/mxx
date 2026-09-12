@@ -319,7 +319,7 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_gpu_resident_row_sum_dispatch_releases_input_owners() {
         use crate::{
-            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend, execute,
+            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend_on, execute,
             gpu_calibration::GpuColumnWidths, transcript::SamplingMode,
         };
         use mxx_primitives::{
@@ -336,7 +336,8 @@ mod tests {
         let parameters = DCRTPolyParams::new(n, 4, 54, 8, None, None);
         let ring = Ring::new(parameters.modulus().as_ref().clone(), n as usize);
         let gpu_parameters = GpuDCRTPolyParams::new(n, parameters.to_crt().0, 8, None);
-        let mut backend = gpu_backend([gpu_parameters.clone()]);
+        let mut backend =
+            gpu_backend_on([gpu_parameters.clone()], [gpu_parameters.device_ids()[0]]);
         for (left_columns, right_columns) in [(1, 1), (3, 2)] {
             let tensor = ring
                 .input("left", (2, left_columns))

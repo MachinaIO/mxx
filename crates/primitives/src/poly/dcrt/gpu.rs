@@ -3189,7 +3189,7 @@ mod tests {
         let per_partition_aux =
             RUNTIME_MAX_AUX_LIMBS * (4 + 4) * matrix_count * std::mem::size_of::<*mut u8>();
         assert_eq!(
-            allocation.aux_bytes,
+            allocation.aux_workspace_bytes,
             2 * per_partition_aux,
             "each nonempty partition must query its complete no-fallback aux slab"
         );

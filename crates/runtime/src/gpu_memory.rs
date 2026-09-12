@@ -132,6 +132,13 @@ impl<'a> GpuColumnAllocations<'a> {
             .par_iter()
             .map(|(storage, requests)| {
                 validate_prepared_inventory(device, storage, inventory)?;
+                // Outputs and scratch may compete for the same native slot at
+                // a candidate width. That candidate does not fit; reduce it.
+                // Actual reservation still validates every concrete request.
+                let mut slots = BTreeSet::new();
+                if requests.iter().any(|request| !slots.insert(request.slot_key())) {
+                    return Ok(false);
+                }
                 storage.fits(requests).map_err(GpuAdmissionError::NativeReservation)
             })
             .collect::<Result<Vec<_>, _>>()?;

@@ -551,6 +551,11 @@ pub struct GpuPreparedRequest {
 }
 
 impl GpuPreparedRequest {
+    /// Native slot identity for detecting competing claims in a candidate plan.
+    pub fn slot_key(&self) -> (u64, u64, usize) {
+        (self.storage_id, self.slot_id, self.slot_index)
+    }
+
     pub fn kind(&self) -> GpuPreparedSlotKind {
         self.kind
     }

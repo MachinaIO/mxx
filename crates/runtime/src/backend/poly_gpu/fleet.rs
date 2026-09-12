@@ -4227,8 +4227,9 @@ impl Backend for GpuDcrtBackend {
         validated: &mxx_ir_core::ValidatedGraph,
         capture_trace: bool,
         inputs: &std::collections::BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+        warm_up: bool,
     ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error> {
-        GpuDcrtBackend::prepare_graph_admission(self, validated, capture_trace, inputs)
+        GpuDcrtBackend::prepare_graph_admission(self, validated, capture_trace, inputs, warm_up)
             .map(|guard| guard.map(|guard| Box::new(guard) as Box<dyn std::any::Any>))
     }
 

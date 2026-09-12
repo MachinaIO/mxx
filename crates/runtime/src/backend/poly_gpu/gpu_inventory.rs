@@ -312,6 +312,7 @@ impl GpuDcrtBackend {
         sigma: f64,
         gadget_base: &num_bigint::BigInt,
         digit_count: usize,
+        warm_up: bool,
     ) -> Result<Vec<GpuTracedClaim>, PolyBackendError> {
         let key = TrapdoorPlanKey {
             modulus: matrix.modulus.to_string(),
@@ -324,6 +325,11 @@ impl GpuDcrtBackend {
         };
         if let Some(claims) = self.trapdoor_plans.get(&key) {
             return Ok(claims.clone());
+        }
+        if !warm_up {
+            return Err(PolyBackendError::GpuSubmission(format!(
+                "explicit graph warmup required: missing trace_trapdoor_sampling resource plan for {key:?}"
+            )));
         }
         let params = self.devices[0].1.parameters(matrix)?.clone();
         let device = &mut self.devices[0].1;
@@ -347,6 +353,7 @@ impl GpuDcrtBackend {
         &mut self,
         ty: &ConcreteMatrixType,
         evaluation: bool,
+        warm_up: bool,
     ) -> Result<Vec<GpuTracedClaim>, PolyBackendError> {
         let params = self.devices[0].1.parameters(ty)?.clone();
         let mut all = Vec::new();
@@ -360,6 +367,11 @@ impl GpuDcrtBackend {
             if let Some(claims) = self.polynomial_value_plans.get(&key) {
                 all.extend(claims.iter().cloned());
                 continue;
+            }
+            if !warm_up {
+                return Err(PolyBackendError::GpuSubmission(format!(
+                    "explicit graph warmup required: missing trace_polynomial_values resource plan for {key:?}"
+                )));
             }
             let mut probe = <GpuDCRTPolyMatrix as PolyMatrix>::zero(&params, 1, 1);
             if input_ntt {
@@ -388,6 +400,7 @@ impl GpuDcrtBackend {
         sigma: f64,
         gadget_base: &num_bigint::BigInt,
         digit_count: usize,
+        warm_up: bool,
     ) -> Result<PreimageClaimPlan, PolyBackendError> {
         let key = PreimagePlanKey {
             modulus: ty.modulus.to_string(),
@@ -403,8 +416,18 @@ impl GpuDcrtBackend {
         if let Some(plan) = self.preimage_plans.get(&key) {
             return Ok(plan.clone());
         }
-        let trapdoor_claims =
-            self.trace_trapdoor_sampling(trapdoor_matrix, sigma, gadget_base, digit_count)?;
+        if !warm_up {
+            return Err(PolyBackendError::GpuSubmission(format!(
+                "explicit graph warmup required: missing trace_preimage_plan resource plan for {key:?}"
+            )));
+        }
+        let trapdoor_claims = self.trace_trapdoor_sampling(
+            trapdoor_matrix,
+            sigma,
+            gadget_base,
+            digit_count,
+            warm_up,
+        )?;
         let params = self.devices[0].1.parameters(ty)?.clone();
         let (public_matrix, trapdoor) =
             self.devices[0].1.sample_trapdoor(trapdoor_matrix, sigma, gadget_base, digit_count)?;
@@ -477,11 +500,15 @@ impl GpuDcrtBackend {
     /// through `prepare_memory`. Explicitly installed ledgers retain their
     /// caller-managed lifecycle; automatic inventories reuse free backing and
     /// add only missing demand. The caller asserts exclusive device observation.
+    /// Explicit resource warmup uses `warm_up = true` and discards the returned
+    /// guard before production. Reuse this backend for every warmed graph.
+    /// Production always uses false: cache misses fail before discovery trials.
     pub fn prepare_graph_admission(
         &mut self,
         validated: &ValidatedGraph,
         capture_trace: bool,
         inputs: &BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+        warm_up: bool,
     ) -> Result<Option<GpuGraphAdmissionGuard>, PolyBackendError> {
         if self.prepared_ledger.is_some() && !self.graph_prepared {
             return Ok(None);
@@ -555,6 +582,7 @@ impl GpuDcrtBackend {
                     capture_trace,
                     Some(&input_columns),
                     width,
+                    warm_up,
                 )?
                 .0;
             let fits = self
@@ -695,6 +723,7 @@ impl GpuDcrtBackend {
         capture_trace: bool,
         input_columns: Option<&BTreeMap<WireRef, ColumnInventoryLayout>>,
         scratch_columns: usize,
+        warm_up: bool,
     ) -> Result<
         (
             BTreeMap<(String, usize), (ConcreteMatrixType, ContextDemand)>,
@@ -1047,6 +1076,7 @@ impl GpuDcrtBackend {
                     capture_trace,
                     Some(&child_inputs),
                     scratch_columns,
+                    warm_up,
                 )?;
                 let staged = matches!(kind, NodeKind::ParallelLoop(_)) &&
                     crate::executor::stage_matrix_family_output(
@@ -1424,7 +1454,7 @@ impl GpuDcrtBackend {
                     let Some(ConcreteWireType::Matrix(ty)) = argument_types.first() else {
                         return Err(unsupported(kind));
                     };
-                    let claims = self.trace_polynomial_values(ty, *evaluation)?;
+                    let claims = self.trace_polynomial_values(ty, *evaluation, warm_up)?;
                     let params = parameters(self, ty)?;
                     push_traced(&mut demand, ty, &params, &claims, &add_matrix, &add_layouts);
                 }
@@ -1506,8 +1536,13 @@ impl GpuDcrtBackend {
                         return Err(PolyBackendError::UnsupportedPlacement);
                     }
                     until.set(retained_until(0).max(retained_until(1)));
-                    let claims =
-                        self.trace_trapdoor_sampling(matrix, sigma, gadget_base, *digit_count)?;
+                    let claims = self.trace_trapdoor_sampling(
+                        matrix,
+                        sigma,
+                        gadget_base,
+                        *digit_count,
+                        warm_up,
+                    )?;
                     let params = parameters(self, matrix)?;
                     push_traced(&mut demand, matrix, &params, &claims, &add_matrix, &add_layouts);
                 }
@@ -1541,6 +1576,7 @@ impl GpuDcrtBackend {
                         sigma,
                         gadget_base,
                         *digit_count,
+                        warm_up,
                     )?;
                     let params = parameters(self, ty)?;
                     // The hard-cutoff plan is owned by the compact output,
@@ -1843,6 +1879,7 @@ mod tests {
                 false,
                 None,
                 3,
+                true,
             )
             .unwrap();
         let retained_blocks = demand
@@ -1929,6 +1966,7 @@ mod tests {
                     false,
                     None,
                     3,
+                    true,
                 )
                 .unwrap();
             inventories.push(
@@ -2265,6 +2303,7 @@ mod tests {
                 false,
                 None,
                 width,
+                true,
             )
             .unwrap()
             .0;
@@ -2345,6 +2384,7 @@ mod tests {
                 false,
                 None,
                 width,
+                true,
             )
             .unwrap()
             .0;
@@ -2569,6 +2609,13 @@ mod tests {
             ),
         ]);
         let mut backend = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+        let error = backend
+            .prepare_graph_admission(&graph, false, &inputs, false)
+            .err()
+            .expect("polynomial readback requires explicit resource warmup");
+        assert!(error.to_string().contains("explicit graph warmup required"), "{error}");
+        assert!(backend.polynomial_value_plans.is_empty());
+        drop(backend.prepare_graph_admission(&graph, false, &inputs, true).unwrap());
         let mut store = MemoryArtifactStore::default();
         let config = ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() };
         let mut result = execute_with_config(
@@ -2695,6 +2742,46 @@ mod tests {
             },
         )]);
         let mut backend = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+        let error = execute_with_config(
+            &graph,
+            &mut backend,
+            inputs.clone(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .err()
+        .expect("production cannot discover missing resource plans");
+        assert!(error.to_string().contains("explicit graph warmup required"), "{error}");
+        assert!(backend.trapdoor_plans.is_empty());
+        assert!(backend.preimage_plans.is_empty());
+        if let Some(width) = scratch_columns {
+            // Warm discovery plans without installing wider automatic storage:
+            // this fixture supplies its own width-limited inventory below.
+            backend
+                .graph_admission_demand(
+                    &graph,
+                    &FrozenGraphScopeId::Root,
+                    &graph.bindings,
+                    false,
+                    None,
+                    width,
+                    true,
+                )
+                .unwrap();
+        } else {
+            drop(backend.prepare_graph_admission(&graph, false, &inputs, true).unwrap());
+        }
+        let warmed = (backend.trapdoor_plans.len(), backend.preimage_plans.len());
+        assert!(warmed.0 > 0 && warmed.1 > 0);
+        let saved = std::mem::take(&mut backend.preimage_plans);
+        let error = backend
+            .prepare_graph_admission(&graph, false, &inputs, false)
+            .err()
+            .expect("lost warmup plan must not trigger a replacement trial");
+        assert!(error.to_string().contains("explicit graph warmup required"), "{error}");
+        assert!(backend.preimage_plans.is_empty());
+        backend.preimage_plans = saved;
         if let Some(width) = scratch_columns {
             let demand = backend
                 .graph_admission_demand(
@@ -2704,6 +2791,7 @@ mod tests {
                     false,
                     None,
                     width,
+                    true,
                 )
                 .unwrap()
                 .0;
@@ -2720,6 +2808,7 @@ mod tests {
             config,
         )
         .unwrap();
+        assert_eq!((backend.trapdoor_plans.len(), backend.preimage_plans.len()), warmed);
         assert!(backend.prepared_ledger.is_some());
         if let Some(width) = scratch_columns {
             let preimage = backend

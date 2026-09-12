@@ -45,9 +45,30 @@ The graph-execution measurement callback API has been removed. An optional runti
 observer remains available for explicit diagnostic benchmarks of actual execution;
 it is not an estimator input or enabled by normal runtime execution.
 
-Initial graph preparation is the warmup boundary: native claim tracing for
-polynomial readback, trapdoor and preimage operations can execute GPU work here.
-It recursively covers child scopes before any production node executes.
+Resource-discovery GPU work is restricted to explicit graph warmup:
+`backend.prepare_graph_admission(&graph, capture_trace, &inputs, true)`.
+Drop the returned guard after preparation and reuse the same backend for
+production. Warm every graph and concrete parameter set used by a round trip,
+including nested scopes. This prepares resources without executing the protocol
+or publishing artifacts; synthetic samples are not production outputs.
+
+Ordinary `execute` always passes `warm_up = false`. Polynomial-readback,
+trapdoor and preimage cache misses return an explicit preparation error before
+any discovery trial runs. Production neither silently warms missing classes nor
+extrapolates unprepared resource plans. Operations covered entirely by native
+layout queries need no discovery warmup. Real resource allocation/initialization
+and sampling attempts that produce the requested result remain production work.
+
+```rust,ignore
+// Explicit warmup: use the actual validated graph, bindings and input layout.
+drop(backend.prepare_graph_admission(&graph, false, &inputs, true)?);
+// Production: same backend retains the discovery plans.
+let result = execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)?;
+```
+
+Representative benchmark warmups or a different backend instance do not populate
+this backend's graph-resource caches. If trace capture will be used, prepare
+with `capture_trace = true` as well.
 
 Prepared runtime admission derives widths from native allocation bounds and current
 reusable slots without running calibration kernels. Low-level allocating execution

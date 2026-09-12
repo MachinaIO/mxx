@@ -134,3 +134,16 @@ class minimum when target headroom is exhausted; they do not grant admission.
 Zero-shape
 transfers currently return an explicit unsupported error because the runtime
 fleet codec does not yet support empty artifacts consistently.
+
+### Dynamic family access contract
+
+Dataflow estimation requires every possible member of a dynamically indexed
+family to have the same transfer state (resident GPU value, host staging, or
+artifact), including per-member export overrides. Explicitly packed mixed-state
+families should use static accesses or be normalized by the caller before
+estimation. The estimator uses the representative member's state and does not
+add a runtime validation pass for this contract.
+
+Public import calibration uses a fresh artifact-store verification cache for
+each iteration, including timed iterations after warmup, so each logical import
+includes its first-load content-hash verification.

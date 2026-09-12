@@ -1039,14 +1039,14 @@ where
     ) {
         Ok(instance) => instance,
         Err(error) => {
-            return match executor.cleanup_all_staged_families() {
+            return match executor.cleanup_failed_execution() {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
             };
         }
     };
     if let Err(error) = executor.finish_preimage_progress() {
-        return match executor.cleanup_all_staged_families() {
+        return match executor.cleanup_failed_execution() {
             Ok(()) => Err(error),
             Err(cleanup_error) => Err(cleanup_error),
         };
@@ -1061,7 +1061,7 @@ where
     let (production_id, artifact_handles) = match executor.persist_outputs(&mut named_outputs) {
         Ok(persisted) => persisted,
         Err(error) => {
-            return match executor.cleanup_all_staged_families() {
+            return match executor.cleanup_failed_execution() {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
             };
@@ -2500,7 +2500,15 @@ where
         Ok(leases)
     }
 
-    fn cleanup_all_staged_families(&mut self) -> Result<(), ExecutionError> {
+    fn cleanup_failed_execution(&mut self) -> Result<(), ExecutionError> {
+        // Session identities are durable and may be resumed. Ordinary failed
+        // executions return no handles, so their eager exports are unreachable.
+        if self.session.is_none() {
+            for (handle, _) in self.streamed_exports.values() {
+                self.artifact_store.remove_staged(&handle.key).map_err(Self::artifact_error)?;
+            }
+            self.streamed_exports.clear();
+        }
         let staged = self.staged_families.clone();
         for ((production, name), (descriptor, _)) in staged {
             let Some(count) = descriptor.family_count else {
@@ -9155,6 +9163,72 @@ mod tests {
         assert!(
             matches!(&result.outputs["product"], RuntimeValue::Real(value) if (*value - 6.0).abs() < 1e-12)
         );
+    }
+
+    #[test]
+    fn failed_execution_removes_eager_exports_but_preserves_session_artifacts() {
+        use crate::artifact::FileArtifactStore;
+        let one = scalar_value(NodeKind::ConstantInt(1.into()), Vec::new(), WireType::ConstantInt);
+        let zero = scalar_value(NodeKind::ConstantInt(0.into()), Vec::new(), WireType::ConstantInt);
+        let quotient = scalar_value(
+            NodeKind::IntBinary(IntBinaryOp::Divide),
+            vec![one.clone(), zero],
+            WireType::Int,
+        );
+        let graph = Graph::freeze(
+            "failed-eager-export",
+            Vec::new(),
+            BTreeMap::from([
+                (
+                    "exported".into(),
+                    GraphOutput {
+                        value: one,
+                        confidentiality: Some(ArtifactConfidentiality::Public),
+                    },
+                ),
+                ("failure".into(), GraphOutput { value: quotient, confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let graph = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        for session in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = FileArtifactStore::new(directory.path()).unwrap();
+            let mut backend = cpu_backend([]);
+            let result = if session {
+                execute_in_session(
+                    &graph,
+                    &mut backend,
+                    BTreeMap::new(),
+                    &mut store,
+                    rand::random(),
+                )
+            } else {
+                execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+            };
+            assert!(matches!(result, Err(ExecutionError::DivisionByZero(_))));
+            let mut pending = vec![directory.path().to_path_buf()];
+            let mut artifacts = 0;
+            while let Some(path) = pending.pop() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path.extension().is_some_and(|extension| extension == "artifact") {
+                        artifacts += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                artifacts,
+                usize::from(session),
+                "only resumable sessions retain eager exports"
+            );
+        }
     }
 
     #[test]

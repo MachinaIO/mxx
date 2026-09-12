@@ -314,6 +314,12 @@ impl TransferMeasurements {
                 let mut restored_value = None;
                 let mut staged_value = None;
                 let mut canonical_bytes = None;
+                // Each logical import may be a distinct public artifact. Start
+                // with an empty verification cache so warmup cannot remove its
+                // content-hash check from the measured production load.
+                if matches!(kind, TransferKind::Import) {
+                    store = FileArtifactStore::new(directory.path()).map_err(error)?;
+                }
                 let started = Instant::now();
                 match kind {
                     TransferKind::Stage => {

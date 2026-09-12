@@ -343,3 +343,28 @@ hashes, topology, individual exit codes, and approximately three-second VRAM
 samples. Logs are retrieved to `logs/pr159-a40x4-20260913/` in the primary local
 checkout. No application integration test or production-size throughput
 benchmark is implied by these unit-test results.
+
+## 10. Follow-up on the PR review
+
+The review against `51bfdbd1eb` was checked against the current implementation.
+The useful outstanding corrections are:
+
+- Public import timing starts with a fresh store verification cache on every
+  iteration, so warmup cannot remove content-hash verification from timed loads.
+- Family export accounting distinguishes unique exported indices from export
+  declarations. Aliases count as additional writes without making unrelated
+  members artifact-backed; those members retain their staging/reload costs.
+- If ordinary execution fails after an eager scalar export, abort cleanup removes
+  the unreachable artifact. Session execution retains it for resume.
+
+The ring-dimension lookup key and CenteredExtend column-separability expectation
+were already corrected. Dynamic family access instead has a documented input
+contract: all possible members must have the same transfer state. No new
+validation pass was added. The trapdoor-shrinking suggestion targets an older
+measurement contract; current transfer calibration deliberately measures full
+canonical artifacts, as specified in `docs/benchmark-estimator.md`.
+
+The new duplicate-export and failed-execution regressions passed, including the
+session-retention case. Existing dataflow and canonical GPU transfer tests also
+passed on a local RTX 4080 SUPER. This follow-up does not change GPU lifetime or
+synchronization code and did not provision another remote pod.

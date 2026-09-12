@@ -3710,8 +3710,7 @@ mod tests {
         use mxx_primitives::matrix::dcrt_poly::DCRTPolyMatrix;
         let (cpu, parameters, storages, mut ledger) = prepared_ledger_fixture(2, 100);
         let size = storages[0].1.slot_identity(0).unwrap().rows();
-        let source =
-            Arc::new(DCRTPolyMatrix::identity(&cpu, size + 1, None).slice(0, size, 0, size + 1));
+        let source = DCRTPolyMatrix::identity(&cpu, size + 1, None).slice(0, size, 0, size + 1);
         let expected = source.transpose();
         let requests = storages
             .iter()
@@ -3756,7 +3755,16 @@ mod tests {
                     .into_par_iter()
                     .map(|(parameters, reservation)| {
                         let dispatch = reservation.enter(Vec::new())?;
-                        let input = GpuDCRTPolyMatrix::from_cpu_matrix(&parameters, &source);
+                        // Keep CPU Rayon work outside the thread-bound permit:
+                        // work stealing can otherwise reenter another dispatch.
+                        // Generate the same rectangular identity directly on GPU.
+                        let mut input = GpuDCRTPolyMatrix::zero(&parameters, size, size + 1);
+                        input.fill_constant_columns(
+                            0..size,
+                            0..size,
+                            0,
+                            mxx_primitives::matrix::gpu_dcrt_poly::GpuMatrixRangeConstant::Identity,
+                        )?;
                         let output = input.transpose();
                         drop(input);
                         drop(dispatch.finish()?);

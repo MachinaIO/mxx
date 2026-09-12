@@ -2137,14 +2137,6 @@ mod tests {
                 .filter(|layout| layout.bytes != 0),
         );
         let sampling_end = 2 + layouts.len();
-        let allocation = params
-            .matrix_allocation_bytes(params.crt_depth() - 1, 2 * rows, columns, true)
-            .unwrap();
-        let readback_events = match allocation.execution_class {
-            crate::poly::dcrt::gpu::GpuMatrixExecutionClass::PerLimbStreams => params.crt_depth(),
-            _ => 1,
-        };
-        layouts.extend(std::iter::repeat_n(layouts[0], readback_events - 1));
         let storage = GpuPreparedStorage::new(
             (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, 2 * rows, columns)).collect(),
             Some(&layouts),
@@ -2168,7 +2160,7 @@ mod tests {
             scratch = reservations.pop().unwrap();
             drop(reservations.pop().unwrap());
             let occupancy = storage.occupancy().unwrap();
-            assert_eq!(occupancy.resource_capacity_slots(), readback_events);
+            assert_eq!(occupancy.resource_capacity_slots(), 1);
             assert_eq!(occupancy.resource_occupied_slots(), 0);
             assert_eq!(occupancy.resource_high_water_slots(), 1);
             if wave == 0 {
@@ -2178,10 +2170,8 @@ mod tests {
         // Destroy the cache after resource admission. Destruction must reuse its
         // setup fence, without demanding a new resource permit or a live ctx.
         drop((scratch, cache, covariance));
-        let readback = std::iter::once(2)
-            .chain(sampling_end..storage.slot_count())
-            .map(|index| storage.slot_identity(index).unwrap().workspace_request(0, 1))
-            .collect::<Vec<_>>();
+        // The sample and its readback reuse one completion-event slot.
+        let readback = [storage.slot_identity(2).unwrap().workspace_request(0, 1)];
         for (actual, expected) in samples.iter().zip(expected) {
             let dispatch = storage.reserve(&readback).unwrap().enter(Vec::new()).unwrap();
             assert_eq!(actual.to_cpu_matrix(), expected);

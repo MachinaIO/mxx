@@ -474,10 +474,7 @@ mod tests {
         };
         use mxx_primitives::{
             matrix::gpu_dcrt_poly::{GpuPreparedSlotKind, GpuPreparedWorkspaceLayout},
-            poly::dcrt::{
-                gpu::{GpuMatrixExecutionClass, detected_gpu_device_ids},
-                params::DCRTPolyParams,
-            },
+            poly::dcrt::{gpu::detected_gpu_device_ids, params::DCRTPolyParams},
             sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
         };
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
@@ -561,14 +558,8 @@ mod tests {
         let readbacks = shapes
             .into_iter()
             .map(|(rows, columns)| {
-                let demand = params
-                    .matrix_allocation_bytes(params.crt_depth() - 1, rows, columns, true)
-                    .unwrap();
-                let events = if demand.execution_class == GpuMatrixExecutionClass::PerLimbStreams {
-                    params.crt_depth()
-                } else {
-                    1
-                };
+                // All CRT limbs share one readback batch and completion event.
+                let events = 1;
                 let mut layouts = vec![
                     params.rns_transfer_workspace(params.crt_depth() - 1, rows, columns).unwrap(),
                 ];

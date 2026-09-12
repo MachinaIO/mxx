@@ -3482,7 +3482,7 @@ mod tests {
             PolyMatrix,
             gpu_dcrt_poly::{GpuPreparedSlotKind, GpuPreparedStorage, GpuPreparedWorkspaceLayout},
         },
-        poly::dcrt::{gpu::GpuMatrixExecutionClass, params::DCRTPolyParams},
+        poly::dcrt::params::DCRTPolyParams,
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
 
@@ -6508,14 +6508,8 @@ mod tests {
                     .unwrap(),
                 ),
             ));
-            let allocation = parameters
-                .matrix_allocation_bytes(parameters.crt_depth() - 1, total_rows, 3, true)
-                .unwrap();
-            let events = if allocation.execution_class == GpuMatrixExecutionClass::PerLimbStreams {
-                parameters.crt_depth()
-            } else {
-                1
-            };
+            // All CRT limbs share one readback batch and completion event.
+            let events = 1;
             let mut layouts = vec![
                 parameters
                     .rns_transfer_workspace(parameters.crt_depth() - 1, total_rows, 3)
@@ -6709,13 +6703,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let allocation =
-            params.matrix_allocation_bytes(params.crt_depth() - 1, rows, 2, true).unwrap();
-        let events = if allocation.execution_class == GpuMatrixExecutionClass::PerLimbStreams {
-            params.crt_depth()
-        } else {
-            1
-        };
+        // All CRT limbs share one readback batch and completion event.
+        let events = 1;
         let mut layouts =
             vec![params.rns_transfer_workspace(params.crt_depth() - 1, rows, 2).unwrap()];
         layouts.extend(std::iter::repeat_n(

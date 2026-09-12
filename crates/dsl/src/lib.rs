@@ -116,7 +116,9 @@ impl<R: Into<IntExpr>, C: Into<IntExpr>> IntoShape for (R, C) {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct MatType(pub MatrixType);
 
 impl MatType {
@@ -125,30 +127,62 @@ impl MatType {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct BytesType {
     pub length: IntExpr,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct IntType;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BoolType;
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SmallMatrixType {
     pub matrix: MatrixType,
     pub max_coefficient_bound: IntExpr,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PreimageType {
     pub matrix: MatrixType,
     pub max_coefficient_bound: IntExpr,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TrapdoorType {
     pub matrix: MatrixType,
     pub sigma: RealExpr,
@@ -157,10 +191,14 @@ pub struct TrapdoorType {
     pub preimage_max_coefficient_bound: IntExpr,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct FamilyType<S> {
     pub element: S,
     pub count: IntExpr,
+    /// One flag per flattened element field; shared fields retain scalar storage.
+    pub shared: Vec<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -1111,6 +1149,31 @@ impl Mat {
         )
     }
 
+    /// Exact coefficient-centered extension to a containing CRT basis.
+    #[track_caller]
+    pub fn centered_extend(self, modulus: impl Into<IntExpr>) -> Self {
+        let modulus = modulus.into();
+        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
+        Self::from_node(NodeKind::CenteredExtend { modulus }, vec![self], ty)
+    }
+
+    /// Drops a whole CRT block using `(z-t*center_P(t^-1*z))/P`.
+    /// Set t=1 for ordinary BFV ModDown with unscaled integer error.
+    #[track_caller]
+    pub fn block_mod_switch(
+        self,
+        modulus: impl Into<IntExpr>,
+        plaintext_modulus: impl Into<IntExpr>,
+    ) -> Self {
+        let modulus = modulus.into();
+        let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
+        Self::from_node(
+            NodeKind::BlockModSwitch { modulus, plaintext_modulus: plaintext_modulus.into() },
+            vec![self],
+            ty,
+        )
+    }
+
     pub fn value_handle(&self) -> &ValueHandle {
         &self.value
     }
@@ -1212,6 +1275,7 @@ impl Mat {
             values: vec![node.output(0).expect("coefficient family")],
             element_schema: IntType,
             count,
+            shared: vec![false],
         }
     }
 
@@ -1231,6 +1295,7 @@ impl Mat {
             values: vec![node.output(0).expect("evaluation family")],
             element_schema: IntType,
             count,
+            shared: vec![false],
         }
     }
 
@@ -1434,6 +1499,27 @@ impl Preimage {
         &self.max_coefficient_bound
     }
 
+    /// Preserve the signed coefficients and their bound in a containing ring.
+    #[track_caller]
+    pub fn centered_extend(self, modulus: impl Into<IntExpr>) -> Self {
+        let modulus = modulus.into();
+        let matrix_type = MatrixType { modulus: modulus.clone(), ..self.matrix_type };
+        let wire_type = WireType::Preimage {
+            matrix: matrix_type.clone(),
+            max_coefficient_bound: self.max_coefficient_bound.clone(),
+        };
+        let node = NodeHandle::new(
+            NodeKind::CenteredExtend { modulus },
+            vec![self.value],
+            vec![wire_type],
+        );
+        Self {
+            value: node.output(0).expect("bounded centered extension"),
+            matrix_type,
+            max_coefficient_bound: self.max_coefficient_bound,
+        }
+    }
+
     #[track_caller]
     pub fn mul_small_rhs(self, lhs: Mat) -> Mat {
         let output_type = MatrixType {
@@ -1499,6 +1585,7 @@ impl Trapdoor {
     }
 }
 
+#[derive(Clone)]
 pub struct DslContext {
     name: String,
     parameters: Vec<CompileParameter>,
@@ -1590,6 +1677,7 @@ impl DslContext {
             values: vec![node.output(0).expect("integer family input")],
             element_schema: IntType,
             count,
+            shared: vec![false],
         }
     }
 
@@ -1608,6 +1696,18 @@ impl DslContext {
         value: V,
     ) -> Result<Self, DslError> {
         self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Public))?;
+        Ok(self)
+    }
+
+    /// Export a sequence of named public values in declaration order. Each
+    /// value retains its own schema; structural families are never expanded.
+    pub fn public_outputs<V: GraphValue, N: Into<String>>(
+        mut self,
+        values: impl IntoIterator<Item = (N, V)>,
+    ) -> Result<Self, DslError> {
+        for (name, value) in values {
+            self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Public))?;
+        }
         Ok(self)
     }
 
@@ -2520,8 +2620,11 @@ mod tests {
     fn define_accepts_a_formal_nonartifact_family() {
         let ring = Ring::new(17, 8);
         let matrix_type = MatType(ring.matrix_type((1, 1)));
-        let family_type =
-            FamilyType { element: MatType(ring.matrix_type((1, 1))), count: 2.into() };
+        let family_type = FamilyType {
+            element: MatType(ring.matrix_type((1, 1))),
+            count: 2.into(),
+            shared: vec![false],
+        };
         let subgraph = Subgraph::<(Mat, Family<Mat>), Mat>::define(
             "formal-matrix-family",
             (matrix_type.clone(), family_type.clone()),

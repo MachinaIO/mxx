@@ -271,6 +271,89 @@ where
 }
 
 impl GpuDCRTPolyTrapdoorSampler {
+    /// Allocate the compact preimage destination and its immutable hard-cutoff
+    /// plan. Runtime admission calls this once per retained output inside an
+    /// explicit claim boundary; the tile attempts below fill its columns.
+    pub fn preimage_destination(
+        params: &GpuDCRTPolyParams,
+        public_columns: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
+            .map_err(|_| SmallMatrixError::WidthOverflow)?
+            .max(1);
+        let mut destination = GpuSmallMatrix::new_empty_checked(
+            params,
+            public_columns,
+            columns,
+            max_coefficient_bound,
+            magnitude_bytes,
+            usize::MAX,
+            true,
+        )?;
+        destination.prepare_preimage_hard_cutoff();
+        Ok(destination)
+    }
+
+    /// Create the trapdoor's P1 covariance cache for this sampler's parameters
+    /// and `d` public rows, so later attempts find it prepared instead of
+    /// allocating during production sampling.
+    pub fn prepare_preimage_cache(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        d: usize,
+    ) {
+        let n = params.ring_dimension() as usize;
+        let k = params.modulus_digits();
+        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
+        let _ = get_or_create_p1_covariance_cache(trapdoor, self.c, s, self.sigma);
+    }
+
+    /// One bounded candidate attempt for `target_tile` (already resident and
+    /// in evaluation format) into `destination` columns starting at
+    /// `column_start`, with the production seed derivation for the global
+    /// column and attempt index. Returns whether the tile was accepted. The
+    /// preimage equation and inclusive cutoff are unchanged; only the retry
+    /// loop moves to the caller so each attempt is a separate claim boundary.
+    pub fn preimage_attempt(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target_tile: &GpuDCRTPolyMatrix,
+        destination: &mut GpuSmallMatrix,
+        column_start: usize,
+        global_column_start: usize,
+        attempt: usize,
+        randomness_seed: [u8; 32],
+    ) -> Result<bool, SmallMatrixError> {
+        let d = public_matrix.row_size();
+        let k = public_matrix.col_size();
+        let columns = target_tile.col_size();
+        if target_tile.row_size() != d || k == 0 || columns == 0 || !target_tile.is_ntt() {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if public_matrix.params != *params ||
+            trapdoor.r.params != *params ||
+            trapdoor.e.params != *params ||
+            target_tile.params != *params
+        {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        let candidate = expanded_preimage_candidate(
+            self,
+            params,
+            trapdoor,
+            public_matrix,
+            target_tile,
+            preimage_seed(randomness_seed, b"candidate", global_column_start, attempt),
+        )
+        .into_coeff_domain();
+        destination.try_pack_preimage_hard_cutoff_tile(&candidate, 0, column_start, k, columns)
+    }
+
     /// Produce the bounded preimage directly in compact GPU storage. Each
     /// retry expands only one complete K-by-C_s candidate tile.
     fn bounded_preimage(
@@ -299,6 +382,11 @@ impl GpuDCRTPolyTrapdoorSampler {
             trapdoor.e.params.gpu_ids() != params.gpu_ids()
         {
             return Err(SmallMatrixError::DeviceMismatch);
+        }
+        let target_data = target.column_range(0, columns);
+        target_data.validate_parameters(params)?;
+        if target_data.columns() != columns {
+            return Err(SmallMatrixError::ShapeMismatch);
         }
         let budget = params.vram_budget_bytes();
         let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
@@ -400,6 +488,7 @@ impl GpuDCRTPolyTrapdoorSampler {
             max_coefficient_bound,
             magnitude_bytes,
             budget,
+            false,
         )?;
         destination.prepare_preimage_hard_cutoff();
         let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
@@ -452,7 +541,9 @@ impl GpuDCRTPolyTrapdoorSampler {
         );
         for column_start in (0..columns).step_by(tile_columns) {
             let column_count = tile_columns.min(columns - column_start);
-            let tile_target = target.load_columns(column_start, column_start + column_count);
+            let tile_target = target_data
+                .subrange(column_start, column_start + column_count)
+                .materialize(params)?;
             if tile_target.params != *params || tile_target.params.gpu_ids() != params.gpu_ids() {
                 return Err(SmallMatrixError::ParameterMismatch);
             }
@@ -809,6 +900,94 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_preimage_attempt_claims_are_traceable_and_reproduce_bounded_preimage() {
+        use crate::matrix::gpu_dcrt_poly::{GpuPreparedSlotKind, trace_native_claims};
+        gpu_device_sync();
+        let cpu_params = DCRTPolyParams::new(32, 3, 30, 4, None, None);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let ((trapdoor, public_matrix), trapdoor_claims) =
+            trace_native_claims(|| sampler.trapdoor(&params, 1)).unwrap();
+        assert!(trapdoor_claims.iter().any(|c| c.kind() == GpuPreparedSlotKind::Matrix));
+        let k = public_matrix.col_size();
+        let bound = default_preimage_cutoff(
+            params.ring_dimension(),
+            1,
+            params.modulus_digits(),
+            1 << params.base_bits(),
+            SIGMA,
+        )
+        .unwrap();
+        let uniform = GpuDCRTPolyUniformSampler::new();
+        let target = uniform.sample_uniform(&params, 1, 3, DistType::FinRingDist);
+        let (destination, destination_claims) = trace_native_claims(|| {
+            GpuDCRTPolyTrapdoorSampler::preimage_destination(&params, k, 3, bound.clone()).unwrap()
+        })
+        .unwrap();
+        assert!(destination_claims.iter().any(|c| c.kind() == GpuPreparedSlotKind::CompactPayload));
+        assert!(
+            destination_claims.iter().any(|c| c.kind() == GpuPreparedSlotKind::CompactWorkspace)
+        );
+        let mut destination = destination;
+        let seed: [u8; 32] = rand::random();
+        let tile = target.slice_columns(1, 3);
+        // Production admission prepares the covariance cache before tracing, so
+        // the traced attempt records only per-attempt claims.
+        sampler.prepare_preimage_cache(&params, &trapdoor, 1);
+        let (accepted, attempt_claims) = trace_native_claims(|| {
+            sampler
+                .preimage_attempt(
+                    &params,
+                    &trapdoor,
+                    &public_matrix,
+                    &tile,
+                    &mut destination,
+                    1,
+                    1,
+                    0,
+                    seed,
+                )
+                .unwrap()
+        })
+        .unwrap();
+        // The traced attempt claims the perturbation, residual, candidate and
+        // gadget sampler owners plus their workspaces, in claim order.
+        let kinds = attempt_claims.iter().map(|c| c.kind()).collect::<Vec<_>>();
+        assert!(
+            kinds.iter().filter(|k| **k == GpuPreparedSlotKind::Matrix).count() >= 4,
+            "{kinds:?}"
+        );
+        assert!(kinds.contains(&GpuPreparedSlotKind::SamplerWorkspace), "{kinds:?}");
+        assert!(kinds.contains(&GpuPreparedSlotKind::CompactWorkspace), "{kinds:?}");
+        assert!(
+            attempt_claims
+                .iter()
+                .filter(|c| c.kind() == GpuPreparedSlotKind::Matrix)
+                .all(|c| c.columns() == 2)
+        );
+        // A second attempt on the same shapes records the identical sequence.
+        let (_, again) = trace_native_claims(|| {
+            sampler
+                .preimage_attempt(
+                    &params,
+                    &trapdoor,
+                    &public_matrix,
+                    &tile,
+                    &mut destination,
+                    1,
+                    1,
+                    1,
+                    seed,
+                )
+                .unwrap()
+        })
+        .unwrap();
+        assert_eq!(again, attempt_claims);
+        let _ = accepted;
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_preimage_perturbation_keeps_single_column_tail() {
         gpu_device_sync();
         let size = 2usize;
@@ -863,6 +1042,124 @@ mod tests {
         assert_eq!(compact.rows_count(), public_matrix.col_size());
         assert_eq!(compact.columns_count(), target.col_size());
         assert_eq!(public_matrix.multiply_small_rhs(&compact).unwrap(), target);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_staged_preimage_matches_resident_with_global_column_offset() {
+        use crate::matrix::PolyMatrixColumnData;
+
+        #[derive(Debug)]
+        struct ColumnSource {
+            rows: usize,
+            data: PolyMatrixColumnData<GpuDCRTPolyMatrix>,
+            global_start: usize,
+        }
+
+        impl PolyMatrixColumnSource<GpuDCRTPolyMatrix> for ColumnSource {
+            fn row_size(&self) -> usize {
+                self.rows
+            }
+            fn col_size(&self) -> usize {
+                self.data.columns()
+            }
+            fn global_column_start(&self) -> usize {
+                self.global_start
+            }
+            fn resident_matrix(&self) -> Option<&GpuDCRTPolyMatrix> {
+                match &self.data {
+                    PolyMatrixColumnData::Resident { value, .. } => Some(value.as_ref()),
+                    PolyMatrixColumnData::CpuStaging { .. } => None,
+                }
+            }
+            fn column_range(
+                &self,
+                start: usize,
+                end: usize,
+            ) -> PolyMatrixColumnData<GpuDCRTPolyMatrix> {
+                self.data.subrange(start, end)
+            }
+        }
+
+        gpu_device_sync();
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().expect("ring dimension"))
+            .unwrap_or_else(|_| gpu_test_params().ring_dimension());
+        let cpu_params = DCRTPolyParams::new(n, 2, 16, 8, None, None);
+        let params = gpu_params_from_cpu(&cpu_params);
+        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let rows = 2;
+        let (trapdoor, public_matrix) = sampler.trapdoor(&params, rows);
+        let full_target = GpuDCRTPolyUniformSampler::new().sample_uniform(
+            &params,
+            rows,
+            5,
+            DistType::FinRingDist,
+        );
+        let target = Arc::new(full_target.slice_columns(2, 3));
+        let bytes = Arc::new(full_target.into_cpu_staging_bytes());
+        let host_owner = Arc::downgrade(&bytes);
+        // Storage column 2 is unrelated to logical sampling column 7. Narrowing
+        // descriptors must not add their storage offsets to the randomness domain.
+        let staged = ColumnSource {
+            rows,
+            data: PolyMatrixColumnData::staged(&params, bytes, 1, 4).subrange(1, 2),
+            global_start: 7,
+        };
+        assert!(host_owner.upgrade().is_some(), "the source retains its staging bytes");
+        assert!(staged.resident_matrix().is_none());
+        let empty = staged.column_range(1, 1);
+        assert_eq!(empty.columns(), 0);
+        assert!(matches!(&empty, PolyMatrixColumnData::CpuStaging { start: 3, end: 3, .. }));
+        drop(empty);
+        let resident = ColumnSource {
+            rows,
+            data: PolyMatrixColumnData::Resident { value: target.clone(), start: 0, end: 1 },
+            global_start: staged.global_start,
+        };
+        // A single requested column fixes the native tile schedule for both
+        // representations even though their resident-input accounting differs.
+        assert_eq!((staged.col_size(), resident.col_size()), (1, 1));
+        let seed = rand::random();
+        let bound = permissive_preimage_bound(&params);
+        let staged_preimage = sampler
+            .preimage(&params, &trapdoor, &public_matrix, &staged, bound.clone(), seed)
+            .expect("staged preimage");
+        let resident_preimage = sampler
+            .preimage(&params, &trapdoor, &public_matrix, &resident, bound.clone(), seed)
+            .expect("resident preimage with the same seed and schedule");
+        assert_eq!(staged_preimage, resident_preimage);
+        assert_eq!(public_matrix.multiply_small_rhs(&staged_preimage).unwrap(), *target);
+        assert_eq!(public_matrix.multiply_small_rhs(&resident_preimage).unwrap(), *target);
+
+        // The existing candidate and pack operations independently anchor the
+        // source's logical offset: it enters candidate derivation exactly once.
+        let candidate = expanded_preimage_candidate(
+            &sampler,
+            &params,
+            &trapdoor,
+            &public_matrix,
+            &target,
+            preimage_seed(seed, b"candidate", 7, 0),
+        )
+        .into_coeff_domain();
+        let mut expected = GpuSmallMatrix::new_empty(&params, public_matrix.col_size(), 1, bound)
+            .expect("reference compact owner");
+        expected.prepare_preimage_hard_cutoff();
+        assert!(
+            expected
+                .try_pack_preimage_hard_cutoff_tile(
+                    &candidate,
+                    0,
+                    0,
+                    candidate.row_size(),
+                    candidate.col_size(),
+                )
+                .expect("the permissive bound accepts the first candidate")
+        );
+        assert_eq!(staged_preimage, expected, "global column offset is applied exactly once");
+        drop(staged);
+        assert!(host_owner.upgrade().is_none(), "completed sampling retains no staging owner");
     }
 
     #[test]

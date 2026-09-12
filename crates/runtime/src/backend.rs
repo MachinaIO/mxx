@@ -4,7 +4,7 @@ use mxx_ir_core::{
     node::{ConcatAxis, ConstantMatrix},
     types::ConcreteMatrixType,
 };
-use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnSource};
+use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnData, PolyMatrixColumnSource};
 use num_bigint::BigInt;
 use std::{
     fmt::{self, Debug},
@@ -29,18 +29,18 @@ pub struct PreimageRequest<M, T> {
     pub randomness_seed: [u8; 32],
 }
 
-/// Full logical preimage target whose expanded columns are loaded on demand.
-/// The staged constructor owns host bytes, allowing a GPU owner to be dropped
-/// before sampling while preserving the original matrix dimensions.
+/// Full logical preimage target whose column ranges retain their backing data.
+/// Staged targets own host bytes without capturing a device context; the sampling
+/// worker materializes each range with its own parameters.
 pub struct PreimageTarget<M> {
     rows: usize,
     columns: usize,
-    loader: Arc<dyn Fn(usize, usize) -> M + Send + Sync>,
+    data: PolyMatrixColumnData<M>,
 }
 
 impl<M> Clone for PreimageTarget<M> {
     fn clone(&self) -> Self {
-        Self { rows: self.rows, columns: self.columns, loader: self.loader.clone() }
+        Self { rows: self.rows, columns: self.columns, data: self.data.subrange(0, self.columns) }
     }
 }
 
@@ -54,33 +54,32 @@ impl<M> Debug for PreimageTarget<M> {
     }
 }
 
-impl<M> PreimageTarget<M>
-where
-    M: PolyMatrix + 'static,
-{
+impl<M> PreimageTarget<M> {
     pub fn staged(
-        params: <M::P as mxx_primitives::poly::Poly>::Params,
+        params: &impl mxx_primitives::poly::PolyParams,
         rows: usize,
         columns: usize,
         bytes: Arc<Vec<u8>>,
     ) -> Self {
-        let loader = Arc::new(move |start: usize, end: usize| {
-            M::from_cpu_staging_columns(&params, bytes.as_slice(), start, end)
-        });
-        Self { rows, columns, loader }
+        Self { rows, columns, data: PolyMatrixColumnData::staged(params, bytes, 0, columns) }
     }
+}
 
+impl<M: PolyMatrix> PreimageTarget<M> {
     pub fn resident(value: Arc<M>) -> Self {
         let rows = value.row_size();
         let columns = value.col_size();
-        let loader = Arc::new(move |start: usize, end: usize| value.slice_columns(start, end));
-        Self { rows, columns, loader }
+        Self {
+            rows,
+            columns,
+            data: PolyMatrixColumnData::Resident { value, start: 0, end: columns },
+        }
     }
 }
 
 impl<M> PolyMatrixColumnSource<M> for PreimageTarget<M>
 where
-    M: PolyMatrix + 'static,
+    M: Send + Sync,
 {
     fn row_size(&self) -> usize {
         self.rows
@@ -90,9 +89,16 @@ where
         self.columns
     }
 
-    fn load_columns(&self, start: usize, end: usize) -> M {
+    fn resident_matrix(&self) -> Option<&M> {
+        match &self.data {
+            PolyMatrixColumnData::Resident { value, .. } => Some(value.as_ref()),
+            PolyMatrixColumnData::CpuStaging { .. } => None,
+        }
+    }
+
+    fn column_range(&self, start: usize, end: usize) -> PolyMatrixColumnData<M> {
         assert!(start <= end && end <= self.columns, "invalid preimage target column interval");
-        (self.loader)(start, end)
+        self.data.subrange(start, end)
     }
 }
 
@@ -135,10 +141,91 @@ pub trait Backend {
         evaluation: bool,
     ) -> Result<Vec<BigInt>, Self::Error>;
 
-    /// Selects the setup-time GPU calibration for the next primitive. CPU and
+    /// Selects the graph identity for the next primitive. CPU and
     /// non-fleet backends ignore this hook.
     fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Supplies IR provenance to an explicitly enabled GPU measurement observer.
+    #[cfg(feature = "gpu")]
+    fn observe_gpu_node(
+        &mut self,
+        _scope: &mxx_ir_core::FrozenGraphScopeId,
+        _node: mxx_ir_core::types::NodeId,
+        _instances: usize,
+        _bindings: &mxx_ir_core::ParamEnv,
+    ) {
+    }
+
+    /// Measurement-only scope nesting; no production synchronization is implied.
+    #[cfg(feature = "gpu")]
+    fn observe_gpu_scope(&mut self, _entering: bool) {}
+
+    #[cfg(feature = "gpu")]
+    fn observe_gpu_omitted_nodes(
+        &mut self,
+        _scope: &mxx_ir_core::FrozenGraphScopeId,
+        _nodes: impl Iterator<Item = mxx_ir_core::types::NodeId>,
+    ) {
+    }
+
+    /// Prepares isolated calibration and admission after actual materialization.
+    /// Requests are ordered exactly as the following production batch, with each
+    /// destination placement explicit. No production sampling state is exposed.
+    #[cfg(feature = "gpu")]
+    fn preflight_gpu_operations(
+        &mut self,
+        _requests: &[(
+            usize,
+            crate::gpu_invocation::GpuInvocation<
+                '_,
+                Self::Matrix,
+                Self::SmallMatrix,
+                Self::Trapdoor,
+            >,
+        )],
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Describes a staged preimage source without passing its loader to pilots.
+    #[cfg(feature = "gpu")]
+    fn gpu_preimage_source_layout(
+        &self,
+        ty: &ConcreteMatrixType,
+        _staging_bytes: &[u8],
+        global_column_start: usize,
+    ) -> Result<crate::gpu_invocation::GpuColumnSourceLayout, Self::Error> {
+        Ok(crate::gpu_invocation::GpuColumnSourceLayout::Logical {
+            matrix_type: ty.clone(),
+            global_column_start,
+        })
+    }
+
+    /// Derive and accept a complete prepared inventory for `validated` before
+    /// any node executes. The returned owner ends automatic admission when
+    /// execution exits, including error paths; returned values retain their own
+    /// resources. Backends without prepared admission return no owner.
+    /// With `warm_up = true`, explicitly allow resource-discovery GPU trials.
+    /// Production passes false and requires every trial-derived plan to exist
+    /// already on this backend for the graph's concrete parameters.
+    fn prepare_graph_admission(
+        &mut self,
+        _validated: &mxx_ir_core::ValidatedGraph,
+        _capture_trace: bool,
+        _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
+        _warm_up: bool,
+    ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    /// Limit sibling bodies when the backend parallelizes within primitives.
+    fn parallel_wave_size(&self, limit: usize) -> usize {
+        limit
     }
 
     fn placement_count(&self) -> usize {
@@ -372,6 +459,23 @@ pub trait Backend {
         plaintext_modulus: u64,
     ) -> Result<Self::Matrix, Self::Error>;
 
+    fn centered_extend(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+    fn centered_extend_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
+    fn block_mod_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error>;
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<Self::Matrix>, usize)>,
@@ -385,7 +489,7 @@ pub trait Backend {
     ) -> Result<(Arc<dyn PolyMatrixColumnSource<Self::Matrix>>, Arc<Vec<u8>>), Self::Error>;
 
     fn matrix_from_cpu_staging_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error>;
@@ -619,15 +723,18 @@ pub trait Backend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
 
-    fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8>;
-    fn matrices_to_bytes(&self, values: &[&Self::Matrix]) -> Vec<Vec<u8>> {
+    /// Canonical global row-major compact bytes. Under prepared GPU admission
+    /// this is an explicit export boundary that claims readback resources from
+    /// the accepted inventory and may wait; failure to claim them is an error.
+    fn matrix_to_bytes(&self, value: &Self::Matrix) -> Result<Vec<u8>, Self::Error>;
+    fn matrices_to_bytes(&self, values: &[&Self::Matrix]) -> Result<Vec<Vec<u8>>, Self::Error> {
         values.iter().map(|value| self.matrix_to_bytes(value)).collect()
     }
     /// Decodes an intact payload from this backend's matching matrix codec and type.
     /// Malformed bytes or mismatched metadata violate the caller contract; implementations
     /// may panic. The result reports supported backend failures, not arbitrary corruption.
     fn matrix_from_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error>;
@@ -638,14 +745,14 @@ pub trait Backend {
         semantic_kind: SmallMatrixSemanticKind,
     ) -> Result<Vec<u8>, Self::Error>;
     fn small_matrix_from_bytes(
-        &self,
+        &mut self,
         expected_schema: &ConcreteBoundedMatrixSchema,
         bytes: &[u8],
         expected_semantic_kind: SmallMatrixSemanticKind,
     ) -> Result<Self::SmallMatrix, Self::Error>;
     fn trapdoor_to_bytes(&self, value: &Self::Trapdoor) -> Vec<u8>;
     fn trapdoor_from_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Trapdoor, Self::Error>;
@@ -693,11 +800,15 @@ pub enum RuntimeValue<B: Backend> {
         name: String,
         index: usize,
         descriptor: mxx_ir_core::artifact::ManifestArtifact,
+        /// Shared ownership of this execution's temporary family storage.
+        lifetime: Arc<()>,
     },
     StagedArtifactFamily {
         production: mxx_ir_core::artifact::ProductionId,
         name: String,
         descriptor: mxx_ir_core::artifact::ManifestArtifact,
+        /// Shared ownership of this execution's temporary family storage.
+        lifetime: Arc<()>,
     },
     IndexedFamily(Vec<RuntimeValue<B>>),
 }
@@ -743,17 +854,21 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                 name: name.clone(),
                 descriptor: descriptor.clone(),
             },
-            Self::StagedArtifact { production, name, index, descriptor } => Self::StagedArtifact {
-                production: production.clone(),
-                name: name.clone(),
-                index: *index,
-                descriptor: descriptor.clone(),
-            },
-            Self::StagedArtifactFamily { production, name, descriptor } => {
+            Self::StagedArtifact { production, name, index, descriptor, lifetime } => {
+                Self::StagedArtifact {
+                    production: production.clone(),
+                    name: name.clone(),
+                    index: *index,
+                    descriptor: descriptor.clone(),
+                    lifetime: lifetime.clone(),
+                }
+            }
+            Self::StagedArtifactFamily { production, name, descriptor, lifetime } => {
                 Self::StagedArtifactFamily {
                     production: production.clone(),
                     name: name.clone(),
                     descriptor: descriptor.clone(),
+                    lifetime: lifetime.clone(),
                 }
             }
             Self::IndexedFamily(values) => Self::IndexedFamily(values.clone()),
@@ -794,5 +909,41 @@ impl<B: Backend> RuntimeValue<B> {
 
     pub fn small_matrix(value: B::SmallMatrix) -> Self {
         Self::SmallMatrix(Arc::new(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mxx_primitives::{matrix::dcrt_poly::DCRTPolyMatrix, poly::dcrt::params::DCRTPolyParams};
+
+    #[test]
+    fn preimage_targets_retain_backing_owners_without_loading_ranges() {
+        struct NonMatrix;
+        let params = DCRTPolyParams::new(4, 1, 16, 8, None, None);
+        let bytes = Arc::new(vec![1, 2, 3]);
+        let staged = PreimageTarget::<NonMatrix>::staged(&params, 2, 5, bytes.clone()).clone();
+        assert!(staged.resident_matrix().is_none());
+        assert_eq!(staged.global_column_start(), 0);
+        let PolyMatrixColumnData::CpuStaging { bytes: range_bytes, start, end, .. } =
+            staged.column_range(1, 5).subrange(1, 3)
+        else {
+            panic!("staged targets preserve their host backing");
+        };
+        assert!(Arc::ptr_eq(&bytes, &range_bytes));
+        assert_eq!((start, end), (2, 4));
+        assert_eq!(staged.column_range(5, 5).columns(), 0);
+
+        let owner = Arc::new(DCRTPolyMatrix::zero(&params, 2, 5));
+        let resident = PreimageTarget::resident(owner.clone());
+        assert!(std::ptr::eq(resident.resident_matrix().unwrap(), owner.as_ref()));
+        assert_eq!((resident.row_size(), resident.col_size()), (2, 5));
+        let range = resident.column_range(1, 4);
+        drop(resident);
+        let PolyMatrixColumnData::Resident { value, start, end } = range else {
+            panic!("resident ranges preserve their matrix owner");
+        };
+        assert!(Arc::ptr_eq(&owner, &value));
+        assert_eq!((start, end), (1, 4));
     }
 }

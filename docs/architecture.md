@@ -61,6 +61,39 @@ structural loops; lexical reads become explicit core dependencies with inferred 
 
 Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
 transcripts, sessions, artifacts, and bounded parallel waves.
+Temporary families never spill to disk. The GPU fleet completes one family member
+before starting the next and stages intermediate family results in host RAM. Device
+parallelism is internal to primitives: calibrated column widths share the configured
+VRAM percentage and are recalculated against current residency for each invocation.
+CPU backends retain bounded sibling waves, including across subgraph calls. Values
+are released at their final live reference, including captures and member aliases.
+Root Family exports stream directly to their final artifact paths; the manifest is published
+only after execution succeeds. Other exports write their RAM payloads to final storage.
+Durable exported artifacts remain available for online execution.
+
+The common estimator tracks runtime storage boundaries across Family, capture,
+subgraph, and sequential-loop values. It measures raw-RNS RAM staging/reloading
+and compact artifact encoding/writing/reading/decoding with the production backend
+and artifact store, then adds their invocation-weighted wall times to
+`total_time_seconds`. GPU-resident edges have no added transfer charge;
+`total_work_seconds` remains primitive GPU work. The runtime and estimator share
+the matrix-Family staging rule and artifact codecs.
+
+`dataflow` and `transfers` report the extra costs and counts separately. CPU IR
+dispatch is a measured scalar-node proxy, not a full protocol execution trace.
+Artifact import calibration includes public content-hash verification (also
+charged conservatively to private imports). Measurements sum boundary costs;
+they do not predict overlap with unrelated operations, cold-cache storage
+behavior, or contention in a complete execution. Large transfer shapes use a
+VRAM-bounded representative wave and round the final partial wave upward.
+
+Compact serialization remains the durable-export format. GPU RNS transfers expose D2H
+start/completion separately, and H2D sources are owned by the existing event-based pinned
+memory reclaimer. This permits a previous output store and next input load to overlap.
+Fleet snapshots pipeline two shards and reuse two pinned buffers, bounding transfer
+scratch independently of the number of column chunks.
+Completed scalar exports are written immediately and retained as artifact handles, including
+members projected from batch families.
 
 ### `mxx-gadgets` and `mxx-bgg`
 

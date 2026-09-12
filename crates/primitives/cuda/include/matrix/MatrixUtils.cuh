@@ -64,14 +64,6 @@ int matrix_record_all_limb_writes(
     GpuMatrix *dst, cudaStream_t stream, bool device_already_selected = false);
 bool matrix_aux_slice_for_limb(const GpuMatrix *mat, const dim3 &limb_id, size_t bytes, void **out_ptr);
 size_t matrix_align_up_size(size_t value, size_t alignment);
-int matrix_acquire_aux_workspace(
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id,
-    size_t bytes,
-    void **out_ptr,
-    bool *out_shared,
-    cudaStream_t stream);
-int matrix_release_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream);
 
 __host__ __device__ __forceinline__ uint64_t matrix_load_packed_u64_at(
     const uint8_t *ptr,

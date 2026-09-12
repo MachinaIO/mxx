@@ -2,6 +2,7 @@
 
 #include "ChaCha.cuh"
 #include "matrix/Matrix.cuh"
+#include "gpu_admission.cuh"
 
 typedef struct GpuP1CovarianceCache GpuP1CovarianceCache;
 
@@ -45,7 +46,8 @@ int launch_sample_p1_integer_kernel(
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
-    cudaEvent_t sampled_ready_event);
+    cudaEvent_t sampled_ready_event,
+    GpuContext *ctx, GpuDeviceWorkspace &sampled_owner);
 
 int launch_scatter_p1_integer_to_limb_kernel_device(
     const int64_t *sampled_in_device,
@@ -121,3 +123,14 @@ extern "C"
 #ifdef __cplusplus
 }
 #endif
+
+// Five exact logical spans in native claim order; excludes physical allocator
+// overhead and completion resources. Empty matrices return zero-byte layouts.
+extern "C" int gpu_matrix_query_gaussian_gadget_workspaces(
+    const GpuContext *ctx, int level, size_t rows, size_t cols,
+    uint32_t base_bits, GpuPreparedWorkspaceLayout *out);
+
+// Sampled integers and optional large-dimension scratch for a fixed column range.
+extern "C" int gpu_matrix_query_p1_workspaces(
+    const GpuContext *ctx, size_t rows, size_t columns, int cached,
+    GpuPreparedWorkspaceLayout *out);

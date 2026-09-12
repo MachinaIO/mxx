@@ -47,7 +47,7 @@ fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
 fn values(
     result: &mut ExecutionResult<GpuDcrtBackend>,
     name: &str,
-    backend: &GpuDcrtBackend,
+    backend: &mut GpuDcrtBackend,
     store: &mut MemoryArtifactStore,
 ) -> Vec<BigInt> {
     let RuntimeValue::IndexedFamily(values) =
@@ -107,7 +107,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     )
     .unwrap();
     assert_eq!(
-        values(&mut result, "roundtrip", &backend, &mut store),
+        values(&mut result, "roundtrip", &mut backend, &mut store),
         message
             .iter()
             .map(|v| BigInt::from(*v)
@@ -115,7 +115,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        values(&mut result, "sum", &backend, &mut store),
+        values(&mut result, "sum", &mut backend, &mut store),
         message
             .iter()
             .map(|v| BigInt::from(2 * v)
@@ -128,7 +128,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     expected.rotate_right(1);
     expected[0] = -expected[0];
     assert_eq!(
-        values(&mut result, "product", &backend, &mut store),
+        values(&mut result, "product", &mut backend, &mut store),
         expected
             .into_iter()
             .map(|v| BigInt::from(v)
@@ -304,7 +304,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
                 BigInt::from(if name == "sum" { (2 * m) % t } else { (m * m) % t })
             })
             .collect::<Vec<_>>();
-        assert_eq!(values(&mut result, name, &backend, &mut store), expected, "{name}");
+        assert_eq!(values(&mut result, name, &mut backend, &mut store), expected, "{name}");
     }
     result.cleanup_staged(&mut store).unwrap();
 }
@@ -354,17 +354,17 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     .unwrap();
     let mut expected = vec![BigInt::from(0); n];
     expected[0] = BigInt::from(t - 1);
-    assert_eq!(values(&mut result, "single", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "single", &mut backend, &mut store), expected);
     // Positive rotation moves slot zero to the last position of its row,
     // which was outside the single-value input. Decryption must still return it.
     expected[..n / 2].rotate_left(1);
-    assert_eq!(values(&mut result, "rotated", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "rotated", &mut backend, &mut store), expected);
     let mut expected = partial_values
         .into_iter()
         .map(|v| BigInt::from(v).mod_floor(&BigInt::from(t)))
         .collect::<Vec<_>>();
     expected.push(BigInt::from(0));
-    assert_eq!(values(&mut result, "partial", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "partial", &mut backend, &mut store), expected);
     result.cleanup_staged(&mut store).unwrap();
 }
 
@@ -444,8 +444,14 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     rotated[..n / 2].rotate_left(1);
     rotated[n / 2..].rotate_left(1);
     for level in 0..depth {
-        assert_eq!(values(&mut result, &format!("product{level}"), &backend, &mut store), expected);
-        assert_eq!(values(&mut result, &format!("rotated{level}"), &backend, &mut store), rotated);
+        assert_eq!(
+            values(&mut result, &format!("product{level}"), &mut backend, &mut store),
+            expected
+        );
+        assert_eq!(
+            values(&mut result, &format!("rotated{level}"), &mut backend, &mut store),
+            rotated
+        );
     }
     result.cleanup_staged(&mut store).unwrap();
 }

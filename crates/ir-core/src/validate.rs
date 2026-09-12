@@ -792,6 +792,60 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, rows, ..input })]
         }
+        NodeKind::CenteredExtend { modulus } | NodeKind::BlockModSwitch { modulus, .. } => {
+            require_arity(scope, node, 1)?;
+            let (input, bound) = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => (matrix.clone(), None),
+                ConcreteWireType::Preimage { matrix, max_coefficient_bound }
+                    if matches!(node.kind, NodeKind::CenteredExtend { .. }) =>
+                {
+                    (matrix.clone(), Some(max_coefficient_bound.clone()))
+                }
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "exact RNS conversion requires an ordinary matrix",
+                    )
+                }
+            };
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::one() ||
+                input.modulus <= BigInt::one() ||
+                modulus.is_even() ||
+                input.modulus.is_even()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "exact RNS conversion requires odd moduli greater than one",
+                );
+            }
+            let valid = if let NodeKind::BlockModSwitch { plaintext_modulus, .. } = node.kind {
+                let t = plaintext_modulus.evaluate(env)?;
+                t >= 1.into() &&
+                    t.to_u64().is_some() &&
+                    t.gcd(&input.modulus).is_one() &&
+                    modulus < input.modulus &&
+                    (&input.modulus % &modulus).is_zero()
+            } else {
+                (&modulus % &input.modulus).is_zero()
+            };
+            if !valid {
+                return node_error(
+                    scope,
+                    node.id,
+                    "invalid exact RNS modulus inclusion or plaintext modulus",
+                );
+            }
+            let matrix = ConcreteMatrixType { modulus, ..input };
+            vec![match bound {
+                Some(max_coefficient_bound) => {
+                    ConcreteWireType::Preimage { matrix, max_coefficient_bound }
+                }
+                None => ConcreteWireType::Matrix(matrix),
+            }]
+        }
         NodeKind::RingAutomorphism { index } => {
             require_arity(scope, node, 1)?;
             // An automorphism is a matrix-level operation.  A typed preimage

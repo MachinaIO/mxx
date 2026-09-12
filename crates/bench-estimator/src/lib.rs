@@ -1,5 +1,6 @@
 //! Cost estimation over validated scoped execution plans.
 
+pub mod dataflow;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod harness;
@@ -19,14 +20,19 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeMeasurement {
+    /// Backend work units. The GPU backend uses aggregate execution-owner CUDA-event
+    /// spans in device-seconds; the generic host harness uses host elapsed seconds.
     pub work_seconds: f64,
-    /// Dependency latency: one fleet wave for independently column-separable operations.
+    /// Ideal dependency latency: maximum measured class time for independent waves,
+    /// plus separately measured preparation/initialization prerequisites when present.
     pub latency_seconds: f64,
-    /// Sum of all production fleet wave latencies for the full logical operation.
+    /// Sum of production fleet wave latencies and their preparation/initialization
+    /// prerequisites for the full logical operation.
     pub cumulative_wave_seconds: f64,
     /// Number of independent fleet waves needed for the full logical operation.
     pub independent_wave_count: usize,
-    /// Measured scratch for one bounded execution wave, excluding resident inputs.
+    /// Measured incremental allocation, excluding the invocation's resident baseline.
+    /// GPU representative measurements include one wave's outputs, not scratch alone.
     /// This is not the whole-graph runtime peak and is never multiplied by wave count.
     pub measured_wave_workspace_bytes: u64,
     /// Hypothetical workspace when all independent waves execute concurrently.
@@ -62,6 +68,15 @@ pub struct MeasurementNode<'a> {
     pub concrete_output_types: Vec<ConcreteWireType>,
 }
 
+/// Whether the measured inputs and placement establish a concrete runtime scenario.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeasurementScenario {
+    #[default]
+    BackendDefined,
+    /// Synthetic input values and fresh placement; retained runtime owners/budgets are absent.
+    SyntheticFreshPlacement,
+}
+
 pub trait MeasurementBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -71,6 +86,28 @@ pub trait MeasurementBackend {
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
     ) -> Result<NodeMeasurement, Self::Error>;
+
+    fn measurement_scenario(&self) -> MeasurementScenario {
+        MeasurementScenario::BackendDefined
+    }
+
+    /// GPU backends model runtime staging separately from GPU-resident primitive work.
+    fn models_dataflow(&self) -> bool {
+        false
+    }
+    fn family_wave_size(&self) -> usize {
+        1
+    }
+    fn executor_dispatch_seconds(&self) -> f64 {
+        0.0
+    }
+    fn measure_transfer(
+        &mut self,
+        _kind: dataflow::TransferKind,
+        _ty: &ConcreteWireType,
+    ) -> Result<f64, Self::Error> {
+        Ok(0.0)
+    }
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64;
     fn persistent_bytes_for_node(&self, _kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
@@ -123,9 +160,17 @@ pub trait MeasurementBackend {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
+    /// Synthetic scenarios cannot establish runtime schedule agreement or memory admission.
+    pub measurement_scenario: MeasurementScenario,
+    /// Runtime boundary costs, added to total_time_seconds, not to GPU work.
+    #[serde(default)]
+    pub dataflow: dataflow::DataflowCost,
+    #[serde(default)]
+    pub transfers: Vec<dataflow::TransferCost>,
     pub total_work_seconds: f64,
-    /// Cumulative measured wave latencies including every logical invocation.
-    /// This work-like sum is distinct from the unlimited-resource critical path.
+    /// Cumulative primitive wave latencies plus measured runtime transfer boundaries and
+    /// modeled executor dispatch, including every logical invocation. This is distinct
+    /// from the unlimited-resource GPU critical path; dataflow costs are reported separately.
     pub total_time_seconds: f64,
     /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
     pub preimage_sampling_work_seconds: f64,
@@ -252,6 +297,13 @@ pub fn estimate<B: MeasurementBackend>(
             );
         }
     }
+    if estimator.backend.models_dataflow() {
+        let (dataflow, transfers) = dataflow::estimate(validated, estimator.backend)?;
+        report.total_time_seconds += dataflow.transfer_seconds + dataflow.executor_dispatch_seconds;
+        report.dataflow = dataflow;
+        report.transfers = transfers;
+    }
+    report.measurement_scenario = estimator.backend.measurement_scenario();
     Ok(report)
 }
 

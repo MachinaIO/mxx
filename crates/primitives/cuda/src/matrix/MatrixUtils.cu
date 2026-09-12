@@ -48,11 +48,19 @@ namespace
             {
                 return;
             }
+            GpuAllocationActivity activity(nullptr, device);
+            int previous = -1;
+            const cudaError_t current = cudaGetDevice(&previous);
             cudaError_t err = cudaSetDevice(device);
             if (err == cudaSuccess)
             {
-                cudaEventDestroy(event);
+                err = cudaEventDestroy(event);
             }
+            if (err != cudaSuccess || current != cudaSuccess)
+                gpu_device_mark_allocation_unknown(device);
+            if (current == cudaSuccess && previous != device &&
+                cudaSetDevice(previous) != cudaSuccess)
+                gpu_device_mark_allocation_unknown(previous);
             event = nullptr;
             device = -1;
         }
@@ -60,13 +68,19 @@ namespace
 
     thread_local ThreadLocalConsumerEventState g_thread_local_consumer_event;
 
-    int matrix_get_thread_local_consumer_event(int device, cudaEvent_t *out_event)
+    int matrix_get_thread_local_consumer_event(const GpuContext *ctx, int device, cudaEvent_t *out_event, GpuCudaResource &resource)
     {
         if (device < 0 || !out_event)
         {
             return set_error("invalid matrix_get_thread_local_consumer_event arguments");
         }
 
+        if (ctx->execution->resource_admission_required.load(std::memory_order_acquire)) {
+            const int status = resource.acquire(ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+            if (status == 0) *out_event = resource.event;
+            return status;
+        }
+        gpu_claim_trace_record(GPU_PREPARED_COMPLETION_EVENT, 0, 0, -1, -1, 0, 1);
         auto &tls = g_thread_local_consumer_event;
         if (tls.event && tls.device == device)
         {
@@ -76,20 +90,24 @@ namespace
 
         if (tls.event)
         {
+            GpuAllocationActivity activity(nullptr, tls.device);
             cudaError_t err = cudaSetDevice(tls.device);
             if (err != cudaSuccess)
             {
+                gpu_device_mark_allocation_unknown(tls.device);
                 return set_error(err);
             }
             err = cudaEventDestroy(tls.event);
             if (err != cudaSuccess)
             {
+                gpu_device_mark_allocation_unknown(tls.device);
                 return set_error(err);
             }
             tls.event = nullptr;
             tls.device = -1;
         }
 
+        GpuAllocationActivity activity(nullptr, device);
         cudaError_t err = cudaSetDevice(device);
         if (err != cudaSuccess)
         {
@@ -98,6 +116,7 @@ namespace
         err = cudaEventCreateWithFlags(&tls.event, cudaEventDisableTiming);
         if (err != cudaSuccess)
         {
+            gpu_device_mark_allocation_unknown(device);
             tls.event = nullptr;
             tls.device = -1;
             return set_error(err);
@@ -335,6 +354,7 @@ int matrix_track_limb_consumer(
     cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(consumer_device);
     if (err != cudaSuccess)
     {
+        gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
         return set_error(err);
     }
 
@@ -342,22 +362,42 @@ int matrix_track_limb_consumer(
     // Acquire this limb's owned event before recording a separate completion.
     if (!state->write_done)
     {
+        GpuAllocationActivity activity(src->ctx->execution.get(), state->device);
+        if (src->ctx->execution->resource_admission_required.load(std::memory_order_acquire)) {
+            gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
+            return set_error("matrix consumer requires a prepared writer event");
+        }
         err = cudaEventCreateWithFlags(&state->write_done, cudaEventDisableTiming);
         if (err != cudaSuccess)
         {
-            // The consumer kernel is already queued. Its old completion alias
-            // cannot protect source cleanup when lazy event allocation fails.
-            cudaStreamSynchronize(consumer_stream);
+            gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
             return set_error(err);
         }
     }
 
-    // Fast path: consumer already runs on the producer stream.
+    // Fast path: consumer already runs on the producer stream. The consumer
+    // event is still claimed (or traced) so the claim sequence of an admitted
+    // operation does not depend on which streams its owners happened to receive.
     if (state->stream == consumer_stream)
     {
+        if (!completion && gpu_claim_deterministic_events_active())
+        {
+            GpuCudaResource unused_resource;
+            cudaEvent_t unused_event = nullptr;
+            const int status = matrix_get_thread_local_consumer_event(
+                src->ctx, consumer_device, &unused_event, unused_resource);
+            if (status != 0)
+            {
+                gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
+                return status;
+            }
+            if (unused_resource.release() != 0)
+                gpu_execution_mark_allocation_unknown(src->ctx->execution.get());
+        }
         err = cudaEventRecord(state->write_done, consumer_stream);
         if (err != cudaSuccess)
         {
+            gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
             return set_error(err);
         }
         state->completion_owner = limb_id.y;
@@ -366,23 +406,27 @@ int matrix_track_limb_consumer(
         return 0;
     }
 
+    GpuCudaResource consumer_resource;
     cudaEvent_t consumer_done = completion;
     if (!consumer_done)
     {
-        const int status = matrix_get_thread_local_consumer_event(consumer_device, &consumer_done);
+        const int status = matrix_get_thread_local_consumer_event(src->ctx, consumer_device, &consumer_done, consumer_resource);
         if (status != 0)
         {
+            gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
             return status;
         }
         err = cudaEventRecord(consumer_done, consumer_stream);
         if (err != cudaSuccess)
         {
+            gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
             return set_error(err);
         }
     }
     err = cudaStreamWaitEvent(state->stream, consumer_done, 0);
     if (err != cudaSuccess)
     {
+        gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
         return set_error(err);
     }
 
@@ -390,6 +434,7 @@ int matrix_track_limb_consumer(
     err = cudaEventRecord(state->write_done, state->stream);
     if (err != cudaSuccess)
     {
+        gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
         return set_error(err);
     }
     state->completion_owner = limb_id.y;
@@ -430,13 +475,20 @@ int matrix_track_limb_consumer_readonly(
     cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(consumer_device);
     if (err != cudaSuccess)
     {
+        gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
         return set_error(err);
     }
     cudaEvent_t consumer_done = completion;
+    GpuCudaResource resource;
     if (!consumer_done)
     {
-        err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
-        if (err == cudaSuccess) err = cudaEventRecord(consumer_done, consumer_stream);
+        const int status = resource.acquire(src->ctx, consumer_device, GPU_PREPARED_COMPLETION_EVENT);
+        if (status != 0) {
+            gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
+            return status;
+        }
+        consumer_done = resource.event;
+        err = cudaEventRecord(consumer_done, consumer_stream);
     }
     if (err == cudaSuccess)
     {
@@ -453,17 +505,16 @@ int matrix_track_limb_consumer_readonly(
         // read-only consumers still wait only for the original input writer.
         err = cudaStreamWaitEvent(state->stream, consumer_done, 0);
     }
-    const cudaError_t destroy_err = !completion && consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
-    if (err == cudaSuccess)
+    const int release_status = resource.release();
+    if (release_status != 0)
     {
-        err = destroy_err;
+        gpu_execution_mark_allocation_unknown(src->ctx->execution.get());
+        gpu_device_mark_allocation_unknown(consumer_device);
     }
+    if (err == cudaSuccess && release_status != 0) return release_status;
     if (err != cudaSuccess)
     {
-        // The caller may release the source immediately after an error.  A
-        // synchronous error-path fence keeps that release safe without
-        // changing the producer's write_done event.
-        cudaStreamSynchronize(consumer_stream);
+        gpu_context_retire_stream(src->ctx, consumer_device, consumer_stream);
         return set_error(err);
     }
     return 0;
@@ -494,22 +545,27 @@ int matrix_record_limb_write(
     cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(state->device);
     if (err != cudaSuccess)
     {
+        gpu_context_retire_stream(dst->ctx, state->device, stream);
         return set_error(err);
     }
     if (!state->write_done)
     {
+        GpuAllocationActivity activity(dst->ctx->execution.get(), state->device);
+        if (dst->ctx->execution->resource_admission_required.load(std::memory_order_acquire)) {
+            gpu_context_retire_stream(dst->ctx, state->device, stream);
+            return set_error("matrix write requires a prepared completion event");
+        }
         err = cudaEventCreateWithFlags(&state->write_done, cudaEventDisableTiming);
         if (err != cudaSuccess)
         {
-            // The write is already queued; protect immediate owner cleanup
-            // when its new completion event cannot be allocated.
-            cudaStreamSynchronize(stream);
+            gpu_context_retire_stream(dst->ctx, state->device, stream);
             return set_error(err);
         }
     }
     err = cudaEventRecord(state->write_done, stream);
     if (err != cudaSuccess)
     {
+        gpu_context_retire_stream(dst->ctx, state->device, stream);
         return set_error(err);
     }
     state->completion_owner = limb_id.y;
@@ -714,64 +770,6 @@ size_t matrix_align_up_size(size_t value, size_t alignment)
     }
     return (value + alignment - 1) & ~(alignment - 1);
 }
-
-int matrix_acquire_aux_workspace(
-    const GpuMatrix *aux_owner,
-    const dim3 *aux_limb_id,
-    size_t bytes,
-    void **out_ptr,
-    bool *out_shared,
-    cudaStream_t stream)
-{
-    if (!out_ptr || !out_shared)
-    {
-        return set_error("invalid matrix_acquire_aux_workspace arguments");
-    }
-    *out_ptr = nullptr;
-    *out_shared = false;
-    if (bytes == 0)
-    {
-        return 0;
-    }
-    if (aux_owner && aux_limb_id)
-    {
-        if (matrix_aux_slice_for_limb(aux_owner, *aux_limb_id, bytes, out_ptr))
-        {
-            *out_shared = true;
-            return 0;
-        }
-        return set_error("preallocated matrix auxiliary workspace is insufficient");
-    }
-    if (!stream)
-    {
-        return set_error("null stream in matrix_acquire_aux_workspace");
-    }
-    cudaError_t err = cudaMallocAsync(out_ptr, bytes, stream);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    return 0;
-}
-
-int matrix_release_aux_workspace(void *ptr, bool from_shared, cudaStream_t stream)
-{
-    if (!ptr || from_shared)
-    {
-        return 0;
-    }
-    if (!stream)
-    {
-        return set_error("null stream in matrix_release_aux_workspace");
-    }
-    cudaError_t err = cudaFreeAsync(ptr, stream);
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    return 0;
-}
-
 
 uint32_t bit_width_u64(uint64_t v)
 {

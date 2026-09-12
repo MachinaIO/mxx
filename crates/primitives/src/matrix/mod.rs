@@ -24,44 +24,166 @@ pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {
     fn entry_size(&self) -> usize;
 }
 
-/// A logical full matrix whose columns are materialized on demand.
+/// A source range whose accelerator placement is chosen by its consumer.
+/// Describing a range retains existing storage and never expands staging bytes.
+#[derive(Debug)]
+pub enum PolyMatrixColumnData<M> {
+    Resident {
+        value: Arc<M>,
+        start: usize,
+        end: usize,
+    },
+    CpuStaging {
+        bytes: Arc<Vec<u8>>,
+        ring_dimension: u32,
+        moduli: Arc<Vec<u64>>,
+        base_bits: u32,
+        dropped_moduli: usize,
+        start: usize,
+        end: usize,
+    },
+}
+
+impl<M> PolyMatrixColumnData<M> {
+    pub fn staged(params: &impl PolyParams, bytes: Arc<Vec<u8>>, start: usize, end: usize) -> Self {
+        assert!(start <= end, "invalid staged column interval");
+        Self::CpuStaging {
+            bytes,
+            ring_dimension: params.ring_dimension(),
+            moduli: Arc::new(params.to_crt().0),
+            base_bits: params.base_bits(),
+            dropped_moduli: params.dropped_moduli(),
+            start,
+            end,
+        }
+    }
+
+    pub fn columns(&self) -> usize {
+        let (start, end) = match self {
+            Self::Resident { start, end, .. } | Self::CpuStaging { start, end, .. } => {
+                (*start, *end)
+            }
+        };
+        end.checked_sub(start).expect("valid source column interval")
+    }
+
+    pub fn subrange(&self, start: usize, end: usize) -> Self {
+        assert!(start <= end && end <= self.columns(), "invalid source column subrange");
+        match self {
+            Self::Resident { value, start: offset, .. } => Self::Resident {
+                value: Arc::clone(value),
+                start: offset + start,
+                end: offset + end,
+            },
+            Self::CpuStaging {
+                bytes,
+                ring_dimension,
+                moduli,
+                base_bits,
+                dropped_moduli,
+                start: offset,
+                ..
+            } => Self::CpuStaging {
+                bytes: Arc::clone(bytes),
+                ring_dimension: *ring_dimension,
+                moduli: Arc::clone(moduli),
+                base_bits: *base_bits,
+                dropped_moduli: *dropped_moduli,
+                start: offset + start,
+                end: offset + end,
+            },
+        }
+    }
+}
+
+impl<M: PolyMatrix> PolyMatrixColumnData<M> {
+    /// Validate before constructing an expanded tile. Staging identity excludes
+    /// execution placement; an existing resident owner must already belong to
+    /// this execution. Explicit transfers belong to the caller's transport plan.
+    pub fn validate_parameters(
+        &self,
+        params: &<M::P as Poly>::Params,
+    ) -> Result<(), SmallMatrixError> {
+        match self {
+            Self::Resident { value, start, end } => {
+                if start > end || *end > value.col_size() {
+                    return Err(SmallMatrixError::ShapeMismatch);
+                }
+                if value.params() != params {
+                    return Err(SmallMatrixError::ParameterMismatch);
+                }
+                if value.params().execution_owner_id() != params.execution_owner_id() {
+                    return Err(SmallMatrixError::DeviceMismatch);
+                }
+            }
+            Self::CpuStaging {
+                ring_dimension,
+                moduli,
+                base_bits,
+                dropped_moduli,
+                start,
+                end,
+                ..
+            } => {
+                if start > end {
+                    return Err(SmallMatrixError::ShapeMismatch);
+                }
+                if *ring_dimension != params.ring_dimension() ||
+                    **moduli != params.to_crt().0 ||
+                    *base_bits != params.base_bits() ||
+                    *dropped_moduli != params.dropped_moduli()
+                {
+                    return Err(SmallMatrixError::ParameterMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn materialize(self, params: &<M::P as Poly>::Params) -> Result<M, SmallMatrixError> {
+        self.validate_parameters(params)?;
+        Ok(match self {
+            Self::Resident { value, start, end } => value.slice_columns(start, end),
+            Self::CpuStaging { bytes, start, end, .. } => {
+                M::from_cpu_staging_columns(params, bytes.as_slice(), start, end)
+            }
+        })
+    }
+}
+
+/// A logical full matrix whose columns are materialized on the consumer's owner.
 ///
-/// Implementations may be backed by host staging bytes or persistent storage;
-/// callers must not assume that the complete expanded matrix is resident.
+/// A range describes existing resident storage or host staging. Implementations
+/// must not allocate accelerator storage while constructing that description.
+/// The consumer materializes it with explicit execution parameters, after its
+/// range has been assigned to a worker.
 pub trait PolyMatrixColumnSource<M>: Debug + Send + Sync {
     fn row_size(&self) -> usize;
     fn col_size(&self) -> usize;
 
     /// Expanded storage already resident while a sampling tile is live.
-    /// Host-backed sources return `None`; resident sources expose their owner
-    /// so the sampler includes it in its peak-memory calculation.
     fn resident_matrix(&self) -> Option<&M> {
         None
     }
 
     /// Global offset of local column zero in the logical matrix.
-    ///
-    /// Column-partitioned backends include this offset when deriving tile
-    /// randomness. GPU sampling is reproducible for the same seed and tile
-    /// schedule; changing tile boundaries can change the sampled preimage.
+    /// Sampling is reproducible for the same seed and tile schedule; changing
+    /// tile boundaries can change the sampled preimage.
     fn global_column_start(&self) -> usize {
         0
     }
 
-    fn load_columns(&self, start: usize, end: usize) -> M;
+    fn column_range(&self, start: usize, end: usize) -> PolyMatrixColumnData<M>;
 }
 
-/// Owns a resident matrix while presenting it as a logical column source.
-/// Sampling can therefore retain the full logical shape and load only the
-/// requested columns, without exposing an expanded preimage-returning API.
 #[derive(Clone, Debug)]
 pub struct ResidentPolyMatrixColumnSource<M: PolyMatrix> {
-    value: M,
+    value: Arc<M>,
 }
 
 impl<M: PolyMatrix> ResidentPolyMatrixColumnSource<M> {
     pub fn new(value: M) -> Self {
-        Self { value }
+        Self { value: Arc::new(value) }
     }
 }
 
@@ -69,17 +191,15 @@ impl<M: PolyMatrix> PolyMatrixColumnSource<M> for ResidentPolyMatrixColumnSource
     fn resident_matrix(&self) -> Option<&M> {
         Some(&self.value)
     }
-
     fn row_size(&self) -> usize {
         self.value.row_size()
     }
-
     fn col_size(&self) -> usize {
         self.value.col_size()
     }
-
-    fn load_columns(&self, start: usize, end: usize) -> M {
-        self.value.slice_columns(start, end)
+    fn column_range(&self, start: usize, end: usize) -> PolyMatrixColumnData<M> {
+        assert!(start <= end && end <= self.col_size(), "invalid resident column interval");
+        PolyMatrixColumnData::Resident { value: Arc::clone(&self.value), start, end }
     }
 }
 
@@ -634,6 +754,15 @@ pub trait PolyMatrix:
         destination: &<Self::P as Poly>::Params,
         plaintext_modulus: u64,
     ) -> Result<Self, String>;
+    /// Canonical centered coefficient lift to a containing CRT basis.
+    /// No full-coefficient big-integer reconstruction is performed.
+    fn centered_extend(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Exact BFV block switch `(z-t*center_P(t^-1*z))/P` to a strict subset.
+    fn block_mod_switch(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String>;
     /// Performs the operation S * (identity ⊗ other)
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self;
     /// Performs the operation S * (identity ⊗ G^-1(other)),
@@ -798,6 +927,8 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
 
     fn params(&self) -> &Self::Params;
     fn max_coefficient_bound(&self) -> &BigUint;
+    /// Preserve bounded signed coefficients in a containing modulus.
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String>;
     fn rows(&self) -> usize;
     fn columns(&self) -> usize;
     fn size(&self) -> (usize, usize) {
@@ -871,6 +1002,13 @@ where
 
     fn params(&self) -> &Self::Params {
         self.value.params()
+    }
+
+    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String> {
+        Ok(Self::from_validated(
+            self.value.centered_extend(destination)?,
+            self.max_coefficient_bound.clone(),
+        ))
     }
 
     fn max_coefficient_bound(&self) -> &BigUint {
@@ -991,6 +1129,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_column_identity_rejects_wrong_basis_before_decoding() {
+        use crate::{matrix::dcrt_poly::DCRTPolyMatrix, poly::dcrt::params::DCRTPolyParams};
+
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse().expect("ring dimension"))
+            .unwrap_or(32);
+        let parameters = DCRTPolyParams::new(n, 2, 54, 8, None, None);
+        let mut reversed_basis = parameters.to_crt().0;
+        reversed_basis.reverse();
+        let wrong = DCRTPolyParams::new(n, 2, 54, 8, Some(reversed_basis), None);
+        assert_eq!(parameters.modulus(), wrong.modulus());
+        // The payload is deliberately not decodable: a wrong mathematical
+        // identity must return an error before invoking any storage decoder.
+        let data =
+            PolyMatrixColumnData::<DCRTPolyMatrix>::staged(&parameters, Arc::new(Vec::new()), 3, 7);
+        assert!(data.validate_parameters(&parameters).is_ok());
+        assert_eq!(data.columns(), 4);
+        assert_eq!(data.subrange(1, 3).columns(), 2);
+        assert!(matches!(data.materialize(&wrong), Err(SmallMatrixError::ParameterMismatch)));
+    }
 
     #[test]
     fn canonical_coefficient_sign_handles_even_modulus_tie() {

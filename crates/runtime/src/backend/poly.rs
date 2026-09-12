@@ -161,7 +161,9 @@ pub(super) fn decode_small_matrix_artifact<'a>(
 }
 
 #[cfg(feature = "gpu")]
-pub(super) fn encode_small_matrix_artifact(
+/// Encode compact coefficients with the production artifact schema.
+/// Callers may use this pure codec before importing a synthetic or stored value.
+pub fn encode_small_matrix_artifact(
     expected_schema: &ConcreteBoundedMatrixSchema,
     payload: &[u8],
     semantic_kind: SmallMatrixSemanticKind,
@@ -231,6 +233,8 @@ pub struct RingKey {
 
 #[derive(Debug, Error)]
 pub enum PolyBackendError {
+    #[error("exact RNS conversion failed: {0}")]
+    ExactRns(String),
     #[error("requested preimage bound {requested} is below minimum {minimum}")]
     PreimageBoundTooSmall { requested: BigInt, minimum: BigInt },
     #[error("no concrete polynomial parameters registered for {0:?}")]
@@ -251,6 +255,8 @@ pub enum PolyBackendError {
     InvalidSmallMatrixArtifact(&'static str),
     #[error("GPU fleet calibration failed: {0}")]
     GpuCalibration(String),
+    #[error("GPU fleet submission failed: {0}")]
+    GpuSubmission(String),
     #[error("the requested GPU placement is unavailable through a direct device or peer copy")]
     UnsupportedPlacement,
     #[error(
@@ -468,20 +474,6 @@ where
         self.preimage_batch_calls
     }
 
-    /// Fleet resharding must remain device-resident. Explicit host staging is
-    /// reserved for artifact and preimage-target ownership transitions.
-    #[cfg(feature = "gpu")]
-    pub(super) fn matrix_to_active_placement_peer_only(
-        &self,
-        value: &M,
-    ) -> Result<M, PolyBackendError> {
-        let target = self.parameters_for_matrix(value)?;
-        if value.params() == target {
-            return Ok(value.clone());
-        }
-        value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
-    }
-
     pub(super) fn parameters(
         &self,
         matrix_type: &ConcreteMatrixType,
@@ -529,7 +521,7 @@ where
         (base, digits)
     }
 
-    fn parameters_for_matrix(
+    pub(super) fn parameters_for_matrix(
         &self,
         matrix: &M,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
@@ -544,7 +536,7 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
-    fn parameters_for_small_matrix(
+    pub(super) fn parameters_for_small_matrix(
         &self,
         matrix: &M::SmallMatrix,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError>
@@ -562,7 +554,7 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
-    fn ring_integer(
+    pub(super) fn ring_integer(
         parameters: &<M::P as Poly>::Params,
         value: &BigInt,
     ) -> Result<M::P, PolyBackendError> {
@@ -644,7 +636,9 @@ where
 
     fn matrix_to_active_placement(&mut self, value: &M) -> Result<M, Self::Error> {
         let target = self.parameters_for_matrix(value)?;
-        if value.params() == target {
+        if value.params() == target &&
+            value.params().execution_owner_id() == target.execution_owner_id()
+        {
             return Ok(value.clone());
         }
         if let Some(copied) = value.copy_to_params_direct(target) {
@@ -660,7 +654,10 @@ where
     }
 
     fn matrix_is_on_active_placement(&self, value: &M) -> bool {
-        self.parameters_for_matrix(value).is_ok_and(|target| value.params() == target)
+        self.parameters_for_matrix(value).is_ok_and(|target| {
+            value.params() == target &&
+                value.params().execution_owner_id() == target.execution_owner_id()
+        })
     }
 
     fn small_matrix_to_active_placement(
@@ -668,7 +665,9 @@ where
         value: &M::SmallMatrix,
     ) -> Result<M::SmallMatrix, Self::Error> {
         let target = self.parameters_for_small_matrix(value)?;
-        if value.params() == target {
+        if value.params() == target &&
+            value.params().execution_owner_id() == target.execution_owner_id()
+        {
             return Ok(value.clone());
         }
         let payload = value.to_canonical_coefficients()?;
@@ -682,7 +681,10 @@ where
     }
 
     fn small_matrix_is_on_active_placement(&self, value: &M::SmallMatrix) -> bool {
-        self.parameters_for_small_matrix(value).is_ok_and(|target| value.params() == target)
+        self.parameters_for_small_matrix(value).is_ok_and(|target| {
+            value.params() == target &&
+                value.params().execution_owner_id() == target.execution_owner_id()
+        })
     }
 
     fn fence_released_memory(&mut self) -> Result<(), Self::Error> {
@@ -842,7 +844,7 @@ where
                 M::unit_column_vector(parameters, ty.rows, index)
             }
             ConstantMatrix::Gadget { base, small } => {
-                if !ty.columns.is_multiple_of(ty.rows) {
+                if ty.rows == 0 || !ty.columns.is_multiple_of(ty.rows) {
                     return Err(PolyBackendError::InvalidInteger);
                 }
                 let base = base.evaluate(env).map_err(|_| PolyBackendError::InvalidInteger)?;
@@ -934,6 +936,14 @@ where
 
     fn multiply_batch(&mut self, inputs: Vec<(Arc<M>, Arc<M>)>) -> Result<Vec<M>, Self::Error> {
         Ok(M::multiply_batch_out_of_place(inputs))
+    }
+
+    fn matrix_mul_accumulate(
+        &mut self,
+        request: MatrixMulAccumulateRequest<M>,
+    ) -> Result<M, Self::Error> {
+        // Keep singleton fleet shards on the same fused primitive as batches.
+        Ok(self.matrix_mul_accumulate_batch(vec![request])?.remove(0))
     }
 
     fn matrix_mul_accumulate_batch(
@@ -1064,6 +1074,33 @@ where
             .map_err(PolyBackendError::BasisConversion)
     }
 
+    fn centered_extend(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+    ) -> Result<M, Self::Error> {
+        value.centered_extend(self.parameters(destination)?).map_err(PolyBackendError::ExactRns)
+    }
+
+    fn centered_extend_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        value.centered_extend(self.parameters(destination)?).map_err(PolyBackendError::ExactRns)
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        plaintext_modulus: u64,
+    ) -> Result<M, Self::Error> {
+        value
+            .block_mod_switch(self.parameters(destination)?, plaintext_modulus)
+            .map_err(PolyBackendError::ExactRns)
+    }
+
     fn ring_automorphism_batch(
         &mut self,
         inputs: Vec<(Arc<M>, usize)>,
@@ -1083,11 +1120,11 @@ where
                 .map(|value| value.into_cpu_staging_bytes())
                 .unwrap_or_else(|value| value.as_ref().to_cpu_staging_bytes()),
         );
-        Ok((Arc::new(PreimageTarget::staged(params, rows, columns, bytes.clone())), bytes))
+        Ok((Arc::new(PreimageTarget::staged(&params, rows, columns, bytes.clone())), bytes))
     }
 
     fn matrix_from_cpu_staging_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<M, Self::Error> {
@@ -1101,7 +1138,7 @@ where
         columns: usize,
         bytes: Arc<Vec<u8>>,
     ) -> Result<Arc<dyn PolyMatrixColumnSource<M>>, Self::Error> {
-        let params = self.parameters(ty)?.clone();
+        let params = self.parameters(ty)?;
         Ok(Arc::new(PreimageTarget::staged(params, rows, columns, bytes)))
     }
 
@@ -1518,22 +1555,26 @@ where
         )
     }
 
-    fn matrix_to_bytes(&self, value: &M) -> Vec<u8> {
-        value.to_compact_bytes()
+    fn matrix_to_bytes(&self, value: &M) -> Result<Vec<u8>, Self::Error> {
+        Ok(value.to_compact_bytes())
     }
 
-    fn matrices_to_bytes(&self, values: &[&M]) -> Vec<Vec<u8>> {
+    fn matrices_to_bytes(&self, values: &[&M]) -> Result<Vec<Vec<u8>>, Self::Error> {
         #[cfg(feature = "gpu")]
         {
-            M::compact_bytes_batch(values)
+            Ok(M::compact_bytes_batch(values))
         }
         #[cfg(not(feature = "gpu"))]
         {
-            values.iter().map(|value| value.to_compact_bytes()).collect()
+            Ok(values.iter().map(|value| value.to_compact_bytes()).collect())
         }
     }
 
-    fn matrix_from_bytes(&self, ty: &ConcreteMatrixType, bytes: &[u8]) -> Result<M, Self::Error> {
+    fn matrix_from_bytes(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        bytes: &[u8],
+    ) -> Result<M, Self::Error> {
         Ok(M::from_compact_bytes(self.parameters(ty)?, bytes))
     }
 
@@ -1613,7 +1654,7 @@ where
     }
 
     fn small_matrix_from_bytes(
-        &self,
+        &mut self,
         expected_schema: &ConcreteBoundedMatrixSchema,
         bytes: &[u8],
         expected_semantic_kind: SmallMatrixSemanticKind,
@@ -1704,7 +1745,7 @@ where
     }
 
     fn trapdoor_from_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<T::Trapdoor, Self::Error> {
@@ -1728,6 +1769,34 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
 mod tests {
     use super::*;
     use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
+
+    #[test]
+    fn test_constant_gadget_rejects_zero_rows_before_dividing() {
+        use mxx_ir_core::expr::IntExpr;
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(8);
+        let parameters = DCRTPolyParams::new(n, 2, 17, 2, None, None);
+        let mut backend = cpu_backend([parameters.clone()]);
+        for columns in [0, 1] {
+            let ty = ConcreteMatrixType {
+                modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+                ring_dimension: n as usize,
+                rows: 0,
+                columns,
+            };
+            for small in [false, true] {
+                let constant = ConstantMatrix::Gadget {
+                    base: IntExpr::constant(BigInt::one() << parameters.base_bits()),
+                    small,
+                };
+                assert!(matches!(
+                    backend.constant_matrix(&ty, &constant, &ParamEnv::default()),
+                    Err(PolyBackendError::InvalidInteger)
+                ));
+            }
+        }
+    }
 
     #[test]
     fn test_polynomial_values_round_trip_and_input_validation() {

@@ -170,7 +170,17 @@ def layout{index} : MxxRuntime.RegularLayout {q} :=
             layout.modulus, layout.ring_dimension
         ));
     }
-    source.push_str(&format!("    none\n\nend\nend {namespace}\n"));
+    source.push_str("    none\n\n");
+    for (index, layout) in layouts.iter().enumerate() {
+        if layout.dropped_moduli == 0 {
+            source.push_str(&format!(
+                "instance exactLayout{index} : Fact ((backend.regularLayout {q} {n}).map MxxRuntime.RegularLayout.droppedModuli = some 0) := ⟨by rfl⟩\n\n",
+                q = layout.modulus,
+                n = layout.ring_dimension,
+            ));
+        }
+    }
+    source.push_str(&format!("end\nend {namespace}\n"));
     Ok(LeanBackendArtifact {
         source,
         module_name: module_name.into(),
@@ -377,6 +387,7 @@ mod tests {
         assert_eq!(source.matches("def layout0").count(), 1);
         assert!(!source.contains("def layout1"));
         assert!(source.contains("[17, 19]"));
+        assert!(source.contains("instance exactLayout0"));
         assert!(matches!(
             render_backend_context(&[first, reversed], "Fixture", "Fixture"),
             Err(LayoutError::ConflictingRingLayout { .. })
@@ -392,6 +403,8 @@ mod tests {
         let approximate = approximate.validate().unwrap();
         assert_eq!(approximate.digit_count(LeanGadgetMode::Regular), 2);
         assert_eq!(approximate.digit_count(LeanGadgetMode::Small), 2);
+        let source = render_backend_context(&[approximate.clone()], "Fixture", "Fixture").unwrap();
+        assert!(!source.source().contains("instance exactLayout"));
         assert!(matches!(
             render_backend_context(&[exact, approximate], "Fixture", "Fixture"),
             Err(LayoutError::ConflictingRingLayout { .. })

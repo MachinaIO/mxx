@@ -218,6 +218,7 @@ extern "C" int gpu_matrix_store_compact_bytes_batch(
     {
         return set_error("compact serialization batch requires coefficient matrices");
     }
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
     const size_t limb_count = static_cast<size_t>(first->level + 1);
     const size_t poly_count = first->rows * first->cols;
     const size_t n = static_cast<size_t>(first->ctx->N);
@@ -322,6 +323,7 @@ extern "C" int gpu_matrix_store_compact_bytes_batch(
     modulus_words.resize(words_per_coeff, 0);
     half_modulus_words.resize(words_per_coeff, 0);
 
+    CompactWorkspace workspace;
     const uint8_t **d_pointers = nullptr;
     size_t *d_strides = nullptr;
     uint8_t *d_coefficient_bytes = nullptr;
@@ -338,41 +340,50 @@ extern "C" int gpu_matrix_store_compact_bytes_batch(
     uint8_t *d_payload = nullptr;
     unsigned int *host_max_bits = nullptr;
     uint8_t *host_payload = nullptr;
-    auto release = [&]() {
-        if (d_payload) cudaFreeAsync(d_payload, stream);
-        if (d_offsets) cudaFreeAsync(d_offsets, stream);
-        if (d_signed_widths) cudaFreeAsync(d_signed_widths, stream);
-        if (d_overflow) cudaFreeAsync(d_overflow, stream);
-        if (d_max_bits) cudaFreeAsync(d_max_bits, stream);
-        if (d_signs) cudaFreeAsync(d_signs, stream);
-        if (d_words) cudaFreeAsync(d_words, stream);
-        if (d_half_modulus_words) cudaFreeAsync(d_half_modulus_words, stream);
-        if (d_modulus_words) cudaFreeAsync(d_modulus_words, stream);
-        if (d_inverses) cudaFreeAsync(d_inverses, stream);
-        if (d_moduli) cudaFreeAsync(d_moduli, stream);
-        if (d_coefficient_bytes) cudaFreeAsync(d_coefficient_bytes, stream);
-        if (d_strides) cudaFreeAsync(d_strides, stream);
-        if (d_pointers) cudaFreeAsync(d_pointers, stream);
-        if (host_payload) cudaFreeHost(host_payload);
-        if (host_max_bits) cudaFreeHost(host_max_bits);
+    bool host_pending = false;
+    auto release = [&]() -> cudaError_t {
+        cudaError_t cleanup_error = cudaSuccess;
+        const auto check_release = [&](cudaError_t released) {
+            if (released != cudaSuccess)
+            {
+                gpu_execution_mark_allocation_unknown(first->ctx->execution.get());
+                if (cleanup_error == cudaSuccess) cleanup_error = released;
+            }
+        };
+        check_release(workspace.storage.release() == 0 ? cudaSuccess : cudaErrorUnknown);
+        if (host_pending) {
+            // Failed D2H submission/wait does not make CPU storage reusable.
+            // The existing reclaimer either proves completion or quarantines it.
+            void *pointers[] = {host_payload, host_max_bits};
+            if (gpu_defer_pinned_frees(first->ctx, device, stream, pointers, 2) != 0)
+                check_release(cudaErrorUnknown);
+        } else {
+            if (gpu_pinned_free(host_payload) != 0) check_release(cudaErrorUnknown);
+            if (gpu_pinned_free(host_max_bits) != 0) check_release(cudaErrorUnknown);
+        }
+        return cleanup_error;
     };
-    auto allocate = [&](auto **pointer, size_t bytes) {
-        return cudaMallocAsync(reinterpret_cast<void **>(pointer), bytes, stream);
-    };
+    const int workspace_status = workspace.acquire(first->ctx, device, first->level,
+        first->rows, first->cols, matrix_count, 1, 0, stream);
+    if (workspace_status != 0) { release(); return workspace_status; }
     const size_t inverse_count = first->ctx->garner_inverse_table.size();
     const size_t word_count = total_coefficients * words_per_coeff;
-    error = allocate(&d_pointers, pointers.size() * sizeof(uint8_t *));
-    if (error == cudaSuccess) error = allocate(&d_strides, strides.size() * sizeof(size_t));
-    if (error == cudaSuccess) error = allocate(&d_coefficient_bytes, coefficient_bytes.size());
-    if (error == cudaSuccess) error = allocate(&d_moduli, moduli.size() * sizeof(uint64_t));
-    if (error == cudaSuccess) error = allocate(&d_inverses, inverse_count * sizeof(uint64_t));
-    if (error == cudaSuccess) error = allocate(&d_modulus_words, words_per_coeff * sizeof(uint64_t));
-    if (error == cudaSuccess) error = allocate(&d_half_modulus_words, words_per_coeff * sizeof(uint64_t));
-    if (error == cudaSuccess) error = allocate(&d_words, word_count * sizeof(uint64_t));
-    if (error == cudaSuccess) error = allocate(&d_signs, total_coefficients);
-    if (error == cudaSuccess) error = allocate(&d_max_bits, matrix_count * sizeof(unsigned int));
-    if (error == cudaSuccess) error = allocate(&d_overflow, sizeof(int));
-    if (error == cudaSuccess) error = cudaHostAlloc(&host_max_bits, matrix_count * sizeof(unsigned int), cudaHostAllocDefault);
+    error = workspace.span(0, &d_pointers, pointers.size() * sizeof(uint8_t *));
+    if (error == cudaSuccess) error = workspace.span(1, &d_strides, strides.size() * sizeof(size_t));
+    if (error == cudaSuccess) error = workspace.span(2, &d_coefficient_bytes, coefficient_bytes.size());
+    if (error == cudaSuccess) error = workspace.span(3, &d_moduli, moduli.size() * sizeof(uint64_t));
+    if (error == cudaSuccess) error = workspace.span(4, &d_inverses, inverse_count * sizeof(uint64_t));
+    if (error == cudaSuccess) error = workspace.span(5, &d_modulus_words, words_per_coeff * sizeof(uint64_t));
+    if (error == cudaSuccess) error = workspace.span(6, &d_half_modulus_words, words_per_coeff * sizeof(uint64_t));
+    if (error == cudaSuccess) error = workspace.span(7, &d_words, word_count * sizeof(uint64_t));
+    if (error == cudaSuccess) error = workspace.span(8, &d_signs, total_coefficients);
+    if (error == cudaSuccess) error = workspace.span(9, &d_max_bits, matrix_count * sizeof(unsigned int));
+    if (error == cudaSuccess) error = workspace.span(10, &d_overflow, sizeof(int));
+    if (error == cudaSuccess) {
+        host_max_bits = static_cast<unsigned int *>(gpu_pinned_alloc(
+            first->ctx, matrix_count * sizeof(unsigned int), alignof(unsigned int)));
+        if (!host_max_bits) error = cudaErrorMemoryAllocation;
+    }
     if (error != cudaSuccess)
     {
         release();
@@ -407,9 +418,11 @@ extern "C" int gpu_matrix_store_compact_bytes_batch(
         d_modulus_words, d_half_modulus_words, d_signs, d_max_bits);
     error = cudaGetLastError();
     int host_overflow = 0;
+    host_pending = true;
     if (error == cudaSuccess) error = cudaMemcpyAsync(host_max_bits, d_max_bits, matrix_count * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
     if (error == cudaSuccess) error = cudaMemcpyAsync(&host_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost, stream);
     if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
+    if (error == cudaSuccess) host_pending = false;
     if (error != cudaSuccess || host_overflow != 0)
     {
         release();
@@ -440,10 +453,13 @@ extern "C" int gpu_matrix_store_compact_bytes_batch(
     const size_t total_payload = offsets.back();
     if (total_payload > 0)
     {
-        error = allocate(&d_signed_widths, matrix_count * sizeof(uint32_t));
-        if (error == cudaSuccess) error = allocate(&d_offsets, offsets.size() * sizeof(size_t));
-        if (error == cudaSuccess) error = allocate(&d_payload, total_payload);
-        if (error == cudaSuccess) error = cudaHostAlloc(&host_payload, total_payload, cudaHostAllocDefault);
+        error = workspace.span(11, &d_signed_widths, matrix_count * sizeof(uint32_t));
+        if (error == cudaSuccess) error = workspace.span(12, &d_offsets, offsets.size() * sizeof(size_t));
+        if (error == cudaSuccess) error = workspace.span(13, &d_payload, total_payload);
+        if (error == cudaSuccess) {
+            host_payload = static_cast<uint8_t *>(gpu_pinned_alloc(first->ctx, total_payload, alignof(uint8_t)));
+            if (!host_payload) error = cudaErrorMemoryAllocation;
+        }
         if (error == cudaSuccess) error = copy(d_signed_widths, signed_widths.data(), matrix_count * sizeof(uint32_t));
         if (error == cudaSuccess) error = copy(d_offsets, offsets.data(), offsets.size() * sizeof(size_t));
         if (error != cudaSuccess)
@@ -458,8 +474,10 @@ extern "C" int gpu_matrix_store_compact_bytes_batch(
             d_words, d_signs, coefficients_per_matrix, static_cast<int>(words_per_coeff),
             d_signed_widths, d_offsets, d_payload);
         error = cudaGetLastError();
+        host_pending = true;
         if (error == cudaSuccess) error = cudaMemcpyAsync(host_payload, d_payload, total_payload, cudaMemcpyDeviceToHost, stream);
         if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
+        if (error == cudaSuccess) host_pending = false;
         if (error != cudaSuccess)
         {
             release();
@@ -486,6 +504,6 @@ extern "C" int gpu_matrix_store_compact_bytes_batch(
             }
         }
     }
-    release();
-    return 0;
+    const cudaError_t cleanup_error = release();
+    return cleanup_error == cudaSuccess ? 0 : set_error(cleanup_error);
 }

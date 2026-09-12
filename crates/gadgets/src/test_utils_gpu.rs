@@ -61,7 +61,8 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
     );
     let expected = lhs.clone() + &rhs;
     let mut backend = gpu_backend([gpu_parameters.clone()]);
-    let result = execute(
+    let mut store = MemoryArtifactStore::default();
+    let mut result = execute(
         &graph,
         &mut backend,
         BTreeMap::from([
@@ -78,13 +79,14 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
                 )),
             ),
         ]),
-        &mut MemoryArtifactStore::default(),
+        &mut store,
         SamplingMode::Fresh,
     )
     .expect("execute gadget graph on the GPU runtime backend");
-    let RuntimeValue::Matrix(actual) = &result.outputs["output-0"] else {
-        panic!("gadget output must be a matrix")
-    };
+    let actual = result
+        .materialize_output("output-0", &mut backend, &mut store)
+        .expect("materialize GPU gadget output");
+    let RuntimeValue::Matrix(actual) = actual else { panic!("gadget output must be a matrix") };
     assert_eq!(backend.gather_matrix_for_host(actual).unwrap().to_cpu_matrix(), expected);
 }
 
@@ -206,16 +208,15 @@ fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
         })
         .collect();
     let mut backend = gpu_backend([gpu_parameters]);
-    let execution = execute(
-        &graph,
-        &mut backend,
-        runtime_inputs,
-        &mut MemoryArtifactStore::default(),
-        SamplingMode::Fresh,
-    )
-    .expect("execute packed nested-RNS addition on the GPU runtime backend");
+    let mut store = MemoryArtifactStore::default();
+    let mut execution =
+        execute(&graph, &mut backend, runtime_inputs, &mut store, SamplingMode::Fresh)
+            .expect("execute packed nested-RNS addition on the GPU runtime backend");
     for (index, expected) in expected.into_iter().enumerate() {
-        let RuntimeValue::Matrix(actual) = &execution.outputs[&format!("output-{index}")] else {
+        let actual = execution
+            .materialize_output(&format!("output-{index}"), &mut backend, &mut store)
+            .expect("materialize GPU packed nested-RNS output");
+        let RuntimeValue::Matrix(actual) = actual else {
             panic!("packed nested-RNS output must be a matrix")
         };
         assert_eq!(backend.gather_matrix_for_host(actual).unwrap().to_cpu_matrix(), expected);

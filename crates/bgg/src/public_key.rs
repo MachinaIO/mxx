@@ -12,7 +12,7 @@ pub struct BggPublicKeyWire {
     pub reveal_plaintext: bool,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BggPublicKeyType {
     pub matrix: MatType,
     pub reveal_plaintext: bool,

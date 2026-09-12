@@ -63,6 +63,8 @@ pub struct PrimitiveNames {
     pub centered_rebase: String,
     pub rns_mod_up: String,
     pub rns_mod_down: String,
+    pub centered_extend: String,
+    pub block_mod_switch: String,
     pub ring_automorphism: String,
     pub pack_polynomial: String,
     pub polynomial_from_values: String,
@@ -114,6 +116,8 @@ impl Default for PrimitiveNames {
             centered_rebase: "MxxRuntime.centeredRebaseRuns".into(),
             rns_mod_up: "MxxRuntime.rnsModUpRuns".into(),
             rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
+            centered_extend: "MxxRuntime.centeredExtendRuns".into(),
+            block_mod_switch: "MxxRuntime.blockModSwitchRuns".into(),
             ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
             polynomial_from_values: "MxxRuntime.polynomialFromValues".into(),
@@ -210,18 +214,25 @@ pub struct RootBoundary {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeProofShape {
-    /// Root scopes use one named record; child scopes retain their existential telescope.
+    /// Named witness view; leaf execution relations retain their existential telescope.
     pub witness_record: Option<String>,
-    /// Exact root body at one fixed witness, for composing intermediate-node proofs.
+    /// Exact body at one fixed witness, for composing intermediate-node proofs.
     pub body_relation: Option<String>,
+    /// Checked conversion from the execution relation to the named witness view.
+    pub runs_iff_body: String,
     /// Emitted value right-hand sides; references name earlier entries or root arguments.
     pub value_expressions: BTreeMap<String, String>,
-    /// Witness fields (roots) or binders (children), in exact exported order. Pure lets
+    /// Witness fields, also the leaf existential binders, in exact exported order. Pure lets
     /// are deliberately absent: Lean unfolds them while eliminating `Runs`.
     pub witnesses: Vec<(String, String)>,
     /// Positions in the right-associated conjunction contributed by each node,
     /// including its guards. The final output equation is at `constraint_count`.
     pub node_constraints: BTreeMap<NodeId, std::ops::Range<usize>>,
+    /// Checked accessors for each node's facts, in local constraint order.
+    /// Consumers apply each name to a body proof obtained through `runs_iff_body`.
+    pub node_facts: BTreeMap<NodeId, Vec<String>>,
+    /// Checked accessor for the final output equation of a record-backed scope.
+    pub output_fact: Option<String>,
     pub constraint_count: usize,
 }
 
@@ -417,7 +428,8 @@ struct Emitter<'a> {
     current_anonymous_lets: BTreeSet<String>,
     current_uses_hash_model: bool,
     current_witnesses: Vec<(String, String)>,
-    current_record: bool,
+    current_runs_record: bool,
+    current_witness_bindings: Vec<std::ops::Range<usize>>,
     current_value_expressions: BTreeMap<String, String>,
     scope_proofs: BTreeMap<FrozenGraphScopeId, ScopeProofShape>,
 }
@@ -467,7 +479,8 @@ impl<'a> Emitter<'a> {
             current_anonymous_lets: BTreeSet::new(),
             current_uses_hash_model: false,
             current_witnesses: Vec::new(),
-            current_record: false,
+            current_runs_record: false,
+            current_witness_bindings: Vec::new(),
             current_value_expressions: BTreeMap::new(),
             scope_proofs: BTreeMap::new(),
             requires_hash_model: graph.scopes().values().any(|scope| {
@@ -693,9 +706,10 @@ impl<'a> Emitter<'a> {
     fn emit_scope(&mut self, scope_id: &FrozenGraphScopeId) -> Result<(), ExportError> {
         self.indent = 1;
         self.current_witnesses.clear();
+        self.current_witness_bindings.clear();
         self.current_value_expressions.clear();
         let scope = self.graph.scope(scope_id).expect("scope key came from graph");
-        self.current_record = matches!(scope_id, FrozenGraphScopeId::Root) ||
+        self.current_runs_record = matches!(scope_id, FrozenGraphScopeId::Root) ||
             scope.nodes().iter().any(|node| {
                 matches!(node.kind(), NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_))
             });
@@ -801,18 +815,45 @@ impl<'a> Emitter<'a> {
                 return Err(ExportError::MissingLoopIndex(slot));
             }
         }
+        let node_facts = node_constraints
+            .iter()
+            .map(|(node, range)| {
+                (
+                    *node,
+                    range
+                        .clone()
+                        .enumerate()
+                        .map(|(local, _)| {
+                            format!(
+                                "{}.{}.node_{}.fact_{local}",
+                                self.options.namespace, self.scopes[scope_id], node.0
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
         self.scope_proofs.insert(
             scope_id.clone(),
             ScopeProofShape {
-                witness_record: self.current_record.then(|| {
+                witness_record: Some({
                     format!("{}.{}.Witness", self.options.namespace, self.scopes[scope_id])
                 }),
-                body_relation: self
-                    .current_record
-                    .then(|| format!("{}.{}.body", self.options.namespace, self.scopes[scope_id])),
+                body_relation: Some(format!(
+                    "{}.{}.body",
+                    self.options.namespace, self.scopes[scope_id]
+                )),
+                runs_iff_body: format!(
+                    "{}.{}.runs_iff_body",
+                    self.options.namespace, self.scopes[scope_id]
+                ),
                 value_expressions: self.current_value_expressions.clone(),
                 witnesses: self.current_witnesses.clone(),
-                node_constraints,
+                node_constraints: node_constraints.clone(),
+                node_facts,
+                output_fact: Some({
+                    format!("{}.{}.output_fact", self.options.namespace, self.scopes[scope_id])
+                }),
                 constraint_count: relations.len(),
             },
         );
@@ -822,7 +863,7 @@ impl<'a> Emitter<'a> {
         // Keep both the existential telescope and each conjunction fragment small
         // during elaboration. Reducible suffix calls preserve the exact right-associated
         // And proposition and original witness order by definitional equality.
-        let mut constraint_call = conclusion;
+        let mut constraint_call = conclusion.clone();
         let mut constraint_definition = String::new();
         // Include the output equation in the final fragment even for a closed pure scope.
         let fragment_count = relations.len().max(1).div_ceil(32);
@@ -860,7 +901,7 @@ impl<'a> Emitter<'a> {
         );
         // Large records need projections and recursors, not size or constructor
         // injectivity theorems; generating the latter dominates Lean elaboration.
-        let record = if self.current_record {
+        let record = {
             let fields = self
                 .current_witnesses
                 .iter()
@@ -870,10 +911,8 @@ impl<'a> Emitter<'a> {
                 "set_option genInjectivity false in\nset_option genSizeOf false in\nstructure {}.Witness where\n{fields}\n",
                 self.scopes[scope_id]
             )
-        } else {
-            String::new()
         };
-        if self.current_record {
+        {
             let name = &self.scopes[scope_id];
             let body_header =
                 final_header.replacen(&format!("def {name} "), &format!("abbrev {name}.body "), 1);
@@ -883,6 +922,29 @@ impl<'a> Emitter<'a> {
                 "{}({witness_name} : {name}.Witness) : Prop :=\n",
                 body_header.strip_suffix(": Prop :=\n").expect("scope header")
             );
+            // Reuse the single emitted body. Binder spans come directly from
+            // bind_existential, so reconstruction never parses generated Lean text.
+            let legacy_body = if self.current_runs_record {
+                None
+            } else {
+                let mut body = String::new();
+                let mut cursor = declaration_start;
+                for (depth, ((field, ty), span)) in
+                    self.current_witnesses.iter().zip(&self.current_witness_bindings).enumerate()
+                {
+                    for line in self.source[cursor..span.start].split_inclusive('\n') {
+                        body.push_str(&"  ".repeat(depth));
+                        body.push_str(line);
+                    }
+                    body.push_str(&format!("{}∃ ({field} : {ty}),\n", "  ".repeat(depth + 1)));
+                    cursor = span.end;
+                }
+                for line in self.source[cursor..].split_inclusive('\n') {
+                    body.push_str(&"  ".repeat(self.current_witnesses.len()));
+                    body.push_str(line);
+                }
+                Some(body)
+            };
             self.source
                 .insert_str(declaration_start, &(record + &constraint_definition + &body_header));
             let mut wrapper_header = final_header
@@ -901,9 +963,88 @@ impl<'a> Emitter<'a> {
             }
             let loop_arguments =
                 loop_names.iter().map(|name| format!("{name} ")).collect::<String>();
-            self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness\n\n"));
-        } else {
-            self.source.insert_str(declaration_start, &(constraint_definition + &final_header));
+            if let Some(body) = legacy_body {
+                self.source.push_str(&final_header);
+                self.source.push_str(&body);
+            } else {
+                self.source.push_str(&format!("{wrapper_header}  ∃ witness : {name}.Witness,\n    {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness\n\n"));
+            }
+            let equivalence_header = wrapper_header.replacen(
+                &format!("def {name} "),
+                &format!("theorem {name}.runs_iff_body "),
+                1,
+            );
+            let equivalence_header =
+                equivalence_header.strip_suffix(": Prop :=\n").expect("scope header");
+            self.source.push_str(&format!("{equivalence_header}: {name} {backend}{hash}params {loop_arguments}{input} outputs ↔ (∃ witness : {name}.Witness, {name}.body {backend}{hash}params {loop_arguments}{input} outputs witness) := by\n"));
+            if self.current_runs_record {
+                self.source.push_str("  exact Iff.rfl\n\n");
+            } else {
+                let fields = self
+                    .current_witnesses
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>();
+                let names = fields.join(", ");
+                self.source.push_str("  constructor\n  · intro h\n");
+                if !fields.is_empty() {
+                    self.source.push_str(&format!("    obtain ⟨{names}, h⟩ := h\n"));
+                }
+                self.source.push_str(&format!("    exact ⟨⟨{names}⟩, h⟩\n  · rintro ⟨witness, h⟩\n    cases witness with\n    | mk {names_space} =>\n", names_space=fields.join(" ")));
+                if fields.is_empty() {
+                    self.source.push_str("      exact h\n\n");
+                } else {
+                    self.source.push_str(&format!("      exact ⟨{names}, h⟩\n\n"));
+                }
+            }
+            // Keep conjunction representation details inside core-generated, Lean-checked
+            // proof accessors. Lean infers their exact propositions from the body.
+            let accessor_context = format!(
+                "{}{}{{params : Params}}{} {{inputs : {input_ty}}} {{outputs : {output_ty}}} {{witness : {name}.Witness}}",
+                if self.requires_backend { "{backend : MxxRuntime.BackendContext} " } else { "" },
+                if self.requires_hash_model { "{hashModel : MxxRuntime.HashModel} " } else { "" },
+                loop_names.iter().map(|name| format!(" {{{name} : Nat}}")).collect::<String>(),
+            );
+            let body_call =
+                format!("{name}.body {backend}{hash}params {loop_arguments}inputs outputs witness");
+            let accessor_arguments = format!(
+                "{}{}(params := params) {}(inputs := inputs) (outputs := outputs) (witness := witness)",
+                if self.requires_backend { "(backend := backend) " } else { "" },
+                if self.requires_hash_model { "(hashModel := hashModel) " } else { "" },
+                loop_names.iter().map(|name| format!("({name} := {name}) ")).collect::<String>(),
+            );
+            // Each suffix accessor consumes one conjunction link, avoiding quadratic
+            // projection strings and repeated copies of the body's let telescope.
+            for position in 1..=relations.len() {
+                let previous = if position == 1 {
+                    "facts".to_owned()
+                } else {
+                    format!("({name}.facts_tail_{} {accessor_arguments} facts)", position - 1)
+                };
+                self.source.push_str(&format!(
+                    "private def {name}.facts_tail_{position} {accessor_context} (facts : {body_call}) :=\n  {previous}.2\n\n"
+                ));
+            }
+            for (node, range) in &node_constraints {
+                for (local, position) in range.clone().enumerate() {
+                    let suffix = if position == 0 {
+                        "facts".to_owned()
+                    } else {
+                        format!("({name}.facts_tail_{position} {accessor_arguments} facts)")
+                    };
+                    self.source.push_str(&format!(
+                        "def {name}.node_{}.fact_{local} {accessor_context} (facts : {body_call}) :=\n  {suffix}.1\n\n", node.0,
+                    ));
+                }
+            }
+            let suffix = if relations.is_empty() {
+                "facts".to_owned()
+            } else {
+                format!("{name}.facts_tail_{} {accessor_arguments} facts", relations.len())
+            };
+            self.source.push_str(&format!(
+                "def {name}.output_fact {accessor_context} (facts : {body_call}) :=\n  {suffix}\n\n",
+            ));
         }
         Ok(())
     }
@@ -1460,6 +1601,28 @@ impl<'a> Emitter<'a> {
                     output(0)
                 ));
             }
+            NodeKind::CenteredExtend { modulus } => {
+                append_expression_guards(modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} {} {}",
+                    self.options.primitives.centered_extend,
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::BlockModSwitch { modulus, plaintext_modulus } => {
+                append_expression_guards(modulus, env, relations);
+                append_expression_guards(plaintext_modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} ({}) {} {}",
+                    self.options.primitives.block_mod_switch,
+                    env.expr(plaintext_modulus),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
             NodeKind::RingAutomorphism { index } => {
                 append_expression_guards(index, env, relations);
                 self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
@@ -1960,16 +2123,13 @@ impl<'a> Emitter<'a> {
     fn bind_existential(&mut self, name: &str, ty: &str) {
         self.current_value_expressions.insert(
             name.to_owned(),
-            if self.current_record { format!("witness.{name}") } else { name.to_owned() },
+            if self.current_runs_record { format!("witness.{name}") } else { name.to_owned() },
         );
         self.current_scope_values.push((name.to_owned(), ty.to_owned()));
         self.current_witnesses.push((name.to_owned(), ty.to_owned()));
-        if self.current_record {
-            self.source.push_str(&format!("  let {name} := witness.{name}\n"));
-        } else {
-            self.source.push_str(&format!("{}∃ ({} : {}),\n", "  ".repeat(self.indent), name, ty));
-            self.indent += 1;
-        }
+        let start = self.source.len();
+        self.source.push_str(&format!("  let {name} := witness.{name}\n"));
+        self.current_witness_bindings.push(start..self.source.len());
     }
     fn output_type(&self, scope: &GraphScope, node: NodeId, port: u32) -> String {
         let wire = WireRef { node, port: crate::types::Port(port) };
@@ -3446,15 +3606,26 @@ mod tests {
         assert_eq!(proof.body_relation.as_deref(), Some("Generated.generatedRoot.body"));
         assert_eq!(proof.value_expressions["w_1_0"], "witness.w_1_0");
         assert_eq!(proof.constraint_count, 8);
-        let projection = |position: usize, last: bool| {
-            format!("h{}{}", ".2".repeat(position), if last { "" } else { ".1" })
-        };
+        assert_eq!(
+            proof.node_facts[&NodeId(1)].last().unwrap(),
+            "Generated.generatedRoot.node_1.fact_6"
+        );
+        assert_eq!(proof.output_fact.as_deref(), Some("Generated.generatedRoot.output_fact"));
         let mut fixture = format!(
-            "{}\ntheorem sliceProjectionForward (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2)\n    (h : Generated.generatedRoot params () output) :\n    ∃ sliced transformed : Mxx.Primitives.ExactMatrix 17 2 1 2,\n      MxxRuntime.sliceMatrix (0 : Mxx.Primitives.ExactMatrix 17 2 2 2) 0 1 0 2 sliced ∧\n      MxxRuntime.ringAutomorphismRuns 1 sliced transformed ∧ output = transformed := by\n  obtain ⟨witness, h⟩ := h\n  rcases witness with ⟨sliced, transformed⟩\n  exact ⟨sliced, transformed, {}, {}, {}⟩\n",
+            "{}\ntheorem sliceProjectionForward (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2)\n    (h : Generated.generatedRoot params () output) :\n    ∃ sliced transformed : Mxx.Primitives.ExactMatrix 17 2 1 2,\n      MxxRuntime.sliceMatrix (0 : Mxx.Primitives.ExactMatrix 17 2 2 2) 0 1 0 2 sliced ∧\n      MxxRuntime.ringAutomorphismRuns 1 sliced transformed ∧ output = transformed := by\n  obtain ⟨witness, h⟩ := h\n  have hs := {}\n  have ht := {}\n  have ho := {}\n  rcases witness with ⟨sliced, transformed⟩\n  exact ⟨sliced, transformed, hs, ht, ho⟩\n",
             artifact.source,
-            projection(proof.node_constraints[&NodeId(1)].end - 1, false),
-            projection(proof.node_constraints[&NodeId(2)].start, false),
-            projection(proof.constraint_count, true)
+            format!(
+                "{} (params := params) (inputs := ()) (outputs := output) (witness := witness) h",
+                proof.node_facts[&NodeId(1)].last().unwrap()
+            ),
+            format!(
+                "{} (params := params) (inputs := ()) (outputs := output) (witness := witness) h",
+                proof.node_facts[&NodeId(2)][0]
+            ),
+            format!(
+                "{} (params := params) (inputs := ()) (outputs := output) (witness := witness) h",
+                proof.output_fact.as_ref().unwrap()
+            )
         );
         fixture.push_str("\nexample (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2) :\n    Generated.generatedRoot params () output ↔\n    ∃ sliced transformed : Mxx.Primitives.ExactMatrix 17 2 1 2,\n      MxxRuntime.sliceMatrix (0 : Mxx.Primitives.ExactMatrix 17 2 2 2) 0 1 0 2 sliced ∧\n      MxxRuntime.ringAutomorphismRuns 1 sliced transformed ∧ output = transformed := by\n  constructor\n  · exact sliceProjectionForward params output\n  · rintro ⟨sliced, transformed, hs, ht, ho⟩\n    exact ⟨⟨sliced, transformed⟩, by decide, by decide, by decide, by decide, by decide, by decide, hs, ht, ho⟩\n");
         fixture.push_str("\nexample (params : Generated.Params) (output : Mxx.Primitives.ExactMatrix 17 2 1 2) :\n    Generated.generatedRoot params () output ↔ ∃ witness, Generated.generatedRoot.body params () output witness := Iff.rfl\n");
@@ -3462,6 +3633,181 @@ mod tests {
             .join("../../test_data/lean_scope_projections");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("SliceProjections.lean"), fixture).unwrap();
+    }
+
+    #[test]
+    fn test_leaf_scope_named_facts_preserve_existential_runs() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(2),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let family_type = WireType::IndexedFamily {
+            element: Box::new(WireType::Matrix(matrix.clone())),
+            count: IntExpr::constant(2),
+        };
+        let decomposed_type = WireType::Preimage {
+            matrix: MatrixType { rows: IntExpr::constant(2), ..matrix.clone() },
+            max_coefficient_bound: IntExpr::constant(1),
+        };
+        let child = with_new_construction_scope(|scope| {
+            let family = NodeHandle::new(
+                NodeKind::Input {
+                    name: "captured".into(),
+                    wire_type: family_type.clone(),
+                    artifact: None,
+                },
+                vec![],
+                vec![family_type.clone()],
+            )
+            .output(0)
+            .unwrap();
+            let selected = NodeHandle::new(
+                NodeKind::FamilyGetStatic { index: IntExpr::constant(1) },
+                vec![family.clone()],
+                vec![WireType::Matrix(matrix)],
+            )
+            .output(0)
+            .unwrap();
+            let decomposed = NodeHandle::new(
+                NodeKind::GadgetDecompose {
+                    base: IntExpr::constant(2),
+                    digit_count: IntExpr::constant(2),
+                    small: false,
+                },
+                vec![selected],
+                vec![decomposed_type.clone()],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("captured_decomposition", scope, vec![family], vec![decomposed])
+                .unwrap()
+        });
+        let family = NodeHandle::new(
+            NodeKind::Input {
+                name: "members".into(),
+                wire_type: family_type.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![family_type],
+        )
+        .output(0)
+        .unwrap();
+        let parallel = NodeHandle::parallel_loop(
+            child,
+            vec![family],
+            vec![WireType::IndexedFamily {
+                element: Box::new(decomposed_type),
+                count: IntExpr::constant(2),
+            }],
+            ParallelLoop {
+                count: IntExpr::constant(2),
+                minimum_count: 0,
+                index_slot: 0,
+                bindings: vec![],
+                input_modes: vec![LoopInputMode::Broadcast],
+            },
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "leaf_facts",
+            vec![],
+            BTreeMap::from([(
+                "out".into(),
+                GraphOutput { value: parallel, confidentiality: None },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(
+            &validated,
+            &ExportOptions {
+                backend_layouts: vec![BackendLayout {
+                    modulus: 17.into(),
+                    ring_dimension: 2,
+                    base: 2.into(),
+                    regular_digits: 2,
+                }],
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        let (scope_id, shape) = artifact
+            .scope_proofs
+            .iter()
+            .find(|(id, _)| matches!(id, FrozenGraphScopeId::ParallelBody { .. }))
+            .unwrap();
+        assert_eq!(shape.witnesses.len(), 2);
+        assert_eq!(shape.node_facts.values().map(Vec::len).sum::<usize>(), shape.constraint_count);
+        assert_eq!(
+            artifact.static_node_visits,
+            graph.scopes().values().map(|scope| scope.nodes().len()).sum::<usize>()
+        );
+        let relation = &artifact.scope_relations[scope_id];
+        let run_definition = artifact
+            .source
+            .split(&format!("def {} ", relation.strip_prefix("Generated.").unwrap()))
+            .nth(1)
+            .unwrap()
+            .split("theorem ")
+            .next()
+            .unwrap();
+        assert!(run_definition.contains("∃ ("));
+        assert!(!run_definition.contains("∃ witness :"));
+        let node = |predicate: fn(&NodeKind) -> bool| {
+            graph
+                .scope(scope_id)
+                .unwrap()
+                .nodes()
+                .iter()
+                .enumerate()
+                .find(|(_, node)| predicate(node.kind()))
+                .map(|(index, _)| NodeId(index as u64))
+                .unwrap()
+        };
+        let get = node(|kind| matches!(kind, NodeKind::FamilyGetStatic { .. }));
+        let decompose = node(|kind| matches!(kind, NodeKind::GadgetDecompose { .. }));
+        let record = shape.witness_record.as_ref().unwrap();
+        let body = shape.body_relation.as_ref().unwrap();
+        let equiv = &shape.runs_iff_body;
+        let get_fact = shape.node_facts[&get].last().unwrap();
+        let decomposition_fact = shape.node_facts[&decompose].last().unwrap();
+        let output_fact = shape.output_fact.as_ref().unwrap();
+        let selected = &shape.witnesses[0].0;
+        let decomposed = &shape.witnesses[1].0;
+        let mut fixture = artifact.source.clone();
+        fixture.push_str(&format!(r#"
+example (backend : MxxRuntime.BackendContext) (params : Generated.Params) (i : Nat)
+    (inputs : Fin 2 → Mxx.Primitives.ExactMatrix 17 2 1 1)
+    (outputs : Mxx.Primitives.ExactMatrix 17 2 2 1)
+    (h : {relation} backend params i inputs outputs) :
+    ∃ witness : {record},
+      MxxRuntime.familyGetStatic inputs 1 witness.{selected} ∧
+      MxxRuntime.gadgetDecomposeRuns backend 2 2 witness.{selected} witness.{decomposed} ∧
+      outputs = witness.{decomposed} := by
+  obtain ⟨witness, facts⟩ := ({equiv} backend params i inputs outputs).mp h
+  exact ⟨witness,
+    {get_fact} (backend := backend) (params := params) (i_0 := i) (inputs := inputs) (outputs := outputs) (witness := witness) facts,
+    {decomposition_fact} (backend := backend) (params := params) (i_0 := i) (inputs := inputs) (outputs := outputs) (witness := witness) facts,
+    {output_fact} (backend := backend) (params := params) (i_0 := i) (inputs := inputs) (outputs := outputs) (witness := witness) facts⟩
+
+example (backend : MxxRuntime.BackendContext) (params : Generated.Params) (i : Nat)
+    (inputs : Fin 2 → Mxx.Primitives.ExactMatrix 17 2 1 1)
+    (outputs : Mxx.Primitives.ExactMatrix 17 2 2 1)
+    (witness : {record}) (facts : {body} backend params i inputs outputs witness) :
+    {relation} backend params i inputs outputs :=
+  ({equiv} backend params i inputs outputs).mpr ⟨witness, facts⟩
+"#));
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/lean_leaf_facts");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("LeafFacts.lean"), fixture).unwrap();
     }
 
     #[test]

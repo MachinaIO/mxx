@@ -121,7 +121,32 @@ where
     }
 }
 
-fn hash_seed_for_matrix<H: digest::Digest>(key: [u8; 32], tag: &[u8]) -> GpuRngSeed {
+/// The COEFF-format hash gadget source for one retained column range, driven by
+/// an already derived invocation seed. Compact hash admission samples each
+/// admitted range with this stream and decomposes it in place; the values equal
+/// `sample_hash_gadget_source_columns` for the same key, tag and columns.
+pub fn sample_seeded_gadget_source_columns(
+    params: &GpuDCRTPolyParams,
+    nrow: usize,
+    total_ncol: usize,
+    col_start: usize,
+    col_len: usize,
+    seed: GpuRngSeed,
+) -> GpuDCRTPolyMatrix {
+    sample_gpu_matrix_with_seed_columns_coeff(
+        params,
+        nrow,
+        total_ncol,
+        col_start,
+        col_len,
+        DistType::FinRingDist,
+        seed,
+    )
+}
+
+/// Derive the existing matrix sampler stream once for a complete logical
+/// invocation. All retained column ranges must reuse this seed.
+pub fn hash_seed_for_matrix<H: digest::Digest>(key: [u8; 32], tag: &[u8]) -> GpuRngSeed {
     let mut seed_bytes = [0u8; 32];
     let mut written = 0usize;
     let mut counter = 0u32;

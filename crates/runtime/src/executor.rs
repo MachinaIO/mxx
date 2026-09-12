@@ -60,7 +60,9 @@ pub struct ExecutionConfig {
     /// By default, derive the complete prepared GPU inventory from the graph and accept it
     /// before the first node executes. Graphs containing kinds without a
     /// compiled admitted runner fail before any partial execution. The caller
-    /// asserts exclusive device observation during setup.
+    /// asserts exclusive device observation during setup. Resource-discovery
+    /// trials must already have run in explicit backend warmup; production
+    /// reports missing plans rather than executing synthetic GPU work.
     pub prepared_gpu_admission: bool,
 }
 
@@ -947,7 +949,7 @@ where
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
     let graph_admission = if config.prepared_gpu_admission {
         backend
-            .prepare_graph_admission(validated, capture_trace, &inputs)
+            .prepare_graph_admission(validated, capture_trace, &inputs, false)
             .map_err(|error| ExecutionError::Backend(error.to_string()))?
     } else {
         None

@@ -207,11 +207,15 @@ pub trait Backend {
     /// any node executes. The returned owner ends automatic admission when
     /// execution exits, including error paths; returned values retain their own
     /// resources. Backends without prepared admission return no owner.
+    /// With `warm_up = true`, explicitly allow resource-discovery GPU trials.
+    /// Production passes false and requires every trial-derived plan to exist
+    /// already on this backend for the graph's concrete parameters.
     fn prepare_graph_admission(
         &mut self,
         _validated: &mxx_ir_core::ValidatedGraph,
         _capture_trace: bool,
         _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
+        _warm_up: bool,
     ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error>
     where
         Self: Sized,

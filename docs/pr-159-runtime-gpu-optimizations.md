@@ -83,10 +83,12 @@ intervals.
 
 Production preflight reserves the retained owners and fits temporary widths
 against actual native storage slots. It does **not** launch a synthetic GPU
-pilot at a newly encountered production node. Initial preparation/warmup may
-trace allocation claims for operations such as trapdoor sampling and preimage
-sampling before any production node starts. Child-scope preparation is included
-in that initial analysis.
+pilot at a newly encountered production node. Allocation-claim discovery for
+polynomial readback, trapdoor sampling and preimage sampling requires an explicit
+`prepare_graph_admission(..., warm_up = true)` call on the production backend.
+Child scopes are included in that preparation. Ordinary `execute` uses false
+and reports a missing plan rather than executing synthetic GPU work. Preparing
+a new backend or only a different representative graph is not sufficient.
 
 The separate low-level allocating path makes this distinction explicit through
 `select_operation(operation, warm_up)`. Only `warm_up=true` permits a missing
@@ -368,3 +370,27 @@ The new duplicate-export and failed-execution regressions passed, including the
 session-retention case. Existing dataflow and canonical GPU transfer tests also
 passed on a local RTX 4080 SUPER. This follow-up does not change GPU lifetime or
 synchronization code and did not provision another remote pod.
+
+## 11. Explicit resource-discovery warmup
+
+Normal execution now requests cached resource plans only. A missing polynomial
+readback, trapdoor or preimage plan is a warmup error, including in nested
+scopes; it never starts a replacement GPU discovery trial. Call
+`prepare_graph_admission(&graph, capture_trace, &inputs, true)` explicitly,
+drop its guard, and retain that backend for production. See
+`docs/benchmark-estimator.md` for the calling contract.
+
+CPU and GPU workspace library builds passed without warnings. On the local
+RTX 4080 SUPER, the final runtime library suite passed 262 tests with four
+ignored. The three affected graph/readback/preimage fixtures also passed three
+consecutive standalone runs each, covering warmup guard disposal, cold-cache
+rejection, successful warmed execution and rejection after a cached plan is lost.
+Independent review found no actionable issue. No integration or multi-GPU test
+was run for this change.
+
+The first suite run exposed an over-wide warmup in the forced-width tail fixture;
+its explicit warmup now uses the fixture's requested width. Two unchanged manual
+inventory fixtures (canonical import/export and polynomial constants) also failed
+that first suite's admission checks, then passed both standalone and in the final
+suite. Their initial failures were not reproduced or diagnosed by this change;
+the passing final run does not establish the absence of intermittent failures.

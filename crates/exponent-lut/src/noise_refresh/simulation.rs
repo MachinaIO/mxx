@@ -1070,7 +1070,8 @@ fn artifact_member_bytes(artifact: &ManifestArtifact) -> u64 {
         }
         ArtifactType::Trapdoor { matrix, .. } => matrix_coefficient_bytes(matrix),
         ArtifactType::Bytes { length } => u64::try_from(*length).unwrap_or(u64::MAX),
-        ArtifactType::TypedBlob { .. } => 0,
+        // Variable-size payload lengths are not available in the manifest type.
+        ArtifactType::Int | ArtifactType::TypedBlob { .. } => 0,
     }
 }
 

@@ -11,7 +11,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -759,6 +759,7 @@ pub struct Graph {
 }
 
 struct GraphData {
+    spec_hash: OnceLock<(crate::ParamEnv, crate::artifact::SpecHash)>,
     name: String,
     parameters: Vec<CompileParameter>,
     outputs: BTreeMap<String, OutputRoot>,
@@ -840,6 +841,7 @@ impl Graph {
         Ok((
             Self {
                 inner: Arc::new(GraphData {
+                    spec_hash: OnceLock::new(),
                     name,
                     parameters,
                     outputs: frozen_outputs,
@@ -854,6 +856,15 @@ impl Graph {
 
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    // A frozen graph is immutable and clones share its storage. Keep one
+    // binding-specific hash, bounding cache memory independently of the number
+    // of executions. Other bindings are hashed normally, never reused blindly.
+    pub(crate) fn spec_hash_cache(
+        &self,
+    ) -> &OnceLock<(crate::ParamEnv, crate::artifact::SpecHash)> {
+        &self.inner.spec_hash
     }
 
     pub fn parameters(&self) -> &[CompileParameter] {
@@ -1255,6 +1266,7 @@ impl SerializedGraph {
         }
         Ok(Graph {
             inner: Arc::new(GraphData {
+                spec_hash: OnceLock::new(),
                 name: self.name,
                 parameters: self.parameters,
                 outputs: self.outputs,

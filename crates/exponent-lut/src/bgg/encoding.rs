@@ -4002,8 +4002,8 @@ mod noiseless_prf_tests {
                     ExecutionConfig::default(),
                 )
                 .expect("production PRF online execution");
-                result.materialize_output("vector", &backend, &mut store).unwrap();
-                result.materialize_output("anchor", &backend, &mut store).unwrap();
+                result.materialize_output("vector", &mut backend, &mut store).unwrap();
+                result.materialize_output("anchor", &mut backend, &mut store).unwrap();
                 let RuntimeValue::Matrix(actual) = &result.outputs["vector"] else {
                     panic!("matrix")
                 };

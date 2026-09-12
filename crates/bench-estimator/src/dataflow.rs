@@ -23,8 +23,16 @@ pub enum TransferKind {
     Import,
 }
 
+/// The timing boundary that owns this transfer. Primitive local/peer transfers
+/// stay inside primitive measurement and never appear in the dataflow transfer list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferCostOwner {
+    DataflowMaterialization,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TransferCost {
+    pub owner: TransferCostOwner,
     pub kind: TransferKind,
     pub wire_type: ConcreteWireType,
     pub count: u128,
@@ -36,6 +44,8 @@ pub struct TransferCost {
 pub struct DataflowCost {
     pub transfer_seconds: f64,
     pub executor_node_instances: u128,
+    /// Scalar executor/liveness management proxy; excludes GPU backend submission,
+    /// whose host cost is already owned by primitive fleet wall timing.
     pub executor_dispatch_seconds: f64,
     #[serde(skip)]
     pub(crate) transfers: BTreeMap<Vec<u8>, (TransferKind, ConcreteWireType, u128)>,
@@ -212,6 +222,7 @@ pub(crate) fn estimate<B: MeasurementBackend>(
         let total_seconds = seconds * *count as f64;
         cost.transfer_seconds += total_seconds;
         transfers.push(TransferCost {
+            owner: TransferCostOwner::DataflowMaterialization,
             kind: *kind,
             wire_type: ty.clone(),
             count: *count,
@@ -309,11 +320,6 @@ impl Analysis<'_> {
                             cost.add(&steady, count - 1);
                         }
                     }
-                    if matches!(id, FrozenGraphScopeId::Root) {
-                        for value in &mut carried {
-                            value.store(&mut cost, false);
-                        }
-                    }
                     result = carried;
                 }
                 NodeKind::ParallelLoop(spec) => {
@@ -345,14 +351,18 @@ impl Analysis<'_> {
                             let wire = WireRef { node, port: Port(port as u32) };
                             let exported = self.exports.get(&(id.clone(), wire));
                             let all_exported = exported.is_some_and(|members| {
-                                members.as_ref().is_none_or(|members| members.len() == count)
+                                members.as_ref().is_none_or(|members| {
+                                    members.iter().collect::<BTreeSet<_>>().len() == count
+                                })
                             });
                             let artifact = all_exported ||
                                 matches!(value, Value::Leaf(ty, _) if ArtifactType::from_wire_type(ty).is_some() && !matches!(ty, ConcreteWireType::Matrix(_)));
+                            let retained = scope.outputs().contains(&wire);
                             let stage = mxx_runtime::executor::stage_matrix_family_output(
                                 id,
                                 count,
                                 self.wave_size,
+                                retained,
                             );
                             let mut overrides = BTreeMap::new();
                             if !all_exported && let Some(Some(indices)) = exported {
@@ -366,7 +376,14 @@ impl Analysis<'_> {
                             if artifact || stage {
                                 value.store(&mut boundary, artifact);
                             }
-                            cost.add(&boundary, count - overrides.len());
+                            let aliases = if all_exported {
+                                exported
+                                    .and_then(|members| members.as_ref())
+                                    .map_or(0, |members| members.len() - count)
+                            } else {
+                                0
+                            };
+                            cost.add(&boundary, count - overrides.len() + aliases);
                             result.push(Value::Family(count, vec![value.clone()], overrides));
                         }
                     }
@@ -387,6 +404,8 @@ impl Analysis<'_> {
                     result[0] = values[&args[0]].member(index);
                 }
                 NodeKind::FamilyGetDynamic => {
+                    // Estimation contract: dynamically selected family members
+                    // have the same transfer state, including export overrides.
                     result[0] = values[&args[0]].member(0);
                     result[0].load(&mut cost);
                 }
@@ -620,6 +639,38 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_member_exports_preserve_other_members_staging() {
+        let ring = Ring::new(257, 8);
+        for export_other in [false, true] {
+            let family = parallel(2, |_| Ok(ring.identity(1))).unwrap();
+            let mut context = DslContext::new("duplicate-member-exports")
+                .public_output("first", family.at(0))
+                .unwrap()
+                .public_output("alias", family.at(0))
+                .unwrap()
+                .output("consumer", family.at(1) + ring.identity(1))
+                .unwrap();
+            if export_other {
+                context = context.public_output("other", family.at(1)).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let actual = counts(&graph);
+            assert!(
+                actual.contains(&(TransferKind::Export, if export_other { 3 } else { 2 })),
+                "{actual:?}"
+            );
+            if export_other {
+                assert!(actual.contains(&(TransferKind::Import, 1)), "{actual:?}");
+                assert!(!actual.iter().any(|(kind, _)| *kind == TransferKind::Stage));
+            } else {
+                assert!(actual.contains(&(TransferKind::Stage, 1)), "{actual:?}");
+                assert!(actual.contains(&(TransferKind::Load, 1)), "{actual:?}");
+                assert!(!actual.iter().any(|(kind, _)| *kind == TransferKind::Import));
+            }
+        }
+    }
+
+    #[test]
     fn sequential_carried_family_uses_production_staging_rule() {
         let ring = Ring::new(257, 8);
         let input = parallel(1, |_| Ok(ring.identity(1))).unwrap();
@@ -634,8 +685,8 @@ mod tests {
             .validate(&ParamEnv::default())
             .unwrap();
         let counts = counts(&graph);
-        assert!(counts.contains(&(TransferKind::Stage, 2)), "{counts:?}");
-        assert!(counts.contains(&(TransferKind::Load, 1)), "{counts:?}");
+        assert!(counts.contains(&(TransferKind::Stage, 4)), "{counts:?}");
+        assert!(counts.contains(&(TransferKind::Load, 3)), "{counts:?}");
         assert_eq!(counts.len(), 2);
     }
 }

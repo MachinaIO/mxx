@@ -191,9 +191,11 @@ mod graph_tests {
                 )
             })
             .collect::<Vec<_>>();
-        let result = execute(
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute(
             &validated,
-            &mut cpu_backend([parameters]),
+            &mut backend,
             input_values
                 .iter()
                 .enumerate()
@@ -201,12 +203,15 @@ mod graph_tests {
                     (format!("input_{index}"), RuntimeValue::matrix(value.clone()))
                 })
                 .collect::<BTreeMap<_, _>>(),
-            &mut MemoryArtifactStore::default(),
+            &mut store,
             SamplingMode::Fresh,
         )
         .expect("execute merge Graph IR");
         for index in 0..3 {
-            let RuntimeValue::Matrix(actual) = &result.outputs[&format!("output_{index}")] else {
+            let actual = result
+                .materialize_output(&format!("output_{index}"), &mut backend, &mut store)
+                .expect("materialize merge output");
+            let RuntimeValue::Matrix(actual) = actual else {
                 panic!("merge output must be a matrix")
             };
             assert_eq!(actual.as_ref(), &(input_values[index].clone() + &input_values[3 + index]));

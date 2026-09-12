@@ -27,13 +27,20 @@ use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
 use tracing::info;
+
+#[cfg(feature = "gpu")]
+use crate::gpu_invocation::{GpuColumnSourceLayout, GpuInvocation, preflight};
+
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_plan;
+mod plan_cache;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionConfig {
@@ -47,7 +54,14 @@ pub struct ExecutionConfig {
     pub preimage_progress: Option<PreimageProgressConfig>,
     /// Optionally fence backend release streams after this many executed nodes.
     /// This bounds queued releases without waiting unrelated live matrices.
+    /// When set, also drain pending releases before returning. With `None`,
+    /// releases remain asynchronous and are protected by backend lifetime events.
     pub release_fence_interval: Option<NonZeroUsize>,
+    /// By default, derive the complete prepared GPU inventory from the graph and accept it
+    /// before the first node executes. Graphs containing kinds without a
+    /// compiled admitted runner fail before any partial execution. The caller
+    /// asserts exclusive device observation during setup.
+    pub prepared_gpu_admission: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -56,6 +70,7 @@ impl Default for ExecutionConfig {
             max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
             preimage_progress: None,
             release_fence_interval: None,
+            prepared_gpu_admission: true,
         }
     }
 }
@@ -76,8 +91,11 @@ pub fn stage_matrix_family_output(
     scope: &FrozenGraphScopeId,
     count: usize,
     wave_size: usize,
+    retained: bool,
 ) -> bool {
-    matches!(scope, FrozenGraphScopeId::Root) || count > wave_size
+    matches!(scope, FrozenGraphScopeId::Root) ||
+        count > wave_size ||
+        (matches!(scope, FrozenGraphScopeId::SequentialBody { .. }) && retained)
 }
 
 pub struct ExecutionResult<B: Backend> {
@@ -85,6 +103,543 @@ pub struct ExecutionResult<B: Backend> {
     pub production_id: Option<ProductionId>,
     pub artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
     pub staged_family_leases: Vec<StagedFamilyLease>,
+}
+
+/// A dispatch-only optimization: the original graph, validation and producer
+/// execution remain intact. Aliases are installed before concat input release.
+#[derive(Default)]
+struct RootBlockAliases {
+    arguments: Vec<Vec<WireRef>>,
+    absent_run_ends: Vec<usize>,
+    #[cfg(feature = "gpu")]
+    calibration: gpu_plan::Operations,
+    concats: BTreeMap<NodeId, Vec<(WireRef, WireRef)>>,
+    slices: BTreeSet<NodeId>,
+    row_block_concats: BTreeSet<NodeId>,
+    adds: BTreeMap<NodeId, (NodeId, WireRef)>,
+    decompositions: BTreeMap<NodeId, NodeId>,
+    compact_products: BTreeMap<NodeId, (NodeId, WireRef, Vec<Vec<WireRef>>)>,
+    row_sums: BTreeMap<NodeId, RootRowSumPlan>,
+    row_sum_interiors: BTreeSet<NodeId>,
+    row_sum_captures: BTreeMap<NodeId, Vec<NodeId>>,
+    // A whole root composed only of resident inputs and one fused row sum.
+    input_row_sum: Option<(NodeId, Vec<String>)>,
+}
+
+impl RootBlockAliases {
+    fn absent_run_end(
+        &self,
+        position: usize,
+        release_interval: Option<NonZeroUsize>,
+        report_progress: bool,
+    ) -> Option<usize> {
+        if release_interval.is_some() || report_progress {
+            return None;
+        }
+        self.absent_run_ends.get(position).copied().filter(|end| *end > position)
+    }
+}
+
+/// Recognized runtime row sums, exposed for explicit calibration setup.
+/// The original graph must already have passed validation.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RootRowSumPlan {
+    pub source: WireRef,
+    pub tensor_operands: Option<[WireRef; 2]>,
+    pub rows: Vec<Vec<usize>>,
+    interiors: BTreeSet<NodeId>,
+}
+
+#[doc(hidden)]
+pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRowSumPlan> {
+    let scope = validated.source.scope(&FrozenGraphScopeId::Root).expect("validated root");
+    let checked = validated.root_scope();
+    let mut uses = BTreeMap::<WireRef, Vec<NodeId>>::new();
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        for argument in scope.arguments(node).expect("validated arguments") {
+            uses.entry(argument).or_default().push(NodeId(index as u64));
+        }
+    }
+    let mut plans = BTreeMap::new();
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        if !matches!(node.kind(), NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Rows }) {
+            continue;
+        }
+        let output = WireRef { node: NodeId(index as u64), port: Port(0) };
+        let Some(ConcreteWireType::Matrix(output_type)) = checked.wire_types.get(&output) else {
+            continue
+        };
+        let arguments = scope.arguments(node).expect("validated concat arguments");
+        if arguments.is_empty() || output_type.rows != arguments.len() {
+            continue;
+        }
+        let mut source = None;
+        let mut groups = Vec::new();
+        let mut interiors = BTreeSet::new();
+        let mut valid = true;
+        for argument in arguments {
+            let mut pending = vec![argument];
+            let mut rows = Vec::new();
+            while let Some(wire) = pending.pop() {
+                let Some(ConcreteWireType::Matrix(ty)) = checked.wire_types.get(&wire) else {
+                    valid = false;
+                    break;
+                };
+                if wire.port != Port(0) ||
+                    uses.get(&wire).map(Vec::len) != Some(1) ||
+                    checked.liveness.retained.contains(&wire) ||
+                    scope.outputs().contains(&wire) ||
+                    ty.rows != 1 ||
+                    ty.columns != output_type.columns ||
+                    ty.modulus != output_type.modulus ||
+                    ty.ring_dimension != output_type.ring_dimension
+                {
+                    valid = false;
+                    break;
+                }
+                let producer = scope.node(wire.node).expect("validated row producer");
+                let inputs = scope.arguments(producer).expect("validated row arguments");
+                match producer.kind() {
+                    NodeKind::MatrixBinary(MatrixBinaryOp::Add) if inputs.len() == 2 => {
+                        pending.push(inputs[1]);
+                        pending.push(inputs[0]);
+                    }
+                    NodeKind::Slice { rows: range, columns } if inputs.len() == 1 => {
+                        let input = inputs[0];
+                        let Some(ConcreteWireType::Matrix(input_type)) =
+                            checked.wire_types.get(&input)
+                        else {
+                            valid = false;
+                            break;
+                        };
+                        let evaluate = |range: &mxx_ir_core::node::IndexRange| {
+                            Some((
+                                range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                                range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                            ))
+                        };
+                        let row_range = range.as_ref().map_or(Some((0, input_type.rows)), evaluate);
+                        let column_range =
+                            columns.as_ref().map_or(Some((0, input_type.columns)), evaluate);
+                        let Some((start, end)) = row_range else {
+                            valid = false;
+                            break
+                        };
+                        if end.checked_sub(start) != Some(1) ||
+                            end > input_type.rows ||
+                            column_range != Some((0, input_type.columns)) ||
+                            input_type.columns != output_type.columns ||
+                            input_type.modulus != output_type.modulus ||
+                            input_type.ring_dimension != output_type.ring_dimension ||
+                            source.is_some_and(|source| source != input)
+                        {
+                            valid = false;
+                            break;
+                        }
+                        source = Some(input);
+                        rows.push(start);
+                    }
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+                interiors.insert(wire.node);
+            }
+            if !valid || rows.is_empty() {
+                valid = false;
+                break;
+            }
+            groups.push(rows);
+        }
+        if valid {
+            plans.insert(
+                output.node,
+                RootRowSumPlan {
+                    source: source.expect("nonempty row groups have a source"),
+                    tensor_operands: None,
+                    rows: groups,
+                    interiors,
+                },
+            );
+        }
+    }
+    // Compose only when every original consumer remains represented. A
+    // retained parent or a mixed consumer keeps the materialized boundary.
+    loop {
+        let mut replacement = None;
+        for (parent_id, parent) in &plans {
+            let wire = WireRef { node: *parent_id, port: Port(0) };
+            if checked.liveness.retained.contains(&wire) || scope.outputs().contains(&wire) {
+                continue;
+            }
+            let Some(consumers) = uses.get(&wire) else { continue };
+            let parent_type = checked.wire_types[&wire].matrix_type().expect("row sum output");
+            let mut children = plans
+                .iter()
+                .filter(|(_, plan)| plan.source == wire)
+                .map(|(node, plan)| (*node, plan.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let mut covered = true;
+            for consumer in consumers {
+                if children
+                    .iter()
+                    .any(|(node, plan)| node == consumer || plan.interiors.contains(consumer))
+                {
+                    continue;
+                }
+                let node = scope.node(*consumer).expect("validated row sum consumer");
+                let NodeKind::Slice { rows, columns } = node.kind() else {
+                    covered = false;
+                    break
+                };
+                let output = WireRef { node: *consumer, port: Port(0) };
+                let Some(ConcreteWireType::Matrix(output_type)) = checked.wire_types.get(&output)
+                else {
+                    covered = false;
+                    break;
+                };
+                let evaluate = |range: &mxx_ir_core::node::IndexRange| {
+                    Some((
+                        range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                        range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                    ))
+                };
+                let selected = rows.as_ref().map_or(Some((0, parent_type.rows)), evaluate);
+                let columns = columns.as_ref().map_or(Some((0, parent_type.columns)), evaluate);
+                let Some((start, end)) = selected else {
+                    covered = false;
+                    break
+                };
+                if end.checked_sub(start) != Some(1) ||
+                    end > parent.rows.len() ||
+                    columns != Some((0, parent_type.columns)) ||
+                    output_type.rows != 1 ||
+                    output_type.columns != parent_type.columns ||
+                    output_type.modulus != parent_type.modulus ||
+                    output_type.ring_dimension != parent_type.ring_dimension
+                {
+                    covered = false;
+                    break;
+                }
+                children.insert(
+                    *consumer,
+                    RootRowSumPlan {
+                        source: wire,
+                        tensor_operands: None,
+                        rows: vec![vec![start]],
+                        interiors: BTreeSet::new(),
+                    },
+                );
+            }
+            if !covered || children.is_empty() {
+                continue;
+            }
+            // A compact DAG can repeatedly sum two copies of a prior row.
+            // Keep that materialized boundary instead of expanding its terms
+            // exponentially. This matches the native row-sum term capacity.
+            let expanded_terms = children.values().try_fold(0usize, |total, child| {
+                child
+                    .rows
+                    .iter()
+                    .flatten()
+                    .try_fold(total, |total, row| total.checked_add(parent.rows[*row].len()))
+            });
+            if expanded_terms.is_none_or(|terms| terms > 32) {
+                continue;
+            }
+            for child in children.values_mut() {
+                child.rows = child
+                    .rows
+                    .iter()
+                    .map(|group| {
+                        group.iter().flat_map(|row| parent.rows[*row].iter().copied()).collect()
+                    })
+                    .collect();
+                child.source = parent.source;
+                child.interiors.extend(parent.interiors.iter().copied());
+                child.interiors.insert(*parent_id);
+            }
+            replacement = Some((*parent_id, children));
+            break;
+        }
+        let Some((parent, children)) = replacement else { break };
+        plans.remove(&parent);
+        plans.extend(children);
+    }
+    // A single row-sum consumer can read tensor products directly. Keep the
+    // tensor boundary whenever another plan or observable consumer needs it.
+    let sources = plans.values().map(|plan| plan.source).collect::<Vec<_>>();
+    for plan in plans.values_mut() {
+        let source = plan.source;
+        if sources.iter().filter(|wire| **wire == source).count() != 1 ||
+            checked.liveness.retained.contains(&source) ||
+            scope.outputs().contains(&source) ||
+            !matches!(
+                scope.node(source.node).expect("validated source").kind(),
+                NodeKind::Tensor
+            ) ||
+            !uses
+                .get(&source)
+                .is_some_and(|users| users.iter().all(|user| plan.interiors.contains(user)))
+        {
+            continue;
+        }
+        let arguments = scope.arguments(scope.node(source.node).unwrap()).unwrap();
+        if arguments.len() != 2 ||
+            arguments.iter().any(|wire| {
+                !matches!(checked.wire_types.get(wire), Some(ConcreteWireType::Matrix(_)))
+            })
+        {
+            continue;
+        }
+        plan.tensor_operands = Some([arguments[0], arguments[1]]);
+        plan.interiors.insert(source.node);
+    }
+    plans
+}
+
+fn root_block_aliases(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+    capture_trace: bool,
+) -> Arc<RootBlockAliases> {
+    if capture_trace || scope_id != &FrozenGraphScopeId::Root {
+        return Arc::new(RootBlockAliases::default());
+    }
+    plan_cache::get(validated, || {
+        let plan = build_root_block_aliases(validated);
+        #[cfg(feature = "gpu")]
+        let plan = gpu_plan::prepare(validated, plan);
+        plan
+    })
+}
+
+fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
+    let mut plan = RootBlockAliases::default();
+    let scope = validated.source.scope(&FrozenGraphScopeId::Root).expect("validated root");
+    let checked = validated.root_scope();
+    plan.arguments = checked
+        .execution_order
+        .iter()
+        .map(|node| scope.arguments(node).expect("validated arguments"))
+        .collect();
+    plan.row_sums = root_row_sum_plans(validated);
+    let mut reserved = BTreeSet::new();
+    for (output, row_sum) in &plan.row_sums {
+        reserved.insert(*output);
+        reserved.insert(row_sum.source.node);
+        reserved.extend(row_sum.interiors.iter().copied());
+        plan.row_sum_interiors.extend(row_sum.interiors.iter().copied());
+        let first = *row_sum.interiors.first().expect("nonempty row sum interiors");
+        plan.row_sum_captures.entry(first).or_default().push(*output);
+    }
+    let mut users = BTreeMap::<WireRef, Vec<usize>>::new();
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        for wire in scope.arguments(node).expect("validated arguments") {
+            users.entry(wire).or_default().push(index);
+        }
+    }
+    for (index, node) in checked.execution_order.iter().enumerate() {
+        if reserved.contains(&NodeId(index as u64)) {
+            continue;
+        }
+        if !matches!(node.kind(), NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Rows }) {
+            continue;
+        }
+        let wire = WireRef { node: NodeId(index as u64), port: Port(0) };
+        if checked.liveness.retained.contains(&wire) || scope.outputs().contains(&wire) {
+            continue;
+        }
+        let Some(consumers) = users.get(&wire) else { continue };
+        let Some(ConcreteWireType::Matrix(concat_type)) = checked.wire_types.get(&wire) else {
+            continue;
+        };
+        let args = scope.arguments(node).expect("validated concat arguments");
+        let mut blocks = Vec::with_capacity(args.len());
+        let mut start = 0usize;
+        for arg in args {
+            let Some(ConcreteWireType::Matrix(ty)) = checked.wire_types.get(&arg) else {
+                break;
+            };
+            let Some(end) = start.checked_add(ty.rows) else { break };
+            blocks.push((start, end, arg));
+            start = end;
+        }
+        if blocks.len() != node.arguments().len() {
+            continue;
+        }
+        if consumers.len() == 1 {
+            let consumer = consumers[0];
+            let add = &checked.execution_order[consumer];
+            let args = scope.arguments(add).expect("validated add arguments");
+            let output = WireRef { node: NodeId(consumer as u64), port: Port(0) };
+            if blocks.len() <= 32 &&
+                matches!(add.kind(), NodeKind::GadgetDecompose { .. }) &&
+                args == [wire]
+            {
+                plan.row_block_concats.insert(wire.node);
+                plan.decompositions.insert(output.node, wire.node);
+                continue;
+            }
+            if blocks.len() <= 32 &&
+                matches!(add.kind(), NodeKind::MatrixMulSmallRhs) &&
+                args.len() == 2 &&
+                args[0] == wire &&
+                !checked.liveness.retained.contains(&output) &&
+                !scope.outputs().contains(&output)
+            {
+                let Some(ConcreteWireType::Matrix(product_type)) = checked.wire_types.get(&output)
+                else {
+                    continue
+                };
+                let mut aliases = vec![Vec::new(); blocks.len()];
+                let mut covered = true;
+                for user in users.get(&output).into_iter().flatten() {
+                    let slice = &checked.execution_order[*user];
+                    let NodeKind::Slice { rows, columns } = slice.kind() else {
+                        covered = false;
+                        break
+                    };
+                    let range = |range: &mxx_ir_core::node::IndexRange| {
+                        Some((
+                            range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                            range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                        ))
+                    };
+                    let rows = rows.as_ref().map_or(Some((0, product_type.rows)), range);
+                    let columns = columns.as_ref().map_or(Some((0, product_type.columns)), range);
+                    let Some(block) =
+                        blocks.iter().position(|(start, end, _)| rows == Some((*start, *end)))
+                    else {
+                        covered = false;
+                        break
+                    };
+                    if columns != Some((0, product_type.columns)) ||
+                        reserved.contains(&NodeId(*user as u64))
+                    {
+                        covered = false;
+                        break;
+                    }
+                    aliases[block].push(WireRef { node: NodeId(*user as u64), port: Port(0) });
+                }
+                if covered && aliases.iter().all(|aliases| !aliases.is_empty()) {
+                    plan.row_block_concats.insert(wire.node);
+                    plan.slices.extend(aliases.iter().flatten().map(|wire| wire.node));
+                    plan.compact_products.insert(output.node, (wire.node, args[1], aliases));
+                    continue;
+                }
+            }
+            if matches!(add.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add)) &&
+                args.len() == 2 &&
+                args[0] == wire &&
+                args[1] != wire &&
+                checked.wire_types.get(&args[1]) == checked.wire_types.get(&wire) &&
+                checked.wire_types.get(&output) == checked.wire_types.get(&wire)
+            {
+                plan.row_block_concats.insert(wire.node);
+                plan.adds.insert(output.node, (wire.node, args[1]));
+                continue;
+            }
+        }
+        let mut aliases = Vec::with_capacity(consumers.len());
+        for &consumer in consumers {
+            let slice = &checked.execution_order[consumer];
+            let NodeKind::Slice { rows, columns } = slice.kind() else { break };
+            let range = |range: &mxx_ir_core::node::IndexRange| {
+                Some((
+                    range.start.evaluate(&validated.bindings).ok()?.to_usize()?,
+                    range.end.evaluate(&validated.bindings).ok()?.to_usize()?,
+                ))
+            };
+            let row_range = match rows {
+                Some(rows) => range(rows),
+                None => Some((0, concat_type.rows)),
+            };
+            let col_range = match columns {
+                Some(columns) => range(columns),
+                None => Some((0, concat_type.columns)),
+            };
+            if col_range != Some((0, concat_type.columns)) {
+                break;
+            }
+            let Some((_, _, source)) =
+                blocks.iter().find(|(start, end, _)| row_range == Some((*start, *end)))
+            else {
+                break
+            };
+            let output = WireRef { node: NodeId(consumer as u64), port: Port(0) };
+            if checked.wire_types.get(&output) != checked.wire_types.get(source) {
+                break;
+            }
+            aliases.push((output, *source));
+        }
+        if aliases.len() == consumers.len() {
+            plan.slices.extend(aliases.iter().map(|(output, _)| output.node));
+            plan.concats.insert(wire.node, aliases);
+        }
+    }
+    // Omit only bookkeeping for wires which no dispatch action can insert.
+    // In particular, do not move captures or last-use releases of live sources.
+    let absent = plan
+        .row_sum_interiors
+        .iter()
+        .filter_map(|id| {
+            let wire = WireRef { node: *id, port: Port(0) };
+            (!plan.row_sums.contains_key(id) &&
+                !plan.adds.contains_key(id) &&
+                !plan.slices.contains(id) &&
+                !checked.liveness.retained.contains(&wire) &&
+                !scope.outputs().contains(&wire) &&
+                checked.execution_order[id.0 as usize].output_types().len() == 1)
+                .then_some(wire)
+        })
+        .collect::<BTreeSet<_>>();
+    plan.absent_run_ends = (0..checked.execution_order.len()).collect();
+    let mut run_end = checked.execution_order.len();
+    for position in (0..checked.execution_order.len()).rev() {
+        let id = NodeId(position as u64);
+        let wire = WireRef { node: id, port: Port(0) };
+        let empty = absent.contains(&wire) &&
+            !plan.row_sum_captures.contains_key(&id) &&
+            !plan.concats.contains_key(&id) &&
+            !plan.row_block_concats.contains(&id) &&
+            plan.arguments[position].iter().all(|argument| absent.contains(argument));
+        if empty {
+            plan.absent_run_ends[position] = run_end;
+        } else {
+            run_end = position;
+        }
+    }
+    if let [output] = scope.outputs() {
+        if let Some(row_sum) = plan.row_sums.get(&output.node) {
+            let operands = row_sum
+                .tensor_operands
+                .as_ref()
+                .map_or(std::slice::from_ref(&row_sum.source), |operands| operands.as_slice());
+            let names = operands
+                .iter()
+                .map(|wire| match scope.node(wire.node)?.kind() {
+                    NodeKind::Input { name, artifact: None, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            // No other producer, artifact load, or observable intermediate may
+            // disappear when dispatching the already-fused operation directly.
+            if names.is_some() &&
+                checked.execution_order.iter().enumerate().all(|(index, _)| {
+                    let id = NodeId(index as u64);
+                    id == output.node ||
+                        row_sum.interiors.contains(&id) ||
+                        operands.iter().any(|wire| wire.node == id)
+                })
+            {
+                plan.input_row_sum = names.map(|names| (output.node, names));
+            }
+        }
+    }
+    plan
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,17 +659,19 @@ impl<B: Backend> ExecutionResult<B> {
     pub fn materialize_output<S: ArtifactStore>(
         &mut self,
         name: &str,
-        backend: &B,
+        backend: &mut B,
         store: &mut S,
     ) -> Result<&RuntimeValue<B>, ExecutionError> {
         let value = self
             .outputs
-            .get(name)
-            .cloned()
+            .get_mut(name)
             .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?;
-        let value = materialize_runtime_value(value, backend, store)?;
-        self.outputs.insert(name.to_owned(), value);
-        Ok(&self.outputs[name])
+        // Resident matrices already are the materialized output. In particular,
+        // keep their owners in place instead of cloning and reinserting them.
+        if !matches!(value, RuntimeValue::Matrix(_) | RuntimeValue::SmallMatrix(_)) {
+            *value = materialize_runtime_value(value.clone(), backend, store)?;
+        }
+        Ok(value)
     }
 
     /// Deletes ephemeral streamed families returned by this execution.
@@ -163,13 +720,11 @@ struct InstanceResult<B: Backend> {
 struct ExecutableNode<'a> {
     id: NodeId,
     kind: &'a NodeKind,
-    args: Vec<WireRef>,
+    args: &'a [WireRef],
 }
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
-    #[error("GPU preparation dispatch yielded to its completion boundary")]
-    GpuPreparationYield,
     #[error("backend operation failed: {0}")]
     Backend(String),
     #[error("preimage progress expected {expected} generated preimages but observed {actual}")]
@@ -390,7 +945,13 @@ where
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
-    let scratch_production = scratch_production_id(&production, rand::random());
+    let graph_admission = if config.prepared_gpu_admission {
+        backend
+            .prepare_graph_admission(validated, capture_trace, &inputs)
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?
+    } else {
+        None
+    };
     let mut executor = Executor {
         validated,
         backend,
@@ -400,7 +961,7 @@ where
         session,
         config,
         production,
-        scratch_production,
+        scratch_production: None,
         staged_families: BTreeMap::new(),
         root_exports: {
             let mut exports = BTreeMap::<_, Vec<_>>::new();
@@ -478,14 +1039,14 @@ where
     ) {
         Ok(instance) => instance,
         Err(error) => {
-            return match executor.cleanup_all_staged_families() {
+            return match executor.cleanup_failed_execution() {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
             };
         }
     };
     if let Err(error) = executor.finish_preimage_progress() {
-        return match executor.cleanup_all_staged_families() {
+        return match executor.cleanup_failed_execution() {
             Ok(()) => Err(error),
             Err(cleanup_error) => Err(cleanup_error),
         };
@@ -500,7 +1061,7 @@ where
     let (production_id, artifact_handles) = match executor.persist_outputs(&mut named_outputs) {
         Ok(persisted) => persisted,
         Err(error) => {
-            return match executor.cleanup_all_staged_families() {
+            return match executor.cleanup_failed_execution() {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
             };
@@ -515,7 +1076,9 @@ where
             });
         }
     }
-    executor.fence_pending_releases()?;
+    if config.release_fence_interval.is_some() {
+        executor.fence_pending_releases()?;
+    }
     info!(
         graph = validated.source.name(),
         host_returned_node_instances = executor.executed_node_count,
@@ -529,6 +1092,7 @@ where
         artifact_handles,
         staged_family_leases,
     };
+    drop(graph_admission);
     Ok((result, executor.trace.take().unwrap_or_default()))
 }
 
@@ -541,7 +1105,7 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     session: Option<ProductionId>,
     config: ExecutionConfig,
     production: ProductionId,
-    scratch_production: ProductionId,
+    scratch_production: Option<ProductionId>,
     staged_families: BTreeMap<(ProductionId, String), (ManifestArtifact, Arc<()>)>,
     root_exports: BTreeMap<WireRef, Vec<(String, ArtifactConfidentiality)>>,
     member_exports: BTreeMap<WireId, BTreeMap<usize, Vec<(String, ArtifactConfidentiality)>>>,
@@ -628,10 +1192,10 @@ where
     ) -> Result<InstanceResult<B>, ExecutionError> {
         self.execute_instances_batch(
             scope_id,
-            vec![env.clone()],
-            vec![path],
-            vec![inputs],
-            vec![placement],
+            std::slice::from_ref(env),
+            &[path],
+            &[inputs],
+            &[placement],
         )
         .map(|mut instances| instances.pop().expect("single execution returns one instance"))
     }
@@ -639,10 +1203,10 @@ where
     fn execute_instances_batch(
         &mut self,
         scope_id: &FrozenGraphScopeId,
-        envs: Vec<ParamEnv>,
-        paths: Vec<Vec<InstantiationFrame>>,
-        inputs: Vec<BTreeMap<String, RuntimeValue<B>>>,
-        placements: Vec<usize>,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        inputs: &[BTreeMap<String, RuntimeValue<B>>],
+        placements: &[usize],
     ) -> Result<Vec<InstanceResult<B>>, ExecutionError> {
         debug_assert_eq!(envs.len(), paths.len());
         debug_assert_eq!(envs.len(), inputs.len());
@@ -656,11 +1220,103 @@ where
         let validated_scope = self.validated.scope(scope_id).ok_or_else(|| {
             ExecutionError::MissingSubgraph { node: NodeId(0), name: format!("{scope_id:?}") }
         })?;
+        #[cfg(feature = "gpu")]
+        self.backend.observe_gpu_scope(true);
         let schedule = &validated_scope.liveness;
+        let block_aliases = root_block_aliases(self.validated, scope_id, self.trace.is_some());
+        #[cfg(feature = "gpu")]
+        self.backend.observe_gpu_omitted_nodes(
+            scope_id,
+            block_aliases
+                .slices
+                .iter()
+                .copied()
+                .chain(block_aliases.concats.keys().copied())
+                .chain(block_aliases.row_block_concats.iter().copied())
+                .chain(block_aliases.row_sum_interiors.iter().copied()),
+        );
+        if envs.len() == 1 &&
+            self.config.release_fence_interval.is_none() &&
+            !tracing::enabled!(tracing::Level::INFO)
+        {
+            if let Some((node, names)) = &block_aliases.input_row_sum {
+                // Lazy, staged, missing and non-matrix inputs retain the ordinary
+                // dispatch path and its materialization/error ordering.
+                let matrices = names
+                    .iter()
+                    .map(|name| match inputs[0].get(name) {
+                        Some(RuntimeValue::Matrix(matrix)) => Some(matrix.as_ref()),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(matrices) = matrices {
+                    #[cfg(feature = "gpu")]
+                    self.backend.observe_gpu_node(scope_id, *node, 1, &envs[0]);
+                    #[cfg(feature = "gpu")]
+                    if let Some(operation) =
+                        block_aliases.calibration[node].clone().map_err(ExecutionError::Backend)?
+                    {
+                        self.backend
+                            .select_gpu_operation(operation)
+                            .map_err(Self::backend_error)?;
+                    }
+                    self.set_placement(placements[0])?;
+                    let row_sum = &block_aliases.row_sums[node];
+                    let output = if let [left, right] = matrices.as_slice() {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::TensorSumRows { left, right, rows: &row_sum.rows },
+                        )
+                        .map_err(Self::backend_error)?;
+                        self.backend.tensor_sum_rows(left, right, &row_sum.rows)
+                    } else {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::SumRows { value: matrices[0], rows: &row_sum.rows },
+                        )
+                        .map_err(Self::backend_error)?;
+                        self.backend.sum_rows(matrices[0], &row_sum.rows)
+                    }
+                    .map_err(Self::backend_error)?;
+                    self.executed_node_count = self
+                        .executed_node_count
+                        .saturating_add(validated_scope.execution_order.len());
+                    self.has_pending_releases = true;
+                    #[cfg(feature = "gpu")]
+                    self.backend.observe_gpu_scope(false);
+                    return Ok(vec![InstanceResult { outputs: vec![RuntimeValue::matrix(output)] }]);
+                }
+            }
+        }
         let mut values = (0..envs.len())
             .map(|_| BTreeMap::<WireRef, RuntimeValue<B>>::new())
             .collect::<Vec<_>>();
-        for (position, handle) in validated_scope.execution_order.iter().enumerate() {
+        // Own concat blocks until their sole block-aware consumer executes, even when
+        // the unchanged liveness schedule releases the original input wires.
+        let mut row_blocks = (0..envs.len())
+            .map(|_| BTreeMap::<NodeId, Vec<Arc<B::Matrix>>>::new())
+            .collect::<Vec<_>>();
+        let mut row_sum_sources = (0..envs.len())
+            .map(|_| BTreeMap::<NodeId, (Arc<B::Matrix>, Option<Arc<B::Matrix>>)>::new())
+            .collect::<Vec<_>>();
+        let mut position = 0;
+        while position < validated_scope.execution_order.len() {
+            if let Some(end) = block_aliases.absent_run_end(
+                position,
+                self.config.release_fence_interval,
+                tracing::enabled!(tracing::Level::INFO),
+            ) {
+                // These nodes have no values, actions, or live arguments. Keep
+                // their structural count without visiting their empty dispatch.
+                self.executed_node_count = self
+                    .executed_node_count
+                    .saturating_add((end - position).saturating_mul(envs.len()));
+                position = end;
+                continue;
+            }
+            let handle = &validated_scope.execution_order[position];
             // Counts include structural nodes and each instantiated loop-body
             // node, not coefficients, kernels, or device-completed work. Scope
             // totals describe the unexpanded template only. Reporting never
@@ -684,118 +1340,319 @@ where
                 );
                 self.last_progress_report = Some(Instant::now());
             }
+            let dynamic_arguments;
+            let arguments = if let Some(arguments) = block_aliases.arguments.get(position) {
+                arguments.as_slice()
+            } else {
+                dynamic_arguments =
+                    scope.arguments(handle).expect("validated node belongs to its scope");
+                dynamic_arguments.as_slice()
+            };
             let node = ExecutableNode {
                 id: NodeId(position as u64),
                 kind: handle.kind(),
-                args: scope.arguments(handle).expect("validated node belongs to its scope"),
+                args: arguments,
             };
-            #[cfg(feature = "gpu")]
-            let calibration_groups =
-                if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
-                    let declared_argument_types = node
+            let aliased = block_aliases.slices.contains(&node.id) ||
+                block_aliases.concats.contains_key(&node.id) ||
+                block_aliases.row_block_concats.contains(&node.id) ||
+                block_aliases.row_sum_interiors.contains(&node.id);
+            if let Some(outputs) = block_aliases.row_sum_captures.get(&node.id) {
+                for index in 0..envs.len() {
+                    self.set_placement(placements[index])?;
+                    for output in outputs {
+                        let row_sum = &block_aliases.row_sums[output];
+                        let matrices = if let Some([left, right]) = row_sum.tensor_operands {
+                            // Materialize in the original Tensor argument order,
+                            // before its unchanged liveness releases either input.
+                            let left = self.matrix(&mut values[index], left)?;
+                            let right = self.matrix(&mut values[index], right)?;
+                            (left, Some(right))
+                        } else {
+                            (self.matrix(&mut values[index], row_sum.source)?, None)
+                        };
+                        row_sum_sources[index].insert(*output, matrices);
+                    }
+                }
+            }
+            if block_aliases.row_block_concats.contains(&node.id) {
+                for index in 0..envs.len() {
+                    self.set_placement(placements[index])?;
+                    let matrices = node
                         .args
                         .iter()
-                        .map(|wire| {
-                            scope
-                                .node(wire.node)
-                                .and_then(|producer| {
-                                    producer.output_types().get(wire.port.0 as usize)
-                                })
-                                .cloned()
-                                .ok_or_else(|| {
-                                    ExecutionError::MissingMetadata(WireId {
-                                        instantiation_path: paths[0].clone(),
-                                        wire: *wire,
-                                    })
-                                })
-                        })
+                        .map(|argument| self.matrix(&mut values[index], *argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    crate::gpu_calibration::gpu_calibration_groups(
-                        scope_id,
-                        node.id,
-                        node.kind,
-                        &declared_argument_types,
-                        handle.output_types(),
-                        &envs,
-                    )
-                    .map_err(ExecutionError::Backend)?
+                    row_blocks[index].insert(node.id, matrices);
+                }
+            }
+            if let Some(aliases) = block_aliases.concats.get(&node.id) {
+                for index in 0..envs.len() {
+                    self.set_placement(placements[index])?;
+                    // Materialize every original argument, including unselected
+                    // blocks, preserving artifact-load errors and staging work.
+                    let matrices = node
+                        .args
+                        .iter()
+                        .map(|argument| self.matrix(&mut values[index], *argument))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for (output, source) in aliases {
+                        let argument = node
+                            .args
+                            .iter()
+                            .position(|argument| argument == source)
+                            .expect("block alias selects a concat argument");
+                        let matrix = matrices[argument].clone();
+                        values[index].insert(*output, RuntimeValue::Matrix(matrix));
+                    }
+                }
+            }
+            // A singleton dispatch needs neither an index vector nor an outer
+            // group allocation. Dynamic child calibration retains its grouping.
+            let mut singleton_operation = None;
+            let mut all_instances = |operation: Option<[u8; 32]>| {
+                if envs.len() == 1 {
+                    singleton_operation = Some(operation);
+                    Vec::new()
                 } else {
-                    vec![(None, (0..envs.len()).collect())]
-                };
+                    vec![(operation, (0..envs.len()).collect::<Vec<_>>())]
+                }
+            };
+            #[cfg(feature = "gpu")]
+            let calibration_groups = if aliased {
+                Vec::new()
+            } else if scope_id == &FrozenGraphScopeId::Root && self.trace.is_none() {
+                let operation =
+                    block_aliases.calibration[&node.id].clone().map_err(ExecutionError::Backend)?;
+                all_instances(operation)
+            } else if scope_id == &FrozenGraphScopeId::Root &&
+                crate::gpu_calibration::gpu_operation_is_column_separable(node.kind)
+            {
+                // The root executes with exactly validated.bindings. Its concrete
+                // types already passed validation; re-evaluating declared types here
+                // duplicates that work. Child scopes still use their actual runtime
+                // environments below, including loop-dependent preimage bounds.
+                let argument_types = node
+                    .args
+                    .iter()
+                    .map(|wire| validated_scope.wire_types[wire].clone())
+                    .collect::<Vec<_>>();
+                let output_types = (0..handle.output_types().len())
+                    .map(|port| {
+                        // Validation and dispatch both number nodes by their
+                        // position in the frozen scope's execution order.
+                        let wire = WireRef { node: node.id, port: Port(port as u32) };
+                        validated_scope.wire_types[&wire].clone()
+                    })
+                    .collect::<Vec<_>>();
+                let operation =
+                    crate::gpu_calibration::gpu_operation_is_column_separable_for_types(
+                        node.kind,
+                        &argument_types,
+                    )
+                    .then(|| {
+                        crate::gpu_calibration::gpu_calibration_operation_identity(
+                            node.kind,
+                            &argument_types,
+                            &output_types,
+                            &self.validated.bindings,
+                        )
+                    })
+                    .transpose()
+                    .map_err(ExecutionError::Backend)?;
+                all_instances(operation)
+            } else if crate::gpu_calibration::gpu_operation_is_column_separable(node.kind) {
+                let declared_argument_types = node
+                    .args
+                    .iter()
+                    .map(|wire| {
+                        scope
+                            .node(wire.node)
+                            .and_then(|producer| producer.output_types().get(wire.port.0 as usize))
+                            .cloned()
+                            .ok_or_else(|| {
+                                ExecutionError::MissingMetadata(WireId {
+                                    instantiation_path: paths[0].clone(),
+                                    wire: *wire,
+                                })
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::gpu_calibration::gpu_calibration_groups(
+                    scope_id,
+                    node.id,
+                    node.kind,
+                    &declared_argument_types,
+                    handle.output_types(),
+                    envs,
+                )
+                .map_err(ExecutionError::Backend)?
+            } else {
+                all_instances(None)
+            };
             #[cfg(not(feature = "gpu"))]
             let calibration_groups: Vec<(Option<[u8; 32]>, Vec<usize>)> =
-                vec![(None, (0..envs.len()).collect())];
+                if aliased { Vec::new() } else { all_instances(None) };
 
-            for (operation, mut indices) in calibration_groups {
+            for (operation, indices) in
+                singleton_operation.iter().map(|operation| (*operation, &[0usize][..])).chain(
+                    calibration_groups
+                        .iter()
+                        .map(|(operation, indices)| (*operation, indices.as_slice())),
+                )
+            {
+                #[cfg(feature = "gpu")]
+                self.backend.observe_gpu_node(scope_id, node.id, indices.len(), &envs[indices[0]]);
                 if let Some(operation) = operation {
                     self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
-                    if self.backend.begin_gpu_preparation().map_err(Self::backend_error)? {
-                        let index = indices[0];
-                        self.set_placement(placements[index])?;
-                        let mut preparation_values = values[index].clone();
-                        loop {
-                            // The preparation wrapper never returns a production value:
-                            // inputs and pilot outputs remain owned by the backend until
-                            // the explicit completion boundary has observed their events.
-                            let dispatch = self.execute_node(
-                                scope_id,
-                                &envs[index],
-                                &paths[index],
-                                &node,
-                                &inputs[index],
-                                &mut preparation_values,
-                            );
-                            match dispatch {
-                                Err(ExecutionError::GpuPreparationYield) => {
-                                    match self.backend.advance_gpu_preparation() {
-                                        Ok(true) => {
-                                            values[index] = preparation_values;
-                                            break;
-                                        }
-                                        Ok(false) => {}
-                                        Err(error) => {
-                                            self.backend.cancel_gpu_preparation();
-                                            return Err(Self::backend_error(error));
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    self.backend.cancel_gpu_preparation();
-                                    return Err(error);
-                                }
-                                Ok(()) => {
-                                    self.backend.cancel_gpu_preparation();
-                                    // Some nodes (e.g. transcript replay and whole
-                                    // trapdoor construction) do not need a column pilot.
-                                    // Keep their actual result and never draw twice.
-                                    values[index] = preparation_values;
-                                    indices.remove(0);
-                                    break;
-                                }
-                            }
-                        }
-                    }
                 }
                 if indices.is_empty() {
                     continue;
                 }
-                if matches!(node.kind, NodeKind::PreimageSample { .. }) && indices.len() > 1 {
+                if let Some(row_sum) = block_aliases.row_sums.get(&node.id) {
+                    for &index in indices {
+                        self.set_placement(placements[index])?;
+                        let (source, right) = row_sum_sources[index]
+                            .remove(&node.id)
+                            .expect("row sum source survives until concat");
+                        let output = if let Some(right) = right {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                self.backend,
+                                GpuInvocation::TensorSumRows {
+                                    left: &source,
+                                    right: &right,
+                                    rows: &row_sum.rows,
+                                },
+                            )
+                            .map_err(Self::backend_error)?;
+                            self.backend.tensor_sum_rows(&source, &right, &row_sum.rows)
+                        } else {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                self.backend,
+                                GpuInvocation::SumRows { value: &source, rows: &row_sum.rows },
+                            )
+                            .map_err(Self::backend_error)?;
+                            self.backend.sum_rows(&source, &row_sum.rows)
+                        }
+                        .map_err(Self::backend_error)?;
+                        self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(output));
+                        self.has_pending_releases = true;
+                    }
+                } else if let Some(concat) = block_aliases.decompositions.get(&node.id) {
+                    let NodeKind::GadgetDecompose { base, small, digit_count } = &node.kind else {
+                        unreachable!()
+                    };
+                    for &index in indices {
+                        self.set_placement(placements[index])?;
+                        let input_type = self.matrix_type(scope_id, &paths[index], node.args[0])?;
+                        let base = base
+                            .evaluate(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        let digits = self.eval_usize(node.id, digit_count, &envs[index])?;
+                        self.backend
+                            .validate_gadget_layout(&input_type, &base, digits, *small)
+                            .map_err(Self::backend_error)?;
+                        let blocks =
+                            row_blocks[index].remove(concat).expect("decomposition block owners");
+                        let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::GadgetDecomposeRowBlocks {
+                                blocks: &references,
+                                small: *small,
+                                digit_count: Some(digits),
+                            },
+                        )
+                        .map_err(Self::backend_error)?;
+                        let output = self
+                            .backend
+                            .gadget_decompose_row_blocks(&references, *small, Some(digits))
+                            .map_err(Self::backend_error)?;
+                        self.put(
+                            &mut values[index],
+                            node.id,
+                            0,
+                            RuntimeValue::small_matrix(output),
+                        );
+                        self.has_pending_releases = true;
+                    }
+                } else if let Some((concat, rhs, aliases)) =
+                    block_aliases.compact_products.get(&node.id)
+                {
+                    for &index in indices {
+                        self.set_placement(placements[index])?;
+                        let rhs = self.small_matrix(&mut values[index], *rhs)?;
+                        let blocks =
+                            row_blocks[index].remove(concat).expect("compact product block owners");
+                        let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::MultiplySmallRhsRowBlocks {
+                                blocks: &references,
+                                right: &rhs,
+                            },
+                        )
+                        .map_err(Self::backend_error)?;
+                        let outputs = self
+                            .backend
+                            .multiply_small_rhs_row_blocks(&references, &rhs)
+                            .map_err(Self::backend_error)?;
+                        for (output, aliases) in outputs.into_iter().zip(aliases) {
+                            let value = RuntimeValue::matrix(output);
+                            for alias in aliases {
+                                self.put(
+                                    &mut values[index],
+                                    alias.node,
+                                    alias.port.0,
+                                    value.clone(),
+                                );
+                            }
+                        }
+                        self.has_pending_releases = true;
+                    }
+                } else if let Some((concat, right)) = block_aliases.adds.get(&node.id) {
+                    for &index in indices {
+                        self.set_placement(placements[index])?;
+                        let right = self.matrix(&mut values[index], *right)?;
+                        let blocks = row_blocks[index]
+                            .remove(concat)
+                            .expect("fused concat blocks survive until Add");
+                        let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::AddRowBlocks { blocks: &references, right: &right },
+                        )
+                        .map_err(Self::backend_error)?;
+                        let output = self
+                            .backend
+                            .add_row_blocks(&references, &right)
+                            .map_err(Self::backend_error)?;
+                        self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(output));
+                        self.has_pending_releases = true;
+                    }
+                } else if matches!(node.kind, NodeKind::PreimageSample { .. }) && indices.len() > 1
+                {
                     self.execute_preimage_batch(
                         scope_id,
-                        &envs,
-                        &paths,
-                        &placements,
+                        envs,
+                        paths,
+                        placements,
                         &node,
                         &mut values,
-                        &indices,
+                        indices,
                     )?;
                 } else if indices.len() > 1 &&
                     self.execute_parallel_matrix_node_by_placement(
-                        &placements,
-                        &envs,
+                        placements,
+                        envs,
                         &node,
                         &mut values,
-                        &indices,
+                        indices,
                     )?
                 {
                 } else if let NodeKind::SubgraphCall(call) = node.kind {
@@ -822,22 +1679,24 @@ where
                             path.push(InstantiationFrame { call: node.id, loop_index: None });
                             path
                         })
-                        .collect();
-                    let child_placements = indices.iter().map(|index| placements[*index]).collect();
+                        .collect::<Vec<_>>();
+                    let child_placements =
+                        indices.iter().map(|index| placements[*index]).collect::<Vec<_>>();
                     let results = self.execute_instances_batch(
                         &child_id,
-                        child_envs,
-                        child_paths,
-                        child_inputs,
-                        child_placements,
+                        &child_envs,
+                        &child_paths,
+                        &child_inputs,
+                        &child_placements,
                     )?;
-                    for (index, result) in indices.into_iter().zip(results) {
+                    drop(child_inputs);
+                    for (&index, result) in indices.iter().zip(results) {
                         for (port, value) in result.outputs.into_iter().enumerate() {
                             self.put(&mut values[index], node.id, port as u32, value);
                         }
                     }
                 } else if matches!(node.kind, NodeKind::Select { .. }) {
-                    for index in indices {
+                    for &index in indices {
                         self.set_placement(placements[index])?;
                         self.execute_select(
                             &envs[index],
@@ -848,7 +1707,7 @@ where
                         )?;
                     }
                 } else {
-                    for index in indices {
+                    for &index in indices {
                         self.set_placement(placements[index])?;
                         self.execute_node(
                             scope_id,
@@ -908,7 +1767,7 @@ where
                         self.retire_value(value)?;
                     }
                 }
-                for argument in &node.args {
+                for argument in node.args {
                     if schedule.last_use.get(argument) == Some(&position) &&
                         !schedule.retained.contains(argument)
                     {
@@ -935,6 +1794,7 @@ where
                     "execution progress checkpoint"
                 );
             }
+            position += 1;
         }
         let mut instances = Vec::with_capacity(values.len());
         for (index, mut instance_values) in values.into_iter().enumerate() {
@@ -958,6 +1818,8 @@ where
             }
             instances.push(InstanceResult { outputs });
         }
+        #[cfg(feature = "gpu")]
+        self.backend.observe_gpu_scope(false);
         Ok(instances)
     }
 
@@ -1009,6 +1871,24 @@ where
                     let right = self.matrix(instance, node.args[1])?;
                     inputs.push((left, right));
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &inputs
+                            .iter()
+                            .map(|(left, right)| {
+                                (
+                                    placement,
+                                    GpuInvocation::Binary {
+                                        operation: *operation,
+                                        left: left.as_ref(),
+                                        right: right.as_ref(),
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 match operation {
                     MatrixBinaryOp::Add => self.backend.add_batch(inputs),
                     MatrixBinaryOp::Subtract => self.backend.sub_batch(inputs),
@@ -1038,6 +1918,15 @@ where
                     };
                     requests.push(MatrixMulAccumulateRequest { products, bias });
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &requests
+                            .iter()
+                            .map(|request| (placement, GpuInvocation::Accumulate { request }))
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 self.backend.matrix_mul_accumulate_batch(requests).map_err(Self::backend_error)?
             }
             NodeKind::MatrixNegate => {
@@ -1046,6 +1935,17 @@ where
                     let instance = &mut values[*index];
                     inputs.push(self.matrix(instance, node.args[0])?);
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &inputs
+                            .iter()
+                            .map(|value| {
+                                (placement, GpuInvocation::Negate { value: value.as_ref() })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 self.backend.negate_batch(inputs).map_err(Self::backend_error)?
             }
             NodeKind::MatrixScale { scalar } => {
@@ -1059,6 +1959,20 @@ where
                         .map_err(|error| self.expression_error(node.id, error))?;
                     inputs.push((value, scalar));
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &inputs
+                            .iter()
+                            .map(|(value, scalar)| {
+                                (
+                                    placement,
+                                    GpuInvocation::ScaleInteger { value: value.as_ref(), scalar },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
             }
             _ => unreachable!("matrix batch kind checked by caller"),
@@ -1149,7 +2063,13 @@ where
             });
             self.streamed_exports.insert(name, (handle, descriptor));
         }
-        Ok(replacement.expect("declared export"))
+        // Integer exports retain the scalar result contract. Their small resident
+        // values can also feed later arithmetic after the artifact is written.
+        if matches!(value, RuntimeValue::Int(_)) {
+            Ok(value.clone())
+        } else {
+            Ok(replacement.expect("declared export"))
+        }
     }
 
     fn persist_outputs(
@@ -1508,10 +2428,16 @@ where
             content_hash: None,
             layout: Some(crate::artifact::STAGED_FAMILY_LAYOUT.to_owned()),
         };
-        self.staged_families.insert(
-            (self.scratch_production.clone(), name.clone()),
-            (descriptor.clone(), Arc::new(())),
-        );
+        // Scratch identity is private to streamed families. Ordinary resident
+        // executions need neither its random nonce nor its domain-separated hash.
+        // Initialize at registration so even an empty returned family owns the
+        // same identity as every other scratch artifact in this execution.
+        let production = &self.production;
+        let scratch = self
+            .scratch_production
+            .get_or_insert_with(|| scratch_production_id(production, rand::random()));
+        self.staged_families
+            .insert((scratch.clone(), name.clone()), (descriptor.clone(), Arc::new(())));
         Ok(Some((name, descriptor)))
     }
 
@@ -1577,7 +2503,15 @@ where
         Ok(leases)
     }
 
-    fn cleanup_all_staged_families(&mut self) -> Result<(), ExecutionError> {
+    fn cleanup_failed_execution(&mut self) -> Result<(), ExecutionError> {
+        // Session identities are durable and may be resumed. Ordinary failed
+        // executions return no handles, so their eager exports are unreachable.
+        if self.session.is_none() {
+            for (handle, _) in self.streamed_exports.values() {
+                self.artifact_store.remove_staged(&handle.key).map_err(Self::artifact_error)?;
+            }
+            self.streamed_exports.clear();
+        }
         let staged = self.staged_families.clone();
         for ((production, name), (descriptor, _)) in staged {
             let Some(count) = descriptor.family_count else {
@@ -1724,6 +2658,9 @@ where
             NodeKind::ConstantMatrix { value, .. } => {
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Constant { ty: &ty, value, env })
+                    .map_err(Self::backend_error)?;
                 let matrix =
                     self.backend.constant_matrix(&ty, value, env).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(matrix));
@@ -1734,20 +2671,18 @@ where
                 let sigma = self.trapdoor_sigma(scope_id, path, trapdoor_wire)?;
                 let (gadget_base, digit_count) =
                     self.trapdoor_layout(scope_id, path, trapdoor_wire)?;
-                let public = self
-                    .backend
-                    .constant_matrix(
-                        &ty,
-                        &mxx_ir_core::node::ConstantMatrix::Gadget {
-                            base: match &node.kind {
-                                NodeKind::GadgetTrapdoor { base, .. } => base.clone(),
-                                _ => unreachable!(),
-                            },
-                            small: false,
-                        },
-                        env,
-                    )
+                let gadget = mxx_ir_core::node::ConstantMatrix::Gadget {
+                    base: match &node.kind {
+                        NodeKind::GadgetTrapdoor { base, .. } => base.clone(),
+                        _ => unreachable!(),
+                    },
+                    small: false,
+                };
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Constant { ty: &ty, value: &gadget, env })
                     .map_err(Self::backend_error)?;
+                let public =
+                    self.backend.constant_matrix(&ty, &gadget, env).map_err(Self::backend_error)?;
                 self.put(
                     values,
                     node.id,
@@ -1806,6 +2741,55 @@ where
                 let output = ((value >> bit) & BigInt::one()) == BigInt::one();
                 self.put(values, node.id, 0, RuntimeValue::Bool(output));
             }
+            NodeKind::PolynomialFromValues { matrix_type, evaluation } => {
+                let concrete = mxx_ir_core::concretize_wire_type(
+                    &mxx_ir_core::types::WireType::Matrix(matrix_type.clone()),
+                    env,
+                    scope_id,
+                    node.id,
+                )
+                .map_err(|error| self.expression_error(node.id, error))?;
+                let ConcreteWireType::Matrix(ty) = concrete else { unreachable!() };
+                let wire = node.args[0];
+                let count = self.family_count(values, wire)?;
+                // Materialization borrows the artifact store and backend mutably.
+                let members = (0..count)
+                    .map(|index| match self.family_member(values, wire, index, node.id)? {
+                        RuntimeValue::Int(value) => Ok(value),
+                        _ => Err(ExecutionError::ValueKind(wire)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::PolynomialFromValues {
+                        ty: &ty,
+                        values: &members,
+                        evaluation: *evaluation,
+                    },
+                )
+                .map_err(Self::backend_error)?;
+                let output = self
+                    .backend
+                    .polynomial_from_values(&ty, &members, *evaluation)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::PolynomialValues { evaluation } => {
+                let input = self.matrix(values, node.args[0])?;
+                let output = self
+                    .backend
+                    .polynomial_values(&input, *evaluation)
+                    .map_err(Self::backend_error)?;
+                self.put(
+                    values,
+                    node.id,
+                    0,
+                    RuntimeValue::IndexedFamily(
+                        output.into_iter().map(RuntimeValue::Int).collect(),
+                    ),
+                );
+            }
             NodeKind::IntToReal => {
                 let value = self
                     .int(values, node.args[0])?
@@ -1844,6 +2828,12 @@ where
             NodeKind::MatrixBinary(operation) => {
                 let left = self.matrix(values, node.args[0])?;
                 let right = self.matrix(values, node.args[1])?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::Binary { operation: *operation, left: &left, right: &right },
+                )
+                .map_err(Self::backend_error)?;
                 let output = match operation {
                     MatrixBinaryOp::Add => self.backend.add(&left, &right),
                     MatrixBinaryOp::Subtract => self.backend.sub(&left, &right),
@@ -1855,6 +2845,12 @@ where
             NodeKind::MatrixMulSmallRhs => {
                 let lhs = self.matrix(values, node.args[0])?;
                 let rhs = self.small_matrix(values, node.args[1])?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::MultiplySmallRhs { left: &lhs, right: &rhs },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .multiply_small_rhs(lhs.as_ref(), rhs.as_ref())
@@ -1877,14 +2873,19 @@ where
                 } else {
                     None
                 };
-                let output = self
-                    .backend
-                    .matrix_mul_accumulate(MatrixMulAccumulateRequest { products, bias })
+                let request = MatrixMulAccumulateRequest { products, bias };
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Accumulate { request: &request })
                     .map_err(Self::backend_error)?;
+                let output =
+                    self.backend.matrix_mul_accumulate(request).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::MatrixNegate => {
                 let input = self.matrix(values, node.args[0])?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Negate { value: &input })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.negate(&input).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -1892,12 +2893,21 @@ where
                 let input = self.matrix(values, node.args[0])?;
                 let scalar =
                     scalar.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::ScaleInteger { value: &input, scalar: &scalar },
+                )
+                .map_err(Self::backend_error)?;
                 let output =
                     self.backend.scale_integer(&input, &scalar).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::Transpose => {
                 let input = self.matrix(values, node.args[0])?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Transpose { value: &input })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.transpose(&input).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -1921,6 +2931,16 @@ where
                         })
                     })
                     .transpose()?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::Slice {
+                        value: &input,
+                        rows: rows.as_ref(),
+                        columns: columns.as_ref(),
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .slice(&input, rows.as_ref(), columns.as_ref())
@@ -1930,6 +2950,9 @@ where
             NodeKind::Tensor => {
                 let left = self.matrix(values, node.args[0])?;
                 let right = self.matrix(values, node.args[1])?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Tensor { left: &left, right: &right })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.tensor(&left, &right).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -1940,6 +2963,9 @@ where
                     .map(|wire| self.matrix(values, *wire))
                     .collect::<Result<Vec<_>, _>>()?;
                 let inputs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Concat { inputs: &inputs, axis: *axis })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.concat(&inputs, *axis).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -1951,6 +2977,8 @@ where
                     maximum: &ty.modulus - BigInt::from(1),
                 };
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    #[cfg(feature = "gpu")]
+                    preflight(backend, GpuInvocation::SampleUniform { ty: &ty, range: &range })?;
                     backend.sample_uniform(&ty, &range)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -1969,6 +2997,8 @@ where
                         .map_err(|error| self.expression_error(node.id, error))?,
                 };
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    #[cfg(feature = "gpu")]
+                    preflight(backend, GpuInvocation::SampleUniform { ty: &ty, range: &range })?;
                     backend.sample_uniform(&ty, &range)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -1983,6 +3013,15 @@ where
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        backend,
+                        GpuInvocation::SampleGaussian {
+                            ty: &ty,
+                            sigma,
+                            max_coefficient_bound: &max_coefficient_bound,
+                        },
+                    )?;
                     backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -2052,6 +3091,17 @@ where
                 match (variant, gadget_base.as_ref(), digit_count) {
                     (HashVariant::Plain, None, None) => {
                         let value = self.sample_matrix(path, wire, &ty, |backend| {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                backend,
+                                GpuInvocation::SampleHash {
+                                    ty: &ty,
+                                    variant: *variant,
+                                    tag_bytes: tag.len(),
+                                    gadget_base: None,
+                                    digit_count: None,
+                                },
+                            )?;
                             backend.sample_hash(&ty, key, &tag)
                         })?;
                         self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -2080,13 +3130,26 @@ where
                             wire,
                             &schema,
                             semantic_kind,
-                            |backend| match variant {
-                                HashVariant::Decomposed => {
-                                    backend.sample_hash_decomposed(&ty, key, &tag, base, count)
+                            |backend| {
+                                #[cfg(feature = "gpu")]
+                                preflight(
+                                    backend,
+                                    GpuInvocation::SampleHash {
+                                        ty: &ty,
+                                        variant: *variant,
+                                        tag_bytes: tag.len(),
+                                        gadget_base: Some(base),
+                                        digit_count: Some(count),
+                                    },
+                                )?;
+                                match variant {
+                                    HashVariant::Decomposed => {
+                                        backend.sample_hash_decomposed(&ty, key, &tag, base, count)
+                                    }
+                                    HashVariant::SmallDecomposed => backend
+                                        .sample_hash_small_decomposed(&ty, key, &tag, base, count),
+                                    HashVariant::Plain => unreachable!("plain hash handled above"),
                                 }
-                                HashVariant::SmallDecomposed => backend
-                                    .sample_hash_small_decomposed(&ty, key, &tag, base, count),
-                                HashVariant::Plain => unreachable!("plain hash handled above"),
                             },
                         )?;
                         self.put(values, node.id, 0, RuntimeValue::small_matrix(value));
@@ -2173,6 +3236,16 @@ where
                     self.backend
                         .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                         .map_err(Self::backend_error)?;
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::GadgetDecompose {
+                            value: &target,
+                            small,
+                            digit_count: Some(digit_count),
+                        },
+                    )
+                    .map_err(Self::backend_error)?;
                     (
                         self.backend
                             .gadget_decompose(&target, small, Some(digit_count))
@@ -2184,6 +3257,19 @@ where
                         secret.as_ref().expect("sampled trapdoor must carry secret material");
                     let target_source =
                         self.preimage_source(values, path, node.args[2], &target_type)?;
+                    #[cfg(feature = "gpu")]
+                    let target_layout = {
+                        let RuntimeValue::HostMatrix { bytes, .. } = &values[&node.args[2]] else {
+                            unreachable!("preimage source installs its staging payload")
+                        };
+                        self.backend
+                            .gpu_preimage_source_layout(
+                                &target_type,
+                                bytes,
+                                target_source.global_column_start(),
+                            )
+                            .map_err(Self::backend_error)?
+                    };
                     let randomness_seed =
                         preimage_request_seed(self.production.execution_nonce, path, wire);
                     self.sample_small_matrix_with_status(
@@ -2192,6 +3278,19 @@ where
                         &schema,
                         semantic_kind,
                         |backend| {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                backend,
+                                GpuInvocation::SamplePreimage {
+                                    schema: &schema,
+                                    sigma,
+                                    gadget_base: &gadget_base,
+                                    digit_count,
+                                    trapdoor: secret,
+                                    public: &public,
+                                    target: &target_layout,
+                                },
+                            )?;
                             backend.sample_preimage(
                                 &schema.matrix,
                                 sigma,
@@ -2235,22 +3334,104 @@ where
                             .to_owned(),
                     });
                 }
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::GadgetDecompose {
+                        value: &input,
+                        small: *small,
+                        digit_count: Some(digit_count),
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .gadget_decompose(&input, *small, Some(digit_count))
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
             }
-            NodeKind::ModulusSwitch { .. } | NodeKind::ModulusReduce { .. } => {
+            NodeKind::ModulusSwitch { .. } |
+            NodeKind::ModulusReduce { .. } |
+            NodeKind::CenteredRebase { .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let output = if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::ModulusSwitch { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.modulus_switch(&input, &ty)
+                } else if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::CenteredRebase { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
+                    self.backend.centered_rebase(&input, &ty)
                 } else {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::ReduceModulus { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.reduce_modulus(&input, &ty)
                 }
                 .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::RnsModUp { source_moduli, digit_size, normalize, .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::RnsModUp {
+                        value: &input,
+                        destination: &ty,
+                        source_moduli,
+                        digit_size: *digit_size,
+                        normalize: *normalize,
+                    },
+                )
+                .map_err(Self::backend_error)?;
+                let output = self
+                    .backend
+                    .rns_mod_up(&input, &ty, source_moduli, *digit_size, *normalize)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
+            NodeKind::RnsModDown { source_moduli, plaintext_modulus, .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let plaintext_modulus = plaintext_modulus
+                    .evaluate(env)
+                    .map_err(|error| self.expression_error(node.id, error))?
+                    .to_u64()
+                    .ok_or_else(|| {
+                        self.expression_error(node.id, "plaintext modulus does not fit u64")
+                    })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::RnsModDown {
+                        value: &input,
+                        destination: &ty,
+                        source_moduli,
+                        plaintext_modulus,
+                    },
+                )
+                .map_err(Self::backend_error)?;
+                let output = self
+                    .backend
+                    .rns_mod_down(&input, &ty, source_moduli, plaintext_modulus)
+                    .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::CenteredExtend { .. }
@@ -2259,6 +3440,12 @@ where
                 let input = self.small_matrix(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::CenteredExtendSmall { value: &input, destination: &ty },
+                )
+                .map_err(Self::backend_error)?;
                 let output =
                     self.backend.centered_extend_small(&input, &ty).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
@@ -2270,8 +3457,24 @@ where
                 let output = if let NodeKind::BlockModSwitch { plaintext_modulus, .. } = &node.kind
                 {
                     let t = self.eval_usize(node.id, plaintext_modulus, env)? as u64;
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::BlockModSwitch {
+                            value: &input,
+                            destination: &ty,
+                            plaintext_modulus: t,
+                        },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.block_mod_switch(&input, &ty, t)
                 } else {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::CenteredExtend { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.centered_extend(&input, &ty)
                 }
                 .map_err(Self::backend_error)?;
@@ -2280,6 +3483,9 @@ where
             NodeKind::RingAutomorphism { index } => {
                 let input = self.matrix(values, node.args[0])?;
                 let index = self.eval_usize(node.id, index, env)?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::RingAutomorphism { value: &input, index })
+                    .map_err(Self::backend_error)?;
                 let output =
                     self.backend.ring_automorphism(&input, index).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
@@ -2297,10 +3503,26 @@ where
                 let coefficient = self.int(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::Constant {
+                        ty: &ty,
+                        value: &mxx_ir_core::node::ConstantMatrix::Identity,
+                        env,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let identity = self
                     .backend
                     .constant_matrix(&ty, &mxx_ir_core::node::ConstantMatrix::Identity, env)
                     .map_err(Self::backend_error)?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::ScaleInteger { value: &identity, scalar: &coefficient },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .scale_integer(&identity, &coefficient)
@@ -2346,6 +3568,17 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 let destination =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::CrtRecompose {
+                        levels: &levels,
+                        plaintext_moduli: &plaintext_moduli,
+                        reconstruction_coefficients: &reconstruction_coefficients,
+                        destination: &destination,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .crt_recompose(
@@ -2378,6 +3611,16 @@ where
                             wire: WireRef { node: node.id, port: Port(0) },
                         })
                     })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::PackPolynomialCoefficients {
+                        ty: &ty,
+                        bits: &bits,
+                        coefficient_bits,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .pack_polynomial_coefficients(&ty, &bits, coefficient_bits)
@@ -2423,9 +3666,9 @@ where
                 })?;
                 let count = self.eval_usize(node.id, &loop_node.count, env)?;
                 // A bounded family inside a body is consumed on the
-                // device, including loop-carried accumulators. Completed root
-                // loops return their state to RAM; large families still stream
-                // to RAM one wave at a time.
+                // device. Only the carried outputs cross the host-RAM boundary;
+                // staging every reduction level would transfer the same data
+                // repeatedly. Large families still stream to host memory.
                 let wave_size =
                     self.backend.parallel_wave_size(self.config.max_parallel_instances.get());
                 let staged = (0..child.outputs().len())
@@ -2518,11 +3761,14 @@ where
                         }
                         let instances = self.execute_instances_batch(
                             &child_id,
-                            child_envs,
-                            child_paths,
-                            child_inputs,
-                            child_placements.clone(),
+                            &child_envs,
+                            &child_paths,
+                            &child_inputs,
+                            &child_placements,
                         )?;
+                        // Match the owned-call lifetime: release child inputs
+                        // before serializing this wave's returned outputs.
+                        drop(child_inputs);
                         for (offset, instance) in instances.into_iter().enumerate() {
                             self.set_placement(child_placements[offset])?;
                             for (port, value) in instance.outputs.into_iter().enumerate() {
@@ -2540,7 +3786,12 @@ where
                                     let production = if descriptor.layout.is_none() {
                                         self.production.clone()
                                     } else {
-                                        self.scratch_production.clone()
+                                        self.scratch_production
+                                            .as_ref()
+                                            .expect(
+                                                "staged descriptor initializes scratch identity",
+                                            )
+                                            .clone()
                                     };
                                     self.artifact_store
                                         .store(
@@ -2576,7 +3827,22 @@ where
                                             declarations.clone(),
                                         )?
                                     } else if !stage_matrix_family_output(
-                                        scope_id, count, wave_size,
+                                        scope_id,
+                                        count,
+                                        wave_size,
+                                        matches!(
+                                            scope_id,
+                                            FrozenGraphScopeId::SequentialBody { .. }
+                                        ) && self
+                                            .validated
+                                            .source
+                                            .scope(scope_id)
+                                            .expect("scope")
+                                            .outputs()
+                                            .contains(&WireRef {
+                                                node: node.id,
+                                                port: Port(port as u32),
+                                            }),
                                     ) {
                                         value
                                     } else if let RuntimeValue::Matrix(matrix) = value {
@@ -2623,14 +3889,19 @@ where
                                         Arc::new(())
                                     } else {
                                         self.staged_families
-                                            [&(self.scratch_production.clone(), name.clone())]
+                                            [&(self.scratch_production.as_ref().expect("staged descriptor initializes scratch identity").clone(), name.clone())]
                                             .1
                                             .clone()
                                     },
                                     production: if direct {
                                         self.production.clone()
                                     } else {
-                                        self.scratch_production.clone()
+                                        self.scratch_production
+                                            .as_ref()
+                                            .expect(
+                                                "staged descriptor initializes scratch identity",
+                                            )
+                                            .clone()
                                     },
                                     name: name.clone(),
                                     descriptor,
@@ -2709,16 +3980,6 @@ where
                 }
                 self.set_placement(parent_placement)?;
                 for (port, value) in carried.into_iter().enumerate() {
-                    let value = if matches!(scope_id, FrozenGraphScopeId::Root) {
-                        let wire = WireRef { node: node.id, port: Port(port as u32) };
-                        let ty = self
-                            .validated_wire_type(scope_id, wire)
-                            .ok_or(ExecutionError::ValueKind(wire))?
-                            .clone();
-                        self.stage_matrix_value(value, &ty)?
-                    } else {
-                        value
-                    };
                     self.put(values, node.id, port as u32, value);
                 }
             }
@@ -2842,31 +4103,6 @@ where
         }
     }
 
-    fn stage_matrix_value(
-        &mut self,
-        value: RuntimeValue<B>,
-        ty: &ConcreteWireType,
-    ) -> Result<RuntimeValue<B>, ExecutionError> {
-        match (value, ty) {
-            (RuntimeValue::Matrix(matrix), ConcreteWireType::Matrix(matrix_type)) => {
-                let (_, bytes) =
-                    self.backend.preimage_target(matrix).map_err(Self::backend_error)?;
-                Ok(RuntimeValue::HostMatrix { matrix_type: matrix_type.clone(), bytes })
-            }
-            (
-                RuntimeValue::IndexedFamily(members),
-                ConcreteWireType::IndexedFamily { element, .. },
-            ) => {
-                let members = members
-                    .into_iter()
-                    .map(|value| self.stage_matrix_value(value, element))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(RuntimeValue::IndexedFamily(members))
-            }
-            (value, _) => Ok(value),
-        }
-    }
-
     fn preimage_source(
         &mut self,
         values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
@@ -2922,6 +4158,8 @@ where
             path: Vec<InstantiationFrame>,
             schema: ConcreteBoundedMatrixSchema,
             request: PreimageRequest<M, T>,
+            #[cfg(feature = "gpu")]
+            target_layout: GpuColumnSourceLayout,
         }
 
         let mut pending = Vec::new();
@@ -2959,6 +4197,16 @@ where
                 self.backend
                     .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                     .map_err(Self::backend_error)?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::GadgetDecompose {
+                        value: &target,
+                        small,
+                        digit_count: Some(digit_count),
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let value = self
                     .backend
                     .gadget_decompose(&target, small, Some(digit_count))
@@ -2979,9 +4227,21 @@ where
                 node.args[2],
                 &target_type,
             )?;
+            #[cfg(feature = "gpu")]
+            let target_layout = {
+                let RuntimeValue::HostMatrix { bytes, .. } = &values[instance][&node.args[2]]
+                else {
+                    unreachable!("preimage source installs its staging payload")
+                };
+                self.backend
+                    .gpu_preimage_source_layout(&target_type, bytes, target.global_column_start())
+                    .map_err(Self::backend_error)?
+            };
             let randomness_seed =
                 preimage_request_seed(self.production.execution_nonce, &paths[instance], wire);
             pending.push(Pending {
+                #[cfg(feature = "gpu")]
+                target_layout,
                 instance,
                 placement: placements[instance],
                 wire,
@@ -3025,13 +4285,24 @@ where
                     {
                         self.set_placement(request.placement)?;
                         outputs[index] = Some(
-                            self.backend
-                                .small_matrix_from_bytes(
+                            {
+                                #[cfg(feature = "gpu")]
+                                preflight(
+                                    self.backend,
+                                    GpuInvocation::ImportSmallMatrix {
+                                        schema: &request.schema,
+                                        bytes: &bytes,
+                                        semantic_kind: SmallMatrixSemanticKind::Preimage,
+                                    },
+                                )
+                                .map_err(Self::backend_error)?;
+                                self.backend.small_matrix_from_bytes(
                                     &request.schema,
                                     &bytes,
                                     SmallMatrixSemanticKind::Preimage,
                                 )
-                                .map_err(Self::backend_error)?,
+                            }
+                            .map_err(Self::backend_error)?,
                         );
                     }
                     Some(
@@ -3063,6 +4334,33 @@ where
                         })
                     })
                     .collect::<Vec<_>>();
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &groups
+                            .iter()
+                            .flat_map(|(placement, indices, _)| {
+                                let pending = &pending;
+                                indices.iter().map(move |index| {
+                                    let pending = &pending[*index];
+                                    let request = &pending.request;
+                                    (
+                                        *placement,
+                                        GpuInvocation::SamplePreimage {
+                                            schema: &pending.schema,
+                                            sigma: request.sigma,
+                                            gadget_base: &request.gadget_base,
+                                            digit_count: request.digit_count,
+                                            trapdoor: request.trapdoor.as_ref(),
+                                            public: request.public.as_ref(),
+                                            target: &pending.target_layout,
+                                        },
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 let batches = groups
                     .iter()
                     .map(|(placement, _, requests)| (*placement, requests.clone()))
@@ -3151,13 +4449,24 @@ where
                         {
                             self.set_placement(request.placement)?;
                             outputs.push(
-                                self.backend
-                                    .small_matrix_from_bytes(
+                                {
+                                    #[cfg(feature = "gpu")]
+                                    preflight(
+                                        self.backend,
+                                        GpuInvocation::ImportSmallMatrix {
+                                            schema: &request.schema,
+                                            bytes: &bytes,
+                                            semantic_kind: SmallMatrixSemanticKind::Preimage,
+                                        },
+                                    )
+                                    .map_err(Self::backend_error)?;
+                                    self.backend.small_matrix_from_bytes(
                                         &request.schema,
                                         &bytes,
                                         SmallMatrixSemanticKind::Preimage,
                                     )
-                                    .map_err(Self::backend_error)?,
+                                }
+                                .map_err(Self::backend_error)?,
                             );
                         }
                         RecordedValue::Matrix { .. } |
@@ -3197,6 +4506,33 @@ where
                     })
                 })
                 .collect::<Vec<_>>();
+            #[cfg(feature = "gpu")]
+            self.backend
+                .preflight_gpu_operations(
+                    &groups
+                        .iter()
+                        .flat_map(|(placement, indices, _)| {
+                            let pending = &pending;
+                            indices.iter().map(move |index| {
+                                let pending = &pending[*index];
+                                let request = &pending.request;
+                                (
+                                    *placement,
+                                    GpuInvocation::SamplePreimage {
+                                        schema: &pending.schema,
+                                        sigma: request.sigma,
+                                        gadget_base: &request.gadget_base,
+                                        digit_count: request.digit_count,
+                                        trapdoor: request.trapdoor.as_ref(),
+                                        public: request.public.as_ref(),
+                                        target: &pending.target_layout,
+                                    },
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(Self::backend_error)?;
             let batches = groups
                 .iter()
                 .map(|(placement, _, requests)| (*placement, requests.clone()))
@@ -3312,11 +4648,14 @@ where
                 .map_err(Self::artifact_error)?
             {
                 return match recorded {
-                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => self
-                        .backend
-                        .matrix_from_bytes(ty, &bytes)
-                        .map(|value| (value, false))
-                        .map_err(Self::backend_error),
+                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => {
+                        #[cfg(feature = "gpu")]
+                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes: &bytes })
+                            .map_err(Self::backend_error)?;
+                        self.backend.matrix_from_bytes(ty, &bytes)
+                    }
+                    .map(|value| (value, false))
+                    .map_err(Self::backend_error),
                     RecordedValue::Matrix { .. } |
                     RecordedValue::SmallMatrix { .. } |
                     RecordedValue::Trapdoor { .. } => {
@@ -3332,7 +4671,10 @@ where
                         site,
                         RecordedValue::Matrix {
                             matrix_type: ty.clone(),
-                            bytes: self.backend.matrix_to_bytes(&value),
+                            bytes: self
+                                .backend
+                                .matrix_to_bytes(&value)
+                                .map_err(Self::backend_error)?,
                         },
                     )],
                 )
@@ -3349,17 +4691,20 @@ where
                     site,
                     RecordedValue::Matrix {
                         matrix_type: ty.clone(),
-                        bytes: self.backend.matrix_to_bytes(&value),
+                        bytes: self.backend.matrix_to_bytes(&value).map_err(Self::backend_error)?,
                     },
                 )?;
                 Ok((value, true))
             }
             SamplingMode::Replay(replayer) => match replayer.get(&site)? {
-                RecordedValue::Matrix { bytes, .. } => self
-                    .backend
-                    .matrix_from_bytes(ty, bytes)
-                    .map(|value| (value, false))
-                    .map_err(Self::backend_error),
+                RecordedValue::Matrix { bytes, .. } => {
+                    #[cfg(feature = "gpu")]
+                    preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes })
+                        .map_err(Self::backend_error)?;
+                    self.backend.matrix_from_bytes(ty, bytes)
+                }
+                .map(|value| (value, false))
+                .map_err(Self::backend_error),
                 RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
                     Err(TranscriptError::KindMismatch(site).into())
                 }
@@ -3405,11 +4750,21 @@ where
                         schema: recorded_schema,
                         semantic_kind: recorded_kind,
                         bytes,
-                    } if recorded_schema == *schema && recorded_kind == semantic_kind => self
-                        .backend
-                        .small_matrix_from_bytes(schema, &bytes, semantic_kind)
-                        .map(|value| (value, false))
-                        .map_err(Self::backend_error),
+                    } if recorded_schema == *schema && recorded_kind == semantic_kind => {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::ImportSmallMatrix {
+                                schema,
+                                bytes: &bytes,
+                                semantic_kind,
+                            },
+                        )
+                        .map_err(Self::backend_error)?;
+                        self.backend.small_matrix_from_bytes(schema, &bytes, semantic_kind)
+                    }
+                    .map(|value| (value, false))
+                    .map_err(Self::backend_error),
                     RecordedValue::Matrix { .. } |
                     RecordedValue::SmallMatrix { .. } |
                     RecordedValue::Trapdoor { .. } => {
@@ -3454,11 +4809,17 @@ where
                     schema: recorded_schema,
                     semantic_kind: recorded_kind,
                     bytes,
-                } if recorded_schema == schema && *recorded_kind == semantic_kind => self
-                    .backend
-                    .small_matrix_from_bytes(schema, bytes, semantic_kind)
-                    .map(|value| (value, false))
-                    .map_err(Self::backend_error),
+                } if recorded_schema == schema && *recorded_kind == semantic_kind => {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::ImportSmallMatrix { schema, bytes, semantic_kind },
+                    )
+                    .map_err(Self::backend_error)?;
+                    self.backend.small_matrix_from_bytes(schema, bytes, semantic_kind)
+                }
+                .map(|value| (value, false))
+                .map_err(Self::backend_error),
                 RecordedValue::Matrix { .. } |
                 RecordedValue::SmallMatrix { .. } |
                 RecordedValue::Trapdoor { .. } => Err(TranscriptError::KindMismatch(site).into()),
@@ -3514,20 +4875,38 @@ where
                         trapdoor_bytes,
                     }),
                 ) if matrix_type == *ty && secret_type == *ty && bytes == public_bytes => {
-                    let public =
-                        self.backend.matrix_from_bytes(ty, &bytes).map_err(Self::backend_error)?;
-                    let secret = self
-                        .backend
-                        .trapdoor_from_bytes(ty, &trapdoor_bytes)
+                    let public = {
+                        #[cfg(feature = "gpu")]
+                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes: &bytes })
+                            .map_err(Self::backend_error)?;
+                        self.backend.matrix_from_bytes(ty, &bytes)
+                    }
+                    .map_err(Self::backend_error)?;
+                    let secret = {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::ImportTrapdoor { ty, bytes: &trapdoor_bytes },
+                        )
                         .map_err(Self::backend_error)?;
+                        self.backend.trapdoor_from_bytes(ty, &trapdoor_bytes)
+                    }
+                    .map_err(Self::backend_error)?;
                     Ok((public, secret))
                 }
                 (None, None) => {
-                    let (public, secret) = self
-                        .backend
-                        .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                    let (public, secret) = {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
+                        )
                         .map_err(Self::backend_error)?;
-                    let public_bytes = self.backend.matrix_to_bytes(&public);
+                        self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                    }
+                    .map_err(Self::backend_error)?;
+                    let public_bytes =
+                        self.backend.matrix_to_bytes(&public).map_err(Self::backend_error)?;
                     self.artifact_store
                         .record_transcript_batch(
                             &production,
@@ -3558,16 +4937,29 @@ where
             };
         }
         match &mut self.sampling_mode {
-            SamplingMode::Fresh => self
-                .backend
-                .sample_trapdoor(ty, sigma, gadget_base, digit_count)
-                .map_err(Self::backend_error),
+            SamplingMode::Fresh => {
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
+                )
+                .map_err(Self::backend_error)?;
+                self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count)
+            }
+            .map_err(Self::backend_error),
             SamplingMode::Record(recorder) => {
-                let (public, secret) = self
-                    .backend
-                    .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                let (public, secret) = {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
+                    )
                     .map_err(Self::backend_error)?;
-                let public_bytes = self.backend.matrix_to_bytes(&public);
+                    self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                }
+                .map_err(Self::backend_error)?;
+                let public_bytes =
+                    self.backend.matrix_to_bytes(&public).map_err(Self::backend_error)?;
                 recorder.record(
                     matrix_site,
                     RecordedValue::Matrix { matrix_type: ty.clone(), bytes: public_bytes.clone() },
@@ -3585,17 +4977,27 @@ where
             SamplingMode::Replay(replayer) => {
                 let public = match replayer.get(&matrix_site)? {
                     RecordedValue::Matrix { bytes, .. } => {
-                        self.backend.matrix_from_bytes(ty, bytes).map_err(Self::backend_error)?
+                        #[cfg(feature = "gpu")]
+                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes })
+                            .map_err(Self::backend_error)?;
+                        self.backend.matrix_from_bytes(ty, bytes)
                     }
+                    .map_err(Self::backend_error)?,
                     RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
                         return Err(TranscriptError::KindMismatch(matrix_site).into());
                     }
                 };
                 let secret = match replayer.get(&trapdoor_site)? {
-                    RecordedValue::Trapdoor { trapdoor_bytes, .. } => self
-                        .backend
-                        .trapdoor_from_bytes(ty, trapdoor_bytes)
-                        .map_err(Self::backend_error)?,
+                    RecordedValue::Trapdoor { trapdoor_bytes, .. } => {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::ImportTrapdoor { ty, bytes: trapdoor_bytes },
+                        )
+                        .map_err(Self::backend_error)?;
+                        self.backend.trapdoor_from_bytes(ty, trapdoor_bytes)
+                    }
+                    .map_err(Self::backend_error)?,
                     RecordedValue::Matrix { .. } | RecordedValue::SmallMatrix { .. } => {
                         return Err(TranscriptError::KindMismatch(trapdoor_site).into());
                     }
@@ -3631,10 +5033,16 @@ where
         value: RuntimeValue<B>,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
         if let RuntimeValue::HostMatrix { matrix_type, bytes } = value {
-            let matrix = self
-                .backend
-                .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
+            let matrix = {
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::ImportCpuStaging { ty: &matrix_type, bytes: &bytes },
+                )
                 .map_err(Self::backend_error)?;
+                self.backend.matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
+            }
+            .map_err(Self::backend_error)?;
             Ok(RuntimeValue::matrix(matrix))
         } else if let RuntimeValue::LazyArtifact { production, name, index, descriptor } = value {
             let key = ArtifactKey { production, name, index };
@@ -3660,7 +5068,7 @@ where
     }
 
     fn decode_artifact(
-        &self,
+        &mut self,
         artifact_type: ArtifactType,
         payload: ArtifactPayload,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
@@ -3707,11 +5115,11 @@ where
     }
 
     fn int(
-        &self,
-        values: &BTreeMap<WireRef, RuntimeValue<B>>,
+        &mut self,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
         wire: WireRef,
     ) -> Result<BigInt, ExecutionError> {
-        match self.value(values, wire)? {
+        match self.materialize(values, wire)? {
             RuntimeValue::Int(value) => Ok(value),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
@@ -4070,7 +5478,7 @@ where
             name
         });
         names
-            .zip(&node.args)
+            .zip(node.args)
             .map(|(name, wire)| Ok((name.clone(), self.value(values, *wire)?)))
             .collect()
     }
@@ -4096,7 +5504,7 @@ where
             return Err(ExecutionError::ValueKind(WireRef { node: node.id, port: Port(0) }));
         }
         names
-            .zip(&node.args)
+            .zip(node.args)
             .zip(modes)
             .zip(broadcast_inputs)
             .map(|(((name, wire), mode), broadcast)| {
@@ -4173,11 +5581,7 @@ where
     }
 
     fn backend_error(error: B::Error) -> ExecutionError {
-        if B::is_gpu_preparation_yield(&error) {
-            ExecutionError::GpuPreparationYield
-        } else {
-            ExecutionError::Backend(error.to_string())
-        }
+        ExecutionError::Backend(error.to_string())
     }
 
     fn artifact_error(error: S::Error) -> ExecutionError {
@@ -4221,7 +5625,7 @@ fn preimage_request_seed(
 
 fn runtime_inputs_digest<B: Backend>(
     validated: &ValidatedGraph,
-    backend: &B,
+    backend: &mut B,
     inputs: &BTreeMap<String, RuntimeValue<B>>,
 ) -> Result<[u8; 32], ExecutionError> {
     let root = validated.source.root_scope();
@@ -4260,7 +5664,7 @@ fn runtime_inputs_digest<B: Backend>(
 }
 
 fn hash_runtime_value<B: Backend>(
-    backend: &B,
+    backend: &mut B,
     value: &RuntimeValue<B>,
     concrete: &ConcreteWireType,
     hasher: &mut Sha256,
@@ -4286,15 +5690,28 @@ fn hash_runtime_value<B: Backend>(
             hash_sized(hasher, value);
         }
         RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            #[cfg(feature = "gpu")]
+            preflight(backend, GpuInvocation::ImportCpuStaging { ty: matrix_type, bytes })
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let matrix = backend
                 .matrix_from_cpu_staging_bytes(matrix_type, bytes)
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             hasher.update([5]);
-            hash_sized(hasher, &backend.matrix_to_bytes(&matrix));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(&matrix)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
         }
         RuntimeValue::Matrix(value) => {
             hasher.update([5]);
-            hash_sized(hasher, &backend.matrix_to_bytes(value));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(value)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
         }
         RuntimeValue::SmallMatrix(value) => {
             let artifact_type = ArtifactType::from_wire_type(concrete).ok_or_else(|| {
@@ -4333,7 +5750,12 @@ fn hash_runtime_value<B: Backend>(
             hash_sized(hasher, gadget_base.to_string().as_bytes());
             hasher.update(digit_count.to_le_bytes());
             hasher.update([gadget_small.map_or(0, |small| if small { 2 } else { 1 })]);
-            hash_sized(hasher, &backend.matrix_to_bytes(public));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(public)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
             match secret {
                 Some(secret) => {
                     hasher.update([1]);
@@ -4493,11 +5915,14 @@ fn collect_staged_families<B: Backend>(
 
 fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
     value: RuntimeValue<B>,
-    backend: &B,
+    backend: &mut B,
     store: &mut S,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     match value {
         RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            #[cfg(feature = "gpu")]
+            preflight(backend, GpuInvocation::ImportCpuStaging { ty: &matrix_type, bytes: &bytes })
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let matrix = backend
                 .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
@@ -4537,7 +5962,7 @@ fn materialize_artifact_family<B: Backend, S: ArtifactStore>(
     name: String,
     descriptor: ManifestArtifact,
     staged: bool,
-    backend: &B,
+    backend: &mut B,
     store: &mut S,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     let count = descriptor
@@ -4565,8 +5990,14 @@ pub fn encode_artifact<B: Backend>(
     artifact_type: &ArtifactType,
 ) -> Result<(ArtifactPayload, Vec<u8>), ExecutionError> {
     match (value, artifact_type) {
+        (RuntimeValue::Int(value), ArtifactType::Int) => {
+            let bytes = value.to_signed_bytes_le();
+            Ok((ArtifactPayload::Bytes(bytes.clone()), bytes))
+        }
         (RuntimeValue::Matrix(matrix), ArtifactType::Matrix(_)) => {
-            let bytes = backend.matrix_to_bytes(matrix);
+            let bytes = backend
+                .matrix_to_bytes(matrix)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
         }
         (RuntimeValue::SmallMatrix(matrix), artifact_type)
@@ -4589,7 +6020,9 @@ pub fn encode_artifact<B: Backend>(
             RuntimeValue::Trapdoor { secret: Some(secret), public, .. },
             ArtifactType::Trapdoor { .. },
         ) => {
-            let public_bytes = backend.matrix_to_bytes(public);
+            let public_bytes = backend
+                .matrix_to_bytes(public)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let secret_bytes = backend.trapdoor_to_bytes(secret);
             let mut canonical = Vec::with_capacity(
                 16usize.saturating_add(public_bytes.len()).saturating_add(secret_bytes.len()),
@@ -4607,11 +6040,19 @@ pub fn encode_artifact<B: Backend>(
 }
 
 pub fn decode_artifact<B: Backend>(
-    backend: &B,
+    backend: &mut B,
     artifact_type: ArtifactType,
     payload: ArtifactPayload,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
+    #[cfg(feature = "gpu")]
+    crate::gpu_invocation::preflight_artifact(backend, &artifact_type, &payload)
+        .map_err(|error| ExecutionError::Backend(error.to_string()))?;
     match (artifact_type, payload) {
+        (ArtifactType::Int, ArtifactPayload::Bytes(bytes))
+            if BigInt::from_signed_bytes_le(&bytes).to_signed_bytes_le() == bytes =>
+        {
+            Ok(RuntimeValue::Int(BigInt::from_signed_bytes_le(&bytes)))
+        }
         (ArtifactType::Matrix(matrix_type), ArtifactPayload::Matrix(bytes)) => {
             let matrix = backend
                 .matrix_from_bytes(&matrix_type, &bytes)
@@ -4699,13 +6140,624 @@ mod tests {
     use num_traits::ToPrimitive;
     use rand::Rng;
 
+    #[test]
+    fn root_block_aliases_preserve_multiple_consumers_and_trace_results() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, 8usize);
+        let first = ring.input("first", (1, 1));
+        let second = ring.input("second", (2, 1));
+        let joined = Mat::concat(ConcatAxis::Rows, vec![first, second]);
+        let top = joined.clone().slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+        let bottom = joined.slice(Some(IndexRange { start: 1.into(), end: 3.into() }), None);
+        let graph = DslContext::new("root-block-aliases")
+            .output("top", top.clone())
+            .unwrap()
+            .output("twice", top.clone() + top)
+            .unwrap()
+            .output("bottom", bottom)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert_eq!(plan.concats.len(), 1);
+        assert_eq!(plan.slices.len(), 2);
+        let dynamic_scope = FrozenGraphScopeId::ParallelBody {
+            parent: Box::new(FrozenGraphScopeId::Root),
+            owner: NodeId(0),
+        };
+        assert!(root_block_aliases(&graph, &dynamic_scope, false).concats.is_empty());
+        assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).concats.is_empty());
+
+        let first_matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_biguints(&parameters, &[7u8.into()])],
+        );
+        let second_matrix = first_matrix.concat_rows(&[&first_matrix]);
+        let inputs = BTreeMap::from([
+            ("first".to_owned(), RuntimeValue::matrix(first_matrix.clone())),
+            ("second".to_owned(), RuntimeValue::matrix(second_matrix.clone())),
+        ]);
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let optimized =
+            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
+        let (reference, _) =
+            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                .unwrap();
+        for name in ["top", "twice", "bottom"] {
+            assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
+        }
+        assert_eq!(matrix_output(&optimized, "top"), &first_matrix);
+        assert_eq!(matrix_output(&optimized, "bottom"), &second_matrix);
+    }
+
+    #[test]
+    fn root_sparse_row_sum_preserves_source_and_matches_trace() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, 8usize);
+        // The source concat must survive even though all original consumers
+        // are slices eliminated by the row-sum plan.
+        let source = Mat::concat(
+            ConcatAxis::Rows,
+            vec![ring.input("first", (1, 1)), ring.input("rest", (3, 1))],
+        );
+        let row = |index: usize| {
+            source
+                .clone()
+                .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+        };
+        let sum = Mat::concat(ConcatAxis::Rows, vec![row(0), row(1) + row(2), row(3)]);
+        let graph = DslContext::new("sparse-row-sum")
+            .output("sum", sum)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert_eq!(plan.row_sums.len(), 1);
+        assert_eq!(plan.row_sums.values().next().unwrap().rows, vec![vec![0], vec![1, 2], vec![3]]);
+        assert!(plan.concats.is_empty());
+        let source = plan.row_sums.values().next().unwrap().source;
+        for (position, arguments) in plan.arguments.iter().enumerate() {
+            if arguments.contains(&source) {
+                assert_eq!(
+                    plan.absent_run_end(position, None, false),
+                    None,
+                    "materialized source consumers retain their original release points"
+                );
+            }
+        }
+        assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).row_sums.is_empty());
+        let matrices = [1u8, 3, 5, 7].map(|value| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+            )
+        });
+        let inputs = BTreeMap::from([
+            ("first".to_owned(), RuntimeValue::matrix(matrices[0].clone())),
+            (
+                "rest".to_owned(),
+                RuntimeValue::matrix(matrices[1].concat_rows(&[&matrices[2], &matrices[3]])),
+            ),
+        ]);
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let optimized =
+            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
+        let (reference, _) =
+            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                .unwrap();
+        assert_eq!(matrix_output(&optimized, "sum"), matrix_output(&reference, "sum"));
+        let middle = &matrices[1] + &matrices[2];
+        let expected = matrices[0].concat_rows(&[&middle, &matrices[3]]);
+        assert_eq!(matrix_output(&optimized, "sum"), &expected);
+    }
+
+    #[test]
+    fn tensor_row_sum_fusion_preserves_trace_and_observable_tensor_boundaries() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let scalar = |value: u8| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+            )
+        };
+        let left = scalar(2).concat_rows(&[&scalar(3)]);
+        let right = scalar(5).concat_rows(&[&scalar(7)]);
+        let expected = left.tensor(&right).sum_rows(&[vec![0], vec![1, 2], vec![3]]);
+        let mut backend = cpu_backend([parameters.clone()]);
+        for boundary in 0..4 {
+            let ring = Ring::new(modulus.clone(), 8usize);
+            let tensor = ring.input("left", (2, 1)).tensor(ring.input("right", (2, 1)));
+            let row = |index: usize| {
+                tensor
+                    .clone()
+                    .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+            };
+            let sum = Mat::concat(ConcatAxis::Rows, vec![row(0), row(1) + row(2), row(3)]);
+            let mut context =
+                DslContext::new("tensor-row-sum-boundaries").output("sum", sum).unwrap();
+            if boundary == 1 {
+                context = context.output("tensor", tensor.clone()).unwrap();
+            } else if boundary == 2 {
+                context = context.output("other", tensor.clone() + tensor.clone()).unwrap();
+            }
+            let mut graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            if boundary == 3 {
+                let checked = graph.scopes.get_mut(&FrozenGraphScopeId::Root).unwrap();
+                let index = checked
+                    .execution_order
+                    .iter()
+                    .position(|node| matches!(node.kind(), NodeKind::Tensor))
+                    .unwrap();
+                checked
+                    .liveness
+                    .retained
+                    .insert(WireRef { node: NodeId(index as u64), port: Port(0) });
+            }
+            let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+            assert_eq!(
+                plan.row_sums.values().filter(|sum| sum.tensor_operands.is_some()).count(),
+                usize::from(boundary == 0)
+            );
+            assert!(
+                root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).row_sums.is_empty()
+            );
+            assert_eq!(plan.input_row_sum.is_some(), boundary == 0);
+            let node_count = graph.root_scope().execution_order.len();
+            let mut position = 0;
+            let mut visited = 0;
+            let mut represented = 0;
+            while position < node_count {
+                let end = plan.absent_run_end(position, None, false).unwrap_or(position + 1);
+                if end == position + 1 && plan.absent_run_end(position, None, false).is_none() {
+                    visited += 1;
+                }
+                represented += end - position;
+                position = end;
+            }
+            assert_eq!(represented, node_count, "all original structural nodes remain counted");
+            if boundary == 0 {
+                assert_eq!(node_count, 9);
+                assert_eq!(visited, 4, "inputs, tensor capture, and fused output remain visited");
+            }
+            for position in 0..node_count {
+                assert_eq!(plan.absent_run_end(position, NonZeroUsize::new(1), false), None);
+                assert_eq!(plan.absent_run_end(position, None, true), None);
+                let traced = root_block_aliases(&graph, &FrozenGraphScopeId::Root, true);
+                assert_eq!(traced.absent_run_end(position, None, false), None);
+            }
+            for capture in plan.row_sum_captures.keys() {
+                assert_eq!(plan.absent_run_end(capture.0 as usize, None, false), None);
+            }
+            let inputs = BTreeMap::from([
+                ("left".to_owned(), RuntimeValue::matrix(left.clone())),
+                ("right".to_owned(), RuntimeValue::matrix(right.clone())),
+            ]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let fenced = execute_with_config(
+                &graph,
+                &mut backend,
+                inputs.clone(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    release_fence_interval: NonZeroUsize::new(1),
+                    ..ExecutionConfig::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(matrix_output(&fenced, "sum"), &expected);
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            assert_eq!(matrix_output(&optimized, "sum"), &expected);
+            for name in reference.outputs.keys() {
+                assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_row_composition_bounds_deep_doubling_without_losing_terms() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        let ring = Ring::new(97, 8usize);
+        let mut value = ring.input("source", (1, 1));
+        for _ in 0..40 {
+            // Separate Slice nodes each have one consumer, so every level is
+            // eligible locally, but expanding the complete chain is not safe.
+            let row =
+                || value.clone().slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+            value = Mat::concat(ConcatAxis::Rows, vec![row() + row()]);
+        }
+        let graph = DslContext::new("bounded-row-composition")
+            .output("result", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plans = root_row_sum_plans(&graph);
+        assert!(plans.len() >= 8, "retain boundaries instead of expanding forty doublings");
+        let scope = graph.source.scope(&FrozenGraphScopeId::Root).unwrap();
+        let source = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .position(
+                |node| matches!(node.kind(), NodeKind::Input { name, .. } if name == "source"),
+            )
+            .unwrap();
+        let mut multiplicities =
+            BTreeMap::from([(WireRef { node: NodeId(source as u64), port: Port(0) }, 1u128)]);
+        for (node, plan) in &plans {
+            assert_eq!(plan.rows.len(), 1);
+            assert!(plan.rows[0].len() <= 32);
+            assert!(plan.rows[0].iter().all(|row| *row == 0));
+            let count = multiplicities[&plan.source] * plan.rows[0].len() as u128;
+            multiplicities.insert(WireRef { node: *node, port: Port(0) }, count);
+        }
+        assert_eq!(
+            multiplicities[&scope.outputs()[0]],
+            1u128 << 40,
+            "bounded plans must preserve every duplicate term exactly"
+        );
+    }
+
+    #[test]
+    fn composed_sparse_rows_preserve_outputs_and_observable_parent_boundaries() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        for mode in 0..3 {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+            let ring = Ring::new(modulus, 8usize);
+            let source = ring.input("source", (4, 1));
+            let row = |matrix: &Mat, index: usize| {
+                matrix
+                    .clone()
+                    .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+            };
+            let product = Mat::concat(
+                ConcatAxis::Rows,
+                vec![row(&source, 0), row(&source, 1) + row(&source, 2), row(&source, 3)],
+            );
+            let leading = row(&product, 0);
+            let carry = Mat::concat(ConcatAxis::Rows, vec![row(&product, 1), row(&product, 2)]);
+            let mut context = DslContext::new("composed-sparse-rows")
+                .output("leading", leading)
+                .unwrap()
+                .output("carry", carry)
+                .unwrap();
+            if mode == 1 {
+                context = context.output("parent", product.clone()).unwrap();
+            }
+            if mode == 2 {
+                context = context.output("transpose", product.transpose()).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let plans = root_row_sum_plans(&graph);
+            assert_eq!(plans.len(), 2);
+            if mode == 0 {
+                assert!(plans.values().any(|plan| plan.rows == vec![vec![0]]));
+                assert!(plans.values().any(|plan| plan.rows == vec![vec![1, 2], vec![3]]));
+                assert_eq!(
+                    plans.values().next().unwrap().source,
+                    plans.values().next_back().unwrap().source
+                );
+            } else {
+                assert!(plans.values().any(|plan| plan.rows == vec![vec![0], vec![1, 2], vec![3]]));
+            }
+            let matrices = [1u8, 3, 5, 7].map(|value| {
+                DCRTPolyMatrix::from_poly_vec_row(
+                    &parameters,
+                    vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+                )
+            });
+            let source = matrices[0].concat_rows(&[&matrices[1], &matrices[2], &matrices[3]]);
+            let inputs = BTreeMap::from([("source".to_owned(), RuntimeValue::matrix(source))]);
+            let mut backend = cpu_backend([parameters]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            for name in optimized.outputs.keys() {
+                assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
+            }
+            let middle = &matrices[1] + &matrices[2];
+            assert_eq!(matrix_output(&optimized, "leading"), &matrices[0]);
+            assert_eq!(matrix_output(&optimized, "carry"), &middle.concat_rows(&[&matrices[3]]));
+        }
+    }
+
+    #[test]
+    fn root_sparse_row_sum_preserves_observed_interiors_and_partial_slices() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        for mode in 0..4 {
+            let ring = Ring::new(97, 8usize);
+            let source = ring.input("source", (3, 2));
+            let row = |index: usize| {
+                source.clone().slice(
+                    Some(IndexRange { start: index.into(), end: (index + 1).into() }),
+                    (mode == 2).then(|| IndexRange { start: 0.into(), end: 1.into() }),
+                )
+            };
+            let first = row(0);
+            let middle = first.clone() + row(1);
+            let joined = Mat::concat(ConcatAxis::Rows, vec![middle.clone(), row(2)]);
+            let mut context =
+                DslContext::new("sparse-row-sum-fallback").output("joined", joined).unwrap();
+            if mode == 0 {
+                context = context.output("slice", first.clone()).unwrap();
+            }
+            if mode == 1 {
+                context = context.output("add", middle).unwrap();
+            }
+            if mode == 3 {
+                context = context.output("other", first + row(2)).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            assert!(root_row_sum_plans(&graph).is_empty());
+        }
+    }
+
+    #[test]
+    fn root_block_add_preserves_results_and_retained_concat_outputs() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::ConcatAxis;
+
+        for retain_concat in [false, true] {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+            let ring = Ring::new(modulus, 8usize);
+            let first = ring.input("first", (1, 1));
+            let second = ring.input("second", (2, 1));
+            let joined = Mat::concat(ConcatAxis::Rows, vec![first.clone(), second.clone()]);
+            // Both sides are concats. Only the left concat may be stashed;
+            // the right remains an ordinary materialized Add argument.
+            let right = Mat::concat(ConcatAxis::Rows, vec![second, first]);
+            let sum = joined.clone() + right;
+            let mut context = DslContext::new("root-block-add").output("sum", sum).unwrap();
+            if retain_concat {
+                context = context.output("joined", joined).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+            assert_eq!(plan.adds.len(), usize::from(!retain_concat));
+            assert_eq!(plan.row_block_concats.len(), usize::from(!retain_concat));
+            assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).adds.is_empty());
+
+            let first_matrix = DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[7u8.into()])],
+            );
+            let second_row = DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[11u8.into()])],
+            );
+            let second_matrix = second_row.concat_rows(&[&first_matrix]);
+            let inputs = BTreeMap::from([
+                ("first".to_owned(), RuntimeValue::matrix(first_matrix)),
+                ("second".to_owned(), RuntimeValue::matrix(second_matrix)),
+            ]);
+            let mut backend = cpu_backend([parameters]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            assert_eq!(matrix_output(&optimized, "sum"), matrix_output(&reference, "sum"));
+            if retain_concat {
+                assert_eq!(
+                    matrix_output(&optimized, "joined"),
+                    matrix_output(&reference, "joined")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_block_plans_preserve_observable_boundaries() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        for retained in [false, true] {
+            let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+            let ring = Ring::new(parameters.modulus().as_ref().clone(), 8usize);
+            let digits = parameters.modulus_digits();
+            let input = Mat::concat(
+                ConcatAxis::Rows,
+                vec![ring.input("a", (1, 3)), ring.input("b", (2, 3))],
+            );
+            let left = Mat::concat(
+                ConcatAxis::Rows,
+                vec![ring.input("x", (1, 3 * digits)), ring.input("y", (2, 3 * digits))],
+            );
+            let product = input.clone().decompose(16, digits).mul_small_rhs(left.clone());
+            let first =
+                product.clone().slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+            let second =
+                product.clone().slice(Some(IndexRange { start: 1.into(), end: 3.into() }), None);
+            let mut context = DslContext::new("compact-block-boundaries")
+                .output("first", first)
+                .unwrap()
+                .output("second", second)
+                .unwrap();
+            if retained {
+                context = context
+                    .output("input", input)
+                    .unwrap()
+                    .output("left", left)
+                    .unwrap()
+                    .output("product", product)
+                    .unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+            assert_eq!(plan.decompositions.len(), usize::from(!retained));
+            assert_eq!(plan.compact_products.len(), usize::from(!retained));
+            let traced = root_block_aliases(&graph, &FrozenGraphScopeId::Root, true);
+            assert!(traced.decompositions.is_empty() && traced.compact_products.is_empty());
+            let matrix = |rows, columns| {
+                DCRTPolyMatrix::from_poly_vec(
+                    &parameters,
+                    (0..rows)
+                        .map(|_| {
+                            (0..columns)
+                                .map(|_| {
+                                    DCRTPoly::from_biguints(
+                                        &parameters,
+                                        &[rand::random::<u16>().into()],
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                )
+            };
+            let inputs = BTreeMap::from([
+                ("a".into(), RuntimeValue::matrix(matrix(1, 3))),
+                ("b".into(), RuntimeValue::matrix(matrix(2, 3))),
+                ("x".into(), RuntimeValue::matrix(matrix(1, 3 * digits))),
+                ("y".into(), RuntimeValue::matrix(matrix(2, 3 * digits))),
+            ]);
+            let mut backend = cpu_backend([parameters]);
+            let mut store = MemoryArtifactStore::default();
+            let optimized =
+                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            let (reference, _) =
+                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+                    .unwrap();
+            for name in ["first", "second"] {
+                assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
+            }
+        }
+    }
+
+    #[test]
+    fn root_plan_cache_respects_mutable_validation_metadata() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        let ring = Ring::new(97, 8usize);
+        let joined = Mat::concat(
+            ConcatAxis::Rows,
+            vec![ring.input("first", (2, 2)), ring.input("second", (2, 2))],
+        );
+        let selected = joined.slice(Some(IndexRange { start: 0.into(), end: 2.into() }), None);
+        let mut graph = DslContext::new("cached-block-plan")
+            .output("selected", selected)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let original = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert_eq!(original.concats.len(), 1);
+        assert!(Arc::ptr_eq(
+            &original,
+            &root_block_aliases(&graph, &FrozenGraphScopeId::Root, false)
+        ));
+        let concat = *original.concats.keys().next().unwrap();
+        graph
+            .scopes
+            .get_mut(&FrozenGraphScopeId::Root)
+            .unwrap()
+            .liveness
+            .retained
+            .insert(WireRef { node: concat, port: Port(0) });
+        let retained = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert!(retained.concats.is_empty());
+        assert!(!Arc::ptr_eq(&original, &retained));
+        graph
+            .scopes
+            .get_mut(&FrozenGraphScopeId::Root)
+            .unwrap()
+            .liveness
+            .retained
+            .remove(&WireRef { node: concat, port: Port(0) });
+        assert!(Arc::ptr_eq(
+            &original,
+            &root_block_aliases(&graph, &FrozenGraphScopeId::Root, false)
+        ));
+        assert!(root_block_aliases(&graph, &FrozenGraphScopeId::Root, true).concats.is_empty());
+    }
+
+    #[test]
+    fn root_block_aliases_keep_retained_and_partial_concat_materialized() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        for retained in [false, true] {
+            let ring = Ring::new(97, 8usize);
+            let joined = Mat::concat(
+                ConcatAxis::Rows,
+                vec![ring.input("first", (2, 2)), ring.input("second", (2, 2))],
+            );
+            let selected = joined.clone().slice(
+                Some(IndexRange { start: 0.into(), end: 2.into() }),
+                (!retained).then(|| IndexRange { start: 0.into(), end: 1.into() }),
+            );
+            let mut context =
+                DslContext::new("block-alias-fallback").output("selected", selected).unwrap();
+            if retained {
+                context = context.output("joined", joined).unwrap();
+            }
+            let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            assert!(
+                root_block_aliases(&graph, &FrozenGraphScopeId::Root, false).concats.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn block_aliases_do_not_hide_invalid_unselected_producers() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        let ring = Ring::new(97, 8usize);
+        let invalid = ring.input("lhs", (2, 3)) * ring.input("rhs", (4, 1));
+        let joined = Mat::concat(ConcatAxis::Rows, vec![ring.input("valid", (1, 1)), invalid]);
+        let selected = joined.slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None);
+        let graph = DslContext::new("invalid-unselected-block")
+            .output("selected", selected)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(graph.validate(&ParamEnv::default()).is_err());
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct PlacementProbeSmallMatrix {
+    pub(super) struct PlacementProbeSmallMatrix {
         placement: usize,
     }
 
     #[derive(Debug, Error)]
-    enum PlacementProbeError {
+    pub(super) enum PlacementProbeError {
         #[error("small matrix belongs to placement {owner}, but codec is on placement {active}")]
         ParameterMismatch { owner: usize, active: usize },
         #[error("forced broadcast preparation failure at placement {placement}")]
@@ -4717,7 +6769,9 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct PlacementProbeBackend {
+    pub(super) struct PlacementProbeBackend {
+        #[cfg(feature = "gpu")]
+        pub(super) import_probe: Option<super::gpu_plan::ImportProbe>,
         active: usize,
         encoded: std::cell::RefCell<Vec<(SmallMatrixSemanticKind, usize, usize)>>,
         fail_broadcast_preparation: bool,
@@ -4737,6 +6791,39 @@ mod tests {
         type SmallMatrix = PlacementProbeSmallMatrix;
         type Trapdoor = ();
         type Error = PlacementProbeError;
+
+        #[cfg(feature = "gpu")]
+        fn preflight_gpu_operations(
+            &mut self,
+            requests: &[(
+                usize,
+                GpuInvocation<'_, Self::Matrix, Self::SmallMatrix, Self::Trapdoor>,
+            )],
+        ) -> Result<(), Self::Error> {
+            if let Some(probe) = &mut self.import_probe {
+                if !probe.preflight(requests) {
+                    return Err(PlacementProbeError::ForcedFailure { placement: self.active });
+                }
+            }
+            Ok(())
+        }
+
+        fn polynomial_from_values(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            values: &[BigInt],
+            evaluation: bool,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, values, evaluation)
+        }
+
+        fn polynomial_values(
+            &mut self,
+            value: &Self::Matrix,
+            evaluation: bool,
+        ) -> Result<Vec<BigInt>, Self::Error> {
+            unused_probe_operation!(value, evaluation)
+        }
 
         fn placement_count(&self) -> usize {
             2
@@ -4936,6 +7023,34 @@ mod tests {
             unused_probe_operation!(value, destination)
         }
 
+        fn centered_rebase(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+
+        fn rns_mod_up(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+            source_moduli: &[u64],
+            digit_size: usize,
+            normalize: bool,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination, source_moduli, digit_size, normalize)
+        }
+        fn rns_mod_down(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+            source_moduli: &[u64],
+            plaintext_modulus: u64,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination, source_moduli, plaintext_modulus)
+        }
+
         fn centered_extend(
             &mut self,
             value: &Self::Matrix,
@@ -4970,10 +7085,15 @@ mod tests {
         }
 
         fn matrix_from_cpu_staging_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Matrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("staging", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
 
@@ -5094,15 +7214,20 @@ mod tests {
             )
         }
 
-        fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
+        fn matrix_to_bytes(&self, value: &Self::Matrix) -> Result<Vec<u8>, Self::Error> {
             unused_probe_operation!(value)
         }
 
         fn matrix_from_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Matrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("matrix", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
 
@@ -5127,11 +7252,16 @@ mod tests {
         }
 
         fn small_matrix_from_bytes(
-            &self,
+            &mut self,
             expected_schema: &ConcreteBoundedMatrixSchema,
             bytes: &[u8],
             expected_semantic_kind: SmallMatrixSemanticKind,
         ) -> Result<Self::SmallMatrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("small", self.active);
+                return Ok(PlacementProbeSmallMatrix { placement: self.active });
+            }
             unused_probe_operation!(expected_schema, bytes, expected_semantic_kind)
         }
 
@@ -5140,10 +7270,15 @@ mod tests {
         }
 
         fn trapdoor_from_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Trapdoor, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("trapdoor", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
     }
@@ -5426,7 +7561,7 @@ mod tests {
         assert_eq!(values.len(), 3);
         assert!(values.iter().all(|value| matches!(value, RuntimeValue::HostMatrix { .. })));
         let RuntimeValue::IndexedFamily(values) = result
-            .materialize_output("values", &backend, &mut store)
+            .materialize_output("values", &mut backend, &mut store)
             .expect("materialize range output")
         else {
             panic!("materialized range output is not an indexed family");
@@ -5479,7 +7614,7 @@ mod tests {
         for handle in result.artifact_handles.values().flatten() {
             store.load(&handle.key, &manifest.artifacts[&handle.key.name]).unwrap();
         }
-        result.materialize_output("values", &backend, &mut store).unwrap();
+        result.materialize_output("values", &mut backend, &mut store).unwrap();
     }
 
     #[test]
@@ -5509,7 +7644,7 @@ mod tests {
                 .unwrap();
         // At most the current input and output family coexist, regardless of chain length.
         assert!(store.peak_entries <= 6, "peak staged entries: {}", store.peak_entries);
-        result.materialize_output("result", &backend, &mut store).unwrap();
+        result.materialize_output("result", &mut backend, &mut store).unwrap();
         result.cleanup_staged(&mut store).unwrap();
     }
 
@@ -5543,11 +7678,11 @@ mod tests {
             execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .expect("execution");
         let gathered = result
-            .materialize_output("gathered", &backend, &mut store)
+            .materialize_output("gathered", &mut backend, &mut store)
             .expect("materialized gathered family")
             .clone();
         let expected = result
-            .materialize_output("expected", &backend, &mut store)
+            .materialize_output("expected", &mut backend, &mut store)
             .expect("materialized expected family")
             .clone();
         let matrices = |value: RuntimeValue<CpuDcrtBackend>| {
@@ -5865,15 +8000,18 @@ mod tests {
             .validate(&ParamEnv::default())
             .unwrap();
         let expected = -DCRTPolyMatrix::identity(&low, 1, None);
-        let result = execute(
+        let mut backend = cpu_backend([low, high]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute(
             &graph,
-            &mut cpu_backend([low, high]),
+            &mut backend,
             BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(expected.clone()))]),
-            &mut MemoryArtifactStore::default(),
+            &mut store,
             SamplingMode::Fresh,
         )
         .unwrap();
         assert_eq!(matrix_output(&result, "product"), &expected);
+        result.materialize_output("digits", &mut backend, &mut store).unwrap();
         assert!(matches!(result.outputs["digits"], RuntimeValue::SmallMatrix(_)));
     }
 
@@ -6241,6 +8379,9 @@ mod tests {
     }
 
     #[test]
+    // The CPU trapdoor representation uses GPU backing under this feature,
+    // so this fixture shares the existing GPU test isolation boundary.
+    #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn transcript_replay_preserves_preimage_small_owner_and_relation() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -6466,44 +8607,6 @@ mod tests {
     }
 
     #[test]
-    fn iteration_returns_completed_matrix_state_to_ram() {
-        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
-        let ring =
-            Ring::new(BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()), 8);
-        let input = parallel(1, |_| Ok(ring.identity(1))).unwrap();
-        let output = iterate(3, input, |_, state| {
-            parallel(1, |index| Ok(state.at(index) + ring.identity(1)))
-        })
-        .unwrap();
-        let graph = DslContext::new("matrix-loop-state")
-            .output("state", output)
-            .unwrap()
-            .output("expected", ring.identity(1) * 4usize)
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let mut backend = cpu_backend([parameters]);
-        let mut store = MemoryArtifactStore::default();
-        let mut result =
-            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
-        let RuntimeValue::IndexedFamily(members) = &result.outputs["state"] else {
-            panic!("family")
-        };
-        assert!(matches!(&members[0], RuntimeValue::HostMatrix { .. }));
-        let expected = matrix_output(&result, "expected").clone();
-        let RuntimeValue::IndexedFamily(members) =
-            result.materialize_output("state", &backend, &mut store).unwrap()
-        else {
-            panic!("family")
-        };
-        let RuntimeValue::Matrix(actual) = &members[0] else { panic!("matrix") };
-        assert_eq!(actual.as_ref(), &expected);
-    }
-
-    #[test]
     fn iteration_carries_each_output_into_the_next_iteration() {
         let context = DslContext::new("runtime-sequential-scan");
         let increments = context.int_family_input("increments", 3);
@@ -6570,22 +8673,26 @@ mod tests {
             .expect("build")
             .validate(&ParamEnv::default())
             .expect("validation");
-        let result = execute(
-            &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
-            BTreeMap::new(),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .expect("execution");
-        let RuntimeValue::IndexedFamily(state) = &result.outputs["state"] else {
+        let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("execution");
+        // Integer loop outputs can be staged now that Int is an artifact type.
+        // Resolve the family through the public API before checking its values.
+        let RuntimeValue::IndexedFamily(state) = result
+            .materialize_output("state", &mut backend, &mut store)
+            .expect("materialized family")
+        else {
             panic!("state output is not a family")
         };
+        assert_eq!(state.len(), 2);
         assert!(
             state.iter().all(
                 |value| matches!(value, RuntimeValue::Int(value) if value == &BigInt::from(3))
             )
         );
+        result.cleanup_staged(&mut store).expect("clean staged integer family");
     }
 
     #[test]
@@ -6608,9 +8715,11 @@ mod tests {
             .expect("build")
             .validate(&ParamEnv::default())
             .expect("validation");
-        let result = execute(
+        let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute(
             &validated,
-            &mut cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]),
+            &mut backend,
             BTreeMap::from([(
                 "bits".to_owned(),
                 RuntimeValue::IndexedFamily(
@@ -6620,15 +8729,22 @@ mod tests {
                         .collect(),
                 ),
             )]),
-            &mut MemoryArtifactStore::default(),
+            &mut store,
             SamplingMode::Fresh,
         )
         .expect("execution");
-        let RuntimeValue::IndexedFamily(packed) = &result.outputs["packed"] else {
+        // Integer loop outputs can be staged now that Int is an artifact type.
+        // Resolve the family through the public API before checking its values.
+        let RuntimeValue::IndexedFamily(packed) = result
+            .materialize_output("packed", &mut backend, &mut store)
+            .expect("materialized family")
+        else {
             panic!("packed output is not a family")
         };
+        assert_eq!(packed.len(), 2);
         assert!(matches!(&packed[0], RuntimeValue::Int(value) if value == &BigInt::from(5)));
         assert!(matches!(&packed[1], RuntimeValue::Int(value) if value == &BigInt::from(6)));
+        result.cleanup_staged(&mut store).expect("clean staged integer family");
     }
 
     #[test]
@@ -6779,7 +8895,7 @@ mod tests {
             execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .expect("execution");
         let bytes = |value: &RuntimeValue<_>| match value {
-            RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix),
+            RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix).unwrap(),
             _ => panic!("expected matrix"),
         };
         assert_eq!(bytes(&result.outputs["actual-one"]), bytes(&result.outputs["expected-one"]));
@@ -6876,9 +8992,9 @@ mod tests {
             nonce,
         )
         .expect("resumed session execution");
-        let backend = cpu_backend([parameters.clone()]);
-        first.materialize_output("sample", &backend, &mut store).unwrap();
-        second.materialize_output("sample", &backend, &mut store).unwrap();
+        let mut backend = cpu_backend([parameters.clone()]);
+        first.materialize_output("sample", &mut backend, &mut store).unwrap();
+        second.materialize_output("sample", &mut backend, &mut store).unwrap();
         assert_eq!(first.production_id, second.production_id);
         assert_eq!(matrix_output(&first, "sample"), matrix_output(&second, "sample"));
 
@@ -6919,6 +9035,56 @@ mod tests {
         output_type: WireType,
     ) -> ValueHandle {
         NodeHandle::new(kind, arguments, vec![output_type]).output(0).expect("scalar output")
+    }
+
+    #[test]
+    fn exported_integer_remains_available_to_downstream_arithmetic() {
+        let integer = BigInt::from(rand::random::<i64>());
+        let value =
+            scalar_value(NodeKind::ConstantInt(integer.clone()), Vec::new(), WireType::ConstantInt);
+        let one =
+            scalar_value(NodeKind::ConstantInt(BigInt::from(1)), Vec::new(), WireType::ConstantInt);
+        let successor = scalar_value(
+            NodeKind::IntBinary(IntBinaryOp::Add),
+            vec![value.clone(), one],
+            WireType::Int,
+        );
+        let graph = Graph::freeze(
+            "exported-integer-consumer",
+            Vec::new(),
+            BTreeMap::from([
+                (
+                    "value".to_owned(),
+                    GraphOutput { value, confidentiality: Some(ArtifactConfidentiality::Public) },
+                ),
+                ("successor".to_owned(), GraphOutput { value: successor, confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        let mut backend = cpu_backend([]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let RuntimeValue::Int(successor) = &result.outputs["successor"] else {
+            panic!("expected integer successor");
+        };
+        assert_eq!(successor, &(&integer + BigInt::from(1)));
+        let RuntimeValue::Int(exported) = &result.outputs["value"] else {
+            panic!("integer exports must retain their resident scalar result");
+        };
+        assert_eq!(exported, &integer);
+        let RuntimeValue::Int(exported) =
+            result.materialize_output("value", &mut backend, &mut store).unwrap()
+        else {
+            panic!("expected exported integer");
+        };
+        assert_eq!(exported, &integer);
     }
 
     #[test]
@@ -7000,6 +9166,72 @@ mod tests {
         assert!(
             matches!(&result.outputs["product"], RuntimeValue::Real(value) if (*value - 6.0).abs() < 1e-12)
         );
+    }
+
+    #[test]
+    fn failed_execution_removes_eager_exports_but_preserves_session_artifacts() {
+        use crate::artifact::FileArtifactStore;
+        let one = scalar_value(NodeKind::ConstantInt(1.into()), Vec::new(), WireType::ConstantInt);
+        let zero = scalar_value(NodeKind::ConstantInt(0.into()), Vec::new(), WireType::ConstantInt);
+        let quotient = scalar_value(
+            NodeKind::IntBinary(IntBinaryOp::Divide),
+            vec![one.clone(), zero],
+            WireType::Int,
+        );
+        let graph = Graph::freeze(
+            "failed-eager-export",
+            Vec::new(),
+            BTreeMap::from([
+                (
+                    "exported".into(),
+                    GraphOutput {
+                        value: one,
+                        confidentiality: Some(ArtifactConfidentiality::Public),
+                    },
+                ),
+                ("failure".into(), GraphOutput { value: quotient, confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let graph = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        for session in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = FileArtifactStore::new(directory.path()).unwrap();
+            let mut backend = cpu_backend([]);
+            let result = if session {
+                execute_in_session(
+                    &graph,
+                    &mut backend,
+                    BTreeMap::new(),
+                    &mut store,
+                    rand::random(),
+                )
+            } else {
+                execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+            };
+            assert!(matches!(result, Err(ExecutionError::DivisionByZero(_))));
+            let mut pending = vec![directory.path().to_path_buf()];
+            let mut artifacts = 0;
+            while let Some(path) = pending.pop() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path.extension().is_some_and(|extension| extension == "artifact") {
+                        artifacts += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                artifacts,
+                usize::from(session),
+                "only resumable sessions retain eager exports"
+            );
+        }
     }
 
     #[test]

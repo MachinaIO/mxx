@@ -185,6 +185,11 @@ impl std::fmt::Debug for FileArtifactStore {
 
 impl Drop for FileArtifactStore {
     fn drop(&mut self) {
+        // Closing our descriptor alone can leave a flock held by a concurrent
+        // fork until its child execs. Release ownership explicitly first.
+        for lock in self.locks.values() {
+            let _ = unlock(lock);
+        }
         self.locks.clear();
     }
 }
@@ -619,6 +624,7 @@ impl SessionStore for FileArtifactStore {
             return Err(FileArtifactError::SessionBusy(production));
         }
         if let Err(error) = self.store_session(&session) {
+            unlock(&lock).map_err(|source| FileArtifactError::Io { path: lock_path, source })?;
             return Err(error);
         }
         self.locks.insert(production.clone(), lock);
@@ -630,6 +636,12 @@ impl SessionStore for FileArtifactStore {
         if !self.active_sessions.contains(production) {
             return Err(FileArtifactError::SessionNotOpen(production.clone()));
         }
+        let lock = self
+            .locks
+            .get(production)
+            .ok_or_else(|| FileArtifactError::SessionNotOpen(production.clone()))?;
+        unlock(lock)
+            .map_err(|source| FileArtifactError::Io { path: self.lock_path(production), source })?;
         self.locks.remove(production);
         self.active_sessions.remove(production);
         Ok(())
@@ -972,6 +984,20 @@ fn try_lock(file: &fs::File) -> io::Result<bool> {
 #[cfg(not(unix))]
 fn try_lock(_file: &fs::File) -> io::Result<bool> {
     Ok(true)
+}
+
+#[cfg(unix)]
+fn unlock(file: &fs::File) -> io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn unlock(_file: &fs::File) -> io::Result<()> {
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1480,6 +1506,9 @@ impl MemoryArtifactStore {
 
 fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> bool {
     match (artifact_type, payload) {
+        (ArtifactType::Int, ArtifactPayload::Bytes(bytes)) => {
+            num_bigint::BigInt::from_signed_bytes_le(bytes).to_signed_bytes_le() == *bytes
+        }
         (ArtifactType::Matrix(_), ArtifactPayload::Matrix(_)) |
         (ArtifactType::SmallMatrix { .. }, ArtifactPayload::SmallMatrix(_)) |
         (ArtifactType::Preimage { .. }, ArtifactPayload::SmallMatrix(_)) |
@@ -1530,6 +1559,26 @@ mod tests {
 
     fn production(seed: u8) -> ProductionId {
         ProductionId { spec_hash: SpecHash([seed; 32]), execution_nonce: [seed + 1; 32] }
+    }
+
+    #[test]
+    fn test_integer_artifact_requires_canonical_signed_encoding() {
+        for value in [
+            BigInt::from(0),
+            BigInt::from(-129),
+            BigInt::from(128),
+            BigInt::from(1) << 200usize,
+            -(BigInt::from(1) << 200usize),
+        ] {
+            let bytes = value.to_signed_bytes_le();
+            assert!(payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(bytes.clone())));
+            assert_eq!(BigInt::from_signed_bytes_le(&bytes), value);
+            let mut redundant = bytes;
+            redundant.push(if value.sign() == num_bigint::Sign::Minus { 255 } else { 0 });
+            assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(redundant)));
+        }
+        assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(vec![])));
+        assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::TypedBlob(vec![0])));
     }
 
     #[test]
@@ -1822,6 +1871,40 @@ mod tests {
             store.load(&key, &descriptor).expect("load original payload"),
             ArtifactPayload::Bytes(vec![1])
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_file_session_owner_releases_locks_with_duplicated_descriptors() {
+        for explicit in [false, true] {
+            let directory = tempdir().unwrap();
+            let production = production(50);
+            let descriptor = SessionDescriptor::new(production.clone(), "graph", [10; 32]);
+            let mut store = FileArtifactStore::new(directory.path()).unwrap();
+            assert_eq!(store.open_session(&descriptor).unwrap(), SessionStatus::Running);
+            // dup shares the same open file description as a fork-inherited
+            // descriptor, so this exercises the lifetime without process races.
+            let inherited = store.locks[&production].try_clone().unwrap();
+            let mut contender = FileArtifactStore::new(directory.path()).unwrap();
+            assert!(matches!(
+                contender.open_session(&descriptor),
+                Err(FileArtifactError::SessionBusy(_))
+            ));
+            if explicit {
+                store.release_session(&production).unwrap();
+            } else {
+                drop(store);
+            }
+            assert_eq!(contender.open_session(&descriptor).unwrap(), SessionStatus::Running);
+            drop(inherited);
+            let mut third = FileArtifactStore::new(directory.path()).unwrap();
+            assert!(matches!(
+                third.open_session(&descriptor),
+                Err(FileArtifactError::SessionBusy(_))
+            ));
+            contender.release_session(&production).unwrap();
+            assert_eq!(third.open_session(&descriptor).unwrap(), SessionStatus::Running);
+        }
     }
 
     #[test]

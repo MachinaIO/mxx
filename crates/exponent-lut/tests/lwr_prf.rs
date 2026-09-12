@@ -1423,7 +1423,7 @@ mod rns_bgg {
                 let RuntimeValue::Matrix(matrix) = &result.outputs["value"] else {
                     panic!("matrix")
                 };
-                let bytes = backend.matrix_to_bytes(matrix);
+                let bytes = backend.matrix_to_bytes(matrix).unwrap();
                 let restored = backend
                     .matrix_from_bytes(
                         &ConcreteMatrixType {

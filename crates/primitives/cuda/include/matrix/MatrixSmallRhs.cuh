@@ -31,6 +31,7 @@ int gpu_small_matrix_create(
     size_t magnitude_bytes,
     const uint64_t *bound_words,
     size_t bound_word_count,
+    bool initialize_zero,
     GpuSmallMatrix **out);
 void gpu_small_matrix_destroy(GpuSmallMatrix *mat);
 int gpu_small_matrix_wait(const GpuSmallMatrix *mat);
@@ -39,6 +40,12 @@ int gpu_small_matrix_copy_columns(
     GpuSmallMatrix *out,
     const GpuSmallMatrix *src,
     size_t source_column_start);
+int gpu_small_matrix_copy_range(
+    GpuSmallMatrix *out,
+    size_t destination_column_start,
+    const GpuSmallMatrix *src,
+    size_t source_column_start,
+    size_t columns);
 int gpu_small_matrix_view_columns(
     const GpuSmallMatrix *src,
     size_t source_column_start,
@@ -53,13 +60,16 @@ int gpu_small_matrix_store_coefficients(
     uint8_t *payload,
     size_t payload_len);
 int gpu_small_matrix_decompose_base(
-    const GpuMatrix *src,
+    const GpuMatrix *const *sources,
+    size_t block_count,
     uint32_t base_bits,
     int small_mode,
     const uint64_t *max_coefficient_bound,
     size_t bound_word_count,
     GpuSmallMatrix *out,
-    size_t dropped_moduli);
+    size_t dropped_moduli,
+    const GpuMatrixRange *source_views,
+    const GpuMatrixRange *destination_view);
 int gpu_small_matrix_prepare_preimage_hard_cutoff(GpuSmallMatrix *mat);
 int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
     GpuSmallMatrix *dst,
@@ -71,12 +81,16 @@ int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
     const uint64_t *bound_words,
     size_t bound_word_count,
     int32_t *accepted_out);
+int gpu_matrix_query_small_rhs_workspace_bytes(
+    const GpuContext *ctx, int level, size_t inner, size_t columns,
+    size_t *narrow_bytes, size_t *wide_bytes);
 int gpu_matrix_mul_small_rhs(
-    GpuMatrix *out,
-    const GpuMatrix *lhs_eval,
+    GpuMatrix *const *outputs,
+    const GpuMatrix *const *inputs,
+    size_t block_count,
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
-    GpuSmallMatrixAllocationReport *allocation_report);
+    GpuSmallMatrixAllocationReport *allocation_report, const GpuMatrixBatchView *views);
 #ifdef __cplusplus
 }
 #endif

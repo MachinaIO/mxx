@@ -50,6 +50,8 @@ pub enum SmallMatrixSemanticKind {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(tag = "tag", content = "value")]
 pub enum ArtifactType {
+    /// An arbitrary-precision integer, canonically encoded as signed little-endian bytes.
+    Int,
     Matrix(ConcreteMatrixType),
     SmallMatrix {
         matrix: ConcreteMatrixType,
@@ -82,6 +84,7 @@ pub enum ArtifactType {
 impl ArtifactType {
     pub fn from_wire_type(wire_type: &ConcreteWireType) -> Option<Self> {
         match wire_type {
+            ConcreteWireType::ConstantInt | ConcreteWireType::Int => Some(Self::Int),
             ConcreteWireType::Matrix(matrix) => Some(Self::Matrix(matrix.clone())),
             ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } => {
                 Some(Self::SmallMatrix {
@@ -110,10 +113,8 @@ impl ArtifactType {
             ConcreteWireType::TypedBlob { type_name, schema_hash } => {
                 Some(Self::TypedBlob { type_name: type_name.clone(), schema_hash: *schema_hash })
             }
-            ConcreteWireType::ConstantInt |
             ConcreteWireType::ConstantReal |
             ConcreteWireType::ConstantBool |
-            ConcreteWireType::Int |
             ConcreteWireType::Real |
             ConcreteWireType::Bool |
             ConcreteWireType::IndexedFamily { .. } => None,

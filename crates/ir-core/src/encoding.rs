@@ -46,6 +46,11 @@ pub fn hash_canonical<T: Serialize>(value: &T) -> Result<[u8; 32], EncodingError
 /// `ProductionId`s use this hash so artifacts produced with different
 /// concrete dimensions or moduli cannot be interchanged.
 pub fn spec_hash(graph: &Graph, bindings: &ParamEnv) -> Result<SpecHash, EncodingError> {
+    if let Some((cached_bindings, hash)) = graph.spec_hash_cache().get() {
+        if cached_bindings == bindings {
+            return Ok(hash.clone());
+        }
+    }
     #[derive(Serialize)]
     struct Payload<'a> {
         ir_version: u32,
@@ -63,7 +68,11 @@ pub fn spec_hash(graph: &Graph, bindings: &ParamEnv) -> Result<SpecHash, Encodin
             .collect(),
         real_bindings: bindings.reals.iter().map(|(name, value)| (name.as_str(), value)).collect(),
     };
-    Ok(SpecHash(hash_canonical(&payload)?))
+    let hash = SpecHash(hash_canonical(&payload)?);
+    // A competing first computation is harmless: both results commit to the
+    // exact graph and bindings. No lock or graph serialization on cache hits.
+    let _ = graph.spec_hash_cache().set((bindings.clone(), hash.clone()));
+    Ok(hash)
 }
 
 fn canonicalize_value(value: &mut Value) {
@@ -216,7 +225,19 @@ mod tests {
             ..ParamEnv::default()
         };
 
-        assert_ne!(spec_hash(&graph, &first).unwrap(), spec_hash(&graph, &second).unwrap());
+        let first_hash = spec_hash(&graph, &first).unwrap();
+        let second_hash = spec_hash(&graph, &second).unwrap();
+        assert_ne!(first_hash, second_hash);
+        let decoded: Graph = serde_json::from_slice(&canonical_json(&graph).unwrap()).unwrap();
+        assert_eq!(second_hash, spec_hash(&decoded, &second).unwrap());
+        assert_eq!(first_hash, spec_hash(&graph.clone(), &first).unwrap());
+        let mut changed_real = first.clone();
+        changed_real.reals.insert("sigma".into(), Rational::new(3.into(), 1.into()).unwrap());
+        assert_ne!(first_hash, spec_hash(&graph, &changed_real).unwrap());
+        assert_eq!(
+            spec_hash(&graph, &changed_real).unwrap(),
+            spec_hash(&decoded, &changed_real).unwrap()
+        );
     }
 
     #[test]

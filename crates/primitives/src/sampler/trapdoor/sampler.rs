@@ -124,7 +124,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
                 minimum,
             });
         }
-        let target = target.load_columns(0, target.col_size());
+        let target = target.column_range(0, target.col_size()).materialize(params)?;
         loop {
             let candidate =
                 expanded_preimage_candidate(self, params, trapdoor, public_matrix, &target);
@@ -400,6 +400,50 @@ mod test {
         };
         let gadget_matrix = DCRTPolyMatrix::gadget_matrix(&params, size, None);
         assert_eq!(muled, gadget_matrix);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_preimage_generation_small_moduli_reconstructs_target() {
+        // These small primes are below typical perturbation magnitudes. Signed
+        // Gaussian coefficients must still enter every CRT limb modulo q.
+        for (dimension, bits, base_bits) in [(2, 6, 3), (4, 12, 4), (4, 6, 3)] {
+            let depth = if dimension == 4 && bits == 6 { 2 } else { 1 };
+            let params = DCRTPolyParams::new(dimension, depth, bits, base_bits, None, None);
+            let sampler = DCRTPolyTrapdoorSampler::new(&params, SIGMA);
+            let (trapdoor, public) = sampler.trapdoor(&params, 1);
+            let bound = default_preimage_cutoff(
+                params.ring_dimension(),
+                1,
+                params.modulus_digits(),
+                1u32 << params.base_bits(),
+                SIGMA,
+            )
+            .unwrap();
+            for _ in 0..3 {
+                let target = DCRTPolyUniformSampler::new().sample_uniform(
+                    &params,
+                    1,
+                    2,
+                    DistType::FinRingDist,
+                );
+                let sampled = sampler
+                    .preimage(
+                        &params,
+                        &trapdoor,
+                        &public,
+                        &crate::matrix::ResidentPolyMatrixColumnSource::new(target.clone()),
+                        bound.clone(),
+                        rand::random(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    &public * sampled.value(),
+                    target,
+                    "small-modulus preimage relation: dimension={dimension}, bits={bits}, depth={depth}"
+                );
+            }
+        }
     }
 
     #[test]

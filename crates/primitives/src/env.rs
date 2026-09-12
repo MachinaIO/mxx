@@ -28,9 +28,8 @@ fn positive_usize(name: &str, default: usize) -> Result<usize, String> {
     }
 }
 
-/// `MXX_GPU_VRAM_PERCENT`: target percentage of each GPU's total VRAM used to
-/// size operation waves. Calibrated runtime waves retain a one-column minimum
-/// when resident inputs reach this target. Default: 80.
+/// `MXX_GPU_VRAM_PERCENT`: percentage of each GPU's total VRAM available to
+/// one GPU operation. Default: 80.
 pub fn gpu_vram_percent() -> Result<u32, String> {
     let percent = positive_usize("MXX_GPU_VRAM_PERCENT", 80)?;
     if percent <= 100 {
@@ -48,6 +47,13 @@ pub fn gpu_preimage_max_tile_attempts() -> Result<usize, String> {
     positive_usize("MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS", 64)
 }
 
+/// Repetitions of paired compact-operation library measurements. Each sample
+/// includes submission and result completion; setup and validation are separate.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn compact_operation_test_repeats() -> usize {
+    positive_usize("MXX_PRIMITIVE_TEST_REPEATS", 3).unwrap()
+}
+
 #[cfg(test)]
 pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
     // Small unit-test defaults; overrides permit the same production path to
@@ -59,16 +65,6 @@ pub(crate) fn modulus_conversion_test_parameters() -> (u32, usize, usize, u32) {
     assert!(dimension >= 16 && dimension.is_power_of_two());
     assert!(depth >= 4);
     (u32::try_from(dimension).unwrap(), depth, bits, u32::try_from(base_bits).unwrap())
-}
-
-#[cfg(test)]
-pub fn matrix_batch_test_shape() -> (usize, usize, usize) {
-    // Bound the benchmark wave independently of ring/CRT parameter overrides.
-    (
-        positive_usize("MXX_PRIMITIVE_TEST_BATCH_SIZE", 3).unwrap(),
-        positive_usize("MXX_PRIMITIVE_TEST_INNER", 3).unwrap(),
-        positive_usize("MXX_PRIMITIVE_TEST_COLUMNS", 5).unwrap(),
-    )
 }
 
 #[cfg(test)]
@@ -107,3 +103,21 @@ mod tests {
         unsafe { std::env::remove_var(name) };
     }
 }
+
+/// Internal re-execution marker for the GPU retirement failure unit test. A
+/// quarantined execution intentionally survives until its isolated process exits.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) const GPU_RETIREMENT_TEST_CHILD: &str = "MXX_PRIMITIVE_GPU_RETIREMENT_TEST_CHILD";
+
+/// Isolates the prepared-occupancy test's process-wide CUDA pool counters while
+/// leaving unrelated tests concurrent in the parent test process.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) const GPU_PREPARED_OCCUPANCY_TEST_CHILD: &str =
+    "MXX_PRIMITIVE_GPU_PREPARED_OCCUPANCY_TEST_CHILD";
+
+/// Isolates unit tests that assert exact process-global live-context counts or
+/// require exactly one live context. The `#[sequential]` and
+/// `serial(gpu_context)` guard groups do not exclude each other, so the checks
+/// run in a child process while unrelated tests stay concurrent in the parent.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) const GPU_CONTEXT_COUNT_TEST_CHILD: &str = "MXX_PRIMITIVE_GPU_CONTEXT_COUNT_TEST_CHILD";

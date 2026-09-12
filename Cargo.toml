@@ -12,6 +12,7 @@ members = [
     "crates/func-enc",
     "crates/we",
     "crates/io",
+    "crates/fhe",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ mxx-dsl = { path = "crates/dsl" }
 mxx-runtime = { path = "crates/runtime" }
 mxx-bench-estimator = { path = "crates/bench-estimator" }
 mxx-bgg = { path = "crates/bgg" }
+mxx-fhe = { path = "crates/fhe" }
 bigdecimal = "0.4"
 bincode = "2.0.1"
 bitvec = "1"

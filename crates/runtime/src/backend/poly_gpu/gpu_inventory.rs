@@ -39,6 +39,10 @@ struct ColumnInventoryLayout {
     cuts: Vec<usize>,
     capacities: Vec<usize>,
     alternatives: bool,
+    // May contain descriptors with no native owner until materialization.
+    // Alternatives use OR: eager members retain their separately counted owners.
+    lazy: bool,
+    packed_family: bool,
 }
 
 impl ColumnInventoryLayout {
@@ -47,7 +51,7 @@ impl ColumnInventoryLayout {
         cuts.dedup();
         let mut capacities = cuts.windows(2).map(|range| range[1] - range[0]).collect::<Vec<_>>();
         capacities.sort_unstable_by(|a, b| b.cmp(a));
-        Self { cuts, capacities, alternatives: false }
+        Self { cuts, capacities, alternatives: false, lazy: false, packed_family: false }
     }
 
     fn include_alternative(&mut self, other: Self) {
@@ -55,6 +59,8 @@ impl ColumnInventoryLayout {
             *self = other;
             return;
         }
+        self.lazy |= other.lazy;
+        self.packed_family |= other.packed_family;
         self.alternatives |= other.alternatives || self.cuts != other.cuts;
         self.cuts.extend(other.cuts);
         self.cuts.sort_unstable();
@@ -92,12 +98,22 @@ impl ColumnInventoryLayout {
                 for member in members {
                     self.include_input(member, columns);
                 }
+                self.packed_family = true;
                 return;
             }
             // Host/lazy members materialize as complete fresh matrices.
             _ => vec![0, columns],
         };
-        self.include_alternative(Self::new(cuts));
+        let mut layout = Self::new(cuts);
+        layout.lazy = matches!(
+            value,
+            RuntimeValue::LazyArtifact { .. } |
+                RuntimeValue::StagedArtifact { .. } |
+                RuntimeValue::HostMatrix { .. } |
+                RuntimeValue::LazyArtifactFamily { .. } |
+                RuntimeValue::StagedArtifactFamily { .. }
+        );
+        self.include_alternative(layout);
     }
 }
 
@@ -272,6 +288,64 @@ fn family_leaves(ty: &ConcreteWireType) -> Box<dyn Iterator<Item = &ConcreteWire
         }
         _ => Box::new(std::iter::once(ty)),
     }
+}
+
+fn import_inventory(
+    parameters: &GpuDCRTPolyParams,
+    output: &ConcreteWireType,
+    scratch_columns: usize,
+) -> Result<(Vec<(usize, usize)>, Vec<GpuPreparedWorkspaceLayout>), PolyBackendError> {
+    let mut matrices = Vec::new();
+    let mut layouts = Vec::new();
+    match output {
+        ConcreteWireType::Matrix(ty) => {
+            // Artifact import: coefficient staging, codec
+            // stream and load workspace for the widest payload.
+            let params = parameters;
+            let level = params.crt_depth() - 1;
+            let bits = u16::try_from(params.modulus().bits())
+                .map_err(|_| PolyBackendError::InvalidInteger)?;
+            let load = params
+                .compact_transfer_workspace(
+                    level,
+                    ty.rows,
+                    ty.columns,
+                    GpuCompactTransferKind::Load { max_coefficient_bits: bits },
+                )
+                .map_err(PolyBackendError::GpuSubmission)?;
+            let transfer = params
+                .rns_transfer_workspace(level, ty.rows, ty.columns.min(scratch_columns))
+                .map_err(PolyBackendError::GpuSubmission)?;
+            matrices.push((ty.rows, ty.columns.min(scratch_columns)));
+            layouts.extend(vec![
+                stream(),
+                load,
+                GpuPreparedWorkspaceLayout {
+                    kind: GpuPreparedSlotKind::PinnedHost,
+                    bytes: transfer.bytes,
+                    alignment: 1,
+                },
+                transfer,
+                event(),
+            ]);
+        }
+        ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. } => {
+            let (ty, bound) = bound_of(output).ok_or(PolyBackendError::InvalidInteger)?;
+            let params = parameters;
+            let staging =
+                compact_payload(&params, ty.rows, ty.columns.min(scratch_columns), &bound)?;
+            layouts.extend(vec![
+                staging,
+                pinned_payload(
+                    &ConcreteMatrixType { columns: ty.columns.min(scratch_columns), ..ty.clone() },
+                    &bound,
+                ),
+                event(),
+            ]);
+        }
+        _ => {}
+    }
+    Ok((matrices, layouts))
 }
 
 /// Add traced claims as inventory demand: matrix owners become backing
@@ -523,7 +597,7 @@ impl GpuDcrtBackend {
             .par_iter()
             .enumerate()
             .filter_map(|(position, handle)| {
-                let NodeKind::Input { name, .. } = handle.kind() else { return None };
+                let NodeKind::Input { name, artifact, .. } = handle.kind() else { return None };
                 let wire =
                     WireRef { node: mxx_ir_core::types::NodeId(position as u64), port: Port(0) };
                 let mut layout = ColumnInventoryLayout::default();
@@ -539,6 +613,7 @@ impl GpuDcrtBackend {
                         layout = ColumnInventoryLayout::new(vec![0, ty.columns]);
                     }
                 }
+                layout.lazy |= artifact.is_some();
                 Some((wire, layout))
             })
             .collect::<BTreeMap<_, _>>();
@@ -585,11 +660,11 @@ impl GpuDcrtBackend {
                     warm_up,
                 )?
                 .0;
-            let fits = self
+            let requested = self
                 .devices
                 .par_iter()
                 .enumerate()
-                .map(|(device, (_, backend))| -> Result<bool, PolyBackendError> {
+                .map(|(device, (_, backend))| -> Result<usize, PolyBackendError> {
                     let mut bytes = 0usize;
                     let mut used = HashSet::new();
                     for (ty, context) in demand.values() {
@@ -623,17 +698,17 @@ impl GpuDcrtBackend {
                             }
                         }
                     }
-                    Ok(bytes <= available[device])
+                    Ok(bytes)
                 })
-                .try_reduce(|| true, |left, right| Ok(left && right))?;
-            if fits {
+                .collect::<Result<Vec<_>, PolyBackendError>>()?;
+            if requested.iter().zip(&available).all(|(requested, available)| requested <= available)
+            {
                 break demand;
             }
             if width == 1 {
-                return Err(PolyBackendError::GpuSubmission(
-                    "retained graph owners and one-column scratch exceed the setup memory budget"
-                        .into(),
-                ));
+                return Err(PolyBackendError::GpuSubmission(format!(
+                    "retained graph owners and one-column scratch exceed the setup memory budget: requested bytes per device {requested:?}, available bytes per device {available:?}"
+                )));
             }
             width = width.div_ceil(2);
         };
@@ -851,11 +926,20 @@ impl GpuDcrtBackend {
             let id = mxx_ir_core::types::NodeId(node_position as u64);
             let retained_until = |port: usize| {
                 let wire = WireRef { node: id, port: Port(port as u32) };
-                let end = if capture_trace {
+                let mut end = if capture_trace {
                     usize::MAX
                 } else {
                     owner_until.get(&wire).copied().unwrap_or(node_position)
                 };
+                if matches!(handle.kind(), NodeKind::Select { .. }) {
+                    // Select materializes and caches only the chosen candidate.
+                    // Its owner can outlive the selection output through a later
+                    // use of that candidate; reserve one possible owner until
+                    // the latest candidate use without importing all candidates.
+                    for candidate in scope.arguments(handle).unwrap().iter().skip(1) {
+                        end = end.max(owner_until.get(candidate).copied().unwrap_or(node_position));
+                    }
+                }
                 // execute_instances_batch borrows the complete input map. A
                 // child input materialized from a staged family therefore stays
                 // alive until the body returns, even after its last wire use.
@@ -1008,7 +1092,122 @@ impl GpuDcrtBackend {
                         *width = (*width).min(ty.columns / (index + 1));
                     }
                 }
+                layout.lazy = match kind {
+                    NodeKind::Input { artifact, .. } => artifact.is_some(),
+                    NodeKind::FamilyPack { .. } => arguments
+                        .iter()
+                        .any(|wire| column_layouts.get(wire).is_some_and(|source| source.lazy)),
+                    NodeKind::FamilyGetStatic { .. } => {
+                        column_layouts.get(&arguments[0]).is_some_and(|source| source.lazy)
+                    }
+                    _ => false,
+                };
+                layout.packed_family = matches!(kind, NodeKind::FamilyPack { .. }) ||
+                    (matches!(
+                        kind,
+                        NodeKind::FamilyGetStatic { .. } |
+                            NodeKind::FamilyGetDynamic |
+                            NodeKind::Select { .. }
+                    ) && matches!(output, ConcreteWireType::IndexedFamily { .. }) &&
+                        arguments.iter().any(|wire| {
+                            column_layouts.get(wire).is_some_and(|source| source.packed_family)
+                        }));
+                if matches!(output, ConcreteWireType::IndexedFamily { .. }) &&
+                    matches!(kind, NodeKind::FamilyGetDynamic | NodeKind::Select { .. })
+                {
+                    layout.lazy |= arguments
+                        .iter()
+                        .any(|wire| column_layouts.get(wire).is_some_and(|source| source.lazy));
+                }
                 column_layouts.insert(wire, layout);
+            }
+            // Only materializing consumers create owners for lazy inputs. Packs
+            // and static selection copy descriptors; loop Zip placement imports
+            // one member into the borrowed child input map instead.
+            let structural = matches!(
+                kind,
+                NodeKind::Input { .. } |
+                    NodeKind::FamilyPack { .. } |
+                    NodeKind::FamilyGetStatic { .. } |
+                    NodeKind::FamilyGetDynamic |
+                    NodeKind::Select { .. } |
+                    NodeKind::SubgraphCall(_) |
+                    NodeKind::SequentialLoop(_)
+            );
+            let materialized = arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(index, wire)| {
+                    let layout = column_layouts.get(wire)?;
+                    if !layout.lazy || structural {
+                        return None;
+                    }
+                    let end = if let NodeKind::ParallelLoop(body) = kind {
+                        if !matches!(
+                            body.input_modes[index],
+                            mxx_ir_core::node::LoopInputMode::Broadcast
+                        ) || (matches!(
+                            argument_types[index],
+                            ConcreteWireType::IndexedFamily { .. }
+                        ) && !layout.packed_family)
+                        {
+                            return None;
+                        }
+                        node_position
+                    } else {
+                        owner_until.get(wire).copied().unwrap_or(node_position)
+                    };
+                    Some((*wire, argument_types[index].clone(), end))
+                })
+                .collect::<Vec<_>>();
+            let mut imports = Vec::new();
+            for (wire, ty, end) in materialized {
+                until.set(if capture_trace { usize::MAX } else { end });
+                for leaf in family_leaves(&ty) {
+                    if let ConcreteWireType::Matrix(ty) = leaf {
+                        add_matrix(&mut demand, ty, ty.rows, ty.columns);
+                    } else if let Some((ty, bound)) = bound_of(leaf) {
+                        let params = parameters(self, ty)?;
+                        add_layouts(
+                            &mut demand,
+                            ty,
+                            vec![compact_payload(&params, ty.rows, ty.columns, &bound)?],
+                        );
+                    }
+                    imports.push(leaf.clone());
+                }
+                // Placement imports clone the descriptor; ordinary materialize
+                // replaces this wire's cached value in the executor map.
+                if !matches!(kind, NodeKind::ParallelLoop(_)) {
+                    column_layouts.get_mut(&wire).unwrap().lazy = false;
+                }
+            }
+            if matches!(
+                kind,
+                NodeKind::Input { .. } |
+                    NodeKind::FamilyGetStatic { .. } |
+                    NodeKind::FamilyGetDynamic |
+                    NodeKind::Select { .. }
+            ) {
+                for (port, ty) in output_types.iter().enumerate() {
+                    let wire = WireRef { node: id, port: Port(port as u32) };
+                    if !column_layouts.get(&wire).is_some_and(|layout| layout.lazy) &&
+                        !matches!(ty, ConcreteWireType::IndexedFamily { .. })
+                    {
+                        imports.extend(family_leaves(ty).cloned());
+                    }
+                }
+            }
+            until.set(node_position);
+            for output in imports {
+                if let Some(ty) = output.matrix_type() {
+                    let params = parameters(self, ty)?;
+                    let (matrices, layouts) = import_inventory(&params, &output, scratch_columns)?;
+                    for (rows, columns) in matrices {
+                        add_matrix(&mut demand, ty, rows, columns);
+                    }
+                    add_layouts(&mut demand, ty, layouts);
+                }
             }
             // A fleet executes one sibling body at a time, with parallelism
             // inside each admitted primitive. Summarize child peak slots once;
@@ -1067,7 +1266,17 @@ impl GpuDcrtBackend {
                     .iter()
                     .map(|wire| column_layouts.get(wire).cloned().unwrap_or_default())
                     .zip(validated.source.scope(&child_id).unwrap().inputs().iter().copied())
-                    .map(|(cuts, wire)| (wire, cuts))
+                    .map(|(mut cuts, wire)| {
+                        if matches!(kind, NodeKind::ParallelLoop(_)) &&
+                            !matches!(
+                                validated.scope(&child_id).unwrap().wire_types[&wire],
+                                ConcreteWireType::IndexedFamily { .. }
+                            )
+                        {
+                            cuts.lazy = false;
+                        }
+                        (wire, cuts)
+                    })
                     .collect::<BTreeMap<_, _>>();
                 let (child, child_outputs) = self.graph_admission_demand(
                     validated,
@@ -1104,10 +1313,11 @@ impl GpuDcrtBackend {
                             leaf = element;
                         }
                         if let Some(ty) = leaf.matrix_type() {
-                            column_layouts.insert(
-                                WireRef { node: id, port: Port(port as u32) },
-                                ColumnInventoryLayout::new(vec![0, ty.columns]),
-                            );
+                            column_layouts.insert(WireRef { node: id, port: Port(port as u32) }, {
+                                let mut layout = ColumnInventoryLayout::new(vec![0, ty.columns]);
+                                layout.lazy = true;
+                                layout
+                            });
                         }
                     }
                 }
@@ -1206,6 +1416,11 @@ impl GpuDcrtBackend {
                 .enumerate()
                 .flat_map(|(port, ty)| family_leaves(ty).map(move |leaf| (port, leaf)))
                 .filter(|_| !optimizer.omitted.contains(&id))
+                .filter(|(port, _)| {
+                    !column_layouts
+                        .get(&WireRef { node: id, port: Port(*port as u32) })
+                        .is_some_and(|layout| layout.lazy)
+                })
             {
                 until.set(retained_until(port));
                 match output {
@@ -1264,6 +1479,9 @@ impl GpuDcrtBackend {
             // Replication may need a full owner; normalization preserves every
             // input fragment and keeps all normalized fragments live together.
             for (wire, argument) in arguments.iter().zip(&argument_types) {
+                if column_layouts.get(wire).is_some_and(|layout| layout.lazy) {
+                    continue;
+                }
                 if let ConcreteWireType::Matrix(ty) = argument {
                     add_matrix(&mut demand, ty, ty.rows, ty.columns);
                     if let Some(layout) =
@@ -1277,87 +1495,6 @@ impl GpuDcrtBackend {
             }
             // Kind-specific native scratch at the candidate range width.
             match kind {
-                NodeKind::Input { .. } |
-                NodeKind::FamilyGetStatic { .. } |
-                NodeKind::FamilyGetDynamic |
-                NodeKind::Select { .. } => {
-                    for output in output_types.iter().flat_map(family_leaves) {
-                        match output {
-                            ConcreteWireType::Matrix(ty) => {
-                                // Artifact import: coefficient staging, codec
-                                // stream and load workspace for the widest payload.
-                                let params = parameters(self, ty)?;
-                                let level = params.crt_depth() - 1;
-                                let bits = u16::try_from(params.modulus().bits())
-                                    .map_err(|_| PolyBackendError::InvalidInteger)?;
-                                let load = params
-                                    .compact_transfer_workspace(
-                                        level,
-                                        ty.rows,
-                                        ty.columns,
-                                        GpuCompactTransferKind::Load { max_coefficient_bits: bits },
-                                    )
-                                    .map_err(PolyBackendError::GpuSubmission)?;
-                                let transfer = params
-                                    .rns_transfer_workspace(
-                                        level,
-                                        ty.rows,
-                                        ty.columns.min(scratch_columns),
-                                    )
-                                    .map_err(PolyBackendError::GpuSubmission)?;
-                                add_matrix(
-                                    &mut demand,
-                                    ty,
-                                    ty.rows,
-                                    ty.columns.min(scratch_columns),
-                                );
-                                add_layouts(
-                                    &mut demand,
-                                    ty,
-                                    vec![
-                                        stream(),
-                                        load,
-                                        GpuPreparedWorkspaceLayout {
-                                            kind: GpuPreparedSlotKind::PinnedHost,
-                                            bytes: transfer.bytes,
-                                            alignment: 1,
-                                        },
-                                        transfer,
-                                        event(),
-                                    ],
-                                );
-                            }
-                            ConcreteWireType::SmallMatrix { .. } |
-                            ConcreteWireType::Preimage { .. } => {
-                                let (ty, bound) =
-                                    bound_of(output).ok_or(PolyBackendError::InvalidInteger)?;
-                                let params = parameters(self, ty)?;
-                                let staging = compact_payload(
-                                    &params,
-                                    ty.rows,
-                                    ty.columns.min(scratch_columns),
-                                    &bound,
-                                )?;
-                                add_layouts(
-                                    &mut demand,
-                                    ty,
-                                    vec![
-                                        staging,
-                                        pinned_payload(
-                                            &ConcreteMatrixType {
-                                                columns: ty.columns.min(scratch_columns),
-                                                ..ty.clone()
-                                            },
-                                            &bound,
-                                        ),
-                                        event(),
-                                    ],
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 NodeKind::PolynomialFromValues { .. } | NodeKind::ConstantMatrix { .. } => {
                     if let ConcreteWireType::Matrix(ty) = &output_types[0] {
                         if ty.rows == 1 && ty.columns == 1 {
@@ -1629,6 +1766,36 @@ impl GpuDcrtBackend {
             while let ConcreteWireType::IndexedFamily { element, .. } = output_type {
                 output_type = element;
             }
+            if *scope_id == FrozenGraphScopeId::Root &&
+                column_layouts.get(output).is_some_and(|layout| layout.lazy)
+            {
+                // materialize_output recursively loads the entire requested
+                // family. Every imported member remains owned by the result;
+                // only its transfer scratch can be reused between members.
+                until.set(usize::MAX);
+                for leaf in family_leaves(&checked.wire_types[output]) {
+                    if let ConcreteWireType::Matrix(ty) = leaf {
+                        add_matrix(&mut demand, ty, ty.rows, ty.columns);
+                    } else if let Some((ty, bound)) = bound_of(leaf) {
+                        let params = parameters(self, ty)?;
+                        add_layouts(
+                            &mut demand,
+                            ty,
+                            vec![compact_payload(&params, ty.rows, ty.columns, &bound)?],
+                        );
+                    }
+                }
+                until.set(position.get());
+                if let Some(ty) = output_type.matrix_type() {
+                    let params = parameters(self, ty)?;
+                    let (matrices, layouts) =
+                        import_inventory(&params, output_type, scratch_columns)?;
+                    for (rows, columns) in matrices {
+                        add_matrix(&mut demand, ty, rows, columns);
+                    }
+                    add_layouts(&mut demand, ty, layouts);
+                }
+            }
             match output_type {
                 ConcreteWireType::Matrix(ty) => {
                     let params = parameters(self, ty)?;
@@ -1686,9 +1853,12 @@ mod tests {
         transcript::SamplingMode,
     };
     use mxx_dsl::{DslContext, Ring};
-    use mxx_ir_core::{ParamEnv, graph::FrozenGraphScopeId};
+    use mxx_ir_core::{ParamEnv, graph::FrozenGraphScopeId, types::ConcreteMatrixType};
     use mxx_primitives::{
-        matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+        matrix::{
+            PolyMatrix,
+            gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuPreparedSlotKind},
+        },
         poly::{
             Poly as _, PolyParams,
             dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
@@ -1978,6 +2148,414 @@ mod tests {
         }
         assert_eq!(inventories[0], inventories[1]);
         assert!(!inventories[0][0].0.is_empty(), "selected member still needs native owners");
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_inventory_lazy_scalar_packs_match_lazy_families() {
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let count = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(128)
+            .max(3);
+        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let ty = ConcreteMatrixType {
+            rows: 2,
+            columns: 3,
+            ring_dimension: n as usize,
+            modulus: params.modulus().as_ref().clone().into(),
+        };
+        let production =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        for (compact, select_candidates) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut inventories = Vec::new();
+            for count in [2, count] {
+                for packed in [false, true] {
+                    let artifact_type = if compact {
+                        ArtifactType::Preimage {
+                            matrix: ty.clone(),
+                            max_coefficient_bound: 7.into(),
+                        }
+                    } else {
+                        ArtifactType::Matrix(ty.clone())
+                    };
+                    let names = if packed {
+                        (0..count).map(|index| format!("member-{index}")).collect::<Vec<_>>()
+                    } else {
+                        vec!["members".into()]
+                    };
+                    let manifest = Manifest {
+                        ir_version: mxx_ir_core::encoding::IR_VERSION,
+                        production_id: production.clone(),
+                        artifacts: names
+                            .iter()
+                            .map(|name| {
+                                (
+                                    name.clone(),
+                                    ManifestArtifact {
+                                        artifact_type: artifact_type.clone(),
+                                        family_count: (!packed).then_some(count),
+                                        confidentiality: ArtifactConfidentiality::Private,
+                                        content_hash: None,
+                                        layout: None,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    };
+                    let result = if compact {
+                        let members = if packed {
+                            mxx_dsl::Family::pack(
+                                names
+                                    .iter()
+                                    .map(|name| {
+                                        ring.preimage_artifact_input(
+                                            production.clone(),
+                                            name.clone(),
+                                            (2, 3),
+                                            7,
+                                            ArtifactConfidentiality::Private,
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                            .unwrap()
+                        } else {
+                            ring.preimage_family_artifact_input(
+                                production.clone(),
+                                "members",
+                                count,
+                                (2, 3),
+                                7,
+                                ArtifactConfidentiality::Private,
+                            )
+                        };
+                        let selected = if select_candidates {
+                            mxx_dsl::select(0, (0..count).map(|index| members.at(index)).collect())
+                                .unwrap()
+                        } else {
+                            members.at(0)
+                        };
+                        selected.mul_small_rhs(ring.input("left", (1, 2)))
+                    } else {
+                        let members = if packed {
+                            mxx_dsl::Family::pack(
+                                names
+                                    .iter()
+                                    .map(|name| {
+                                        ring.artifact_input(
+                                            production.clone(),
+                                            name.clone(),
+                                            (2, 3),
+                                            ArtifactConfidentiality::Private,
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                            .unwrap()
+                        } else {
+                            ring.family_artifact_input(
+                                production.clone(),
+                                "members",
+                                count,
+                                (2, 3),
+                                ArtifactConfidentiality::Private,
+                            )
+                        };
+                        let selected = if select_candidates {
+                            mxx_dsl::select(0, (0..count).map(|index| members.at(index)).collect())
+                                .unwrap()
+                        } else {
+                            members.at(0)
+                        };
+                        -selected
+                    };
+                    let graph = DslContext::new("scalar-artifact-pack-inventory")
+                        .output("result", result)
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                        .validate_with_manifests(
+                            &ParamEnv::default(),
+                            &BTreeMap::from([(production.clone(), manifest)]),
+                        )
+                        .unwrap();
+                    let (demand, _) = backend
+                        .graph_admission_demand(
+                            &graph,
+                            &FrozenGraphScopeId::Root,
+                            &ParamEnv::default(),
+                            false,
+                            None,
+                            3,
+                            true,
+                        )
+                        .unwrap();
+                    inventories.push(
+                        demand
+                            .into_values()
+                            .map(|(_, demand)| (demand.matrices, demand.layouts))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            if !compact {
+                // A mixed packed family is eagerly placed when broadcast,
+                // including lazy members not selected by the child body.
+                let names = (0..count).map(|index| format!("mixed-{index}")).collect::<Vec<_>>();
+                let manifest = Manifest {
+                    ir_version: mxx_ir_core::encoding::IR_VERSION,
+                    production_id: production.clone(),
+                    artifacts: names
+                        .iter()
+                        .map(|name| {
+                            (
+                                name.clone(),
+                                ManifestArtifact {
+                                    artifact_type: ArtifactType::Matrix(ty.clone()),
+                                    family_count: None,
+                                    confidentiality: ArtifactConfidentiality::Private,
+                                    content_hash: None,
+                                    layout: None,
+                                },
+                            )
+                        })
+                        .collect(),
+                };
+                let members = mxx_dsl::Family::pack(
+                    std::iter::once(ring.input("eager", (2, 3)))
+                        .chain(names.iter().map(|name| {
+                            ring.artifact_input(
+                                production.clone(),
+                                name.clone(),
+                                (2, 3),
+                                ArtifactConfidentiality::Private,
+                            )
+                        }))
+                        .collect(),
+                )
+                .unwrap();
+                // Direct and offset indices lower to Zip/ZipOffset. A runtime
+                // remainder keeps the whole family as a broadcast input.
+                let result = mxx_dsl::parallel(2, |index| Ok(-members.at(index % 2))).unwrap();
+                let graph = DslContext::new("mixed-family-broadcast")
+                    .output("result", result)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate_with_manifests(
+                        &ParamEnv::default(),
+                        &BTreeMap::from([(production.clone(), manifest)]),
+                    )
+                    .unwrap();
+                assert!(graph.root_scope().execution_order.iter().any(|node| {
+                    matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(body)
+                        if body.input_modes.contains(&mxx_ir_core::node::LoopInputMode::Broadcast))
+                }));
+                let (demand, _) = backend
+                    .graph_admission_demand(
+                        &graph,
+                        &FrozenGraphScopeId::Root,
+                        &ParamEnv::default(),
+                        false,
+                        None,
+                        3,
+                        true,
+                    )
+                    .unwrap();
+                let owners = demand
+                    .values()
+                    .flat_map(|(_, demand)| &demand.matrices)
+                    .filter(|&&(rows, columns)| rows >= 2 && columns >= 3)
+                    .count();
+                assert!(
+                    owners >= count,
+                    "broadcast placement must reserve every lazy member of a mixed packed family: {owners} < {count}"
+                );
+            }
+            for inventory in &inventories[1..] {
+                assert_eq!(
+                    &inventories[0], inventory,
+                    "lazy scalar packs must reserve only selected members; compact={compact}"
+                );
+            }
+            assert!(
+                inventories[0].iter().any(|(_, layouts)| layouts
+                    .iter()
+                    .any(|layout| layout.kind == GpuPreparedSlotKind::PinnedHost)),
+                "materialization still requires native import staging"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_inventory_lazy_input_cached_across_intervening_operations() {
+        use crate::artifact::{ArtifactKey, ArtifactPayload, ArtifactStore};
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let ty = ConcreteMatrixType {
+            rows: 2,
+            columns: 3,
+            ring_dimension: n as usize,
+            modulus: params.modulus().as_ref().clone().into(),
+        };
+        let production =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 2, 3, DistType::FinRingDist);
+        let bytes = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original).to_compact_bytes();
+        let mut store = MemoryArtifactStore::default();
+        store
+            .store(
+                ArtifactKey { production: production.clone(), name: "input".into(), index: None },
+                &ArtifactType::Matrix(ty.clone()),
+                ArtifactConfidentiality::Private,
+                None,
+                ArtifactPayload::Matrix(bytes.clone()),
+            )
+            .unwrap();
+        let manifest = Manifest {
+            ir_version: mxx_ir_core::encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([(
+                "input".into(),
+                ManifestArtifact {
+                    artifact_type: ArtifactType::Matrix(ty),
+                    family_count: None,
+                    confidentiality: ArtifactConfidentiality::Private,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+        };
+        store.store_manifest(manifest.clone()).unwrap();
+        let input = ring.artifact_input(
+            production.clone(),
+            "input",
+            (2, 3),
+            ArtifactConfidentiality::Private,
+        );
+        let mut intermediate = -mxx_dsl::select(0, vec![input.clone(), input.clone()]).unwrap();
+        let count = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(8)
+            .max(2);
+        for _ in 0..count {
+            intermediate = -(-intermediate);
+        }
+        // The second access must read the cached imported owner after temporary
+        // slots have been reused repeatedly. Trusted arithmetic predicts input.
+        let output = (intermediate + input.clone()) + input;
+        let graph = DslContext::new("cached-lazy-input-lifetime")
+            .output("result", output)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest.clone())]),
+            )
+            .unwrap();
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+        drop(backend.prepare_graph_admission(&graph, false, &BTreeMap::new(), true).unwrap());
+        let mut result = execute_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(output) =
+            result.materialize_output("result", &mut backend, &mut store).unwrap()
+        else {
+            panic!("matrix result");
+        };
+        assert_eq!(backend.matrix_to_bytes(&output).unwrap(), bytes);
+        drop(result);
+        drop(backend);
+
+        // Returned lazy descriptors must also be importable when the caller
+        // requests the whole output family after graph execution.
+        let input = ring.artifact_input(
+            production.clone(),
+            "input",
+            (2, 3),
+            ArtifactConfidentiality::Private,
+        );
+        let family = mxx_dsl::Family::pack(vec![input; count]).unwrap();
+        let graph = DslContext::new("retained-lazy-output-family")
+            .output("result", family)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        drop(backend.prepare_graph_admission(&graph, false, &BTreeMap::new(), true).unwrap());
+        let mut result = execute_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let RuntimeValue::IndexedFamily(members) =
+            result.materialize_output("result", &mut backend, &mut store).unwrap()
+        else {
+            panic!("family result")
+        };
+        assert_eq!(members.len(), count);
+        for member in members {
+            let RuntimeValue::Matrix(matrix) = member else { panic!("matrix member") };
+            assert_eq!(backend.matrix_to_bytes(matrix).unwrap(), bytes);
+        }
     }
 
     #[test]

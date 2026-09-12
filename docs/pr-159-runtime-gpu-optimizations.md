@@ -393,3 +393,46 @@ inventory fixtures (canonical import/export and polynomial constants) also faile
 that first suite's admission checks, then passed both standalone and in the final
 suite. Their initial failures were not reproduced or diagnosed by this change;
 the passing final run does not establish the absence of intermittent failures.
+
+## 12. Lazy checkpoint input admission
+
+An artifact descriptor does not own a GPU matrix. Admission now tracks lazy
+provenance through scalar inputs, family packs, selections and child scopes.
+It reserves imported owners when a consumer materializes them, and retains
+cached owners through their last use and live aliases. Unselected descriptors
+do not become native payload reservations merely because their family is live.
+This makes a lazy family and an equivalent pack of scalar artifact inputs use
+the same inventory for the same selected members.
+`Select` reserves the chosen owner's worst-case lifetime, including later uses
+of its cached candidate, rather than importing every candidate in the planner.
+
+Real imports still reserve matrix or compact staging, transfer workspaces,
+streams, events and pinned buffers. Broadcasting an in-memory packed family
+still reserves every member that placement actually imports. Lazy root outputs
+retain import resources for later materialization. Unlike an input family used
+only for selection, a returned family must reserve all members that the existing
+`materialize_output` API loads and retains together; transfer scratch is reused.
+The added output-family regression caught and corrected a one-member reservation
+in the reference implementation. Budget rejection reports
+requested and available bytes per device; it does not disable admission or
+permit new discovery trials during production.
+
+The regression coverage compares ordinary and compact artifact representations
+at different family sizes, preserves mixed-family broadcast reservations, and
+executes repeated uses of a selected/cached imported matrix across temporary-buffer
+reuse, and materializes a complete lazy output family after execution.
+The broadcast fixture uses a runtime remainder index because direct and offset
+loop-index selections lower to Zip/ZipOffset and import only the selected member.
+
+Local RTX 4080 SUPER validation passed all three lazy-inventory regressions on
+three consecutive runs each. The final runtime library suite passed 264 tests
+with four ignored. These runs include the additional `Select` lifetime and lazy
+output-family corrections, rather than merely compiling the reference patch.
+CPU and GPU release workspace library builds completed without warnings.
+An independent review accepted the final selection-lifetime and output-family
+corrections; execution evidence comes from the local GPU runs above.
+
+This is a runtime-only change. No application-specific checkpoint driver or
+private application crate is included. A successful full production checkpoint
+replay and production-size utilization measurements remain separate validation
+requirements; library tests do not establish either result.

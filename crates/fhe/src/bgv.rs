@@ -1192,7 +1192,7 @@ mod tests {
         let mut result =
             execute(&decryption, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
-        result.materialize_output("plaintext", &backend, &mut store).unwrap();
+        result.materialize_output("plaintext", &mut backend, &mut store).unwrap();
         let mut expected = vec![BigInt::from(0); n];
         expected[0] = BigInt::from(9);
         assert_eq!(integers(&result, "plaintext"), expected);
@@ -1656,8 +1656,8 @@ mod benchmarks {
         let mut prepared =
             execute(&preparation, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
-        let key = prepared.materialize_output("key", &backend, &mut store).unwrap().clone();
-        let value = prepared.materialize_output("value", &backend, &mut store).unwrap().clone();
+        let key = prepared.materialize_output("key", &mut backend, &mut store).unwrap().clone();
+        let value = prepared.materialize_output("value", &mut backend, &mut store).unwrap().clone();
         let (kp, width) = bgv.key_switch_parameters(level).unwrap();
         let kr = Ring::new(kp.modulus().as_ref().clone(), n);
         let switched = bgv
@@ -1680,7 +1680,7 @@ mod benchmarks {
             let start = Instant::now();
             let mut output =
                 execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
-            output.materialize_output("switched", &backend, &mut store).unwrap();
+            output.materialize_output("switched", &mut backend, &mut store).unwrap();
             let elapsed = start.elapsed().as_secs_f64();
             output.cleanup_staged(&mut store).unwrap();
             if repeat != 0 {

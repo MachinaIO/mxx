@@ -1147,7 +1147,7 @@ mod tests {
             execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
         let RuntimeValue::IndexedFamily(indices) =
-            result.materialize_output("indices", &backend, &mut store).unwrap()
+            result.materialize_output("indices", &mut backend, &mut store).unwrap()
         else {
             panic!("indices output must be an integer family")
         };

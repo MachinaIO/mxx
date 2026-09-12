@@ -91,6 +91,38 @@ pub(super) fn prepare(validated: &ValidatedGraph, mut plan: RootBlockAliases) ->
 }
 
 #[cfg(test)]
+#[derive(Default)]
+pub(super) struct ImportProbe {
+    events: Vec<(&'static str, usize)>,
+    reject: bool,
+}
+
+#[cfg(test)]
+impl ImportProbe {
+    pub(super) fn preflight<M, S, T>(
+        &mut self,
+        requests: &[(usize, crate::gpu_invocation::GpuInvocation<'_, M, S, T>)],
+    ) -> bool {
+        use crate::gpu_invocation::GpuInvocation;
+        for (placement, request) in requests {
+            let kind = match request {
+                GpuInvocation::ImportMatrix { .. } => "prepare matrix",
+                GpuInvocation::ImportSmallMatrix { .. } => "prepare small",
+                GpuInvocation::ImportTrapdoor { .. } => "prepare trapdoor",
+                GpuInvocation::ImportCpuStaging { .. } => "prepare staging",
+                _ => "prepare sampler or arithmetic",
+            };
+            self.events.push((kind, *placement));
+        }
+        !self.reject
+    }
+
+    pub(super) fn import(&mut self, kind: &'static str, placement: usize) {
+        self.events.push((kind, placement));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mxx_dsl::{DslContext, Mat, Ring};
@@ -100,7 +132,125 @@ mod tests {
     };
 
     #[test]
-    #[serial_test::serial]
+    fn test_gpu_external_import_preflight_precedes_decode_and_rejection() {
+        use crate::{
+            MemoryArtifactStore, RuntimeValue,
+            artifact::ArtifactPayload,
+            backend::Backend,
+            executor::{ExecutionResult, decode_artifact, tests::PlacementProbeBackend},
+        };
+        use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
+        use std::{collections::BTreeMap, sync::Arc};
+
+        let ty = ConcreteMatrixType { modulus: 97.into(), ring_dimension: 8, rows: 1, columns: 1 };
+        let mut backend = PlacementProbeBackend::default();
+        backend.import_probe = Some(ImportProbe::default());
+        assert!(backend.set_active_placement(1));
+        decode_artifact(
+            &mut backend,
+            ArtifactType::Matrix(ty.clone()),
+            ArtifactPayload::Matrix(vec![11]),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.import_probe.as_ref().unwrap().events,
+            [("prepare matrix", 1), ("matrix", 1)]
+        );
+
+        let probe = backend.import_probe.as_mut().unwrap();
+        probe.events.clear();
+        probe.reject = true;
+        assert!(
+            decode_artifact(
+                &mut backend,
+                ArtifactType::Matrix(ty.clone()),
+                ArtifactPayload::Matrix(vec![11]),
+            )
+            .is_err()
+        );
+        assert_eq!(backend.import_probe.as_ref().unwrap().events, [("prepare matrix", 1)]);
+
+        let probe = backend.import_probe.as_mut().unwrap();
+        probe.events.clear();
+        probe.reject = false;
+        let mut result = ExecutionResult {
+            outputs: BTreeMap::from([(
+                "staged".into(),
+                RuntimeValue::HostMatrix { matrix_type: ty, bytes: Arc::new(vec![11]) },
+            )]),
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+        };
+        let mut store = MemoryArtifactStore::default();
+        result.materialize_output("staged", &mut backend, &mut store).unwrap();
+        result.materialize_output("staged", &mut backend, &mut store).unwrap();
+        assert_eq!(
+            backend.import_probe.as_ref().unwrap().events,
+            [("prepare staging", 1), ("staging", 1)]
+        );
+    }
+
+    #[test]
+    fn test_gpu_replay_preflights_only_the_import() {
+        use crate::{
+            MemoryArtifactStore,
+            executor::{execute, tests::PlacementProbeBackend},
+            transcript::{DrawSite, RecordedValue, SamplingMode, TranscriptRecorder},
+        };
+        use mxx_ir_core::{
+            node::NodeKind,
+            types::{NodeId, Port, WireRef},
+        };
+        use std::collections::BTreeMap;
+
+        let ring = Ring::new(97u64, 8usize);
+        let graph = DslContext::new("preflight-replayed-import")
+            .output("sample", ring.gaussian((1, 1), 3, 19))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let node = graph
+            .source
+            .root_scope()
+            .nodes()
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| {
+                matches!(node.kind(), NodeKind::GaussianSample { .. })
+                    .then_some(NodeId(index as u64))
+            })
+            .unwrap();
+        let wire = WireRef { node, port: Port(0) };
+        let ty = graph.root_scope().wire_types[&wire].matrix_type().unwrap().clone();
+        let mut recorder = TranscriptRecorder::default();
+        recorder
+            .record(
+                DrawSite { instantiation_path: Vec::new(), node, port: Port(0) },
+                RecordedValue::Matrix { matrix_type: ty, bytes: vec![11] },
+            )
+            .unwrap();
+        let replayer = recorder.into_replayer();
+        let mut backend = PlacementProbeBackend::default();
+        backend.import_probe = Some(ImportProbe::default());
+        execute(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Replay(&replayer),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.import_probe.as_ref().unwrap().events,
+            [("prepare matrix", 0), ("matrix", 0)]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
     fn test_gpu_resident_row_sum_dispatch_releases_input_owners() {
         use crate::{
             MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend, execute,
@@ -143,7 +293,7 @@ mod tests {
             let operation = plan.calibration[node].as_ref().unwrap().unwrap();
             backend.set_column_widths_for_operation(
                 operation,
-                GpuColumnWidths { gpu0: left_columns * right_columns, nonzero: None },
+                GpuColumnWidths { gpu0: Some(left_columns * right_columns), nonzero: None },
             );
             let sampler = DCRTPolyUniformSampler::new();
             let left = sampler.sample_uniform(&parameters, 2, left_columns, DistType::FinRingDist);
@@ -169,7 +319,7 @@ mod tests {
             let mut result =
                 execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
             let RuntimeValue::Matrix(output) =
-                result.materialize_output("out", &backend, &mut store).unwrap()
+                result.materialize_output("out", &mut backend, &mut store).unwrap()
             else {
                 panic!("matrix output")
             };

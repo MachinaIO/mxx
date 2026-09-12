@@ -103,3 +103,21 @@ mod tests {
         unsafe { std::env::remove_var(name) };
     }
 }
+
+/// Internal re-execution marker for the GPU retirement failure unit test. A
+/// quarantined execution intentionally survives until its isolated process exits.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) const GPU_RETIREMENT_TEST_CHILD: &str = "MXX_PRIMITIVE_GPU_RETIREMENT_TEST_CHILD";
+
+/// Isolates the prepared-occupancy test's process-wide CUDA pool counters while
+/// leaving unrelated tests concurrent in the parent test process.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) const GPU_PREPARED_OCCUPANCY_TEST_CHILD: &str =
+    "MXX_PRIMITIVE_GPU_PREPARED_OCCUPANCY_TEST_CHILD";
+
+/// Isolates unit tests that assert exact process-global live-context counts or
+/// require exactly one live context. The `#[sequential]` and
+/// `serial(gpu_context)` guard groups do not exclude each other, so the checks
+/// run in a child process while unrelated tests stay concurrent in the parent.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) const GPU_CONTEXT_COUNT_TEST_CHILD: &str = "MXX_PRIMITIVE_GPU_CONTEXT_COUNT_TEST_CHILD";

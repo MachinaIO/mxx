@@ -5,6 +5,14 @@ pub mod backend;
 pub mod executor;
 #[cfg(feature = "gpu")]
 pub mod gpu_calibration;
+#[cfg(feature = "gpu")]
+pub mod gpu_enqueue;
+#[cfg(feature = "gpu")]
+pub mod gpu_invocation;
+#[cfg(feature = "gpu")]
+pub mod gpu_memory;
+#[cfg(feature = "gpu")]
+pub mod gpu_schedule;
 pub mod lean;
 pub mod session;
 pub mod transcript;

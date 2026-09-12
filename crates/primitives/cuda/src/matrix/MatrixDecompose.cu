@@ -1,3 +1,165 @@
+MatrixTransformWorkspace::MatrixTransformWorkspace()
+    : base(nullptr), pinned(nullptr), owner(nullptr), device(-1), stream(nullptr),
+      bytes(0), separate(false), completed(false)
+{
+}
+
+int MatrixTransformWorkspace::acquire(
+    GpuMatrix *output, int selected_device, cudaStream_t selected_stream,
+    const GpuMatrixTransformWorkspaceBytes &requirements)
+{
+    if (owner || !output || !output->ctx || !selected_stream ||
+        output->shared_aux_buffers.size() != 1 ||
+        output->shared_aux_buffers[0].device != selected_device ||
+        (requirements.pinned_bytes != 0 && requirements.pinned_bytes != requirements.workspace_bytes))
+        return set_error("invalid matrix transform workspace owner");
+    owner = output;
+    device = selected_device;
+    stream = selected_stream;
+    bytes = requirements.workspace_bytes;
+    cudaError_t error = cudaSetDevice(device);
+    if (error != cudaSuccess) return set_error(error);
+    int status = matrix_wait_all_limb_streams(output, device, stream, true);
+    if (status != 0) return status;
+    const auto &aux = output->shared_aux_buffers[0];
+    if (aux.slots_total > SIZE_MAX / sizeof(void *))
+        return set_error("matrix transform auxiliary size overflow");
+    separate = requirements.additional_bytes != 0;
+    if ((separate && requirements.additional_bytes != bytes) ||
+        (!separate && (bytes > aux.slots_total * sizeof(void *) || (bytes != 0 && !aux.ptr))))
+        return set_error("matrix transform workspace plan mismatch");
+    if (bytes != 0)
+    {
+        if (separate)
+        {
+            const int allocated = device_workspace.acquire(
+                output->ctx, device, GPU_PREPARED_TRANSFORM_WORKSPACE,
+                bytes, requirements.alignment, stream);
+            if (allocated != 0) return allocated;
+            base = device_workspace.data;
+        }
+        else base = reinterpret_cast<uint8_t *>(aux.ptr);
+    }
+    if (requirements.pinned_bytes != 0)
+    {
+        pinned = static_cast<uint8_t *>(gpu_pinned_alloc(output->ctx, bytes, requirements.alignment));
+        if (!pinned) return 1;
+        std::memset(pinned, 0, bytes);
+    }
+    return 0;
+}
+
+int MatrixTransformWorkspace::upload()
+{
+    if (!owner || !pinned || !base || bytes == 0)
+        return set_error("missing matrix transform staging storage");
+    const cudaError_t error = cudaMemcpyAsync(base, pinned, bytes, cudaMemcpyHostToDevice, stream);
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+int MatrixTransformWorkspace::release()
+{
+    int status = 0;
+    if (pinned)
+    {
+        void *pointer = pinned;
+        pinned = nullptr;
+        status = gpu_defer_pinned_frees(owner->ctx, device, stream, &pointer, 1);
+        if (status != 0)
+            gpu_execution_mark_allocation_unknown(owner->ctx->execution.get());
+    }
+    if (separate && base)
+    {
+        const int released = device_workspace.release();
+        base = nullptr;
+        if (status == 0) status = released;
+    }
+    return status;
+}
+
+int MatrixTransformWorkspace::complete()
+{
+    if (!owner || completed) return set_error("invalid matrix transform completion");
+    const int status = release();
+    if (status != 0) return status;
+    // Final ownership dominates the metadata free and all auxiliary consumers.
+    const int recorded = matrix_record_all_limb_writes(owner, stream);
+    if (recorded != 0) return recorded;
+    completed = true;
+    return 0;
+}
+
+int MatrixTransformWorkspace::retire()
+{
+    if (!owner || completed) return 0;
+    cudaError_t error = cudaSetDevice(device);
+    int status = error == cudaSuccess ? release() : set_error(error);
+    const int retired = gpu_context_retire_stream(owner->ctx, device, stream);
+    if (status != 0 || retired != 0)
+        gpu_execution_mark_allocation_unknown(owner->ctx->execution.get());
+    completed = true;
+    return status != 0 ? status : retired;
+}
+
+MatrixTransformWorkspace::~MatrixTransformWorkspace()
+{
+    retire();
+}
+
+extern "C" int gpu_matrix_query_gadget_correction_workspace_bytes(
+    const GpuContext *ctx, int level, size_t rows, size_t cols,
+    size_t dropped_moduli, GpuMatrixTransformWorkspaceBytes *out)
+{
+    if (!out || level < 0 || dropped_moduli > static_cast<size_t>(level))
+        return set_error("invalid gadget correction workspace query");
+    GpuMatrixAllocationBytes allocation{};
+    // Keep the correction allocation class stable across column waves and
+    // short tails. If one column needs separate metadata, every wider range
+    // uses that same fixed span, even if its larger auxiliary area could fit it.
+    const int status = gpu_matrix_query_allocation_bytes(
+        ctx, level, rows, cols == 0 ? 0 : 1, GPU_POLY_FORMAT_COEFF, &allocation);
+    if (status != 0) return status;
+    const size_t limbs = static_cast<size_t>(level) + 1;
+    if (limbs > GPU_RUNTIME_MAX_LIMBS) return set_error("unsupported gadget correction limb count");
+    const size_t bytes = rows == 0 || cols == 0 ? 0 :
+        dropped_moduli * (limbs - dropped_moduli + 1) * sizeof(uint64_t);
+    *out = {bytes, bytes <= allocation.aux_workspace_bytes ? 0 : bytes, 0, alignof(uint64_t)};
+    return 0;
+}
+
+extern "C" int gpu_matrix_query_decompose_workspace_bytes(
+    const GpuContext *ctx, int level, size_t rows, size_t cols, int format,
+    uint32_t base_bits, int small, size_t dropped_moduli,
+    GpuMatrixDecomposeWorkspaceBytes *out)
+{
+    if (!ctx || !out || level < 0 || static_cast<size_t>(level) >= ctx->moduli.size() ||
+        base_bits == 0 || base_bits > (small ? 64U : 62U) || (small != 0 && small != 1) ||
+        (small && dropped_moduli != 0) || dropped_moduli > static_cast<size_t>(level))
+        return set_error("invalid decomposition workspace query");
+    GpuMatrixAllocationBytes source{};
+    int status = gpu_matrix_query_allocation_bytes(ctx, level, rows, cols, format, &source);
+    if (status != 0) return status;
+    uint32_t crt_bits = 0;
+    for (const auto modulus : ctx->moduli) crt_bits = std::max(crt_bits, bit_width_u64(modulus));
+    const size_t digits = (crt_bits + base_bits - 1) / base_bits;
+    const size_t towers = small ? 1 : static_cast<size_t>(level) + 1 - dropped_moduli;
+    if (digits == 0 || digits > SIZE_MAX / towers || rows > SIZE_MAX / (digits * towers))
+        return set_error("decomposition output shape overflow");
+    GpuMatrixDecomposeWorkspaceBytes plan{};
+    plan.output_rows = rows * digits * towers;
+    GpuMatrixAllocationBytes output{};
+    status = gpu_matrix_query_allocation_bytes(
+        ctx, level, plan.output_rows, cols, format, &output);
+    if (status != 0) return status;
+    if (rows != 0 && cols != 0 && (format == GPU_POLY_FORMAT_EVAL || dropped_moduli != 0))
+        plan.coefficient_copy = source;
+    status = gpu_matrix_query_gadget_correction_workspace_bytes(
+        ctx, level, rows, cols, dropped_moduli, &plan.correction);
+    if (status != 0) return status;
+    *out = plan;
+    return 0;
+}
+
 __device__ __forceinline__ uint64_t pow_mod_u64(uint64_t base, uint32_t exp, uint64_t modulus)
 {
     if (modulus == 0)
@@ -80,9 +242,8 @@ __device__ __forceinline__ uint64_t signed_digit_to_residue(int64_t digit, uint6
 
 __global__ void matrix_decompose_all_slots_kernel(
     const uint8_t *src_base,
-    uint8_t *const *dst_bases,
-    const size_t *dst_stride_bytes,
-    const uint8_t *dst_coeff_bytes,
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *src_descriptors,
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *dst_descriptors,
     const uint64_t *dst_moduli,
     size_t src_stride_bytes,
     uint8_t src_coeff_bytes,
@@ -93,7 +254,6 @@ __global__ void matrix_decompose_all_slots_kernel(
     size_t src_cols,
     size_t out_cols,
     size_t log_base_q,
-    uint32_t src_bits,
     uint64_t src_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
@@ -102,7 +262,7 @@ __global__ void matrix_decompose_all_slots_kernel(
     size_t poly_offset,
     size_t slot_offset)
 {
-    if (!src_base || !dst_bases || !dst_stride_bytes || !dst_coeff_bytes || !dst_moduli)
+    if (!src_base || !src_descriptors || !dst_descriptors || !dst_moduli)
     {
         return;
     }
@@ -132,20 +292,21 @@ __global__ void matrix_decompose_all_slots_kernel(
     }
     const uint32_t digit_idx = static_cast<uint32_t>(slot_idx % static_cast<size_t>(digits_per_tower));
 
-    uint8_t *const dst_base = dst_bases[out_limb];
-    const size_t dst_stride = dst_stride_bytes[out_limb];
-    const uint8_t dst_bytes = dst_coeff_bytes[out_limb];
+    const auto descriptor = dst_descriptors[out_limb];
+    uint8_t *const dst_base = descriptor.base;
+    const size_t dst_stride = descriptor.stride;
+    const uint8_t dst_bytes = descriptor.width;
     const uint64_t out_modulus = dst_moduli[out_limb];
     if (!dst_base || dst_bytes == 0 || dst_stride < n * static_cast<size_t>(dst_bytes))
     {
         return;
     }
 
-    const uint64_t residue =
-        matrix_load_limb_u64(src_base, poly_idx, coeff_idx, src_stride_bytes, src_coeff_bytes);
     uint64_t digit = 0;
     if (balanced)
     {
+        const uint64_t residue =
+            matrix_load_limb_u64(src_base, poly_idx, coeff_idx, src_stride_bytes, src_coeff_bytes);
         int64_t value = centered_lift_u64(residue, src_modulus);
         int64_t signed_digit = 0;
         const int64_t base = int64_t{1} << base_bits;
@@ -163,14 +324,14 @@ __global__ void matrix_decompose_all_slots_kernel(
     }
     else
     {
+        // Unsigned small decomposition truncates each actual CRT residue.
+        // Negative coefficients have different residues in different towers;
+        // broadcasting the first tower's digits changes the represented value.
+        const auto source = src_descriptors[out_limb];
+        const uint64_t residue = matrix_load_limb_u64(
+            source.base, poly_idx, coeff_idx, source.stride, source.width);
         const uint32_t shift = digit_idx * base_bits;
-        uint64_t mask = 0;
-        if (shift < src_bits)
-        {
-            const uint32_t remaining = src_bits - shift;
-            const uint32_t digit_bits = min(base_bits, remaining);
-            mask = digit_bits >= 64 ? ~uint64_t{0} : ((uint64_t{1} << digit_bits) - 1);
-        }
+        const uint64_t mask = base_bits >= 64 ? ~uint64_t{0} : ((uint64_t{1} << base_bits) - 1);
         digit = shift >= 64 ? 0 : ((residue >> shift) & mask);
         if (out_modulus != 0 && digit >= out_modulus)
         {
@@ -187,9 +348,8 @@ __global__ void matrix_decompose_all_slots_kernel(
 
 int launch_decompose_all_slots_kernel(
     const uint8_t *src_base,
-    uint8_t *const *dst_bases,
-    const size_t *dst_stride_bytes,
-    const uint8_t *dst_coeff_bytes,
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *src_descriptors,
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *dst_descriptors,
     const uint64_t *dst_moduli,
     size_t src_stride_bytes,
     uint8_t src_coeff_bytes,
@@ -199,7 +359,6 @@ int launch_decompose_all_slots_kernel(
     size_t src_cols,
     size_t out_cols,
     size_t log_base_q,
-    uint32_t src_bits,
     uint64_t src_modulus,
     uint32_t base_bits,
     uint32_t digits_per_tower,
@@ -207,7 +366,7 @@ int launch_decompose_all_slots_kernel(
     size_t src_digit_offset_base,
     cudaStream_t stream)
 {
-    if (!src_base || !dst_bases || !dst_stride_bytes || !dst_coeff_bytes || !dst_moduli)
+    if (!src_base || !src_descriptors || !dst_descriptors || !dst_moduli)
     {
         return set_error("null pointer in matrix_decompose_all_slots_kernel");
     }
@@ -254,9 +413,8 @@ int launch_decompose_all_slots_kernel(
                 static_cast<uint32_t>(slot_chunk)};
             matrix_decompose_all_slots_kernel<<<grid, kDecomposeThreads, 0, stream>>>(
                 src_base,
-                dst_bases,
-                dst_stride_bytes,
-                dst_coeff_bytes,
+                src_descriptors,
+                dst_descriptors,
                 dst_moduli,
                 src_stride_bytes,
                 src_coeff_bytes,
@@ -267,7 +425,6 @@ int launch_decompose_all_slots_kernel(
                 src_cols,
                 out_cols,
                 log_base_q,
-                src_bits,
                 src_modulus,
                 base_bits,
                 digits_per_tower,
@@ -285,367 +442,131 @@ int launch_decompose_all_slots_kernel(
     return 0;
 }
 
-__global__ void matrix_fill_gadget_multi_limb_kernel(
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    size_t rows,
-    size_t local_cols,
-    size_t global_column_start,
-    size_t log_base_q,
-    uint32_t digits_per_tower,
-    uint32_t base_bits)
-{
-    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    size_t total = poly_count * n;
-    if (idx >= total)
-    {
-        return;
-    }
-    const size_t poly_idx = idx / n;
-    const size_t coeff_idx = idx - poly_idx * n;
+namespace {
+struct MatrixConstantMetadata {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *output;
+    unsigned indices[GPU_RUNTIME_MAX_LIMBS];
+    uint64_t moduli[GPU_RUNTIME_MAX_LIMBS];
+    size_t output_offset, output_pitch, columns, global_start, unit_index, columns_per_row;
+    unsigned digits_per_tower, base_bits;
+    int mode;
+    bool small;
+};
+static_assert(sizeof(MatrixConstantMetadata) + 2 * sizeof(size_t) <= 4096,
+              "constant metadata exceeds portable CUDA argument capacity");
 
-    // Gadget entries are constant polynomials. Write their evaluation directly
-    // to every slot so constructing the matrix does not require a full NTT.
-    uint64_t value = 0;
-    if (rows > 0 && local_cols > 0 && log_base_q > 0)
-    {
-        size_t row = poly_idx / local_cols;
-        size_t col = global_column_start + poly_idx - row * local_cols;
-        size_t block_start = row * log_base_q;
-        if (col >= block_start && col < block_start + log_base_q)
-        {
-            size_t local = col - block_start;
-            uint32_t tower = static_cast<uint32_t>(local / static_cast<size_t>(digits_per_tower));
-            uint32_t digit = static_cast<uint32_t>(local % static_cast<size_t>(digits_per_tower));
-            if (tower == limb_idx)
-            {
-                uint64_t base = uint64_t{1} << base_bits;
-                value = pow_mod_u64(base, digit, modulus);
+__global__ void matrix_fill_constant_columns_kernel(
+    const MatrixConstantMetadata metadata, size_t count, size_t n)
+{
+    const size_t limb = blockIdx.z;
+    const auto output = metadata.output[metadata.indices[limb]];
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const size_t row = index / n / metadata.columns;
+        const size_t column = index / n % metadata.columns;
+        const size_t global_column = metadata.global_start + column;
+        uint64_t value = 0;
+        if (metadata.mode == 1) value = row == global_column;
+        else if (metadata.mode == 2) value = global_column == metadata.unit_index;
+        else if (metadata.mode == 4) value = row == metadata.unit_index;
+        else if (metadata.mode == 3) {
+            const size_t block_start = row * metadata.columns_per_row;
+            if (global_column >= block_start && global_column - block_start < metadata.columns_per_row) {
+                const size_t digit = global_column - block_start;
+                if (metadata.small || digit / metadata.digits_per_tower == limb) {
+                    value = pow_mod_u64(uint64_t{1} << metadata.base_bits,
+                        digit % metadata.digits_per_tower, metadata.moduli[limb]);
+                }
             }
         }
+        matrix_store_limb_u64(output.base,
+            metadata.output_offset + row * metadata.output_pitch + column,
+            index % n, output.stride, output.width, value);
     }
-    matrix_store_limb_u64(dst_base, poly_idx, coeff_idx, dst_stride_bytes, dst_coeff_bytes, value);
+}
 }
 
-static int launch_fill_gadget_multi_limb_kernel(
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    size_t rows,
-    size_t cols,
-    size_t global_column_start,
-    size_t log_base_q,
-    uint32_t digits_per_tower,
-    uint32_t base_bits,
-    cudaStream_t stream)
+extern "C" int gpu_matrix_fill_constant_columns(
+    GpuMatrix *out, const GpuMatrixRange *range, size_t global_column_start,
+    int mode, size_t total_columns, size_t unit_index,
+    uint32_t base_bits, int small, size_t dropped_moduli)
 {
-    if (!dst_base)
-    {
-        return set_error("null output base pointer in matrix_fill_gadget_multi_limb_kernel");
+    if (!out || !out->ctx || !out->ctx->execution || !range || out->level < 0 ||
+        out->ctx->N <= 0 || mode < 0 || mode > 4 || (small != 0 && small != 1) ||
+        (mode != 0 && out->format != GPU_POLY_FORMAT_EVAL))
+        return set_error("invalid constant destination, format or mode");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
+    const auto &v = *range;
+    if (v.row_start > v.row_end || v.row_end > out->rows ||
+        v.column_start > v.column_end || v.column_end > out->cols ||
+        (out->cols != 0 && out->rows > SIZE_MAX / out->cols))
+        return set_error("invalid constant destination range");
+    const size_t rows = v.row_end - v.row_start, columns = v.column_end - v.column_start;
+    const size_t limbs = static_cast<size_t>(out->level) + 1;
+    auto *ctx = out->ctx;
+    if (limbs > GPU_RUNTIME_MAX_LIMBS || ctx->moduli.size() < limbs || ctx->limb_gpu_ids.size() < limbs)
+        return set_error("invalid constant limb basis");
+    MatrixConstantMetadata metadata{};
+    if (mode == 1 && total_columns != rows) return set_error("identity is not square");
+    if (mode == 2 && (rows != 1 || unit_index >= total_columns)) return set_error("invalid unit row");
+    if (mode == 4 && (total_columns != 1 || unit_index >= rows)) return set_error("invalid unit column");
+    if (mode == 3) {
+        if (base_bits == 0 || base_bits >= 63 || dropped_moduli >= ctx->moduli.size())
+            return set_error("invalid gadget base or dropped moduli");
+        unsigned bits = 0;
+        // The logical gadget uses the full parameter basis even when an output
+        // retains fewer active limbs. Active limbs are its exact projection.
+        for (const uint64_t modulus : ctx->moduli) bits = std::max(bits, bit_width_u64(modulus));
+        metadata.digits_per_tower = (bits + base_bits - 1) / base_bits;
+        metadata.columns_per_row = metadata.digits_per_tower *
+            (small ? 1 : ctx->moduli.size() - dropped_moduli);
+        if (metadata.columns_per_row == 0 || rows > SIZE_MAX / metadata.columns_per_row ||
+            total_columns != rows * metadata.columns_per_row)
+            return set_error("invalid gadget full column count");
     }
-    if (poly_count == 0 || n == 0)
-    {
-        return 0;
+    if (global_column_start > total_columns || columns > total_columns - global_column_start)
+        return set_error("constant global column range is outside its logical shape");
+    const size_t n = static_cast<size_t>(ctx->N);
+    if ((columns != 0 && rows > SIZE_MAX / columns) || rows * columns > SIZE_MAX / n)
+        return set_error("constant coefficient count overflow");
+    if (rows == 0 || columns == 0) return 0;
+    int device = -1;
+    for (size_t limb = 0; limb < limbs; ++limb) {
+        const auto id = ctx->limb_gpu_ids[limb];
+        if (id.x >= out->shared_limb_buffers.size()) return set_error("invalid constant partition");
+        const auto &buffer = out->shared_limb_buffers[id.x];
+        if (!buffer.device_descriptors || id.y >= buffer.limb_count)
+            return set_error("missing constant output descriptors");
+        if (limb == 0) { device = buffer.device; metadata.output = buffer.device_descriptors; }
+        else if (device != buffer.device || metadata.output != buffer.device_descriptors)
+            return set_error("constant output limbs must share one device and partition");
+        metadata.indices[limb] = id.y;
+        metadata.moduli[limb] = ctx->moduli[limb];
     }
-
-    const int threads = 256;
-    const size_t total = poly_count * n;
-    const int blocks = static_cast<int>((total + threads - 1) / threads);
-    matrix_fill_gadget_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
-        dst_base,
-        poly_count,
-        n,
-        dst_stride_bytes,
-        dst_coeff_bytes,
-        modulus,
-        limb_idx,
-        rows,
-        cols,
-        global_column_start,
-        log_base_q,
-        digits_per_tower,
-        base_bits);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    return 0;
-}
-
-__global__ void matrix_fill_sparse_constant_columns_kernel(
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    size_t local_cols,
-    size_t global_column_start,
-    size_t unit_index,
-    bool identity)
-{
-    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total = poly_count * n;
-    if (idx >= total) return;
-    const size_t poly_idx = idx / n;
-    const size_t coeff_idx = idx - poly_idx * n;
-    const size_t row = poly_idx / local_cols;
-    const size_t global_col = global_column_start + poly_idx - row * local_cols;
-    const uint64_t value = identity ? static_cast<uint64_t>(row == global_col)
-                                    : static_cast<uint64_t>(global_col == unit_index);
-    matrix_store_limb_u64(
-        dst_base, poly_idx, coeff_idx, dst_stride_bytes, dst_coeff_bytes, value);
-}
-
-static int gpu_matrix_fill_sparse_constant_columns_impl(
-    GpuMatrix *out,
-    size_t total_columns,
-    size_t unit_index,
-    size_t global_column_start,
-    bool identity)
-{
-    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
-    if (!out || !out->ctx || out->level < 0)
-        return set_error("invalid ranged constant output");
-    if ((identity && out->rows != total_columns) || (!identity && out->rows != 1) ||
-        (!identity && unit_index >= total_columns) || global_column_start > total_columns ||
-        out->cols > total_columns - global_column_start)
-        return set_error("invalid ranged constant shape or column range");
-    if (out->cols != 0 && out->rows > std::numeric_limits<size_t>::max() / out->cols)
-        return set_error("ranged constant polynomial count overflow");
-    const size_t poly_count = out->rows * out->cols;
-    if (poly_count == 0)
-    {
-        out->format = GPU_POLY_FORMAT_EVAL;
-        return 0;
-    }
-    const size_t limb_count = static_cast<size_t>(out->level + 1);
-    if (out->ctx->limb_gpu_ids.size() < limb_count)
-        return set_error("missing ranged constant limb mapping");
-    const size_t n = static_cast<size_t>(out->ctx->N);
-    constexpr int threads = 256;
-    if (poly_count > std::numeric_limits<size_t>::max() / n)
-        return set_error("ranged constant coefficient count overflow");
-    const size_t total = poly_count * n;
-    for (size_t limb = 0; limb < limb_count; ++limb)
-    {
-        const dim3 limb_id = out->ctx->limb_gpu_ids[limb];
-        int device = -1;
-        cudaStream_t stream = nullptr;
-        size_t stride = 0;
-        uint8_t width = 0;
-        if (matrix_limb_device(out, limb_id, &device) != 0 ||
-            matrix_limb_stream(out, limb_id, &stream) != 0 ||
-            !matrix_limb_metadata_by_id(out, limb_id, &stride, &width))
-            return 1;
-        uint8_t *base = matrix_limb_ptr_by_id(out, 0, limb_id);
-        if (device < 0 || !stream || !base)
-            return set_error("invalid ranged constant limb");
-        cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess) return set_error(err);
-        matrix_fill_sparse_constant_columns_kernel<<<
-            (total + threads - 1) / threads, threads, 0, stream>>>(
-                base, poly_count, n, stride, width, out->cols,
-                global_column_start, unit_index, identity);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) return set_error(err);
-        if (matrix_record_limb_write(out, limb_id, stream) != 0) return 1;
-    }
-    out->format = GPU_POLY_FORMAT_EVAL;
-    return 0;
-}
-
-extern "C" int gpu_matrix_fill_identity_columns(
-    GpuMatrix *out,
-    size_t full_size,
-    size_t global_column_start)
-{
-    return gpu_matrix_fill_sparse_constant_columns_impl(
-        out, full_size, 0, global_column_start, true);
-}
-
-extern "C" int gpu_matrix_fill_unit_row_columns(
-    GpuMatrix *out,
-    size_t total_columns,
-    size_t unit_index,
-    size_t global_column_start)
-{
-    return gpu_matrix_fill_sparse_constant_columns_impl(
-        out, total_columns, unit_index, global_column_start, false);
-}
-
-
-static int gpu_matrix_fill_gadget_columns_impl(
-    GpuMatrix *out,
-    uint32_t base_bits,
-    bool small,
-    size_t full_size,
-    size_t global_column_start,
-    size_t dropped_moduli)
-{
-    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
-    if (!out)
-    {
-        return set_error("invalid gpu_matrix_fill_gadget arguments");
-    }
-    if (base_bits == 0 || base_bits >= 63)
-    {
-        return set_error("invalid base_bits in gpu_matrix_fill_gadget");
-    }
-
-    const size_t rows = out->rows;
-    const size_t cols = out->cols;
-    if (rows != full_size || (cols != 0 && rows > std::numeric_limits<size_t>::max() / cols))
-    {
-        return set_error("invalid ranged gadget output shape");
-    }
-    const size_t count = rows * cols;
-    if (count == 0)
-    {
-        out->format = GPU_POLY_FORMAT_EVAL;
-        return 0;
-    }
-
-    const int level = out->level;
-    if (level < 0)
-    {
-        return set_error("invalid level in gpu_matrix_fill_gadget");
-    }
-    const size_t crt_depth = static_cast<size_t>(level + 1);
-    if (dropped_moduli >= crt_depth) return set_error("invalid dropped_moduli");
-    if (out->ctx->moduli.size() < crt_depth)
-    {
-        return set_error("unexpected modulus count in gpu_matrix_fill_gadget");
-    }
-    auto &limb_map = out->ctx->limb_gpu_ids;
-    if (limb_map.size() < crt_depth)
-    {
-        return set_error("unexpected limb mapping size in gpu_matrix_fill_gadget");
-    }
-
-    uint32_t crt_bits = 0;
-    for (size_t i = 0; i < crt_depth; ++i)
-    {
-        crt_bits = std::max(crt_bits, bit_width_u64(out->ctx->moduli[i]));
-    }
-    if (crt_bits == 0)
-    {
-        return set_error("invalid crt_bits in gpu_matrix_fill_gadget");
-    }
-    const uint32_t digits_per_tower = static_cast<uint32_t>((crt_bits + base_bits - 1) / base_bits);
-    if (digits_per_tower == 0)
-    {
-        return set_error("invalid digits_per_tower in gpu_matrix_fill_gadget");
-    }
-    const size_t log_base_q =
-        small ? static_cast<size_t>(digits_per_tower)
-              : static_cast<size_t>(digits_per_tower) * (crt_depth - dropped_moduli);
-    if (full_size != 0 && log_base_q > std::numeric_limits<size_t>::max() / full_size)
-    {
-        return set_error("ranged gadget column count overflow");
-    }
-    const size_t full_cols = full_size * log_base_q;
-    if (global_column_start > full_cols || cols > full_cols - global_column_start)
-    {
-        return set_error("output range mismatch in gpu_matrix_fill_gadget");
-    }
-    int status = 0;
-    for (int limb = 0; limb <= level; ++limb)
-    {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
-        int limb_device = -1;
-        cudaStream_t limb_stream = nullptr;
-        status = matrix_limb_device(out, limb_id, &limb_device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(out, limb_id, &limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        if (limb_device < 0 || !limb_stream)
-        {
-            return set_error("invalid limb metadata in gpu_matrix_fill_gadget");
-        }
-        uint8_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
-        if (!dst_base)
-        {
-            return set_error("null output limb base pointer in gpu_matrix_fill_gadget");
-        }
-        size_t dst_stride_bytes = 0;
-        uint8_t dst_coeff_bytes = 0;
-        if (!matrix_limb_metadata_by_id(out, limb_id, &dst_stride_bytes, &dst_coeff_bytes))
-        {
-            return set_error("invalid output limb metadata in gpu_matrix_fill_gadget");
-        }
-
-        cudaError_t err = cudaSetDevice(limb_device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        status = launch_fill_gadget_multi_limb_kernel(
-            dst_base,
-            count,
-            static_cast<size_t>(out->ctx->N),
-            dst_stride_bytes,
-            dst_coeff_bytes,
-            out->ctx->moduli[static_cast<size_t>(limb)],
-            small ? 0u : static_cast<uint32_t>(limb),
-            rows,
-            cols,
-            global_column_start,
-            log_base_q,
-            digits_per_tower,
-            base_bits,
-            limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_record_limb_write(out, limb_id, limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-
-    out->format = GPU_POLY_FORMAT_EVAL;
-    return 0;
-}
-
-extern "C" int gpu_matrix_fill_gadget_columns(
-    GpuMatrix *out,
-    uint32_t base_bits,
-    int small,
-    size_t full_size,
-    size_t global_column_start,
-    size_t dropped_moduli)
-{
-    if (small != 0 && small != 1)
-        return set_error("invalid ranged gadget mode");
-    return gpu_matrix_fill_gadget_columns_impl(
-        out, base_bits, small != 0, full_size, global_column_start, dropped_moduli);
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    if (!stream) return set_error("missing constant output stream");
+    cudaError_t error = cudaSetDevice(device); if (error != cudaSuccess) return set_error(error);
+    // Retained rectangles can already have readers on other streams. Join
+    // initialization, prior writers and readers before modifying the owner.
+    status = matrix_wait_all_limb_streams(out, device, stream, true);
+    if (status != 0) return status;
+    metadata.output_offset = v.row_start * out->cols + v.column_start;
+    metadata.output_pitch = out->cols; metadata.columns = columns;
+    metadata.global_start = global_column_start; metadata.unit_index = unit_index;
+    metadata.base_bits = base_bits; metadata.mode = mode; metadata.small = small != 0;
+    const size_t count = rows * columns * n;
+    const dim3 grid(static_cast<unsigned>(std::min(count / 256 + (count % 256 != 0), size_t{65535})),
+                    1, static_cast<unsigned>(limbs));
+    matrix_fill_constant_columns_kernel<<<grid, 256, 0, stream>>>(metadata, count, n);
+    error = cudaGetLastError(); if (error != cudaSuccess) return set_error(error);
+    return matrix_record_all_limb_writes(out, stream, true);
 }
 
 __global__ void matrix_fill_small_decomposed_identity_chunk_all_limbs_kernel(
-    const uint8_t *const *src_bases,
-    uint8_t *const *dst_bases,
-    const size_t *src_stride_bytes,
-    const size_t *dst_stride_bytes,
-    const uint8_t *src_coeff_bytes,
-    const uint8_t *dst_coeff_bytes,
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *src_descriptors,
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *dst_descriptors,
     size_t limb_count,
     size_t n,
     size_t size,
@@ -657,12 +578,14 @@ __global__ void matrix_fill_small_decomposed_identity_chunk_all_limbs_kernel(
     {
         return;
     }
-    const uint8_t *src_base = src_bases ? src_bases[limb_idx] : nullptr;
-    uint8_t *dst_base = dst_bases ? dst_bases[limb_idx] : nullptr;
-    const size_t src_stride = src_stride_bytes ? src_stride_bytes[limb_idx] : 0;
-    const size_t dst_stride = dst_stride_bytes ? dst_stride_bytes[limb_idx] : 0;
-    const uint8_t src_bytes = src_coeff_bytes ? src_coeff_bytes[limb_idx] : 0;
-    const uint8_t dst_bytes = dst_coeff_bytes ? dst_coeff_bytes[limb_idx] : 0;
+    const auto source = src_descriptors[limb_idx];
+    const auto target = dst_descriptors[limb_idx];
+    const uint8_t *src_base = source.base;
+    uint8_t *dst_base = target.base;
+    const size_t src_stride = source.stride;
+    const size_t dst_stride = target.stride;
+    const uint8_t src_bytes = source.width;
+    const uint8_t dst_bytes = target.width;
     if (!src_base || !dst_base || src_bytes == 0 || dst_bytes == 0 ||
         src_stride < n * static_cast<size_t>(src_bytes) ||
         dst_stride < n * static_cast<size_t>(dst_bytes))
@@ -697,6 +620,9 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
     const GpuMatrix *scalar_by_digit,
     size_t chunk_idx)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid execution owner in gpu_matrix_fill_small_decomposed_identity_chunk");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
     if (!out || !scalar_by_digit)
     {
         return set_error("invalid gpu_matrix_fill_small_decomposed_identity_chunk arguments");
@@ -744,7 +670,6 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
     cudaStream_t dispatch_stream = nullptr;
     std::vector<dim3> active_limb_ids(limb_count);
     std::vector<uint8_t *> out_limb_bases(limb_count, nullptr);
-    std::vector<const uint8_t *> src_limb_bases(limb_count, nullptr);
     std::vector<size_t> out_limb_stride_bytes(limb_count, 0);
     std::vector<size_t> src_limb_stride_bytes(limb_count, 0);
     std::vector<uint8_t> out_limb_coeff_bytes(limb_count, 0);
@@ -756,6 +681,8 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
         const size_t idx = static_cast<size_t>(limb);
         const dim3 limb_id = limb_map[idx];
         active_limb_ids[idx] = limb_id;
+        if (limb_id.x != 0 || limb_id.y != idx)
+            return set_error("identity decomposition requires ordered colocated descriptors");
 
         int out_device = -1;
         status = matrix_limb_device(out, limb_id, &out_device);
@@ -820,7 +747,6 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
             return set_error("inconsistent limb byte-width in gpu_matrix_fill_small_decomposed_identity_chunk");
         }
         out_limb_bases[idx] = dst;
-        src_limb_bases[idx] = src;
     }
 
     if (dispatch_device < 0 || !dispatch_stream)
@@ -838,16 +764,24 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
         return set_error("too many limbs in gpu_matrix_fill_small_decomposed_identity_chunk");
     }
 
+    if (out->shared_limb_buffers.size() != 1 || scalar_by_digit->shared_limb_buffers.size() != 1 ||
+        !out->shared_limb_buffers[0].device_descriptors ||
+        !scalar_by_digit->shared_limb_buffers[0].device_descriptors ||
+        out->shared_limb_buffers[0].limb_count < limb_count ||
+        scalar_by_digit->shared_limb_buffers[0].limb_count < limb_count ||
+        size > SIZE_MAX / size || size > SIZE_MAX / static_cast<size_t>(out->ctx->N))
+        return set_error("invalid identity decomposition descriptors or shape");
+    const size_t total = size * static_cast<size_t>(out->ctx->N);
+    if (total / 256 + (total % 256 != 0) > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("identity decomposition exceeds CUDA grid capacity");
+    MatrixTransformWorkspace workspace;
+    status = workspace.acquire(out, dispatch_device, dispatch_stream, {});
+    if (status != 0) return status;
     const size_t out_count = size * size;
     for (int limb = 0; limb <= level; ++limb)
     {
         const size_t idx = static_cast<size_t>(limb);
         const dim3 limb_id = active_limb_ids[idx];
-        status = matrix_wait_limb_stream(out, limb_id, dispatch_device, dispatch_stream);
-        if (status != 0)
-        {
-            return status;
-        }
         status = matrix_wait_limb_stream(scalar_by_digit, limb_id, dispatch_device, dispatch_stream);
         if (status != 0)
         {
@@ -868,177 +802,15 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
         }
     }
 
-    if (limb_count > std::numeric_limits<size_t>::max() / sizeof(uint8_t *) ||
-        limb_count > std::numeric_limits<size_t>::max() / sizeof(size_t) ||
-        limb_count > std::numeric_limits<size_t>::max() / sizeof(uint8_t))
-    {
-        return set_error("limb metadata size overflow in gpu_matrix_fill_small_decomposed_identity_chunk");
-    }
-    const size_t limb_ptr_bytes = limb_count * sizeof(uint8_t *);
-    const size_t limb_stride_bytes = limb_count * sizeof(size_t);
-    const size_t limb_coeff_bytes = limb_count * sizeof(uint8_t);
-    uint8_t **src_limb_bases_device = nullptr;
-    uint8_t **out_limb_bases_device = nullptr;
-    size_t *src_limb_stride_bytes_device = nullptr;
-    size_t *out_limb_stride_bytes_device = nullptr;
-    uint8_t *src_limb_coeff_bytes_device = nullptr;
-    uint8_t *out_limb_coeff_bytes_device = nullptr;
-    auto cleanup_dispatch_allocs = [&]()
-    {
-        if (dispatch_device >= 0)
-        {
-            cudaSetDevice(dispatch_device);
-        }
-        if (src_limb_bases_device)
-        {
-            cudaFreeAsync(src_limb_bases_device, dispatch_stream);
-            src_limb_bases_device = nullptr;
-        }
-        if (out_limb_bases_device)
-        {
-            cudaFreeAsync(out_limb_bases_device, dispatch_stream);
-            out_limb_bases_device = nullptr;
-        }
-        if (src_limb_coeff_bytes_device)
-        {
-            cudaFreeAsync(src_limb_coeff_bytes_device, dispatch_stream);
-            src_limb_coeff_bytes_device = nullptr;
-        }
-        if (out_limb_coeff_bytes_device)
-        {
-            cudaFreeAsync(out_limb_coeff_bytes_device, dispatch_stream);
-            out_limb_coeff_bytes_device = nullptr;
-        }
-        if (src_limb_stride_bytes_device)
-        {
-            cudaFreeAsync(src_limb_stride_bytes_device, dispatch_stream);
-            src_limb_stride_bytes_device = nullptr;
-        }
-        if (out_limb_stride_bytes_device)
-        {
-            cudaFreeAsync(out_limb_stride_bytes_device, dispatch_stream);
-            out_limb_stride_bytes_device = nullptr;
-        }
-    };
-
-    err = cudaMallocAsync(reinterpret_cast<void **>(&src_limb_bases_device), limb_ptr_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_bases_device), limb_ptr_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&src_limb_stride_bytes_device), limb_stride_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_stride_bytes_device), limb_stride_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&src_limb_coeff_bytes_device), limb_coeff_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_coeff_bytes_device), limb_coeff_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-
-    err = cudaMemcpyAsync(
-        src_limb_bases_device,
-        src_limb_bases.data(),
-        limb_ptr_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        out_limb_bases_device,
-        out_limb_bases.data(),
-        limb_ptr_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        src_limb_stride_bytes_device,
-        src_limb_stride_bytes.data(),
-        limb_stride_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        out_limb_stride_bytes_device,
-        out_limb_stride_bytes.data(),
-        limb_stride_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        src_limb_coeff_bytes_device,
-        src_limb_coeff_bytes.data(),
-        limb_coeff_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        out_limb_coeff_bytes_device,
-        out_limb_coeff_bytes.data(),
-        limb_coeff_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup_dispatch_allocs();
-        return set_error(err);
-    }
-
     const int threads = 256;
-    const size_t total = size * static_cast<size_t>(out->ctx->N);
     const int blocks = static_cast<int>((total + static_cast<size_t>(threads) - 1) / threads);
     const dim3 grid{
         static_cast<unsigned int>(blocks),
         1u,
         static_cast<unsigned int>(limb_count)};
     matrix_fill_small_decomposed_identity_chunk_all_limbs_kernel<<<grid, threads, 0, dispatch_stream>>>(
-        src_limb_bases_device,
-        out_limb_bases_device,
-        src_limb_stride_bytes_device,
-        out_limb_stride_bytes_device,
-        src_limb_coeff_bytes_device,
-        out_limb_coeff_bytes_device,
+        scalar_by_digit->shared_limb_buffers[0].device_descriptors,
+        out->shared_limb_buffers[0].device_descriptors,
         limb_count,
         static_cast<size_t>(out->ctx->N),
         size,
@@ -1047,7 +819,6 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        cleanup_dispatch_allocs();
         return set_error(err);
     }
 
@@ -1061,19 +832,11 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
             dispatch_stream);
         if (status != 0)
         {
-            cleanup_dispatch_allocs();
-            return status;
-        }
-        status = matrix_record_limb_write(out, active_limb_ids[idx], dispatch_stream);
-        if (status != 0)
-        {
-            cleanup_dispatch_allocs();
             return status;
         }
     }
-    cleanup_dispatch_allocs();
     out->format = scalar_by_digit->format;
-    return 0;
+    return workspace.complete();
 }
 
 // Constants for Section 3.2 of ePrint 2024/909. No full-modulus integers or
@@ -1144,6 +907,9 @@ __global__ void gadget_correct_residues_kernel(
 
 extern "C" int gpu_matrix_correct_gadget_residues(GpuMatrix *src, size_t dropped)
 {
+    if (!src || !src->ctx || !src->ctx->execution)
+        return set_error("invalid execution owner in gpu_matrix_correct_gadget_residues");
+    GpuAllocationActivity activity(src->ctx->execution.get(), -1);
     if (!src || !src->ctx || src->format != GPU_POLY_FORMAT_COEFF || src->level < 0)
         return set_error("invalid approximate gadget source");
     const size_t limbs = static_cast<size_t>(src->level + 1);
@@ -1157,10 +923,10 @@ extern "C" int gpu_matrix_correct_gadget_residues(GpuMatrix *src, size_t dropped
     if (matrix_limb_device(src, first, &device) != 0 ||
         matrix_limb_stream(src, first, &stream) != 0) return 1;
     if (first.x >= src->shared_limb_buffers.size() ||
-        first.x >= src->ctx->ntt_device_constants.size())
+        first.x >= src->ctx->ring_device_constants.size())
         return set_error("missing approximate gadget descriptors");
     const auto &buffers = src->shared_limb_buffers[first.x];
-    const auto &constants = src->ctx->ntt_device_constants[first.x];
+    const auto &constants = src->ctx->ring_device_constants[first.x];
     if (!buffers.device_descriptors || buffers.limb_count < limbs ||
         !constants.moduli || constants.limb_count < limbs)
         return set_error("missing approximate gadget constants");
@@ -1171,36 +937,37 @@ extern "C" int gpu_matrix_correct_gadget_residues(GpuMatrix *src, size_t dropped
         if (matrix_limb_device(src, id, &limb_device) != 0 || limb_device != device ||
             id.x != first.x || id.y != limb)
             return set_error("approximate gadget requires ordered limbs on one device");
-        if (matrix_wait_limb_stream(src, id, device, stream) != 0) return 1;
     }
     cudaError_t err = cudaSetDevice(device);
     if (err != cudaSuccess) return set_error(err);
-    uint64_t *weights = nullptr;
+    GpuMatrixTransformWorkspaceBytes requirements{};
+    int status = gpu_matrix_query_gadget_correction_workspace_bytes(
+        src->ctx, src->level, src->rows, src->cols, dropped, &requirements);
+    if (status != 0) return status;
+    const size_t coefficient_count = static_cast<size_t>(src->ctx->N) * src->rows * src->cols;
+    const size_t blocks = coefficient_count / 256 + (coefficient_count % 256 != 0);
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("gadget correction exceeds CUDA grid capacity");
+    MatrixTransformWorkspace workspace;
+    status = workspace.acquire(src, device, stream, requirements);
+    if (status != 0) return status;
+    auto *weights = reinterpret_cast<uint64_t *>(workspace.base);
     const size_t entries = dropped * (retained + 1);
-    err = cudaMallocAsync(reinterpret_cast<void **>(&weights), entries * sizeof(uint64_t), stream);
-    if (err != cudaSuccess) return set_error(err);
     gadget_low_constants_kernel<<<(entries + 255) / 256, 256, 0, stream>>>(
         constants.moduli, weights, retained, dropped);
     err = cudaGetLastError();
     if (err == cudaSuccess)
     {
-        const dim3 grid((static_cast<size_t>(src->ctx->N) * src->rows * src->cols + 255) / 256, retained);
+        const dim3 grid(static_cast<unsigned int>(blocks), static_cast<unsigned int>(retained));
         gadget_correct_residues_kernel<<<grid, 256, 0, stream>>>(
             buffers.device_descriptors, constants.moduli, weights,
             retained, dropped, src->ctx->N, src->rows * src->cols);
         err = cudaGetLastError();
     }
-    cudaFreeAsync(weights, stream);
     if (err != cudaSuccess) return set_error(err);
-    for (size_t limb = 0; limb < limbs; ++limb)
-    {
-        const dim3 id = src->ctx->limb_gpu_ids[limb];
-        const int status = limb < retained
-            ? matrix_record_limb_write(src, id, stream)
-            : matrix_track_limb_consumer_readonly(src, id, device, stream);
-        if (status != 0) return status;
-    }
-    return 0;
+    // All limbs share the exclusive auxiliary allocation. Joining each limb's
+    // next use also protects the unmodified, discarded limbs read by this call.
+    return workspace.complete();
 }
 
 static int gpu_matrix_decompose_base_impl(
@@ -1230,6 +997,10 @@ static int gpu_matrix_decompose_base_impl(
 
     const size_t rows = src->rows;
     const size_t cols = src->cols;
+    GpuMatrixDecomposeWorkspaceBytes requirements{};
+    int status = gpu_matrix_query_decompose_workspace_bytes(
+        src->ctx, src->level, rows, cols, src->format, base_bits, small, dropped_moduli, &requirements);
+    if (status != 0) return status;
     const size_t count = rows * cols;
     const int level = src->level;
     if (level < 0)
@@ -1256,7 +1027,7 @@ static int gpu_matrix_decompose_base_impl(
     const size_t out_log_base_q =
         small ? static_cast<size_t>(digits_per_tower)
               : static_cast<size_t>(digits_per_tower) * (crt_depth - dropped_moduli);
-    if (out->rows != rows * out_log_base_q || out->cols != cols)
+    if (out->rows != requirements.output_rows || out->cols != cols)
     {
         return set_error("output size mismatch in gpu_matrix_decompose_base");
     }
@@ -1277,7 +1048,6 @@ static int gpu_matrix_decompose_base_impl(
         }
     };
 
-    int status = 0;
     if (src->format == GPU_POLY_FORMAT_EVAL || dropped_moduli > 0)
     {
         const int matrix_format =
@@ -1326,7 +1096,6 @@ static int gpu_matrix_decompose_base_impl(
     std::vector<uint8_t *> out_limb_bases(limb_count, nullptr);
     std::vector<size_t> out_limb_stride_bytes(limb_count, 0);
     std::vector<uint8_t> out_limb_coeff_bytes(limb_count, 0);
-    std::vector<uint64_t> out_limb_moduli(limb_count, 0);
 
     int dispatch_device = -1;
     cudaStream_t dispatch_stream = nullptr;
@@ -1335,6 +1104,11 @@ static int gpu_matrix_decompose_base_impl(
         const size_t idx = static_cast<size_t>(limb);
         const dim3 limb_id = limb_map[idx];
         active_limb_ids[idx] = limb_id;
+        if (limb_id.x != 0 || limb_id.y != idx)
+        {
+            cleanup_tmp_inputs();
+            return set_error("decomposition requires ordered colocated descriptors");
+        }
 
         int out_device = -1;
         status = matrix_limb_device(out, limb_id, &out_device);
@@ -1378,7 +1152,6 @@ static int gpu_matrix_decompose_base_impl(
             return set_error("invalid output limb metadata in gpu_matrix_decompose_base");
         }
         out_limb_bases[idx] = dst;
-        out_limb_moduli[idx] = src->ctx->moduli[idx];
     }
     if (dispatch_device < 0 || !dispatch_stream)
     {
@@ -1386,9 +1159,8 @@ static int gpu_matrix_decompose_base_impl(
         return set_error("invalid dispatch stream in gpu_matrix_decompose_base");
     }
 
-    const int src_limb_begin = 0;
-    const int src_limb_end = small ? 1 : static_cast<int>(crt_depth - dropped_moduli);
-    for (int src_limb = src_limb_begin; src_limb < src_limb_end; ++src_limb)
+    const size_t source_limb_count = small ? limb_count : crt_depth - dropped_moduli;
+    for (size_t src_limb = 0; src_limb < source_limb_count; ++src_limb)
     {
         const dim3 src_limb_id = active_limb_ids[static_cast<size_t>(src_limb)];
         int src_device = -1;
@@ -1405,51 +1177,26 @@ static int gpu_matrix_decompose_base_impl(
         }
     }
 
-    if (limb_count > std::numeric_limits<size_t>::max() / sizeof(uint8_t *) ||
-        limb_count > std::numeric_limits<size_t>::max() / sizeof(size_t) ||
-        limb_count > std::numeric_limits<size_t>::max() / sizeof(uint8_t) ||
-        limb_count > std::numeric_limits<size_t>::max() / sizeof(uint64_t))
+    if (out->shared_limb_buffers.size() != 1 || !out->shared_limb_buffers[0].device_descriptors ||
+        out->shared_limb_buffers[0].limb_count < limb_count || out->ctx->ring_device_constants.empty() ||
+        !out->ctx->ring_device_constants[0].moduli || out->ctx->ring_device_constants[0].limb_count < limb_count ||
+        inputs_matrix->shared_limb_buffers.size() != 1 ||
+        !inputs_matrix->shared_limb_buffers[0].device_descriptors ||
+        inputs_matrix->shared_limb_buffers[0].limb_count < source_limb_count)
     {
         cleanup_tmp_inputs();
-        return set_error("limb metadata size overflow in gpu_matrix_decompose_base");
+        return set_error("missing decomposition device descriptors or moduli");
     }
-    const size_t out_ptr_bytes = limb_count * sizeof(uint8_t *);
-    const size_t out_stride_bytes = limb_count * sizeof(size_t);
-    const size_t out_coeff_bytes = limb_count * sizeof(uint8_t);
-    const size_t out_moduli_bytes = limb_count * sizeof(uint64_t);
-
-    uint8_t **out_limb_bases_device = nullptr;
-    size_t *out_limb_stride_bytes_device = nullptr;
-    uint8_t *out_limb_coeff_bytes_device = nullptr;
-    uint64_t *out_limb_moduli_device = nullptr;
+    MatrixTransformWorkspace workspace;
+    status = workspace.acquire(out, dispatch_device, dispatch_stream, {});
     auto cleanup = [&]()
     {
-        if (dispatch_device >= 0)
-        {
-            cudaSetDevice(dispatch_device);
-        }
-        if (out_limb_bases_device)
-        {
-            cudaFreeAsync(out_limb_bases_device, dispatch_stream);
-            out_limb_bases_device = nullptr;
-        }
-        if (out_limb_stride_bytes_device)
-        {
-            cudaFreeAsync(out_limb_stride_bytes_device, dispatch_stream);
-            out_limb_stride_bytes_device = nullptr;
-        }
-        if (out_limb_coeff_bytes_device)
-        {
-            cudaFreeAsync(out_limb_coeff_bytes_device, dispatch_stream);
-            out_limb_coeff_bytes_device = nullptr;
-        }
-        if (out_limb_moduli_device)
-        {
-            cudaFreeAsync(out_limb_moduli_device, dispatch_stream);
-            out_limb_moduli_device = nullptr;
-        }
+        // Retire before dropping a temporary source whose last reader update
+        // might have failed after a successful earlier kernel submission.
+        workspace.retire();
         cleanup_tmp_inputs();
     };
+    if (status != 0) { cleanup(); return status; }
 
     cudaError_t err = cudaSetDevice(dispatch_device);
     if (err != cudaSuccess)
@@ -1462,12 +1209,6 @@ static int gpu_matrix_decompose_base_impl(
     for (int out_limb = 0; out_limb <= level; ++out_limb)
     {
         const size_t out_idx = static_cast<size_t>(out_limb);
-        status = matrix_wait_limb_stream(out, active_limb_ids[out_idx], dispatch_device, dispatch_stream);
-        if (status != 0)
-        {
-            cleanup();
-            return status;
-        }
         if (out_count > 0)
         {
             const size_t dst_pitch = out_limb_stride_bytes[out_idx];
@@ -1488,85 +1229,22 @@ static int gpu_matrix_decompose_base_impl(
         }
     }
 
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_bases_device), out_ptr_bytes, dispatch_stream);
-    if (err != cudaSuccess)
+    if (small)
     {
-        cleanup();
-        return set_error(err);
+        // One small-decomposition launch reads every tower through its resident
+        // descriptor. Keep those independent input writers and releases covered.
+        status = matrix_wait_all_limb_streams(inputs_matrix, dispatch_device, dispatch_stream, false, true);
+        if (status != 0) { cleanup(); return status; }
     }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_stride_bytes_device), out_stride_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_coeff_bytes_device), out_coeff_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_moduli_device), out_moduli_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-
-    err = cudaMemcpyAsync(
-        out_limb_bases_device,
-        out_limb_bases.data(),
-        out_ptr_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        out_limb_stride_bytes_device,
-        out_limb_stride_bytes.data(),
-        out_stride_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        out_limb_coeff_bytes_device,
-        out_limb_coeff_bytes.data(),
-        out_coeff_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMemcpyAsync(
-        out_limb_moduli_device,
-        out_limb_moduli.data(),
-        out_moduli_bytes,
-        cudaMemcpyHostToDevice,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-
-    for (int src_limb = src_limb_begin; src_limb < src_limb_end; ++src_limb)
+    const size_t launch_count = small ? 1 : source_limb_count;
+    for (size_t src_limb = 0; src_limb < launch_count; ++src_limb)
     {
         const size_t src_idx = static_cast<size_t>(src_limb);
         const dim3 src_limb_id = active_limb_ids[src_idx];
-        status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, dispatch_device, dispatch_stream);
-        if (status != 0)
+        if (!small)
         {
-            cleanup();
-            return status;
+            status = matrix_wait_limb_stream(inputs_matrix, src_limb_id, dispatch_device, dispatch_stream);
+            if (status != 0) { cleanup(); return status; }
         }
 
         const uint8_t *src_base = matrix_limb_ptr_by_id(inputs_matrix, 0, src_limb_id);
@@ -1586,16 +1264,14 @@ static int gpu_matrix_decompose_base_impl(
             cleanup();
             return set_error("invalid source limb metadata in gpu_matrix_decompose_base");
         }
-        const uint32_t src_bits = bit_width_u64(src->ctx->moduli[src_idx]);
         const size_t src_digit_offset_base =
             small ? 0 : (src_idx * static_cast<size_t>(digits_per_tower));
 
         status = launch_decompose_all_slots_kernel(
             src_base,
-            out_limb_bases_device,
-            out_limb_stride_bytes_device,
-            out_limb_coeff_bytes_device,
-            out_limb_moduli_device,
+            inputs_matrix->shared_limb_buffers[0].device_descriptors,
+            out->shared_limb_buffers[0].device_descriptors,
+            out->ctx->ring_device_constants[0].moduli,
             src_stride_bytes,
             src_coeff_bytes,
             limb_count,
@@ -1604,7 +1280,6 @@ static int gpu_matrix_decompose_base_impl(
             cols,
             out->cols,
             out_log_base_q,
-            src_bits,
             src->ctx->moduli[src_idx],
             base_bits,
             digits_per_tower,
@@ -1616,11 +1291,10 @@ static int gpu_matrix_decompose_base_impl(
             cleanup();
             return status;
         }
-        status = matrix_track_limb_consumer(
-            inputs_matrix,
-            src_limb_id,
-            dispatch_device,
-            dispatch_stream);
+        status = small
+            ? matrix_track_all_limb_consumers(inputs_matrix, dispatch_device, dispatch_stream,
+                                             nullptr, false, true)
+            : matrix_track_limb_consumer(inputs_matrix, src_limb_id, dispatch_device, dispatch_stream);
         if (status != 0)
         {
             cleanup();
@@ -1628,16 +1302,8 @@ static int gpu_matrix_decompose_base_impl(
         }
     }
 
-    for (int out_limb = 0; out_limb <= level; ++out_limb)
-    {
-        status = matrix_record_limb_write(out, active_limb_ids[static_cast<size_t>(out_limb)], dispatch_stream);
-        if (status != 0)
-        {
-            cleanup();
-            return status;
-        }
-    }
-
+    status = workspace.complete();
+    if (status != 0) { cleanup(); return status; }
     out->format = GPU_POLY_FORMAT_COEFF;
     if (requested_out_format == GPU_POLY_FORMAT_EVAL)
     {
@@ -1656,10 +1322,16 @@ static int gpu_matrix_decompose_base_impl(
 
 extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out, size_t dropped_moduli)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid execution owner in gpu_matrix_decompose_base");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
     return gpu_matrix_decompose_base_impl(src, base_bits, out, false, dropped_moduli);
 }
 
 extern "C" int gpu_matrix_decompose_base_small(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid execution owner in gpu_matrix_decompose_base_small");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
     return gpu_matrix_decompose_base_impl(src, base_bits, out, true, 0);
 }

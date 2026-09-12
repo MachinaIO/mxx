@@ -11,10 +11,10 @@ struct PlanKey {
     plaintext_modulus: u64,
 }
 
-struct Plan {
-    scales: Vec<u64>,
-    inverses: Vec<u64>,
-    weights: Option<[u64; 64]>,
+pub(super) struct Plan {
+    pub(super) scales: Vec<u64>,
+    pub(super) inverses: Vec<u64>,
+    pub(super) weights: Option<[u64; 64]>,
 }
 
 thread_local! {
@@ -22,33 +22,69 @@ thread_local! {
     static PLANS: RefCell<BTreeMap<PlanKey, Arc<Plan>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-impl GpuDCRTPolyMatrix {
-    pub(super) fn rns_conversion(
-        &self,
-        destination: &GpuDCRTPolyParams,
-        digit_size: usize,
-        normalize: bool,
-        plaintext_modulus: u64,
-    ) -> Result<Self, String> {
-        let source = self.params.moduli();
-        let target = destination.moduli();
-        let down = plaintext_modulus != 0;
-        if self.params.ring_dimension() != destination.ring_dimension() ||
-            self.level + 1 != source.len() ||
-            self.params.execution_owner_id() != destination.execution_owner_id() ||
-            digit_size == 0 ||
-            source.len() > 64 ||
-            target.len() > 64
+/// Coefficient-domain approximate RNS basis conversion. ModUp emits one row
+/// block per source digit; ModDown preserves rows and removes auxiliary primes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuMatrixRnsConversion {
+    Up { digit_size: usize, normalize: bool },
+    Down { plaintext_modulus: u64 },
+}
+
+impl GpuMatrixRnsConversion {
+    pub fn validate(
+        self,
+        source: &GpuDCRTPolyParams,
+        level: usize,
+        target: &GpuDCRTPolyParams,
+    ) -> Result<usize, String> {
+        if source.ring_dimension() != target.ring_dimension() ||
+            level.checked_add(1) != Some(source.crt_depth()) ||
+            source.execution_owner_id() != target.execution_owner_id() ||
+            source.device_ids() != target.device_ids() ||
+            source.crt_depth() > 64 ||
+            target.crt_depth() > 64
         {
-            return Err("RNS conversion requires full bases, matching dimensions, shared execution, nonzero digit size and at most 64 limbs".into());
+            return Err("RNS conversion requires full bases, matching dimensions, placement and shared execution, with at most 64 limbs".into());
         }
-        if if down {
-            target.len() >= source.len() || target.iter().any(|q| !source.contains(q))
-        } else {
-            source.iter().any(|q| !target.contains(q))
-        } {
-            return Err("invalid RNS source/destination subset relation".into());
+        match self {
+            Self::Up { digit_size, .. } => {
+                if digit_size == 0 || source.moduli().iter().any(|q| !target.moduli().contains(q)) {
+                    return Err(
+                        "RNS ModUp requires nonzero digit size and a containing destination basis"
+                            .into(),
+                    );
+                }
+                Ok(source.crt_depth().div_ceil(digit_size))
+            }
+            Self::Down { plaintext_modulus } => {
+                if plaintext_modulus < 2 ||
+                    target.crt_depth() >= source.crt_depth() ||
+                    target.moduli().iter().any(|q| !source.moduli().contains(q)) ||
+                    source
+                        .moduli()
+                        .iter()
+                        .filter(|q| !target.moduli().contains(q))
+                        .any(|q| crate::utils::mod_inverse(plaintext_modulus % q, *q).is_none())
+                {
+                    return Err("RNS ModDown requires a proper subset and invertible plaintext modulus at least two".into());
+                }
+                Ok(1)
+            }
         }
+    }
+
+    pub(super) fn plan(
+        self,
+        source: &GpuDCRTPolyParams,
+        target: &GpuDCRTPolyParams,
+    ) -> Result<Arc<Plan>, String> {
+        let source = source.moduli();
+        let target = target.moduli();
+        let (digit_size, normalize, plaintext_modulus) = match self {
+            Self::Up { digit_size, normalize } => (digit_size, normalize, 0),
+            Self::Down { plaintext_modulus } => (source.len(), false, plaintext_modulus),
+        };
+        let down = plaintext_modulus != 0;
         let key = PlanKey {
             source: source.to_vec(),
             target: target.to_vec(),
@@ -56,12 +92,12 @@ impl GpuDCRTPolyMatrix {
             normalize,
             plaintext_modulus,
         };
-        let plan = PLANS.with(|plans| -> Result<Arc<Plan>, String> {
+        PLANS.with(|plans| -> Result<Arc<Plan>, String> {
             if let Some(plan) = plans.borrow().get(&key) {
                 return Ok(Arc::clone(plan));
             }
             let groups = source
-                .chunks(digit_size)
+                .par_chunks(digit_size)
                 .map(|chunk| chunk.iter().fold(BigUint::from(1u8), |p, q| p * q))
                 .collect::<Vec<_>>();
             let product = source
@@ -135,32 +171,24 @@ impl GpuDCRTPolyMatrix {
             }
             plans.insert(key, Arc::clone(&plan));
             Ok(plan)
-        })?;
-        let groups = if down { 1 } else { source.len().div_ceil(digit_size) };
-        let rows = self.nrow.checked_mul(groups).ok_or("RNS output row count overflow")?;
-        if rows == 0 || self.ncol == 0 {
-            return Ok(Self::new_empty(destination, rows, self.ncol));
-        }
-        let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
-        let input = coefficients.as_ref().unwrap_or(self);
-        let mut output =
-            Self::new_empty_with_state(destination, rows, self.ncol, target.len() - 1, false, None);
-        let status = unsafe {
-            gpu_matrix_rns_conversion(
-                output.raw,
-                input.raw,
-                digit_size,
-                plaintext_modulus,
-                plan.scales.as_ptr(),
-                plan.inverses.as_ptr(),
-                plan.weights.as_ref().map_or(std::ptr::null(), |weights| weights.as_ptr()),
-            )
+        })
+    }
+}
+
+impl GpuDCRTPolyMatrix {
+    pub(super) fn rns_conversion(
+        &self,
+        destination: &GpuDCRTPolyParams,
+        digit_size: usize,
+        normalize: bool,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String> {
+        let conversion = if plaintext_modulus == 0 {
+            GpuMatrixRnsConversion::Up { digit_size, normalize }
+        } else {
+            GpuMatrixRnsConversion::Down { plaintext_modulus }
         };
-        if status != 0 {
-            return Err(crate::poly::dcrt::gpu::last_error_string());
-        }
-        output.ntt_all_in_place();
-        Ok(output)
+        self.column_view(0..self.ncol)?.rns_conversion(destination, conversion, None)
     }
 }
 
@@ -332,83 +360,15 @@ impl GpuDCRTPolyMatrix {
         destination: &GpuDCRTPolyParams,
         plaintext_modulus: Option<u64>,
     ) -> Result<Self, String> {
-        let source_primes = self.params.moduli();
-        let target_primes = destination.moduli();
-        if self.params.ring_dimension() != destination.ring_dimension() ||
-            self.params.execution_owner_id() != destination.execution_owner_id() ||
-            self.level + 1 != source_primes.len() ||
-            source_primes.len() > 64 ||
-            target_primes.len() > 64
-        {
-            return Err("exact RNS conversion requires matching dimensions/execution, full bases and at most 64 limbs".into());
-        }
-        let valid = match plaintext_modulus {
-            Some(t) => {
-                t >= 1 &&
-                    target_primes.len() < source_primes.len() &&
-                    target_primes.iter().all(|p| source_primes.contains(p)) &&
-                    source_primes.iter().all(|p| t % p != 0)
-            }
-            None => source_primes.iter().all(|p| target_primes.contains(p)),
-        };
-        if !valid {
-            return Err("invalid exact RNS source/destination bases or plaintext modulus".into());
-        }
-        // Only public residues/inverses: even the dropped product is not
-        // reconstructed here. The native kernel computes mixed-radix digits.
-        let input_scales = source_primes
-            .par_iter()
-            .map(|prime| match plaintext_modulus {
-                Some(t) => crate::utils::mod_inverse(t % prime, *prime)
-                    .ok_or_else(|| "plaintext modulus is not invertible".to_owned()),
-                None => Ok(1),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let division_inverses = target_primes
-            .par_iter()
-            .map(|prime| {
-                if plaintext_modulus.is_none() {
-                    return Ok(1);
-                }
-                let product = source_primes
-                    .iter()
-                    .filter(|p| !target_primes.contains(p))
-                    .fold(1u64, |product, p| {
-                        ((product as u128 * (*p % prime) as u128) % *prime as u128) as u64
-                    });
-                crate::utils::mod_inverse(product, *prime)
-                    .ok_or_else(|| "dropped CRT product is not invertible".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if self.nrow == 0 || self.ncol == 0 {
-            return Ok(Self::new_empty(destination, self.nrow, self.ncol));
-        }
-        let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
-        let source = coefficients.as_ref().unwrap_or(self);
-        let mut output = Self::new_empty_with_state(
+        self.column_view(0..self.ncol)?.convert_modulus(
             destination,
-            self.nrow,
-            self.ncol,
-            target_primes.len() - 1,
-            false,
+            plaintext_modulus
+                .map(|plaintext_modulus| GpuMatrixModulusConversion::BlockSwitch {
+                    plaintext_modulus,
+                })
+                .unwrap_or(GpuMatrixModulusConversion::CenteredExtend),
             None,
-        );
-        let status = unsafe {
-            gpu_matrix_convert_modulus(
-                output.raw,
-                source.raw,
-                if plaintext_modulus.is_some() { 3 } else { 2 },
-                division_inverses.as_ptr(),
-                division_inverses.len(),
-                plaintext_modulus.unwrap_or(0),
-                input_scales.as_ptr(),
-            )
-        };
-        if status != 0 {
-            return Err(crate::poly::dcrt::gpu::last_error_string());
-        }
-        output.ntt_all_in_place();
-        Ok(output)
+        )
     }
 }
 

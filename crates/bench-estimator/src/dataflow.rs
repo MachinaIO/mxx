@@ -23,8 +23,16 @@ pub enum TransferKind {
     Import,
 }
 
+/// The timing boundary that owns this transfer. Primitive local/peer transfers
+/// stay inside primitive measurement and never appear in the dataflow transfer list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferCostOwner {
+    DataflowMaterialization,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TransferCost {
+    pub owner: TransferCostOwner,
     pub kind: TransferKind,
     pub wire_type: ConcreteWireType,
     pub count: u128,
@@ -36,6 +44,8 @@ pub struct TransferCost {
 pub struct DataflowCost {
     pub transfer_seconds: f64,
     pub executor_node_instances: u128,
+    /// Scalar executor/liveness management proxy; excludes GPU backend submission,
+    /// whose host cost is already owned by primitive fleet wall timing.
     pub executor_dispatch_seconds: f64,
     #[serde(skip)]
     pub(crate) transfers: BTreeMap<Vec<u8>, (TransferKind, ConcreteWireType, u128)>,
@@ -212,6 +222,7 @@ pub(crate) fn estimate<B: MeasurementBackend>(
         let total_seconds = seconds * *count as f64;
         cost.transfer_seconds += total_seconds;
         transfers.push(TransferCost {
+            owner: TransferCostOwner::DataflowMaterialization,
             kind: *kind,
             wire_type: ty.clone(),
             count: *count,

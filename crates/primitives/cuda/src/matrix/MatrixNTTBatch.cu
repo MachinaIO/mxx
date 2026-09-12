@@ -10,6 +10,7 @@ namespace
         uint32_t indices[GPU_RUNTIME_MAX_LIMBS];
         size_t limb_count;
         bool out_of_place;
+        __device__ size_t polynomial(size_t index) const { return index; }
         __device__ size_t limb(size_t index) const { return index % limb_count; }
         __device__ auto output(size_t index) const {
             return outputs[index / limb_count][indices[limb(index)]];
@@ -192,6 +193,7 @@ int run_matrix_transform_batch(
     if (!matrices || matrix_count == 0 || !matrices[0] || !matrices[0]->ctx)
         return set_error("invalid run_matrix_transform_batch arguments");
     GpuMatrix *first = matrices[0];
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
     const GpuPolyFormat input_format =
         forward ? GPU_POLY_FORMAT_COEFF : GPU_POLY_FORMAT_EVAL;
     const GpuPolyFormat output_format =
@@ -279,9 +281,9 @@ int run_matrix_transform_batch(
         }
     }
     const size_t partition = static_cast<size_t>(limb_ids[0].x);
-    if (partition >= first->ctx->ntt_device_constants.size())
+    if (partition >= first->ctx->ring_device_constants.size())
         return set_error("missing batch INTT constants");
-    const auto &constants = first->ctx->ntt_device_constants[partition];
+    const auto &constants = first->ctx->ring_device_constants[partition];
     if (constants.device != device || constants.ring_dimension != n ||
         constants.limb_count < limb_count || !constants.twiddle_inverse ||
         !constants.twiddle_forward || !constants.twiddle_shoup_inverse ||

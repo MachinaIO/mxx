@@ -20,14 +20,17 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeMeasurement {
+    /// Backend work units. The GPU backend uses aggregate execution-owner CUDA-event
+    /// spans in device-seconds; the generic host harness uses host elapsed seconds.
     pub work_seconds: f64,
-    /// Dependency latency: one fleet wave for independently column-separable operations.
+    /// Ideal dependency latency: maximum measured class time for independent waves.
     pub latency_seconds: f64,
     /// Sum of all production fleet wave latencies for the full logical operation.
     pub cumulative_wave_seconds: f64,
     /// Number of independent fleet waves needed for the full logical operation.
     pub independent_wave_count: usize,
-    /// Measured scratch for one bounded execution wave, excluding resident inputs.
+    /// Measured incremental allocation for one bounded wave, excluding resident inputs.
+    /// The current GPU adapter includes output allocations; this is not scratch alone.
     /// This is not the whole-graph runtime peak and is never multiplied by wave count.
     pub measured_wave_workspace_bytes: u64,
     /// Hypothetical workspace when all independent waves execute concurrently.
@@ -63,6 +66,19 @@ pub struct MeasurementNode<'a> {
     pub concrete_output_types: Vec<ConcreteWireType>,
 }
 
+/// Whether the measured inputs and placement establish a concrete runtime scenario.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeasurementScenario {
+    #[default]
+    BackendDefined,
+    /// Synthetic input values and fresh placement; retained runtime owners/budgets are absent.
+    SyntheticFreshPlacement,
+    /// Every fleet-wave node was measured over the wave classes of an admitted runtime
+    /// invocation plan: actual owner intervals, admitted widths and exact multiplicities.
+    /// Operand values remain synthetic; timing is not a physical-memory certificate.
+    AdmittedInvocationPlan,
+}
+
 pub trait MeasurementBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -72,6 +88,10 @@ pub trait MeasurementBackend {
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
     ) -> Result<NodeMeasurement, Self::Error>;
+
+    fn measurement_scenario(&self) -> MeasurementScenario {
+        MeasurementScenario::BackendDefined
+    }
 
     /// GPU backends model runtime staging separately from GPU-resident primitive work.
     fn models_dataflow(&self) -> bool {
@@ -142,6 +162,8 @@ pub trait MeasurementBackend {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
+    /// Synthetic scenarios cannot establish runtime schedule agreement or memory admission.
+    pub measurement_scenario: MeasurementScenario,
     /// Runtime boundary costs, added to total_time_seconds, not to GPU work.
     #[serde(default)]
     pub dataflow: dataflow::DataflowCost,
@@ -283,6 +305,7 @@ pub fn estimate<B: MeasurementBackend>(
         report.dataflow = dataflow;
         report.transfers = transfers;
     }
+    report.measurement_scenario = estimator.backend.measurement_scenario();
     Ok(report)
 }
 

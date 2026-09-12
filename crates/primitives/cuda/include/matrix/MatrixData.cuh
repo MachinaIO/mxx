@@ -7,12 +7,22 @@ extern "C"
 {
 #endif
 
+    typedef enum GpuMatrixExecutionClass
+    {
+        GPU_MATRIX_EMPTY = 0,
+        GPU_MATRIX_SHARED_STREAM = 1,
+        GPU_MATRIX_PER_LIMB_STREAMS = 2,
+    } GpuMatrixExecutionClass;
+
     typedef struct GpuMatrixAllocationBytes
     {
         size_t data_bytes;
         size_t aux_bytes;
+        // Reusable portion of aux_bytes, excluding descriptors and padding.
+        size_t aux_workspace_bytes;
         size_t event_bytes;
         size_t total_bytes;
+        GpuMatrixExecutionClass execution_class;
     } GpuMatrixAllocationBytes;
 
     int gpu_matrix_query_allocation_bytes(
@@ -34,8 +44,10 @@ extern "C"
     void gpu_matrix_destroy(GpuMatrix *mat);
     int gpu_matrix_zero(GpuMatrix *mat);
     int gpu_matrix_wait(const GpuMatrix *mat);
+    int gpu_matrix_is_ready(const GpuMatrix *mat, int *out_ready);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);
-    int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied);
+    int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied,
+        const GpuMatrixBatchView *view);
     int gpu_matrix_copy_block(
         GpuMatrix *out,
         const GpuMatrix *src,

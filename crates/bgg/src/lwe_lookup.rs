@@ -2014,7 +2014,7 @@ mod tests {
             .unwrap();
             let low = {
                 let RuntimeValue::IndexedFamily(values) =
-                    result.materialize_output("low", &backend, &mut store).unwrap()
+                    result.materialize_output("low", &mut backend, &mut store).unwrap()
                 else {
                     panic!("low output must be a family")
                 };
@@ -2028,7 +2028,7 @@ mod tests {
             };
             assert_eq!(low.len(), 3);
             let RuntimeValue::IndexedFamily(residuals) =
-                result.materialize_output("residual", &backend, &mut store).unwrap()
+                result.materialize_output("residual", &mut backend, &mut store).unwrap()
             else {
                 panic!("residual output must be a family")
             };

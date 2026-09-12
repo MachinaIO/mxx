@@ -122,7 +122,7 @@ pub fn configure_widths(backend: &mut GpuDcrtBackend, graph: &mxx_ir_core::Valid
     for (identity, width) in widths {
         backend.set_column_widths_for_operation(
             identity,
-            GpuColumnWidths { gpu0: width, nonzero: Some(width) },
+            GpuColumnWidths { gpu0: Some(width), nonzero: Some(width) },
         );
     }
 }

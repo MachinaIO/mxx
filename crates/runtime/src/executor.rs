@@ -36,6 +36,9 @@ use thiserror::Error;
 use tracing::info;
 
 #[cfg(feature = "gpu")]
+use crate::gpu_invocation::{GpuColumnSourceLayout, GpuInvocation, preflight};
+
+#[cfg(feature = "gpu")]
 mod gpu_plan;
 mod plan_cache;
 
@@ -54,6 +57,11 @@ pub struct ExecutionConfig {
     /// When set, also drain pending releases before returning. With `None`,
     /// releases remain asynchronous and are protected by backend lifetime events.
     pub release_fence_interval: Option<NonZeroUsize>,
+    /// Derive the complete prepared GPU inventory from the graph and accept it
+    /// before the first node executes. Graphs containing kinds without a
+    /// compiled admitted runner fail before any partial execution. The caller
+    /// asserts exclusive device observation during setup.
+    pub prepared_gpu_admission: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -62,6 +70,7 @@ impl Default for ExecutionConfig {
             max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
             preimage_progress: None,
             release_fence_interval: None,
+            prepared_gpu_admission: false,
         }
     }
 }
@@ -650,7 +659,7 @@ impl<B: Backend> ExecutionResult<B> {
     pub fn materialize_output<S: ArtifactStore>(
         &mut self,
         name: &str,
-        backend: &B,
+        backend: &mut B,
         store: &mut S,
     ) -> Result<&RuntimeValue<B>, ExecutionError> {
         let value = self
@@ -936,6 +945,11 @@ where
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
+    if config.prepared_gpu_admission {
+        backend
+            .prepare_graph_admission(validated)
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+    }
     let mut executor = Executor {
         validated,
         backend,
@@ -1231,8 +1245,20 @@ where
                     self.set_placement(placements[0])?;
                     let row_sum = &block_aliases.row_sums[node];
                     let output = if let [left, right] = matrices.as_slice() {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::TensorSumRows { left, right, rows: &row_sum.rows },
+                        )
+                        .map_err(Self::backend_error)?;
                         self.backend.tensor_sum_rows(left, right, &row_sum.rows)
                     } else {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::SumRows { value: matrices[0], rows: &row_sum.rows },
+                        )
+                        .map_err(Self::backend_error)?;
                         self.backend.sum_rows(matrices[0], &row_sum.rows)
                     }
                     .map_err(Self::backend_error)?;
@@ -1465,8 +1491,24 @@ where
                             .remove(&node.id)
                             .expect("row sum source survives until concat");
                         let output = if let Some(right) = right {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                self.backend,
+                                GpuInvocation::TensorSumRows {
+                                    left: &source,
+                                    right: &right,
+                                    rows: &row_sum.rows,
+                                },
+                            )
+                            .map_err(Self::backend_error)?;
                             self.backend.tensor_sum_rows(&source, &right, &row_sum.rows)
                         } else {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                self.backend,
+                                GpuInvocation::SumRows { value: &source, rows: &row_sum.rows },
+                            )
+                            .map_err(Self::backend_error)?;
                             self.backend.sum_rows(&source, &row_sum.rows)
                         }
                         .map_err(Self::backend_error)?;
@@ -1490,6 +1532,16 @@ where
                         let blocks =
                             row_blocks[index].remove(concat).expect("decomposition block owners");
                         let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::GadgetDecomposeRowBlocks {
+                                blocks: &references,
+                                small: *small,
+                                digit_count: Some(digits),
+                            },
+                        )
+                        .map_err(Self::backend_error)?;
                         let output = self
                             .backend
                             .gadget_decompose_row_blocks(&references, *small, Some(digits))
@@ -1511,6 +1563,15 @@ where
                         let blocks =
                             row_blocks[index].remove(concat).expect("compact product block owners");
                         let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::MultiplySmallRhsRowBlocks {
+                                blocks: &references,
+                                right: &rhs,
+                            },
+                        )
+                        .map_err(Self::backend_error)?;
                         let outputs = self
                             .backend
                             .multiply_small_rhs_row_blocks(&references, &rhs)
@@ -1536,6 +1597,12 @@ where
                             .remove(concat)
                             .expect("fused concat blocks survive until Add");
                         let references = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::AddRowBlocks { blocks: &references, right: &right },
+                        )
+                        .map_err(Self::backend_error)?;
                         let output = self
                             .backend
                             .add_row_blocks(&references, &right)
@@ -1777,6 +1844,24 @@ where
                     let right = self.matrix(instance, node.args[1])?;
                     inputs.push((left, right));
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &inputs
+                            .iter()
+                            .map(|(left, right)| {
+                                (
+                                    placement,
+                                    GpuInvocation::Binary {
+                                        operation: *operation,
+                                        left: left.as_ref(),
+                                        right: right.as_ref(),
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 match operation {
                     MatrixBinaryOp::Add => self.backend.add_batch(inputs),
                     MatrixBinaryOp::Subtract => self.backend.sub_batch(inputs),
@@ -1806,6 +1891,15 @@ where
                     };
                     requests.push(MatrixMulAccumulateRequest { products, bias });
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &requests
+                            .iter()
+                            .map(|request| (placement, GpuInvocation::Accumulate { request }))
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 self.backend.matrix_mul_accumulate_batch(requests).map_err(Self::backend_error)?
             }
             NodeKind::MatrixNegate => {
@@ -1814,6 +1908,17 @@ where
                     let instance = &mut values[*index];
                     inputs.push(self.matrix(instance, node.args[0])?);
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &inputs
+                            .iter()
+                            .map(|value| {
+                                (placement, GpuInvocation::Negate { value: value.as_ref() })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 self.backend.negate_batch(inputs).map_err(Self::backend_error)?
             }
             NodeKind::MatrixScale { scalar } => {
@@ -1827,6 +1932,20 @@ where
                         .map_err(|error| self.expression_error(node.id, error))?;
                     inputs.push((value, scalar));
                 }
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &inputs
+                            .iter()
+                            .map(|(value, scalar)| {
+                                (
+                                    placement,
+                                    GpuInvocation::ScaleInteger { value: value.as_ref(), scalar },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
             }
             _ => unreachable!("matrix batch kind checked by caller"),
@@ -2504,6 +2623,9 @@ where
             NodeKind::ConstantMatrix { value, .. } => {
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Constant { ty: &ty, value, env })
+                    .map_err(Self::backend_error)?;
                 let matrix =
                     self.backend.constant_matrix(&ty, value, env).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(matrix));
@@ -2514,20 +2636,18 @@ where
                 let sigma = self.trapdoor_sigma(scope_id, path, trapdoor_wire)?;
                 let (gadget_base, digit_count) =
                     self.trapdoor_layout(scope_id, path, trapdoor_wire)?;
-                let public = self
-                    .backend
-                    .constant_matrix(
-                        &ty,
-                        &mxx_ir_core::node::ConstantMatrix::Gadget {
-                            base: match &node.kind {
-                                NodeKind::GadgetTrapdoor { base, .. } => base.clone(),
-                                _ => unreachable!(),
-                            },
-                            small: false,
-                        },
-                        env,
-                    )
+                let gadget = mxx_ir_core::node::ConstantMatrix::Gadget {
+                    base: match &node.kind {
+                        NodeKind::GadgetTrapdoor { base, .. } => base.clone(),
+                        _ => unreachable!(),
+                    },
+                    small: false,
+                };
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Constant { ty: &ty, value: &gadget, env })
                     .map_err(Self::backend_error)?;
+                let public =
+                    self.backend.constant_matrix(&ty, &gadget, env).map_err(Self::backend_error)?;
                 self.put(
                     values,
                     node.id,
@@ -2604,6 +2724,16 @@ where
                         _ => Err(ExecutionError::ValueKind(wire)),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::PolynomialFromValues {
+                        ty: &ty,
+                        values: &members,
+                        evaluation: *evaluation,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .polynomial_from_values(&ty, &members, *evaluation)
@@ -2663,6 +2793,12 @@ where
             NodeKind::MatrixBinary(operation) => {
                 let left = self.matrix(values, node.args[0])?;
                 let right = self.matrix(values, node.args[1])?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::Binary { operation: *operation, left: &left, right: &right },
+                )
+                .map_err(Self::backend_error)?;
                 let output = match operation {
                     MatrixBinaryOp::Add => self.backend.add(&left, &right),
                     MatrixBinaryOp::Subtract => self.backend.sub(&left, &right),
@@ -2674,6 +2810,12 @@ where
             NodeKind::MatrixMulSmallRhs => {
                 let lhs = self.matrix(values, node.args[0])?;
                 let rhs = self.small_matrix(values, node.args[1])?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::MultiplySmallRhs { left: &lhs, right: &rhs },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .multiply_small_rhs(lhs.as_ref(), rhs.as_ref())
@@ -2696,14 +2838,19 @@ where
                 } else {
                     None
                 };
-                let output = self
-                    .backend
-                    .matrix_mul_accumulate(MatrixMulAccumulateRequest { products, bias })
+                let request = MatrixMulAccumulateRequest { products, bias };
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Accumulate { request: &request })
                     .map_err(Self::backend_error)?;
+                let output =
+                    self.backend.matrix_mul_accumulate(request).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::MatrixNegate => {
                 let input = self.matrix(values, node.args[0])?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Negate { value: &input })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.negate(&input).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2711,12 +2858,21 @@ where
                 let input = self.matrix(values, node.args[0])?;
                 let scalar =
                     scalar.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::ScaleInteger { value: &input, scalar: &scalar },
+                )
+                .map_err(Self::backend_error)?;
                 let output =
                     self.backend.scale_integer(&input, &scalar).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::Transpose => {
                 let input = self.matrix(values, node.args[0])?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Transpose { value: &input })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.transpose(&input).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2740,6 +2896,16 @@ where
                         })
                     })
                     .transpose()?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::Slice {
+                        value: &input,
+                        rows: rows.as_ref(),
+                        columns: columns.as_ref(),
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .slice(&input, rows.as_ref(), columns.as_ref())
@@ -2749,6 +2915,9 @@ where
             NodeKind::Tensor => {
                 let left = self.matrix(values, node.args[0])?;
                 let right = self.matrix(values, node.args[1])?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Tensor { left: &left, right: &right })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.tensor(&left, &right).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2759,6 +2928,9 @@ where
                     .map(|wire| self.matrix(values, *wire))
                     .collect::<Result<Vec<_>, _>>()?;
                 let inputs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::Concat { inputs: &inputs, axis: *axis })
+                    .map_err(Self::backend_error)?;
                 let output = self.backend.concat(&inputs, *axis).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2770,6 +2942,8 @@ where
                     maximum: &ty.modulus - BigInt::from(1),
                 };
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    #[cfg(feature = "gpu")]
+                    preflight(backend, GpuInvocation::SampleUniform { ty: &ty, range: &range })?;
                     backend.sample_uniform(&ty, &range)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -2788,6 +2962,8 @@ where
                         .map_err(|error| self.expression_error(node.id, error))?,
                 };
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    #[cfg(feature = "gpu")]
+                    preflight(backend, GpuInvocation::SampleUniform { ty: &ty, range: &range })?;
                     backend.sample_uniform(&ty, &range)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -2802,6 +2978,15 @@ where
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        backend,
+                        GpuInvocation::SampleGaussian {
+                            ty: &ty,
+                            sigma,
+                            max_coefficient_bound: &max_coefficient_bound,
+                        },
+                    )?;
                     backend.sample_gaussian(&ty, sigma, &max_coefficient_bound)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -2871,6 +3056,17 @@ where
                 match (variant, gadget_base.as_ref(), digit_count) {
                     (HashVariant::Plain, None, None) => {
                         let value = self.sample_matrix(path, wire, &ty, |backend| {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                backend,
+                                GpuInvocation::SampleHash {
+                                    ty: &ty,
+                                    variant: *variant,
+                                    tag_bytes: tag.len(),
+                                    gadget_base: None,
+                                    digit_count: None,
+                                },
+                            )?;
                             backend.sample_hash(&ty, key, &tag)
                         })?;
                         self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -2899,13 +3095,26 @@ where
                             wire,
                             &schema,
                             semantic_kind,
-                            |backend| match variant {
-                                HashVariant::Decomposed => {
-                                    backend.sample_hash_decomposed(&ty, key, &tag, base, count)
+                            |backend| {
+                                #[cfg(feature = "gpu")]
+                                preflight(
+                                    backend,
+                                    GpuInvocation::SampleHash {
+                                        ty: &ty,
+                                        variant: *variant,
+                                        tag_bytes: tag.len(),
+                                        gadget_base: Some(base),
+                                        digit_count: Some(count),
+                                    },
+                                )?;
+                                match variant {
+                                    HashVariant::Decomposed => {
+                                        backend.sample_hash_decomposed(&ty, key, &tag, base, count)
+                                    }
+                                    HashVariant::SmallDecomposed => backend
+                                        .sample_hash_small_decomposed(&ty, key, &tag, base, count),
+                                    HashVariant::Plain => unreachable!("plain hash handled above"),
                                 }
-                                HashVariant::SmallDecomposed => backend
-                                    .sample_hash_small_decomposed(&ty, key, &tag, base, count),
-                                HashVariant::Plain => unreachable!("plain hash handled above"),
                             },
                         )?;
                         self.put(values, node.id, 0, RuntimeValue::small_matrix(value));
@@ -2992,6 +3201,16 @@ where
                     self.backend
                         .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                         .map_err(Self::backend_error)?;
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::GadgetDecompose {
+                            value: &target,
+                            small,
+                            digit_count: Some(digit_count),
+                        },
+                    )
+                    .map_err(Self::backend_error)?;
                     (
                         self.backend
                             .gadget_decompose(&target, small, Some(digit_count))
@@ -3003,6 +3222,19 @@ where
                         secret.as_ref().expect("sampled trapdoor must carry secret material");
                     let target_source =
                         self.preimage_source(values, path, node.args[2], &target_type)?;
+                    #[cfg(feature = "gpu")]
+                    let target_layout = {
+                        let RuntimeValue::HostMatrix { bytes, .. } = &values[&node.args[2]] else {
+                            unreachable!("preimage source installs its staging payload")
+                        };
+                        self.backend
+                            .gpu_preimage_source_layout(
+                                &target_type,
+                                bytes,
+                                target_source.global_column_start(),
+                            )
+                            .map_err(Self::backend_error)?
+                    };
                     let randomness_seed =
                         preimage_request_seed(self.production.execution_nonce, path, wire);
                     self.sample_small_matrix_with_status(
@@ -3011,6 +3243,19 @@ where
                         &schema,
                         semantic_kind,
                         |backend| {
+                            #[cfg(feature = "gpu")]
+                            preflight(
+                                backend,
+                                GpuInvocation::SamplePreimage {
+                                    schema: &schema,
+                                    sigma,
+                                    gadget_base: &gadget_base,
+                                    digit_count,
+                                    trapdoor: secret,
+                                    public: &public,
+                                    target: &target_layout,
+                                },
+                            )?;
                             backend.sample_preimage(
                                 &schema.matrix,
                                 sigma,
@@ -3054,6 +3299,16 @@ where
                             .to_owned(),
                     });
                 }
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::GadgetDecompose {
+                        value: &input,
+                        small: *small,
+                        digit_count: Some(digit_count),
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .gadget_decompose(&input, *small, Some(digit_count))
@@ -3067,10 +3322,28 @@ where
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 let output = if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::ModulusSwitch { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.modulus_switch(&input, &ty)
                 } else if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::CenteredRebase { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.centered_rebase(&input, &ty)
                 } else {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::ReduceModulus { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.reduce_modulus(&input, &ty)
                 }
                 .map_err(Self::backend_error)?;
@@ -3080,6 +3353,18 @@ where
                 let input = self.matrix(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::RnsModUp {
+                        value: &input,
+                        destination: &ty,
+                        source_moduli,
+                        digit_size: *digit_size,
+                        normalize: *normalize,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .rns_mod_up(&input, &ty, source_moduli, *digit_size, *normalize)
@@ -3097,6 +3382,17 @@ where
                     .ok_or_else(|| {
                         self.expression_error(node.id, "plaintext modulus does not fit u64")
                     })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::RnsModDown {
+                        value: &input,
+                        destination: &ty,
+                        source_moduli,
+                        plaintext_modulus,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .rns_mod_down(&input, &ty, source_moduli, plaintext_modulus)
@@ -3109,6 +3405,12 @@ where
                 let input = self.small_matrix(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::CenteredExtendSmall { value: &input, destination: &ty },
+                )
+                .map_err(Self::backend_error)?;
                 let output =
                     self.backend.centered_extend_small(&input, &ty).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
@@ -3120,8 +3422,24 @@ where
                 let output = if let NodeKind::BlockModSwitch { plaintext_modulus, .. } = &node.kind
                 {
                     let t = self.eval_usize(node.id, plaintext_modulus, env)? as u64;
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::BlockModSwitch {
+                            value: &input,
+                            destination: &ty,
+                            plaintext_modulus: t,
+                        },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.block_mod_switch(&input, &ty, t)
                 } else {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::CenteredExtend { value: &input, destination: &ty },
+                    )
+                    .map_err(Self::backend_error)?;
                     self.backend.centered_extend(&input, &ty)
                 }
                 .map_err(Self::backend_error)?;
@@ -3130,6 +3448,9 @@ where
             NodeKind::RingAutomorphism { index } => {
                 let input = self.matrix(values, node.args[0])?;
                 let index = self.eval_usize(node.id, index, env)?;
+                #[cfg(feature = "gpu")]
+                preflight(self.backend, GpuInvocation::RingAutomorphism { value: &input, index })
+                    .map_err(Self::backend_error)?;
                 let output =
                     self.backend.ring_automorphism(&input, index).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
@@ -3147,10 +3468,26 @@ where
                 let coefficient = self.int(values, node.args[0])?;
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::Constant {
+                        ty: &ty,
+                        value: &mxx_ir_core::node::ConstantMatrix::Identity,
+                        env,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let identity = self
                     .backend
                     .constant_matrix(&ty, &mxx_ir_core::node::ConstantMatrix::Identity, env)
                     .map_err(Self::backend_error)?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::ScaleInteger { value: &identity, scalar: &coefficient },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .scale_integer(&identity, &coefficient)
@@ -3196,6 +3533,17 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 let destination =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::CrtRecompose {
+                        levels: &levels,
+                        plaintext_moduli: &plaintext_moduli,
+                        reconstruction_coefficients: &reconstruction_coefficients,
+                        destination: &destination,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .crt_recompose(
@@ -3228,6 +3576,16 @@ where
                             wire: WireRef { node: node.id, port: Port(0) },
                         })
                     })?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::PackPolynomialCoefficients {
+                        ty: &ty,
+                        bits: &bits,
+                        coefficient_bits,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .pack_polynomial_coefficients(&ty, &bits, coefficient_bits)
@@ -3765,6 +4123,8 @@ where
             path: Vec<InstantiationFrame>,
             schema: ConcreteBoundedMatrixSchema,
             request: PreimageRequest<M, T>,
+            #[cfg(feature = "gpu")]
+            target_layout: GpuColumnSourceLayout,
         }
 
         let mut pending = Vec::new();
@@ -3802,6 +4162,16 @@ where
                 self.backend
                     .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                     .map_err(Self::backend_error)?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::GadgetDecompose {
+                        value: &target,
+                        small,
+                        digit_count: Some(digit_count),
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let value = self
                     .backend
                     .gadget_decompose(&target, small, Some(digit_count))
@@ -3822,9 +4192,21 @@ where
                 node.args[2],
                 &target_type,
             )?;
+            #[cfg(feature = "gpu")]
+            let target_layout = {
+                let RuntimeValue::HostMatrix { bytes, .. } = &values[instance][&node.args[2]]
+                else {
+                    unreachable!("preimage source installs its staging payload")
+                };
+                self.backend
+                    .gpu_preimage_source_layout(&target_type, bytes, target.global_column_start())
+                    .map_err(Self::backend_error)?
+            };
             let randomness_seed =
                 preimage_request_seed(self.production.execution_nonce, &paths[instance], wire);
             pending.push(Pending {
+                #[cfg(feature = "gpu")]
+                target_layout,
                 instance,
                 placement: placements[instance],
                 wire,
@@ -3868,13 +4250,24 @@ where
                     {
                         self.set_placement(request.placement)?;
                         outputs[index] = Some(
-                            self.backend
-                                .small_matrix_from_bytes(
+                            {
+                                #[cfg(feature = "gpu")]
+                                preflight(
+                                    self.backend,
+                                    GpuInvocation::ImportSmallMatrix {
+                                        schema: &request.schema,
+                                        bytes: &bytes,
+                                        semantic_kind: SmallMatrixSemanticKind::Preimage,
+                                    },
+                                )
+                                .map_err(Self::backend_error)?;
+                                self.backend.small_matrix_from_bytes(
                                     &request.schema,
                                     &bytes,
                                     SmallMatrixSemanticKind::Preimage,
                                 )
-                                .map_err(Self::backend_error)?,
+                            }
+                            .map_err(Self::backend_error)?,
                         );
                     }
                     Some(
@@ -3906,6 +4299,33 @@ where
                         })
                     })
                     .collect::<Vec<_>>();
+                #[cfg(feature = "gpu")]
+                self.backend
+                    .preflight_gpu_operations(
+                        &groups
+                            .iter()
+                            .flat_map(|(placement, indices, _)| {
+                                let pending = &pending;
+                                indices.iter().map(move |index| {
+                                    let pending = &pending[*index];
+                                    let request = &pending.request;
+                                    (
+                                        *placement,
+                                        GpuInvocation::SamplePreimage {
+                                            schema: &pending.schema,
+                                            sigma: request.sigma,
+                                            gadget_base: &request.gadget_base,
+                                            digit_count: request.digit_count,
+                                            trapdoor: request.trapdoor.as_ref(),
+                                            public: request.public.as_ref(),
+                                            target: &pending.target_layout,
+                                        },
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(Self::backend_error)?;
                 let batches = groups
                     .iter()
                     .map(|(placement, _, requests)| (*placement, requests.clone()))
@@ -3994,13 +4414,24 @@ where
                         {
                             self.set_placement(request.placement)?;
                             outputs.push(
-                                self.backend
-                                    .small_matrix_from_bytes(
+                                {
+                                    #[cfg(feature = "gpu")]
+                                    preflight(
+                                        self.backend,
+                                        GpuInvocation::ImportSmallMatrix {
+                                            schema: &request.schema,
+                                            bytes: &bytes,
+                                            semantic_kind: SmallMatrixSemanticKind::Preimage,
+                                        },
+                                    )
+                                    .map_err(Self::backend_error)?;
+                                    self.backend.small_matrix_from_bytes(
                                         &request.schema,
                                         &bytes,
                                         SmallMatrixSemanticKind::Preimage,
                                     )
-                                    .map_err(Self::backend_error)?,
+                                }
+                                .map_err(Self::backend_error)?,
                             );
                         }
                         RecordedValue::Matrix { .. } |
@@ -4040,6 +4471,33 @@ where
                     })
                 })
                 .collect::<Vec<_>>();
+            #[cfg(feature = "gpu")]
+            self.backend
+                .preflight_gpu_operations(
+                    &groups
+                        .iter()
+                        .flat_map(|(placement, indices, _)| {
+                            let pending = &pending;
+                            indices.iter().map(move |index| {
+                                let pending = &pending[*index];
+                                let request = &pending.request;
+                                (
+                                    *placement,
+                                    GpuInvocation::SamplePreimage {
+                                        schema: &pending.schema,
+                                        sigma: request.sigma,
+                                        gadget_base: &request.gadget_base,
+                                        digit_count: request.digit_count,
+                                        trapdoor: request.trapdoor.as_ref(),
+                                        public: request.public.as_ref(),
+                                        target: &pending.target_layout,
+                                    },
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(Self::backend_error)?;
             let batches = groups
                 .iter()
                 .map(|(placement, _, requests)| (*placement, requests.clone()))
@@ -4155,11 +4613,14 @@ where
                 .map_err(Self::artifact_error)?
             {
                 return match recorded {
-                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => self
-                        .backend
-                        .matrix_from_bytes(ty, &bytes)
-                        .map(|value| (value, false))
-                        .map_err(Self::backend_error),
+                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => {
+                        #[cfg(feature = "gpu")]
+                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes: &bytes })
+                            .map_err(Self::backend_error)?;
+                        self.backend.matrix_from_bytes(ty, &bytes)
+                    }
+                    .map(|value| (value, false))
+                    .map_err(Self::backend_error),
                     RecordedValue::Matrix { .. } |
                     RecordedValue::SmallMatrix { .. } |
                     RecordedValue::Trapdoor { .. } => {
@@ -4175,7 +4636,10 @@ where
                         site,
                         RecordedValue::Matrix {
                             matrix_type: ty.clone(),
-                            bytes: self.backend.matrix_to_bytes(&value),
+                            bytes: self
+                                .backend
+                                .matrix_to_bytes(&value)
+                                .map_err(Self::backend_error)?,
                         },
                     )],
                 )
@@ -4192,17 +4656,20 @@ where
                     site,
                     RecordedValue::Matrix {
                         matrix_type: ty.clone(),
-                        bytes: self.backend.matrix_to_bytes(&value),
+                        bytes: self.backend.matrix_to_bytes(&value).map_err(Self::backend_error)?,
                     },
                 )?;
                 Ok((value, true))
             }
             SamplingMode::Replay(replayer) => match replayer.get(&site)? {
-                RecordedValue::Matrix { bytes, .. } => self
-                    .backend
-                    .matrix_from_bytes(ty, bytes)
-                    .map(|value| (value, false))
-                    .map_err(Self::backend_error),
+                RecordedValue::Matrix { bytes, .. } => {
+                    #[cfg(feature = "gpu")]
+                    preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes })
+                        .map_err(Self::backend_error)?;
+                    self.backend.matrix_from_bytes(ty, bytes)
+                }
+                .map(|value| (value, false))
+                .map_err(Self::backend_error),
                 RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
                     Err(TranscriptError::KindMismatch(site).into())
                 }
@@ -4248,11 +4715,21 @@ where
                         schema: recorded_schema,
                         semantic_kind: recorded_kind,
                         bytes,
-                    } if recorded_schema == *schema && recorded_kind == semantic_kind => self
-                        .backend
-                        .small_matrix_from_bytes(schema, &bytes, semantic_kind)
-                        .map(|value| (value, false))
-                        .map_err(Self::backend_error),
+                    } if recorded_schema == *schema && recorded_kind == semantic_kind => {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::ImportSmallMatrix {
+                                schema,
+                                bytes: &bytes,
+                                semantic_kind,
+                            },
+                        )
+                        .map_err(Self::backend_error)?;
+                        self.backend.small_matrix_from_bytes(schema, &bytes, semantic_kind)
+                    }
+                    .map(|value| (value, false))
+                    .map_err(Self::backend_error),
                     RecordedValue::Matrix { .. } |
                     RecordedValue::SmallMatrix { .. } |
                     RecordedValue::Trapdoor { .. } => {
@@ -4297,11 +4774,17 @@ where
                     schema: recorded_schema,
                     semantic_kind: recorded_kind,
                     bytes,
-                } if recorded_schema == schema && *recorded_kind == semantic_kind => self
-                    .backend
-                    .small_matrix_from_bytes(schema, bytes, semantic_kind)
-                    .map(|value| (value, false))
-                    .map_err(Self::backend_error),
+                } if recorded_schema == schema && *recorded_kind == semantic_kind => {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::ImportSmallMatrix { schema, bytes, semantic_kind },
+                    )
+                    .map_err(Self::backend_error)?;
+                    self.backend.small_matrix_from_bytes(schema, bytes, semantic_kind)
+                }
+                .map(|value| (value, false))
+                .map_err(Self::backend_error),
                 RecordedValue::Matrix { .. } |
                 RecordedValue::SmallMatrix { .. } |
                 RecordedValue::Trapdoor { .. } => Err(TranscriptError::KindMismatch(site).into()),
@@ -4357,20 +4840,38 @@ where
                         trapdoor_bytes,
                     }),
                 ) if matrix_type == *ty && secret_type == *ty && bytes == public_bytes => {
-                    let public =
-                        self.backend.matrix_from_bytes(ty, &bytes).map_err(Self::backend_error)?;
-                    let secret = self
-                        .backend
-                        .trapdoor_from_bytes(ty, &trapdoor_bytes)
+                    let public = {
+                        #[cfg(feature = "gpu")]
+                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes: &bytes })
+                            .map_err(Self::backend_error)?;
+                        self.backend.matrix_from_bytes(ty, &bytes)
+                    }
+                    .map_err(Self::backend_error)?;
+                    let secret = {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::ImportTrapdoor { ty, bytes: &trapdoor_bytes },
+                        )
                         .map_err(Self::backend_error)?;
+                        self.backend.trapdoor_from_bytes(ty, &trapdoor_bytes)
+                    }
+                    .map_err(Self::backend_error)?;
                     Ok((public, secret))
                 }
                 (None, None) => {
-                    let (public, secret) = self
-                        .backend
-                        .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                    let (public, secret) = {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
+                        )
                         .map_err(Self::backend_error)?;
-                    let public_bytes = self.backend.matrix_to_bytes(&public);
+                        self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                    }
+                    .map_err(Self::backend_error)?;
+                    let public_bytes =
+                        self.backend.matrix_to_bytes(&public).map_err(Self::backend_error)?;
                     self.artifact_store
                         .record_transcript_batch(
                             &production,
@@ -4401,16 +4902,29 @@ where
             };
         }
         match &mut self.sampling_mode {
-            SamplingMode::Fresh => self
-                .backend
-                .sample_trapdoor(ty, sigma, gadget_base, digit_count)
-                .map_err(Self::backend_error),
+            SamplingMode::Fresh => {
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
+                )
+                .map_err(Self::backend_error)?;
+                self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count)
+            }
+            .map_err(Self::backend_error),
             SamplingMode::Record(recorder) => {
-                let (public, secret) = self
-                    .backend
-                    .sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                let (public, secret) = {
+                    #[cfg(feature = "gpu")]
+                    preflight(
+                        self.backend,
+                        GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
+                    )
                     .map_err(Self::backend_error)?;
-                let public_bytes = self.backend.matrix_to_bytes(&public);
+                    self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count)
+                }
+                .map_err(Self::backend_error)?;
+                let public_bytes =
+                    self.backend.matrix_to_bytes(&public).map_err(Self::backend_error)?;
                 recorder.record(
                     matrix_site,
                     RecordedValue::Matrix { matrix_type: ty.clone(), bytes: public_bytes.clone() },
@@ -4428,17 +4942,27 @@ where
             SamplingMode::Replay(replayer) => {
                 let public = match replayer.get(&matrix_site)? {
                     RecordedValue::Matrix { bytes, .. } => {
-                        self.backend.matrix_from_bytes(ty, bytes).map_err(Self::backend_error)?
+                        #[cfg(feature = "gpu")]
+                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes })
+                            .map_err(Self::backend_error)?;
+                        self.backend.matrix_from_bytes(ty, bytes)
                     }
+                    .map_err(Self::backend_error)?,
                     RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
                         return Err(TranscriptError::KindMismatch(matrix_site).into());
                     }
                 };
                 let secret = match replayer.get(&trapdoor_site)? {
-                    RecordedValue::Trapdoor { trapdoor_bytes, .. } => self
-                        .backend
-                        .trapdoor_from_bytes(ty, trapdoor_bytes)
-                        .map_err(Self::backend_error)?,
+                    RecordedValue::Trapdoor { trapdoor_bytes, .. } => {
+                        #[cfg(feature = "gpu")]
+                        preflight(
+                            self.backend,
+                            GpuInvocation::ImportTrapdoor { ty, bytes: trapdoor_bytes },
+                        )
+                        .map_err(Self::backend_error)?;
+                        self.backend.trapdoor_from_bytes(ty, trapdoor_bytes)
+                    }
+                    .map_err(Self::backend_error)?,
                     RecordedValue::Matrix { .. } | RecordedValue::SmallMatrix { .. } => {
                         return Err(TranscriptError::KindMismatch(trapdoor_site).into());
                     }
@@ -4474,10 +4998,16 @@ where
         value: RuntimeValue<B>,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
         if let RuntimeValue::HostMatrix { matrix_type, bytes } = value {
-            let matrix = self
-                .backend
-                .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
+            let matrix = {
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    GpuInvocation::ImportCpuStaging { ty: &matrix_type, bytes: &bytes },
+                )
                 .map_err(Self::backend_error)?;
+                self.backend.matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
+            }
+            .map_err(Self::backend_error)?;
             Ok(RuntimeValue::matrix(matrix))
         } else if let RuntimeValue::LazyArtifact { production, name, index, descriptor } = value {
             let key = ArtifactKey { production, name, index };
@@ -4503,7 +5033,7 @@ where
     }
 
     fn decode_artifact(
-        &self,
+        &mut self,
         artifact_type: ArtifactType,
         payload: ArtifactPayload,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
@@ -5060,7 +5590,7 @@ fn preimage_request_seed(
 
 fn runtime_inputs_digest<B: Backend>(
     validated: &ValidatedGraph,
-    backend: &B,
+    backend: &mut B,
     inputs: &BTreeMap<String, RuntimeValue<B>>,
 ) -> Result<[u8; 32], ExecutionError> {
     let root = validated.source.root_scope();
@@ -5099,7 +5629,7 @@ fn runtime_inputs_digest<B: Backend>(
 }
 
 fn hash_runtime_value<B: Backend>(
-    backend: &B,
+    backend: &mut B,
     value: &RuntimeValue<B>,
     concrete: &ConcreteWireType,
     hasher: &mut Sha256,
@@ -5125,15 +5655,28 @@ fn hash_runtime_value<B: Backend>(
             hash_sized(hasher, value);
         }
         RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            #[cfg(feature = "gpu")]
+            preflight(backend, GpuInvocation::ImportCpuStaging { ty: matrix_type, bytes })
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let matrix = backend
                 .matrix_from_cpu_staging_bytes(matrix_type, bytes)
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             hasher.update([5]);
-            hash_sized(hasher, &backend.matrix_to_bytes(&matrix));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(&matrix)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
         }
         RuntimeValue::Matrix(value) => {
             hasher.update([5]);
-            hash_sized(hasher, &backend.matrix_to_bytes(value));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(value)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
         }
         RuntimeValue::SmallMatrix(value) => {
             let artifact_type = ArtifactType::from_wire_type(concrete).ok_or_else(|| {
@@ -5172,7 +5715,12 @@ fn hash_runtime_value<B: Backend>(
             hash_sized(hasher, gadget_base.to_string().as_bytes());
             hasher.update(digit_count.to_le_bytes());
             hasher.update([gadget_small.map_or(0, |small| if small { 2 } else { 1 })]);
-            hash_sized(hasher, &backend.matrix_to_bytes(public));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(public)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
             match secret {
                 Some(secret) => {
                     hasher.update([1]);
@@ -5332,11 +5880,14 @@ fn collect_staged_families<B: Backend>(
 
 fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
     value: RuntimeValue<B>,
-    backend: &B,
+    backend: &mut B,
     store: &mut S,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     match value {
         RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            #[cfg(feature = "gpu")]
+            preflight(backend, GpuInvocation::ImportCpuStaging { ty: &matrix_type, bytes: &bytes })
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let matrix = backend
                 .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
@@ -5376,7 +5927,7 @@ fn materialize_artifact_family<B: Backend, S: ArtifactStore>(
     name: String,
     descriptor: ManifestArtifact,
     staged: bool,
-    backend: &B,
+    backend: &mut B,
     store: &mut S,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     let count = descriptor
@@ -5409,7 +5960,9 @@ pub fn encode_artifact<B: Backend>(
             Ok((ArtifactPayload::Bytes(bytes.clone()), bytes))
         }
         (RuntimeValue::Matrix(matrix), ArtifactType::Matrix(_)) => {
-            let bytes = backend.matrix_to_bytes(matrix);
+            let bytes = backend
+                .matrix_to_bytes(matrix)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
         }
         (RuntimeValue::SmallMatrix(matrix), artifact_type)
@@ -5432,7 +5985,9 @@ pub fn encode_artifact<B: Backend>(
             RuntimeValue::Trapdoor { secret: Some(secret), public, .. },
             ArtifactType::Trapdoor { .. },
         ) => {
-            let public_bytes = backend.matrix_to_bytes(public);
+            let public_bytes = backend
+                .matrix_to_bytes(public)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let secret_bytes = backend.trapdoor_to_bytes(secret);
             let mut canonical = Vec::with_capacity(
                 16usize.saturating_add(public_bytes.len()).saturating_add(secret_bytes.len()),
@@ -5450,10 +6005,13 @@ pub fn encode_artifact<B: Backend>(
 }
 
 pub fn decode_artifact<B: Backend>(
-    backend: &B,
+    backend: &mut B,
     artifact_type: ArtifactType,
     payload: ArtifactPayload,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
+    #[cfg(feature = "gpu")]
+    crate::gpu_invocation::preflight_artifact(backend, &artifact_type, &payload)
+        .map_err(|error| ExecutionError::Backend(error.to_string()))?;
     match (artifact_type, payload) {
         (ArtifactType::Int, ArtifactPayload::Bytes(bytes))
             if BigInt::from_signed_bytes_le(&bytes).to_signed_bytes_le() == bytes =>
@@ -6159,12 +6717,12 @@ mod tests {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct PlacementProbeSmallMatrix {
+    pub(super) struct PlacementProbeSmallMatrix {
         placement: usize,
     }
 
     #[derive(Debug, Error)]
-    enum PlacementProbeError {
+    pub(super) enum PlacementProbeError {
         #[error("small matrix belongs to placement {owner}, but codec is on placement {active}")]
         ParameterMismatch { owner: usize, active: usize },
         #[error("forced broadcast preparation failure at placement {placement}")]
@@ -6176,7 +6734,9 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct PlacementProbeBackend {
+    pub(super) struct PlacementProbeBackend {
+        #[cfg(feature = "gpu")]
+        pub(super) import_probe: Option<super::gpu_plan::ImportProbe>,
         active: usize,
         encoded: std::cell::RefCell<Vec<(SmallMatrixSemanticKind, usize, usize)>>,
         fail_broadcast_preparation: bool,
@@ -6196,6 +6756,22 @@ mod tests {
         type SmallMatrix = PlacementProbeSmallMatrix;
         type Trapdoor = ();
         type Error = PlacementProbeError;
+
+        #[cfg(feature = "gpu")]
+        fn preflight_gpu_operations(
+            &mut self,
+            requests: &[(
+                usize,
+                GpuInvocation<'_, Self::Matrix, Self::SmallMatrix, Self::Trapdoor>,
+            )],
+        ) -> Result<(), Self::Error> {
+            if let Some(probe) = &mut self.import_probe {
+                if !probe.preflight(requests) {
+                    return Err(PlacementProbeError::ForcedFailure { placement: self.active });
+                }
+            }
+            Ok(())
+        }
 
         fn polynomial_from_values(
             &mut self,
@@ -6474,10 +7050,15 @@ mod tests {
         }
 
         fn matrix_from_cpu_staging_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Matrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("staging", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
 
@@ -6598,15 +7179,20 @@ mod tests {
             )
         }
 
-        fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
+        fn matrix_to_bytes(&self, value: &Self::Matrix) -> Result<Vec<u8>, Self::Error> {
             unused_probe_operation!(value)
         }
 
         fn matrix_from_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Matrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("matrix", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
 
@@ -6631,11 +7217,16 @@ mod tests {
         }
 
         fn small_matrix_from_bytes(
-            &self,
+            &mut self,
             expected_schema: &ConcreteBoundedMatrixSchema,
             bytes: &[u8],
             expected_semantic_kind: SmallMatrixSemanticKind,
         ) -> Result<Self::SmallMatrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("small", self.active);
+                return Ok(PlacementProbeSmallMatrix { placement: self.active });
+            }
             unused_probe_operation!(expected_schema, bytes, expected_semantic_kind)
         }
 
@@ -6644,10 +7235,15 @@ mod tests {
         }
 
         fn trapdoor_from_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Trapdoor, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("trapdoor", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
     }
@@ -6930,7 +7526,7 @@ mod tests {
         assert_eq!(values.len(), 3);
         assert!(values.iter().all(|value| matches!(value, RuntimeValue::HostMatrix { .. })));
         let RuntimeValue::IndexedFamily(values) = result
-            .materialize_output("values", &backend, &mut store)
+            .materialize_output("values", &mut backend, &mut store)
             .expect("materialize range output")
         else {
             panic!("materialized range output is not an indexed family");
@@ -6983,7 +7579,7 @@ mod tests {
         for handle in result.artifact_handles.values().flatten() {
             store.load(&handle.key, &manifest.artifacts[&handle.key.name]).unwrap();
         }
-        result.materialize_output("values", &backend, &mut store).unwrap();
+        result.materialize_output("values", &mut backend, &mut store).unwrap();
     }
 
     #[test]
@@ -7013,7 +7609,7 @@ mod tests {
                 .unwrap();
         // At most the current input and output family coexist, regardless of chain length.
         assert!(store.peak_entries <= 6, "peak staged entries: {}", store.peak_entries);
-        result.materialize_output("result", &backend, &mut store).unwrap();
+        result.materialize_output("result", &mut backend, &mut store).unwrap();
         result.cleanup_staged(&mut store).unwrap();
     }
 
@@ -7047,11 +7643,11 @@ mod tests {
             execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .expect("execution");
         let gathered = result
-            .materialize_output("gathered", &backend, &mut store)
+            .materialize_output("gathered", &mut backend, &mut store)
             .expect("materialized gathered family")
             .clone();
         let expected = result
-            .materialize_output("expected", &backend, &mut store)
+            .materialize_output("expected", &mut backend, &mut store)
             .expect("materialized expected family")
             .clone();
         let matrices = |value: RuntimeValue<CpuDcrtBackend>| {
@@ -7380,7 +7976,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(matrix_output(&result, "product"), &expected);
-        result.materialize_output("digits", &backend, &mut store).unwrap();
+        result.materialize_output("digits", &mut backend, &mut store).unwrap();
         assert!(matches!(result.outputs["digits"], RuntimeValue::SmallMatrix(_)));
     }
 
@@ -7748,6 +8344,9 @@ mod tests {
     }
 
     #[test]
+    // The CPU trapdoor representation uses GPU backing under this feature,
+    // so this fixture shares the existing GPU test isolation boundary.
+    #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn transcript_replay_preserves_preimage_small_owner_and_relation() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -8046,8 +8645,9 @@ mod tests {
                 .expect("execution");
         // Integer loop outputs can be staged now that Int is an artifact type.
         // Resolve the family through the public API before checking its values.
-        let RuntimeValue::IndexedFamily(state) =
-            result.materialize_output("state", &backend, &mut store).expect("materialized family")
+        let RuntimeValue::IndexedFamily(state) = result
+            .materialize_output("state", &mut backend, &mut store)
+            .expect("materialized family")
         else {
             panic!("state output is not a family")
         };
@@ -8100,8 +8700,9 @@ mod tests {
         .expect("execution");
         // Integer loop outputs can be staged now that Int is an artifact type.
         // Resolve the family through the public API before checking its values.
-        let RuntimeValue::IndexedFamily(packed) =
-            result.materialize_output("packed", &backend, &mut store).expect("materialized family")
+        let RuntimeValue::IndexedFamily(packed) = result
+            .materialize_output("packed", &mut backend, &mut store)
+            .expect("materialized family")
         else {
             panic!("packed output is not a family")
         };
@@ -8259,7 +8860,7 @@ mod tests {
             execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .expect("execution");
         let bytes = |value: &RuntimeValue<_>| match value {
-            RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix),
+            RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix).unwrap(),
             _ => panic!("expected matrix"),
         };
         assert_eq!(bytes(&result.outputs["actual-one"]), bytes(&result.outputs["expected-one"]));
@@ -8356,9 +8957,9 @@ mod tests {
             nonce,
         )
         .expect("resumed session execution");
-        let backend = cpu_backend([parameters.clone()]);
-        first.materialize_output("sample", &backend, &mut store).unwrap();
-        second.materialize_output("sample", &backend, &mut store).unwrap();
+        let mut backend = cpu_backend([parameters.clone()]);
+        first.materialize_output("sample", &mut backend, &mut store).unwrap();
+        second.materialize_output("sample", &mut backend, &mut store).unwrap();
         assert_eq!(first.production_id, second.production_id);
         assert_eq!(matrix_output(&first, "sample"), matrix_output(&second, "sample"));
 
@@ -8444,7 +9045,7 @@ mod tests {
         };
         assert_eq!(exported, &integer);
         let RuntimeValue::Int(exported) =
-            result.materialize_output("value", &backend, &mut store).unwrap()
+            result.materialize_output("value", &mut backend, &mut store).unwrap()
         else {
             panic!("expected exported integer");
         };

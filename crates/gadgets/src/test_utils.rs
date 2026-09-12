@@ -373,26 +373,33 @@ pub fn execute_circuit_with_shape(
 ) -> Vec<DCRTPolyMatrix> {
     assert!(inputs.iter().all(|input| input.size() == shape), "runtime input shape mismatch");
     let graph = build_circuit_graph(name, parameters, circuit, inputs.len(), shape);
-    let result = execute(
+    let mut backend = cpu_backend([parameters.clone()]);
+    let mut store = MemoryArtifactStore::default();
+    let mut result = execute(
         &graph,
-        &mut cpu_backend([parameters.clone()]),
+        &mut backend,
         inputs
             .iter()
             .enumerate()
             .map(|(index, value)| (format!("input-{index}"), RuntimeValue::matrix(value.clone())))
             .collect::<BTreeMap<_, _>>(),
-        &mut MemoryArtifactStore::default(),
+        &mut store,
         SamplingMode::Fresh,
     )
     .expect("execute runtime unit-test graph");
-    (0..circuit.output_gate_ids().len())
+    let outputs = (0..circuit.output_gate_ids().len())
         .map(|index| {
-            let RuntimeValue::Matrix(value) = &result.outputs[&format!("output-{index}")] else {
+            let value = result
+                .materialize_output(&format!("output-{index}"), &mut backend, &mut store)
+                .expect("materialize runtime unit-test output");
+            let RuntimeValue::Matrix(value) = value else {
                 panic!("gadget output must be a matrix")
             };
             value.as_ref().clone()
         })
-        .collect()
+        .collect();
+    result.cleanup_staged(&mut store).expect("clean up runtime unit-test outputs");
+    outputs
 }
 
 pub(crate) fn build_circuit_graph(

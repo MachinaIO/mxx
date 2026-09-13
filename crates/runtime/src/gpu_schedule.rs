@@ -31,6 +31,17 @@ pub struct GpuColumnWaveClass {
     pub first_wave: usize,
 }
 
+/// A contiguous run of resource-equivalent waves of a bounded sibling batch.
+/// Job indices refer to the original sibling and its local source interval,
+/// just as execution does. Position-sensitive work must use the original
+/// schedules to expand `first_wave..first_wave + multiplicity`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GpuColumnBatchWaveClass {
+    pub jobs: Vec<(usize, GpuColumnJob)>,
+    pub multiplicity: usize,
+    pub first_wave: usize,
+}
+
 /// A run of consecutive waves on one device with one local job width.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DeviceWaveSegment {
@@ -167,44 +178,86 @@ impl GpuColumnSchedule {
             .collect()
     }
 
-    /// Distinct wave shapes with exact multiplicities, computed from the
-    /// stored ownership without enumerating every wave. Two waves share a
-    /// class when the same devices are active with the same local widths.
+    /// Distinct owner/width classes without enumerating every future wave.
     pub fn wave_classes(&self) -> Vec<GpuColumnWaveClass> {
-        let segments =
-            (0..self.widths.len()).map(|device| self.device_segments(device)).collect::<Vec<_>>();
+        Self::batch_wave_classes(&[self])
+            .into_iter()
+            .map(|class| GpuColumnWaveClass {
+                jobs: class.jobs.into_iter().map(|(_, job)| job).collect(),
+                multiplicity: class.multiplicity,
+                first_wave: class.first_wave,
+            })
+            .collect()
+    }
+
+    /// The same bounded sibling grouping used by native batch submission.
+    /// Iteration retains only the per-owner cursors and the current wave.
+    pub fn batch_waves<'a>(
+        schedules: &[&'a Self],
+    ) -> impl Iterator<Item = Vec<(usize, GpuColumnJob)>> + 'a {
+        let mut waves = schedules.iter().map(|schedule| schedule.waves()).collect::<Vec<_>>();
+        std::iter::from_fn(move || {
+            let jobs = waves
+                .iter_mut()
+                .enumerate()
+                .flat_map(|(instance, waves)| {
+                    waves.next().into_iter().flatten().map(move |job| (instance, job))
+                })
+                .collect::<Vec<_>>();
+            (!jobs.is_empty()).then_some(jobs)
+        })
+    }
+
+    /// Compress the actual sibling schedules by source owner and local width.
+    /// Complexity depends on stored intervals, not the number of column waves.
+    /// Different siblings/owners never collapse merely because widths match.
+    pub fn batch_wave_classes(schedules: &[&Self]) -> Vec<GpuColumnBatchWaveClass> {
+        let segments = schedules
+            .iter()
+            .enumerate()
+            .flat_map(|(instance, schedule)| {
+                (0..schedule.widths.len())
+                    .map(move |device| (instance, device, schedule.device_segments(device)))
+            })
+            .collect::<Vec<_>>();
         let mut boundaries = segments
             .iter()
-            .flatten()
+            .flat_map(|(_, _, segments)| segments)
             .flat_map(|segment| [segment.wave_start, segment.wave_end])
             .collect::<Vec<_>>();
         boundaries.sort_unstable();
         boundaries.dedup();
-        let mut classes: Vec<GpuColumnWaveClass> = Vec::new();
+        let mut classes: Vec<GpuColumnBatchWaveClass> = Vec::new();
         for range in boundaries.windows(2) {
             let (start, end) = (range[0], range[1]);
             let jobs = segments
                 .iter()
-                .enumerate()
-                .filter_map(|(device, segments)| {
+                .filter_map(|(instance, device, segments)| {
                     segments
                         .iter()
                         .find(|segment| segment.wave_start <= start && start < segment.wave_end)
-                        .map(|segment| Self::segment_job(device, segment, start))
+                        .map(|segment| (*instance, Self::segment_job(*device, segment, start)))
                 })
                 .collect::<Vec<_>>();
             if jobs.is_empty() {
                 continue;
             }
-            let shape = |jobs: &[GpuColumnJob]| {
-                jobs.iter().map(|job| (job.device, job.end - job.start)).collect::<Vec<_>>()
-            };
-            if let Some(existing) =
-                classes.iter_mut().find(|class| shape(&class.jobs) == shape(&jobs))
-            {
+            // Source indices advance monotonically and finished siblings never
+            // return. Merge adjacent runs only: this preserves a contiguous
+            // wave range for consumers that need the exact column offsets.
+            if let Some(existing) = classes.last_mut().filter(|class| {
+                class.first_wave + class.multiplicity == start &&
+                    class.jobs.len() == jobs.len() &&
+                    class.jobs.iter().zip(&jobs).all(|((a, left), (b, right))| {
+                        a == b &&
+                            left.device == right.device &&
+                            left.source_interval == right.source_interval &&
+                            left.end - left.start == right.end - right.start
+                    })
+            }) {
                 existing.multiplicity += end - start;
             } else {
-                classes.push(GpuColumnWaveClass {
+                classes.push(GpuColumnBatchWaveClass {
                     jobs,
                     multiplicity: end - start,
                     first_wave: start,
@@ -253,6 +306,59 @@ impl GpuColumnSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_batch_classes_match_native_wave_grouping_and_keep_owner_identity() {
+        for columns in 1..=12 {
+            for width in 1..=4 {
+                let first = GpuColumnSchedule::new(
+                    columns,
+                    vec![width],
+                    vec![GpuColumnInterval { device: 0, start: 0, end: columns }],
+                )
+                .unwrap();
+                let second = GpuColumnSchedule::new(
+                    8,
+                    vec![3],
+                    vec![
+                        GpuColumnInterval { device: 0, start: 0, end: 4 },
+                        GpuColumnInterval { device: 0, start: 4, end: 8 },
+                    ],
+                )
+                .unwrap();
+                let schedules = [&first, &second];
+                let shape = |jobs: &[(usize, GpuColumnJob)]| {
+                    jobs.iter()
+                        .map(|(instance, job)| {
+                            (*instance, job.device, job.source_interval, job.end - job.start)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut expected = std::collections::BTreeMap::new();
+                for (wave, jobs) in GpuColumnSchedule::batch_waves(&schedules).enumerate() {
+                    let entry = expected.entry(shape(&jobs)).or_insert((0, wave, jobs));
+                    entry.0 += 1;
+                }
+                let actual = GpuColumnSchedule::batch_wave_classes(&schedules)
+                    .into_iter()
+                    .map(|class| {
+                        (shape(&class.jobs), (class.multiplicity, class.first_wave, class.jobs))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(actual, expected);
+            }
+        }
+        let huge = GpuColumnSchedule::new(
+            usize::MAX,
+            vec![1],
+            vec![GpuColumnInterval { device: 0, start: 0, end: usize::MAX }],
+        )
+        .unwrap();
+        let classes = GpuColumnSchedule::batch_wave_classes(&[&huge, &huge]);
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].multiplicity, usize::MAX);
+        assert_eq!(classes[0].jobs.len(), 2);
+    }
 
     #[test]
     fn test_preserved_ownership_determines_actual_waves() {

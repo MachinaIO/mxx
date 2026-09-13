@@ -63,226 +63,447 @@ impl PreparedFleetOutput for GpuFleetSmallMatrix {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize)]
-pub(super) enum PreparedMatrixSource {
+pub enum PreparedMatrixSource {
     Shard(usize),
     Replica { device: usize, context: usize, evaluation: bool },
     Fragment { device: usize, context: usize, index: usize, evaluation: bool },
 }
 
+/// CPU-only column-owner layout, observed on an input or derived for an output.
+/// It carries no native pointer or lease. Derived layouts describe coverage and
+/// format only; they do not establish an actual matrix identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatrixInputFragment {
+    pub device: i32,
+    pub context: usize,
+    pub start: usize,
+    pub end: usize,
+    pub level: usize,
+    pub evaluation: bool,
+}
+
 impl PreparedMatrixSource {
-    pub(super) fn layout(self, matrix: &GpuFleetMatrix) -> ((usize, usize), bool) {
-        match self {
-            Self::Shard(index) | Self::Fragment { index, .. } => {
-                (matrix.shards[index].value.size(), matrix.shards[index].value.is_ntt())
-            }
-            Self::Replica { evaluation, .. } => {
-                let original = matrix.shards[0].value.is_ntt();
-                let mixed = matrix.shards.iter().any(|shard| shard.value.is_ntt() != original);
-                (matrix.size(), if mixed { evaluation } else { original })
+    /// Shared source choice for metadata admission and concrete preparation.
+    /// None means a replica is required; Fragment means a format conversion.
+    pub(super) fn existing(
+        fragments: impl IntoIterator<Item = MatrixInputFragment>,
+        columns: std::ops::Range<usize>,
+        device: usize,
+        parameters: &GpuDCRTPolyParams,
+        evaluation: bool,
+    ) -> Option<Self> {
+        fragments.into_iter().enumerate().find_map(|(index, fragment)| {
+            (fragment.device == parameters.device_ids()[0] &&
+                fragment.context == parameters.context_identity() &&
+                fragment.start <= columns.start &&
+                columns.end <= fragment.end)
+                .then_some(if fragment.evaluation == evaluation {
+                    Self::Shard(index)
+                } else {
+                    Self::Fragment {
+                        device,
+                        context: parameters.context_identity(),
+                        index,
+                        evaluation,
+                    }
+                })
+        })
+    }
+
+    /// Lower source selection and every required copy/normalization from
+    /// layout metadata alone. Order is significant: mixed-format fragments
+    /// are normalized before the replica that consumes them.
+    pub fn plan(
+        fragments: impl Iterator<Item = MatrixInputFragment> + Clone,
+        shape: (usize, usize),
+        columns: std::ops::Range<usize>,
+        device: usize,
+        parameters: &GpuDCRTPolyParams,
+        evaluation: bool,
+    ) -> (Self, Vec<MatrixInputLayout>) {
+        let source =
+            Self::existing(fragments.clone(), columns, device, parameters, evaluation).unwrap_or(
+                Self::Replica { device, context: parameters.context_identity(), evaluation },
+            );
+        if matches!(source, Self::Shard(_)) {
+            return (source, Vec::new());
+        }
+        let first = fragments.clone().next().expect("nonempty matrix layout");
+        let mixed = fragments.clone().any(|fragment| fragment.evaluation != first.evaluation);
+        let mut preparation = Vec::new();
+        if let Self::Replica { device, context, evaluation } = source &&
+            mixed
+        {
+            for (index, fragment) in fragments.clone().enumerate() {
+                if fragment.evaluation != evaluation {
+                    preparation.push(MatrixInputLayout {
+                        source: Self::Fragment { device, context, index, evaluation },
+                        shape: (shape.0, fragment.end - fragment.start),
+                        level: fragment.level,
+                        evaluation: fragment.evaluation,
+                    });
+                }
             }
         }
+        preparation.push(match source {
+            Self::Fragment { index, .. } => {
+                let fragment = fragments.clone().nth(index).expect("selected fragment");
+                MatrixInputLayout {
+                    source,
+                    shape: (shape.0, fragment.end - fragment.start),
+                    level: fragment.level,
+                    evaluation: fragment.evaluation,
+                }
+            }
+            Self::Replica { .. } => MatrixInputLayout {
+                source,
+                shape,
+                level: first.level,
+                evaluation: if mixed { evaluation } else { first.evaluation },
+            },
+            Self::Shard(_) => unreachable!("borrowed source needs no preparation"),
+        });
+        (source, preparation)
     }
 }
+
+/// A fully determined input allocation and its initial format, before its
+/// required normalization. Both inventory and real preparation use this layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatrixInputLayout {
+    pub source: PreparedMatrixSource,
+    pub shape: (usize, usize),
+    pub level: usize,
+    pub evaluation: bool,
+}
+
+impl MatrixInputLayout {
+    /// Assign the complete ordered preparation transaction without reserving or
+    /// executing anything. Callers supply only preparations absent for this owner,
+    /// with their actual source levels. Failure leaves the supplied inventory intact.
+    pub fn assign(
+        layouts: impl IntoIterator<Item = Self>,
+        parameters: &GpuDCRTPolyParams,
+        slots: &[(mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedSlotSnapshot, bool)],
+    ) -> Result<Option<Vec<(Self, GpuPreparedRequest)>>, String> {
+        use mxx_primitives::matrix::gpu_dcrt_poly::{GpuPreparedSlotSnapshot, GpuTracedClaim};
+        let mut layouts = layouts.into_iter().peekable();
+        if layouts.peek().is_none() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut slots = slots.to_vec();
+        let mut selected = Vec::new();
+        // Normalize fragments before selecting the replica that consumes them.
+        // Sequential choice preserves native size-class preference and prevents
+        // two preparations from claiming the same backing slot.
+        for layout in layouts {
+            let claim = GpuTracedClaim::matrix(
+                layout.shape.0,
+                layout.shape.1,
+                layout.level,
+                layout.evaluation,
+            );
+            let Some(request) = GpuPreparedSlotSnapshot::assign(parameters, &slots, &[claim])?
+                .into_iter()
+                .next()
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            for (slot, eligible) in &mut slots {
+                let id = slot.identity();
+                *eligible &= (id.storage_id(), id.slot_id(), id.slot_index()) != request.slot_key();
+            }
+            selected.push((layout, request));
+        }
+        Ok(Some(selected))
+    }
+}
+
+/// Observed immutable input layouts retained by a root/wave admission.
+/// Keys are actual fleet owner IDs, never shape-based aliases.
+pub(super) type MatrixInputLayouts = HashMap<u64, Arc<[MatrixInputFragment]>>;
+pub(super) type SymbolicMatrixLayouts =
+    std::collections::BTreeMap<mxx_ir_core::types::WireRef, Arc<[MatrixInputFragment]>>;
 
 pub(super) type PreparedMatrixInputs =
     HashMap<(u64, PreparedMatrixSource), Arc<GpuColumnShard<GpuDCRTPolyMatrix>>>;
 
 pub(super) struct MatrixInputPreparation {
     pub matrix: GpuFleetMatrix,
-    pub source: PreparedMatrixSource,
+    pub layout: MatrixInputLayout,
     pub parameters: GpuDCRTPolyParams,
     pub device: usize,
     pub storage: Arc<GpuPreparedStorage>,
     pub request: GpuPreparedRequest,
 }
 
-/// Matrix size classes keep incompatible aspect ratios from consuming one
-/// another's peak capacity. No dimensions are rounded in the native backing.
-pub(super) fn matrix_capacity_class(rows: usize, columns: usize) -> (u32, u32) {
-    (capacity_class(rows), capacity_class(columns))
+pub(super) use mxx_primitives::matrix::gpu_dcrt_poly::{capacity_class, matrix_capacity_class};
+
+/// Immutable capacity view for one registered native parameter context.
+/// It holds no backing storage or reservation. Eligibility is the observed or
+/// hypothetical scenario; native commit independently rechecks every request.
+pub struct MatrixSlotContext {
+    pub device: usize,
+    pub context: usize,
+    pub slots: Vec<(mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedSlotSnapshot, bool)>,
 }
 
-pub(super) fn capacity_class(size: usize) -> u32 {
-    usize::BITS - size.max(1).saturating_sub(1).leading_zeros()
+pub type MatrixSlotInventory = Vec<MatrixSlotContext>;
+// Hypothetical slot IDs are local to a parameter context; native IDs must not
+// accidentally make the same planner depend on process-global uniqueness.
+pub(super) type MatrixSlotKey = (usize, (u64, u64, usize));
+
+/// Input geometry and parameter handles, with no GPU payload or backing owner.
+/// Native admission obtains this from its real inputs; hypothetical admission
+/// supplies the same metadata from an explicit placement scenario.
+#[derive(Clone)]
+pub struct MatrixDescriptor {
+    pub id: u64,
+    pub rows: usize,
+    pub columns: usize,
+    pub shards: Vec<GpuColumnShard<MatrixFragmentDescriptor>>,
+    pub input_layout: Arc<[MatrixInputFragment]>,
+}
+
+#[derive(Clone)]
+pub struct MatrixFragmentDescriptor {
+    pub parameters: GpuDCRTPolyParams,
+    pub level: usize,
+    pub columns: usize,
+    pub evaluation: bool,
+}
+
+impl MatrixFragmentDescriptor {
+    pub fn params(&self) -> &GpuDCRTPolyParams {
+        &self.parameters
+    }
+    pub fn level(&self) -> usize {
+        self.level
+    }
+    pub fn is_ntt(&self) -> bool {
+        self.evaluation
+    }
+    pub fn columns_count(&self) -> usize {
+        self.columns
+    }
+
+    pub fn registered_parameters<'a>(
+        &self,
+        backend: &'a DeviceBackend,
+    ) -> Result<&'a GpuDCRTPolyParams, PolyBackendError> {
+        let key = crate::backend::poly::RingKey {
+            modulus: BigInt::from(self.parameters.modulus().as_ref().clone()),
+            ring_dimension: self.parameters.ring_dimension() as usize,
+        };
+        backend.parameters[backend.active_placement]
+            .get(&key)
+            .ok_or(PolyBackendError::MissingParameters(key))
+    }
+}
+
+impl MatrixDescriptor {
+    pub fn size(&self) -> (usize, usize) {
+        (self.rows, self.columns)
+    }
+}
+
+impl super::gpu_compiled::MatrixShape for MatrixDescriptor {
+    fn shape(&self) -> (usize, usize) {
+        self.size()
+    }
+}
+
+impl From<&GpuFleetMatrix> for MatrixDescriptor {
+    fn from(matrix: &GpuFleetMatrix) -> Self {
+        Self {
+            id: matrix.id,
+            rows: matrix.rows,
+            columns: matrix.columns,
+            input_layout: matrix.input_layout.clone(),
+            shards: matrix
+                .shards
+                .iter()
+                .map(|shard| GpuColumnShard {
+                    device_id: shard.device_id,
+                    global_column_start: shard.global_column_start,
+                    value: MatrixFragmentDescriptor {
+                        parameters: shard.value.params().clone(),
+                        level: shard.value.level(),
+                        columns: shard.value.col_size(),
+                        evaluation: shard.value.is_ntt(),
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&GpuFleetSmallMatrix> for MatrixDescriptor {
+    fn from(matrix: &GpuFleetSmallMatrix) -> Self {
+        let shards = matrix
+            .shards
+            .iter()
+            .map(|shard| GpuColumnShard {
+                device_id: shard.device_id,
+                global_column_start: shard.global_column_start,
+                value: MatrixFragmentDescriptor {
+                    parameters: shard.value.params().clone(),
+                    level: shard.value.params().crt_depth() - 1,
+                    columns: shard.value.columns_count(),
+                    evaluation: false,
+                },
+            })
+            .collect::<Vec<_>>();
+        let input_layout = shards
+            .iter()
+            .map(|shard| MatrixInputFragment {
+                device: shard.device_id,
+                context: shard.value.parameters.context_identity(),
+                start: shard.global_column_start,
+                end: shard.global_column_start + shard.value.columns,
+                level: shard.value.level,
+                evaluation: false,
+            })
+            .collect();
+        Self { id: matrix.id, rows: matrix.rows, columns: matrix.columns, shards, input_layout }
+    }
+}
+
+/// One selected copy/normalization, before native values or storage are bound.
+pub struct MatrixInputRequest {
+    pub owner: u64,
+    pub layout: MatrixInputLayout,
+    pub parameters: GpuDCRTPolyParams,
+    pub device: usize,
+    pub request: GpuPreparedRequest,
 }
 
 pub(super) fn select_prepared_matrix(
-    inventory: &[(usize, Arc<GpuPreparedStorage>)],
-    chosen: &mut HashSet<u64>,
+    inventory: &MatrixSlotInventory,
+    chosen: &mut HashSet<MatrixSlotKey>,
     device: usize,
     parameters: &GpuDCRTPolyParams,
     level: usize,
     shape: (usize, usize),
     evaluation: bool,
     compact_bound: Option<&num_bigint::BigUint>,
-) -> Result<Option<(Arc<GpuPreparedStorage>, GpuPreparedRequest)>, PolyBackendError> {
-    // Prefer the prepared size class. Its slots cover peak simultaneous
-    // demand; taking another class first can starve a later larger output.
-    let mut selected = None;
-    for (_, storage) in inventory
-        .iter()
-        .filter(|(owner, storage)| *owner == device && storage.matches_parameters(parameters))
-    {
-        for index in 0..storage.slot_count() {
-            let slot = storage.slot_identity(index).unwrap();
-            if slot.kind() !=
-                if compact_bound.is_some() {
-                    GpuPreparedSlotKind::CompactPayload
-                } else {
-                    GpuPreparedSlotKind::Matrix
-                } ||
-                (compact_bound.is_none() && slot.level() != Some(level)) ||
-                chosen.contains(&slot.slot_id())
-            {
-                continue;
-            }
-            let request = if let Some(bound) = compact_bound {
-                slot.workspace_request(
-                    GpuSmallMatrix::allocation_bytes(parameters, shape.0, shape.1, bound)
-                        .map_err(|e| PolyBackendError::GpuSubmission(e.to_string()))?,
-                    256,
-                )
-            } else {
-                slot.matrix_request(shape.0, shape.1, evaluation)
-            };
-            if storage.fits(&[request]).map_err(PolyBackendError::GpuCalibration)? {
-                let size = (
-                    if compact_bound.is_some() {
-                        capacity_class(slot.requested_backing_bytes()) !=
-                            capacity_class(request.bytes())
-                    } else {
-                        matrix_capacity_class(slot.rows(), slot.columns()) !=
-                            matrix_capacity_class(shape.0, shape.1)
-                    },
-                    slot.requested_backing_bytes(),
-                );
-                if selected.as_ref().is_none_or(|(_, _, _, previous)| size < *previous) {
-                    selected = Some((storage.clone(), request, slot.slot_id(), size));
-                }
-            }
-        }
+) -> Result<Option<GpuPreparedRequest>, PolyBackendError> {
+    use mxx_primitives::matrix::gpu_dcrt_poly::{
+        GpuPreparedSlotSnapshot, GpuPreparedWorkspaceLayout, GpuTracedClaim,
+    };
+    let claim = if let Some(bound) = compact_bound {
+        GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
+            kind: GpuPreparedSlotKind::CompactPayload,
+            bytes: GpuSmallMatrix::allocation_bytes(parameters, shape.0, shape.1, bound)
+                .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?,
+            alignment: 256,
+        })
+    } else {
+        GpuTracedClaim::matrix(shape.0, shape.1, level, evaluation)
+    };
+    // Native and hypothetical selection consume the same typed layout matcher
+    // and size-class preferences. Snapshot eligibility includes region ownership
+    // and pending readers; commit still rechecks every selected native request.
+    let slots = inventory
+        .par_iter()
+        .filter(|entry| entry.device == device && entry.context == parameters.context_identity())
+        .flat_map_iter(|entry| {
+            entry.slots.iter().map(|&(slot, available)| {
+                let eligible = available &&
+                    !chosen.contains(&(parameters.context_identity(), {
+                        let id = slot.identity();
+                        (id.storage_id(), id.slot_id(), id.slot_index())
+                    }));
+                (slot, eligible)
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = GpuPreparedSlotSnapshot::assign(parameters, &slots, &[claim])
+        .map_err(PolyBackendError::GpuSubmission)?
+        .into_iter()
+        .next()
+        .flatten();
+    if let Some(request) = selected {
+        chosen.insert((parameters.context_identity(), request.slot_key()));
     }
-    Ok(selected.map(|(storage, request, slot, _)| {
-        chosen.insert(slot);
-        (storage, request)
-    }))
+    Ok(selected)
 }
 
 /// Select one immutable input range, with a shared full replica when existing
 /// owners cannot serve it on the required native parameter context.
 pub(super) fn select_matrix_input(
-    matrix: &GpuFleetMatrix,
+    matrix: &MatrixDescriptor,
     columns: std::ops::Range<usize>,
     device: usize,
     parameters: &GpuDCRTPolyParams,
     evaluation: bool,
-    inventory: &[(usize, Arc<GpuPreparedStorage>)],
-    chosen: &mut HashSet<u64>,
+    inventory: &MatrixSlotInventory,
+    chosen: &mut HashSet<MatrixSlotKey>,
     planned: &mut HashSet<(u64, PreparedMatrixSource)>,
-    preparation: &mut Vec<MatrixInputPreparation>,
+    preparation: &mut Vec<MatrixInputRequest>,
+    admitted_inputs: &MatrixInputLayouts,
 ) -> Result<Option<PreparedMatrixSource>, PolyBackendError> {
     let first = matrix.shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-    let original = matrix.shards.iter().position(|shard| {
-        shard.device_id == parameters.device_ids()[0] &&
-            shard.value.params().context_identity() == parameters.context_identity() &&
-            shard.global_column_start <= columns.start &&
-            columns.end - shard.global_column_start <= shard.value.col_size()
-    });
-    let source = if let Some(index) = original {
-        if matrix.shards[index].value.is_ntt() == evaluation {
-            return Ok(Some(PreparedMatrixSource::Shard(index)));
-        }
-        PreparedMatrixSource::Fragment {
-            device,
-            context: parameters.context_identity(),
-            index,
-            evaluation,
-        }
-    } else {
-        if matrix.shards.iter().any(|shard| {
+    let fragments = admitted_inputs.get(&matrix.id).unwrap_or(&matrix.input_layout);
+    let (source, layouts) = PreparedMatrixSource::plan(
+        fragments.iter().copied(),
+        matrix.size(),
+        columns,
+        device,
+        parameters,
+        evaluation,
+    );
+    if matches!(source, PreparedMatrixSource::Replica { .. }) &&
+        matrix.shards.iter().any(|shard| {
             shard.value.level() != first.value.level() ||
                 shard.value.params().ring_dimension() != parameters.ring_dimension() ||
                 shard.value.params().moduli() != parameters.moduli()
-        }) {
-            return Err(PolyBackendError::GpuSubmission(
-                "prepared replica has incompatible source parameters".into(),
-            ));
-        }
-        PreparedMatrixSource::Replica { device, context: parameters.context_identity(), evaluation }
-    };
-    if planned.contains(&(matrix.id, source)) {
+        })
+    {
+        return Err(PolyBackendError::GpuSubmission(
+            "prepared replica has incompatible source parameters".into(),
+        ));
+    }
+    if layouts.iter().all(|layout| planned.contains(&(matrix.id, layout.source))) {
         return Ok(Some(source));
     }
-    if let PreparedMatrixSource::Replica { device, context, evaluation } = source {
-        let mixed = matrix.shards.iter().any(|shard| shard.value.is_ntt() != first.value.is_ntt());
-        if mixed {
-            // Each mismatching fragment crosses devices at most once, into its
-            // destination-context normalization owner. Replicas in this batch
-            // share it; original inputs are immutable. Reserve every fragment
-            // before submission, including those needed only by a pilot owner.
-            for (index, shard) in matrix.shards.iter().enumerate() {
-                if shard.value.is_ntt() == evaluation {
-                    continue;
-                }
-                let fragment =
-                    PreparedMatrixSource::Fragment { device, context, index, evaluation };
-                if planned.contains(&(matrix.id, fragment)) {
-                    continue;
-                }
-                let Some((storage, request)) = select_prepared_matrix(
-                    inventory,
-                    chosen,
-                    device,
-                    parameters,
-                    shard.value.level(),
-                    shard.value.size(),
-                    shard.value.is_ntt(),
-                    None,
-                )?
-                else {
-                    return Ok(None);
-                };
-                planned.insert((matrix.id, fragment));
-                preparation.push(MatrixInputPreparation {
-                    matrix: matrix.clone(),
-                    source: fragment,
-                    parameters: parameters.clone(),
-                    device,
-                    storage,
-                    request,
-                });
-            }
-        }
-    }
-    let (shape, original_evaluation) = source.layout(matrix);
-    let level = match source {
-        PreparedMatrixSource::Shard(index) | PreparedMatrixSource::Fragment { index, .. } => {
-            matrix.shards[index].value.level()
-        }
-        _ => first.value.level(),
-    };
-    let Some((storage, request)) = select_prepared_matrix(
-        inventory,
-        chosen,
-        device,
-        parameters,
-        level,
-        shape,
-        original_evaluation,
-        None,
-    )?
+    let slots = inventory
+        .par_iter()
+        .filter(|entry| entry.device == device && entry.context == parameters.context_identity())
+        .flat_map_iter(|entry| {
+            entry.slots.iter().map(|&(slot, available)| {
+                (
+                    slot,
+                    available &&
+                        !chosen.contains(&(parameters.context_identity(), {
+                            let id = slot.identity();
+                            (id.storage_id(), id.slot_id(), id.slot_index())
+                        })),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let layouts =
+        layouts.into_iter().filter(|layout| !planned.contains(&(matrix.id, layout.source)));
+    let Some(selected) = MatrixInputLayout::assign(layouts, parameters, &slots)
+        .map_err(PolyBackendError::GpuSubmission)?
     else {
         return Ok(None);
     };
-    planned.insert((matrix.id, source));
-    preparation.push(MatrixInputPreparation {
-        matrix: matrix.clone(),
-        source,
-        parameters: parameters.clone(),
-        device,
-        storage,
-        request,
-    });
+    // Publish metadata only after the entire input preparation fits. Native
+    // reservation later rechecks all requests before any copy or conversion.
+    for (layout, request) in selected {
+        chosen.insert((parameters.context_identity(), request.slot_key()));
+        planned.insert((matrix.id, layout.source));
+        preparation.push(MatrixInputRequest {
+            owner: matrix.id,
+            layout,
+            parameters: parameters.clone(),
+            device,
+            request,
+        });
+    }
     Ok(Some(source))
 }
 
@@ -329,7 +550,7 @@ impl GpuDcrtBackend {
                     let (selected, later) =
                         claims.into_iter().partition::<Vec<_>, _>(|(index, _)| {
                             matches!(
-                                preparation[*index].source,
+                                preparation[*index].layout.source,
                                 PreparedMatrixSource::Replica { .. }
                             ) == replicas
                         });
@@ -353,15 +574,15 @@ impl GpuDcrtBackend {
                     let mut outputs = Vec::with_capacity(claims.len());
                     for (index, reservation) in std::mem::take(claims) {
                         let input = &preparation[index];
-                        let (shape, evaluation) = input.source.layout(&input.matrix);
-                        let source_shards = match input.source {
+                        let MatrixInputLayout { shape, evaluation, .. } = input.layout;
+                        let source_shards = match input.layout.source {
                             PreparedMatrixSource::Shard(index) |
                             PreparedMatrixSource::Fragment { index, .. } => {
                                 &input.matrix.shards[index..index + 1]
                             }
                             PreparedMatrixSource::Replica { .. } => input.matrix.shards.as_slice(),
                         };
-                        let start = match input.source {
+                        let start = match input.layout.source {
                             PreparedMatrixSource::Replica { .. } => 0,
                             _ => source_shards[0].global_column_start,
                         };
@@ -381,7 +602,7 @@ impl GpuDcrtBackend {
                         for (index, original) in source_shards.iter().enumerate() {
                             let source =
                                 if let PreparedMatrixSource::Replica { device, context, .. } =
-                                    input.source
+                                    input.layout.source
                                 {
                                     if original.value.is_ntt() != evaluation {
                                         inputs
@@ -417,7 +638,7 @@ impl GpuDcrtBackend {
                                 )))
                                 .map_err(PolyBackendError::GpuSubmission)?;
                         }
-                        let desired_evaluation = match input.source {
+                        let desired_evaluation = match input.layout.source {
                             PreparedMatrixSource::Replica { evaluation, .. } |
                             PreparedMatrixSource::Fragment { evaluation, .. } => evaluation,
                             PreparedMatrixSource::Shard(_) => true,
@@ -429,7 +650,7 @@ impl GpuDcrtBackend {
                         }
                         drop(dispatch.finish().map_err(PolyBackendError::GpuSubmission)?);
                         outputs.push((
-                            (input.matrix.id, input.source),
+                            (input.matrix.id, input.layout.source),
                             Arc::new(GpuColumnShard {
                                 device_id: input.parameters.device_ids()[0],
                                 global_column_start: start,
@@ -538,6 +759,7 @@ mod tests {
         let right = GpuFleetMatrix::from_matrix(right);
         let storage = Arc::new(
             GpuPreparedStorage::new(
+                None,
                 [
                     (columns, rows),
                     (rows, columns),
@@ -550,6 +772,7 @@ mod tests {
                 .chain((0..columns).into_par_iter().map(|_| (rows, 1)))
                 .map(|(r, c)| GpuDCRTPolyMatrix::zero(&params, r, c))
                 .collect(),
+                None,
                 None,
             )
             .unwrap(),
@@ -573,7 +796,9 @@ mod tests {
                 ));
                 Arc::new(
                     GpuPreparedStorage::new(
+                        None,
                         vec![GpuDCRTPolyMatrix::zero(&params, rows, columns)],
+                        None,
                         Some(&layouts),
                     )
                     .unwrap(),
@@ -590,9 +815,13 @@ mod tests {
             .unwrap();
         backend.select_gpu_operation([124; 32]).unwrap();
         let requests = [
-            (0, GpuInvocation::Transpose { value: &input }),
-            (0, GpuInvocation::Tensor { left: &input, right: &right }),
-            (0, GpuInvocation::TensorSumRows { left: &input, right: &right, rows: &tensor_groups }),
+            (0, None, GpuInvocation::Transpose { value: &input }),
+            (0, None, GpuInvocation::Tensor { left: &input, right: &right }),
+            (
+                0,
+                None,
+                GpuInvocation::TensorSumRows { left: &input, right: &right, rows: &tensor_groups },
+            ),
         ];
         let tensor = original.tensor(&other);
         let expected = [original.transpose(), tensor.clone(), tensor.sum_rows(&tensor_groups)];

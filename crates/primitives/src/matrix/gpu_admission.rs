@@ -7,14 +7,19 @@
 //! Other native scratch, raw native pinned buffers, and private events still require their
 //! own production requirement and enforcement before full invocation admission.
 
-use super::GpuDCRTPolyMatrix;
+use super::{GpuDCRTPolyMatrix, PolyMatrix};
 use crate::poly::dcrt::gpu::{
     GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuMatrixOpaque, last_error_string,
 };
-use std::{cell::Cell, ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
+use std::{cell::Cell, ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc, sync::Arc};
 
 #[repr(C)]
 struct PreparedStorageOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct RegionOpaque {
     _private: [u8; 0],
 }
 
@@ -56,6 +61,24 @@ impl Drop for GpuGraphAdmissionGuard {
 }
 
 unsafe extern "C" {
+    fn gpu_prepared_slots_plan(
+        context: *mut crate::poly::dcrt::gpu::GpuContextOpaque,
+        claims: *const GpuTracedClaim,
+        count: usize,
+        out: *mut GpuPreparedSlotSnapshot,
+    ) -> i32;
+    fn gpu_prepared_storage_snapshot(
+        storage: *const PreparedStorageOpaque,
+        region: *const RegionOpaque,
+        out: *mut GpuPreparedSlotSnapshot,
+        count: usize,
+    ) -> i32;
+    fn gpu_prepared_slot_layout_fits(
+        context: *mut crate::poly::dcrt::gpu::GpuContextOpaque,
+        slot: *const GpuPreparedSlotSnapshot,
+        request: *const GpuPreparedRequest,
+        out_fits: *mut i32,
+    ) -> i32;
     fn gpu_graph_admission_begin(context: *mut crate::poly::dcrt::gpu::GpuContextOpaque) -> i32;
     fn gpu_graph_admission_end(context: *mut crate::poly::dcrt::gpu::GpuContextOpaque);
 }
@@ -330,12 +353,29 @@ unsafe extern "C" {
         storage: *mut PreparedStorageOpaque,
         requests: *const GpuPreparedRequest,
         count: usize,
+        region: *const RegionOpaque,
         out: *mut *mut ReservationOpaque,
+    ) -> i32;
+    fn gpu_prepared_region_create(
+        storage: *mut PreparedStorageOpaque,
+        parent: *const RegionOpaque,
+        slots: *const usize,
+        count: usize,
+        out: *mut *mut RegionOpaque,
+    ) -> i32;
+    fn gpu_prepared_region_destroy(region: *mut RegionOpaque);
+    fn gpu_prepared_storage_releases(
+        storage: *const PreparedStorageOpaque,
+        region: *const RegionOpaque,
+        wait_slots: *const usize,
+        wait_count: usize,
+        out_pending: *mut u8,
     ) -> i32;
     fn gpu_prepared_storage_fits(
         storage: *const PreparedStorageOpaque,
         requests: *const GpuPreparedRequest,
         count: usize,
+        region: *const RegionOpaque,
         out_fits: *mut i32,
     ) -> i32;
     fn gpu_matrix_reservation_destroy(reservation: *mut ReservationOpaque);
@@ -374,7 +414,7 @@ unsafe extern "C" fn release_backing(owner: *mut c_void) {
 }
 
 #[repr(i32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum GpuPreparedSlotKind {
     Matrix = 0,
     BatchWorkspace = 1,
@@ -551,6 +591,21 @@ pub struct GpuPreparedRequest {
 }
 
 impl GpuPreparedRequest {
+    /// Assign distinct slots to simultaneous claims from preference-ordered
+    /// eligible candidates. This is CPU matching only: callers supply current
+    /// eligibility and native reservation must still recheck the result.
+    pub fn assign(candidates: &[Vec<Self>]) -> Vec<Option<Self>> {
+        let edges = candidates
+            .iter()
+            .map(|slots| slots.iter().map(|request| request.slot_key().1).collect())
+            .collect::<Vec<_>>();
+        match_prepared_slots(&edges)
+            .into_iter()
+            .enumerate()
+            .map(|(claim, selected)| selected.map(|edge| candidates[claim][edge]))
+            .collect()
+    }
+
     /// Native slot identity for detecting competing claims in a candidate plan.
     pub fn slot_key(&self) -> (u64, u64, usize) {
         (self.storage_id, self.slot_id, self.slot_index)
@@ -711,6 +766,191 @@ impl GpuPreparedSlotIdentity {
     }
 }
 
+/// Matrix size classes keep incompatible aspect ratios from consuming one
+/// another's peak capacity. No dimensions are rounded in the native backing.
+pub fn matrix_capacity_class(rows: usize, columns: usize) -> (u32, u32) {
+    (capacity_class(rows), capacity_class(columns))
+}
+
+pub fn capacity_class(size: usize) -> u32 {
+    usize::BITS - size.max(1).saturating_sub(1).leading_zeros()
+}
+
+/// Return a maximum-cardinality assignment, with no index for unmatched claims. Augmenting paths
+/// allow a flexible claim to move when its initial choice is the only fit for a later claim.
+/// Candidate order preserves the native size-class preference; all eligible
+/// edges are considered before declaring simultaneous capacity insufficient.
+/// The queue avoids recursion proportional to the admitted batch size.
+fn match_prepared_slots(candidates: &[Vec<u64>]) -> Vec<Option<usize>> {
+    use std::collections::{HashMap, VecDeque};
+    let mut owners = HashMap::<u64, usize>::new();
+    let mut selected = vec![None; candidates.len()];
+    for root in 0..candidates.len() {
+        let mut parents = vec![None; candidates.len()];
+        let mut visited = vec![false; candidates.len()];
+        visited[root] = true;
+        let mut queue = VecDeque::from([root]);
+        let mut free = None;
+        'search: while let Some(claim) = queue.pop_front() {
+            for (edge, slot) in candidates[claim].iter().enumerate() {
+                if let Some(&owner) = owners.get(slot) {
+                    if !visited[owner] {
+                        visited[owner] = true;
+                        parents[owner] = Some((claim, edge));
+                        queue.push_back(owner);
+                    }
+                } else {
+                    free = Some((claim, edge));
+                    break 'search;
+                }
+            }
+        }
+        let Some((mut claim, mut edge)) = free else { continue };
+        loop {
+            selected[claim] = Some(edge);
+            owners.insert(candidates[claim][edge], claim);
+            match parents[claim] {
+                Some(previous) => (claim, edge) = previous,
+                None => break,
+            }
+        }
+    }
+    selected
+}
+
+/// Pointer-free typed capacity and observed eligibility of one native slot.
+/// This owns no backing or lease. Matrix compatibility uses the same CPU native
+/// layout query as reservation; availability still requires a commit recheck.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GpuPreparedSlotSnapshot {
+    identity: GpuPreparedSlotIdentity,
+    auxiliary_capacity_bytes: usize,
+    available: i32,
+}
+
+impl GpuPreparedSlotSnapshot {
+    /// Plan an unbacked inventory using the same capacity builder as native
+    /// storage creation. This allocates CPU metadata only: no GPU backing,
+    /// event, stream, kernel or lease. IDs belong to this one plan and storage
+    /// ID zero prevents the requests from being mistaken for real reservations.
+    pub fn plan(
+        params: &crate::poly::dcrt::gpu::GpuDCRTPolyParams,
+        claims: &[GpuTracedClaim],
+    ) -> Result<Vec<Self>, String> {
+        let mut slots = Vec::<Self>::with_capacity(claims.len());
+        let status = unsafe {
+            gpu_prepared_slots_plan(
+                params.ctx_raw(),
+                claims.as_ptr(),
+                claims.len(),
+                slots.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        // Native planning initialized the complete output on success.
+        unsafe {
+            slots.set_len(claims.len());
+        }
+        Ok(slots)
+    }
+
+    /// Maximum-cardinality typed assignment in claim order, using CPU metadata
+    /// only. The caller supplies eligibility for the scenario being planned;
+    /// this may include hypothetical release state but never grants a lease.
+    /// Native reservation must recheck every returned request before execution.
+    /// Unmatched claims are None. Candidate ordering preserves size-class and
+    /// smallest-backing preferences, without starving less flexible claims.
+    pub fn assign(
+        params: &crate::poly::dcrt::gpu::GpuDCRTPolyParams,
+        slots: &[(Self, bool)],
+        claims: &[GpuTracedClaim],
+    ) -> Result<Vec<Option<GpuPreparedRequest>>, String> {
+        use rayon::prelude::*;
+        let candidates = claims
+            .par_iter()
+            .map(|claim| {
+                let mut candidates = Vec::new();
+                for (slot, eligible) in slots {
+                    if !eligible {
+                        continue;
+                    }
+                    if let Some(request) = slot.request(params, claim)? {
+                        let identity = slot.identity();
+                        let bytes = identity.requested_backing_bytes();
+                        let other_class = if claim.kind() == GpuPreparedSlotKind::Matrix {
+                            matrix_capacity_class(identity.rows(), identity.columns()) !=
+                                matrix_capacity_class(claim.rows(), claim.columns())
+                        } else {
+                            capacity_class(bytes) != capacity_class(claim.bytes())
+                        };
+                        candidates.push(((other_class, bytes), request));
+                    }
+                }
+                candidates.sort_by_key(|(preference, _)| *preference);
+                Ok(candidates)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(GpuPreparedRequest::assign(
+            &candidates
+                .into_iter()
+                .map(|slots| slots.into_iter().map(|(_, request)| request).collect())
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    pub fn identity(&self) -> GpuPreparedSlotIdentity {
+        self.identity
+    }
+    pub fn is_available(&self) -> bool {
+        self.available != 0
+    }
+
+    /// Lower a compatible claim without consulting native storage or acquiring
+    /// resources. Parameters must be those of the observed storage's context.
+    /// A fitting layout alone does not imply that the slot is available.
+    pub fn request(
+        &self,
+        params: &crate::poly::dcrt::gpu::GpuDCRTPolyParams,
+        claim: &GpuTracedClaim,
+    ) -> Result<Option<GpuPreparedRequest>, String> {
+        let slot = self.identity;
+        if slot.kind() != claim.kind() ||
+            (claim.kind() == GpuPreparedSlotKind::Matrix && slot.level() != claim.level())
+        {
+            return Ok(None);
+        }
+        let request = if claim.kind() == GpuPreparedSlotKind::Matrix {
+            slot.matrix_request(
+                claim.rows(),
+                claim.columns(),
+                claim.is_evaluation().unwrap_or(true),
+            )
+        } else {
+            slot.workspace_request(claim.bytes(), claim.alignment().max(1))
+        };
+        Ok(self.fits_request(params, &request)?.then_some(request))
+    }
+
+    /// Check an exact request against this slot's CPU layout metadata. The
+    /// caller supplies availability separately; this creates no native owner.
+    pub fn fits_request(
+        &self,
+        params: &crate::poly::dcrt::gpu::GpuDCRTPolyParams,
+        request: &GpuPreparedRequest,
+    ) -> Result<bool, String> {
+        let mut fits = 0;
+        let status =
+            unsafe { gpu_prepared_slot_layout_fits(params.ctx_raw(), self, request, &mut fits) };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(fits != 0)
+    }
+}
+
 /// Native logical demand for exact ordered claims. These independent dimensions
 /// are not additive: CUDA resource units and pinned bytes are not device bytes.
 #[repr(C)]
@@ -827,11 +1067,16 @@ impl GpuPreparedOccupancy {
 /// transfer/auxiliary lengths follow the claim, independent of physical backing.
 /// Live outputs keep their slots exclusive even after dispatch returns.
 pub struct GpuPreparedStorage {
+    context: usize,
     raw: NonNull<PreparedStorageOpaque>,
     identity: u64,
     execution_owner_id: u64,
     device: i32,
-    slots: Vec<GpuPreparedSlotIdentity>,
+    slots: Arc<Vec<GpuPreparedSlotIdentity>>,
+    // A permission-bearing view shares the original native storage handle.
+    // The region retains that original owner (or its parent view), forming an
+    // acyclic ownership chain; only the original wrapper destroys the handle.
+    region: Option<Arc<GpuPreparedRegion>>,
 }
 
 // Native slots are claimed atomically; each leased matrix has one owning Rust
@@ -846,11 +1091,54 @@ impl GpuPreparedStorage {
     /// reservation. This consumes matrices without cloning their device data.
     /// Actual backing and opaque-resource residency must be accounted for by the
     /// caller; successful construction alone is not physical memory admission.
+    ///
+    /// `uninitialized_matrices` appends one matrix slot per typed claim,
+    /// preserving its exact level and evaluation format. Appending does no coefficient-zeroing
+    /// work at all: the payload is left as `cudaMallocAsync` returned it, so
+    /// these slots never carry a placeholder zero fill. The descriptor-init
+    /// kernel that `gpu_matrix_create` runs is REQUIRED and still runs for every
+    /// appended slot, so the device descriptor array is always initialized. The
+    /// coefficient payload is left undefined, and the allocation's auxiliary
+    /// scratch region stays undefined exactly as for every other empty-matrix
+    /// creation. Those owners exist only inside this constructor: they are handed
+    /// to the native storage immediately and are never readable as a matrix. The
+    /// caller must treat every appended slot as requiring the writing operation
+    /// to define each subsequently read byte. Partial-write and accumulating
+    /// operations still have to zero or initialize their owner at first use,
+    /// because creation does not guarantee a zero fill and reuse hands back
+    /// whatever payload the previous claim left there. Pass the ring of the
+    /// appended slots as `params`; an absent claim list needs no ring.
     pub fn new(
+        params: Option<&crate::poly::dcrt::gpu::GpuDCRTPolyParams>,
         backing: Vec<GpuDCRTPolyMatrix>,
+        uninitialized_matrices: Option<&[GpuTracedClaim]>,
         workspaces: Option<&[GpuPreparedWorkspaceLayout]>,
     ) -> Result<Self, String> {
         let workspaces = workspaces.unwrap_or(&[]);
+        let mut backing = backing;
+        let shapes = uninitialized_matrices.unwrap_or(&[]);
+        if !shapes.is_empty() {
+            let params = params.ok_or_else(|| {
+                "uninitialized prepared backing requires its parameter ring".to_owned()
+            })?;
+            backing.reserve(shapes.len());
+            for claim in shapes {
+                let (rows, columns) = (claim.rows(), claim.columns());
+                if rows == 0 || columns == 0 {
+                    return Err("uninitialized prepared backing requires nonzero rows and columns"
+                        .to_owned());
+                }
+                backing.push(GpuDCRTPolyMatrix::new_empty_with_state(
+                    params,
+                    rows,
+                    columns,
+                    claim.level().expect("typed matrix claim"),
+                    claim.is_evaluation().expect("typed matrix claim"),
+                    None,
+                ));
+            }
+        }
+        let context = backing.first().map(|matrix| matrix.params().context_identity());
         let pointers = backing.iter().map(|matrix| matrix.raw).collect::<Vec<_>>();
         let slot_count =
             pointers.len().checked_add(workspaces.len()).ok_or("slot count overflow")?;
@@ -875,11 +1163,13 @@ impl GpuPreparedStorage {
         }
         let raw = NonNull::new(raw).expect("successful native storage has an owner");
         let mut storage = Self {
+            context: context.expect("native storage creation requires one backing context"),
             raw,
             identity: 0,
             execution_owner_id: 0,
             device: -1,
-            slots: Vec::with_capacity(slot_count),
+            slots: Arc::new(Vec::with_capacity(slot_count)),
+            region: None,
         };
         let status = unsafe {
             gpu_prepared_storage_identity(
@@ -899,7 +1189,9 @@ impl GpuPreparedStorage {
             if status != 0 {
                 return Err(last_error_string());
             }
-            storage.slots.push(unsafe { identity.assume_init() });
+            Arc::get_mut(&mut storage.slots)
+                .expect("new storage metadata")
+                .push(unsafe { identity.assume_init() });
         }
         Ok(storage)
     }
@@ -927,6 +1219,11 @@ impl GpuPreparedStorage {
     pub fn execution_owner_id(&self) -> u64 {
         self.execution_owner_id
     }
+    /// Exact context of the retained native backing, including related contexts
+    /// that are not the backend's canonical parameter registration for a ring.
+    pub fn context_identity(&self) -> usize {
+        self.context
+    }
     /// Match the exact related-ring context without reservation or submission.
     pub fn matches_parameters(&self, params: &crate::poly::dcrt::gpu::GpuDCRTPolyParams) -> bool {
         unsafe { gpu_prepared_storage_matches_context(self.raw.as_ptr(), params.ctx_raw()) != 0 }
@@ -936,6 +1233,30 @@ impl GpuPreparedStorage {
     }
     pub fn slot_identity(&self, slot: usize) -> Option<GpuPreparedSlotIdentity> {
         self.slots.get(slot).copied()
+    }
+
+    /// Observe typed capacity and region-relative eligibility without polling
+    /// CUDA events, retaining owners, or reserving storage. Pending external
+    /// readers are classified separately by poll_releases; reservation rechecks
+    /// this potentially stale observation before production starts.
+    pub fn snapshot(&self) -> Result<Vec<GpuPreparedSlotSnapshot>, String> {
+        let mut slots = Vec::<GpuPreparedSlotSnapshot>::with_capacity(self.slot_count());
+        let status = unsafe {
+            gpu_prepared_storage_snapshot(
+                self.raw.as_ptr(),
+                self.region.as_ref().map_or(std::ptr::null(), |region| region.raw.as_ptr()),
+                slots.as_mut_ptr(),
+                self.slot_count(),
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        // The native function initialized exactly slot_count entries on success.
+        unsafe {
+            slots.set_len(self.slot_count());
+        }
+        Ok(slots)
     }
 
     /// Compute exact logical demand with the same native layouts as reserve.
@@ -961,19 +1282,62 @@ impl GpuPreparedStorage {
     /// reserve rechecks every layout and acquires the complete list atomically.
     /// Physical sealing and other resource families remain separate obligations.
     pub fn fits(&self, requests: &[GpuPreparedRequest]) -> Result<bool, String> {
-        let mut fits = 0;
+        fit_prepared(self, requests, self.region.as_deref())
+    }
+
+    /// Poll idle external slots for pending readers. Only the explicitly
+    /// selected `wait_for` indices may block the host. Admission uses an empty
+    /// list first and waits only when no immediately eligible wave fits.
+    /// Region-owned storage retains its admitted event-ordered reuse instead.
+    /// Returns pending slot indices; a reservation must still recheck ownership.
+    pub fn poll_releases(&self, wait_for: &[usize]) -> Result<Vec<usize>, String> {
+        let mut pending = vec![0u8; self.slot_count()];
         let status = unsafe {
-            gpu_prepared_storage_fits(
+            gpu_prepared_storage_releases(
                 self.raw.as_ptr(),
-                requests.as_ptr(),
-                requests.len(),
-                &mut fits,
+                self.region.as_ref().map_or(std::ptr::null(), |region| region.raw.as_ptr()),
+                wait_for.as_ptr(),
+                wait_for.len(),
+                pending.as_mut_ptr(),
             )
         };
         if status != 0 {
             return Err(last_error_string());
         }
-        Ok(fits != 0)
+        Ok(pending
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, pending)| (pending != 0).then_some(index))
+            .collect())
+    }
+
+    /// Reserve whole slots as reusable capacity, without consuming an operation
+    /// lease or launching GPU work. A nested region borrows from its parent;
+    /// independent regions can only take externally available slots. On a
+    /// region-authorized view, omitting parent uses that view's region. `None`
+    /// means competing ownership prevented this attempt; every partial claim
+    /// has been rolled back. API/CUDA failures remain errors.
+    pub fn reserve_region(
+        self: &Arc<Self>,
+        slots: &[usize],
+        parent: Option<&GpuPreparedRegion>,
+    ) -> Result<Option<GpuPreparedRegion>, String> {
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_prepared_region_create(
+                self.raw.as_ptr(),
+                parent
+                    .or(self.region.as_deref())
+                    .map_or(std::ptr::null(), |parent| parent.raw.as_ptr()),
+                slots.as_ptr(),
+                slots.len(),
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(NonNull::new(raw).map(|raw| GpuPreparedRegion { raw, storage: self.clone() }))
     }
 
     /// Nonblocking observation, retiring logical charges only for available
@@ -1047,34 +1411,118 @@ impl GpuPreparedStorage {
     /// The first successful reservation permanently requires ordinary-allocation
     /// permits on this owner. Cancellation does not downgrade that checked mode.
     pub fn reserve(&self, requests: &[GpuPreparedRequest]) -> Result<GpuMatrixReservation, String> {
-        let identities = requests
-            .iter()
-            .map(|request| {
-                self.slot_identity(request.slot_index)
-                    .ok_or_else(|| "prepared matrix slot index out of bounds".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let requests = requests.to_vec();
-        let mut raw = std::ptr::null_mut();
-        let status = unsafe {
-            gpu_matrix_reserve(self.raw.as_ptr(), requests.as_ptr(), requests.len(), &mut raw)
-        };
-        if status != 0 {
-            return Err(last_error_string());
-        }
-        Ok(GpuMatrixReservation {
-            raw: Some(NonNull::new(raw).expect("successful reservation has an owner")),
-            slots: identities,
-            requests,
-            not_sync: PhantomData,
-        })
+        reserve_prepared(self, requests, self.region.as_deref())
     }
 }
 
 impl Drop for GpuPreparedStorage {
     fn drop(&mut self) {
-        unsafe { gpu_prepared_storage_destroy(self.raw.as_ptr()) };
+        if self.region.is_none() {
+            unsafe { gpu_prepared_storage_destroy(self.raw.as_ptr()) };
+        }
     }
+}
+
+/// Exclusive region capacity, separate from operation reservations. Native
+/// outputs retain backing after this owner is dropped. A child region retains
+/// its parent and restores exclusion to it on drop, without an external window.
+/// Multiple workers may reserve disjoint slots through the same region.
+#[must_use]
+pub struct GpuPreparedRegion {
+    raw: NonNull<RegionOpaque>,
+    storage: Arc<GpuPreparedStorage>,
+}
+
+// Native region exclusion is atomic and immutable after construction. Operations
+// retain their own unique reservation tokens; sharing capacity is not sharing leases.
+unsafe impl Send for GpuPreparedRegion {}
+unsafe impl Sync for GpuPreparedRegion {}
+
+impl GpuPreparedRegion {
+    /// A storage view carrying this region's authority. Existing typed fit and
+    /// reserve callers use it directly; native identities and capacity metadata
+    /// remain unchanged. Cloning the view never duplicates device backing.
+    pub fn storage(self: &Arc<Self>) -> Arc<GpuPreparedStorage> {
+        Arc::new(GpuPreparedStorage {
+            context: self.storage.context,
+            raw: self.storage.raw,
+            identity: self.storage.identity,
+            execution_owner_id: self.storage.execution_owner_id,
+            device: self.storage.device,
+            slots: self.storage.slots.clone(),
+            region: Some(self.clone()),
+        })
+    }
+
+    pub fn fits(&self, requests: &[GpuPreparedRequest]) -> Result<bool, String> {
+        fit_prepared(&self.storage, requests, Some(self))
+    }
+
+    pub fn reserve(&self, requests: &[GpuPreparedRequest]) -> Result<GpuMatrixReservation, String> {
+        reserve_prepared(&self.storage, requests, Some(self))
+    }
+}
+
+impl Drop for GpuPreparedRegion {
+    fn drop(&mut self) {
+        unsafe { gpu_prepared_region_destroy(self.raw.as_ptr()) };
+    }
+}
+
+fn fit_prepared(
+    storage: &GpuPreparedStorage,
+    requests: &[GpuPreparedRequest],
+    region: Option<&GpuPreparedRegion>,
+) -> Result<bool, String> {
+    let mut fits = 0;
+    let status = unsafe {
+        gpu_prepared_storage_fits(
+            storage.raw.as_ptr(),
+            requests.as_ptr(),
+            requests.len(),
+            region.map_or(std::ptr::null(), |region| region.raw.as_ptr()),
+            &mut fits,
+        )
+    };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    Ok(fits != 0)
+}
+
+fn reserve_prepared(
+    storage: &GpuPreparedStorage,
+    requests: &[GpuPreparedRequest],
+    region: Option<&GpuPreparedRegion>,
+) -> Result<GpuMatrixReservation, String> {
+    let identities = requests
+        .iter()
+        .map(|request| {
+            storage
+                .slot_identity(request.slot_index)
+                .ok_or_else(|| "prepared matrix slot index out of bounds".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let requests = requests.to_vec();
+    let mut raw = std::ptr::null_mut();
+    let status = unsafe {
+        gpu_matrix_reserve(
+            storage.raw.as_ptr(),
+            requests.as_ptr(),
+            requests.len(),
+            region.map_or(std::ptr::null(), |region| region.raw.as_ptr()),
+            &mut raw,
+        )
+    };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    Ok(GpuMatrixReservation {
+        raw: Some(NonNull::new(raw).expect("successful reservation has an owner")),
+        slots: identities,
+        requests,
+        not_sync: PhantomData,
+    })
 }
 
 /// An owned reservation that can move to its target worker before activation.
@@ -1356,6 +1804,63 @@ mod tests {
         },
     };
 
+    #[test]
+    fn test_typed_slot_matching_matches_exhaustive_assignment_oracle() {
+        // Exhaust every compatibility graph for three claims and three slots.
+        // The oracle enumerates all injective assignments, independently of the
+        // augmenting-path implementation and its deterministic preferences.
+        for mask in 0..(1 << 9) {
+            let edges = (0..3)
+                .map(|claim| {
+                    (0..3)
+                        .filter(|slot| mask & (1 << (claim * 3 + slot)) != 0)
+                        .map(|slot| slot as u64)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let feasible = (0..3).any(|a| {
+                (0..3).any(|b| {
+                    (0..3).any(|c| {
+                        a != b &&
+                            a != c &&
+                            b != c &&
+                            edges[0].contains(&a) &&
+                            edges[1].contains(&b) &&
+                            edges[2].contains(&c)
+                    })
+                })
+            });
+            let partial = match_prepared_slots(&edges);
+            let maximum = (0..=3)
+                .flat_map(|a| (0..=3).flat_map(move |b| (0..=3).map(move |c| [a, b, c])))
+                .filter(|assignment| {
+                    assignment.iter().enumerate().all(|(claim, &slot)| {
+                        slot == 3 ||
+                            (edges[claim].contains(&slot) &&
+                                !assignment[..claim].contains(&slot))
+                    })
+                })
+                .map(|assignment| assignment.iter().filter(|&&slot| slot != 3).count())
+                .max()
+                .unwrap();
+            assert_eq!(partial.iter().flatten().count(), maximum, "partial graph {mask}");
+            let selected = partial.into_iter().collect::<Option<Vec<_>>>();
+            assert_eq!(selected.is_some(), feasible, "compatibility graph {mask}");
+            if let Some(selected) = selected {
+                let mut slots = selected
+                    .iter()
+                    .enumerate()
+                    .map(|(claim, &edge)| edges[claim][edge])
+                    .collect::<Vec<_>>();
+                slots.sort_unstable();
+                slots.dedup();
+                assert_eq!(slots.len(), 3);
+            }
+        }
+        assert_eq!(match_prepared_slots(&[]), vec![]);
+        assert_eq!(match_prepared_slots(&[vec![10, 20], vec![10]]), vec![Some(1), Some(0)]);
+    }
+
     // Existing fixed-shape fixtures request each slot's complete layout. Keep
     // their mathematical and ownership assertions unchanged across the typed API.
     fn reserve(
@@ -1388,6 +1893,165 @@ mod tests {
 
     #[test]
     #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_release_poll_observes_a_deterministically_delayed_reader() {
+        use crate::{
+            poly::dcrt::gpu::gpu_matrix_transpose,
+            sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+        };
+        unsafe extern "C" {
+            fn gpu_test_matrix_stream_gate(matrix: *mut GpuMatrixOpaque) -> *mut std::ffi::c_void;
+            fn gpu_test_release_stream_gate(gate: *mut std::ffi::c_void);
+        }
+        struct Gate(*mut std::ffi::c_void);
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                unsafe { gpu_test_release_stream_gate(self.0) };
+            }
+        }
+        let (cpu, params) = parameters();
+        let size = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(3)
+            .max(1);
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, size, size, DistType::FinRingDist);
+        let storage = GpuPreparedStorage::new(
+            None,
+            (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, size, size)).collect(),
+            None,
+            None,
+        )
+        .unwrap();
+        let reader = GpuDCRTPolyMatrix::zero(&params, size, size);
+        let dispatch = reserve(&storage, &[0]).unwrap().enter(Vec::new()).unwrap();
+        let source = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original);
+        drop(dispatch.finish().unwrap());
+        source.wait_until_ready();
+        reader.wait_until_ready();
+        let gate = Gate(unsafe { gpu_test_matrix_stream_gate(reader.raw) });
+        assert!(!gate.0.is_null(), "install test-only reader gate");
+        assert_eq!(unsafe { gpu_matrix_transpose(reader.raw, source.raw, std::ptr::null()) }, 0);
+        drop(source);
+        // The transpose is genuinely pending, independent of GPU speed. One
+        // other slot still permits immediate progress without waiting on it.
+        assert_eq!(storage.poll_releases(&[]).unwrap(), vec![0]);
+        drop(reserve(&storage, &[1]).unwrap());
+        assert_eq!(storage.poll_releases(&[]).unwrap(), vec![0]);
+        drop(gate);
+        assert!(storage.poll_releases(&[0]).unwrap().is_empty());
+        let dispatch = reserve(&storage, &[0]).unwrap().enter(Vec::new()).unwrap();
+        let replacement = GpuDCRTPolyMatrix::zero(&params, size, size);
+        drop(dispatch.finish().unwrap());
+        // Overwrite the recycled backing before checking the reader result.
+        // A host-observed producer must not bypass a later consumer dependency.
+        assert_eq!(reader.to_cpu_matrix(), original.transpose());
+        drop(replacement);
+        drop(reserve(&storage, &[0, 1]).unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_release_wait_reuses_source_without_waiting_for_live_owners() {
+        use crate::sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler};
+        let (cpu, params) = parameters();
+        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(5);
+        let storage = Arc::new(
+            GpuPreparedStorage::new(
+                None,
+                vec![
+                    GpuDCRTPolyMatrix::zero(&params, 2, columns),
+                    GpuDCRTPolyMatrix::zero(&params, columns, 2),
+                    GpuDCRTPolyMatrix::zero(&params, 1, 1),
+                ],
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 2, columns, DistType::FinRingDist);
+        let dispatch = reserve(&storage, &[0, 1, 2]).unwrap().enter(Vec::new()).unwrap();
+        let source = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original);
+        let reader = source.transpose();
+        let unrelated = GpuDCRTPolyMatrix::zero(&params, 1, 1);
+        drop(dispatch.finish().unwrap());
+        drop(source);
+        // The source is logically free, but its transpose may still read it.
+        // Waiting for index 0 must succeed while indices 1 and 2 remain owned.
+        storage.poll_releases(&[]).unwrap();
+        assert!(!storage.poll_releases(&[0]).unwrap().contains(&0));
+        let region = Arc::new(storage.reserve_region(&[0], None).unwrap().unwrap());
+        assert!(storage.reserve_region(&[1, 2], None).unwrap().is_none());
+        assert!(region.storage().poll_releases(&[]).unwrap().is_empty());
+        let request = storage.slot_identity(0).unwrap().matrix_request(2, columns, true);
+        let dispatch = region.reserve(&[request]).unwrap().enter(Vec::new()).unwrap();
+        let replacement = GpuDCRTPolyMatrix::zero(&params, 2, columns);
+        drop(dispatch.finish().unwrap());
+        assert_eq!(reader.to_cpu_matrix(), original.transpose());
+        assert_eq!(replacement.to_cpu_matrix(), DCRTPolyMatrix::zero(&cpu, 2, columns));
+        assert_eq!(unrelated.to_cpu_matrix(), DCRTPolyMatrix::zero(&cpu, 1, 1));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_regions_lend_slots_and_preserve_escaping_outputs() {
+        let (cpu, params) = parameters();
+        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(2);
+        let storage = Arc::new(
+            GpuPreparedStorage::new(
+                None,
+                vec![
+                    GpuDCRTPolyMatrix::zero(&params, 1, columns),
+                    GpuDCRTPolyMatrix::zero(&params, 1, columns),
+                ],
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let requests = (0..2)
+            .map(|slot| storage.slot_identity(slot).unwrap().matrix_request(1, columns, true))
+            .collect::<Vec<_>>();
+
+        let competing = storage.reserve_region(&[1], None).unwrap().unwrap();
+        assert!(storage.reserve_region(&[0, 1], None).unwrap().is_none());
+        assert!(storage.fits(&requests[..1]).unwrap(), "failed region rolls back its prefix");
+        drop(competing);
+        let parent = storage.reserve_region(&[0, 1], None).unwrap().unwrap();
+        assert!(!storage.fits(&requests).unwrap());
+        assert!(
+            storage.reserve(&requests[..1]).is_err(),
+            "external operation cannot steal capacity"
+        );
+        assert!(parent.fits(&requests).unwrap());
+        let child = storage.reserve_region(&[0], Some(&parent)).unwrap().unwrap();
+        let sibling = storage.reserve_region(&[1], Some(&parent)).unwrap().unwrap();
+        assert!(!parent.fits(&requests[..1]).unwrap(), "child owns its subregion");
+        assert!(!child.fits(&requests[1..]).unwrap(), "child cannot use a sibling slot");
+        // Cancel and reacquire an operation lease under the same containing owner.
+        drop(child.reserve(&requests[..1]).unwrap());
+        assert!(child.fits(&requests[..1]).unwrap());
+        drop(parent);
+        assert!(!storage.fits(&requests).unwrap(), "children retain their parent exclusion");
+        let dispatch = child.reserve(&requests[..1]).unwrap().enter(Vec::new()).unwrap();
+        let output = GpuDCRTPolyMatrix::zero(&params, 1, columns);
+        drop(dispatch.finish().unwrap());
+        drop(child);
+        assert!(!storage.fits(&requests[..1]).unwrap());
+        drop(sibling);
+        assert!(!storage.fits(&requests[..1]).unwrap(), "escaped output still owns its backing");
+        assert!(storage.fits(&requests[1..]).unwrap());
+        assert_eq!(output.to_cpu_matrix(), DCRTPolyMatrix::zero(&cpu, 1, columns));
+        drop(output);
+        assert!(storage.fits(&requests).unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
     fn test_gpu_managed_setup_requires_complete_idle_inventory_and_exact_empty_resources() {
         use crate::poly::dcrt::gpu::{
             GpuAllocationEpochBoundary, GpuAllocationEpochObservation,
@@ -1395,7 +2059,9 @@ mod tests {
         };
         let (_, params) = parameters();
         let first = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 kind: GpuPreparedSlotKind::CompletionEvent,
                 bytes: 0,
@@ -1404,7 +2070,8 @@ mod tests {
         )
         .unwrap();
         let second =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None).unwrap();
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None, None)
+                .unwrap();
         assert!(GpuPreparedStorage::finish_setup(&[]).is_err());
         assert!(GpuPreparedStorage::finish_setup(&[&first]).is_err());
         assert!(GpuPreparedStorage::finish_setup(&[&first, &first]).is_err());
@@ -1479,7 +2146,9 @@ mod tests {
         assert!(maximum > 0);
         let backing_columns = maximum.checked_add(1).unwrap();
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, 2, backing_columns)).collect(),
+            None,
             None,
         )
         .unwrap();
@@ -1543,7 +2212,9 @@ mod tests {
             None,
         );
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 kind: GpuPreparedSlotKind::CompletionEvent,
                 bytes: 0,
@@ -1600,9 +2271,13 @@ mod tests {
             alignment: 1,
             kind: GpuPreparedSlotKind::CompletionEvent,
         };
-        let storage =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], Some(&[event]))
-                .unwrap();
+        let storage = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
+            Some(&[event]),
+        )
+        .unwrap();
         let claims = [storage.slot_identity(1).unwrap().workspace_request(0, 1)];
         let mut token = storage.reserve(&claims).unwrap();
         for round in 0..2 {
@@ -1626,7 +2301,9 @@ mod tests {
             kind: GpuPreparedSlotKind::CompletionEvent,
         };
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
             Some(&[event, event]),
         )
         .unwrap();
@@ -1689,7 +2366,9 @@ mod tests {
             kind: GpuPreparedSlotKind::CompletionEvent,
         };
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, 2, columns)).collect(),
+            None,
             Some(&[transfer, event, event, event, event]),
         )
         .unwrap();
@@ -1761,7 +2440,9 @@ mod tests {
             kind: GpuPreparedSlotKind::SubmissionStream,
         };
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 2, columns)],
+            None,
             Some(&[stream, workspace]),
         )
         .unwrap();
@@ -1801,9 +2482,13 @@ mod tests {
         let right = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original);
         let zero = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &cpu_zero);
         let layout = GpuDCRTPolyMatrix::equality_workspace().unwrap();
-        let storage =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], Some(&[layout]))
-                .unwrap();
+        let storage = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
+            Some(&[layout]),
+        )
+        .unwrap();
         let requests =
             [storage.slot_identity(1).unwrap().workspace_request(layout.bytes, layout.alignment)];
         let mut token = storage.reserve(&requests).unwrap();
@@ -1884,7 +2569,9 @@ mod tests {
                 .is_err()
         );
         let storage = GpuPreparedStorage::new(
+            None,
             (0..3).map(|_| GpuDCRTPolyMatrix::zero(&params, 2, columns)).collect(),
+            None,
             Some(&[store, batch, loads[0], loads[1]]),
         )
         .unwrap();
@@ -1963,7 +2650,9 @@ mod tests {
         assert!(params.rns_transfer_workspace(usize::MAX, 2, columns).is_err());
         assert!(params.rns_transfer_workspace(0, usize::MAX, 2).is_err());
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, 2, columns)).collect(),
+            None,
             Some(&[layout]),
         )
         .unwrap();
@@ -2056,7 +2745,9 @@ mod tests {
             },
         ];
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2).into_par_iter().map(|_| GpuDCRTPolyMatrix::zero(&params, 1, columns)).collect(),
+            None,
             Some(&layouts),
         )
         .unwrap();
@@ -2138,7 +2829,9 @@ mod tests {
         );
         let sampling_end = 2 + layouts.len();
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, 2 * rows, columns)).collect(),
+            None,
             Some(&layouts),
         )
         .unwrap();
@@ -2269,7 +2962,9 @@ mod tests {
                 let layouts =
                     layouts.into_iter().filter(|layout| layout.bytes != 0).collect::<Vec<_>>();
                 let storage = GpuPreparedStorage::new(
+                    None,
                     (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, 2 * rows, columns)).collect(),
+                    None,
                     Some(&layouts),
                 )
                 .unwrap();
@@ -2334,10 +3029,12 @@ mod tests {
         );
         let rows = params.modulus_digits();
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2)
                 .into_par_iter()
                 .map(|_| GpuDCRTPolyMatrix::zero(&params, rows, columns))
                 .collect(),
+            None,
             Some(&layouts),
         )
         .unwrap();
@@ -2405,7 +3102,9 @@ mod tests {
         let report = rhs.allocation_report(&gadget).unwrap();
         assert_eq!(report.u64_workspace_limb_count, params.crt_depth());
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2).into_par_iter().map(|_| GpuDCRTPolyMatrix::zero(&params, 1, columns)).collect(),
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: report.expanded_rhs_workspace_bytes,
                 alignment: 8,
@@ -2488,10 +3187,12 @@ mod tests {
             kind: GpuPreparedSlotKind::PinnedHost,
         });
         let storage = GpuPreparedStorage::new(
+            None,
             [(rows, 1), (1, rows), (1, rows)]
                 .into_par_iter()
                 .map(|(rows, cols)| GpuDCRTPolyMatrix::zero(&target, rows, cols))
                 .collect(),
+            None,
             Some(&layouts),
         )
         .unwrap();
@@ -2571,9 +3272,13 @@ mod tests {
                 kind: GpuPreparedSlotKind::PinnedHost,
             },
         ];
-        let storage =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], Some(&layouts))
-                .unwrap();
+        let storage = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
+            Some(&layouts),
+        )
+        .unwrap();
         let requests = (1..=4)
             .map(|index| {
                 let slot = storage.slot_identity(index).unwrap();
@@ -2618,7 +3323,8 @@ mod tests {
         let (_, params) = parameters();
         let graph = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
         let storage =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None).unwrap();
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None, None)
+                .unwrap();
         GpuPreparedStorage::finish_setup(&[&storage]).unwrap();
         drop(graph);
         // Ordinary caller-owned work is legal after execute has returned.
@@ -2657,7 +3363,9 @@ mod tests {
         let (_, params) = parameters();
         let bytes = params.ring_dimension() as usize * std::mem::size_of::<u64>();
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: bytes * 2,
                 alignment: 8,
@@ -2723,7 +3431,9 @@ mod tests {
             .to_vec();
         let bytes = reference.len();
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, rows, 1)],
+            None,
             Some(
                 &[GpuPreparedWorkspaceLayout {
                     bytes,
@@ -2819,7 +3529,9 @@ mod tests {
             DCRTPolyUniformSampler::new().sample_uniform(&cpu, rows, 1, DistType::FinRingDist);
         let bytes = rows * params.ring_dimension() as usize * params.crt_depth() * 8;
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, rows, 1)],
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes,
                 alignment: 1,
@@ -2836,6 +3548,135 @@ mod tests {
         drop(params);
         drop(matrix);
         assert_eq!(gpu_device_memory_usage(device).unwrap().live_contexts, contexts);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_delayed_compact_upload_keeps_pinned_and_event_capacity_pending() {
+        use crate::{
+            matrix::{PolyMatrixSmallRhs, SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix},
+            poly::dcrt::gpu::GpuContextOpaque,
+            sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+        };
+        unsafe extern "C" {
+            fn gpu_test_context_stream_gate(context: *mut GpuContextOpaque) -> *mut c_void;
+            fn gpu_test_release_stream_gate(gate: *mut c_void);
+        }
+        struct Gate(*mut c_void);
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                unsafe { gpu_test_release_stream_gate(self.0) };
+            }
+        }
+        let (cpu, params) = parameters();
+        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(3)
+            .max(1);
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 1, columns, DistType::FinRingDist);
+        let compact = original.gadget_decompose(false, None).unwrap();
+        let payload = compact.to_canonical_coefficients().unwrap();
+        let bound = compact.max_coefficient_bound().clone();
+        let layouts = [
+            GpuPreparedWorkspaceLayout {
+                kind: GpuPreparedSlotKind::CompactPayload,
+                bytes: GpuSmallMatrix::allocation_bytes(&params, compact.rows(), columns, &bound)
+                    .unwrap(),
+                alignment: 256,
+            },
+            GpuPreparedWorkspaceLayout {
+                kind: GpuPreparedSlotKind::PinnedHost,
+                bytes: payload.len(),
+                alignment: 1,
+            },
+            GpuPreparedWorkspaceLayout {
+                kind: GpuPreparedSlotKind::CompletionEvent,
+                bytes: 0,
+                alignment: 1,
+            },
+        ];
+        let storage = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
+            Some(&layouts),
+        )
+        .unwrap();
+        let guard = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
+        // Declare the output first so panic unwinding releases the gate before
+        // destroying an output whose producer is still behind that gate.
+        let uploaded;
+        let gate = Gate(unsafe { gpu_test_context_stream_gate(params.ctx_raw()) });
+        assert!(!gate.0.is_null());
+        let dispatch = reserve(&storage, &[1, 2, 3]).unwrap().enter(Vec::new()).unwrap();
+        uploaded = GpuSmallMatrix::from_canonical_coefficients(
+            &params,
+            compact.rows(),
+            columns,
+            bound,
+            &payload,
+        )
+        .unwrap();
+        drop(dispatch.finish().unwrap());
+        assert_eq!(storage.poll_releases(&[]).unwrap(), vec![2, 3]);
+        let pinned = storage.slot_identity(2).unwrap().workspace_request(payload.len(), 1);
+        let event = storage.slot_identity(3).unwrap().workspace_request(0, 1);
+        assert!(!storage.fits(&[pinned]).unwrap());
+        assert!(!storage.fits(&[event]).unwrap());
+        drop(gate);
+        storage.poll_releases(&[3]).unwrap();
+        assert!(storage.fits(&[pinned, event]).unwrap());
+        drop(guard);
+        assert_eq!(uploaded.to_canonical_coefficients().unwrap(), payload);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_pinned_release_selection_makes_upload_capacity_reusable() {
+        use crate::sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler};
+        let (cpu, params) = parameters();
+        let rows = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(2)
+            .max(1);
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, rows, 1, DistType::FinRingDist);
+        let bytes = rows * params.ring_dimension() as usize * params.crt_depth() * 8;
+        let storage = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&params, rows, 1)],
+            None,
+            Some(&[
+                GpuPreparedWorkspaceLayout {
+                    bytes,
+                    alignment: 1,
+                    kind: GpuPreparedSlotKind::PinnedHost,
+                },
+                params.rns_transfer_workspace(params.crt_depth() - 1, rows, 1).unwrap(),
+                GpuPreparedWorkspaceLayout {
+                    bytes: 0,
+                    alignment: 1,
+                    kind: GpuPreparedSlotKind::CompletionEvent,
+                },
+            ]),
+        )
+        .unwrap();
+        let guard = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
+        let dispatch = reserve(&storage, &[0, 1, 2, 3]).unwrap().enter(Vec::new()).unwrap();
+        let matrix = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original);
+        drop(dispatch.finish().unwrap());
+        storage.poll_releases(&[]).unwrap();
+        // The completion and pinned allocation belong to the same retirement.
+        // Selecting the event must make progress without a global fence.
+        storage.poll_releases(&[3]).unwrap();
+        let event = storage.slot_identity(3).unwrap();
+        assert!(storage.fits(&[event.workspace_request(0, 1)]).unwrap());
+        storage.poll_releases(&[1]).unwrap();
+        let pinned = storage.slot_identity(1).unwrap();
+        assert!(storage.fits(&[pinned.workspace_request(bytes, 1)]).unwrap());
+        drop(guard);
+        assert_eq!(matrix.to_cpu_matrix(), original);
     }
 
     #[test]
@@ -2857,13 +3698,19 @@ mod tests {
             .unwrap_or(2);
         assert!(rows > 0);
         let first = GpuPreparedStorage::new(
+            None,
             (0..2).map(|_| GpuDCRTPolyMatrix::zero(&params, rows, 1)).collect(),
+            None,
             None,
         )
         .unwrap();
-        let second =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&related, rows, 1)], None)
-                .unwrap();
+        let second = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&related, rows, 1)],
+            None,
+            None,
+        )
+        .unwrap();
         let stores = [&first, &second];
         let fixed_request = first.slot_identity(0).unwrap().matrix_request(rows, 1, true);
         let claims = [
@@ -3018,19 +3865,27 @@ mod tests {
             )
             .unwrap();
         assert!(layout.additional_bytes > 0);
-        let source_store =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&source_params, rows, 1)], None)
-                .unwrap();
+        let source_store = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&source_params, rows, 1)],
+            None,
+            None,
+        )
+        .unwrap();
         let output_store = GpuPreparedStorage::new(
+            None,
             [(rows, 1), (1, rows), (1, rows)]
                 .into_par_iter()
                 .map(|(rows, columns)| GpuDCRTPolyMatrix::zero(&target, rows, columns))
                 .collect(),
             None,
+            None,
         )
         .unwrap();
         let workspace_store = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&target, 1, 1)],
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: layout.additional_bytes,
                 alignment: layout.alignment,
@@ -3118,14 +3973,22 @@ mod tests {
         let (cpu, params) = parameters();
         let foreign = GpuDCRTPolyParams::new(cpu.ring_dimension(), cpu.to_crt().0, 4, None);
         let first =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 2, 1)], None).unwrap();
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 2, 1)], None, None)
+                .unwrap();
         let second = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 2, 1), GpuDCRTPolyMatrix::zero(&params, 2, 1)],
+            None,
             None,
         )
         .unwrap();
-        let other =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&foreign, 2, 1)], None).unwrap();
+        let other = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&foreign, 2, 1)],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             reserve(&first, &[0]).unwrap().enter(vec![reserve(&other, &[0]).unwrap()]).is_err()
         );
@@ -3187,7 +4050,7 @@ mod tests {
             .into_par_iter()
             .map(|_| GpuDCRTPolyMatrix::zero(&params, maximum, maximum))
             .collect();
-        let storage = GpuPreparedStorage::new(backing, None).unwrap();
+        let storage = GpuPreparedStorage::new(None, backing, None, None).unwrap();
         let requests = (0..2)
             .map(|index| {
                 storage.slot_identity(index).unwrap().matrix_request(maximum, widths[0], true)
@@ -3273,7 +4136,9 @@ mod tests {
             .unwrap_or(3);
         assert!(columns >= 2);
         let storage = GpuPreparedStorage::new(
+            None,
             (0..2).into_par_iter().map(|_| GpuDCRTPolyMatrix::zero(&params, 2, columns)).collect(),
+            None,
             None,
         )
         .unwrap();
@@ -3347,7 +4212,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: requirements.additional_bytes * 2,
                 alignment: requirements.alignment,
@@ -3444,7 +4311,7 @@ mod tests {
                 .map(|_| GpuDCRTPolyMatrix::zero(&params, maximum, maximum))
                 .collect::<Vec<_>>();
             let original_pointer = backing[0].raw;
-            let mut storage = GpuPreparedStorage::new(backing, None).unwrap();
+            let mut storage = GpuPreparedStorage::new(None, backing, None, None).unwrap();
             let identity = storage.slot_identity(0).unwrap();
             params.fence_released_memory();
             storage.reset_occupied_high_water().unwrap();
@@ -3525,7 +4392,9 @@ mod tests {
     fn test_gpu_prepared_fit_rechecks_ownership_and_freezes_the_actual_request() {
         let (cpu, params) = parameters();
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 3, 7), GpuDCRTPolyMatrix::zero(&params, 3, 7)],
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: 64,
                 alignment: 8,
@@ -3537,6 +4406,67 @@ mod tests {
         let second = storage.slot_identity(1).unwrap();
         let workspace = storage.slot_identity(2).unwrap();
         let request = first.matrix_request(3, 2, true);
+        let snapshot = storage.snapshot().unwrap();
+        assert!(snapshot.iter().all(GpuPreparedSlotSnapshot::is_available));
+        let claims = snapshot
+            .iter()
+            .map(|slot| {
+                let identity = slot.identity();
+                if identity.kind() == GpuPreparedSlotKind::Matrix {
+                    GpuTracedClaim::matrix(
+                        identity.rows(),
+                        identity.columns(),
+                        identity.level().unwrap(),
+                        true,
+                    )
+                } else {
+                    GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
+                        kind: identity.kind(),
+                        bytes: identity.requested_backing_bytes(),
+                        alignment: identity.alignment(),
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        let planned = {
+            let guard = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
+            let planned = GpuPreparedSlotSnapshot::plan(&params, &claims).unwrap();
+            drop(guard);
+            planned
+        };
+        for (actual, planned) in snapshot.iter().zip(&planned) {
+            let mut capacity = planned.identity();
+            assert_eq!(capacity.storage_id(), 0, "unbacked plans have no reservable storage");
+            capacity.storage_id = actual.identity.storage_id;
+            capacity.backing_id = actual.identity.backing_id;
+            capacity.slot_id = actual.identity.slot_id;
+            assert_eq!(capacity, actual.identity);
+            assert_eq!(planned.auxiliary_capacity_bytes, actual.auxiliary_capacity_bytes);
+        }
+        let assignment = GpuPreparedSlotSnapshot::assign(
+            &params,
+            &planned.iter().map(|slot| (*slot, true)).collect::<Vec<_>>(),
+            &claims,
+        )
+        .unwrap();
+        assert!(assignment.iter().all(Option::is_some));
+        assert!(
+            storage.reserve(&[assignment[0].unwrap()]).is_err(),
+            "unbacked capacity must not authorize native use"
+        );
+        let layout_fits = |request: GpuPreparedRequest| {
+            let claim = GpuTracedClaim {
+                kind: request.kind as i32,
+                rows: request.rows,
+                columns: request.columns,
+                bytes: request.bytes,
+                alignment: request.alignment,
+                level: request.level,
+                format: request.format,
+            };
+            snapshot[request.slot_index].request(&params, &claim).unwrap().is_some()
+        };
+        assert!(layout_fits(request));
         assert!(storage.fits(&[request]).unwrap());
         for oversized in [
             first.matrix_request(4, 2, true),
@@ -3544,6 +4474,7 @@ mod tests {
             workspace.workspace_request(65, 8),
             workspace.workspace_request(32, 16),
         ] {
+            assert!(!layout_fits(oversized));
             assert!(!storage.fits(&[oversized]).unwrap());
             assert!(storage.reserve(&[request, oversized]).is_err());
             assert_eq!(storage.occupancy().unwrap().reserved_bytes(), 0);
@@ -3558,6 +4489,9 @@ mod tests {
         let both = [request, second.matrix_request(3, 2, true)];
         assert!(storage.fits(&both).unwrap());
         let competing = storage.reserve(&both[1..]).unwrap();
+        assert!(snapshot[1].is_available(), "an observation owns no live state");
+        assert!(!storage.snapshot().unwrap()[1].is_available());
+        assert!(layout_fits(both[1]), "capacity and availability are separate");
         assert!(!storage.fits(&both).unwrap());
         assert!(storage.reserve(&both).is_err());
         assert!(storage.fits(&[request]).unwrap(), "failed atomic reserve must return its prefix");
@@ -3630,7 +4564,9 @@ mod tests {
             .map(|index| GpuDCRTPolyMatrix::zero(&params, 1, if index == 0 { 2 } else { 1 }))
             .collect();
         let storage = GpuPreparedStorage::new(
+            None,
             backing,
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: required.additional_bytes * 2,
                 alignment: required.alignment,
@@ -3670,7 +4606,7 @@ mod tests {
             .into_par_iter()
             .map(|(rows, columns)| GpuDCRTPolyMatrix::zero(&params, rows, columns))
             .collect();
-        let mut storage = GpuPreparedStorage::new(backing, None).unwrap();
+        let mut storage = GpuPreparedStorage::new(None, backing, None, None).unwrap();
         let parent = reserve(&storage, &[0, 1, 2, 3, 4, 5]).unwrap();
         let capacity = storage.occupancy().unwrap().reserved_bytes();
         let mut rejected = std::ptr::null_mut();
@@ -3783,7 +4719,7 @@ mod tests {
             .into_par_iter()
             .map(|_| GpuDCRTPolyMatrix::zero(&params, 1, 1))
             .collect();
-        let mut storage = GpuPreparedStorage::new(backing, Some(&workspaces)).unwrap();
+        let mut storage = GpuPreparedStorage::new(None, backing, None, Some(&workspaces)).unwrap();
         let workspace_start = count * 2;
         let identity = storage.slot_identity(workspace_start + 3).unwrap();
         assert_eq!(identity.kind(), GpuPreparedSlotKind::BatchWorkspace);
@@ -3889,7 +4825,9 @@ mod tests {
             .map(|(rows, columns)| GpuDCRTPolyMatrix::zero(&target, rows, columns))
             .collect();
         let storage = GpuPreparedStorage::new(
+            None,
             backing,
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: requirements.additional_bytes,
                 alignment: requirements.alignment,
@@ -3944,7 +4882,9 @@ mod tests {
 
         let (cpu, params) = parameters();
         let mut storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 3, 2), GpuDCRTPolyMatrix::zero(&params, 3, 2)],
+            None,
             None,
         )
         .unwrap();
@@ -4010,7 +4950,9 @@ mod tests {
     fn test_gpu_prepared_occupancy_counts_reader_reuse_once_across_workers() {
         let (cpu, params) = parameters();
         let mut storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 5, 2), GpuDCRTPolyMatrix::zero(&params, 2, 5)],
+            None,
             None,
         )
         .unwrap();
@@ -4109,7 +5051,9 @@ mod tests {
             panic!("native storage preparation failed: {}", last_error_string());
         }
         let mut reservation = std::ptr::null_mut();
-        let status = unsafe { gpu_matrix_reserve(storage, std::ptr::null(), 0, &mut reservation) };
+        let status = unsafe {
+            gpu_matrix_reserve(storage, std::ptr::null(), 0, std::ptr::null(), &mut reservation)
+        };
         if status != 0 {
             unsafe { gpu_prepared_storage_destroy(storage) };
             panic!("native dispatch preparation failed: {}", last_error_string());
@@ -4147,7 +5091,7 @@ mod tests {
                 GpuDCRTPolyMatrix::zero(&params, 2, rows),
             ];
             let original = backing[0].raw;
-            let storage = GpuPreparedStorage::new(backing, None).unwrap();
+            let storage = GpuPreparedStorage::new(None, backing, None, None).unwrap();
             assert_eq!(storage.slot_count(), 2);
             let dispatch = reserve(&storage, &[0, 1]).unwrap().enter(Vec::new()).unwrap();
             let source = GpuDCRTPolyMatrix::identity_columns(&params, rows, 0, 2);
@@ -4173,10 +5117,59 @@ mod tests {
 
     #[test]
     #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_uninitialized_backing_reuses_slot_across_two_overwrites() {
+        for (rows, columns) in [(3, 2), (5, 3)] {
+            let (cpu, params) = parameters();
+            let storage = GpuPreparedStorage::new(
+                Some(&params),
+                Vec::new(),
+                Some(&[
+                    GpuTracedClaim::matrix(rows, columns, params.crt_depth() - 1, true),
+                    GpuTracedClaim::matrix(rows, columns, 0, false),
+                ]),
+                None,
+            )
+            .unwrap();
+            assert_eq!(storage.slot_count(), 2);
+            let coefficient = storage.slot_identity(1).unwrap();
+            assert_eq!(coefficient.level(), Some(0));
+            assert!(storage.fits(&[coefficient.matrix_request(rows, columns, false)]).unwrap());
+            let slot = storage.slot_identity(0).unwrap();
+            assert_eq!(slot.rows(), rows);
+            assert_eq!(slot.columns(), columns);
+
+            // Two complete writes of distinct nonzero contents into the same
+            // uninitialized prepared slot. Each write must land in the single
+            // backing this storage allocated, and each must read back exactly.
+            let mut recycled = None;
+            for column_start in [0, 1] {
+                let dispatch = reserve(&storage, &[0]).unwrap().enter(Vec::new()).unwrap();
+                let overwrite =
+                    GpuDCRTPolyMatrix::identity_columns(&params, rows, column_start, columns);
+                if let Some(previous) = recycled {
+                    assert_eq!(overwrite.raw, previous);
+                }
+                recycled = Some(overwrite.raw);
+                let expected = DCRTPolyMatrix::identity(&cpu, rows, None);
+                let column_end = column_start + columns;
+                assert_eq!(
+                    overwrite.to_cpu_matrix(),
+                    expected.slice(0, rows, column_start, column_end)
+                );
+                drop(overwrite);
+                drop(dispatch.finish().unwrap());
+            }
+            drop(storage);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
     fn test_gpu_prepared_matrix_dispatch_rejects_unplanned_allocations() {
         let (_, params) = parameters();
         let storage =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 2, 3)], None).unwrap();
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 2, 3)], None, None)
+                .unwrap();
         assert!(reserve(&storage, &[0, 0]).is_err());
         let dispatch = reserve(&storage, &[0]).unwrap().enter(Vec::new()).unwrap();
         let create = |rows, columns| {
@@ -4244,10 +5237,12 @@ mod tests {
         let (cpu, params) = parameters();
         let storage = std::sync::Arc::new(
             GpuPreparedStorage::new(
+                None,
                 vec![
                     GpuDCRTPolyMatrix::zero(&params, 5, 2),
                     GpuDCRTPolyMatrix::zero(&params, 2, 5),
                 ],
+                None,
                 None,
             )
             .unwrap(),
@@ -4294,9 +5289,12 @@ mod tests {
     fn test_gpu_prepared_reservations_rollback_without_activation() {
         let (_, params) = parameters();
         let first =
-            GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(&params, 2, 3)], None).unwrap();
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 2, 3)], None, None)
+                .unwrap();
         let second = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 2, 3), GpuDCRTPolyMatrix::zero(&params, 2, 3)],
+            None,
             None,
         )
         .unwrap();
@@ -4352,7 +5350,9 @@ mod tests {
     fn test_gpu_prepared_nested_activation_rolls_back_only_incoming_reservation() {
         let (cpu, params) = parameters();
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 2, 3), GpuDCRTPolyMatrix::zero(&params, 2, 3)],
+            None,
             None,
         )
         .unwrap();
@@ -4376,10 +5376,12 @@ mod tests {
         let (second_cpu, second_params) = parameters();
         assert_ne!(first_params.ctx_raw(), second_params.ctx_raw());
         let result = GpuPreparedStorage::new(
+            None,
             vec![
                 GpuDCRTPolyMatrix::zero(&first_params, 3, 2),
                 GpuDCRTPolyMatrix::zero(&second_params, 3, 2),
             ],
+            None,
             None,
         );
         assert!(result.is_err());

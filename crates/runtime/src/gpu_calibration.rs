@@ -850,25 +850,32 @@ impl GpuDeviceCalibration {
     }
 }
 
-/// One active owner's invocation-local budget. Fixed preparation is already
-/// charged when candidate headroom is observed. The exact budget snapshot also
-/// includes every retained output owner, once, before temporary width search.
+/// One active owner's invocation-local budget, observed before its region is
+/// reserved. The candidate requirement itself carries the region's complete
+/// fixed, output and temporary claim, so a requirement is compared against
+/// `budget_bytes - charged_bytes_before_region`; nothing is pre-charged for the
+/// retained owners and no lease is needed to evaluate a candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuWidthAdmission {
     pub device: usize,
     pub remaining_columns: usize,
-    /// Capacity in the pilot's units, used only as a slope hint. Prepared
-    /// capacity excludes retained reservations; physical backing stays charged.
+    /// Capacity in the pilot's units, used only as a slope hint. The prepared
+    /// variant is the participant storage's current free occupancy, which still
+    /// includes whatever this region would claim; the exact native fit corrects
+    /// any overestimate. Physical backing stays charged separately.
     pub candidate_capacity: GpuCandidateCapacity,
     pub budget_bytes: u64,
-    pub charged_bytes_after_outputs: u64,
+    pub charged_bytes_before_region: u64,
 }
 
 /// Requirements for one width in a provider-declared monotone allocation class.
 /// Prepared requests use actual native storage, never a cached fit boolean or a
-/// scalar payload estimate. All fixed/output reservations must already be held.
-/// This covers the listed resources only; the invocation's finite resource seal
-/// and managed capacity checks remain necessary before dispatch is permitted.
+/// scalar payload estimate. A requirement must cover the complete region at that
+/// width — fixed owners, retained outputs and temporary claims — because they are
+/// held simultaneously and can compete for the same native slot. Nothing is
+/// reserved yet. This covers the listed resources only; the invocation's finite
+/// resource seal and managed capacity checks remain necessary before dispatch is
+/// permitted.
 pub enum GpuTemporaryRequirement<'a> {
     /// Independently justified bound on remaining managed allocation demand.
     BoundedBytes(u64),
@@ -881,6 +888,40 @@ pub enum GpuTemporaryRequirement<'a> {
         /// Keep the same ordered owners across all widths in this class.
         resources: Vec<(&'a GpuPreparedStorage, Vec<GpuPreparedRequest>)>,
     },
+}
+
+/// Fit of one storage's complete simultaneous role group at one candidate width.
+///
+/// Retained fixed owners, retained outputs and candidate scratch are held at the
+/// same time, so two roles can resolve to the same native slot. That is a
+/// rejection of the candidate, not a stale or malformed request: a narrower
+/// width may still fit. A request whose slot identity is stale, or whose native
+/// layout is invalid, remains an error.
+pub(crate) enum GpuPreparedRoleFit {
+    Fits,
+    Rejected,
+    Invalid(String),
+}
+
+/// Shared fit decision for one storage's complete role group. The native width
+/// search and the calibrated width search both use this single decision, so one
+/// candidate is never accepted by one rule and rejected by another.
+pub(crate) fn gpu_prepared_role_fit(
+    storage: &GpuPreparedStorage,
+    requests: &[GpuPreparedRequest],
+) -> GpuPreparedRoleFit {
+    // One native slot carries one simultaneous role. A repeated slot is
+    // therefore a candidate that does not fit; an actual reservation still
+    // rejects a request group that claims a native slot twice.
+    let mut slots = HashSet::with_capacity(requests.len());
+    if requests.iter().any(|request| !slots.insert(request.slot_key())) {
+        return GpuPreparedRoleFit::Rejected;
+    }
+    match storage.fits(requests) {
+        Ok(true) => GpuPreparedRoleFit::Fits,
+        Ok(false) => GpuPreparedRoleFit::Rejected,
+        Err(message) => GpuPreparedRoleFit::Invalid(message),
+    }
 }
 
 struct GpuRequirementFit {
@@ -930,10 +971,16 @@ impl GpuTemporaryRequirement<'_> {
                 }
                 // These are host-only native layout/state queries. Evaluate every
                 // participating context, including separate related CRT owners.
+                // A candidate whose roles overlap one native slot is rejected;
+                // the search below then continues at a narrower width.
                 let fits = resources
                     .par_iter()
-                    .map(|(storage, requests)| {
-                        storage.fits(requests).map_err(GpuCalibrationError::NativeFit)
+                    .map(|(storage, requests)| match gpu_prepared_role_fit(storage, requests) {
+                        GpuPreparedRoleFit::Fits => Ok(true),
+                        GpuPreparedRoleFit::Rejected => Ok(false),
+                        GpuPreparedRoleFit::Invalid(message) => {
+                            Err(GpuCalibrationError::NativeFit(message))
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(GpuRequirementFit {
@@ -1005,19 +1052,21 @@ impl GpuCalibrationProfile {
         }
     }
 
-    /// Largest class-valid widths after complete output reservation. Requirements
-    /// must cover a monotone interval of the exact production resource class.
-    /// Native prepared fitting checks each storage's current layouts/availability;
-    /// a byte slope only limits the candidate. The callback must not allocate on
-    /// the GPU, submit, wait, or release retained preparation/output reservations.
+    /// Largest class-valid widths whose complete region fits. Requirements must
+    /// cover a monotone interval of the exact production resource class,
+    /// including its retained owners. Native prepared fitting checks each
+    /// storage's current layouts/availability; a byte slope only limits the
+    /// candidate. The callback must not allocate on the GPU, submit, wait, or
+    /// acquire a retained preparation/output reservation.
     ///
     /// This is an advisory search, not an executable memory permit. After choosing
-    /// widths, atomically reserve every native request and any separately bounded
-    /// remaining demand. Dispatch additionally requires an accepted resource seal.
-    /// The post-output charge is the accepted initial adjusted residency plus
-    /// live managed allocation reservations. Prepared backing is included once;
-    /// slot reuse adds no managed allocation charge. Later physical observations
-    /// do not change this charge. Do not derive it from logical request bytes.
+    /// widths, atomically reserve the fitted native requests and any separately
+    /// bounded remaining demand. Dispatch additionally requires an accepted
+    /// resource seal. The pre-region charge is the accepted initial adjusted
+    /// residency plus live managed allocation reservations. Prepared backing is
+    /// included once; slot reuse adds no managed allocation charge. Later physical
+    /// observations do not change this charge. Do not derive it from logical
+    /// request bytes.
     pub fn derive_widths<'a>(
         &self,
         owners: &[GpuWidthAdmission],
@@ -1059,11 +1108,11 @@ impl GpuCalibrationProfile {
                 }
                 let available = owner
                     .budget_bytes
-                    .checked_sub(owner.charged_bytes_after_outputs)
+                    .checked_sub(owner.charged_bytes_before_region)
                     .ok_or(GpuCalibrationError::InvalidAdmission {
                     device: owner.device,
                     budget_bytes: owner.budget_bytes,
-                    charged_bytes: owner.charged_bytes_after_outputs,
+                    charged_bytes: owner.charged_bytes_before_region,
                 })?;
                 if let GpuCandidateCapacity::DefaultPoolHeadroomBytes(bytes) =
                     owner.candidate_capacity
@@ -1186,7 +1235,7 @@ impl GpuCalibrationProfile {
                 .expect("an active owner contributes a role width");
             let calibration = self.role(*device)?;
             let fit = temporary_requirements(*device, &calibration.class, width)?
-                .fit(calibration, owner.budget_bytes - owner.charged_bytes_after_outputs)?;
+                .fit(calibration, owner.budget_bytes - owner.charged_bytes_before_region)?;
             if !fit.fits || fit.storage_ids != *storage_ids {
                 return Err(GpuCalibrationError::UnstableTemporaryRequirement {
                     device: *device,
@@ -1657,7 +1706,7 @@ mod tests {
                         budget_bytes.saturating_sub(memory.resident_bytes),
                     ),
                     budget_bytes,
-                    charged_bytes_after_outputs: memory.resident_bytes,
+                    charged_bytes_before_region: memory.resident_bytes,
                 }
             })
             .collect()
@@ -2310,7 +2359,7 @@ mod tests {
             remaining_columns: 40,
             candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(1_000),
             budget_bytes: 1_000,
-            charged_bytes_after_outputs: 900,
+            charged_bytes_before_region: 900,
         };
         let widths = profile
             .derive_widths(&[owner], |_, queried_class, columns| {
@@ -2323,7 +2372,7 @@ mod tests {
         assert_eq!(widths.nonzero, None);
         // Output-only work fits even when retained outputs consume the budget:
         // their pilot slope limits the candidate, but is not charged twice.
-        let full_output = GpuWidthAdmission { charged_bytes_after_outputs: 1_000, ..owner };
+        let full_output = GpuWidthAdmission { charged_bytes_before_region: 1_000, ..owner };
         assert_eq!(
             profile
                 .derive_widths(&[full_output], |_, _, _| Ok(GpuTemporaryRequirement::BoundedBytes(
@@ -2352,7 +2401,7 @@ mod tests {
             remaining_columns: usize::MAX,
             candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(usize::MAX as u64),
             budget_bytes: usize::MAX as u64,
-            charged_bytes_after_outputs: usize::MAX as u64 - 2,
+            charged_bytes_before_region: usize::MAX as u64 - 2,
         };
         assert_eq!(
             wide.derive_widths(&[wide_owner], |_, _, columns| Ok(
@@ -2386,7 +2435,7 @@ mod tests {
                 remaining_columns: 25,
                 candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(100),
                 budget_bytes: 100,
-                charged_bytes_after_outputs: 10,
+                charged_bytes_before_region: 10,
             };
             assert_eq!(
                 profile
@@ -2427,21 +2476,21 @@ mod tests {
                 remaining_columns: 0,
                 candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(0),
                 budget_bytes: 0,
-                charged_bytes_after_outputs: 0,
+                charged_bytes_before_region: 0,
             },
             GpuWidthAdmission {
                 device: 2,
                 remaining_columns: 9,
                 candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(0),
                 budget_bytes: 100,
-                charged_bytes_after_outputs: 100,
+                charged_bytes_before_region: 100,
             },
             GpuWidthAdmission {
                 device: 3,
                 remaining_columns: 6,
                 candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(0),
                 budget_bytes: 100,
-                charged_bytes_after_outputs: 100,
+                charged_bytes_before_region: 100,
             },
         ];
         let widths = profile
@@ -2590,7 +2639,7 @@ mod tests {
             remaining_columns: 4,
             candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(500),
             budget_bytes: 500,
-            charged_bytes_after_outputs: 0,
+            charged_bytes_before_region: 0,
         };
         assert_eq!(
             profile.derive_widths(&[owner, owner], linear_requirement),
@@ -2598,7 +2647,7 @@ mod tests {
         );
         assert!(matches!(
             profile.derive_widths(
-                &[GpuWidthAdmission { charged_bytes_after_outputs: 501, ..owner }],
+                &[GpuWidthAdmission { charged_bytes_before_region: 501, ..owner }],
                 linear_requirement
             ),
             Err(GpuCalibrationError::InvalidAdmission { .. })
@@ -2730,7 +2779,7 @@ mod tests {
             remaining_columns: 0,
             candidate_capacity: GpuCandidateCapacity::DefaultPoolHeadroomBytes(0),
             budget_bytes: 100,
-            charged_bytes_after_outputs: 100,
+            charged_bytes_before_region: 100,
         };
         let active = GpuWidthAdmission { device: 2, remaining_columns: 4, ..inactive };
         assert_eq!(
@@ -2787,7 +2836,9 @@ mod tests {
         let input = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original);
         let transfer = params.rns_transfer_workspace(params.crt_depth() - 1, 2, 1).unwrap();
         let storage = GpuPreparedStorage::new(
+            None,
             (0..3).map(|_| GpuDCRTPolyMatrix::zero(&params, 2, columns)).collect(),
+            None,
             Some(&[
                 transfer,
                 GpuPreparedWorkspaceLayout {
@@ -2885,8 +2936,13 @@ mod tests {
         let stores = [&params, &related]
             .into_iter()
             .map(|params| {
-                GpuPreparedStorage::new(vec![GpuDCRTPolyMatrix::zero(params, 1, columns)], None)
-                    .unwrap()
+                GpuPreparedStorage::new(
+                    None,
+                    vec![GpuDCRTPolyMatrix::zero(params, 1, columns)],
+                    None,
+                    None,
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let claims = stores
@@ -2971,7 +3027,9 @@ mod tests {
         let params = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 4, None);
         let scratch_limit = maximum / 2;
         let mut storage = GpuPreparedStorage::new(
+            None,
             (0..2).into_par_iter().map(|_| GpuDCRTPolyMatrix::zero(&params, 2, maximum)).collect(),
+            None,
             Some(&[GpuPreparedWorkspaceLayout {
                 bytes: 8 * scratch_limit,
                 alignment: 8,
@@ -3018,7 +3076,7 @@ mod tests {
             // Synthetic ledger values exercise independent dimensions, not a
             // claim that this test has physically sealed its CUDA execution.
             budget_bytes: 100,
-            charged_bytes_after_outputs: 100,
+            charged_bytes_before_region: 100,
         };
         assert!(
             calibration.candidate_width(owner.candidate_capacity, maximum).unwrap() > scratch_limit
@@ -3050,7 +3108,7 @@ mod tests {
         assert!(storage.reserve(&requests(scratch_limit)).is_err());
         assert!(matches!(
             profile.derive_widths(
-                &[GpuWidthAdmission { charged_bytes_after_outputs: 0, ..owner }],
+                &[GpuWidthAdmission { charged_bytes_before_region: 0, ..owner }],
                 requirements
             ),
             Err(GpuCalibrationError::InsufficientPreparedCapacity { device: 0, .. })
@@ -3062,7 +3120,7 @@ mod tests {
         );
         assert_eq!(
             profile.derive_widths(
-                &[GpuWidthAdmission { charged_bytes_after_outputs: 101, ..owner }],
+                &[GpuWidthAdmission { charged_bytes_before_region: 101, ..owner }],
                 |_, _, _| panic!("invalid physical charge reached native fit")
             ),
             Err(GpuCalibrationError::InvalidAdmission {
@@ -3123,10 +3181,12 @@ mod tests {
             .map(|_| {
                 let params = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 4, None);
                 GpuPreparedStorage::new(
+                    None,
                     (0..maximum)
                         .into_par_iter()
                         .map(|_| GpuDCRTPolyMatrix::zero(&params, 1, 1))
                         .collect(),
+                    None,
                     None,
                 )
                 .unwrap()
@@ -3153,7 +3213,7 @@ mod tests {
                 remaining_columns: maximum,
                 candidate_capacity: GpuCandidateCapacity::PreparedAvailableBytes(maximum as u64),
                 budget_bytes: 100,
-                charged_bytes_after_outputs: 100,
+                charged_bytes_before_region: 100,
             })
             .collect::<Vec<_>>();
         let requests = |device: usize, start: usize, end: usize| {

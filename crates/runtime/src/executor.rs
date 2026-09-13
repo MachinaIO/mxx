@@ -25,6 +25,7 @@ use mxx_ir_core::{
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -39,7 +40,7 @@ use tracing::info;
 use crate::gpu_invocation::{GpuColumnSourceLayout, GpuInvocation, preflight};
 
 #[cfg(feature = "gpu")]
-pub(crate) mod gpu_plan;
+pub mod gpu_plan;
 mod plan_cache;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,15 +90,353 @@ pub struct PreimageProgressConfig {
 
 /// Shared execution/estimation contract for intermediate matrix Family outputs.
 /// Durable exports use the artifact path regardless of this RAM-staging decision.
+/// The single staging rule for a parallel-loop output family: whether the
+/// admitted wave must cross the host boundary instead of keeping device owners.
+/// `total_count` is the loop's whole body count, never the number of bodies in
+/// the current wave, so the action admitted for one wave cannot be rewritten by
+/// a shorter tail wave.
 pub fn stage_matrix_family_output(
     scope: &FrozenGraphScopeId,
-    count: usize,
+    total_count: usize,
     wave_size: usize,
     retained: bool,
 ) -> bool {
     matches!(scope, FrozenGraphScopeId::Root) ||
-        count > wave_size ||
+        total_count > wave_size ||
         (matches!(scope, FrozenGraphScopeId::SequentialBody { .. }) && retained)
+}
+
+/// The single retention rule of a parallel loop's output families: a port is
+/// retained when its owning scope exports that port. Root loops stage every
+/// port. The rule is per output port, never per loop node, because a body can
+/// export some of its ports and consume others locally.
+pub fn retained_loop_output_ports(
+    validated: &ValidatedGraph,
+    scope: &FrozenGraphScopeId,
+    loop_node: NodeId,
+    child_outputs: &[WireRef],
+) -> Vec<bool> {
+    let owning = validated.source.scope(scope);
+    child_outputs
+        .iter()
+        .enumerate()
+        .map(|(port, _)| {
+            matches!(scope, FrozenGraphScopeId::SequentialBody { .. }) &&
+                owning.is_some_and(|owning| {
+                    owning.outputs().contains(&WireRef { node: loop_node, port: Port(port as u32) })
+                })
+        })
+        .collect()
+}
+
+/// Per-output-port staging actions of one bounded wave.
+///
+/// `retained` is [`retained_loop_output_ports`] of the same loop; `total_count`
+/// is the loop's whole body count, never the number of bodies in this wave.
+pub fn staged_loop_outputs(
+    scope: &FrozenGraphScopeId,
+    total_count: usize,
+    wave_size: usize,
+    retained: &[bool],
+) -> Vec<bool> {
+    retained
+        .iter()
+        .map(|retained| stage_matrix_family_output(scope, total_count, wave_size, *retained))
+        .collect()
+}
+
+/// Metadata-only description of one bounded parallel-loop wave, handed to
+/// [`Backend::admit_wave`] before that wave's lazy inputs are materialized.
+///
+/// It borrows the validated child scope, the owning scope's actual values (lazy
+/// descriptors and existing owners, never clones of payload owners) and the
+/// parent parameters, so a backend can choose a capacity-correct wave size
+/// without executing a body, importing a candidate, or allocating a GPU value.
+pub struct WaveAdmissionRequest<'a, B: Backend> {
+    /// Scope that owns the parallel loop.
+    scope: &'a FrozenGraphScopeId,
+    loop_node: NodeId,
+    /// Validated graph that owns the child scope.
+    validated: &'a ValidatedGraph,
+    /// Validated body scope whose bodies this wave instantiates.
+    child_id: &'a FrozenGraphScopeId,
+    /// Validated body-scope input wires, one per instance argument.
+    child_inputs: &'a [WireRef],
+    /// Validated body-scope output wires, one per result port.
+    child_outputs: &'a [WireRef],
+    /// The loop's argument wires, one per body input in `input_modes` order.
+    arguments: &'a [WireRef],
+    /// Parameters of the owning scope. A candidate body index adds that
+    /// instance's `bindings` evaluation to this environment.
+    parent_env: &'a ParamEnv,
+    /// The owning scope's live values as the executor holds them: lazy
+    /// descriptors, host-staged values and existing owners. Admission may read
+    /// their identity and shapes but must not materialize or clone them.
+    values: &'a BTreeMap<WireRef, RuntimeValue<B>>,
+    /// Broadcast owners retained from earlier waves, indexed by placement and
+    /// argument. Absent before the first admission; no payload is loaded here.
+    broadcast_inputs: Option<&'a [Vec<Option<RuntimeValue<B>>>]>,
+    capture_trace: bool,
+    /// Total body count of the loop; waves never rewrite this value.
+    total_count: usize,
+    /// Index of the first body of this wave.
+    next_index: usize,
+    /// Bodies left from `next_index`, i.e. `total_count - next_index`.
+    remaining: usize,
+    /// Caller's per-wave cap (`ExecutionConfig::max_parallel_instances`).
+    caller_cap: usize,
+    /// Per output port, whether that family must stay retained for its owning
+    /// scope. Length equals `child_outputs.len()`.
+    retained_output_ports: Vec<bool>,
+}
+
+/// A borrowed body input before materialization. Eager selections point at the
+/// exact member, preserving alias identity. Lazy family selections retain the
+/// family descriptor and member index without cloning or loading its payload.
+pub struct WaveInput<'a, B: Backend> {
+    pub wire: WireRef,
+    pub value: &'a RuntimeValue<B>,
+    pub member: Option<usize>,
+}
+
+impl<'a, B: Backend> WaveAdmissionRequest<'a, B> {
+    /// Build the request for the wave starting at `next_index`. Retention of
+    /// each output port is derived here, so the executor and the planner cannot
+    /// disagree about which ports cross the host boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        validated: &'a ValidatedGraph,
+        scope: &'a FrozenGraphScopeId,
+        loop_node: NodeId,
+        child_id: &'a FrozenGraphScopeId,
+        child_inputs: &'a [WireRef],
+        child_outputs: &'a [WireRef],
+        arguments: &'a [WireRef],
+        parent_env: &'a ParamEnv,
+        values: &'a BTreeMap<WireRef, RuntimeValue<B>>,
+        broadcast_inputs: Option<&'a [Vec<Option<RuntimeValue<B>>>]>,
+        capture_trace: bool,
+        total_count: usize,
+        next_index: usize,
+        caller_cap: usize,
+    ) -> Self {
+        let retained_output_ports =
+            retained_loop_output_ports(validated, scope, loop_node, child_outputs);
+        Self {
+            scope,
+            loop_node,
+            validated,
+            child_id,
+            child_inputs,
+            child_outputs,
+            arguments,
+            parent_env,
+            values,
+            broadcast_inputs,
+            capture_trace,
+            total_count,
+            next_index,
+            remaining: total_count.saturating_sub(next_index),
+            caller_cap,
+            retained_output_ports,
+        }
+    }
+
+    pub fn scope(&self) -> &FrozenGraphScopeId {
+        self.scope
+    }
+
+    /// Validated graph that owns [`Self::child`].
+    pub fn validated(&self) -> &ValidatedGraph {
+        self.validated
+    }
+
+    /// Validated body scope this wave instantiates. Its execution order, wire
+    /// types and liveness are the planning contract for the candidate bodies.
+    pub fn child(&self) -> &GraphScope {
+        self.validated.source.scope(self.child_id).expect("validated child scope")
+    }
+
+    pub fn child_id(&self) -> &FrozenGraphScopeId {
+        self.child_id
+    }
+
+    pub fn child_inputs(&self) -> &[WireRef] {
+        self.child_inputs
+    }
+
+    pub fn child_outputs(&self) -> &[WireRef] {
+        self.child_outputs
+    }
+
+    /// The loop's argument wires, one per body input in `input_modes` order.
+    pub fn arguments(&self) -> &[WireRef] {
+        self.arguments
+    }
+
+    /// Parameters of the owning scope, before the per-index bindings.
+    pub fn parent_env(&self) -> &ParamEnv {
+        self.parent_env
+    }
+
+    /// Live values of the owning scope. Borrowed, never materialized here.
+    pub fn values(&self) -> &BTreeMap<WireRef, RuntimeValue<B>> {
+        self.values
+    }
+
+    /// All retained placement replicas, including those not selected by the
+    /// candidate's first body. Admission must account for their live owners.
+    pub fn broadcast_inputs(&self) -> Option<&[Vec<Option<RuntimeValue<B>>>]> {
+        self.broadcast_inputs
+    }
+
+    pub fn selected_inputs(&self, index: usize) -> Result<Vec<WaveInput<'_, B>>, ExecutionError> {
+        self.arguments
+            .iter()
+            .zip(self.child_inputs)
+            .zip(self.input_modes())
+            .enumerate()
+            .map(|(argument, ((source, wire), mode))| {
+                let value = self.values.get(source).ok_or(ExecutionError::MissingWire(*source))?;
+                let offset = match mode {
+                    LoopInputMode::Broadcast => {
+                        let value = self.broadcast_inputs.map_or(value, |placements| {
+                            placements[index % placements.len()][argument]
+                                .as_ref()
+                                .expect("retained broadcast owner")
+                        });
+                        return Ok(WaveInput { wire: *wire, value, member: None })
+                    }
+                    LoopInputMode::Zip => 0,
+                    LoopInputMode::ZipOffset { offset } => *offset,
+                };
+                let count = match value {
+                    RuntimeValue::IndexedFamily(values) => values.len(),
+                    RuntimeValue::LazyArtifactFamily { descriptor, .. } |
+                    RuntimeValue::StagedArtifactFamily { descriptor, .. } => {
+                        descriptor.family_count.unwrap_or(0)
+                    }
+                    _ => return Err(ExecutionError::ValueKind(*source)),
+                };
+                let member = index
+                    .checked_add(offset)
+                    .filter(|member| *member < count)
+                    .ok_or_else(|| ExecutionError::SelectIndexOutOfRange {
+                        node: self.loop_node,
+                        index: BigInt::from(index) + BigInt::from(offset),
+                        count,
+                    })?;
+                Ok(match value {
+                    RuntimeValue::IndexedFamily(values) => {
+                        WaveInput { wire: *wire, value: &values[member], member: None }
+                    }
+                    _ => WaveInput { wire: *wire, value, member: Some(member) },
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve a candidate's actual loop bindings without reading artifact
+    /// payloads or constructing runtime values. Execution uses this same method.
+    pub fn body_bindings(&self, index: usize) -> Result<ParamEnv, ExecutionError> {
+        let node = self
+            .validated
+            .source
+            .scope(self.scope)
+            .expect("validated parent scope")
+            .node(self.loop_node)
+            .expect("validated loop node");
+        let NodeKind::ParallelLoop(body) = node.kind() else {
+            unreachable!("parallel wave request")
+        };
+        self.parent_env.child(&body.bindings, Some((body.index_slot, index))).map_err(|error| {
+            ExecutionError::Expression { node: self.loop_node, message: error.to_string() }
+        })
+    }
+
+    pub fn input_modes(&self) -> &[LoopInputMode] {
+        let node = self
+            .validated
+            .source
+            .scope(self.scope)
+            .expect("validated parent scope")
+            .node(self.loop_node)
+            .expect("validated loop node");
+        let NodeKind::ParallelLoop(body) = node.kind() else {
+            unreachable!("parallel wave request")
+        };
+        &body.input_modes
+    }
+
+    pub fn capture_trace(&self) -> bool {
+        self.capture_trace
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    pub fn next_index(&self) -> usize {
+        self.next_index
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    pub fn caller_cap(&self) -> usize {
+        self.caller_cap
+    }
+
+    pub fn retained_output_ports(&self) -> &[bool] {
+        &self.retained_output_ports
+    }
+
+    /// Staging action of every output port for an accepted wave size. This is
+    /// the single staging rule, and it is evaluated from the loop's total
+    /// count, so a later (shorter) wave cannot silently choose an action other
+    /// than the one admitted for the earlier waves.
+    pub fn staged_outputs(&self, wave_size: usize) -> Vec<bool> {
+        staged_loop_outputs(self.scope, self.total_count, wave_size, &self.retained_output_ports)
+    }
+
+    /// Freeze an accepted wave size, clamped to the caller cap and to the
+    /// bodies that actually remain, together with its staging actions.
+    pub fn admission_of_size(&self, wave_size: usize) -> WaveAdmission {
+        let wave_size = wave_size.min(self.caller_cap).min(self.remaining).max(1);
+        WaveAdmission {
+            wave_size,
+            staged_outputs: self.staged_outputs(wave_size),
+            reservation: None,
+        }
+    }
+
+    /// Backend-neutral admission: the whole remaining prefix the caller
+    /// allows, without reservation or discovery.
+    pub fn default_admission(&self) -> WaveAdmission {
+        self.admission_of_size(self.caller_cap.min(self.remaining))
+    }
+}
+
+/// An accepted bounded wave: its frozen instance count and the staging action
+/// of every output port for that wave.
+///
+/// This is an internal input contract, not a validated user input: the
+/// executor consumes it verbatim. A backend must return exactly
+/// `1 <= wave_size <= caller_cap.min(remaining)` and one staging action per
+/// child output port; [`WaveAdmissionRequest::admission_of_size`] and
+/// [`WaveAdmissionRequest::default_admission`] enforce both for every ordinary
+/// implementation. Only a backend that fabricates a wave by hand owes the check
+/// itself, so the executor does not re-validate the arithmetic on every wave.
+pub struct WaveAdmission {
+    pub wave_size: usize,
+    pub staged_outputs: Vec<bool>,
+    /// Exclusive region ownership committed by admission. The executor keeps
+    /// this token through input materialization, nested bodies and output
+    /// publication, then drops it before admitting another wave. Escaping
+    /// native outputs retain their own backing independently of this token.
+    /// CPU admission has no device ownership and leaves this field empty.
+    pub reservation: Option<Box<dyn std::any::Any>>,
 }
 
 pub struct ExecutionResult<B: Backend> {
@@ -949,7 +1288,13 @@ where
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
     let graph_admission = if config.prepared_gpu_admission {
         backend
-            .prepare_graph_admission(validated, capture_trace, &inputs, false)
+            .prepare_graph_admission(
+                validated,
+                capture_trace,
+                &inputs,
+                config.max_parallel_instances.get(),
+                false,
+            )
             .map_err(|error| ExecutionError::Backend(error.to_string()))?
     } else {
         None
@@ -1268,6 +1613,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::TensorSumRows { left, right, rows: &row_sum.rows },
                         )
                         .map_err(Self::backend_error)?;
@@ -1276,6 +1622,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::SumRows { value: matrices[0], rows: &row_sum.rows },
                         )
                         .map_err(Self::backend_error)?;
@@ -1518,6 +1865,7 @@ where
                             #[cfg(feature = "gpu")]
                             preflight(
                                 self.backend,
+                                None,
                                 GpuInvocation::TensorSumRows {
                                     left: &source,
                                     right: &right,
@@ -1530,6 +1878,7 @@ where
                             #[cfg(feature = "gpu")]
                             preflight(
                                 self.backend,
+                                None,
                                 GpuInvocation::SumRows { value: &source, rows: &row_sum.rows },
                             )
                             .map_err(Self::backend_error)?;
@@ -1559,6 +1908,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::GadgetDecomposeRowBlocks {
                                 blocks: &references,
                                 small: *small,
@@ -1590,6 +1940,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::MultiplySmallRhsRowBlocks {
                                 blocks: &references,
                                 right: &rhs,
@@ -1624,6 +1975,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::AddRowBlocks { blocks: &references, right: &right },
                         )
                         .map_err(Self::backend_error)?;
@@ -1647,6 +1999,7 @@ where
                     )?;
                 } else if indices.len() > 1 &&
                     self.execute_parallel_matrix_node_by_placement(
+                        scope_id,
                         placements,
                         envs,
                         &node,
@@ -1824,6 +2177,7 @@ where
 
     fn execute_parallel_matrix_node_by_placement(
         &mut self,
+        scope_id: &FrozenGraphScopeId,
         placements: &[usize],
         envs: &[ParamEnv],
         node: &ExecutableNode<'_>,
@@ -1835,7 +2189,8 @@ where
             NodeKind::MatrixBinary(_) |
                 NodeKind::MatrixMulAccumulate { .. } |
                 NodeKind::MatrixNegate |
-                NodeKind::MatrixScale { .. }
+                NodeKind::MatrixScale { .. } |
+                NodeKind::RingAutomorphism { .. }
         ) {
             return Ok(false);
         }
@@ -1846,7 +2201,9 @@ where
                 .filter(|index| placements[*index] == placement)
                 .collect::<Vec<_>>();
             if !indices.is_empty() {
-                self.execute_parallel_matrix_node(placement, envs, node, values, &indices)?;
+                self.execute_parallel_matrix_node(
+                    scope_id, placement, envs, node, values, &indices,
+                )?;
             }
         }
         Ok(true)
@@ -1854,12 +2211,17 @@ where
 
     fn execute_parallel_matrix_node(
         &mut self,
+        scope_id: &FrozenGraphScopeId,
         placement: usize,
         envs: &[ParamEnv],
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
         indices: &[usize],
     ) -> Result<(), ExecutionError> {
+        // The validated-IR metadata thread exists only in GPU builds; the CPU
+        // path keeps the identical dispatch order without it.
+        #[cfg(not(feature = "gpu"))]
+        let _ = scope_id;
         self.set_placement(placement)?;
         let outputs = match node.kind {
             NodeKind::MatrixBinary(operation) => {
@@ -1871,23 +2233,31 @@ where
                     inputs.push((left, right));
                 }
                 #[cfg(feature = "gpu")]
-                self.backend
-                    .preflight_gpu_operations(
-                        &inputs
-                            .iter()
-                            .map(|(left, right)| {
-                                (
-                                    placement,
-                                    GpuInvocation::Binary {
-                                        operation: *operation,
-                                        left: left.as_ref(),
-                                        right: right.as_ref(),
-                                    },
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(Self::backend_error)?;
+                {
+                    let requests = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(position, (left, right))| {
+                            Ok((
+                                placement,
+                                Some(gpu_node_operation(
+                                    self.validated,
+                                    scope_id,
+                                    &envs[indices[position]],
+                                    node,
+                                )?),
+                                GpuInvocation::Binary {
+                                    operation: *operation,
+                                    left: left.as_ref(),
+                                    right: right.as_ref(),
+                                },
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ExecutionError>>()?;
+                    self.backend
+                        .preflight_gpu_operations(&requests)
+                        .map_err(Self::backend_error)?;
+                }
                 match operation {
                     MatrixBinaryOp::Add => self.backend.add_batch(inputs),
                     MatrixBinaryOp::Subtract => self.backend.sub_batch(inputs),
@@ -1918,14 +2288,27 @@ where
                     requests.push(MatrixMulAccumulateRequest { products, bias });
                 }
                 #[cfg(feature = "gpu")]
-                self.backend
-                    .preflight_gpu_operations(
-                        &requests
-                            .iter()
-                            .map(|request| (placement, GpuInvocation::Accumulate { request }))
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(Self::backend_error)?;
+                {
+                    let preflight_requests = requests
+                        .iter()
+                        .enumerate()
+                        .map(|(position, request)| {
+                            Ok((
+                                placement,
+                                Some(gpu_node_operation(
+                                    self.validated,
+                                    scope_id,
+                                    &envs[indices[position]],
+                                    node,
+                                )?),
+                                GpuInvocation::Accumulate { request },
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ExecutionError>>()?;
+                    self.backend
+                        .preflight_gpu_operations(&preflight_requests)
+                        .map_err(Self::backend_error)?;
+                }
                 self.backend.matrix_mul_accumulate_batch(requests).map_err(Self::backend_error)?
             }
             NodeKind::MatrixNegate => {
@@ -1935,16 +2318,27 @@ where
                     inputs.push(self.matrix(instance, node.args[0])?);
                 }
                 #[cfg(feature = "gpu")]
-                self.backend
-                    .preflight_gpu_operations(
-                        &inputs
-                            .iter()
-                            .map(|value| {
-                                (placement, GpuInvocation::Negate { value: value.as_ref() })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(Self::backend_error)?;
+                {
+                    let requests = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(position, value)| {
+                            Ok((
+                                placement,
+                                Some(gpu_node_operation(
+                                    self.validated,
+                                    scope_id,
+                                    &envs[indices[position]],
+                                    node,
+                                )?),
+                                GpuInvocation::Negate { value: value.as_ref() },
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ExecutionError>>()?;
+                    self.backend
+                        .preflight_gpu_operations(&requests)
+                        .map_err(Self::backend_error)?;
+                }
                 self.backend.negate_batch(inputs).map_err(Self::backend_error)?
             }
             NodeKind::MatrixScale { scalar } => {
@@ -1959,20 +2353,61 @@ where
                     inputs.push((value, scalar));
                 }
                 #[cfg(feature = "gpu")]
-                self.backend
-                    .preflight_gpu_operations(
-                        &inputs
-                            .iter()
-                            .map(|(value, scalar)| {
-                                (
-                                    placement,
-                                    GpuInvocation::ScaleInteger { value: value.as_ref(), scalar },
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(Self::backend_error)?;
+                {
+                    let requests = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(position, (value, scalar))| {
+                            Ok((
+                                placement,
+                                Some(gpu_node_operation(
+                                    self.validated,
+                                    scope_id,
+                                    &envs[indices[position]],
+                                    node,
+                                )?),
+                                GpuInvocation::ScaleInteger { value: value.as_ref(), scalar },
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ExecutionError>>()?;
+                    self.backend
+                        .preflight_gpu_operations(&requests)
+                        .map_err(Self::backend_error)?;
+                }
                 self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
+            }
+            NodeKind::RingAutomorphism { index: expression } => {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for &instance in indices {
+                    let index = self.eval_usize(node.id, expression, &envs[instance])?;
+                    inputs.push((self.matrix(&mut values[instance], node.args[0])?, index));
+                }
+                #[cfg(feature = "gpu")]
+                {
+                    let requests = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(position, (value, index))| {
+                            Ok((
+                                placement,
+                                Some(gpu_node_operation(
+                                    self.validated,
+                                    scope_id,
+                                    &envs[indices[position]],
+                                    node,
+                                )?),
+                                GpuInvocation::RingAutomorphism {
+                                    value: value.as_ref(),
+                                    index: *index,
+                                },
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ExecutionError>>()?;
+                    self.backend
+                        .preflight_gpu_operations(&requests)
+                        .map_err(Self::backend_error)?;
+                }
+                self.backend.ring_automorphism_batch(inputs).map_err(Self::backend_error)?
             }
             _ => unreachable!("matrix batch kind checked by caller"),
         };
@@ -2555,7 +2990,16 @@ where
     ) -> Result<(), ExecutionError> {
         match &node.kind {
             NodeKind::Input { name, wire_type: _, artifact } => {
-                if let Some(artifact) = artifact {
+                // Only the owning scope loads an artifact input from the
+                // artifact store. Every other scope is caller-bound: its input
+                // is supplied by the parent call that instantiated it (a loop
+                // broadcast owner, a loop family member, or a subgraph-call
+                // argument), and the descriptor copied into the child node only
+                // records which outer value the capture came from. Re-deriving
+                // that descriptor here would load the artifact once per body
+                // and discard the owner the caller already materialized.
+                let stored = artifact.as_ref().filter(|_| *scope_id == FrozenGraphScopeId::Root);
+                if let Some(artifact) = stored {
                     let wire = WireRef { node: node.id, port: Port(0) };
                     let wire_id = WireId { instantiation_path: path.to_vec(), wire };
                     let concrete = self
@@ -2620,6 +3064,11 @@ where
                         },
                     );
                 } else {
+                    // Caller-bound input: the owning scope's declared input, or
+                    // a child scope's capture of an outer artifact value. The
+                    // supplied value may still be a lazy descriptor when its
+                    // parent has not materialized it, exactly like any other
+                    // lazy input.
                     let value = inputs
                         .get(name)
                         .cloned()
@@ -2658,8 +3107,12 @@ where
                 let ty =
                     self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::Constant { ty: &ty, value, env })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
+                    GpuInvocation::Constant { ty: &ty, value, env },
+                )
+                .map_err(Self::backend_error)?;
                 let matrix =
                     self.backend.constant_matrix(&ty, value, env).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(matrix));
@@ -2678,8 +3131,12 @@ where
                     small: false,
                 };
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::Constant { ty: &ty, value: &gadget, env })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    None,
+                    GpuInvocation::Constant { ty: &ty, value: &gadget, env },
+                )
+                .map_err(Self::backend_error)?;
                 let public =
                     self.backend.constant_matrix(&ty, &gadget, env).map_err(Self::backend_error)?;
                 self.put(
@@ -2761,6 +3218,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::PolynomialFromValues {
                         ty: &ty,
                         values: &members,
@@ -2830,6 +3288,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::Binary { operation: *operation, left: &left, right: &right },
                 )
                 .map_err(Self::backend_error)?;
@@ -2847,6 +3306,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::MultiplySmallRhs { left: &lhs, right: &rhs },
                 )
                 .map_err(Self::backend_error)?;
@@ -2874,8 +3334,12 @@ where
                 };
                 let request = MatrixMulAccumulateRequest { products, bias };
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::Accumulate { request: &request })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
+                    GpuInvocation::Accumulate { request: &request },
+                )
+                .map_err(Self::backend_error)?;
                 let output =
                     self.backend.matrix_mul_accumulate(request).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
@@ -2883,8 +3347,12 @@ where
             NodeKind::MatrixNegate => {
                 let input = self.matrix(values, node.args[0])?;
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::Negate { value: &input })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
+                    GpuInvocation::Negate { value: &input },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self.backend.negate(&input).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2895,6 +3363,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::ScaleInteger { value: &input, scalar: &scalar },
                 )
                 .map_err(Self::backend_error)?;
@@ -2905,8 +3374,12 @@ where
             NodeKind::Transpose => {
                 let input = self.matrix(values, node.args[0])?;
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::Transpose { value: &input })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
+                    GpuInvocation::Transpose { value: &input },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self.backend.transpose(&input).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2933,6 +3406,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::Slice {
                         value: &input,
                         rows: rows.as_ref(),
@@ -2950,8 +3424,12 @@ where
                 let left = self.matrix(values, node.args[0])?;
                 let right = self.matrix(values, node.args[1])?;
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::Tensor { left: &left, right: &right })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
+                    GpuInvocation::Tensor { left: &left, right: &right },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self.backend.tensor(&left, &right).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2963,8 +3441,12 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 let inputs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::Concat { inputs: &inputs, axis: *axis })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
+                    GpuInvocation::Concat { inputs: &inputs, axis: *axis },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self.backend.concat(&inputs, *axis).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
@@ -2975,9 +3457,15 @@ where
                     minimum: BigInt::from(0),
                     maximum: &ty.modulus - BigInt::from(1),
                 };
+                #[cfg(feature = "gpu")]
+                let operation = gpu_node_operation(self.validated, scope_id, env, node)?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
                     #[cfg(feature = "gpu")]
-                    preflight(backend, GpuInvocation::SampleUniform { ty: &ty, range: &range })?;
+                    preflight(
+                        backend,
+                        Some(operation),
+                        GpuInvocation::SampleUniform { ty: &ty, range: &range },
+                    )?;
                     backend.sample_uniform(&ty, &range)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -2995,9 +3483,15 @@ where
                         .evaluate(env)
                         .map_err(|error| self.expression_error(node.id, error))?,
                 };
+                #[cfg(feature = "gpu")]
+                let operation = gpu_node_operation(self.validated, scope_id, env, node)?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
                     #[cfg(feature = "gpu")]
-                    preflight(backend, GpuInvocation::SampleUniform { ty: &ty, range: &range })?;
+                    preflight(
+                        backend,
+                        Some(operation),
+                        GpuInvocation::SampleUniform { ty: &ty, range: &range },
+                    )?;
                     backend.sample_uniform(&ty, &range)
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
@@ -3011,10 +3505,13 @@ where
                 let max_coefficient_bound = max_coefficient_bound
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
+                #[cfg(feature = "gpu")]
+                let operation = gpu_node_operation(self.validated, scope_id, env, node)?;
                 let value = self.sample_matrix(path, wire, &ty, |backend| {
                     #[cfg(feature = "gpu")]
                     preflight(
                         backend,
+                        Some(operation),
                         GpuInvocation::SampleGaussian {
                             ty: &ty,
                             sigma,
@@ -3093,6 +3590,7 @@ where
                             #[cfg(feature = "gpu")]
                             preflight(
                                 backend,
+                                None,
                                 GpuInvocation::SampleHash {
                                     ty: &ty,
                                     variant: *variant,
@@ -3133,6 +3631,7 @@ where
                                 #[cfg(feature = "gpu")]
                                 preflight(
                                     backend,
+                                    None,
                                     GpuInvocation::SampleHash {
                                         ty: &ty,
                                         variant: *variant,
@@ -3238,6 +3737,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        None,
                         GpuInvocation::GadgetDecompose {
                             value: &target,
                             small,
@@ -3280,6 +3780,7 @@ where
                             #[cfg(feature = "gpu")]
                             preflight(
                                 backend,
+                                None,
                                 GpuInvocation::SamplePreimage {
                                     schema: &schema,
                                     sigma,
@@ -3336,6 +3837,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::GadgetDecompose {
                         value: &input,
                         small: *small,
@@ -3359,6 +3861,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                         GpuInvocation::ModulusSwitch { value: &input, destination: &ty },
                     )
                     .map_err(Self::backend_error)?;
@@ -3367,6 +3870,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                         GpuInvocation::CenteredRebase { value: &input, destination: &ty },
                     )
                     .map_err(Self::backend_error)?;
@@ -3375,6 +3879,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                         GpuInvocation::ReduceModulus { value: &input, destination: &ty },
                     )
                     .map_err(Self::backend_error)?;
@@ -3390,6 +3895,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::RnsModUp {
                         value: &input,
                         destination: &ty,
@@ -3419,6 +3925,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::RnsModDown {
                         value: &input,
                         destination: &ty,
@@ -3442,6 +3949,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::CenteredExtendSmall { value: &input, destination: &ty },
                 )
                 .map_err(Self::backend_error)?;
@@ -3459,6 +3967,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                         GpuInvocation::BlockModSwitch {
                             value: &input,
                             destination: &ty,
@@ -3471,6 +3980,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                         GpuInvocation::CenteredExtend { value: &input, destination: &ty },
                     )
                     .map_err(Self::backend_error)?;
@@ -3483,8 +3993,12 @@ where
                 let input = self.matrix(values, node.args[0])?;
                 let index = self.eval_usize(node.id, index, env)?;
                 #[cfg(feature = "gpu")]
-                preflight(self.backend, GpuInvocation::RingAutomorphism { value: &input, index })
-                    .map_err(Self::backend_error)?;
+                preflight(
+                    self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
+                    GpuInvocation::RingAutomorphism { value: &input, index },
+                )
+                .map_err(Self::backend_error)?;
                 let output =
                     self.backend.ring_automorphism(&input, index).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
@@ -3505,6 +4019,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::Constant {
                         ty: &ty,
                         value: &mxx_ir_core::node::ConstantMatrix::Identity,
@@ -3519,6 +4034,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::ScaleInteger { value: &identity, scalar: &coefficient },
                 )
                 .map_err(Self::backend_error)?;
@@ -3570,6 +4086,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    Some(gpu_node_operation(self.validated, scope_id, env, node)?),
                     GpuInvocation::CrtRecompose {
                         levels: &levels,
                         plaintext_moduli: &plaintext_moduli,
@@ -3613,6 +4130,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::PackPolynomialCoefficients {
                         ty: &ty,
                         bits: &bits,
@@ -3668,8 +4186,9 @@ where
                 // device. Only the carried outputs cross the host-RAM boundary;
                 // staging every reduction level would transfer the same data
                 // repeatedly. Large families still stream to host memory.
-                let wave_size =
-                    self.backend.parallel_wave_size(self.config.max_parallel_instances.get());
+                // Whether an output family is staged, per output port, is
+                // decided by wave admission below from the loop's retention
+                // requirements.
                 let staged = (0..child.outputs().len())
                     .map(|port| {
                         self.staged_family_descriptor(scope_id, path, node.id, port as u32, count)
@@ -3711,36 +4230,81 @@ where
                 }
                 let parent_placement = self.backend.active_placement();
                 let loop_result = (|| {
-                    let mut broadcast_inputs = (0..placement_count)
-                        .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
-                        .collect::<Vec<_>>();
-                    for (argument, (wire, mode)) in
-                        node.args.iter().zip(&loop_node.input_modes).enumerate()
-                    {
-                        if matches!(mode, LoopInputMode::Broadcast) {
-                            let placed = self.values_for_placements(self.value(values, *wire)?)?;
-                            for (placement, value) in placed.into_iter().enumerate() {
-                                broadcast_inputs[placement][argument] = Some(value);
-                            }
-                        }
-                    }
-                    self.set_placement(parent_placement)?;
+                    // Broadcast inputs are loop invariants, but a lazy artifact
+                    // stays a descriptor until the first wave has been admitted:
+                    // the admitted size must never be decided after that load.
+                    // The per-placement owners are built once for this loop and
+                    // reused by every later wave of it. Each body's capture
+                    // input is bound to that owner, so the loop-level
+                    // materialization is the only load of a broadcast artifact.
+                    let mut broadcast_inputs: Option<Arc<Vec<Vec<Option<RuntimeValue<B>>>>>> = None;
                     let mut wave_start = 0;
                     while wave_start < count {
+                        // Admit before materializing this wave's lazy inputs;
+                        // the accepted size and its staging actions stay frozen
+                        // for the whole wave.
+                        // Retain only the cache container while the first wave
+                        // initializes it; payload owners are never cloned for admission.
+                        let retained_broadcasts = broadcast_inputs.clone();
+                        let request = WaveAdmissionRequest::new(
+                            self.validated,
+                            scope_id,
+                            node.id,
+                            &child_id,
+                            child.inputs(),
+                            child.outputs(),
+                            &node.args,
+                            env,
+                            values,
+                            retained_broadcasts.as_deref().map(Vec::as_slice),
+                            self.trace.is_some(),
+                            count,
+                            wave_start,
+                            self.config.max_parallel_instances.get(),
+                        );
+                        let admission =
+                            self.backend.admit_wave(&request).map_err(Self::backend_error)?;
+                        let wave_size = admission.wave_size;
+                        let child_envs = (wave_start..wave_start + wave_size)
+                            .into_par_iter()
+                            .map(|index| request.body_bindings(index))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if broadcast_inputs.is_none() {
+                            let mut placed = (0..placement_count)
+                                .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
+                                .collect::<Vec<_>>();
+                            let mut broadcast_arguments = BTreeMap::<WireRef, usize>::new();
+                            for (argument, (wire, mode)) in
+                                node.args.iter().zip(&loop_node.input_modes).enumerate()
+                            {
+                                if matches!(mode, LoopInputMode::Broadcast) {
+                                    if let Some(&previous) = broadcast_arguments.get(wire) {
+                                        for values in &mut placed {
+                                            values[argument] = values[previous].clone();
+                                        }
+                                        continue;
+                                    }
+                                    broadcast_arguments.insert(*wire, argument);
+                                    let placed_values =
+                                        self.values_for_placements(self.value(values, *wire)?)?;
+                                    for (placement, value) in placed_values.into_iter().enumerate()
+                                    {
+                                        placed[placement][argument] = Some(value);
+                                    }
+                                }
+                            }
+                            self.set_placement(parent_placement)?;
+                            broadcast_inputs = Some(Arc::new(placed));
+                        }
+                        let broadcast_inputs =
+                            broadcast_inputs.as_ref().expect("broadcast inputs prepared");
                         let wave_end = count.min(wave_start.saturating_add(wave_size));
                         let wave_len = wave_end - wave_start;
-                        let mut child_envs = Vec::with_capacity(wave_len);
                         let mut child_paths = Vec::with_capacity(wave_len);
                         let mut child_inputs = Vec::with_capacity(wave_len);
                         let mut child_placements = Vec::with_capacity(wave_len);
                         for index in wave_start..wave_end {
                             let placement = index % placement_count;
-                            child_envs.push(self.child_env(
-                                env,
-                                &loop_node.bindings,
-                                Some((loop_node.index_slot, index)),
-                                node.id,
-                            )?);
                             let mut child_path = path.to_vec();
                             child_path.push(InstantiationFrame {
                                 call: node.id,
@@ -3752,10 +4316,9 @@ where
                                 child,
                                 node,
                                 &loop_node.input_modes,
-                                index,
+                                &request.selected_inputs(index)?,
                                 placement,
                                 &broadcast_inputs[placement],
-                                values,
                             )?);
                         }
                         let instances = self.execute_instances_batch(
@@ -3772,6 +4335,11 @@ where
                             self.set_placement(child_placements[offset])?;
                             for (port, value) in instance.outputs.into_iter().enumerate() {
                                 if let Some((name, descriptor)) = &staged[port] {
+                                    // A nested loop may return a selected staged
+                                    // member. Resolve only this published value,
+                                    // while the containing wave still owns its
+                                    // import and serialization capacity.
+                                    let value = self.materialize_value(value)?;
                                     let (payload, bytes) = encode_artifact(
                                         self.backend,
                                         &value,
@@ -3825,24 +4393,7 @@ where
                                             &ty,
                                             declarations.clone(),
                                         )?
-                                    } else if !stage_matrix_family_output(
-                                        scope_id,
-                                        count,
-                                        wave_size,
-                                        matches!(
-                                            scope_id,
-                                            FrozenGraphScopeId::SequentialBody { .. }
-                                        ) && self
-                                            .validated
-                                            .source
-                                            .scope(scope_id)
-                                            .expect("scope")
-                                            .outputs()
-                                            .contains(&WireRef {
-                                                node: node.id,
-                                                port: Port(port as u32),
-                                            }),
-                                    ) {
+                                    } else if !admission.staged_outputs[port] {
                                         value
                                     } else if let RuntimeValue::Matrix(matrix) = value {
                                         let wire =
@@ -3873,6 +4424,9 @@ where
                                 }
                             }
                         }
+                        // Keep containing capacity through output serialization,
+                        // including its transfer scratch. Errors unwind the same token.
+                        drop(admission);
                         wave_start = wave_end;
                     }
                     for (port, family) in families.into_iter().enumerate() {
@@ -4199,6 +4753,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::GadgetDecompose {
                         value: &target,
                         small,
@@ -4288,6 +4843,7 @@ where
                                 #[cfg(feature = "gpu")]
                                 preflight(
                                     self.backend,
+                                    None,
                                     GpuInvocation::ImportSmallMatrix {
                                         schema: &request.schema,
                                         bytes: &bytes,
@@ -4345,6 +4901,11 @@ where
                                     let request = &pending.request;
                                     (
                                         *placement,
+                                        // The production preimage sampler is an
+                                        // algorithmic step with its own traced
+                                        // claim plan; the invocation determines
+                                        // the operation.
+                                        None,
                                         GpuInvocation::SamplePreimage {
                                             schema: &pending.schema,
                                             sigma: request.sigma,
@@ -4452,6 +5013,7 @@ where
                                     #[cfg(feature = "gpu")]
                                     preflight(
                                         self.backend,
+                                        None,
                                         GpuInvocation::ImportSmallMatrix {
                                             schema: &request.schema,
                                             bytes: &bytes,
@@ -4517,6 +5079,10 @@ where
                                 let request = &pending.request;
                                 (
                                     *placement,
+                                    // The production preimage sampler is an
+                                    // algorithmic step with its own traced claim
+                                    // plan; the invocation determines the operation.
+                                    None,
                                     GpuInvocation::SamplePreimage {
                                         schema: &pending.schema,
                                         sigma: request.sigma,
@@ -4649,8 +5215,12 @@ where
                 return match recorded {
                     RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => {
                         #[cfg(feature = "gpu")]
-                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes: &bytes })
-                            .map_err(Self::backend_error)?;
+                        preflight(
+                            self.backend,
+                            None,
+                            GpuInvocation::ImportMatrix { ty, bytes: &bytes },
+                        )
+                        .map_err(Self::backend_error)?;
                         self.backend.matrix_from_bytes(ty, &bytes)
                     }
                     .map(|value| (value, false))
@@ -4698,7 +5268,7 @@ where
             SamplingMode::Replay(replayer) => match replayer.get(&site)? {
                 RecordedValue::Matrix { bytes, .. } => {
                     #[cfg(feature = "gpu")]
-                    preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes })
+                    preflight(self.backend, None, GpuInvocation::ImportMatrix { ty, bytes })
                         .map_err(Self::backend_error)?;
                     self.backend.matrix_from_bytes(ty, bytes)
                 }
@@ -4753,6 +5323,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::ImportSmallMatrix {
                                 schema,
                                 bytes: &bytes,
@@ -4812,6 +5383,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        None,
                         GpuInvocation::ImportSmallMatrix { schema, bytes, semantic_kind },
                     )
                     .map_err(Self::backend_error)?;
@@ -4876,8 +5448,12 @@ where
                 ) if matrix_type == *ty && secret_type == *ty && bytes == public_bytes => {
                     let public = {
                         #[cfg(feature = "gpu")]
-                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes: &bytes })
-                            .map_err(Self::backend_error)?;
+                        preflight(
+                            self.backend,
+                            None,
+                            GpuInvocation::ImportMatrix { ty, bytes: &bytes },
+                        )
+                        .map_err(Self::backend_error)?;
                         self.backend.matrix_from_bytes(ty, &bytes)
                     }
                     .map_err(Self::backend_error)?;
@@ -4885,6 +5461,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::ImportTrapdoor { ty, bytes: &trapdoor_bytes },
                         )
                         .map_err(Self::backend_error)?;
@@ -4898,6 +5475,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
                         )
                         .map_err(Self::backend_error)?;
@@ -4940,6 +5518,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
                 )
                 .map_err(Self::backend_error)?;
@@ -4951,6 +5530,7 @@ where
                     #[cfg(feature = "gpu")]
                     preflight(
                         self.backend,
+                        None,
                         GpuInvocation::SampleTrapdoor { ty, sigma, gadget_base, digit_count },
                     )
                     .map_err(Self::backend_error)?;
@@ -4977,7 +5557,7 @@ where
                 let public = match replayer.get(&matrix_site)? {
                     RecordedValue::Matrix { bytes, .. } => {
                         #[cfg(feature = "gpu")]
-                        preflight(self.backend, GpuInvocation::ImportMatrix { ty, bytes })
+                        preflight(self.backend, None, GpuInvocation::ImportMatrix { ty, bytes })
                             .map_err(Self::backend_error)?;
                         self.backend.matrix_from_bytes(ty, bytes)
                     }
@@ -4991,6 +5571,7 @@ where
                         #[cfg(feature = "gpu")]
                         preflight(
                             self.backend,
+                            None,
                             GpuInvocation::ImportTrapdoor { ty, bytes: trapdoor_bytes },
                         )
                         .map_err(Self::backend_error)?;
@@ -5036,6 +5617,7 @@ where
                 #[cfg(feature = "gpu")]
                 preflight(
                     self.backend,
+                    None,
                     GpuInvocation::ImportCpuStaging { ty: &matrix_type, bytes: &bytes },
                 )
                 .map_err(Self::backend_error)?;
@@ -5487,10 +6069,9 @@ where
         child: &GraphScope,
         node: &ExecutableNode<'_>,
         modes: &[LoopInputMode],
-        index: usize,
+        selected: &[WaveInput<'_, B>],
         placement: usize,
         broadcast_inputs: &[Option<RuntimeValue<B>>],
-        values: &BTreeMap<WireRef, RuntimeValue<B>>,
     ) -> Result<BTreeMap<String, RuntimeValue<B>>, ExecutionError> {
         let names = child.inputs().iter().map(|wire| {
             let input = child.node(wire.node).expect("validated child input node");
@@ -5503,10 +6084,10 @@ where
             return Err(ExecutionError::ValueKind(WireRef { node: node.id, port: Port(0) }));
         }
         names
-            .zip(node.args)
             .zip(modes)
             .zip(broadcast_inputs)
-            .map(|(((name, wire), mode), broadcast)| {
+            .zip(selected)
+            .map(|(((name, mode), broadcast), selected)| {
                 let value = match mode {
                     LoopInputMode::Broadcast => {
                         broadcast.clone().ok_or(ExecutionError::ValueKind(WireRef {
@@ -5515,22 +6096,36 @@ where
                         }))?
                     }
                     LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
-                        let offset = match mode {
-                            LoopInputMode::Zip => 0,
-                            LoopInputMode::ZipOffset { offset } => *offset,
-                            LoopInputMode::Broadcast => unreachable!(),
+                        let value = if let Some(member) = selected.member {
+                            match selected.value {
+                                RuntimeValue::LazyArtifactFamily {
+                                    production,
+                                    name,
+                                    descriptor,
+                                } => RuntimeValue::LazyArtifact {
+                                    production: production.clone(),
+                                    name: name.clone(),
+                                    index: Some(member),
+                                    descriptor: descriptor.clone(),
+                                },
+                                RuntimeValue::StagedArtifactFamily {
+                                    production,
+                                    name,
+                                    descriptor,
+                                    lifetime,
+                                } => RuntimeValue::StagedArtifact {
+                                    production: production.clone(),
+                                    name: name.clone(),
+                                    index: member,
+                                    descriptor: descriptor.clone(),
+                                    lifetime: lifetime.clone(),
+                                },
+                                _ => unreachable!("selected lazy family input"),
+                            }
+                        } else {
+                            selected.value.clone()
                         };
-                        let index = index.checked_add(offset).ok_or(
-                            ExecutionError::SelectIndexOutOfRange {
-                                node: node.id,
-                                index: BigInt::from(index),
-                                count: self.family_count(values, *wire)?,
-                            },
-                        )?;
-                        self.value_for_placement(
-                            self.family_member_value(values, *wire, index)?,
-                            placement,
-                        )?
+                        self.value_for_placement(value, placement)?
                     }
                 };
                 Ok((name.clone(), value))
@@ -5545,18 +6140,7 @@ where
         loop_index: Option<(u32, usize)>,
         node: NodeId,
     ) -> Result<ParamEnv, ExecutionError> {
-        let mut env = parent.clone();
-        if let Some((slot, index)) = loop_index {
-            env.loop_indices.insert(slot, BigInt::from(index));
-        }
-        let expression_env = env.clone();
-        for (name, expression) in bindings {
-            let value = expression
-                .evaluate(&expression_env)
-                .map_err(|error| self.expression_error(node, error))?;
-            env.integers.insert(name.clone(), value);
-        }
-        Ok(env)
+        parent.child(bindings, loop_index).map_err(|error| self.expression_error(node, error))
     }
 
     fn eval_usize(
@@ -5690,7 +6274,7 @@ fn hash_runtime_value<B: Backend>(
         }
         RuntimeValue::HostMatrix { matrix_type, bytes } => {
             #[cfg(feature = "gpu")]
-            preflight(backend, GpuInvocation::ImportCpuStaging { ty: matrix_type, bytes })
+            preflight(backend, None, GpuInvocation::ImportCpuStaging { ty: matrix_type, bytes })
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let matrix = backend
                 .matrix_from_cpu_staging_bytes(matrix_type, bytes)
@@ -5920,8 +6504,12 @@ fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
     match value {
         RuntimeValue::HostMatrix { matrix_type, bytes } => {
             #[cfg(feature = "gpu")]
-            preflight(backend, GpuInvocation::ImportCpuStaging { ty: &matrix_type, bytes: &bytes })
-                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            preflight(
+                backend,
+                None,
+                GpuInvocation::ImportCpuStaging { ty: &matrix_type, bytes: &bytes },
+            )
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             let matrix = backend
                 .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
@@ -6038,6 +6626,22 @@ pub fn encode_artifact<B: Backend>(
     }
 }
 
+/// Validated IR metadata of one dispatched node: the node kind, its concrete
+/// argument and output wire types in port order, and this instance's parameter
+/// bindings. It is the single authority the GPU lowering uses for the node's
+/// resource operation, and it reads the same validated wire types the dispatcher
+/// already uses for this scope.
+#[cfg(feature = "gpu")]
+fn gpu_node_operation(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+    env: &ParamEnv,
+    node: &ExecutableNode<'_>,
+) -> Result<crate::gpu_invocation::GpuNodeOperation, ExecutionError> {
+    crate::gpu_invocation::GpuNodeOperation::new(validated, scope_id, node.id, env)
+        .map_err(ExecutionError::Backend)
+}
+
 pub fn decode_artifact<B: Backend>(
     backend: &mut B,
     artifact_type: ArtifactType,
@@ -6121,11 +6725,12 @@ mod tests {
     use crate::{
         artifact::MemoryArtifactStore,
         backend::poly::{CpuDcrtBackend, cpu_backend},
+        session::{SessionAliasDescriptor, SessionStatus},
     };
     use mxx_dsl::{DslContext, Family, HashTag, Int, MatType, Ring, Subgraph, iterate, parallel};
     use mxx_ir_core::{
         Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, ValueHandle, WireType,
-        artifact::ArtifactConfidentiality,
+        artifact::{ArtifactConfidentiality, Manifest},
         node::{IntBinaryOp, IntCompareOp, NodeKind, RealBinaryOp},
     };
     use mxx_primitives::{
@@ -6138,6 +6743,430 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn wave_admission_staging_is_per_output_port() {
+        let parallel_scope = FrozenGraphScopeId::ParallelBody {
+            parent: Box::new(FrozenGraphScopeId::Root),
+            owner: NodeId(0),
+        };
+        let sequential_scope = FrozenGraphScopeId::SequentialBody {
+            parent: Box::new(FrozenGraphScopeId::Root),
+            owner: NodeId(0),
+        };
+        // A two-port body whose owning scope exports only its first port. The
+        // rule is per output port, so the unexported port must not inherit the
+        // exported port's staging action, which a node-level rule would do.
+        let retained = [true, false];
+        assert_eq!(staged_loop_outputs(&sequential_scope, 2, 2, &retained), vec![true, false]);
+        assert_eq!(
+            staged_loop_outputs(&sequential_scope, 2, 2, &[retained[0] || retained[1]; 2]),
+            vec![true, true]
+        );
+
+        // The action is evaluated from the loop's whole body count, so a full
+        // wave and a shorter tail wave of the same loop agree, while treating
+        // the tail as its own total count would silently switch the action.
+        let bounded = [false];
+        let scope = parallel_scope;
+        assert_eq!(staged_loop_outputs(&scope, 19, 7, &bounded), vec![true]);
+        assert_eq!(staged_loop_outputs(&scope, 19, 2, &bounded), vec![true]);
+        assert_eq!(staged_loop_outputs(&scope, 2, 2, &bounded), vec![false]);
+
+        // A sequential body keeps its own exported port retained even when the
+        // whole loop fits in one admitted wave.
+        assert_eq!(staged_loop_outputs(&sequential_scope, 2, 2, &[true, false]), vec![true, false]);
+    }
+
+    #[test]
+    fn wave_admission_request_reports_every_body_output_port() {
+        use mxx_dsl::parallel;
+
+        // A two-leaf parallel body: the loop node has one output port per body
+        // leaf, and every port's staging action comes from the shared rule.
+        let context = DslContext::new("wave-admission-ports");
+        let values = context.int_family_input("values", 4);
+        let pairs = parallel(2, |index| {
+            let value = values.at(index);
+            Ok((value.clone(), value))
+        })
+        .expect("two-port parallel body");
+        let built = context.output("pairs", pairs).expect("output").build().expect("build");
+        let validated = built.validate(&ParamEnv::default()).expect("validation");
+        let mut backend = PlacementProbeBackend::default();
+        backend.admission_probe = Some(AdmissionProbe::default());
+        let result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::from([(
+                "values".to_owned(),
+                RuntimeValue::IndexedFamily(
+                    (0..4).map(|value| RuntimeValue::Int(BigInt::from(value))).collect(),
+                ),
+            )]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(1).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("execution");
+        assert!(!result.outputs.is_empty(), "both body output ports are results");
+
+        let admissions = backend.admission_probe.as_ref().unwrap().admissions();
+        assert_eq!(admissions.len(), 2, "two bodies with a one-body wave cap");
+        for (wave, (scope, next_index, wave_size, retained, staged)) in
+            admissions.iter().enumerate()
+        {
+            assert_eq!(*scope, FrozenGraphScopeId::Root);
+            assert_eq!(*next_index, wave);
+            assert_eq!(*wave_size, 1);
+            assert_eq!(retained.len(), 2, "one retention flag per body output port");
+            assert_eq!(retained, &vec![false, false]);
+            assert_eq!(staged, &staged_loop_outputs(&FrozenGraphScopeId::Root, 2, 1, retained));
+            assert_eq!(staged, &vec![true, true]);
+        }
+    }
+
+    #[test]
+    fn lazy_broadcast_input_materializes_after_wave_admission_and_loads_once() {
+        use mxx_dsl::{GraphValueSchema, Int, IntType, parallel};
+
+        // Produce one scalar integer artifact to broadcast into the loop.
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let producer = DslContext::new("lazy-broadcast-producer")
+            .public_output("bias", Int::constant(7))
+            .expect("bias output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut producer_store = MemoryArtifactStore::default();
+        let produced = execute(
+            &producer,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut producer_store,
+            SamplingMode::Fresh,
+        )
+        .expect("producer execution");
+        let production = produced.production_id.clone().expect("artifact production");
+        let manifest = producer_store.manifest(&production).expect("manifest").clone();
+        let manifests = BTreeMap::from([(production.clone(), manifest)]);
+
+        // The bias is a lazy scalar descriptor captured by every body as a
+        // Broadcast input. The owning scope may not load it before the first
+        // wave has been admitted, the loop-level broadcast owner must serve
+        // every body of every wave, and a body's capture input is caller-bound,
+        // so it must not reload the artifact.
+        let context = DslContext::new("lazy-broadcast-admission");
+        let values = context.int_family_input("values", 3);
+        let bias = IntType
+            .artifact_input(production.clone(), "bias", ArtifactConfidentiality::Public)
+            .expect("bias artifact input");
+        let sums = parallel(3, |index| {
+            Ok(values.at(index.clone()).add(values.at(index)).add(bias.clone()))
+        })
+        .expect("broadcast body");
+        let built = context.output("sums", sums).expect("output").build().expect("build");
+        let validated = built
+            .validate_with_manifests(&ParamEnv::default(), &manifests)
+            .expect("validation with the bias manifest");
+        let config = ExecutionConfig {
+            max_parallel_instances: NonZeroUsize::new(1).expect("nonzero"),
+            ..ExecutionConfig::default()
+        };
+
+        let mut store = LoadObservingStore::new(producer_store);
+        let mut backend = PlacementProbeBackend::default();
+        let mut probe = AdmissionProbe::default();
+        probe.loads = Some(store.counter());
+        store.active_admission = Some(probe.active.clone());
+        backend.admission_probe = Some(probe);
+        let load_key =
+            ArtifactKey { production: production.clone(), name: "bias".to_owned(), index: None };
+        let loop_inputs = || {
+            BTreeMap::from([(
+                "values".to_owned(),
+                RuntimeValue::IndexedFamily(
+                    (0..3).map(|value| RuntimeValue::Int(BigInt::from(value))).collect(),
+                ),
+            )])
+        };
+        let mut result = execute_with_config(
+            &validated,
+            &mut backend,
+            loop_inputs(),
+            &mut store,
+            SamplingMode::Fresh,
+            config.clone(),
+        )
+        .expect("broadcast execution");
+        assert_eq!(store.active_at_load, vec![1], "reservation covers lazy input loading");
+        assert_eq!(store.active_at_store, vec![1; 3], "reservation covers each output store");
+        let probe = backend.admission_probe.as_ref().unwrap();
+        assert_eq!(*probe.active_at_admission.borrow(), vec![0; 3], "previous wave retired");
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0, "last wave retired");
+        let RuntimeValue::IndexedFamily(members) =
+            result.materialize_output("sums", &mut backend, &mut store).expect("family output")
+        else {
+            panic!("broadcast result is an indexed family")
+        };
+        let probe = backend.admission_probe.as_ref().unwrap();
+        assert_eq!(probe.admissions().len(), 3, "three bodies with a one-body wave cap");
+        assert_eq!(
+            *probe.lazy_broadcasts_at_admission.borrow(),
+            vec![1, 0, 0],
+            "later admissions see the retained owner, not the original lazy descriptor"
+        );
+        assert_eq!(
+            probe.loads_at_admission(),
+            vec![0, 1, 1],
+            "the first wave is admitted before any bias load; later waves reuse the owner"
+        );
+        assert_eq!(
+            store.load_count(&load_key),
+            1,
+            "one loop-level load serves every body; a body's capture input is caller-bound"
+        );
+        // Trusted arithmetic: body `index` computes `2 * index + 7`.
+        assert_eq!(members.len(), 3);
+        for (index, member) in members.iter().enumerate() {
+            let RuntimeValue::Int(value) = member else { panic!("integer member") };
+            assert_eq!(value, &BigInt::from(2 * index as i64 + 7));
+        }
+
+        // With no stored payload the same graph fails at the bias load. The
+        // failure must follow the first admission: admission decides the wave
+        // before that load, so it can never observe the loaded owner.
+        let mut backend = PlacementProbeBackend::default();
+        backend.admission_probe = Some(AdmissionProbe::default());
+        let mut empty = LoadObservingStore::default();
+        assert!(matches!(
+            execute_with_config(
+                &validated,
+                &mut backend,
+                loop_inputs(),
+                &mut empty,
+                SamplingMode::Fresh,
+                config,
+            ),
+            Err(ExecutionError::Artifact(_))
+        ));
+        assert_eq!(backend.admission_probe.as_ref().unwrap().admissions().len(), 1);
+        assert_eq!(empty.count(), 1, "only the loop-level load is attempted");
+        assert_eq!(
+            backend.admission_probe.as_ref().unwrap().active.load(Ordering::SeqCst),
+            0,
+            "input loading failure releases the admitted region"
+        );
+    }
+
+    #[test]
+    fn nested_wave_reservations_keep_the_parent_until_child_publication() {
+        let outputs = parallel(2, |outer| {
+            let children = parallel(2, |inner| Ok(outer.clone().add(inner)))?;
+            Ok(children.at(Int::constant(0)))
+        })
+        .expect("nested loops");
+        let graph = DslContext::new("nested-wave-reservations")
+            .output("outputs", outputs)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = PlacementProbeBackend::default();
+        backend.admission_probe = Some(AdmissionProbe::default());
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(1).unwrap(),
+                ..ExecutionConfig::default()
+            },
+        )
+        .unwrap();
+        let probe = backend.admission_probe.as_ref().unwrap();
+        assert_eq!(*probe.active_at_admission.borrow(), vec![0, 1, 1, 0, 1, 1]);
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        let RuntimeValue::IndexedFamily(values) =
+            result.materialize_output("outputs", &mut backend, &mut store).unwrap()
+        else {
+            panic!("integer family")
+        };
+        for (index, value) in values.iter().enumerate() {
+            assert!(matches!(value, RuntimeValue::Int(value) if value == &BigInt::from(index)));
+        }
+    }
+
+    #[test]
+    fn broadcast_capture_binds_the_loop_owner_for_matrix_bodies() {
+        // A matrix artifact captured as a Broadcast input must be materialized
+        // once for the whole loop: the body's capture input is bound to the
+        // loop-level owner, not to a descriptor that is reloaded per body.
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            (1u8..=3).map(|value| DCRTPoly::from_biguints(&parameters, &[value.into()])).collect(),
+        );
+
+        let producer = DslContext::new("broadcast-capture-producer")
+            .public_output("matrix", ring.input("matrix", (1, 3)))
+            .expect("matrix output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut producer_store = MemoryArtifactStore::default();
+        let produced = execute(
+            &producer,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([("matrix".to_owned(), RuntimeValue::matrix(matrix.clone()))]),
+            &mut producer_store,
+            SamplingMode::Fresh,
+        )
+        .expect("producer execution");
+        let production = produced.production_id.clone().expect("artifact production");
+        let manifest = producer_store.manifest(&production).expect("manifest").clone();
+
+        let input = ring.artifact_input(
+            production.clone(),
+            "matrix",
+            (1, 3),
+            ArtifactConfidentiality::Public,
+        );
+        let negated = parallel(3, |_| Ok(-input.clone())).expect("broadcast body");
+        let built = DslContext::new("broadcast-capture-consumer")
+            .output("negated", negated)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = built
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .expect("validation with the matrix manifest");
+
+        let mut store = LoadObservingStore::new(producer_store);
+        let mut backend = cpu_backend([parameters.clone()]);
+        let mut result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(1).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("broadcast execution");
+        let RuntimeValue::IndexedFamily(members) =
+            result.materialize_output("negated", &mut backend, &mut store).expect("family output")
+        else {
+            panic!("broadcast result is an indexed family")
+        };
+        let load_key =
+            ArtifactKey { production: production.clone(), name: "matrix".to_owned(), index: None };
+        assert_eq!(
+            store.load_count(&load_key),
+            1,
+            "one loop-level load serves every body of every wave"
+        );
+        let expected = matrix.negate_out_of_place();
+        assert_eq!(members.len(), 3);
+        for member in members {
+            let RuntimeValue::Matrix(value) = member else { panic!("matrix member") };
+            assert_eq!(value.as_ref(), &expected);
+        }
+    }
+
+    #[test]
+    fn subgraph_call_capture_binds_the_supplied_lazy_artifact_once() {
+        // A named subgraph's captured artifact input is caller-bound exactly
+        // like a loop body's: the call must bind the value its caller supplied
+        // instead of loading the artifact again for the child scope.
+        use mxx_dsl::{Mat, MatType};
+
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            (1u8..=3).map(|value| DCRTPoly::from_biguints(&parameters, &[value.into()])).collect(),
+        );
+        let producer = DslContext::new("subgraph-capture-producer")
+            .public_output("matrix", ring.input("matrix", (1, 3)))
+            .expect("matrix output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut producer_store = MemoryArtifactStore::default();
+        let produced = execute(
+            &producer,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([("matrix".to_owned(), RuntimeValue::matrix(matrix.clone()))]),
+            &mut producer_store,
+            SamplingMode::Fresh,
+        )
+        .expect("producer execution");
+        let production = produced.production_id.clone().expect("artifact production");
+        let manifest = producer_store.manifest(&production).expect("manifest").clone();
+        let ty = MatType(ring.matrix_type((1, 3)));
+        let negate = Subgraph::define("negate-single-argument", ty, |value: Mat| Ok(-value))
+            .expect("subgraph definition");
+        let input = ring.artifact_input(
+            production.clone(),
+            "matrix",
+            (1, 3),
+            ArtifactConfidentiality::Public,
+        );
+        let called = negate.call(input).expect("subgraph call");
+        let built = DslContext::new("subgraph-capture-consumer")
+            .output("negated", called)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = built
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .expect("validation with the matrix manifest");
+
+        let mut store = LoadObservingStore::new(producer_store);
+        let mut backend = cpu_backend([parameters.clone()]);
+        let result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .expect("subgraph execution");
+        let load_key = ArtifactKey { production, name: "matrix".to_owned(), index: None };
+        assert_eq!(
+            store.load_count(&load_key),
+            1,
+            "a subgraph call binds its supplied capture instead of loading again"
+        );
+        let RuntimeValue::Matrix(value) = &result.outputs["negated"] else {
+            panic!("matrix result")
+        };
+        assert_eq!(value.as_ref(), &matrix.negate_out_of_place());
+    }
 
     #[test]
     fn root_block_aliases_preserve_multiple_consumers_and_trace_results() {
@@ -6767,10 +7796,177 @@ mod tests {
         ForcedFailure { placement: usize },
     }
 
+    /// Ordered record of every accepted wave of one probe execution.
+    ///
+    /// When `loads` is set to a [`LoadObservingStore`] counter it also records
+    /// how many artifact payloads had been loaded when each wave was admitted,
+    /// which distinguishes "admission decided the wave before the load" from a
+    /// load that preceded (and therefore influenced) the decision.
+    #[derive(Default)]
+    pub(super) struct AdmissionProbe {
+        /// `(owning scope, next index, accepted size, per-port retention, staging)`
+        pub(super) admissions:
+            std::cell::RefCell<Vec<(FrozenGraphScopeId, usize, usize, Vec<bool>, Vec<bool>)>>,
+        pub(super) loads: Option<Arc<AtomicUsize>>,
+        pub(super) loads_at_admission: std::cell::RefCell<Vec<usize>>,
+        lazy_broadcasts_at_admission: std::cell::RefCell<Vec<usize>>,
+        active: Arc<AtomicUsize>,
+        active_at_admission: std::cell::RefCell<Vec<usize>>,
+    }
+
+    struct AdmissionLease(Arc<AtomicUsize>);
+
+    impl Drop for AdmissionLease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl AdmissionProbe {
+        /// Accepted waves recorded so far, in execution order.
+        pub(super) fn admissions(
+            &self,
+        ) -> Vec<(FrozenGraphScopeId, usize, usize, Vec<bool>, Vec<bool>)> {
+            self.admissions.borrow().clone()
+        }
+
+        /// Payload loads performed before each accepted wave was admitted.
+        pub(super) fn loads_at_admission(&self) -> Vec<usize> {
+            self.loads_at_admission.borrow().clone()
+        }
+    }
+
+    /// Artifact store wrapper that counts payload loads, so a fixture can
+    /// observe whether a load happened before or after wave admission.
+    #[derive(Default)]
+    pub(super) struct LoadObservingStore {
+        inner: MemoryArtifactStore,
+        loads: Arc<AtomicUsize>,
+        active_admission: Option<Arc<AtomicUsize>>,
+        active_at_load: Vec<usize>,
+        active_at_store: Vec<usize>,
+    }
+
+    impl LoadObservingStore {
+        /// Wrap an existing store so its payloads stay available while loads
+        /// are counted from this point on.
+        pub(super) fn new(inner: MemoryArtifactStore) -> Self {
+            Self { inner, ..Self::default() }
+        }
+
+        pub(super) fn counter(&self) -> Arc<AtomicUsize> {
+            self.loads.clone()
+        }
+
+        pub(super) fn count(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+
+        pub(super) fn load_count(&self, key: &ArtifactKey) -> usize {
+            self.inner.load_count(key)
+        }
+    }
+
+    impl ArtifactStore for LoadObservingStore {
+        type Error = <MemoryArtifactStore as ArtifactStore>::Error;
+
+        fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
+            self.inner.load_manifest(production)
+        }
+
+        fn load(
+            &mut self,
+            key: &ArtifactKey,
+            descriptor: &ManifestArtifact,
+        ) -> Result<ArtifactPayload, Self::Error> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            if let Some(active) = &self.active_admission {
+                self.active_at_load.push(active.load(Ordering::SeqCst));
+            }
+            self.inner.load(key, descriptor)
+        }
+
+        fn store(
+            &mut self,
+            key: ArtifactKey,
+            artifact_type: &ArtifactType,
+            confidentiality: ArtifactConfidentiality,
+            layout: Option<&str>,
+            payload: ArtifactPayload,
+        ) -> Result<(), Self::Error> {
+            if let Some(active) = &self.active_admission {
+                self.active_at_store.push(active.load(Ordering::SeqCst));
+            }
+            self.inner.store(key, artifact_type, confidentiality, layout, payload)
+        }
+
+        fn load_staged(
+            &mut self,
+            key: &ArtifactKey,
+            descriptor: &ManifestArtifact,
+        ) -> Result<ArtifactPayload, Self::Error> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_staged(key, descriptor)
+        }
+
+        fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+            self.inner.remove_staged(key)
+        }
+
+        fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+            self.inner.store_manifest(manifest)
+        }
+    }
+
+    impl SessionStore for LoadObservingStore {
+        fn resolve_session_nonce(
+            &mut self,
+            descriptor: &SessionAliasDescriptor,
+        ) -> Result<[u8; 32], Self::Error> {
+            self.inner.resolve_session_nonce(descriptor)
+        }
+
+        fn open_session(
+            &mut self,
+            descriptor: &SessionDescriptor,
+        ) -> Result<SessionStatus, Self::Error> {
+            self.inner.open_session(descriptor)
+        }
+
+        fn release_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
+            self.inner.release_session(production)
+        }
+
+        fn transcript_entry(
+            &mut self,
+            production: &ProductionId,
+            site: &DrawSite,
+        ) -> Result<Option<RecordedValue>, Self::Error> {
+            self.inner.transcript_entry(production, site)
+        }
+
+        fn record_transcript_batch(
+            &mut self,
+            production: &ProductionId,
+            entries: &[(DrawSite, RecordedValue)],
+        ) -> Result<(), Self::Error> {
+            self.inner.record_transcript_batch(production, entries)
+        }
+
+        fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
+            self.inner.commit_artifact(handle)
+        }
+
+        fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+            self.inner.finalize_session(manifest)
+        }
+    }
+
     #[derive(Default)]
     pub(super) struct PlacementProbeBackend {
         #[cfg(feature = "gpu")]
         pub(super) import_probe: Option<super::gpu_plan::ImportProbe>,
+        pub(super) admission_probe: Option<AdmissionProbe>,
         active: usize,
         encoded: std::cell::RefCell<Vec<(SmallMatrixSemanticKind, usize, usize)>>,
         fail_broadcast_preparation: bool,
@@ -6791,11 +7987,47 @@ mod tests {
         type Trapdoor = ();
         type Error = PlacementProbeError;
 
+        fn admit_wave(
+            &mut self,
+            request: &WaveAdmissionRequest<'_, Self>,
+        ) -> Result<WaveAdmission, Self::Error> {
+            let mut admission = request.default_admission();
+            if let Some(probe) = &self.admission_probe {
+                probe.active_at_admission.borrow_mut().push(probe.active.load(Ordering::SeqCst));
+                probe.active.fetch_add(1, Ordering::SeqCst);
+                admission.reservation = Some(Box::new(AdmissionLease(probe.active.clone())));
+                let selected =
+                    request.selected_inputs(request.next_index()).expect("valid wave inputs");
+                probe.lazy_broadcasts_at_admission.borrow_mut().push(
+                    selected
+                        .iter()
+                        .zip(request.input_modes())
+                        .filter(|(input, mode)| {
+                            matches!(mode, LoopInputMode::Broadcast) &&
+                                matches!(input.value, RuntimeValue::LazyArtifact { .. })
+                        })
+                        .count(),
+                );
+                probe.admissions.borrow_mut().push((
+                    request.scope().clone(),
+                    request.next_index(),
+                    admission.wave_size,
+                    request.retained_output_ports().to_vec(),
+                    admission.staged_outputs.clone(),
+                ));
+                if let Some(loads) = &probe.loads {
+                    probe.loads_at_admission.borrow_mut().push(loads.load(Ordering::SeqCst));
+                }
+            }
+            Ok(admission)
+        }
+
         #[cfg(feature = "gpu")]
         fn preflight_gpu_operations(
             &mut self,
             requests: &[(
                 usize,
+                Option<crate::gpu_invocation::GpuNodeOperation>,
                 GpuInvocation<'_, Self::Matrix, Self::SmallMatrix, Self::Trapdoor>,
             )],
         ) -> Result<(), Self::Error> {

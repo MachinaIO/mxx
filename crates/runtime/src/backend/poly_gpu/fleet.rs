@@ -55,18 +55,34 @@ use std::{
 
 #[path = "gpu_admit.rs"]
 mod gpu_admit;
+#[path = "gpu_claims.rs"]
+mod gpu_claims;
 #[path = "gpu_compiled.rs"]
 mod gpu_compiled;
 #[path = "gpu_inventory.rs"]
 mod gpu_inventory;
 #[path = "gpu_preflight.rs"]
 mod gpu_preflight;
+#[path = "gpu_preimage_batch.rs"]
+mod gpu_preimage_batch;
 #[path = "gpu_prepare.rs"]
 mod gpu_prepare;
+pub use gpu_admit::{
+    GpuMatrixColumnContext, GpuMatrixColumnRequirements, GpuMatrixLayoutPlan,
+    MatrixPlacementInvocation as GpuMatrixPlacementInvocation,
+};
 pub use gpu_compiled::GpuAdmittedInvocationSummary;
 use gpu_compiled::{
     CompiledMatrixInvocation, ExecutionPayload, PreimageClaimPlan, PreimagePlanKey,
     PreparedMatrixOperation, TrapdoorPlanKey,
+};
+pub use gpu_inventory::{GpuContextDemand, GpuInventoryValue, GpuScopeProgress, GpuScopeResources};
+pub use gpu_prepare::{
+    MatrixDescriptor as GpuMatrixDescriptor,
+    MatrixFragmentDescriptor as GpuMatrixFragmentDescriptor,
+    MatrixInputFragment as GpuMatrixInputFragment, MatrixInputLayout as GpuMatrixInputLayout,
+    MatrixInputRequest as GpuMatrixInputRequest, MatrixSlotContext as GpuMatrixSlotContext,
+    MatrixSlotInventory as GpuMatrixSlotInventory, PreparedMatrixSource as GpuMatrixInputSource,
 };
 
 const SHARED_POOL_CALIBRATION_ERROR: &str =
@@ -393,6 +409,9 @@ pub struct GpuFleetMatrix {
     // Logical aliases share native allocation and release ownership. Cloning a
     // primitive matrix here would allocate a second, unreserved GPU payload.
     shards: Arc<Vec<GpuColumnShard<GpuDCRTPolyMatrix>>>,
+    // Publish immutable source geometry with the actual owner. Admission and
+    // downstream preparation share this metadata without re-inspecting shards.
+    input_layout: Arc<[gpu_prepare::MatrixInputFragment]>,
 }
 
 // Device commands must retain resident storage independently of a caller's
@@ -444,13 +463,29 @@ impl PartialEq for GpuFleetMatrix {
 impl Eq for GpuFleetMatrix {}
 
 impl GpuFleetMatrix {
-    fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuDCRTPolyMatrix>>) -> Self {
+    pub fn new(
+        rows: usize,
+        columns: usize,
+        shards: Vec<GpuColumnShard<GpuDCRTPolyMatrix>>,
+    ) -> Self {
         validate_shards(rows, columns, &shards, |matrix| matrix.size());
+        let input_layout = shards
+            .iter()
+            .map(|shard| gpu_prepare::MatrixInputFragment {
+                device: shard.device_id,
+                context: shard.value.params().context_identity(),
+                start: shard.global_column_start,
+                end: shard.global_column_start + shard.value.col_size(),
+                level: shard.value.level(),
+                evaluation: shard.value.is_ntt(),
+            })
+            .collect();
         Self {
             id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
             rows,
             columns,
             shards: Arc::new(shards),
+            input_layout,
         }
     }
 
@@ -575,7 +610,7 @@ impl PartialEq for GpuFleetSmallMatrix {
 impl Eq for GpuFleetSmallMatrix {}
 
 impl GpuFleetSmallMatrix {
-    fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuSmallMatrix>>) -> Self {
+    pub fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuSmallMatrix>>) -> Self {
         validate_shards(rows, columns, &shards, |matrix| matrix.size());
         Self {
             id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
@@ -658,6 +693,21 @@ fn validate_shards<T>(
     assert_eq!(next, columns, "fleet shards must cover every logical column exactly once");
 }
 
+impl GpuFleetTrapdoor {
+    /// Prepare the fixed covariance owner consumed by subsequent Preimage
+    /// sampling. Explicit benchmark setup calls this before its storage seal,
+    /// matching production trapdoor preparation without a sampler trial.
+    pub fn prepare_preimage_cache(&self, sigma: f64, public_rows: usize) {
+        self.values.par_iter().for_each(|trapdoor| {
+            let parameters = trapdoor.r.params();
+            <GpuDCRTPolyTrapdoorSampler as mxx_primitives::sampler::PolyTrapdoorSampler>::new(
+                parameters, sigma,
+            )
+            .prepare_preimage_cache(parameters, trapdoor, public_rows);
+        });
+    }
+}
+
 impl fmt::Display for GpuFleetTrapdoor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "GPU trapdoor replicated on {} device(s)", self.values.len())
@@ -679,7 +729,12 @@ pub struct GpuDcrtBackend {
     rns_staging_buffers: Vec<GpuDCRTMatrixRnsSnapshot>,
     prepared_required: bool,
     graph_prepared: bool,
+    /// Largest parallel-loop wave production prepared backing for, from the
+    /// configured concurrency bound and the setup memory fit. Zero until a
+    /// production graph admission runs.
+    graph_wave: usize,
     prepared_invocations: VecDeque<CompiledMatrixInvocation>,
+    admitted_scope_operations: Vec<Weak<gpu_compiled::AdmittedScopeOperations>>,
     prepared_ledger: Option<crate::gpu_memory::GpuMemoryLedger>,
     /// Traced claim plans for preimage and trapdoor sampling classes, derived
     /// before the inventory sealed.
@@ -711,7 +766,7 @@ struct RuntimePilot {
 }
 
 impl GpuDcrtBackend {
-    pub(super) fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
+    pub fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
         assert!(!placements.is_empty(), "a GPU fleet needs at least one device");
         let vram_percent = fleet_context_vram_percent(
             &placements,
@@ -759,7 +814,9 @@ impl GpuDcrtBackend {
             rns_staging_buffers: Vec::new(),
             prepared_required: false,
             graph_prepared: false,
+            graph_wave: 0,
             prepared_invocations: VecDeque::new(),
+            admitted_scope_operations: Vec::new(),
             prepared_ledger: None,
             preimage_plans: HashMap::new(),
             trapdoor_plans: HashMap::new(),
@@ -787,6 +844,15 @@ impl GpuDcrtBackend {
 
     /// One context per configured device, in fleet order. Related parameter
     /// views on a device share the execution owner used by device-span timing.
+    /// Clone registered parameter views, retaining each device's exact contexts.
+    /// This does not clone allocations, reservations, or calibration state.
+    pub fn parameter_placements(&self) -> Vec<Vec<GpuDCRTPolyParams>> {
+        self.devices
+            .iter()
+            .map(|(_, backend)| backend.parameters[0].values().cloned().collect())
+            .collect()
+    }
+
     pub fn device_parameters(&self) -> Vec<GpuDCRTPolyParams> {
         self.devices
             .par_iter()
@@ -798,6 +864,15 @@ impl GpuDcrtBackend {
                     .clone()
             })
             .collect()
+    }
+
+    /// Registered parameter views for this ring, in configured device order.
+    /// This only reads context metadata; it creates no GPU resource.
+    pub fn resource_parameters(
+        &self,
+        matrix: &ConcreteMatrixType,
+    ) -> Result<Vec<GpuDCRTPolyParams>, PolyBackendError> {
+        self.devices.par_iter().map(|(_, backend)| backend.parameters(matrix).cloned()).collect()
     }
 
     /// Concrete resident CRT tower count for an exactly registered ring.
@@ -4027,17 +4102,8 @@ impl Backend for GpuDcrtBackend {
         evaluation: bool,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                gpu_compiled::PreparedMatrixOperation::Polynomial {
-                    ty: ty.clone(),
-                    coefficients: values.to_vec(),
-                    evaluation,
-                },
-                None,
-                &[],
-                None,
-                gpu_compiled::ExecutionPayload::None,
-            );
+            let _ = (ty, values, evaluation);
+            return self.execute_admitted_matrix(&[], None, gpu_compiled::ExecutionPayload::None);
         }
         self.devices[0]
             .1
@@ -4096,6 +4162,7 @@ impl Backend for GpuDcrtBackend {
         &mut self,
         requests: &[(
             usize,
+            Option<crate::gpu_invocation::GpuNodeOperation>,
             crate::gpu_invocation::GpuInvocation<
                 '_,
                 Self::Matrix,
@@ -4106,10 +4173,13 @@ impl Backend for GpuDcrtBackend {
     ) -> Result<(), Self::Error> {
         if self.prepared_required {
             // Compact row-block products execute as one admitted invocation per
-            // block; the batch is validated in that expanded order.
+            // block; the batch is validated in that expanded order. The node's
+            // types determine the compact product for every block (its output
+            // columns come from the compact RHS type and its inner dimension from
+            // the concatenated operand's columns), so the metadata is kept.
             let expanded = requests
                 .iter()
-                .flat_map(|(placement, request)| match request {
+                .flat_map(|(placement, node, request)| match request {
                     crate::gpu_invocation::GpuInvocation::MultiplySmallRhsRowBlocks {
                         blocks,
                         right,
@@ -4118,6 +4188,7 @@ impl Backend for GpuDcrtBackend {
                         .map(|left| {
                             (
                                 *placement,
+                                node.clone(),
                                 crate::gpu_invocation::GpuInvocation::MultiplySmallRhs {
                                     left: *left,
                                     right: *right,
@@ -4128,14 +4199,23 @@ impl Backend for GpuDcrtBackend {
                     // Trapdoor sampling is an explicit fixed-owner boundary with
                     // its own traced claims; it is not a column invocation.
                     crate::gpu_invocation::GpuInvocation::SampleTrapdoor { .. } => Vec::new(),
-                    other => vec![(*placement, other.clone())],
+                    other => vec![(*placement, node.clone(), other.clone())],
                 })
                 .collect::<Vec<_>>();
             if expanded.is_empty() {
                 return Ok(());
             }
             if self.prepared_ledger.is_some() && self.prepared_invocations.is_empty() {
-                self.admit_matrix_invocations(&expanded)
+                let lowered = expanded
+                    .iter()
+                    .map(|(placement, node, request)| {
+                        if *placement != 0 {
+                            return Err(PolyBackendError::UnsupportedPlacement);
+                        }
+                        CompiledMatrixInvocation::lower(request, node.as_ref(), self)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.admit_matrix_invocations(lowered, usize::MAX)
             } else {
                 self.validate_admitted_matrix_invocations(&expanded)
             }
@@ -4216,10 +4296,14 @@ impl Backend for GpuDcrtBackend {
         })
     }
 
-    fn parallel_wave_size(&self, _limit: usize) -> usize {
-        // Complete and stage one family member before starting the next.
-        // All device parallelism belongs to the calibrated column scheduler.
-        1
+    fn admit_wave(
+        &mut self,
+        request: &crate::executor::WaveAdmissionRequest<'_, Self>,
+    ) -> Result<crate::executor::WaveAdmission, Self::Error> {
+        if !self.prepared_required {
+            return Ok(request.admission_of_size(1));
+        }
+        self.admit_loop_wave(request)
     }
 
     fn prepare_graph_admission(
@@ -4227,10 +4311,17 @@ impl Backend for GpuDcrtBackend {
         validated: &mxx_ir_core::ValidatedGraph,
         capture_trace: bool,
         inputs: &std::collections::BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+        wave_bound: usize,
         warm_up: bool,
     ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error> {
-        GpuDcrtBackend::prepare_graph_admission(self, validated, capture_trace, inputs, warm_up)
-            .map(|guard| guard.map(|guard| Box::new(guard) as Box<dyn std::any::Any>))
+        GpuDcrtBackend::prepare_graph_admission(
+            self,
+            validated,
+            capture_trace,
+            inputs,
+            wave_bound,
+            warm_up,
+        )
     }
 
     // A fleet is one production placement. Device parallelism is internal to
@@ -4250,16 +4341,7 @@ impl Backend for GpuDcrtBackend {
         env: &ParamEnv,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::Constant { ty, value, env };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[], None, ExecutionPayload::None);
         }
         if let Some(runner) = self.constant_column_runner(ty, value, env)? {
             self.restart_runtime_pilot_after_fixed_inputs()
@@ -4284,15 +4366,25 @@ impl Backend for GpuDcrtBackend {
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Add,
-                Some(left),
-                std::slice::from_ref(right),
-                None,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[left, right], None, ExecutionPayload::None);
         }
         self.binary_columns(left, right, Backend::add)
+    }
+
+    fn add_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        if !self.prepared_required || inputs.len() > 1 {
+            return self.execute_matrix_batch(
+                &inputs
+                    .iter()
+                    .map(|(left, right)| vec![left.as_ref(), right.as_ref()])
+                    .collect::<Vec<_>>(),
+                vec![PreparedMatrixOperation::Add; inputs.len()],
+            );
+        }
+        inputs.into_iter().map(|(left, right)| self.add(&left, &right)).collect()
     }
 
     fn add_row_blocks(
@@ -4301,16 +4393,8 @@ impl Backend for GpuDcrtBackend {
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::AddRowBlocks { blocks, right };
-            let (operation, scalable, others, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                scalable,
-                &others,
-                compact,
-                ExecutionPayload::None,
-            );
+            let operands = blocks.iter().copied().chain(std::iter::once(right)).collect::<Vec<_>>();
+            return self.execute_admitted_matrix(&operands, None, ExecutionPayload::None);
         }
         let rows = blocks.iter().try_fold(0usize, |rows, block| {
             rows.checked_add(block.rows).ok_or(PolyBackendError::InvalidInteger)
@@ -4339,15 +4423,25 @@ impl Backend for GpuDcrtBackend {
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Subtract,
-                Some(left),
-                std::slice::from_ref(right),
-                None,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[left, right], None, ExecutionPayload::None);
         }
         self.binary_columns(left, right, Backend::sub)
+    }
+
+    fn sub_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        if !self.prepared_required || inputs.len() > 1 {
+            return self.execute_matrix_batch(
+                &inputs
+                    .iter()
+                    .map(|(left, right)| vec![left.as_ref(), right.as_ref()])
+                    .collect::<Vec<_>>(),
+                vec![PreparedMatrixOperation::Subtract; inputs.len()],
+            );
+        }
+        inputs.into_iter().map(|(left, right)| self.sub(&left, &right)).collect()
     }
 
     fn multiply(
@@ -4356,20 +4450,7 @@ impl Backend for GpuDcrtBackend {
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::Binary {
-                operation: mxx_ir_core::node::MatrixBinaryOp::Multiply,
-                left,
-                right,
-            };
-            let (operation, scalable, fixed, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                scalable,
-                &fixed,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[left, right], None, ExecutionPayload::None);
         }
         if !self.runtime_pilot_is_pending() &&
             self.devices.len() == 1 &&
@@ -4416,21 +4497,44 @@ impl Backend for GpuDcrtBackend {
         Ok(GpuFleetMatrix::new(rows, scalable.columns, shards))
     }
 
+    fn multiply_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        if !self.prepared_required || inputs.len() > 1 {
+            return self.execute_matrix_batch(
+                &inputs
+                    .iter()
+                    .map(|(left, right)| vec![left.as_ref(), right.as_ref()])
+                    .collect::<Vec<_>>(),
+                inputs
+                    .iter()
+                    .map(|(left, right)| PreparedMatrixOperation::Multiply {
+                        scales_left: gpu_matrix_multiply_scales_left(
+                            left.rows,
+                            left.columns,
+                            right.rows,
+                            right.columns,
+                        ),
+                    })
+                    .collect(),
+            );
+        }
+        inputs.into_iter().map(|(left, right)| self.multiply(&left, &right)).collect()
+    }
+
     fn matrix_mul_accumulate(
         &mut self,
         request: MatrixMulAccumulateRequest<Self::Matrix>,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let invocation = crate::gpu_invocation::GpuInvocation::Accumulate { request: &request };
-            let (operation, left, right, compact) =
-                gpu_compiled::CompiledMatrixInvocation::arguments(&invocation, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            let operands = request
+                .products
+                .iter()
+                .flat_map(|(_, left, right)| [left.as_ref(), right.as_ref()])
+                .chain(request.bias.iter().map(|bias| bias.as_ref()))
+                .collect::<Vec<_>>();
+            return self.execute_admitted_matrix(&operands, None, ExecutionPayload::None);
         }
         let first = request.products.first().expect("validated request has a product");
         let first_scales_left = gpu_matrix_multiply_scales_left(
@@ -4469,17 +4573,70 @@ impl Backend for GpuDcrtBackend {
         Ok(GpuFleetMatrix::new(output_rows, output_columns, shards))
     }
 
+    fn matrix_mul_accumulate_batch(
+        &mut self,
+        requests: Vec<MatrixMulAccumulateRequest<Self::Matrix>>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        if !self.prepared_required || requests.len() > 1 {
+            let inputs = requests
+                .iter()
+                .map(|request| {
+                    request
+                        .products
+                        .iter()
+                        .flat_map(|(_, left, right)| [left.as_ref(), right.as_ref()])
+                        .chain(request.bias.iter().map(Arc::as_ref))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let operations = requests
+                .iter()
+                .map(|request| {
+                    let (_, left, right) = &request.products[0];
+                    PreparedMatrixOperation::Accumulate {
+                        products: request
+                            .products
+                            .iter()
+                            .map(|(coefficient, left, right)| {
+                                (
+                                    coefficient.clone(),
+                                    gpu_matrix_multiply_scales_left(
+                                        left.rows,
+                                        left.columns,
+                                        right.rows,
+                                        right.columns,
+                                    ),
+                                )
+                            })
+                            .collect(),
+                        bias: request.bias.is_some(),
+                        rows: if left.size() == (1, 1) { right.rows } else { left.rows },
+                    }
+                })
+                .collect();
+            return self.execute_matrix_batch(&inputs, operations);
+        }
+        requests.into_iter().map(|request| self.matrix_mul_accumulate(request)).collect()
+    }
+
     fn negate(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Negate,
-                Some(value),
-                &[],
-                None,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         self.unary_columns(value, GpuUnaryColumnOperation::Negate)
+    }
+
+    fn negate_batch(
+        &mut self,
+        inputs: Vec<Arc<Self::Matrix>>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        if !self.prepared_required || inputs.len() > 1 {
+            return self.execute_matrix_batch(
+                &inputs.iter().map(|input| vec![input.as_ref()]).collect::<Vec<_>>(),
+                vec![PreparedMatrixOperation::Negate; inputs.len()],
+            );
+        }
+        inputs.into_iter().map(|input| self.negate(&input)).collect()
     }
 
     fn scale_integer(
@@ -4488,15 +4645,26 @@ impl Backend for GpuDcrtBackend {
         scalar: &BigInt,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Scale(scalar.clone()),
-                Some(value),
-                &[],
-                None,
-                ExecutionPayload::None,
-            );
+            let _ = scalar;
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         self.unary_columns(value, GpuUnaryColumnOperation::Scale(scalar.clone()))
+    }
+
+    fn scale_integer_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, BigInt)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        if !self.prepared_required || inputs.len() > 1 {
+            return self.execute_matrix_batch(
+                &inputs.iter().map(|(input, _)| vec![input.as_ref()]).collect::<Vec<_>>(),
+                inputs
+                    .iter()
+                    .map(|(_, scalar)| PreparedMatrixOperation::Scale(scalar.clone()))
+                    .collect(),
+            );
+        }
+        inputs.into_iter().map(|(input, scalar)| self.scale_integer(&input, &scalar)).collect()
     }
 
     fn ring_automorphism(
@@ -4505,15 +4673,26 @@ impl Backend for GpuDcrtBackend {
         index: usize,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Automorphism(index),
-                Some(value),
-                &[],
-                None,
-                ExecutionPayload::None,
-            );
+            let _ = index;
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         self.unary_columns(value, GpuUnaryColumnOperation::Automorphism(index))
+    }
+
+    fn ring_automorphism_batch(
+        &mut self,
+        inputs: Vec<(Arc<Self::Matrix>, usize)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        if !self.prepared_required || inputs.len() > 1 {
+            return self.execute_matrix_batch(
+                &inputs.iter().map(|(input, _)| vec![input.as_ref()]).collect::<Vec<_>>(),
+                inputs
+                    .iter()
+                    .map(|(_, scalar)| PreparedMatrixOperation::Automorphism(*scalar))
+                    .collect(),
+            );
+        }
+        inputs.into_iter().map(|(input, scalar)| self.ring_automorphism(&input, scalar)).collect()
     }
 
     fn modulus_switch(
@@ -4522,17 +4701,7 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request =
-                crate::gpu_invocation::GpuInvocation::ModulusSwitch { value, destination };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         let destination = destination.clone();
         self.unary_columns(
@@ -4549,17 +4718,7 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request =
-                crate::gpu_invocation::GpuInvocation::CenteredRebase { value, destination };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         let destination = destination.clone();
         self.unary_columns(
@@ -4579,22 +4738,7 @@ impl Backend for GpuDcrtBackend {
         normalize: bool,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::RnsModUp {
-                value,
-                destination,
-                source_moduli,
-                digit_size,
-                normalize,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
 
         if value.columns == 0 {
@@ -4618,21 +4762,7 @@ impl Backend for GpuDcrtBackend {
         plaintext_modulus: u64,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::RnsModDown {
-                value,
-                destination,
-                source_moduli,
-                plaintext_modulus,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
 
         let destination = destination.clone();
@@ -4651,17 +4781,7 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request =
-                crate::gpu_invocation::GpuInvocation::ReduceModulus { value, destination };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         let destination = destination.clone();
         self.unary_columns(
@@ -4678,17 +4798,7 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request =
-                crate::gpu_invocation::GpuInvocation::CenteredExtend { value, destination };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         let destination = destination.clone();
         self.unary_columns(
@@ -4705,17 +4815,7 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::SmallMatrix, Self::Error> {
         if self.prepared_required {
-            let request =
-                crate::gpu_invocation::GpuInvocation::CenteredExtendSmall { value, destination };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[], Some(value), ExecutionPayload::None);
         }
         let input = value.clone();
         let destination = destination.clone();
@@ -4750,20 +4850,7 @@ impl Backend for GpuDcrtBackend {
         plaintext_modulus: u64,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::BlockModSwitch {
-                value,
-                destination,
-                plaintext_modulus,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         let destination = destination.clone();
         self.unary_columns(
@@ -4864,14 +4951,9 @@ impl Backend for GpuDcrtBackend {
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::ImportCpuStaging { ty, bytes };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
             return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
+                &[],
+                None,
                 ExecutionPayload::Bytes(Arc::new(bytes.to_vec())),
             );
         }
@@ -4945,13 +5027,7 @@ impl Backend for GpuDcrtBackend {
 
     fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Transpose,
-                Some(value),
-                &[],
-                None,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         if value.rows > 0 && value.columns == 0 && value.shards.is_empty() {
             // A shardless empty owner carries no ring or format metadata. Its
@@ -4987,16 +5063,7 @@ impl Backend for GpuDcrtBackend {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Slice {
-                    rows: row_range.start..row_range.end,
-                    columns: column_range.start..column_range.end,
-                },
-                Some(value),
-                &[],
-                None,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         self.restart_runtime_pilot_after_matrix_inputs(&[value])?;
         let output_rows = row_range.end - row_range.start;
@@ -5017,13 +5084,8 @@ impl Backend for GpuDcrtBackend {
         rows: &[Vec<usize>],
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::SumRows(rows.to_vec()),
-                Some(value),
-                &[],
-                None,
-                ExecutionPayload::None,
-            );
+            let _ = rows;
+            return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         let output_rows = rows.len();
         let rows = rows.to_vec();
@@ -5044,17 +5106,7 @@ impl Backend for GpuDcrtBackend {
         right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Tensor {
-                    right_rows: right.rows,
-                    right_columns: right.columns,
-                    groups: None,
-                },
-                Some(left),
-                std::slice::from_ref(right),
-                None,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[left, right], None, ExecutionPayload::None);
         }
         self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
         let rows = left.rows.checked_mul(right.rows).ok_or(PolyBackendError::InvalidInteger)?;
@@ -5075,17 +5127,8 @@ impl Backend for GpuDcrtBackend {
         groups: &[Vec<usize>],
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            return self.execute_admitted_matrix(
-                PreparedMatrixOperation::Tensor {
-                    right_rows: right.rows,
-                    right_columns: right.columns,
-                    groups: Some(groups.to_vec()),
-                },
-                Some(left),
-                std::slice::from_ref(right),
-                None,
-                ExecutionPayload::None,
-            );
+            let _ = groups;
+            return self.execute_admitted_matrix(&[left, right], None, ExecutionPayload::None);
         }
         self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
         let rows = groups.len();
@@ -5105,16 +5148,7 @@ impl Backend for GpuDcrtBackend {
         axis: ConcatAxis,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::Concat { inputs, axis };
-            let (operation, scalable, others, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                scalable,
-                &others,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(inputs, None, ExecutionPayload::None);
         }
         let (rows, columns, runner) = Self::concat_column_runner(inputs, axis)?;
         let first = inputs[0];
@@ -5167,16 +5201,7 @@ impl Backend for GpuDcrtBackend {
         range: &SampleRange,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::SampleUniform { ty, range };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[], None, ExecutionPayload::None);
         }
         self.restart_runtime_pilot_after_fixed_inputs()
             .map_err(PolyBackendError::GpuCalibration)?;
@@ -5192,20 +5217,7 @@ impl Backend for GpuDcrtBackend {
         max_coefficient_bound: &BigInt,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::SampleGaussian {
-                ty,
-                sigma,
-                max_coefficient_bound,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[], None, ExecutionPayload::None);
         }
         self.restart_runtime_pilot_after_fixed_inputs()
             .map_err(PolyBackendError::GpuCalibration)?;
@@ -5221,25 +5233,10 @@ impl Backend for GpuDcrtBackend {
         tag: &[u8],
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::SampleHash {
-                ty,
-                variant: mxx_ir_core::node::HashVariant::Plain,
-                tag_bytes: tag.len(),
-                gadget_base: None,
-                digit_count: None,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
             let seed = mxx_primitives::sampler::gpu::hash_seed_for_matrix::<keccak_asm::Keccak256>(
                 key, tag,
             );
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::Seed(seed),
-            );
+            return self.execute_admitted_matrix(&[], None, ExecutionPayload::Seed(seed));
         }
         self.restart_runtime_pilot_after_fixed_inputs()
             .map_err(PolyBackendError::GpuCalibration)?;
@@ -5257,25 +5254,10 @@ impl Backend for GpuDcrtBackend {
         digit_count: usize,
     ) -> Result<Self::SmallMatrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::SampleHash {
-                ty,
-                variant: mxx_ir_core::node::HashVariant::Decomposed,
-                tag_bytes: tag.len(),
-                gadget_base: Some(gadget_base),
-                digit_count: Some(digit_count),
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
             let seed = mxx_primitives::sampler::gpu::hash_seed_for_matrix::<keccak_asm::Keccak256>(
                 key, tag,
             );
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::Seed(seed),
-            );
+            return self.execute_admitted_matrix(&[], None, ExecutionPayload::Seed(seed));
         }
         self.validate_gadget_layout(ty, gadget_base, digit_count, false)?;
         let runner = Self::decomposed_hash_column_runner(ty, key, tag, digit_count, false)?;
@@ -5294,25 +5276,10 @@ impl Backend for GpuDcrtBackend {
         digit_count: usize,
     ) -> Result<Self::SmallMatrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::SampleHash {
-                ty,
-                variant: mxx_ir_core::node::HashVariant::SmallDecomposed,
-                tag_bytes: tag.len(),
-                gadget_base: Some(gadget_base),
-                digit_count: Some(digit_count),
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
             let seed = mxx_primitives::sampler::gpu::hash_seed_for_matrix::<keccak_asm::Keccak256>(
                 key, tag,
             );
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::Seed(seed),
-            );
+            return self.execute_admitted_matrix(&[], None, ExecutionPayload::Seed(seed));
         }
         self.validate_gadget_layout(ty, gadget_base, digit_count, true)?;
         let runner = Self::decomposed_hash_column_runner(ty, key, tag, digit_count, true)?;
@@ -5392,6 +5359,34 @@ impl Backend for GpuDcrtBackend {
         Ok((public, GpuFleetTrapdoor { values: Arc::new(values) }))
     }
 
+    fn sample_preimage_batch(
+        &mut self,
+        requests: Vec<crate::backend::PreimageRequest<Self::Matrix, Self::Trapdoor>>,
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
+        if self.prepared_required {
+            return self.execute_prepared_preimage_batch(requests);
+        }
+        if !self.prepared_required && !self.runtime_pilot_is_pending() {
+            return self.execute_preimage_batch(requests);
+        }
+        requests
+            .into_iter()
+            .map(|request| {
+                self.sample_preimage(
+                    &request.matrix_type,
+                    request.sigma,
+                    &request.gadget_base,
+                    request.digit_count,
+                    &request.max_coefficient_bound,
+                    &request.trapdoor,
+                    &request.public,
+                    request.target.as_ref(),
+                    request.randomness_seed,
+                )
+            })
+            .collect()
+    }
+
     fn sample_preimage(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -5405,25 +5400,6 @@ impl Backend for GpuDcrtBackend {
         randomness_seed: [u8; 32],
     ) -> Result<Self::SmallMatrix, Self::Error> {
         if self.prepared_required {
-            let schema = ConcreteBoundedMatrixSchema {
-                matrix: ty.clone(),
-                max_coefficient_bound: max_coefficient_bound.clone(),
-            };
-            let layout = crate::gpu_invocation::GpuColumnSourceLayout::Logical {
-                matrix_type: ty.clone(),
-                global_column_start: target.global_column_start(),
-            };
-            let request = crate::gpu_invocation::GpuInvocation::SamplePreimage {
-                schema: &schema,
-                sigma,
-                gadget_base,
-                digit_count,
-                trapdoor,
-                public,
-                target: &layout,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
             let payload = gpu_compiled::PreimagePayload {
                 trapdoors: trapdoor.values.clone(),
                 public: public.clone(),
@@ -5432,10 +5408,8 @@ impl Backend for GpuDcrtBackend {
                 seed: randomness_seed,
             };
             return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
+                &[],
+                None,
                 ExecutionPayload::Preimage(Arc::new(payload)),
             );
         }
@@ -5505,20 +5479,7 @@ impl Backend for GpuDcrtBackend {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::GadgetDecomposeRowBlocks {
-                blocks,
-                small,
-                digit_count,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(blocks, None, ExecutionPayload::None);
         }
         self.restart_runtime_pilot_after_matrix_inputs(blocks)?;
         let runner = Self::gadget_decompose_row_blocks_column_runner(blocks, small, digit_count);
@@ -5546,17 +5507,7 @@ impl Backend for GpuDcrtBackend {
         rhs: &Self::SmallMatrix,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request =
-                crate::gpu_invocation::GpuInvocation::MultiplySmallRhs { left: lhs, right: rhs };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            return self.execute_admitted_matrix(&[lhs], Some(rhs), ExecutionPayload::None);
         }
         let lhs_replicas = self.small_rhs_column_replicas(lhs, rhs)?;
         if self.devices.len() == 1 &&
@@ -5711,21 +5662,8 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::CrtRecompose {
-                levels,
-                plaintext_moduli,
-                reconstruction_coefficients,
-                destination,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::None,
-            );
+            let operands = levels.iter().collect::<Vec<_>>();
+            return self.execute_admitted_matrix(&operands, None, ExecutionPayload::None);
         }
 
         let first = levels.first().ok_or(PolyBackendError::InvalidInteger)?;
@@ -5884,14 +5822,9 @@ impl Backend for GpuDcrtBackend {
             return Err(PolyBackendError::InvalidInteger);
         }
         if self.prepared_required {
-            let request = crate::gpu_invocation::GpuInvocation::ImportMatrix { ty, bytes };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
             return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
+                &[],
+                None,
                 ExecutionPayload::Bytes(Arc::new(payload)),
             );
         }
@@ -6049,20 +5982,7 @@ impl Backend for GpuDcrtBackend {
                 expected_semantic_kind,
             )?;
             let payload = Arc::new(payload.to_vec());
-            let request = crate::gpu_invocation::GpuInvocation::ImportSmallMatrix {
-                schema: expected_schema,
-                bytes,
-                semantic_kind: expected_semantic_kind,
-            };
-            let (operation, left, right, compact) =
-                CompiledMatrixInvocation::arguments(&request, self)?;
-            return self.execute_admitted_matrix(
-                operation,
-                left,
-                &right,
-                compact,
-                ExecutionPayload::Bytes(payload),
-            );
+            return self.execute_admitted_matrix(&[], None, ExecutionPayload::Bytes(payload));
         }
         if !self
             .active_operation

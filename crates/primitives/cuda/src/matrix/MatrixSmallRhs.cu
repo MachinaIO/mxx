@@ -567,7 +567,7 @@ __device__ __forceinline__ uint64_t compact_words_mod(
     return residue;
 }
 
-__global__ void compact_check_pack_preimage_kernel(
+__device__ void compact_check_pack_preimage_kernel_body(
     const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *limb_descriptors,
     const uint64_t *moduli,
     const uint64_t *garner_inverses,
@@ -696,7 +696,28 @@ __global__ void compact_check_pack_preimage_kernel(
     }
 }
 
-__global__ void compact_commit_preimage_tile_kernel(
+__global__ void compact_check_pack_preimage_kernel(
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *limb_descriptors,
+    const uint64_t *moduli,
+    const uint64_t *garner_inverses,
+    int inverse_stride,
+    const int *subset_indices,
+    int subset_count,
+    int limb_count,
+    size_t coefficient_count,
+    size_t n,
+    int words_per_coeff,
+    const uint64_t *subset_modulus_words,
+    const uint64_t *subset_half_words,
+    const uint64_t *bound_words,
+    size_t magnitude_bytes,
+    int *accepted,
+    uint8_t *staging)
+{
+    compact_check_pack_preimage_kernel_body(limb_descriptors, moduli, garner_inverses, inverse_stride, subset_indices, subset_count, limb_count, coefficient_count, n, words_per_coeff, subset_modulus_words, subset_half_words, bound_words, magnitude_bytes, accepted, staging);
+}
+
+__device__ void compact_commit_preimage_tile_kernel_body(
     uint8_t *payload,
     const uint8_t *staging,
     size_t n,
@@ -719,6 +740,58 @@ __global__ void compact_commit_preimage_tile_kernel(
     const size_t dst_index =
         (((dst_row + row) * dst_cols + dst_col + col) * n + coeff) * width + byte;
     payload[dst_index] = staging[idx];
+}
+
+__global__ void compact_commit_preimage_tile_kernel(
+    uint8_t *payload,
+    const uint8_t *staging,
+    size_t n,
+    size_t rows,
+    size_t tile_cols,
+    size_t dst_cols,
+    size_t dst_row,
+    size_t dst_col,
+    size_t width)
+{
+    compact_commit_preimage_tile_kernel_body(payload, staging, n, rows, tile_cols, dst_cols, dst_row, dst_col, width);
+}
+
+// All per-job metadata fits in immutable kernel arguments. No descriptor
+// upload is required, and each candidate retains its own acceptance word.
+constexpr size_t kCompactPreimageBatch = 16;
+struct CompactPreimageJob {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source;
+    const uint64_t *moduli, *inverses, *modulus, *half, *bound;
+    const int *indices;
+    int inverse_stride, subsets, limbs, words;
+    int *accepted;
+    uint8_t *staging, *payload;
+    size_t magnitude, dst_cols, dst_row, dst_col;
+};
+struct CompactPreimageBatch { CompactPreimageJob jobs[kCompactPreimageBatch]; };
+static_assert(sizeof(CompactPreimageBatch) + 128 < 4096, "bounded cutoff kernel arguments");
+
+__global__ void compact_preimage_initialize_batch_kernel(CompactPreimageBatch batch, size_t count)
+{
+    if (threadIdx.x < count) *batch.jobs[threadIdx.x].accepted = 1;
+}
+__global__ void compact_preimage_check_batch_kernel(
+    CompactPreimageBatch batch, size_t coefficients, size_t n)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    compact_check_pack_preimage_kernel_body(
+        job.source, job.moduli, job.inverses, job.inverse_stride,
+        job.indices, job.subsets, job.limbs, coefficients, n, job.words,
+        job.modulus, job.half, job.bound, job.magnitude, job.accepted, job.staging);
+}
+__global__ void compact_preimage_commit_batch_kernel(
+    CompactPreimageBatch batch, size_t n, size_t rows, size_t columns)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    if (*job.accepted == 0) return;
+    compact_commit_preimage_tile_kernel_body(
+        job.payload, job.staging, n, rows, columns,
+        job.dst_cols, job.dst_row, job.dst_col, 1 + job.magnitude);
 }
 
 void compact_trim_words(std::vector<uint64_t> *words)
@@ -1981,5 +2054,92 @@ extern "C" int gpu_matrix_mul_small_rhs(
         return fail(cudaErrorInvalidResourceHandle);
     const cudaError_t cleanup_err = release();
     if (cleanup_err != cudaSuccess) return set_error(cleanup_err);
+    return 0;
+}
+
+
+// Inputs are homogeneous coefficient matrices in one context. Destinations
+// have independent cutoff plans/decision words, but may use different bounds.
+// The caller owns every destination exclusively and supplies valid tile ranges.
+extern "C" int gpu_small_matrix_pack_preimage_batch(
+    GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
+    const size_t *dst_rows, const size_t *dst_columns, size_t count, int32_t *accepted)
+{
+    if (count == 0) return 0;
+    auto *first = destinations[0];
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
+    if (small_set_device(first) != 0) return 1;
+    const auto stream = first->stream;
+    const size_t rows = sources[0]->rows, columns = sources[0]->cols;
+    const size_t coefficients = rows * columns * first->n;
+    const size_t limbs = sources[0]->level + 1;
+    const size_t partition = first->ctx->limb_gpu_ids[0].x;
+    const auto &constants = first->ctx->ring_device_constants[partition];
+    // Acquire all staging owners before any reader event claims. This explicit
+    // phase order is also used when expanding the W=1 prepared trace.
+    std::vector<std::unique_ptr<GpuDeviceWorkspace>> staging;
+    staging.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        staging.emplace_back(new GpuDeviceWorkspace());
+        const size_t bytes = coefficients * (1 + destinations[index]->magnitude_bytes);
+        if (staging.back()->acquire(first->ctx, first->device,
+                GPU_PREPARED_COMPACT_WORKSPACE, bytes, alignof(uint8_t), stream) != 0)
+            return 1;
+    }
+    for (size_t offset = 0; offset < count; offset += kCompactPreimageBatch) {
+        const size_t width = std::min(kCompactPreimageBatch, count - offset);
+        CompactPreimageBatch batch{};
+        size_t max_bytes = 0;
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            auto *dst = destinations[index];
+            const auto *src = sources[index];
+            if (small_wait(dst, stream) != 0) return 1;
+            for (size_t limb = 0; limb < limbs; ++limb)
+                if (matrix_wait_limb_stream(src, src->ctx->limb_gpu_ids[limb],
+                        first->device, stream, true, true) != 0) return 1;
+            batch.jobs[local] = {
+                src->shared_limb_buffers[partition].device_descriptors,
+                constants.moduli, dst->hard_cutoff_garner_inverses,
+                dst->hard_cutoff_modulus_words, dst->hard_cutoff_half_modulus_words,
+                dst->hard_cutoff_bound_words, dst->hard_cutoff_subset_indices,
+                static_cast<int>(src->ctx->moduli.size()), dst->hard_cutoff_subset_count,
+                static_cast<int>(limbs), dst->hard_cutoff_words_per_coeff,
+                dst->hard_cutoff_device_accepted, staging[index]->data, dst->payload,
+                dst->magnitude_bytes, dst->cols, dst_rows[index], dst_columns[index]
+            };
+            max_bytes = std::max(max_bytes, coefficients * (1 + dst->magnitude_bytes));
+        }
+        compact_preimage_initialize_batch_kernel<<<1, kCompactPreimageBatch, 0, stream>>>(batch, width);
+        cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        const dim3 check((coefficients + kSmallThreads - 1) / kSmallThreads, width);
+        compact_preimage_check_batch_kernel<<<check, kSmallThreads, 0, stream>>>(batch, coefficients, first->n);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        const dim3 commit((max_bytes + kSmallThreads - 1) / kSmallThreads, width);
+        compact_preimage_commit_batch_kernel<<<commit, kSmallThreads, 0, stream>>>(batch, first->n, rows, columns);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            for (size_t limb = 0; limb < limbs; ++limb)
+                if (matrix_track_limb_consumer_readonly(sources[index],
+                        first->ctx->limb_gpu_ids[limb], first->device, stream) != 0) return 1;
+            if (small_record(destinations[index], stream) != 0) return 1;
+        }
+    }
+    for (size_t index = 0; index < count; ++index) {
+        auto *dst = destinations[index];
+        const auto error = cudaMemcpyAsync(dst->hard_cutoff_host_accepted,
+            dst->hard_cutoff_device_accepted, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        if (error != cudaSuccess) return set_error(error);
+    }
+    // A single event covers every decision, including later argument chunks.
+    auto error = cudaEventRecord(first->hard_cutoff_decision_ready, stream);
+    if (error == cudaSuccess) error = cudaEventSynchronize(first->hard_cutoff_decision_ready);
+    if (error != cudaSuccess) return set_error(error);
+    for (size_t index = 0; index < count; ++index)
+        accepted[index] = *destinations[index]->hard_cutoff_host_accepted;
     return 0;
 }

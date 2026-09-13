@@ -70,9 +70,10 @@ pub use gpu_view::{
 mod gpu_admission;
 pub use gpu_admission::{
     GpuCompactTransferKind, GpuGraphAdmissionGuard, GpuMatrixDispatch, GpuMatrixReservation,
-    GpuPreparedDemand, GpuPreparedOccupancy, GpuPreparedOccupancyMode, GpuPreparedRequest,
-    GpuPreparedSlotIdentity, GpuPreparedSlotKind, GpuPreparedStorage, GpuPreparedWorkspaceLayout,
-    GpuTracedClaim, GpuTracedStepGuard, trace_native_claims,
+    GpuPreparedDemand, GpuPreparedOccupancy, GpuPreparedOccupancyMode, GpuPreparedRegion,
+    GpuPreparedRequest, GpuPreparedSlotIdentity, GpuPreparedSlotKind, GpuPreparedSlotSnapshot,
+    GpuPreparedStorage, GpuPreparedWorkspaceLayout, GpuTracedClaim, GpuTracedStepGuard,
+    capacity_class, matrix_capacity_class, trace_native_claims,
 };
 
 #[path = "gpu_staging.rs"]
@@ -794,6 +795,34 @@ impl GpuSmallMatrix {
     pub fn prepare_preimage_hard_cutoff(&mut self) {
         let status = unsafe { gpu_small_matrix_prepare_preimage_hard_cutoff(self.raw) };
         check_status(status, "gpu_small_matrix_prepare_preimage_hard_cutoff");
+    }
+
+    /// Pack homogeneous coefficient candidates into independently owned,
+    /// prepared cutoff destinations. Ranges must fit, contexts must match, and
+    /// each destination must have its own decision word. Bounds may differ.
+    /// Rejected candidates never modify their destinations.
+    pub(crate) fn pack_preimage_batch(
+        jobs: Vec<(&mut Self, &GpuDCRTPolyMatrix, usize, usize)>,
+    ) -> Result<Vec<bool>, String> {
+        let destinations = jobs.iter().map(|(dst, _, _, _)| dst.raw).collect::<Vec<_>>();
+        let sources = jobs.iter().map(|(_, src, _, _)| src.raw.cast_const()).collect::<Vec<_>>();
+        let rows = jobs.iter().map(|(_, _, row, _)| *row).collect::<Vec<_>>();
+        let columns = jobs.iter().map(|(_, _, _, column)| *column).collect::<Vec<_>>();
+        let mut accepted = vec![0i32; jobs.len()];
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_small_matrix_pack_preimage_batch(
+                destinations.as_ptr(),
+                sources.as_ptr(),
+                rows.as_ptr(),
+                columns.as_ptr(),
+                jobs.len(),
+                accepted.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        Ok(accepted.into_iter().map(|flag| flag != 0).collect())
     }
 
     pub fn allocation_report(
@@ -1594,6 +1623,57 @@ impl GpuDCRTPolyMatrix {
         self
     }
 
+    /// Fully write equally shaped coefficient owners using independent seeds,
+    /// and publish evaluation-format Gaussian samples. Inputs use one context.
+    pub(crate) fn sample_gaussian_batch(
+        outputs: &mut [Self],
+        sigma: f64,
+        seeds: &[GpuRngSeed],
+    ) -> Result<(), String> {
+        let raw = outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_sample_gaussian_batch(
+                raw.as_ptr(),
+                seeds.as_ptr(),
+                raw.len(),
+                sigma,
+            )
+        };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        for output in outputs {
+            output.is_ntt = true;
+        }
+        Ok(())
+    }
+
+    /// Convert a homogeneous, exclusively owned candidate batch in place.
+    /// Native descriptors and completion dependencies belong to the existing
+    /// owners; this introduces neither a copy nor an allocation workspace.
+    pub(crate) fn intt_batch_in_place(matrices: &mut [Self]) -> Result<(), String> {
+        let Some(first) = matrices.first() else { return Ok(()) };
+        if first.nrow == 0 || first.ncol == 0 || first.nrow * first.ncol > 65535 {
+            // The scalar GPU transform supports shapes beyond the batch grid.
+            for matrix in matrices {
+                matrix.intt_all_in_place();
+            }
+            return Ok(());
+        }
+        let batch_limit = 65535 / (first.level + 1);
+        for chunk in matrices.chunks_mut(batch_limit) {
+            let raw = chunk.iter().map(|matrix| matrix.raw).collect::<Vec<_>>();
+            let status = unsafe { gpu_matrix_intt_batch(raw.as_ptr(), ptr::null(), raw.len()) };
+            if status != 0 {
+                return Err(crate::poly::dcrt::gpu::last_error_string());
+            }
+            for matrix in chunk {
+                matrix.is_ntt = false;
+            }
+        }
+        Ok(())
+    }
+
     fn compact_bytes_batch_homogeneous(matrices: &[&Self]) -> Vec<Vec<u8>> {
         if matrices.is_empty() {
             return Vec::new();
@@ -2236,6 +2316,37 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
+    /// Sample homogeneous coefficient sources into independently owned gadget
+    /// outputs in the same one-device context. Every digit row is fully written;
+    /// outputs start in coefficient format and become evaluation values.
+    pub(crate) fn sample_gadget_batch(
+        outputs: &mut [Self],
+        sources: &[Self],
+        c: f64,
+        seeds: &[GpuRngSeed],
+    ) -> Result<(), String> {
+        let Some(first) = sources.first() else { return Ok(()) };
+        let raw_outputs = outputs.iter().map(|value| value.raw).collect::<Vec<_>>();
+        let raw_inputs = sources.iter().map(|value| value.raw.cast_const()).collect::<Vec<_>>();
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_sample_gadget_batch(
+                raw_outputs.as_ptr(),
+                raw_inputs.as_ptr(),
+                seeds.as_ptr(),
+                outputs.len(),
+                first.params.base_bits(),
+                c,
+            )
+        };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        for output in outputs {
+            output.is_ntt = true;
+        }
+        Ok(())
+    }
+
     pub(crate) fn create_p1_covariance_cache(
         a_mat: &Self,
         b_mat: &Self,
@@ -2280,6 +2391,36 @@ impl GpuDCRTPolyMatrix {
         let status = unsafe { gpu_matrix_sample_p1_full_cached(cache.raw, tp2.raw, seed, out.raw) };
         check_status(status, "gpu_matrix_sample_p1_full_cached");
         out
+    }
+
+    /// Homogeneous coefficient sources and uninitialized coefficient outputs,
+    /// with resident covariance caches and independent seeds. Every owner and
+    /// cache uses the same one-device context. Outputs become evaluation values.
+    pub(crate) fn sample_p1_batch(
+        outputs: &mut [Self],
+        sources: &[Self],
+        caches: &[&GpuP1CovarianceCache],
+        seeds: &[GpuRngSeed],
+    ) -> Result<(), String> {
+        let raw_outputs = outputs.iter().map(|value| value.raw).collect::<Vec<_>>();
+        let raw_inputs = sources.iter().map(|value| value.raw.cast_const()).collect::<Vec<_>>();
+        let raw_caches = caches.iter().map(|cache| cache.raw.cast_const()).collect::<Vec<_>>();
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_sample_p1_batch(
+                raw_outputs.as_ptr(),
+                raw_inputs.as_ptr(),
+                raw_caches.as_ptr(),
+                seeds.as_ptr(),
+                outputs.len(),
+            )
+        };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        for output in outputs {
+            output.is_ntt = true;
+        }
+        Ok(())
     }
 
     pub(crate) fn mul_vertical_pair(top: &Self, bottom: &Self, rhs: &Self) -> Self {
@@ -2375,6 +2516,25 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
+    /// Concatenate homogeneous, disjoint Eval owners with equal column counts.
+    pub(crate) fn assemble_preimage_batch(
+        outputs: &mut [Self],
+        sources: &[(&Self, &Self)],
+    ) -> Result<(), String> {
+        let outputs = outputs.iter().map(|out| out.raw).collect::<Vec<_>>();
+        let tops = sources.iter().map(|(top, _)| top.raw.cast_const()).collect::<Vec<_>>();
+        let bottoms = sources.iter().map(|(_, bottom)| bottom.raw.cast_const()).collect::<Vec<_>>();
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_preimage_assemble_batch(
+                outputs.as_ptr(),
+                tops.as_ptr(),
+                bottoms.as_ptr(),
+                outputs.len(),
+            )
+        };
+        if status == 0 { Ok(()) } else { Err(crate::poly::dcrt::gpu::last_error_string()) }
+    }
+
     pub(crate) fn preimage_add_correction(&mut self, r: &Self, e: &Self, z: &Self) {
         debug_assert_eq!(self.params, r.params, "preimage correction r params mismatch");
         debug_assert_eq!(self.params, e.params, "preimage correction e params mismatch");
@@ -2400,6 +2560,33 @@ impl GpuDCRTPolyMatrix {
         }
         let status = unsafe { gpu_matrix_preimage_add_correction(self.raw, r.raw, e.raw, z.raw) };
         check_status(status, "gpu_matrix_preimage_add_correction");
+    }
+
+    /// Apply [R; E] to homogeneous inputs. In correction mode, add into the
+    /// candidate top and add the input into its bottom; otherwise fully write
+    /// the product into a 2d-row destination. All owners are evaluation format. Each
+    /// output is exclusively owned and disjoint from every source.
+    pub(crate) fn apply_trapdoor_batch(
+        outputs: &mut [Self],
+        trapdoors: &[(&Self, &Self)],
+        corrections: &[Self],
+        correction: bool,
+    ) -> Result<(), String> {
+        let outputs = outputs.iter().map(|value| value.raw).collect::<Vec<_>>();
+        let rs = trapdoors.iter().map(|(r, _)| r.raw.cast_const()).collect::<Vec<_>>();
+        let es = trapdoors.iter().map(|(_, e)| e.raw.cast_const()).collect::<Vec<_>>();
+        let zs = corrections.iter().map(|z| z.raw.cast_const()).collect::<Vec<_>>();
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_apply_trapdoor_batch(
+                outputs.as_ptr(),
+                rs.as_ptr(),
+                es.as_ptr(),
+                zs.as_ptr(),
+                outputs.len(),
+                correction,
+            )
+        };
+        if status == 0 { Ok(()) } else { Err(crate::poly::dcrt::gpu::last_error_string()) }
     }
 
     pub(crate) fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize, format: i32) {
@@ -5889,6 +6076,121 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_gaussian_batch_preserves_scalar_seeds_across_tail() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(3)
+            .max(1);
+        // Include a modulus fitting u64 and a wider CRT basis; an absent cutoff
+        // must preserve the scalar random stream in both cases.
+        for depth in [1, 3] {
+            let params = gpu_params_from_cpu(&DCRTPolyParams::new(n, depth, 30, 4, None, None));
+            let seeds = (0..65).map(|_| GpuRngSeed::from_bytes(rand::random())).collect::<Vec<_>>();
+            let mut outputs = seeds
+                .iter()
+                .map(|_| {
+                    GpuDCRTPolyMatrix::new_empty_with_state(
+                        &params,
+                        2,
+                        columns,
+                        params.crt_depth() - 1,
+                        false,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+            GpuDCRTPolyMatrix::sample_gaussian_batch(&mut outputs, 12.375, &seeds).unwrap();
+            for (actual, seed) in outputs.iter().zip(seeds) {
+                let expected = GpuDCRTPolyMatrix::sample_distribution(
+                    &params,
+                    2,
+                    columns,
+                    GpuMatrixSampleDist::Gauss,
+                    12.375,
+                    u64::MAX,
+                    seed,
+                );
+                assert!(actual.is_ntt());
+                assert_eq!(actual, &expected);
+            }
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_correction_batch_distinct_owners_and_tail() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(3)
+            .max(1);
+        let params = gpu_params_from_cpu(&DCRTPolyParams::new(n, 3, 30, 4, None, None));
+        // Cross the immutable native argument block boundary (64), with a
+        // different trapdoor and candidate for every job, including the tail.
+        let jobs = (0..65)
+            .map(|_| {
+                let mut random = rng();
+                let mut matrix = |rows, cols| {
+                    gpu_constant_matrix(&params, rows, cols, random.random_range(1..100_000))
+                };
+                (matrix(2, 5), matrix(2, 5), matrix(5, columns), matrix(9, columns))
+            })
+            .collect::<Vec<_>>();
+        let mut outputs = jobs.iter().map(|(_, _, _, output)| output.clone()).collect::<Vec<_>>();
+        let trapdoors = jobs.iter().map(|(r, e, _, _)| (r, e)).collect::<Vec<_>>();
+        let corrections = jobs.iter().map(|(_, _, z, _)| z.clone()).collect::<Vec<_>>();
+        GpuDCRTPolyMatrix::apply_trapdoor_batch(&mut outputs, &trapdoors, &corrections, true)
+            .unwrap();
+        let mut products = jobs
+            .iter()
+            .map(|_| {
+                GpuDCRTPolyMatrix::new_empty_with_state(
+                    &params,
+                    4,
+                    columns,
+                    params.crt_depth() - 1,
+                    true,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        GpuDCRTPolyMatrix::apply_trapdoor_batch(&mut products, &trapdoors, &corrections, false)
+            .unwrap();
+        let mut assembled = jobs
+            .iter()
+            .map(|_| {
+                GpuDCRTPolyMatrix::new_empty_with_state(
+                    &params,
+                    9,
+                    columns,
+                    params.crt_depth() - 1,
+                    true,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let sources = products.iter().zip(&corrections).collect::<Vec<_>>();
+        GpuDCRTPolyMatrix::assemble_preimage_batch(&mut assembled, &sources).unwrap();
+        drop(sources);
+        for ((actual, top), bottom) in assembled.iter().zip(&products).zip(&corrections) {
+            assert_eq!(actual, &top.concat_rows(&[bottom]));
+        }
+        drop(corrections);
+        drop(trapdoors);
+        for ((actual, product), (r, e, z, mut expected)) in outputs.iter().zip(products).zip(jobs) {
+            assert_eq!(product, GpuDCRTPolyMatrix::mul_vertical_pair(&r, &e, &z));
+            expected.preimage_add_correction(&r, &e, &z);
+            assert_eq!(actual, &expected);
+        }
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_preimage_fused_matrix_primitives_match_composition() {
         gpu_device_sync();
         let gpu_params = gpu_params_from_cpu(&gpu_test_params());
@@ -6464,6 +6766,72 @@ mod tests {
         assert_eq!(report.workspace_word_bytes, std::mem::size_of::<u32>());
         assert_eq!(report.u32_workspace_limb_count, params.crt_depth());
         assert_eq!(report.u64_workspace_limb_count, 0);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_preimage_cutoff_batch_preserves_rejections_and_tile_tails() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(3)
+            .max(1);
+        let params = gpu_params_from_cpu(&DCRTPolyParams::new(n, 3, 30, 4, None, None));
+        let sources = (0..17)
+            .map(|_| {
+                gpu_constant_matrix(&params, 1, columns, rng().random_range(10..100))
+                    .into_coeff_domain()
+            })
+            .collect::<Vec<_>>();
+        let make_outputs = || {
+            (0..sources.len())
+                .map(|index| {
+                    let bound = BigUint::from(if index % 2 == 0 { 2u32 } else { 100_000 });
+                    let width = 1 + bound.bits().div_ceil(8).max(1) as usize;
+                    let mut payload = vec![0; 2 * (columns + 2) * n as usize * width];
+                    // Nonzero sentinels detect writes on rejection and outside the tile.
+                    for coefficient in payload.chunks_mut(width) {
+                        coefficient[0] = 1;
+                        coefficient[1] = 1;
+                    }
+                    let mut output = GpuSmallMatrix::from_canonical_coefficients(
+                        &params,
+                        2,
+                        columns + 2,
+                        bound,
+                        &payload,
+                    )
+                    .unwrap();
+                    output.prepare_preimage_hard_cutoff();
+                    output
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut expected = make_outputs();
+        let expected_flags = expected
+            .iter_mut()
+            .zip(&sources)
+            .map(|(dst, src)| {
+                dst.try_pack_preimage_hard_cutoff_tile(src, 1, 1, 1, columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut actual = make_outputs();
+        let flags = GpuSmallMatrix::pack_preimage_batch(
+            actual.iter_mut().zip(&sources).map(|(dst, src)| (dst, src, 1, 1)).collect(),
+        )
+        .unwrap();
+        assert_eq!(flags, expected_flags);
+        assert!(flags.iter().any(|accepted| *accepted));
+        assert!(flags.iter().any(|accepted| !accepted));
+        drop(sources);
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(
+                actual.to_canonical_coefficients().unwrap(),
+                expected.to_canonical_coefficients().unwrap()
+            );
+        }
     }
 
     #[test]

@@ -130,6 +130,47 @@ pub struct GpuDCRTPolyMatrixColumnView<'a> {
 }
 
 impl GpuDCRTPolyMatrix {
+    /// Compute equally shaped Preimage residuals in one native accumulation
+    /// batch: target - A[:, :p1.rows] p1 - A[:, p1.rows:] p2.
+    /// Inputs share a context/level and evaluation format; perturbation blocks
+    /// may have wider backing than the target. Destinations follow the range
+    /// accumulation contract, including its queried batch workspace claims.
+    pub fn preimage_residual_batch<'a>(
+        jobs: impl IntoIterator<
+            Item = (
+                &'a Self,
+                &'a Self,
+                &'a Self,
+                &'a Self,
+                Option<(Self, Range<usize>, Range<usize>)>,
+            ),
+        >,
+    ) -> Result<Vec<Self>, String> {
+        let jobs = jobs
+            .into_iter()
+            .map(|(target, public, p1, p2, destination)| {
+                let columns = target.col_size();
+                Ok((
+                    vec![
+                        (
+                            BigInt::from(-1),
+                            public.column_view(0..p1.row_size())?,
+                            p1.column_view(0..columns)?,
+                        ),
+                        (
+                            BigInt::from(-1),
+                            public.column_view(p1.row_size()..public.col_size())?,
+                            p2.column_view(0..columns)?,
+                        ),
+                    ],
+                    Some(target.column_view(0..columns)?),
+                    destination,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        GpuDCRTPolyMatrixColumnView::multiply_accumulate_batch(jobs)
+    }
+
     /// Fill a retained rectangle without allocating another GPU matrix or
     /// metadata workspace. Other entries and the output format are preserved;
     /// nonzero constants require evaluation format.
@@ -403,6 +444,106 @@ impl GpuDCRTPolyMatrixColumnView<'_> {
             }
         }
         Ok(output)
+    }
+
+    /// Submit equally shaped ranges together, preserving each backing owner's
+    /// pitch and completion dependencies. Inputs may share an owner; output
+    /// rectangles must be disjoint and must not alias any input.
+    ///
+    /// Prepared callers reserve the native batch workspace reported by
+    /// `matrix_batch_workspace_bytes` for the number of jobs before calling.
+    /// This method performs no readback or completion wait.
+    pub fn negate_batch(
+        jobs: impl IntoIterator<Item = (Self, Option<(GpuDCRTPolyMatrix, Range<usize>, Range<usize>)>)>,
+    ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
+        let jobs = jobs
+            .into_iter()
+            .map(|(input, destination)| {
+                let (output, range) =
+                    input.destination(destination, input.owner.is_ntt, input.size())?;
+                Ok((input, output, range))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if jobs.first().is_some_and(|(input, _, _)| {
+            let (rows, columns) = input.size();
+            rows != 0 && columns != 0
+        }) {
+            // These bounded descriptors are the native ABI's per-owner inputs;
+            // coefficient addresses are derived in the kernel from each view.
+            let inputs =
+                jobs.iter().map(|(input, _, _)| input.owner.raw.cast_const()).collect::<Vec<_>>();
+            let outputs = jobs.iter().map(|(_, output, _)| output.raw).collect::<Vec<_>>();
+            let views = jobs
+                .iter()
+                .map(|(input, _, range)| GpuMatrixBatchView {
+                    left: input.range,
+                    right: input.range,
+                    output: *range,
+                })
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                gpu_matrix_negate_batch(
+                    outputs.as_ptr(),
+                    inputs.as_ptr(),
+                    views.as_ptr(),
+                    jobs.len(),
+                )
+            };
+            if status != 0 {
+                return Err(last_error_string());
+            }
+        }
+        Ok(jobs.into_iter().map(|(_, output, _)| output).collect())
+    }
+
+    /// Add or subtract equally shaped pairs in one native launch. The output
+    /// rectangles are disjoint and cannot alias any input; shared input owners
+    /// retain their native reader dependencies through the complete batch.
+    pub fn binary_batch(
+        jobs: impl IntoIterator<
+            Item = (Self, Self, Option<(GpuDCRTPolyMatrix, Range<usize>, Range<usize>)>),
+        >,
+        subtract: bool,
+    ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
+        let jobs = jobs
+            .into_iter()
+            .map(|(left, right, destination)| {
+                let (output, range) =
+                    left.destination(destination, left.owner.is_ntt, left.size())?;
+                Ok((left, right, output, range))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if jobs.first().is_some_and(|(left, _, _, _)| left.size().0 != 0 && left.size().1 != 0) {
+            let left =
+                jobs.iter().map(|(left, _, _, _)| left.owner.raw.cast_const()).collect::<Vec<_>>();
+            let right = jobs
+                .iter()
+                .map(|(_, right, _, _)| right.owner.raw.cast_const())
+                .collect::<Vec<_>>();
+            let outputs = jobs.iter().map(|(_, _, output, _)| output.raw).collect::<Vec<_>>();
+            let views = jobs
+                .iter()
+                .map(|(left, right, _, range)| GpuMatrixBatchView {
+                    left: left.range,
+                    right: right.range,
+                    output: *range,
+                })
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                gpu_matrix_binary_batch(
+                    outputs.as_ptr(),
+                    left.as_ptr(),
+                    right.as_ptr(),
+                    views.as_ptr(),
+                    jobs.len(),
+                    i32::from(subtract),
+                )
+            };
+            if status != 0 {
+                return Err(last_error_string());
+            }
+        }
+        Ok(jobs.into_iter().map(|(_, _, output, _)| output).collect())
     }
 
     /// Copy a borrowed rectangle directly into its admitted destination.
@@ -1603,6 +1744,76 @@ impl GpuDCRTPolyMatrixColumnView<'_> {
         Ok(output)
     }
 
+    /// Multiply matching evaluation-range pairs in one native batch. Complete
+    /// singleton owners broadcast as scalars. Matrix and scalar products form
+    /// separate batches; callers reserve the corresponding native workspace.
+    pub fn multiply_batch(
+        jobs: impl IntoIterator<
+            Item = (Self, Self, Option<(GpuDCRTPolyMatrix, Range<usize>, Range<usize>)>),
+        >,
+    ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
+        let jobs = jobs
+            .into_iter()
+            .map(|(left, right, destination)| {
+                let (left, right) = if left.size() == (1, 1) && left.owner.size() == (1, 1) {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                let scalar = right.size() == (1, 1) && right.owner.size() == (1, 1);
+                let shape = if scalar { left.size() } else { (left.size().0, right.size().1) };
+                let (output, range) = left.destination(destination, true, shape)?;
+                Ok((left, right, output, range, scalar))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if let Some((_, _, _, range, scalar)) = jobs.first() {
+            if range.row_start != range.row_end && range.column_start != range.column_end {
+                let left = jobs
+                    .iter()
+                    .map(|(left, _, _, _, _)| left.owner.raw.cast_const())
+                    .collect::<Vec<_>>();
+                let right = jobs
+                    .iter()
+                    .map(|(_, right, _, _, _)| right.owner.raw.cast_const())
+                    .collect::<Vec<_>>();
+                let outputs =
+                    jobs.iter().map(|(_, _, output, _, _)| output.raw).collect::<Vec<_>>();
+                let views = jobs
+                    .iter()
+                    .map(|(left, right, _, range, _)| GpuMatrixBatchView {
+                        left: left.range,
+                        right: right.range,
+                        output: *range,
+                    })
+                    .collect::<Vec<_>>();
+                let status = unsafe {
+                    if *scalar {
+                        gpu_matrix_mul_scalar_batch(
+                            outputs.as_ptr(),
+                            left.as_ptr(),
+                            right.as_ptr(),
+                            views.as_ptr(),
+                            jobs.len(),
+                            std::ptr::null(),
+                        )
+                    } else {
+                        gpu_matrix_mul_batch(
+                            outputs.as_ptr(),
+                            left.as_ptr(),
+                            right.as_ptr(),
+                            views.as_ptr(),
+                            jobs.len(),
+                        )
+                    }
+                };
+                if status != 0 {
+                    return Err(last_error_string());
+                }
+            }
+        }
+        Ok(jobs.into_iter().map(|(_, _, output, _, _)| output).collect())
+    }
+
     /// The destination is evaluation format. Coefficient inputs use an explicit
     /// range-sized conversion; unrequested source columns/rows are never copied.
     pub fn multiply_poly(
@@ -1736,6 +1947,101 @@ impl GpuDCRTPolyMatrixColumnView<'_> {
         Ok(output)
     }
 
+    /// Submit integer-weighted product sums for all destinations together.
+    /// Product counts and output shapes match across jobs; coefficients, biases
+    /// and owner pitches may differ. Metadata staging belongs to the prepared
+    /// resources returned by the native batch workspace query.
+    pub fn multiply_accumulate_batch(
+        jobs: impl IntoIterator<
+            Item = (
+                Vec<(BigInt, Self, Self)>,
+                Option<Self>,
+                Option<(GpuDCRTPolyMatrix, Range<usize>, Range<usize>)>,
+            ),
+        >,
+    ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
+        let jobs = jobs
+            .into_iter()
+            .map(|(products, bias, destination)| {
+                let (_, first, right) = products.first().expect("nonempty product sum");
+                let shape = if first.size() == (1, 1) {
+                    right.size()
+                } else if right.size() == (1, 1) {
+                    first.size()
+                } else {
+                    (first.size().0, right.size().1)
+                };
+                let (output, range) = first.destination(destination, true, shape)?;
+                Ok((products, bias, output, range))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let Some((first, _, _, _)) = jobs.first() else {
+            return Ok(Vec::new());
+        };
+        let product_count = first.len();
+        let residues = jobs
+            .par_iter()
+            .flat_map_iter(|(products, _, _, _)| {
+                products.iter().flat_map(|(coefficient, left, _)| {
+                    left.params().moduli()[..=left.owner.level].iter().map(move |&modulus| {
+                        let modulus = BigInt::from(modulus);
+                        ((coefficient % &modulus + &modulus) % &modulus).to_u64().unwrap()
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let left = jobs
+            .iter()
+            .flat_map(|(products, _, _, _)| {
+                products.iter().map(|(_, left, _)| left.owner.raw.cast_const())
+            })
+            .collect::<Vec<_>>();
+        let right = jobs
+            .iter()
+            .flat_map(|(products, _, _, _)| {
+                products.iter().map(|(_, _, right)| right.owner.raw.cast_const())
+            })
+            .collect::<Vec<_>>();
+        let outputs = jobs.iter().map(|(_, _, output, _)| output.raw).collect::<Vec<_>>();
+        let biases = jobs
+            .iter()
+            .map(|(_, bias, _, _)| bias.map_or(ptr::null(), |bias| bias.owner.raw.cast_const()))
+            .collect::<Vec<_>>();
+        let bias_views = jobs
+            .iter()
+            .map(|(_, bias, _, range)| bias.map_or(*range, |bias| bias.range))
+            .collect::<Vec<_>>();
+        let views = jobs
+            .iter()
+            .flat_map(|(products, _, _, range)| {
+                products.iter().map(|(_, left, right)| GpuMatrixBatchView {
+                    left: left.range,
+                    right: right.range,
+                    output: *range,
+                })
+            })
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_mul_accumulate_batch(
+                outputs.as_ptr(),
+                left.as_ptr(),
+                right.as_ptr(),
+                ptr::null(),
+                biases.as_ptr(),
+                ptr::null(),
+                jobs.len(),
+                product_count,
+                views.as_ptr(),
+                bias_views.as_ptr(),
+                residues.as_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(jobs.into_iter().map(|(_, _, output, _)| output).collect())
+    }
+
     /// Scale by a host integer without creating a scalar polynomial on the GPU.
     /// Explicit destinations preserve the input format; a standalone result is
     /// returned in evaluation format, matching ordinary polynomial scaling.
@@ -1774,6 +2080,107 @@ impl GpuDCRTPolyMatrixColumnView<'_> {
             output.ntt_all_in_place();
         }
         Ok(output)
+    }
+
+    /// Scale a batch of prepared destinations without constructing GPU scalar
+    /// polynomials. Each job has its own integer; residue conversion is CPU-only.
+    pub fn scale_integer_batch<'s>(
+        jobs: impl IntoIterator<
+            Item = (Self, &'s BigInt, Option<(GpuDCRTPolyMatrix, Range<usize>, Range<usize>)>),
+        >,
+    ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
+        let jobs = jobs
+            .into_iter()
+            .map(|(input, scalar, destination)| {
+                let (output, range) =
+                    input.destination(destination, input.owner.is_ntt, input.size())?;
+                Ok((input, scalar, output, range))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if jobs.first().is_some_and(|(input, _, _, _)| input.size().0 != 0 && input.size().1 != 0) {
+            let residues = jobs
+                .par_iter()
+                .flat_map_iter(|(input, scalar, _, _)| {
+                    input.params().moduli()[..=input.owner.level].iter().map(move |&modulus| {
+                        let modulus = BigInt::from(modulus);
+                        ((*scalar % &modulus + &modulus) % &modulus).to_u64().unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let inputs = jobs
+                .iter()
+                .map(|(input, _, _, _)| input.owner.raw.cast_const())
+                .collect::<Vec<_>>();
+            let outputs = jobs.iter().map(|(_, _, output, _)| output.raw).collect::<Vec<_>>();
+            let views = jobs
+                .iter()
+                .map(|(input, _, _, range)| GpuMatrixBatchView {
+                    left: input.range,
+                    right: input.range,
+                    output: *range,
+                })
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                gpu_matrix_mul_scalar_batch(
+                    outputs.as_ptr(),
+                    inputs.as_ptr(),
+                    std::ptr::null(),
+                    views.as_ptr(),
+                    jobs.len(),
+                    residues.as_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(last_error_string());
+            }
+        }
+        Ok(jobs.into_iter().map(|(_, _, output, _)| output).collect())
+    }
+
+    /// Apply per-job automorphisms in one launch, using supplied destinations
+    /// or allocating them. Format conversion belongs to input preparation.
+    pub fn ring_automorphism_batch(
+        jobs: impl IntoIterator<
+            Item = (Self, usize, Option<(GpuDCRTPolyMatrix, Range<usize>, Range<usize>)>),
+        >,
+    ) -> Result<Vec<GpuDCRTPolyMatrix>, String> {
+        let jobs = jobs
+            .into_iter()
+            .map(|(input, index, destination)| {
+                let (output, range) =
+                    input.destination(destination, input.owner.is_ntt, input.size())?;
+                Ok((input, index, output, range))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if jobs.first().is_some_and(|(input, _, _, _)| input.size().0 != 0 && input.size().1 != 0) {
+            let indices = jobs.iter().map(|(_, index, _, _)| *index).collect::<Vec<_>>();
+            let inputs = jobs
+                .iter()
+                .map(|(input, _, _, _)| input.owner.raw.cast_const())
+                .collect::<Vec<_>>();
+            let outputs = jobs.iter().map(|(_, _, output, _)| output.raw).collect::<Vec<_>>();
+            let views = jobs
+                .iter()
+                .map(|(input, _, _, range)| GpuMatrixBatchView {
+                    left: input.range,
+                    right: input.range,
+                    output: *range,
+                })
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                gpu_matrix_ring_automorphism_batch(
+                    outputs.as_ptr(),
+                    inputs.as_ptr(),
+                    indices.as_ptr(),
+                    views.as_ptr(),
+                    jobs.len(),
+                )
+            };
+            if status != 0 {
+                return Err(last_error_string());
+            }
+        }
+        Ok(jobs.into_iter().map(|(_, _, output, _)| output).collect())
     }
 
     /// Evaluation destinations use a direct permutation of the evaluation
@@ -1852,6 +2259,49 @@ mod tests {
         poly::dcrt::gpu::{GpuMatrixBatchOperation, gpu_default_mempool_usage},
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_preimage_residual_batch_preserves_shared_public_and_wide_sources() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(5)
+            .max(1);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 4, Some(1));
+        let sample = |rows, columns| {
+            GpuDCRTPolyMatrix::from_cpu_matrix(
+                &params,
+                &DCRTPolyUniformSampler::new().sample_uniform(
+                    &cpu,
+                    rows,
+                    columns,
+                    DistType::FinRingDist,
+                ),
+            )
+        };
+        let public = sample(2, 10);
+        let inputs = (0..3)
+            .map(|_| (sample(2, columns), sample(4, columns + 2), sample(6, columns + 3)))
+            .collect::<Vec<_>>();
+        let expected = inputs
+            .iter()
+            .map(|(target, p1, p2)| GpuDCRTPolyMatrix::preimage_residual(target, &public, p1, p2))
+            .collect::<Vec<_>>();
+        let outputs = GpuDCRTPolyMatrix::preimage_residual_batch(
+            inputs.iter().map(|(target, p1, p2)| (target, &public, p1, p2, None)),
+        )
+        .unwrap();
+        drop((public, inputs));
+        assert_eq!(outputs.len(), expected.len());
+        for (output, expected) in outputs.iter().zip(&expected) {
+            assert_eq!(output.size(), (2, columns));
+            assert_eq!(output.to_cpu_matrix(), expected.to_cpu_matrix());
+        }
+    }
 
     #[test]
     #[serial_test::serial(gpu_context)]
@@ -1994,9 +2444,11 @@ mod tests {
                         }
                     }
                     let scratch = GpuPreparedStorage::new(
+                        None,
                         (0..copy_indices.len().max(1))
                             .map(|_| GpuDCRTPolyMatrix::zero(&parameters, 2, 2))
                             .collect(),
+                        None,
                         None,
                     )
                     .unwrap();
@@ -2018,9 +2470,11 @@ mod tests {
                         parameters.crt_depth() + 1,
                     ));
                     let readback = GpuPreparedStorage::new(
+                        None,
                         (0..2)
                             .map(|_| GpuDCRTPolyMatrix::zero(&parameters, width + 4, 4))
                             .collect(),
+                        None,
                         Some(&readback_layouts),
                     )
                     .unwrap();
@@ -2209,7 +2663,9 @@ mod tests {
                 parameters.small_rhs_workspaces(parameters.crt_depth() - 1, inner, 2).unwrap();
             assert_eq!(layouts.len(), if parameters.crt_depth() == 3 { 2 } else { 1 });
             let scratch = GpuPreparedStorage::new(
+                None,
                 vec![GpuDCRTPolyMatrix::zero(&parameters, 1, 1)],
+                None,
                 Some(&layouts),
             )
             .unwrap();
@@ -2227,7 +2683,9 @@ mod tests {
                 parameters.crt_depth(),
             ));
             let readback = GpuPreparedStorage::new(
+                None,
                 (0..2).map(|_| GpuDCRTPolyMatrix::zero(&parameters, width + 4, 5)).collect(),
+                None,
                 Some(&readback_layouts),
             )
             .unwrap();
@@ -3130,7 +3588,9 @@ mod tests {
             params.crt_depth(),
         ));
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, 3, columns)],
+            None,
             Some(&layouts),
         )
         .unwrap();
@@ -3338,7 +3798,9 @@ mod tests {
             params.crt_depth(),
         ));
         let storage = GpuPreparedStorage::new(
+            None,
             vec![GpuDCRTPolyMatrix::zero(&params, columns, columns)],
+            None,
             Some(&layouts),
         )
         .unwrap();
@@ -4208,20 +4670,90 @@ mod tests {
                 );
             }
         }
-        assert!(
-            params
-                .matrix_batch_workspace_bytes(
-                    1,
-                    (2, 3),
-                    1,
-                    1,
-                    GpuMatrixBatchOperation::Accumulate,
-                    true
-                )
-                .is_err()
-        );
+        let scalar_sum = params
+            .matrix_batch_workspace_bytes(
+                1,
+                (2, 3),
+                1,
+                1,
+                GpuMatrixBatchOperation::Accumulate,
+                true,
+            )
+            .unwrap();
+        assert_eq!(scalar_sum.workspace_bytes, 0);
+        assert_eq!(scalar_sum.pinned_bytes, 0);
+        let batched_sum = params
+            .matrix_batch_workspace_bytes(
+                1,
+                (2, 3),
+                3,
+                5,
+                GpuMatrixBatchOperation::Accumulate,
+                true,
+            )
+            .unwrap();
+        assert!(batched_sum.workspace_bytes > 0);
+        assert_eq!(batched_sum.pinned_bytes, 2 * batched_sum.workspace_bytes);
         let empty_cpu = DCRTPolyMatrix::zero(&cpu, 2, 0);
         assert_eq!(empty.negate(None).unwrap().to_cpu_matrix(), empty_cpu);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_integer_batch_keeps_per_job_coefficients_and_reused_output_readers() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 2, 54, 4, None, None);
+        let params = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 4, None);
+        let original = (0..3)
+            .map(|_| {
+                DCRTPolyUniformSampler::new().sample_uniform(&cpu, 2, 3, DistType::FinRingDist)
+            })
+            .collect::<Vec<_>>();
+        let inputs = original
+            .iter()
+            .map(|matrix| GpuDCRTPolyMatrix::from_cpu_matrix(&params, matrix))
+            .collect::<Vec<_>>();
+        let scalars =
+            [-(BigInt::from(1u32) << 90usize) - BigInt::from(7), BigInt::from(0), BigInt::from(3)];
+        let mut outputs = original
+            .iter()
+            .map(|matrix| GpuDCRTPolyMatrix::from_cpu_matrix(&params, matrix))
+            .collect::<Vec<_>>();
+        let mut observations = Vec::new();
+        for reverse in [false, true] {
+            // Prior readers must see the previous contents when these same
+            // output owners are overwritten by the next native batch.
+            if !reverse {
+                observations.extend(
+                    outputs
+                        .iter()
+                        .zip(&original)
+                        .map(|(output, expected)| (output.transpose(), expected.transpose())),
+                );
+            }
+            outputs = GpuDCRTPolyMatrixColumnView::scale_integer_batch(
+                inputs.iter().zip(outputs).enumerate().map(|(index, (input, output))| {
+                    let scalar = &scalars[if reverse { 2 - index } else { index }];
+                    (input.column_view(0..3).unwrap(), scalar, Some((output, 0..2, 0..3)))
+                }),
+            )
+            .unwrap();
+            for (index, (output, input)) in outputs.iter().zip(&original).enumerate() {
+                let scalar = &scalars[if reverse { 2 - index } else { index }];
+                let modulus = BigInt::from(params.modulus().as_ref().clone());
+                let residue = ((scalar % &modulus + &modulus) % &modulus).to_biguint().unwrap();
+                let expected = input
+                    .multiply_poly_out_of_place(&DCRTPoly::from_biguint_to_constant(&cpu, residue));
+                observations.push((output.transpose(), expected.transpose()));
+            }
+        }
+        drop(inputs);
+        drop(outputs);
+        for (actual, expected) in observations {
+            assert_eq!(actual.to_cpu_matrix(), expected);
+        }
     }
 
     #[test]
@@ -4256,11 +4788,15 @@ mod tests {
             let outputs = [0, 1].map(|_| {
                 GpuDCRTPolyMatrix::new_empty_with_state(&params, 2, 3, 1, evaluation, None)
             });
-            let destinations = outputs.each_ref().map(|matrix| matrix.raw);
-            let status = unsafe {
-                gpu_matrix_negate_batch(destinations.as_ptr(), pointers.as_ptr(), views.as_ptr(), 2)
-            };
-            assert_eq!(status, 0, "{}", last_error_string());
+            let outputs = GpuDCRTPolyMatrixColumnView::negate_batch(
+                owners.iter().zip(ranges).zip(outputs).map(|((owner, range), output)| {
+                    (
+                        owner.column_view(range.column_start..range.column_end).unwrap(),
+                        Some((output, 0..2, 0..3)),
+                    )
+                }),
+            )
+            .unwrap();
             let scalars = [3u32, 7].map(|value| {
                 let mut scalar =
                     GpuDCRTPoly::from_biguint_to_constant(&params, BigUint::from(value));

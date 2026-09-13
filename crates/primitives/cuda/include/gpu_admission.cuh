@@ -5,6 +5,7 @@
 struct GpuMatrix;
 struct GpuPreparedMatrixLease;
 struct GpuPreparedStorage;
+struct GpuPreparedRegion;
 struct GpuMatrixReservation;
 struct GpuMatrixDispatchPermit;
 struct GpuPreparedWorkspaceLease;
@@ -76,6 +77,23 @@ struct GpuPreparedSlotIdentity {
     GpuPreparedSlotKind kind;
     size_t alignment;
 };
+
+// CPU-only observation. Copying this neither retains backing nor grants a
+// reservation. Availability can become stale before the native commit.
+struct GpuPreparedSlotSnapshot {
+    GpuPreparedSlotIdentity identity;
+    size_t auxiliary_capacity_bytes;
+    int available;
+};
+
+// Construct unbacked capacity metadata from native allocation layouts. Storage
+// identity zero distinguishes this local planning namespace from real leases.
+extern "C" int gpu_prepared_slots_plan(GpuContext *context,
+    const GpuClaimTraceEntry *claims, size_t count, GpuPreparedSlotSnapshot *out);
+extern "C" int gpu_prepared_storage_snapshot(const GpuPreparedStorage *storage,
+    const GpuPreparedRegion *region, GpuPreparedSlotSnapshot *out, size_t count);
+extern "C" int gpu_prepared_slot_layout_fits(GpuContext *context,
+    const GpuPreparedSlotSnapshot *slot, const GpuPreparedRequest *request, int *out_fits);
 
 // Logical request bytes of whole backing groups, not physical CUDA residency.
 // Reserved bytes cover unconsumed claims. Occupancy begins at actual claim and
@@ -156,13 +174,26 @@ int gpu_prepared_storages_finish_setup(GpuPreparedStorage *const *storages, size
 // The allocation activity scope spans reservation, activation, and teardown.
 int gpu_matrix_reserve(
     GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
-    GpuMatrixReservation **out);
+    const GpuPreparedRegion *region, GpuMatrixReservation **out);
+// Claim whole native slots for a containing region. Nested regions transfer
+// exclusion from their parent without releasing slots to external admissions.
+// Success with a null output means capacity changed/is busy; all acquired slots
+// have been rolled back. Nonzero status is an actual API or CUDA error.
+int gpu_prepared_region_create(GpuPreparedStorage *storage, const GpuPreparedRegion *parent,
+    const size_t *slots, size_t count, GpuPreparedRegion **out);
+void gpu_prepared_region_destroy(GpuPreparedRegion *region);
+// Poll external idle slots' release events. Wait only for explicitly selected
+// slot indices; region-owned capacity keeps its internal event-ordered reuse.
+// out_pending has one byte per storage slot. No device work is submitted.
+int gpu_prepared_storage_releases(const GpuPreparedStorage *storage,
+    const GpuPreparedRegion *region, const size_t *wait_slots, size_t wait_count,
+    unsigned char *out_pending);
 // Nonallocating on the device, nonblocking fit over concrete layouts and free
 // slots. This is advisory under concurrency: reserve rechecks and claims all
 // slots atomically before any participant is published.
 int gpu_prepared_storage_fits(
     const GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
-    int *out_fits);
+    const GpuPreparedRegion *region, int *out_fits);
 // Exact logical demand, independent of the observed high-water mark. Separate
 // device bytes, pinned bytes and opaque resource units; this is not VRAM size.
 typedef struct GpuPreparedDemand {
@@ -282,6 +313,8 @@ struct GpuCudaResource {
     // The execution-owned reclaimer is joined by its owner's destructor. Its
     // jobs must not retain that owner and initiate a self-join on the worker.
     void detach_execution();
+    // Attribute a prepared completion slot to its queued pinned retirement.
+    void defer_to_pinned_release(void *pointer);
     cudaEvent_t event;
     cudaStream_t stream;
 private:

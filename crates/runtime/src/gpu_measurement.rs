@@ -19,6 +19,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 /// a record for every wave. Records never retain GPU input or output owners.
 #[derive(Debug)]
 pub enum GpuAdmittedMeasurement {
+    /// A committed body wave, observed before any of its inputs are loaded.
+    Admission { scope: mxx_ir_core::FrozenGraphScopeId, instances: usize, column_cap: usize },
     /// IR dispatch provenance. Several compiled invocations can belong to this
     /// one node selection; `instances` is its batch of independent IR instances.
     Node(GpuMeasurementNode),
@@ -33,7 +35,9 @@ pub enum GpuAdmittedMeasurement {
     InputPreparation { operation: Option<[u8; 32]>, timing: GpuStageTiming },
     Invocation {
         operation: Option<[u8; 32]>,
-        plan: GpuAdmittedPlanSummary,
+        /// Sibling plans in logical instance order. Wave source intervals index
+        /// their concatenated interval lists; timings cover the entire batch.
+        plans: Vec<GpuAdmittedPlanSummary>,
         /// Host materialization has a separate dataflow timing owner.
         host_import: bool,
         /// Process-local concrete input and prepared-layout identity.
@@ -111,7 +115,12 @@ impl<'a> GpuColumnMeasurement<'a> {
         offset_sensitive: bool,
     ) -> Self {
         if let Some((operation, plan, host_import, scenario)) = invocation {
-            sink(GpuAdmittedMeasurement::Invocation { operation, plan, host_import, scenario });
+            sink(GpuAdmittedMeasurement::Invocation {
+                operation,
+                plans: vec![plan],
+                host_import,
+                scenario,
+            });
         }
         Self { parameters, stores, sink, offset_sensitive, wave_timings: BTreeMap::new() }
     }
@@ -424,9 +433,11 @@ mod tests {
         } else {
             (None, observations.as_slice())
         };
-        let GpuAdmittedMeasurement::Invocation { operation, plan, .. } = &records[0] else {
+        let GpuAdmittedMeasurement::Invocation { operation, plans, .. } = &records[0] else {
             panic!("invocation metadata must precede timing records")
         };
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
         assert!(operation.is_some());
         if let Some(preparation) = preparation {
             assert_eq!(preparation, operation);

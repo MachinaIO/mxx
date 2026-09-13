@@ -45,6 +45,33 @@ impl ValidatedGraph {
         self.scopes.get(id)
     }
 
+    /// Resolve a validated wire in the environment of its actual invocation.
+    /// Cached root types apply only to the original validation bindings. Child
+    /// scopes and other environments resolve the declared type without another
+    /// structural validation pass.
+    pub fn concrete_wire_type(
+        &self,
+        scope: &FrozenGraphScopeId,
+        wire: WireRef,
+        bindings: &ParamEnv,
+    ) -> Result<ConcreteWireType, ValidationError> {
+        if *scope == FrozenGraphScopeId::Root && bindings == &self.bindings {
+            return Ok(self.root_scope().wire_types[&wire].clone());
+        }
+        let producer = self
+            .source
+            .scope(scope)
+            .expect("validated scope")
+            .node(wire.node)
+            .expect("validated producer");
+        concretize_wire_type(
+            &producer.output_types()[wire.port.0 as usize],
+            bindings,
+            scope,
+            wire.node,
+        )
+    }
+
     pub fn root_scope(&self) -> &ValidatedScope {
         self.scope(&FrozenGraphScopeId::Root).expect("validated graph has a root scope")
     }

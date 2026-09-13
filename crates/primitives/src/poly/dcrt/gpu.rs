@@ -102,6 +102,8 @@ pub struct GpuMatrixBatchWorkspaceBytes {
     pub workspace_bytes: usize,
     pub additional_bytes: usize,
     pub alignment: usize,
+    /// Immutable host descriptors retained until their asynchronous uploads finish.
+    pub pinned_bytes: usize,
 }
 
 #[allow(non_camel_case_types)]
@@ -552,6 +554,14 @@ unsafe extern "C" {
         base_bits: u32,
         out: *mut GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_gadget_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        seeds: *const GpuRngSeed,
+        count: usize,
+        base_bits: u32,
+        c: f64,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_gauss_samp_gq_arb_base(
         src: *mut GpuMatrixOpaque,
         base_bits: u32,
@@ -570,6 +580,13 @@ unsafe extern "C" {
         out_cache: *mut *mut GpuP1CovarianceCacheOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy_p1_covariance_cache(cache: *mut GpuP1CovarianceCacheOpaque);
+    pub(crate) fn gpu_matrix_sample_p1_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        caches: *const *const GpuP1CovarianceCacheOpaque,
+        seeds: *const GpuRngSeed,
+        count: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_sample_p1_full_cached(
         cache: *const GpuP1CovarianceCacheOpaque,
         tp2: *const GpuMatrixOpaque,
@@ -589,11 +606,31 @@ unsafe extern "C" {
         p1: *const GpuMatrixOpaque,
         p2: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_preimage_assemble_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        tops: *const *const GpuMatrixOpaque,
+        bottoms: *const *const GpuMatrixOpaque,
+        count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_apply_trapdoor_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        rs: *const *const GpuMatrixOpaque,
+        es: *const *const GpuMatrixOpaque,
+        zs: *const *const GpuMatrixOpaque,
+        count: usize,
+        correction: bool,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_preimage_add_correction(
         out: *mut GpuMatrixOpaque,
         r: *const GpuMatrixOpaque,
         e: *const GpuMatrixOpaque,
         z: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_sample_gaussian_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        seeds: *const GpuRngSeed,
+        count: usize,
+        sigma: f64,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution(
         out: *mut GpuMatrixOpaque,
@@ -683,6 +720,14 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn gpu_small_matrix_prepare_preimage_hard_cutoff(
         mat: *mut GpuSmallMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_pack_preimage_batch(
+        destinations: *const *mut GpuSmallMatrixOpaque,
+        sources: *const *const GpuMatrixOpaque,
+        dst_rows: *const usize,
+        dst_columns: *const usize,
+        count: usize,
+        accepted: *mut i32,
     ) -> c_int;
     pub(crate) fn gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         dst: *mut GpuSmallMatrixOpaque,

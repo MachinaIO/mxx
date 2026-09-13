@@ -933,14 +933,15 @@ impl GpuDcrtBackend {
         &mut self,
         requests: &[(
             usize,
+            Option<crate::gpu_invocation::GpuNodeOperation>,
             GpuInvocation<'_, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor>,
         )],
     ) -> Result<(), PolyBackendError> {
         // Validate the complete batch before running even an isolated pilot.
-        if requests.iter().any(|(placement, _)| *placement != 0) {
+        if requests.iter().any(|(placement, ..)| *placement != 0) {
             return Err(PolyBackendError::UnsupportedPlacement);
         }
-        for (_, request) in requests {
+        for (_, _, request) in requests {
             if !self.runtime_pilot_is_pending() {
                 continue;
             }
@@ -1452,7 +1453,7 @@ mod tests {
              expected: GpuDCRTPolyMatrix| {
                 let operation = rand::random();
                 backend.select_operation(operation, true).unwrap();
-                backend.preflight_gpu_operations(&[(0, invocation)]).unwrap();
+                backend.preflight_gpu_operations(&[(0, None, invocation)]).unwrap();
                 assert!(backend.pending_pilot.is_none(), "preflight must finish before production");
                 assert!(backend.operation_profiles.contains_key(&operation));
                 let actual = execute(backend).unwrap();
@@ -1535,6 +1536,7 @@ mod tests {
         backend
             .preflight_gpu_operations(&[(
                 0,
+                None,
                 GpuInvocation::GadgetDecompose { value: &left, small: false, digit_count: None },
             )])
             .unwrap();
@@ -1553,6 +1555,7 @@ mod tests {
         backend
             .preflight_gpu_operations(&[(
                 0,
+                None,
                 GpuInvocation::MultiplySmallRhsRowBlocks {
                     blocks: &[&upper, &lower],
                     right: &digits,
@@ -1597,6 +1600,7 @@ mod tests {
         backend
             .preflight_gpu_operations(&[(
                 0,
+                None,
                 GpuInvocation::SampleHash {
                     ty: &ty,
                     variant: HashVariant::Plain,
@@ -1618,7 +1622,7 @@ mod tests {
         ] {
             let operation = rand::random();
             backend.select_operation(operation, true).unwrap();
-            backend.preflight_gpu_operations(&[(0, request)]).unwrap();
+            backend.preflight_gpu_operations(&[(0, None, request)]).unwrap();
             assert!(backend.pending_pilot.is_none());
             assert!(backend.operation_profiles.contains_key(&operation));
         }
@@ -1694,6 +1698,7 @@ mod tests {
         backend
             .preflight_gpu_operations(&[(
                 0,
+                None,
                 GpuInvocation::SamplePreimage {
                     schema: &schema,
                     sigma: 4.578,

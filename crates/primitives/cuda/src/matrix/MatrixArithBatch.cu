@@ -485,8 +485,8 @@ namespace
     static_assert(sizeof(AccumulateRangeMetadata) + 3 * sizeof(size_t) <= 4096,
                   "accumulate arguments must fit the portable CUDA parameter limit");
 
-    __global__ void matrix_accumulate_range_kernel(
-        const AccumulateRangeMetadata metadata, size_t columns, size_t count, size_t n)
+    __device__ void matrix_accumulate_range(
+        const AccumulateRangeMetadata &metadata, size_t columns, size_t count, size_t n)
     {
         const size_t limb = blockIdx.z;
         const size_t index = metadata.indices[limb];
@@ -531,6 +531,18 @@ namespace
         }
     }
 
+    __global__ void matrix_accumulate_range_kernel(
+        const AccumulateRangeMetadata metadata, size_t columns, size_t count, size_t n)
+    {
+        matrix_accumulate_range(metadata, columns, count, n);
+    }
+
+    __global__ void matrix_accumulate_ranges_kernel(
+        const AccumulateRangeMetadata *metadata, size_t columns, size_t count, size_t n)
+    {
+        matrix_accumulate_range(metadata[blockIdx.y], columns, count, n);
+    }
+
     struct MatrixBatchMetadata
     {
         GpuContext *context = nullptr;
@@ -573,7 +585,7 @@ namespace
             return set_error("invalid or overflowing matrix batch workspace shape");
         if (matrix_views && operation != GPU_MATRIX_BATCH_BINARY && operation != GPU_MATRIX_BATCH_NEGATE &&
             operation != GPU_MATRIX_BATCH_AUTOMORPHISM && operation != GPU_MATRIX_BATCH_SCALAR &&
-            operation != GPU_MATRIX_BATCH_MULTIPLY)
+            operation != GPU_MATRIX_BATCH_MULTIPLY && operation != GPU_MATRIX_BATCH_ACCUMULATE)
             return set_error("matrix batch operation does not support rectangular views");
         const size_t pointers = matrices * limbs;
         const size_t product_pointers = matrices * products * limbs;
@@ -590,6 +602,14 @@ namespace
             plan.bytes = offset + bytes;
             return true;
         };
+        if (matrix_views && operation == GPU_MATRIX_BATCH_ACCUMULATE) {
+            // W=1 retains the allocation-free kernel-argument specialization.
+            // Larger batches reuse one descriptor arena across term chunks.
+            if (matrices > 65535 || (matrices > 1 && !add(matrices, sizeof(AccumulateRangeMetadata))))
+                return set_error("accumulate batch descriptor extent overflow");
+            *out = plan;
+            return 0;
+        }
         bool valid = false;
         switch (operation)
         {
@@ -640,9 +660,11 @@ namespace
         MatrixBatchAllocationPlan plan{};
         GpuMatrix *owner = nullptr;
         cudaStream_t stream = nullptr;
+        int device = -1;
         uint8_t *base = nullptr;
         bool separate = false;
         bool completed = false;
+        uint8_t *pinned = nullptr;
         GpuDeviceWorkspace device_workspace;
 
         int acquire(GpuMatrix *output, const MatrixBatchMetadata &metadata,
@@ -660,6 +682,7 @@ namespace
                 return set_error("matrix batch output workspace overflow");
             owner = output;
             stream = metadata.stream;
+            device = metadata.device;
             // prepare_matrix_batch has already joined every output's
             // allocation and initialization on this stream.
             if (aux.ptr && plan.bytes <= aux.slots_total * sizeof(void *))
@@ -673,6 +696,12 @@ namespace
                 if (allocated != 0) return allocated;
                 base = device_workspace.data;
             }
+            if (operation == GPU_MATRIX_BATCH_ACCUMULATE && !metadata.views.empty() && metadata.matrix_count > 1) {
+                const size_t chunks = products / kAccumulateTerms + (products % kAccumulateTerms != 0);
+                if (plan.bytes > SIZE_MAX / chunks) return set_error("accumulate host descriptor extent overflow");
+                pinned = static_cast<uint8_t *>(gpu_pinned_alloc(output->ctx, plan.bytes * chunks, alignof(void *)));
+                if (!pinned) return 1;
+            }
             return 0;
         }
 
@@ -680,6 +709,12 @@ namespace
 
         int complete()
         {
+            if (pinned) {
+                void *pointer = pinned;
+                pinned = nullptr;
+                const int status = gpu_defer_pinned_frees(owner->ctx, device, stream, &pointer, 1);
+                if (status != 0) return status;
+            }
             if (separate && base)
             {
                 const int released = device_workspace.release();
@@ -697,6 +732,12 @@ namespace
         ~MatrixBatchWorkspace()
         {
             if (completed || !stream) return;
+            if (pinned) {
+                void *pointer = pinned;
+                pinned = nullptr;
+                if (gpu_defer_pinned_frees(owner->ctx, device, stream, &pointer, 1) != 0)
+                    gpu_execution_mark_allocation_unknown(owner->ctx->execution.get());
+            }
             // Only an error path reaches here. Queue the arena free behind its
             // uploads/kernels, then make every producer/release stream observe
             // that completion. No normal completion installation is assumed.
@@ -1020,9 +1061,15 @@ extern "C" int gpu_matrix_query_batch_workspace_bytes(
         matrix_count, static_cast<size_t>(level) + 1, product_count, operation,
         matrix_views != 0, &plan);
     if (status != 0) return status;
+    size_t pinned_bytes = 0;
+    if (matrix_views && operation == GPU_MATRIX_BATCH_ACCUMULATE && matrix_count > 1) {
+        const size_t chunks = product_count / kAccumulateTerms + (product_count % kAccumulateTerms != 0);
+        if (plan.bytes > SIZE_MAX / chunks) return set_error("accumulate host descriptor extent overflow");
+        pinned_bytes = plan.bytes * chunks;
+    }
     *out = GpuMatrixBatchWorkspaceBytes{
         plan.bytes, plan.bytes <= allocation.aux_workspace_bytes ? 0 : plan.bytes,
-        alignof(void *)};
+        alignof(void *), pinned_bytes};
     return 0;
 }
 
@@ -1469,65 +1516,35 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
         return set_error("invalid execution owner in gpu_matrix_mul_accumulate_batch");
     GpuAllocationActivity activity(outputs[0]->ctx->execution.get(), -1);
     if (views) {
-        auto *out = outputs[0];
-        auto *ctx = out->ctx;
-        if (matrix_count != 1 || product_count == 0 || !left || !right || !biases ||
-            !integer_residues || out->level < 0 || out->format != GPU_POLY_FORMAT_EVAL || ctx->N <= 0)
+        auto *ctx = outputs[0]->ctx;
+        const int level = outputs[0]->level;
+        if (matrix_count > 65535 || product_count == 0 || !left || !right || !biases ||
+            !integer_residues || level < 0 || ctx->N <= 0 ||
+            matrix_count > SIZE_MAX / product_count)
             return set_error("invalid accumulate range arguments");
-        const size_t limbs = static_cast<size_t>(out->level) + 1;
+        const size_t limbs = static_cast<size_t>(level) + 1;
+        const size_t product_total = matrix_count * product_count;
         if (limbs > GPU_RUNTIME_MAX_LIMBS || ctx->limb_gpu_ids.size() < limbs ||
-            ctx->moduli.size() < limbs || product_count > SIZE_MAX / limbs)
+            ctx->moduli.size() < limbs || product_total > SIZE_MAX / limbs)
             return set_error("invalid accumulate range basis");
-        auto valid = [&](const GpuMatrix *matrix, const GpuMatrixRange &range) {
-            return matrix && matrix->ctx == ctx && matrix->level == out->level &&
+        const size_t n = static_cast<size_t>(ctx->N);
+        const auto valid = [&](const GpuMatrix *matrix, const GpuMatrixRange &range) {
+            return matrix && matrix->ctx == ctx && matrix->level == level &&
                 matrix->format == GPU_POLY_FORMAT_EVAL && range.row_start <= range.row_end &&
                 range.row_end <= matrix->rows && range.column_start <= range.column_end &&
                 range.column_end <= matrix->cols && (matrix->cols == 0 || matrix->rows <= SIZE_MAX / matrix->cols);
         };
-        const auto output_range = views[0].output;
-        if (!valid(out, output_range)) return set_error("invalid accumulate output range");
-        const size_t rows = output_range.row_end - output_range.row_start;
-        const size_t columns = output_range.column_end - output_range.column_start;
-        const size_t n = static_cast<size_t>(ctx->N);
+        const auto first_range = views[0].output;
+        if (!valid(outputs[0], first_range)) return set_error("invalid accumulate output range");
+        const size_t rows = first_range.row_end - first_range.row_start;
+        const size_t columns = first_range.column_end - first_range.column_start;
         if ((columns && rows > SIZE_MAX / columns) || rows * columns > SIZE_MAX / n)
             return set_error("accumulate output extent overflow");
         using Descriptor = GpuMatrix::SharedLimbBuffer::DeviceDescriptor;
-        std::vector<AccumulateTerm> terms(product_count);
-        // Complete shape, alias and descriptor validation before queuing waits
-        // or kernels. Empty dot products never dereference their empty owners.
-        for (size_t i = 0; i < product_count; ++i) {
-            const auto &v = views[i];
-            if (!valid(left[i], v.left) || !valid(right[i], v.right) || left[i] == out || right[i] == out ||
-                v.output.row_start != output_range.row_start || v.output.row_end != output_range.row_end ||
-                v.output.column_start != output_range.column_start || v.output.column_end != output_range.column_end)
-                return set_error("invalid accumulate product range or output alias");
-            const size_t lr = v.left.row_end - v.left.row_start, lc = v.left.column_end - v.left.column_start;
-            const size_t rr = v.right.row_end - v.right.row_start, rc = v.right.column_end - v.right.column_start;
-            const unsigned scalar = lr == 1 && lc == 1 ? 1 : (rr == 1 && rc == 1 ? 2 : 0);
-            if ((scalar == 1 && (rr != rows || rc != columns)) ||
-                (scalar == 2 && (lr != rows || lc != columns)) ||
-                (scalar == 0 && (lr != rows || rc != columns || lc != rr)))
-                return set_error("accumulate products have incompatible dimensions");
-            auto &term = terms[i];
-            term.left_offset = v.left.row_start * left[i]->cols + v.left.column_start;
-            term.right_offset = v.right.row_start * right[i]->cols + v.right.column_start;
-            term.left_pitch = left[i]->cols; term.right_pitch = right[i]->cols;
-            term.inner = scalar ? 1 : lc; term.scalar = scalar;
-            for (size_t limb = 0; limb < limbs; ++limb) {
-                const uint64_t residue = integer_residues[i * limbs + limb];
-                if (residue >= ctx->moduli[limb]) return set_error("noncanonical accumulate coefficient");
-                term.residues[limb] = residue;
-            }
-        }
-        const auto *bias = biases[0];
-        if (bias && (!bias_view || !valid(bias, *bias_view) || bias == out ||
-            bias_view->row_end - bias_view->row_start != rows ||
-            bias_view->column_end - bias_view->column_start != columns))
-            return set_error("invalid accumulate bias range");
-        if (rows == 0 || columns == 0) return 0;
-        AccumulateRangeMetadata metadata{};
+        std::vector<AccumulateTerm> terms(product_total);
+        std::vector<AccumulateRangeMetadata> metadata(matrix_count);
         int device = -1;
-        auto descriptors = [&](const GpuMatrix *matrix, const Descriptor **table) -> int {
+        const auto descriptors = [&](const GpuMatrix *matrix, const Descriptor **table) -> int {
             for (size_t limb = 0; limb < limbs; ++limb) {
                 const auto id = ctx->limb_gpu_ids[limb];
                 if (id.x >= matrix->shared_limb_buffers.size()) return set_error("invalid accumulate partition");
@@ -1541,56 +1558,143 @@ extern "C" int gpu_matrix_mul_accumulate_batch(
             }
             return 0;
         };
-        int status = descriptors(out, &metadata.output);
-        if (status != 0) return status;
-        if (bias) { status = descriptors(bias, &metadata.bias); if (status != 0) return status; }
-        for (size_t i = 0; i < product_count; ++i) {
-            if (terms[i].inner == 0) continue;
-            status = descriptors(left[i], &terms[i].left); if (status != 0) return status;
-            status = descriptors(right[i], &terms[i].right); if (status != 0) return status;
+        // Validate every job and alias before the first stream dependency or
+        // launch; descriptor storage is bounded by this admitted batch.
+        for (size_t matrix = 0; matrix < matrix_count; ++matrix) {
+            auto *out = outputs[matrix];
+            auto &m = metadata[matrix];
+            const auto output_range = views[matrix * product_count].output;
+            if (!valid(out, output_range) || output_range.row_end - output_range.row_start != rows ||
+                output_range.column_end - output_range.column_start != columns)
+                return set_error("incompatible accumulate output ranges");
+            for (size_t previous = 0; previous < matrix; ++previous) {
+                const auto other = views[previous * product_count].output;
+                if (outputs[previous] == out && output_range.row_start < other.row_end &&
+                    other.row_start < output_range.row_end && output_range.column_start < other.column_end &&
+                    other.column_start < output_range.column_end)
+                    return set_error("overlapping accumulate output ranges");
+            }
+            int status = rows && columns ? descriptors(out, &m.output) : 0;
+            if (status != 0) return status;
+            m.output_offset = output_range.row_start * out->cols + output_range.column_start;
+            m.output_pitch = out->cols;
+            for (size_t product = 0; product < product_count; ++product) {
+                const size_t i = matrix * product_count + product;
+                const auto &v = views[i];
+                if (!valid(left[i], v.left) || !valid(right[i], v.right) ||
+                    v.output.row_start != output_range.row_start || v.output.row_end != output_range.row_end ||
+                    v.output.column_start != output_range.column_start || v.output.column_end != output_range.column_end)
+                    return set_error("invalid accumulate product range");
+                for (size_t output = 0; output < matrix_count; ++output)
+                    if (left[i] == outputs[output] || right[i] == outputs[output])
+                        return set_error("accumulate product aliases an output");
+                const size_t lr = v.left.row_end - v.left.row_start, lc = v.left.column_end - v.left.column_start;
+                const size_t rr = v.right.row_end - v.right.row_start, rc = v.right.column_end - v.right.column_start;
+                const unsigned scalar = lr == 1 && lc == 1 ? 1 : (rr == 1 && rc == 1 ? 2 : 0);
+                if ((scalar == 1 && (rr != rows || rc != columns)) ||
+                    (scalar == 2 && (lr != rows || lc != columns)) ||
+                    (scalar == 0 && (lr != rows || rc != columns || lc != rr)))
+                    return set_error("accumulate products have incompatible dimensions");
+                auto &term = terms[i];
+                term.left_offset = v.left.row_start * left[i]->cols + v.left.column_start;
+                term.right_offset = v.right.row_start * right[i]->cols + v.right.column_start;
+                term.left_pitch = left[i]->cols; term.right_pitch = right[i]->cols;
+                term.inner = scalar ? 1 : lc; term.scalar = scalar;
+                for (size_t limb = 0; limb < limbs; ++limb) {
+                    const uint64_t residue = integer_residues[i * limbs + limb];
+                    if (residue >= ctx->moduli[limb]) return set_error("noncanonical accumulate coefficient");
+                    term.residues[limb] = residue;
+                }
+                if (rows && columns && term.inner) {
+                    status = descriptors(left[i], &term.left); if (status != 0) return status;
+                    status = descriptors(right[i], &term.right); if (status != 0) return status;
+                }
+            }
+            const auto *bias = biases[matrix];
+            if (bias) {
+                if (!bias_view || !valid(bias, bias_view[matrix]) ||
+                    bias_view[matrix].row_end - bias_view[matrix].row_start != rows ||
+                    bias_view[matrix].column_end - bias_view[matrix].column_start != columns)
+                    return set_error("invalid accumulate bias range");
+                for (size_t output = 0; output < matrix_count; ++output)
+                    if (bias == outputs[output]) return set_error("accumulate bias aliases an output");
+                if (rows && columns) { status = descriptors(bias, &m.bias); if (status != 0) return status; }
+                m.bias_offset = bias_view[matrix].row_start * bias->cols + bias_view[matrix].column_start;
+                m.bias_pitch = bias->cols;
+            }
+            for (size_t limb = 0; limb < limbs; ++limb) {
+                m.indices[limb] = ctx->limb_gpu_ids[limb].y;
+                m.moduli[limb] = ctx->moduli[limb];
+                m.reciprocals[limb] = UINT64_MAX / ctx->moduli[limb];
+            }
         }
-        metadata.output_offset = output_range.row_start * out->cols + output_range.column_start;
-        metadata.output_pitch = out->cols;
-        if (bias) {
-            metadata.bias_offset = bias_view->row_start * bias->cols + bias_view->column_start;
-            metadata.bias_pitch = bias->cols;
-        }
-        for (size_t limb = 0; limb < limbs; ++limb) {
-            metadata.indices[limb] = ctx->limb_gpu_ids[limb].y;
-            metadata.moduli[limb] = ctx->moduli[limb];
-            metadata.reciprocals[limb] = UINT64_MAX / ctx->moduli[limb];
-        }
+        if (rows == 0 || columns == 0) return 0;
         cudaStream_t stream = nullptr;
-        status = matrix_limb_stream(out, ctx->limb_gpu_ids[0], &stream);
+        int status = matrix_limb_stream(outputs[0], ctx->limb_gpu_ids[0], &stream);
         if (status != 0) return status;
         if (!stream) return set_error("missing accumulate output stream");
         cudaError_t error = cudaSetDevice(device); if (error != cudaSuccess) return set_error(error);
-        status = matrix_wait_all_limb_streams(out, device, stream, true); if (status != 0) return status;
-        if (bias) { status = matrix_wait_all_limb_streams(bias, device, stream, false, true); if (status != 0) return status; }
-        for (size_t i = 0; i < product_count; ++i) {
+        for (size_t matrix = 0; matrix < matrix_count; ++matrix) {
+            status = matrix_wait_all_limb_streams(outputs[matrix], device, stream, true); if (status != 0) return status;
+            if (biases[matrix]) { status = matrix_wait_all_limb_streams(biases[matrix], device, stream, false, true); if (status != 0) return status; }
+        }
+        for (size_t i = 0; i < product_total; ++i) {
             if (terms[i].inner == 0) continue;
             status = matrix_wait_all_limb_streams(left[i], device, stream, false, true); if (status != 0) return status;
             status = matrix_wait_all_limb_streams(right[i], device, stream, false, true); if (status != 0) return status;
         }
+        MatrixBatchWorkspace workspace;
+        AccumulateRangeMetadata *device_metadata = nullptr;
+        if (matrix_count > 1) {
+            MatrixBatchMetadata batch{};
+            batch.matrix_count = matrix_count; batch.limb_count = limbs;
+            batch.limb_ids.assign(ctx->limb_gpu_ids.begin(), ctx->limb_gpu_ids.begin() + limbs);
+            batch.device = device; batch.stream = stream; batch.views.resize(matrix_count);
+            status = workspace.acquire(outputs[0], batch, GPU_MATRIX_BATCH_ACCUMULATE, product_count);
+            if (status != 0) return status;
+            device_metadata = static_cast<AccumulateRangeMetadata *>(workspace.region(0));
+        }
         const size_t count = rows * columns * n;
-        const dim3 grid(static_cast<unsigned>(std::min(count / 256 + (count % 256 != 0), size_t{65535})), 1, static_cast<unsigned>(limbs));
-        for (size_t start = 0; start < product_count; start += metadata.term_count) {
-            metadata.term_count = std::min(kAccumulateTerms, product_count - start);
-            std::copy_n(terms.data() + start, metadata.term_count, metadata.terms);
-            metadata.accumulate = start != 0;
-            if (start != 0) metadata.bias = nullptr;
-            matrix_accumulate_range_kernel<<<grid, 256, 0, stream>>>(metadata, columns, count, n);
+        const dim3 grid(static_cast<unsigned>(std::min(count / 256 + (count % 256 != 0), size_t{65535})),
+                        static_cast<unsigned>(matrix_count), static_cast<unsigned>(limbs));
+        for (size_t start = 0; start < product_count; start += kAccumulateTerms) {
+            for (size_t matrix = 0; matrix < matrix_count; ++matrix) {
+                auto &m = metadata[matrix];
+                m.term_count = std::min(kAccumulateTerms, product_count - start);
+                std::copy_n(terms.data() + matrix * product_count + start, m.term_count, m.terms);
+                m.accumulate = start != 0;
+                if (start != 0) m.bias = nullptr;
+            }
+            if (matrix_count == 1) {
+                matrix_accumulate_range_kernel<<<grid, 256, 0, stream>>>(metadata[0], columns, count, n);
+            } else {
+                auto *host_metadata = workspace.pinned + (start / kAccumulateTerms) * workspace.plan.bytes;
+                // Each queued copy has its own immutable host span. The common
+                // reclaimer frees these spans after the final upload/kernel.
+                std::memcpy(host_metadata, metadata.data(), workspace.plan.bytes);
+                error = cudaMemcpyAsync(device_metadata, host_metadata, workspace.plan.bytes, cudaMemcpyHostToDevice, stream);
+                if (error != cudaSuccess) return set_error(error);
+                matrix_accumulate_ranges_kernel<<<grid, 256, 0, stream>>>(device_metadata, columns, count, n);
+            }
             error = cudaGetLastError(); if (error != cudaSuccess) return set_error(error);
         }
-        status = matrix_record_all_limb_writes(out, stream, true); if (status != 0) return status;
+        for (size_t matrix = 0; matrix < matrix_count; ++matrix) {
+            status = matrix_record_all_limb_writes(outputs[matrix], stream, true); if (status != 0) return status;
+        }
         const auto first = ctx->limb_gpu_ids[0];
-        const cudaEvent_t completion = out->exec_limb_states[first.x][first.y].write_done;
-        for (size_t i = 0; i < product_count; ++i) {
+        const cudaEvent_t completion = outputs[0]->exec_limb_states[first.x][first.y].write_done;
+        for (size_t i = 0; i < product_total; ++i) {
             if (terms[i].inner == 0) continue;
             status = matrix_track_all_limb_consumers(left[i], device, stream, completion, true, true); if (status != 0) return status;
             status = matrix_track_all_limb_consumers(right[i], device, stream, completion, true, true); if (status != 0) return status;
         }
-        return bias ? matrix_track_all_limb_consumers(bias, device, stream, completion, true, true) : 0;
+        for (size_t matrix = 0; matrix < matrix_count; ++matrix) {
+            if (biases[matrix]) {
+                status = matrix_track_all_limb_consumers(biases[matrix], device, stream, completion, true, true);
+                if (status != 0) return status;
+            }
+        }
+        return workspace.complete();
     }
     if (bias_view || integer_residues) return set_error("accumulate residues require views");
     if (!outputs || !left || !right || !coefficients || !biases || !inner_dimensions ||

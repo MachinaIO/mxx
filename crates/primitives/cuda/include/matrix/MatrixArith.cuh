@@ -23,6 +23,7 @@ extern "C"
         size_t workspace_bytes;
         size_t additional_bytes;
         size_t alignment;
+        size_t pinned_bytes;
     } GpuMatrixBatchWorkspaceBytes;
 
     // Rectangular ranges refer to the original allocation owner. Empty ranges

@@ -1723,14 +1723,10 @@ impl ExponentProgramLowering for BggNoiseEvaluator<'_> {
         lut: LutId,
         input: &Self::Wire,
         _helpers: Option<&Self::HelperSet>,
-        _: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
         let input = self.scoped(input, gate)?;
         let input = input.as_ref();
-        // Fused branch actions already include the RHS payload. Shared versus
-        // indexed RHS provenance is recorded by the common dependency trace;
-        // neither requires another fresh-error term in this transfer.
         let table = program.lut(lut).ok_or(ProgramNoiseError::MissingLut)?;
         let (step, range) = action_range(program, gate)?;
         let branch_actions = range
@@ -2605,6 +2601,90 @@ mod tests {
             branch.output_variance,
             NonnegativeRational::new(BigUint::from(63u8), BigUint::one()).unwrap()
         );
+    }
+
+    #[test]
+    fn binary_lut_noise_propagates_product_error_and_residual() {
+        use crate::program::{
+            AttributeKnowledge, ExponentLutProgramBuilder, Gate, LutTable, ProgramWireType,
+        };
+        let build = |automatic| {
+            let mut builder = ExponentLutProgramBuilder::new();
+            builder.set_layout(ExpLayout { stride_log2: 0, width_log2: 2 }, 16).unwrap();
+            let input = builder
+                .input(
+                    2,
+                    ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private },
+                )
+                .unwrap();
+            let family = builder.rhs_family(2).unwrap();
+            let rhs = builder.rhs_input(family, 2, 2).unwrap();
+            let binary =
+                builder.register_lut(LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap()).unwrap();
+            let wire = builder.input_wire(input).unwrap();
+            let output = if automatic {
+                builder.lut(wire, binary, Some(rhs)).unwrap()
+            } else {
+                let unary =
+                    builder.register_lut(LutTable::unary(4, 2, vec![0, 1, 1, 0]).unwrap()).unwrap();
+                let product = builder.private_mul(wire, rhs).unwrap();
+                builder.lut(product, unary, None).unwrap()
+            };
+            builder.output(output).unwrap();
+            (builder.build().unwrap(), input, rhs)
+        };
+        let (automatic, input, rhs) = build(true);
+        let (explicit, _, _) = build(false);
+        assert_eq!(automatic.id(), explicit.id());
+        let unit = NonnegativeRational::new(1u8.into(), 1u8.into()).unwrap();
+        let state = |bound| ProgramNoiseState {
+            bound: BigUint::from(bound),
+            doubled_variance: unit.clone(),
+        };
+        let inputs = ProgramNoiseInputs {
+            input_errors: BTreeMap::from([(input, state(3u8))]),
+            rhs_errors: BTreeMap::from([(rhs, state(5u8))]),
+            operation_residuals: BTreeMap::from([(0, state(7u8))]),
+            ..Default::default()
+        };
+        let actions = (0..5)
+            .map(|index| GateNoiseGains {
+                public_plaintext_action: RightActionNoiseGain::unit(),
+                step_index: usize::from(index != 0),
+                operation_index: index,
+                branch_index: if index == 0 { 0 } else { index - 1 },
+                operation: if index == 0 {
+                    GateNoiseOperation::MulPrivate
+                } else {
+                    GateNoiseOperation::Lut
+                },
+                gate: format!("separated-{index}"),
+                action: RightActionNoiseGain { l1: 2u8.into(), l2_squared: 4u8.into() },
+                helper_action: (index != 0).then(RightActionNoiseGain::unit),
+                inherited_bound: 0u8.into(),
+                fresh_bound: 0u8.into(),
+                output_bound: 0u8.into(),
+                inherited_variance: NonnegativeRational::zero(),
+                fresh_variance: NonnegativeRational::zero(),
+                output_variance: NonnegativeRational::zero(),
+            })
+            .collect::<Vec<_>>();
+        let run = |program| {
+            simulate_program(program, &inputs, &2u8.into(), &unit, &actions, &[]).unwrap()
+        };
+        let actual = run(&automatic);
+        let expected = run(&explicit);
+        assert_eq!(actual.dependencies, expected.dependencies);
+        assert_eq!(actual.wire_states, expected.wire_states);
+        let Gate::MulPrivate { output: product, .. } = automatic.gates()[0] else {
+            panic!("product")
+        };
+        // The residual belongs inside the LUT input: 2*3 + 5 + 7 = 18.
+        assert_eq!(actual.wire_states[&product].scalar().unwrap().bound, BigUint::from(18u8));
+        // Four branches each contribute 2*18 + 2*(1+1) = 40.
+        assert_eq!(actual.output_state().bound, BigUint::from(160u16));
+        // H3 aggregates four branches of variance 4*(4*1+1+1)+(1+1).
+        assert_eq!(actual.output_state().doubled_variance, unit.scaled(&104u8.into()));
     }
 
     #[test]

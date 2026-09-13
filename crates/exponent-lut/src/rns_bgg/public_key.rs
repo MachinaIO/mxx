@@ -556,13 +556,13 @@ impl<M: GraphValue, D: GraphValue> GraphValue for RnsBggPublicRhs<M, D> {
     fn flatten(&self) -> Vec<ValueHandle> {
         match self {
             Self::Fixed(rhs) => rhs.flatten(),
-            Self::Lut(_) => vec![],
+            Self::Identity(_) => vec![],
         }
     }
     fn schema(&self) -> Self::Schema {
         match self {
             Self::Fixed(rhs) => RnsBggPublicRhs::Fixed(rhs.schema()),
-            Self::Lut(id) => RnsBggPublicRhs::Lut(*id),
+            Self::Identity(id) => RnsBggPublicRhs::Identity(*id),
         }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
@@ -570,7 +570,7 @@ impl<M: GraphValue, D: GraphValue> GraphValue for RnsBggPublicRhs<M, D> {
             RnsBggPublicRhs::Fixed(rhs) => {
                 Ok(Self::Fixed(RnsBggPrivateRhs::from_values(rhs, values)?))
             }
-            RnsBggPublicRhs::Lut(id) if values.is_empty() => Ok(Self::Lut(*id)),
+            RnsBggPublicRhs::Identity(id) if values.is_empty() => Ok(Self::Identity(*id)),
             _ => Err(DslError::Schema),
         }
     }
@@ -580,13 +580,13 @@ impl<M: GraphValueSchema, D: GraphValueSchema> GraphValueSchema for RnsBggPublic
     fn wire_types(&self) -> Vec<WireType> {
         match self {
             Self::Fixed(rhs) => rhs.wire_types(),
-            Self::Lut(_) => vec![],
+            Self::Identity(_) => vec![],
         }
     }
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
         match self {
             Self::Fixed(rhs) => RnsBggPublicRhs::Fixed(rhs.placeholders_from(next)),
-            Self::Lut(id) => RnsBggPublicRhs::Lut(*id),
+            Self::Identity(id) => RnsBggPublicRhs::Identity(*id),
         }
     }
 }
@@ -1065,6 +1065,9 @@ impl RnsBggScheme {
         material: &RnsBggLutMaterial,
         output_id: [u8; 32],
     ) -> Result<RnsBggPreparedLut, RnsBggError> {
+        if material.table.is_some() && material.rhs_id.is_some() {
+            return Err(RnsBggError::Lut);
+        }
         let lifted = material
             .branches
             .iter()
@@ -1271,6 +1274,7 @@ impl RnsBggScheme {
     ) -> Result<RnsBggLutMaterial, RnsBggError> {
         if material.binding.context != self.context ||
             material.binding.rhs.is_none() ||
+            material.binding.table.is_some() ||
             multipliers.count() != range.count() ||
             multipliers.element_type() !=
                 &self.ring(material.binding.level + 1)?.matrix_type((1, 1))
@@ -1828,6 +1832,9 @@ impl RnsBggScheme {
         output_id: [u8; 32],
         range: &FamilyRange,
     ) -> Result<RnsBggPreparedLutFamily, RnsBggError> {
+        if binding.table.is_some() && binding.rhs.is_some() {
+            return Err(RnsBggError::Lut);
+        }
         let data = &descriptor.prepared;
         self.check_prepared_descriptor(data, binding, input_id, output_id)?;
         if descriptor.range != *range {
@@ -1889,6 +1896,9 @@ impl RnsBggScheme {
         input_id: [u8; 32],
         output_id: [u8; 32],
     ) -> Result<RnsBggPreparedLut, RnsBggError> {
+        if binding.table.is_some() && binding.rhs.is_some() {
+            return Err(RnsBggError::Lut);
+        }
         self.check_prepared_descriptor(descriptor, binding, input_id, output_id)?;
         Ok(descriptor.schema.artifact_input(
             production,
@@ -2287,41 +2297,27 @@ impl ExponentProgramLowering for RnsBggPublicEvaluator<'_> {
         lut: LutId,
         input: &Self::Wire,
         helpers: Option<&Self::HelperSet>,
-        rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, RnsBggError> {
-        let rhs_identity = rhs.map(RnsBggPublicRhs::id);
         let (input, input_plaintext) = input;
         let helpers = helpers.ok_or(RnsBggError::Context)?;
         let material = helpers;
         let binding = material.binding();
-        check_lut_binding(self.scheme, program, lut, input.level, rhs_identity.as_ref(), &binding)?;
+        check_lut_binding(self.scheme, program, lut, input.level, &binding)?;
         let mut identities = vec![input.id, binding.material_id];
         if let Some(table) = binding.table {
             identities.push(table);
         }
-        if let Some(rhs) = binding.rhs {
-            identities.push(rhs);
-        }
         let prepared = self.scheme.prepare_lut(
             input,
             material,
-            output_id(
-                self.scheme.context,
-                &[b'L', binding.table.is_some() as u8, binding.rhs.is_some() as u8],
-                gate,
-                &identities,
-            ),
+            output_id(self.scheme.context, b"L", gate, &identities),
         )?;
         let key = prepared.output_key().clone();
-        let plaintext = if rhs.is_some() {
-            None
-        } else {
-            input_plaintext
-                .as_ref()
-                .map(|mu| lut_plaintext(self.scheme, program, lut, key.level, mu))
-                .transpose()?
-        };
+        let plaintext = input_plaintext
+            .as_ref()
+            .map(|mu| lut_plaintext(self.scheme, program, lut, key.level, mu))
+            .transpose()?;
         self.cache.gates.insert(gate, PreparedGate::Lut(prepared));
         if let Some(value) = &plaintext {
             self.cache.plaintexts.insert(gate, value.clone());
@@ -3013,7 +3009,7 @@ pub(crate) mod program_artifacts_tests {
                 FamilyProgram::new(
                     BTreeMap::from([(w(0), FamilyWireSource::Broadcast(private_wire))]),
                     BTreeMap::new(),
-                    vec![Gate::Lut { input: w(0), rhs: None, lut_id: lut, output: w(1) }],
+                    vec![Gate::Lut { input: w(0), lut_id: lut, output: w(1) }],
                     w(1),
                 )
                 .unwrap(),
@@ -3098,10 +3094,13 @@ pub(crate) mod program_artifacts_tests {
             ),
         )]);
         let online_scalar_rhs_bindings =
-            BTreeMap::from([(scalar_rhs, RnsBggPublicRhs::Lut(rhs_id))]);
+            BTreeMap::from([(scalar_rhs, RnsBggPublicRhs::Identity(rhs_id))]);
         let online_rhs_bindings = BTreeMap::from([(
             rhs_family,
-            (mxx_dsl::parallel(2, |_| Ok(RnsBggPublicRhs::Lut(rhs_id))).unwrap(), range.clone()),
+            (
+                mxx_dsl::parallel(2, |_| Ok(RnsBggPublicRhs::Identity(rhs_id))).unwrap(),
+                range.clone(),
+            ),
         )]);
         let public_helpers = BTreeMap::from([
             (

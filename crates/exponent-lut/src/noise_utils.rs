@@ -446,7 +446,6 @@ pub enum NoiseDependencyNode {
         gate: ProgramGateInstance,
         table: LutId,
         input: NoiseNodeId,
-        rhs: Option<NoiseNodeId>,
         helper: Option<NoiseNodeId>,
     },
     /// A symbolic family reduction preserves the active range and ancestors;
@@ -546,24 +545,15 @@ impl<E: ExponentProgramLowering> ExponentProgramLowering for DependencyEvaluator
         table: LutId,
         input: &Self::Wire,
         helper: Option<&Self::HelperSet>,
-        rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
-        let value = self.inner.lut(
-            program,
-            table,
-            &input.value,
-            helper.map(|h| &h.value),
-            rhs.map(|r| &r.value),
-            gate,
-        )?;
+        let value = self.inner.lut(program, table, &input.value, helper.map(|h| &h.value), gate)?;
         Ok(self.record(
             value,
             NoiseDependencyNode::Lut {
                 gate,
                 table,
                 input: input.node,
-                rhs: rhs.map(|r| r.node),
                 helper: helper.map(|h| h.node),
             },
         ))

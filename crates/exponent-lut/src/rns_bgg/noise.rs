@@ -638,7 +638,6 @@ impl ExponentProgramLowering for RnsBggNoiseEvaluator<'_> {
         lut: LutId,
         input: &Self::Wire,
         helpers: Option<&Self::HelperSet>,
-        rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
         let range = self.gate_range(gate, &[input])?;
@@ -655,14 +654,9 @@ impl ExponentProgramLowering for RnsBggNoiseEvaluator<'_> {
         if material.level != input.level || material.table != Some(table.commitment()) {
             return Err(RnsBggError::Context);
         }
-        if rhs.is_some_and(|rhs| rhs.one_hot.is_some()) {
-            return Err(RnsBggError::Context);
-        }
-        let rhs_l1 = rhs.map_or_else(BigUint::one, |rhs| rhs.payload_l1.clone());
-        // A linear table map sends each supported input monomial to a unit
-        // monomial. Triangle inequality preserves this product l1 bound even
-        // when table entries collide. Identity works for the entire ring.
-        let output_l1 = &input.bound.payload_l1 * rhs_l1;
+        // The input already includes any preceding private product. A unary
+        // table preserves its l1 bound even when output monomials collide.
+        let output_l1 = input.bound.payload_l1.clone();
         let moments = input
             .moments
             .as_ref()
@@ -705,10 +699,9 @@ impl ExponentProgramLowering for RnsBggNoiseEvaluator<'_> {
                 payload_l2_squared: bound.payload_l1.pow(2),
                 moments,
                 bound,
-                public: input.public && rhs.is_none(),
+                public: input.public,
                 range,
-                one_hot: (input.range.is_some() && input.one_hot) ||
-                    rhs.is_some_and(|rhs| rhs.one_hot.is_some()),
+                one_hot: input.range.is_some() && input.one_hot,
             },
         )
     }
@@ -767,6 +760,165 @@ mod tests {
         },
         rns_bgg::RnsBggPlanRequest,
     };
+
+    #[test]
+    fn test_rns_bgg_binary_expansion_noise_and_shared_ancestry() {
+        use crate::{
+            noise_utils::NoiseDependencyNode,
+            program::{
+                AttributeKnowledge, ExponentLutProgramBuilder, Gate, LutTable, ProgramWireType,
+            },
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(16);
+        let request = RnsBggPlanRequest {
+            ring_dimension: n,
+            widths: vec![1, 4],
+            slots: vec![1, 1],
+            eta: 2,
+            crt_bits: 30,
+            terminal_depth: 1,
+            max_crt_depth: 6,
+            memory_budget_bytes: u64::MAX,
+            terminal_value_bound: 3u8.into(),
+        };
+        let (parameters, _) = RnsBggParameters::plan(&request).unwrap();
+        let build = |automatic| {
+            let mut builder = ExponentLutProgramBuilder::new();
+            builder
+                .set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 2 }, n as usize)
+                .unwrap();
+            let input = builder
+                .input(
+                    2,
+                    ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private },
+                )
+                .unwrap();
+            let family = builder.rhs_family(2).unwrap();
+            let rhs = builder.rhs_input(family, 2, 2).unwrap();
+            let binary =
+                builder.register_lut(LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap()).unwrap();
+            let unary = if automatic {
+                None
+            } else {
+                Some(
+                    builder.register_lut(LutTable::unary(4, 2, vec![0, 1, 1, 0]).unwrap()).unwrap(),
+                )
+            };
+            let input_wire = builder.input_wire(input).unwrap();
+            for _ in 0..2 {
+                let output = if automatic {
+                    builder.lut(input_wire, binary, Some(rhs)).unwrap()
+                } else {
+                    let product = builder.private_mul(input_wire, rhs).unwrap();
+                    builder.lut(product, unary.unwrap(), None).unwrap()
+                };
+                builder.output(output).unwrap();
+            }
+            (builder.build().unwrap(), input, rhs)
+        };
+        let (automatic, input_id, rhs_id) = build(true);
+        let (explicit, _, _) = build(false);
+        assert_eq!(automatic.id(), explicit.id());
+        let Gate::Lut { lut_id, output, .. } = automatic.gates()[1] else { panic!("LUT") };
+        let input = RnsBggNoiseValue {
+            level: 0,
+            bound: RnsBggNoiseBound { error: 5u8.into(), payload_l1: 1u8.into() },
+            payload_l2_squared: 1u8.into(),
+            public: false,
+            range: None,
+            one_hot: false,
+            moments: Some(NoiseMoments {
+                mean_numerator: 1.into(),
+                mean_denominator: 1u8.into(),
+                mean_radius: NonnegativeRational::zero(),
+                variance: NonnegativeRational::new(3u8.into(), 2u8.into()).unwrap(),
+            }),
+        };
+        let inputs = BTreeMap::from([(input_id, input.clone())]);
+        let rhs = BTreeMap::from([(
+            rhs_id,
+            RnsBggNoiseRhs {
+                payload_l1: 3u8.into(),
+                payload_l2_squared: 5u8.into(),
+                one_hot: None,
+            },
+        )]);
+        let material = |level, table| RnsBggGateNoiseMaterial {
+            level,
+            table,
+            fresh_error_gain: RightActionNoiseGain::unit(),
+        };
+        let helpers = [0, 2]
+            .into_iter()
+            .map(|step| (ProgramGateInstance::Gate { step }, material(0, None)))
+            .collect::<BTreeMap<_, _>>();
+        let lut_helpers = BTreeMap::from([(
+            lut_id,
+            material(1, Some(automatic.lut(lut_id).unwrap().commitment())),
+        )]);
+        let trace = |parameters: &RnsBggParameters, program: &ExponentLutProgram| {
+            trace_program(
+                parameters,
+                program,
+                &ProgramBindings::new(
+                    &inputs,
+                    &rhs,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &lut_helpers,
+                    Some(&helpers),
+                ),
+                &ProgramFamilyBindings::new(),
+            )
+        };
+        let automatic_trace = trace(&parameters, &automatic).unwrap();
+        let explicit_trace = trace(&parameters, &explicit).unwrap();
+        assert_eq!(automatic_trace.dependencies, explicit_trace.dependencies);
+        for (gate, state) in &automatic_trace.gates {
+            let expected = &explicit_trace.gates[gate];
+            assert_eq!(state.bound.error, expected.bound.error);
+            assert_eq!(state.bound.payload_l1, expected.bound.payload_l1);
+            assert_eq!(state.moments, expected.moments);
+            assert_eq!(
+                state.level,
+                if matches!(gate, ProgramGateInstance::Gate { step: 0 | 2 }) { 1 } else { 2 }
+            );
+        }
+        let product =
+            parameters.private_mul_noise_bound(0, &input.bound, &1u8.into(), 3u8.into()).unwrap();
+        let expected = parameters.lut_noise_bound(1, &product, 4, &1u8.into(), 3u8.into()).unwrap();
+        assert_eq!(automatic_trace.wires[&output].bound.error, expected.error);
+        assert_eq!(automatic_trace.wires[&output].bound.payload_l1, BigUint::from(3u8));
+        let products = automatic_trace
+            .dependencies
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                NoiseDependencyNode::MulPrivate { rhs, .. } => Some(rhs),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(products.len(), 2);
+        assert_eq!(products[0], products[1]);
+        let lut_sources = automatic_trace
+            .dependencies
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                NoiseDependencyNode::Lut { helper, .. } => Some(helper),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lut_sources.len(), 2);
+        assert!(lut_sources[0].is_some());
+        assert_eq!(lut_sources[0], lut_sources[1]);
+        let short =
+            RnsBggParameters::new(parameters.levels()[..2].to_vec(), parameters.eta()).unwrap();
+        assert!(trace(&short, &automatic).is_err());
+    }
 
     #[test]
     fn test_rns_bgg_composed_noise_uses_sum_for_errors_and_max_for_payload() {

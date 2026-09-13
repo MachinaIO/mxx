@@ -962,7 +962,6 @@ impl ExponentProgramLowering for PublicProgramLowering<'_> {
         lut: crate::program::LutId,
         input: &Self::Wire,
         helpers: Option<&Self::HelperSet>,
-        _: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
         let helpers = helpers.ok_or(BggError::InvalidLut)?;

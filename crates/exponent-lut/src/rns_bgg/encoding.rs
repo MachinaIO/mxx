@@ -626,7 +626,7 @@ impl RnsBggScheme {
         let level = bank.level;
         let next = level + 1;
         let ring = self.ring(next)?;
-        if table.is_some_and(|table| table.rhs_width().is_some() != rhs.is_some()) {
+        if table.is_some_and(|table| table.rhs_width().is_some() || rhs.is_some()) {
             return Err(RnsBggError::Lut);
         }
         if rhs.as_ref().is_some_and(|rhs| rhs.payload.matrix_type() != &ring.matrix_type((1, 1))) {
@@ -732,6 +732,9 @@ impl RnsBggScheme {
         tag: impl Into<HashTag>,
         id: [u8; 32],
     ) -> Result<RnsBggLutMaterialFamily, RnsBggError> {
+        if table.is_some_and(|table| table.rhs_width().is_some() || rhs.is_some()) {
+            return Err(RnsBggError::Lut);
+        }
         let rhs_type = self.ring(bank.level + 1)?.matrix_type((1, 1));
         if rhs.is_some_and(|rhs| {
             rhs.payloads.count() != &count || rhs.payloads.element_type() != &rhs_type
@@ -1184,7 +1187,6 @@ impl ExponentProgramLowering for RnsBggEncodingEvaluator<'_> {
         lut: LutId,
         input: &Self::Wire,
         helpers: Option<&Self::HelperSet>,
-        rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, RnsBggError> {
         let Some(PreparedGate::Lut(prepared)) = self.cache.gates.get(&gate) else {
@@ -1195,14 +1197,7 @@ impl ExponentProgramLowering for RnsBggEncodingEvaluator<'_> {
         if helpers.binding != *binding {
             return Err(RnsBggError::Context);
         }
-        check_lut_binding(
-            self.scheme,
-            program,
-            lut,
-            input.0.level,
-            rhs.map(RnsBggPublicRhs::id).as_ref(),
-            binding,
-        )?;
+        check_lut_binding(self.scheme, program, lut, input.0.level, binding)?;
         Ok((
             self.scheme.evaluate_lut(&input.0, prepared, &helpers.masks)?,
             self.cache.plaintexts.get(&gate).cloned(),
@@ -1387,7 +1382,7 @@ pub(crate) mod private_mul_tests {
                 let (wires, rhs_bindings) = body.bind_inputs(
                     |_| Ok((input.clone(), None)),
                     |_| Err(DslError::Schema),
-                    |_| Ok(RnsBggPublicRhs::Lut(rhs.rhs_id)),
+                    |_| Ok(RnsBggPublicRhs::Identity(rhs.rhs_id)),
                     |_| Err(DslError::Schema),
                 )?;
                 Ok((
@@ -2633,16 +2628,16 @@ pub(crate) mod encoding_tests {
     }
 
     #[test]
-    fn test_rns_bgg_flat_lut_two_levels_all_binary_inputs() {
+    fn test_rns_bgg_private_product_and_two_luts_all_binary_inputs() {
         use mxx_primitives::matrix::PolyMatrix;
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(32);
-        let pool = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let pool = DCRTPolyParams::new(n, 4, 17, 4, None, None);
         let primes = pool.to_crt().0;
         let parameters = RnsBggParameters::new(
-            [3, 2, 1]
+            [4, 3, 2, 1]
                 .into_iter()
                 .map(|depth| {
                     DCRTPolyParams::new(n, depth, 17, 4, Some(primes[..depth].to_vec()), None)
@@ -2651,7 +2646,7 @@ pub(crate) mod encoding_tests {
             2,
         )
         .unwrap();
-        assert_eq!(parameters.scale(2).unwrap(), &BigUint::one());
+        assert_eq!(parameters.scale(3).unwrap(), &BigUint::one());
         assert!(parameters.scale(1).unwrap() > &BigUint::one());
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secret = scheme.test_secrets().unwrap();
@@ -2661,7 +2656,7 @@ pub(crate) mod encoding_tests {
             .unwrap();
         let mask0 = scheme
             .sample_mask_bank(
-                0,
+                1,
                 crate::layout::ExpLayout {
                     stride_log2: 0,
                     width_log2: (4 as usize).trailing_zeros(),
@@ -2674,7 +2669,7 @@ pub(crate) mod encoding_tests {
         let online_mask0 = scheme.prepare_online_masks(&secret.mask, &mask0).unwrap();
         let mask1 = scheme
             .sample_mask_bank(
-                1,
+                2,
                 crate::layout::ExpLayout {
                     stride_log2: 0,
                     width_log2: (2 as usize).trailing_zeros(),
@@ -2685,7 +2680,7 @@ pub(crate) mod encoding_tests {
             )
             .unwrap();
         let online_mask1 = scheme.prepare_online_masks(&secret.mask, &mask1).unwrap();
-        let table = LutTable::binary(2, 2, 2, vec![1, 1, 1, 0]).unwrap();
+        let table = LutTable::unary(4, 2, vec![1, 1, 1, 0]).unwrap();
         let flip = LutTable::unary(2, 2, vec![1, 0]).unwrap();
         let second_material = scheme
             .sample_lut_material(
@@ -2698,22 +2693,37 @@ pub(crate) mod encoding_tests {
                 rand::random(),
             )
             .unwrap();
+        let material = scheme
+            .sample_lut_material(
+                &secret.payload,
+                Some(&table),
+                None,
+                &mask0,
+                hash_key.clone(),
+                b"shared-first-lut".as_slice(),
+                rand::random(),
+            )
+            .unwrap();
         let mut graph = DslContext::new("rns_bgg-two-level-binary-lut");
         let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
         for y in 0..2 {
             let rhs = layout.mono(&scheme.ring(1).unwrap(), &BigInt::from(2 * y)).unwrap();
-            let material = scheme
-                .sample_lut_material(
+            let rhs = scheme
+                .sample_private_rhs(
                     &secret.payload,
-                    Some(&table),
-                    Some(RnsBggRhsPlaintext { payload: rhs, id: rand::random() }),
-                    &mask0,
+                    0,
+                    RnsBggRhsPlaintext { payload: rhs, id: rand::random() },
                     hash_key.clone(),
                     format!("rhs-{y}").into_bytes(),
                     rand::random(),
                 )
                 .unwrap();
-            let first_prepared = scheme.prepare_lut(&input_key, &material, rand::random()).unwrap();
+            let rhs = scheme.prepare_private_rhs(&rhs).unwrap();
+            let product_prepared =
+                scheme.prepare_mul_private(&input_key, &rhs, rand::random()).unwrap();
+            let first_prepared = scheme
+                .prepare_lut(product_prepared.output_key(), &material, rand::random())
+                .unwrap();
             let second_prepared = scheme
                 .prepare_lut(first_prepared.output_key(), &second_material, rand::random())
                 .unwrap();
@@ -2726,13 +2736,14 @@ pub(crate) mod encoding_tests {
                         &scheme.prepare_input(&secret.payload, &input_key, mu).unwrap(),
                     )
                     .unwrap();
-                let first = scheme.evaluate_lut(&input, &first_prepared, &online_mask0).unwrap();
+                let product = scheme.evaluate_mul_private(&input, &product_prepared).unwrap();
+                let first = scheme.evaluate_lut(&product, &first_prepared, &online_mask0).unwrap();
                 let second = scheme.evaluate_lut(&first, &second_prepared, &online_mask1).unwrap();
                 let value = flip.values()[table.values()[x + 2 * y]];
                 let expected_mu =
-                    layout.mono(&scheme.ring(2).unwrap(), &BigInt::from(value)).unwrap();
-                let s = scheme.mask_at(&secret.mask, 2).unwrap();
-                let r = scheme.payload_at(&secret.payload, 2).unwrap();
+                    layout.mono(&scheme.ring(3).unwrap(), &BigInt::from(value)).unwrap();
+                let s = scheme.mask_at(&secret.mask, 3).unwrap();
+                let r = scheme.payload_at(&secret.payload, 3).unwrap();
                 let error =
                     second.row - s * second_prepared.output_key().matrix.clone() + expected_mu * r;
 
@@ -2754,9 +2765,10 @@ pub(crate) mod encoding_tests {
         .unwrap();
         let mut bound =
             RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: BigUint::one() };
-        bound = parameters.lut_noise_bound(0, &bound, 4, &1u8.into(), BigUint::one()).unwrap();
-        bound = parameters.lut_noise_bound(1, &bound, 2, &1u8.into(), BigUint::one()).unwrap();
-        let q = parameters.level(2).unwrap().modulus();
+        bound = parameters.private_mul_noise_bound(0, &bound, &1u8.into(), BigUint::one()).unwrap();
+        bound = parameters.lut_noise_bound(1, &bound, 4, &1u8.into(), BigUint::one()).unwrap();
+        bound = parameters.lut_noise_bound(2, &bound, 2, &1u8.into(), BigUint::one()).unwrap();
+        let q = parameters.level(3).unwrap().modulus();
         for value in results.outputs.values() {
             let RuntimeValue::Matrix(matrix) = value else {
                 panic!("matrix error output");
@@ -3457,7 +3469,8 @@ mod common_prf_tests {
                 online_blocks.push((
                     selector_families[block],
                     (
-                        Family::pack(vec![RnsBggPublicRhs::Lut(rhs_id); positions.len()]).unwrap(),
+                        Family::pack(vec![RnsBggPublicRhs::Identity(rhs_id); positions.len()])
+                            .unwrap(),
                         range,
                     ),
                 ));
@@ -3609,12 +3622,12 @@ pub(crate) mod family_tests {
             .unwrap_or(16);
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
-            widths: vec![4],
-            slots: vec![2],
+            widths: vec![1, 4],
+            slots: vec![2, 1],
             eta: 2,
             crt_bits: 30,
             terminal_depth: 1,
-            max_crt_depth: 4,
+            max_crt_depth: 6,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
         })
@@ -3627,7 +3640,7 @@ pub(crate) mod family_tests {
             .unwrap();
         let bank = scheme
             .sample_mask_bank(
-                0,
+                1,
                 crate::layout::ExpLayout {
                     stride_log2: 0,
                     width_log2: (4 as usize).trailing_zeros(),
@@ -3647,22 +3660,42 @@ pub(crate) mod family_tests {
             .unwrap(),
             id: rand::random(),
         };
-        let table = LutTable::binary(2, 2, 2, vec![0, 1, 0, 1]).unwrap();
+        let table = LutTable::unary(4, 2, vec![0, 1, 0, 1]).unwrap();
+        let rhs_bank = scheme
+            .sample_mask_bank(
+                0,
+                crate::layout::ExpLayout { stride_log2: 0, width_log2: 0 },
+                hash_key.clone(),
+                b"composed-rhs-bank".as_slice(),
+                rand::random(),
+            )
+            .unwrap();
         let material = scheme
             .sample_lut_material_family(
                 &secret.payload,
-                Some(&table),
+                None,
                 Some(&selectors),
-                &bank,
+                &rhs_bank,
                 4.into(),
-                hash_key,
+                hash_key.clone(),
                 b"composed-slots".as_slice(),
+                rand::random(),
+            )
+            .unwrap();
+        let lut_material = scheme
+            .sample_lut_material(
+                &secret.payload,
+                Some(&table),
+                None,
+                &bank,
+                hash_key,
+                b"shared-composed-lut".as_slice(),
                 rand::random(),
             )
             .unwrap();
         let range = FamilyRange::bounded(1, 2, 4).unwrap();
         let layout = crate::layout::ExpLayout { stride_log2: 0, width_log2: 2 };
-        let q = parameters.level(1).unwrap().modulus();
+        let q = parameters.level(2).unwrap().modulus();
         let modulus = BigInt::from(q.as_ref().clone());
 
         let mut graph = DslContext::new("rns_bgg-composed-rhs-wrap");
@@ -3672,9 +3705,24 @@ pub(crate) mod family_tests {
                 layout.mono(&scheme.ring(1).unwrap(), &BigInt::from(label)).unwrap(),
             ])
             .unwrap();
-            let composed =
+            let mut composed =
                 scheme.compose_lut_material(&material, &labels, &range, rand::random()).unwrap();
-            let prepared = scheme.prepare_lut(&key, &composed, rand::random()).unwrap();
+            // The table-free identity branch is exactly a fixed RHS GSW.
+            // Preserve the existing slot composition; apply it as a separate
+            // private product before consuming the shared unary table.
+            assert_eq!(composed.branches.len(), 1);
+            let composed = RnsBggPrivateRhs {
+                ciphertext: composed.branches.remove(0).1,
+                lifted_ciphertext: (),
+                level: composed.level,
+                context: composed.context,
+                id: composed.id,
+                rhs_id: composed.rhs_id.unwrap(),
+            };
+            let composed = scheme.prepare_private_rhs(&composed).unwrap();
+            let product = scheme.prepare_mul_private(&key, &composed, rand::random()).unwrap();
+            let prepared =
+                scheme.prepare_lut(product.output_key(), &lut_material, rand::random()).unwrap();
             for input in 0..2 {
                 let payload = layout.mono(&scheme.ring(0).unwrap(), &BigInt::from(input)).unwrap();
                 let encoding = scheme
@@ -3684,9 +3732,10 @@ pub(crate) mod family_tests {
                         &scheme.prepare_input(&secret.payload, &key, payload).unwrap(),
                     )
                     .unwrap();
-                let output = scheme.evaluate_lut(&encoding, &prepared, &online_bank).unwrap();
+                let multiplied = scheme.evaluate_mul_private(&encoding, &product).unwrap();
+                let output = scheme.evaluate_lut(&multiplied, &prepared, &online_bank).unwrap();
                 let expected = layout
-                    .mono(&scheme.ring(1).unwrap(), &BigInt::from((input + label) % 2))
+                    .mono(&scheme.ring(2).unwrap(), &BigInt::from((input + label) % 2))
                     .unwrap();
                 let error = output.row -
                     secret.mask.row.clone().reduce_modulus(modulus.clone()) *
@@ -3699,21 +3748,23 @@ pub(crate) mod family_tests {
         let (noise_material, noise_rhs) =
             crate::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
                 0,
-                Some(table.commitment()),
+                None,
                 &[
                     crate::noise_utils::RightActionNoiseGain::unit(),
                     crate::noise_utils::RightActionNoiseGain::unit(),
                 ],
             )
             .unwrap();
-        let bound = parameters
-            .lut_noise_bound(
+        let product_bound = parameters
+            .private_mul_noise_bound(
                 0,
                 &RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
-                4,
                 &noise_material.fresh_error_gain.l1,
                 noise_rhs.payload_l1,
             )
+            .unwrap();
+        let bound = parameters
+            .lut_noise_bound(1, &product_bound, 4, &1u8.into(), product_bound.payload_l1.clone())
             .unwrap();
         (graph, parameters, bound)
     }
@@ -3721,7 +3772,7 @@ pub(crate) mod family_tests {
     #[test]
     fn test_rns_bgg_composed_rhs_wraps_selected_public_label() {
         let (graph, parameters, bound) = composed_rhs_fixture();
-        let q = parameters.level(1).unwrap().modulus();
+        let q = parameters.level(2).unwrap().modulus();
         let results = execute(
             &graph,
             &mut cpu_backend(parameters.levels().iter().cloned()),
@@ -3926,7 +3977,7 @@ pub(crate) mod family_tests {
         let rhs_bindings = BTreeMap::from([(rhs_family, (rhs_values, range.clone()))]);
         let online_rhs_bindings = BTreeMap::from([(
             rhs_family,
-            (Family::pack(vec![RnsBggPublicRhs::Lut(rhs.id); 2]).unwrap(), range.clone()),
+            (Family::pack(vec![RnsBggPublicRhs::Identity(rhs.id); 2]).unwrap(), range.clone()),
         )]);
         let at = ProgramGateInstance::FamilyGate {
             step: 0,
@@ -4135,12 +4186,12 @@ mod program_tests {
             .unwrap_or(16);
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
-            widths: vec![4],
-            slots: vec![1],
+            widths: vec![1, 4],
+            slots: vec![1, 1],
             eta: 2,
             crt_bits: 30,
             terminal_depth: 1,
-            max_crt_depth: 4,
+            max_crt_depth: 6,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 4u8.into(),
         })
@@ -4152,9 +4203,9 @@ mod program_tests {
             .sample_input_key(0, hash_key.clone(), b"input".as_slice(), rand::random())
             .unwrap();
         let weight_key = scheme
-            .sample_input_key(1, hash_key.clone(), b"weight".as_slice(), rand::random())
+            .sample_input_key(2, hash_key.clone(), b"weight".as_slice(), rand::random())
             .unwrap();
-        let weight = scheme.scalar(1, 2u8).unwrap();
+        let weight = scheme.scalar(2, 2u8).unwrap();
         let weight_encoding = scheme
             .encode(
                 &secret.mask,
@@ -4164,7 +4215,7 @@ mod program_tests {
             .unwrap();
         let bank = scheme
             .sample_mask_bank(
-                0,
+                1,
                 crate::layout::ExpLayout {
                     stride_log2: 0,
                     width_log2: (4 as usize).trailing_zeros(),
@@ -4194,8 +4245,53 @@ mod program_tests {
             builder.mul_public(doubled, builder.input_wire(weight_input).unwrap()).unwrap();
         builder.output(output).unwrap();
         let program = builder.build().unwrap();
-        let gate = ProgramGateInstance::Gate { step: 0 };
-        let q = parameters.level(1).unwrap().modulus();
+        let gate = ProgramGateInstance::Gate { step: 1 };
+        let crate::program::Gate::Lut { lut_id: lut, .. } = program.gates()[1] else {
+            panic!("unary LUT")
+        };
+        let table = program.lut(lut).unwrap();
+        let material = scheme
+            .sample_lut_material(
+                &secret.payload,
+                Some(table),
+                None,
+                &bank,
+                hash_key.clone(),
+                b"shared-unary-lut".as_slice(),
+                rand::random(),
+            )
+            .unwrap();
+        assert!(
+            scheme
+                .sample_lut_material(
+                    &secret.payload,
+                    Some(table),
+                    Some(RnsBggRhsPlaintext {
+                        payload: scheme.scalar(2, 1u8).unwrap(),
+                        id: rand::random()
+                    }),
+                    &bank,
+                    hash_key.clone(),
+                    b"rejected-fused-lut".as_slice(),
+                    rand::random()
+                )
+                .is_err()
+        );
+        let mut rejected = material.clone();
+        rejected.rhs_id = Some(rand::random());
+        let intermediate_key = scheme
+            .sample_input_key(1, hash_key.clone(), b"rejected-input".as_slice(), rand::random())
+            .unwrap();
+        assert!(scheme.prepare_lut(&intermediate_key, &rejected, rand::random()).is_err());
+        let online_helpers = BTreeMap::from([(
+            gate,
+            ProgramValue::Scalar(RnsBggOnlineLutHelpers {
+                binding: material.binding(),
+                masks: online_bank.clone(),
+            }),
+        )]);
+        let helpers = BTreeMap::from([(gate, ProgramValue::Scalar(material))]);
+        let q = parameters.level(2).unwrap().modulus();
         let modulus = BigInt::from(q.as_ref().clone());
         let s = secret.mask.row.clone().reduce_modulus(modulus.clone());
         let r = secret.payload.row.clone().reduce_modulus(modulus);
@@ -4204,32 +4300,24 @@ mod program_tests {
         let mut graph = DslContext::new("rns_bgg-generic-program");
         for y in 0..2 {
             let rhs_id = rand::random();
-            let material = scheme
-                .sample_lut_material(
+            let rhs_material = scheme
+                .sample_private_rhs(
                     &secret.payload,
-                    Some(&table),
-                    Some(RnsBggRhsPlaintext {
+                    0,
+                    RnsBggRhsPlaintext {
                         payload: layout
                             .mono(&scheme.ring(1).unwrap(), &BigInt::from(2 * y))
                             .unwrap(),
                         id: rhs_id,
-                    }),
-                    &bank,
+                    },
                     hash_key.clone(),
                     format!("rhs-{y}").into_bytes(),
                     rand::random(),
                 )
                 .unwrap();
-            let online_helpers = BTreeMap::from([(
-                gate,
-                ProgramValue::Scalar(RnsBggOnlineLutHelpers {
-                    binding: material.binding(),
-                    masks: online_bank.clone(),
-                }),
-            )]);
-            let helpers = BTreeMap::from([(gate, ProgramValue::Scalar(material))]);
-            let rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Lut(rhs_id))]);
-            let public_rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Lut(rhs_id))]);
+            let rhs_material = scheme.prepare_private_rhs(&rhs_material).unwrap();
+            let rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Identity(rhs_id))]);
+            let public_rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Fixed(rhs_material))]);
             let public_inputs = BTreeMap::from([
                 (input, (input_key.clone(), None)),
                 (weight_input, (weight_key.clone(), Some(weight.clone()))),
@@ -4300,7 +4388,8 @@ mod program_tests {
                         .is_err(),
                     "a helper from another artifact must not match by table/RHS alone"
                 );
-                let wrong_rhs = BTreeMap::from([(rhs_input, RnsBggPublicRhs::Lut(rand::random()))]);
+                let wrong_rhs =
+                    BTreeMap::from([(rhs_input, RnsBggPublicRhs::Identity(rand::random()))]);
                 assert!(
                     prepared
                         .evaluate(&ProgramBindings::new(
@@ -4313,16 +4402,16 @@ mod program_tests {
                         ))
                         .is_err()
                 );
-                let expected = scheme.scalar(1, 4u8).unwrap() *
+                let expected = scheme.scalar(2, 4u8).unwrap() *
                     layout
-                        .mono(&scheme.ring(1).unwrap(), &BigInt::from(table.values()[x + 2 * y]))
+                        .mono(&scheme.ring(2).unwrap(), &BigInt::from(table.values()[x + 2 * y]))
                         .unwrap();
                 let error = actual.row.clone() - s.clone() * output_key.matrix.clone() +
                     expected * r.clone();
                 graph = graph
                     .output(
                         format!("error-{x}-{y}"),
-                        scheme.scalar(1, t_inverse.clone()).unwrap() * error,
+                        scheme.scalar(2, t_inverse.clone()).unwrap() * error,
                     )
                     .unwrap();
             }
@@ -4339,15 +4428,16 @@ mod program_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let lut_bound = parameters
-            .lut_noise_bound(
+        let product_bound = parameters
+            .private_mul_noise_bound(
                 0,
                 &RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
-                4,
                 &1u8.into(),
                 1u8.into(),
             )
             .unwrap();
+        let lut_bound =
+            parameters.lut_noise_bound(1, &product_bound, 4, &1u8.into(), 1u8.into()).unwrap();
         let bound = lut_bound.add(&lut_bound).mul_public(&BigUint::from(2u8));
         for value in results.outputs.values() {
             let RuntimeValue::Matrix(matrix) = value else { panic!("error matrix") };

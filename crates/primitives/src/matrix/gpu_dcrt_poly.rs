@@ -70,7 +70,7 @@ pub use gpu_view::{
 mod gpu_admission;
 pub use gpu_admission::{
     GpuCompactTransferKind, GpuGraphAdmissionGuard, GpuMatrixDispatch, GpuMatrixReservation,
-    GpuPreparedDemand, GpuPreparedOccupancy, GpuPreparedOccupancyMode, GpuPreparedRequest,
+    GpuPreparedDemand, GpuPreparedFit, GpuPreparedOccupancy, GpuPreparedOccupancyMode, GpuPreparedRequest,
     GpuPreparedSlotIdentity, GpuPreparedSlotKind, GpuPreparedStorage, GpuPreparedWorkspaceLayout,
     GpuTracedClaim, GpuTracedStepGuard, trace_native_claims,
 };

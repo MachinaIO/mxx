@@ -721,6 +721,15 @@ pub struct GpuPreparedDemand {
     pub resource_slots: usize,
 }
 
+/// Advisory native slot availability; reservations still acquire atomically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuPreparedFit {
+    Unavailable,
+    Available,
+    /// Only completed CPU ownership awaiting DMA reclamation prevents reuse.
+    PendingCpuStaging,
+}
+
 /// Logical requested bytes in prepared matrix and device workspace groups.
 ///
 /// Reservation alone does not occupy storage. Actual claims remain occupied
@@ -961,6 +970,12 @@ impl GpuPreparedStorage {
     /// reserve rechecks every layout and acquires the complete list atomically.
     /// Physical sealing and other resource families remain separate obligations.
     pub fn fits(&self, requests: &[GpuPreparedRequest]) -> Result<bool, String> {
+        Ok(self.fit_status(requests)? == GpuPreparedFit::Available)
+    }
+
+    /// Nonblocking scheduler observation distinguishing deferred upload staging
+    /// from insufficient capacity, live CPU owners, and competing reservations.
+    pub fn fit_status(&self, requests: &[GpuPreparedRequest]) -> Result<GpuPreparedFit, String> {
         let mut fits = 0;
         let status = unsafe {
             gpu_prepared_storage_fits(
@@ -973,7 +988,12 @@ impl GpuPreparedStorage {
         if status != 0 {
             return Err(last_error_string());
         }
-        Ok(fits != 0)
+        match fits {
+            0 => Ok(GpuPreparedFit::Unavailable),
+            1 => Ok(GpuPreparedFit::Available),
+            2 => Ok(GpuPreparedFit::PendingCpuStaging),
+            _ => Err("invalid native prepared fit status".into()),
+        }
     }
 
     /// Nonblocking observation, retiring logical charges only for available

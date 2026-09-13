@@ -160,6 +160,9 @@ int gpu_matrix_reserve(
 // Nonallocating on the device, nonblocking fit over concrete layouts and free
 // slots. This is advisory under concurrency: reserve rechecks and claims all
 // slots atomically before any participant is published.
+// out_fits: 0 = unavailable, 1 = available, 2 = only deferred CPU staging
+// prevents reuse. The scheduler may retry 2 after giving the reclaimer time;
+// a live CPU owner or another reservation never produces 2.
 int gpu_prepared_storage_fits(
     const GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
     int *out_fits);

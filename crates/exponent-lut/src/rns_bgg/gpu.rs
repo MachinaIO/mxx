@@ -139,7 +139,7 @@ fn check_fixture(
             SamplingMode::Fresh,
         )
         .unwrap();
-        let q = parameters.level(1).unwrap().modulus();
+        let q = parameters.levels().last().unwrap().modulus();
         for (name, value) in &results.outputs {
             let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial output") };
             for shard in matrix.shards() {

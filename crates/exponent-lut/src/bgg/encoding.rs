@@ -742,9 +742,8 @@ impl ExponentLutEncodingSampler {
     ///
     /// The declaration is the source of truth for both helper commitments and
     /// the branch coefficient. Every table entry is a native strided monomial.
-    /// For a fused LUT, `rhs` enters each plaintext target as
-    /// `d_sigma * sigma(rhs)` before sampling its fresh switch ciphertext.
-    /// The switch error is sampled afterward and is not multiplied by `rhs`.
+    /// Each switch encrypts only its unary table coefficient. Private RHS
+    /// multiplication is a separate program gate.
     pub fn sample_helpers_for_lut(
         &self,
         mask_secret: Mat,
@@ -753,18 +752,9 @@ impl ExponentLutEncodingSampler {
         table: &LutTable,
         mask_bank: &LutMaskBank,
         tag: impl Into<HashTag>,
-        rhs: Option<Mat>,
     ) -> Result<Vec<LutHelper>, ExponentLutSamplingError> {
-        if table.rhs_width().is_some() != rhs.is_some() {
-            return Err(ExponentLutSamplingError::InvalidConfiguration("LUT RHS arity mismatch"));
-        }
-        if rhs
-            .as_ref()
-            .is_some_and(|rhs| rhs.matrix_type() != &self.layout.ring().matrix_type((1, 1)))
-        {
-            return Err(ExponentLutSamplingError::InvalidConfiguration(
-                "LUT RHS ring or shape mismatch",
-            ));
+        if table.rhs_width().is_some() {
+            return Err(ExponentLutSamplingError::InvalidConfiguration("LUT must be unary"));
         }
         let width = table.values().len();
         let n = self
@@ -808,10 +798,6 @@ impl ExponentLutEncodingSampler {
             let coefficient =
                 lut_coefficient(&self.layout.ring(), &lut_layout, sigma, table.values())
                     .map_err(BggError::from)?;
-            let coefficient = match &rhs {
-                Some(rhs) => coefficient * rhs.clone().ring_automorphism(sigma),
-                None => coefficient,
-            };
             // The switch encrypts the rotated payload relation; the separate
             // mask encoding supplies the compensating public alignment.
             // The fixed switch is generated under the payload secret after
@@ -1236,7 +1222,6 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
         lut: crate::program::LutId,
         input: &Self::Wire,
         helpers: Option<&Self::HelperSet>,
-        rhs: Option<&Self::Rhs>,
         gate: ProgramGateInstance,
     ) -> Result<Self::Wire, Self::Error> {
         let helpers = helpers.ok_or(BggError::InvalidLut)?;
@@ -1247,12 +1232,7 @@ impl ExponentProgramLowering for EncodingProgramLowering<'_> {
             .and_then(|cache| cache.lut_entry(gate))
             .or_else(|| self.shared_cache.and_then(|cache| cache.lut_entry(gate)))
             .ok_or(BggError::InvalidSparseLwrBlock)?;
-        // A fused private RHS suppresses unary public-plaintext metadata.
-        let input = BggEncodingWire {
-            vector: input.vector.clone(),
-            plaintext: if rhs.is_some() { None } else { input.plaintext.clone() },
-        };
-        self.compiler.single_input_lut_table_with_cache(&input, table, helpers, Some(cache))
+        self.compiler.single_input_lut_table_with_cache(input, table, helpers, Some(cache))
     }
 }
 
@@ -1860,7 +1840,7 @@ mod tests {
                 FamilyProgram::new(
                     BTreeMap::from([(input, FamilyWireSource::Member(members))]),
                     BTreeMap::new(),
-                    vec![Gate::Lut { input, lut_id: lut, output: transformed, rhs: None }],
+                    vec![Gate::Lut { input, lut_id: lut, output: transformed }],
                     transformed,
                 )
                 .unwrap(),
@@ -1993,7 +1973,6 @@ mod tests {
                 &table,
                 bank.as_ref(),
                 b"shared".as_slice(),
-                None,
             )
             .unwrap();
         let distinct = sampler
@@ -2004,7 +1983,6 @@ mod tests {
                 &table,
                 bank.as_ref(),
                 b"distinct".as_slice(),
-                None,
             )
             .unwrap();
         assert_eq!(shared.len(), 2);
@@ -2052,7 +2030,6 @@ mod tests {
                 &wide,
                 bank.as_ref(),
                 b"wide".as_slice(),
-                None,
             )
             .unwrap();
         let same_width_helpers = sampler
@@ -2063,7 +2040,6 @@ mod tests {
                 &same_width,
                 bank.as_ref(),
                 b"same-width".as_slice(),
-                None,
             )
             .unwrap();
         let narrow_helpers = sampler
@@ -2074,7 +2050,6 @@ mod tests {
                 &narrow,
                 bank.as_ref(),
                 b"narrow".as_slice(),
-                None,
             )
             .unwrap();
         assert_eq!(
@@ -2547,7 +2522,6 @@ mod prf_tests {
                 &table,
                 bank.as_ref(),
                 b"readout-producer-helpers".as_slice(),
-                None,
             )
             .unwrap();
         let helper_set = LutHelperSet::new(&table, sampled_helpers).unwrap();

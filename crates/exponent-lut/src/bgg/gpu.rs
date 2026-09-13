@@ -169,7 +169,7 @@ impl Fixture {
             .public_sampler
             .sample_mask_bank(self.hash_key.clone(), table.values().len(), tag.clone())
             .expect("public native mask bank");
-        self.helpers_with_banks(&table, tag, private_bank.as_ref(), &public_bank, None)
+        self.helpers_with_banks(&table, tag, private_bank.as_ref(), &public_bank)
     }
 
     fn helpers_with_banks(
@@ -178,7 +178,6 @@ impl Fixture {
         tag: impl Into<mxx_dsl::HashTag>,
         private_bank: &LutMaskBank,
         public_bank: &std::sync::Arc<LutPublicMaskBank>,
-        rhs: Option<Mat>,
     ) -> (Vec<LutHelper>, Vec<LutPublicHelper>) {
         let tag = tag.into();
         let private = self
@@ -190,7 +189,6 @@ impl Fixture {
                 table,
                 private_bank,
                 tag,
-                rhs,
             )
             .expect("native setup helpers");
         let public = private
@@ -327,49 +325,59 @@ fn test_gpu_native_unary_exhaustive_inputs_distinct_secrets() {
 #[serial(dcrt_runtime)]
 fn test_gpu_native_binary_all_u_plus_bv_pairs() {
     let fixture = Fixture::new(2);
-    let table = LutTable::binary(2, 2, 2, vec![0, 1, 1, 0]).unwrap();
+    let table = LutTable::unary(4, 2, vec![0, 1, 1, 0]).unwrap();
     let private_bank = fixture
         .sampler
         .sample_mask_bank(
             fixture.mask_secret.clone(),
             fixture.hash_key.clone(),
-            table.values().len(),
+            4,
             b"binary-bank".as_slice(),
         )
         .unwrap();
     let public_bank = fixture
         .public_sampler
-        .sample_mask_bank(fixture.hash_key.clone(), table.values().len(), b"binary-bank".as_slice())
+        .sample_mask_bank(fixture.hash_key.clone(), 4, b"binary-bank".as_slice())
         .unwrap();
+    let (helpers, public_helpers) = fixture.helpers_with_banks(
+        &table,
+        b"binary-shared-helpers".as_slice(),
+        private_bank.as_ref(),
+        &public_bank,
+    );
     let public_lhs = fixture.public_input(b"binary-lhs".as_slice());
     let mut relations = Vec::new();
     for rhs_exponent in 0..2 {
-        let (helpers, public_helpers) = fixture.helpers_with_banks(
-            &table,
-            format!("binary-helpers-{rhs_exponent}").into_bytes(),
-            private_bank.as_ref(),
-            &public_bank,
-            Some(fixture.rotation(2 * rhs_exponent)),
-        );
-        // Each branch encrypts D_k*sigma_k(rhs) freshly. There is no
-        // preliminary external product on either the key or encoding path.
-        let cache = fixture
-            .public_compiler
-            .build_lut_cache(&public_lhs.matrix, &table, &public_helpers)
+        let rhs = fixture
+            .sampler
+            .sample_cross_secret_rhs(
+                fixture.payload_secret.clone(),
+                fixture.payload_secret.clone(),
+                fixture.rotation(2 * rhs_exponent),
+                fixture.hash_key.clone(),
+                format!("binary-rhs-{rhs_exponent}").into_bytes(),
+            )
             .unwrap();
+        let decomposition = rhs.gsw_ciphertext().clone().decompose(
+            fixture.sampler.layout.gadget_base.clone(),
+            fixture.sampler.layout.digit_count,
+        );
+        let product_key = decomposition.clone().mul_small_rhs(public_lhs.matrix.clone());
+        let cache =
+            fixture.public_compiler.build_lut_cache(&product_key, &table, &public_helpers).unwrap();
         let expected_public = fixture
             .public_compiler
-            .single_input_lut(&public_lhs.matrix, table.values(), &public_helpers)
+            .single_input_lut(&product_key, table.values(), &public_helpers)
             .unwrap();
         for lhs_exponent in 0..2 {
+            let input = fixture.input(b"binary-lhs".as_slice(), lhs_exponent);
+            let product = BggEncodingWire {
+                vector: decomposition.clone().mul_small_rhs(input.vector),
+                plaintext: None,
+            };
             let encoded = fixture
                 .compiler
-                .single_input_lut_table_with_cache(
-                    &fixture.input(b"binary-lhs".as_slice(), lhs_exponent),
-                    &table,
-                    &helpers,
-                    Some(&cache),
-                )
+                .single_input_lut_table_with_cache(&product, &table, &helpers, Some(&cache))
                 .unwrap();
             relations.push(Relation {
                 encoded,
@@ -406,7 +414,6 @@ fn test_gpu_native_two_stage_lut_chain() {
         b"chain-first".as_slice(),
         private_bank.as_ref(),
         &public_bank,
-        None,
     );
     let (second_helpers, second_public_helpers) = fixture.helpers_with_banks(
         &LutTable::unary(2, fixture.parameters.ring_dimension() as usize, second_table.clone())
@@ -414,7 +421,6 @@ fn test_gpu_native_two_stage_lut_chain() {
         b"chain-second".as_slice(),
         private_bank.as_ref(),
         &public_bank,
-        None,
     );
     let input = fixture.input(b"chain-input".as_slice(), 1);
     let public_input = fixture.public_input(b"chain-input".as_slice());

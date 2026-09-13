@@ -1285,18 +1285,31 @@ extern "C" int gpu_prepared_storage_fits(
         return fail("invalid prepared fit arguments");
     *out_fits = 0;
     const auto &backing = *storage->value;
-    if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
-        return fail("prepared fit has unretired work");
+    const auto &execution = *backing.context->execution;
+    if (execution.unretired_work.load(std::memory_order_acquire) ||
+        execution.memory_release_failed.load(std::memory_order_acquire) ||
+        execution.allocation_activity_unknown.load(std::memory_order_seq_cst))
+        return fail("prepared fit has uncertain allocation or release activity");
     try {
         std::vector<PreparedClaim> claims;
         bool fits = false;
         const int status = prepare_claims(backing, requests, count, claims, fits);
         if (status != 0 || !fits) return status;
-        for (const auto &claim : claims)
-            if (backing.slots[claim.request.slot_index]->reservation_owner.load(std::memory_order_acquire) != 0 ||
-                backing.slots[claim.request.slot_index]->state.load(std::memory_order_acquire) != available)
+        bool pending_cpu_staging = false;
+        for (const auto &claim : claims) {
+            const auto &slot = *backing.slots[claim.request.slot_index];
+            if (slot.reservation_owner.load(std::memory_order_acquire) != 0)
                 return 0;
-        *out_fits = 1;
+            const auto state = slot.state.load(std::memory_order_acquire);
+            if (state == available) continue;
+            if (slot.identity.kind == GPU_PREPARED_PINNED_HOST && state == leased &&
+                slot.pinned_deferred.load(std::memory_order_acquire)) {
+                pending_cpu_staging = true;
+                continue;
+            }
+            return 0;
+        }
+        *out_fits = pending_cpu_staging ? 2 : 1;
         return 0;
     } catch (const std::exception &error) { return fail(error.what()); }
 }

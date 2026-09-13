@@ -934,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bgg_scheme_fused_binary_lut_all_inputs() {
+    fn test_bgg_scheme_binary_lut_all_inputs() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
@@ -947,7 +947,7 @@ mod tests {
             digit_count: parameters.modulus_digits(),
             gadget_base: 4.into(),
         };
-        let exponent = ExpLayout { stride_log2: 0, width_log2: 2 };
+        let exponent = ExpLayout { stride_log2: 0, width_log2: 3 };
         let sampler = ExponentLutEncodingSampler {
             layout: layout.clone(),
             exponent_layout: exponent,
@@ -965,59 +965,62 @@ mod tests {
             .unwrap()
             .remove(0);
         let bank = sampler
-            .sample_mask_bank(secret.clone(), hash_key.clone(), 4, b"bank".as_slice())
+            .sample_mask_bank(secret.clone(), hash_key.clone(), 8, b"bank".as_slice())
             .unwrap();
         let public_bank =
-            public_sampler.sample_mask_bank(hash_key.clone(), 4, b"bank".as_slice()).unwrap();
-        let table = LutTable::binary(2, 2, 2, vec![1, 1, 1, 0]).unwrap();
+            public_sampler.sample_mask_bank(hash_key.clone(), 8, b"bank".as_slice()).unwrap();
+        let table = LutTable::binary(2, 4, 8, vec![0, 3, 1, 6, 2, 7, 5, 4]).unwrap();
         let mut builder = ExponentLutProgramBuilder::new();
         builder.set_layout(exponent, n as usize).unwrap();
         let input = builder
             .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
             .unwrap();
-        let family = builder.rhs_family(2).unwrap();
-        let rhs_id = builder.rhs_input(family, 2, 2).unwrap();
+        let family = builder.rhs_family(4).unwrap();
+        let rhs_id = builder.rhs_input(family, 2, 4).unwrap();
         let lut = builder.register_lut(table.clone()).unwrap();
         let output = builder.lut(builder.input_wire(input).unwrap(), lut, Some(rhs_id)).unwrap();
         builder.output(output).unwrap();
         let program = builder.build().unwrap();
-        assert_eq!(program.gates().len(), 1);
-        let mut graph = DslContext::new("bgg-fused-scheme");
-        for y in 0..2 {
-            let rhs_plain = exponent.mono(&ring, &BigInt::from(2 * y)).unwrap();
-            let helpers = sampler
-                .sample_helpers_for_lut(
-                    secret.clone(),
-                    Some(payload_secret.clone()),
-                    hash_key.clone(),
-                    &table,
-                    &bank,
-                    format!("helpers-{y}").into_bytes(),
-                    Some(rhs_plain.clone()),
+        assert_eq!(program.gates().len(), 2);
+        let crate::program::Gate::Lut { lut_id: lut, .. } = program.gates()[1] else {
+            panic!("unary LUT")
+        };
+        let table = program.lut(lut).unwrap();
+        let mut graph = DslContext::new("bgg-binary-scheme");
+        let helpers = sampler
+            .sample_helpers_for_lut(
+                secret.clone(),
+                Some(payload_secret.clone()),
+                hash_key.clone(),
+                &table,
+                &bank,
+                b"shared-lut-helpers".as_slice(),
+            )
+            .unwrap();
+        let public_helpers = helpers
+            .iter()
+            .map(|helper| {
+                LutPublicHelper::with_mask_bank(
+                    helper.sigma(),
+                    helper.switch().public_projection(),
+                    public_bank.clone(),
                 )
-                .unwrap();
-            let public_helpers = helpers
-                .iter()
-                .map(|helper| {
-                    LutPublicHelper::with_mask_bank(
-                        helper.sigma(),
-                        helper.switch().public_projection(),
-                        public_bank.clone(),
-                    )
-                    .unwrap()
-                })
-                .collect();
-            let gate = crate::program::ProgramGateInstance::Gate { step: 0 };
-            let public_helpers = BTreeMap::from([(
-                gate,
-                crate::program::ProgramValue::Scalar(
-                    LutPublicHelperSet::new(&table, public_helpers).unwrap(),
-                ),
-            )]);
-            let encoding_helpers = BTreeMap::from([(
-                gate,
-                crate::program::ProgramValue::Scalar(LutHelperSet::new(&table, helpers).unwrap()),
-            )]);
+                .unwrap()
+            })
+            .collect();
+        let gate = crate::program::ProgramGateInstance::Gate { step: 1 };
+        let public_helpers = BTreeMap::from([(
+            gate,
+            crate::program::ProgramValue::Scalar(
+                LutPublicHelperSet::new(&table, public_helpers).unwrap(),
+            ),
+        )]);
+        let encoding_helpers = BTreeMap::from([(
+            gate,
+            crate::program::ProgramValue::Scalar(LutHelperSet::new(&table, helpers).unwrap()),
+        )]);
+        for y in 0..4 {
+            let rhs_plain = exponent.mono(&ring, &BigInt::from(2 * y)).unwrap();
             let rhs = sampler
                 .sample_cross_secret_rhs(
                     payload_secret.clone(),
@@ -1055,12 +1058,12 @@ mod tests {
                 prepared
                     .cache()
                     .gate_entry(crate::program::ProgramGateInstance::Gate { step: 0 })
-                    .is_none()
+                    .is_some()
             );
             assert!(
                 prepared
                     .cache()
-                    .lut_entry(crate::program::ProgramGateInstance::Gate { step: 0 })
+                    .lut_entry(crate::program::ProgramGateInstance::Gate { step: 1 })
                     .is_some()
             );
             let output_key = &prepared.public_values()[&output];

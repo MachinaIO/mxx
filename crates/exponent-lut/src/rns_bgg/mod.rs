@@ -1898,14 +1898,14 @@ pub(self) fn check_lut_binding(
     program: &ExponentLutProgram,
     lut: LutId,
     level: usize,
-    rhs: Option<&[u8; 32]>,
     binding: &RnsBggLutBinding,
 ) -> Result<(), RnsBggError> {
     let table = program.lut(lut).ok_or(RnsBggError::Lut)?;
     if binding.context != scheme.context ||
         binding.level != level ||
         binding.table != Some(table.commitment()) ||
-        binding.rhs.as_ref() != rhs
+        binding.rhs.is_some() ||
+        table.rhs_width().is_some()
     {
         return Err(RnsBggError::Context);
     }
@@ -1939,18 +1939,18 @@ pub type RnsBggPublicProgramValue =
 pub type RnsBggEncodingProgramValue =
     ProgramValue<(RnsBggEncoding, Option<Mat>), Family<(RnsBggEncoding, Option<Mat>)>>;
 
-/// Fixed products consume a prepared ciphertext; fused LUT branches already
-/// include the RHS plaintext, so their binding needs only its artifact identity.
+/// Public preparation consumes a fixed RHS ciphertext. Online private
+/// multiplication binds its identity to the already prepared ciphertext.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum RnsBggPublicRhs<M = RnsBggMatrix, D = RnsBggDigits> {
     Fixed(RnsBggPrivateRhs<M, D>),
-    Lut([u8; 32]),
+    Identity([u8; 32]),
 }
 impl<M, D> RnsBggPublicRhs<M, D> {
     pub fn id(&self) -> [u8; 32] {
         match self {
             Self::Fixed(rhs) => rhs.rhs_id,
-            Self::Lut(id) => *id,
+            Self::Identity(id) => *id,
         }
     }
 }

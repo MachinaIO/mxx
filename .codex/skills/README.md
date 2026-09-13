@@ -1,71 +1,14 @@
-# Runpod Agent Skills
+# Runpod Skills for mxx
 
-Skills for AI agents to manage GPU workloads on Runpod.
+These repository-local skills adapt upstream Runpod guidance to mxx. They are already present in this checkout; using them does not require reinstalling the upstream collection.
 
-## Available Skills
+| Skill | Use when |
+| --- | --- |
+| `.codex/skills/bench-on-runpod/SKILL.md` | Running mxx programs, tests, or benchmarks on Runpod pods. |
+| `.codex/skills/runpodctl/SKILL.md` | Inspecting or managing Runpod resources through the CLI. |
+| `.codex/skills/flash/SKILL.md` | Implementing or operating Runpod Flash serverless endpoints. |
+| `.codex/skills/companion-clis/SKILL.md` | A Runpod task needs HuggingFace, GitHub, Docker, or S3 CLI operations. |
 
-### flash
+Each entrypoint links to command details needed for its workflow. Read these selectively. Example resource names, GPU choices, and mutation commands are illustrative, not permission or deployment defaults. See `.codex/skills/AGENTS.md` when maintaining these skills.
 
-Complete knowledge of the runpod-flash framework - SDK, CLI, architecture, deployment, and codebase. Use when working with runpod-flash code, writing `@remote` functions, configuring resources, debugging deployments, or understanding the framework internals.
-
-### runpodctl
-
-Manage GPU pods, serverless endpoints, templates, volumes, and models.
-
-## Installation
-
-```bash
-npx skills add runpod/skills
-```
-
-Works with Claude Code, Cursor, GitHub Copilot, Windsurf, Cline, and [17+ other AI agents](https://skills.sh/).
-
-## Setup
-
-```bash
-runpodctl doctor
-```
-
-## Usage
-
-Ask your AI agent:
-
-- "Create a pod with an RTX 4090"
-- "List my pods"
-- "What GPUs are available?"
-- "Show my account balance"
-- "Deploy a serverless endpoint"
-
-## URLs
-
-### Pod URLs
-
-Access exposed ports on your pod:
-
-```
-https://<pod-id>-<port>.proxy.runpod.net
-```
-
-Example: `https://abc123xyz-8888.proxy.runpod.net`
-
-### Serverless URLs
-
-```
-https://api.runpod.ai/v2/<endpoint-id>/run        # Async request
-https://api.runpod.ai/v2/<endpoint-id>/runsync    # Sync request
-https://api.runpod.ai/v2/<endpoint-id>/health     # Health check
-https://api.runpod.ai/v2/<endpoint-id>/status/<job-id>  # Job status
-```
-
-## Structure
-
-```
-flash/
-└── SKILL.md
-runpodctl/
-└── SKILL.md
-```
-
-## License
-
-Apache-2.0
+Upstream Runpod skill material is licensed under Apache-2.0; see `.codex/skills/LICENSE`.

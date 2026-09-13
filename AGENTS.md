@@ -26,6 +26,8 @@ mxx implements lattice-cryptography operations in Rust and CUDA, including polyn
 
 ## Execution and Completion
 
+- Read the smallest relevant file sections and tool outputs. Narrow searches by path and symbol, and summarize large results before returning them to the model.
+- Reuse evidence already collected in the current task. Re-read files or rerun checks only when changes, failures, or unresolved uncertainty could affect the conclusion.
 - Identify the requested outcome and appropriate validation before editing. Complete related changes across the production path before testing; use an intermediate check only when it resolves an implementation uncertainty.
 - Match validation to the change. For documentation-only edits, check links, examples, and instruction consistency; do not build Rust or run GPUs. For code changes, follow the relevant checks in `BUILDER.md` and `GPU.md`.
 - Once checks pass, repeat or broaden them only for new changes, failures, required repetition, or unresolved risks. Do not equate compilation, simulation, GPU execution, and end-to-end correctness.

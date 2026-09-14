@@ -1,6 +1,6 @@
 #![cfg(feature = "gpu")]
 
-//! GPU round trip for the §5.2 NAND compiler.  The test deliberately uses a
+//! GPU round trip for the NAND-to-unary-LUT compiler. The test deliberately uses a
 //! real RNS-BGG Program, including every MulPrivate/LUT pair emitted by the
 //! compiler.  Noise acceptance is performed on that same Program before any
 //! graph is built.
@@ -27,7 +27,10 @@ use mxx_exponent_lut::{
 use mxx_ir_core::ParamEnv;
 use mxx_primitives::poly::{
     Poly, PolyParams,
-    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+    dcrt::{
+        gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+        params::DCRTPolyParams,
+    },
 };
 use mxx_runtime::{
     ExecutionConfig, RuntimeValue,
@@ -38,13 +41,51 @@ use mxx_runtime::{
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::One;
-use std::{collections::BTreeMap, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Instant};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .map(|value| value.parse().expect("integer environment value"))
         .unwrap_or(default)
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name).as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        Err(error) => panic!("invalid {name}: {error}"),
+        Ok(value) => panic!("{name} must be either 0 or 1, got {value:?}"),
+    }
+}
+
+/// Run the same ternary-secret/Gaussian-error model used by the Exponent-LUT
+/// parameter search against the selected level-zero (largest) RNS modulus.
+fn lattice_security_bits(parameters: &DCRTPolyParams, sigma: &BigDecimal) -> u64 {
+    let output = Command::new("lattice-estimator-cli")
+        .arg(parameters.ring_dimension().to_string())
+        .arg(parameters.modulus().as_ref().to_string())
+        .arg("--s-dist")
+        .arg(r#"{"name":"Ternary"}"#)
+        .arg("--e-dist")
+        .arg(format!(r#"{{"name":"DiscreteGaussian","stddev":{sigma}}}"#))
+        .output()
+        .expect("lattice-estimator-cli and Sage must be available on PATH");
+    assert!(
+        output.status.success(),
+        "lattice-estimator-cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("lattice-estimator output must be UTF-8");
+    let estimates = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
+        .collect::<Vec<_>>();
+    let [estimate] = estimates.as_slice() else {
+        panic!("lattice-estimator-cli must print exactly one integer estimate: {stdout}");
+    };
+    estimate.parse().expect("lattice security estimate must fit u64")
 }
 
 fn log_cost_report(stage: &str, report: &CostReport) {
@@ -156,17 +197,43 @@ fn noise_bindings(
 
 #[test]
 fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
+    // Test-shape controls. The small default ring keeps this local GPU integration
+    // test practical; it is deliberately capped at 2^8 by the test contract.
     let depth = env_usize("MXX_EXPONENT_LUT_NAND_DEPTH", 1);
     let n = env_usize("MXX_PRIMITIVE_TEST_RING_DIMENSION", 32);
     assert!(n <= 1 << 8, "NAND integration ring dimension must be at most 2^8");
     let operations_per_drop = env_usize("MXX_EXPONENT_LUT_NAND_OPERATIONS_PER_DROP", 2);
     assert!(operations_per_drop > 1, "this test must exercise multi-operation cadence");
     let circuit = balanced_circuit(depth);
+    // The compiler represents a leaf by one input-controlled matrix shear. A
+    // NAND node evaluates its left and right subcircuits twice each; its leading
+    // fixed shear is fused into the first child operation. Hence T(0)=1 and
+    // T(d)=4*T(d-1), so a balanced depth-d tree has 4^d rounds.
     let rounds = 1usize.checked_shl((2 * depth) as u32).expect("round count overflow");
     let compiled = circuit.compile(ExpLayout { stride_log2: 0, width_log2: 4 }, n, rounds).unwrap();
+    // Every round consumes exactly one original-bit RHS. A binary LUT is
+    // represented by one MulPrivate followed by one unary LUT, hence two steps.
     assert_eq!(compiled.rhs_ids().len(), rounds);
     assert_eq!(compiled.program().steps().len(), rounds * 2);
 
+    // Public workload contract used by the arithmetic planner:
+    // - ring_dimension: polynomial degree (small and configurable for this test).
+    // - widths: active exponent-domain width used by each planner stage. A round alternates the
+    //   8-state domain with its packed 8x2=16 LUT domain; the final width-one entry accounts for
+    //   the terminal Boolean.
+    // - slots: independently materialized ciphertext values processed by a stage (not polynomial
+    //   SIMD slots). This serial scalar Program has one.
+    // - encoding_error_sigma: reviewed runtime/estimator sigma. The runtime derives
+    //   floor(6.5*sigma)=26 and applies that Gaussian hard cutoff.
+    // - crt_bits: bits per CRT prime. The requested 32-bit test contract makes the planner derive
+    //   base_bits=ceil(32/2)=16.
+    // - terminal_depth/max_crt_depth: candidate terminal prefix depth and the exhaustive search
+    //   ceiling for the CRT chain.
+    // - memory_budget_bytes: cap on the planner's modeled peak live LUT graph values. It excludes
+    //   allocator/NTT workspaces and is not total GPU VRAM; 4 GiB is a conservative
+    //   integration-test planning cap.
+    // - terminal_value_bound: the decoded Boolean coefficient is in {0,1}.
+    // - operations_per_drop: the MulPrivate/LUT pair shares one physical level.
     let request = RnsBggPlanRequest {
         ring_dimension: n as u32,
         widths: (0..rounds).flat_map(|_| [8, 16]).chain([1]).collect(),
@@ -180,27 +247,26 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
         operations_per_drop,
     };
     assert_eq!(request.crt_bits, 32, "NAND integration requires 32-bit CRT primes");
-    // Run strict worst-case acceptance and its complete production round trip
-    // before trying the conditional average-case model.
-    let noiseless = std::env::var("MXX_EXPONENT_LUT_NAND_NOISELESS").as_deref() == Ok("1");
-    run_nand_case(&circuit, &compiled, &request, None);
-    if noiseless {
-        println!("nand_noiseless=true; skipping duplicate average-case run");
-        return;
-    }
+    // Execution noise and analytical acceptance are independent explicit
+    // selectors. Noiseless execution is test-only and is never run unless the
+    // flag is exactly 1. Exactly one noise model runs; average is the default.
+    let noiseless = env_flag("MXX_EXPONENT_LUT_NAND_NOISELESS");
     let failure_exponent = u32::try_from(env_usize("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS", 1))
         .expect("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS must fit u32");
     assert!(failure_exponent > 0, "noise failure exponent must be positive");
-    run_nand_case(
-        &circuit,
-        &compiled,
-        &request,
-        Some(&AverageCaseConfig {
+    let average = match std::env::var("MXX_EXPONENT_LUT_NAND_NOISE_MODEL").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("average") => Some(AverageCaseConfig {
             failure_exponent,
             allow_average_acceptance: true,
             ..Default::default()
         }),
-    );
+        Ok("worst") => None,
+        Err(error) => panic!("invalid MXX_EXPONENT_LUT_NAND_NOISE_MODEL: {error}"),
+        Ok(value) => {
+            panic!("MXX_EXPONENT_LUT_NAND_NOISE_MODEL must be `average` or `worst`, got {value:?}")
+        }
+    };
+    run_nand_case(&circuit, &compiled, &request, average.as_ref(), noiseless);
 }
 
 fn run_nand_case(
@@ -208,6 +274,7 @@ fn run_nand_case(
     compiled: &CompiledNandCircuit,
     request: &RnsBggPlanRequest,
     average: Option<&AverageCaseConfig>,
+    noiseless: bool,
 ) {
     let rounds = compiled.rhs_ids().len();
     let readout_width = request.ring_dimension as usize;
@@ -229,6 +296,14 @@ fn run_nand_case(
         &helpers,
         Some(&gate_helpers),
     );
+    // `plan` constructs a concrete nested CRT chain from the public widths,
+    // slot counts, cadence, noise sigma, memory cap, and candidate terminal
+    // depth. `audit_program` then interprets the actual compiled Program DAG and
+    // checks its deterministic or explicitly enabled average-case noise trace.
+    // Neither function runs a lattice estimator or certifies RLWE security.
+    // `MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS` is a tail-failure exponent for
+    // average-case acceptance, not a lattice-security target.
+    //
     // Search the actual CRT depths exhaustively: prime-chain candidates are
     // not assumed to have monotone acceptance. Each candidate must pass both
     // the Program noise audit and the decoder-spacing check at the terminal level.
@@ -245,7 +320,7 @@ fn run_nand_case(
                 .ok()?;
             let readout_level = parameters.levels().len().checked_sub(2)?;
             let output_level = readout_level + 1;
-            let scale = parameters.level(output_level).ok()?.modulus().as_ref() / 4u8;
+            let scale = parameters.level(output_level).ok()?.modulus().as_ref() / 2u8;
             let terminal = parameters
                 .terminal_noise_bound(
                     readout_level,
@@ -253,10 +328,13 @@ fn run_nand_case(
                     scale.clone(),
                 )
                 .ok()?;
-            let decoder_spacing = scale / 2u8;
-            (parameters.terminal_noise_fits(output_level, &terminal).ok()? &&
-                &terminal.error * 2u8 < decoder_spacing)
-                .then_some((parameters, trace, terminal))
+            // The terminal readout embeds Boolean 0 at 0 and Boolean 1 at q/2.
+            // `threshold_decode(2)` places both decision boundaries q/4 from
+            // those centers, so the exact strict decoding condition is
+            // |error| < q/4 = scale/2. The generic `terminal_noise_fits` uses a
+            // stricter q/8 policy and is intentionally not applied here.
+            let decoder_radius = scale / 2u8;
+            (terminal.error < decoder_radius).then_some((parameters, trace, terminal))
         })
     };
     let mut accepted = None;
@@ -273,35 +351,57 @@ fn run_nand_case(
     );
     let (_, parameters, trace, terminal_noise) =
         accepted.expect("no CRT depth passed eval_ok and decoder decryption_ok");
+    // Arithmetic/noise acceptance is not a security estimate. Certify the
+    // actually selected ring dimension and largest q with the external lattice
+    // estimator before constructing either GPU graph.
+    let required_security_bits = u64::try_from(env_usize("MXX_EXPONENT_LUT_NAND_SECURITY_BITS", 1))
+        .expect("security target must fit u64");
+    assert!(required_security_bits > 0, "lattice security target must be positive");
+    let achieved_security_bits =
+        lattice_security_bits(parameters.level(0).unwrap(), &request.encoding_error_sigma);
+    assert!(
+        achieved_security_bits >= required_security_bits,
+        "selected RNS-BGG parameters provide {achieved_security_bits} lattice-security bits, below the required {required_security_bits}"
+    );
     println!(
-        "nand_noise_audit model={} failure_exponent={} rounds={rounds} cadence={operations_per_drop} crt_depth={} base_bits={} events={} bound={}",
+        "nand_noise_audit model={} failure_exponent={} rounds={rounds} cadence={operations_per_drop} crt_depth={} base_bits={} events={} bound={} lattice_security_bits={} required_lattice_security_bits={}",
         if average.is_some() { "average-case" } else { "worst-case" },
         average.map_or(0, |config| config.failure_exponent),
         parameters.levels()[0].crt_depth(),
         parameters.levels()[0].base_bits(),
         trace.joint_event_count,
-        terminal_noise.error
+        terminal_noise.error,
+        achieved_security_bits,
+        required_security_bits,
     );
 
     let assignment =
         (0..circuit.input_count()).map(|_| usize::from(rand::random::<bool>())).collect::<Vec<_>>();
     let expected = oracle(&circuit, &assignment);
     let context = rand::random();
+    // RnsBggScheme groups the public API used below into four phases:
+    // (1) sample secrets/keys and prepare input/RHS/LUT/readout material,
+    // (2) export that public preprocessing into an artifact-producing graph,
+    // (3) import the manifest-validated descriptors and evaluate online,
+    // and (4) project/decrypt the readout. `new_noiseless_for_testing` changes
+    // only fresh encoding-error nodes and is unavailable without `test-utils`.
     #[cfg(feature = "test-utils")]
-    let scheme = if std::env::var("MXX_EXPONENT_LUT_NAND_NOISELESS").as_deref() == Ok("1") {
+    let scheme = if noiseless {
         RnsBggScheme::new_noiseless_for_testing(parameters.clone(), context)
     } else {
         RnsBggScheme::new(parameters.clone(), context)
     };
     #[cfg(not(feature = "test-utils"))]
     let scheme = {
-        if std::env::var("MXX_EXPONENT_LUT_NAND_NOISELESS").as_deref() == Ok("1") {
+        if noiseless {
             panic!(
                 "MXX_EXPONENT_LUT_NAND_NOISELESS=1 requires mxx-exponent-lut feature `test-utils`"
             );
         }
         RnsBggScheme::new(parameters.clone(), context)
     };
+    // Secret setup and input encoding. The hash-key input is public runtime
+    // entropy; domain-separated tags give each sampled object a distinct site.
     let payload_secret = scheme.sample_payload_secret().unwrap();
     let mask_secret = scheme.sample_mask_secret().unwrap();
     let high = scheme.ring(0).unwrap();
@@ -315,6 +415,9 @@ fn run_nand_case(
             ExpLayout { stride_log2: 0, width_log2: 4 }.mono(&high, &BigInt::from(2)).unwrap(),
         )
         .unwrap();
+    // Prepare one private RHS package per compiled matrix-shear round. Each
+    // package encrypts the original circuit bit selected by that round, never
+    // an intermediate value.
     let mut rhs_public = BTreeMap::new();
     for (round, rhs_id) in compiled.rhs_ids().iter().copied().enumerate() {
         let level = round * 2;
@@ -335,7 +438,15 @@ fn run_nand_case(
         let prepared = scheme.prepare_private_rhs(&sampled).unwrap();
         rhs_public.insert(rhs_id, RnsBggPublicRhs::Fixed(prepared));
     }
-    let mut lut_helpers = BTreeMap::new();
+    // `LutId` identifies only the logical unary table, and this NAND lowering
+    // keeps the private RHS in the preceding MulPrivate gate (`rhs=None` below).
+    // The current RNS-BGG *cryptographic* helper is nevertheless not table-only:
+    // `RnsBggLutMaterial` records its level and mask-bank identity, and
+    // `prepare_lut` rejects a helper whose level differs from the input key.
+    // Bind that material by gate instance until RNS-BGG exposes a genuinely
+    // level-independent table helper; reusing one object solely by LutId would
+    // be invalid when the same table occurs at different levels.
+    let mut lut_gate_helpers = BTreeMap::new();
     for (step, operation) in compiled.program().steps().iter().enumerate() {
         let mxx_exponent_lut::program::ProgramStep::Gate(Gate::Lut { lut_id, .. }) = operation
         else {
@@ -361,8 +472,9 @@ fn run_nand_case(
                 rand::random(),
             )
             .unwrap();
-        lut_helpers.insert(*lut_id, ProgramValue::Scalar(material));
+        lut_gate_helpers.insert(ProgramGateInstance::Gate { step }, ProgramValue::Scalar(material));
     }
+    let lut_helpers = BTreeMap::new();
     let public_inputs = BTreeMap::from([(compiled.state_input(), (key.clone(), None))]);
     let prepared = PreparedProgram::new(
         scheme.clone(),
@@ -373,12 +485,14 @@ fn run_nand_case(
             &BTreeMap::new(),
             &BTreeMap::new(),
             &lut_helpers,
-            None,
+            Some(&lut_gate_helpers),
         ),
         ProgramFamilyBindings::new(),
         None,
     )
     .unwrap();
+    // Readout preprocessing maps the terminal Boolean to 0 or q/2 and prepares
+    // the public projection needed to remove the online mask after evaluation.
     let readout_layout = ExpLayout { stride_log2: 0, width_log2: readout_width.trailing_zeros() };
     let readout = ValueReadout::from_canonical_values(
         readout_layout,
@@ -388,7 +502,7 @@ fn run_nand_case(
     // The readout is one production transition after the final program gate.
     let readout_level = rounds * 2;
     let readout_q = parameters.level(readout_level + 1).unwrap().modulus().as_ref().clone();
-    let readout_scale = &readout_q / 4u8;
+    let readout_scale = &readout_q / 2u8;
     let readout_bank = scheme
         .sample_mask_bank(
             readout_level,
@@ -416,6 +530,9 @@ fn run_nand_case(
     let readout_binding = prepared_readout.binding();
     let readout_id = prepared_readout.id();
     let input_key_id = public_readout_input.scalar().unwrap().0.id().to_owned();
+    // `producer` is the preprocessing graph under construction. Each export
+    // appends nodes that persist one class of reusable public material and
+    // returns its typed descriptor. Building freezes the combined graph.
     let binding = scheme.fixed_product_binding();
     let (producer, descriptor) =
         prepared.export(binding.clone(), DslContext::new("nand-preprocess"), "nand").unwrap();
@@ -424,10 +541,6 @@ fn run_nand_case(
     let (producer, readout_descriptor) =
         scheme.export_prepared_readout(&prepared_readout, producer, "nand-readout").unwrap();
     let producer = producer.build().unwrap().validate(&ParamEnv::default()).unwrap();
-    if std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("graph") {
-        println!("nand_graph_only=true");
-        return;
-    }
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "NAND test requires a detected GPU");
     let make_estimator = || {
@@ -463,8 +576,16 @@ fn run_nand_case(
         .iter()
         .map(|p| GpuDCRTPolyParams::new(p.ring_dimension(), p.to_crt().0, p.base_bits(), None));
     let mut backend = gpu_backend_on(rings, devices.iter().copied());
-    let directory = tempfile::tempdir_in("test_data").unwrap();
-    let mut store = FileArtifactStore::new(directory.path()).unwrap();
+    // A configured directory keeps artifacts for inspection/reuse. Otherwise a
+    // test-owned temporary directory under test_data is removed automatically.
+    let configured_directory =
+        std::env::var_os("MXX_EXPONENT_LUT_NAND_ARTIFACT_DIR").map(PathBuf::from);
+    let temporary_directory =
+        configured_directory.is_none().then(|| tempfile::tempdir_in("test_data").unwrap());
+    let directory = configured_directory.as_deref().unwrap_or_else(|| {
+        temporary_directory.as_ref().expect("temporary artifact directory").path()
+    });
+    let mut store = FileArtifactStore::new(directory).unwrap();
     let started = Instant::now();
     let produced = execute_with_config(
         &producer,
@@ -474,6 +595,9 @@ fn run_nand_case(
             RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
         )]),
         &mut store,
+        // Production uses Fresh. Record/Replay are generic runtime diagnostics
+        // for reproducing non-hash random nodes; deterministic hash nodes are
+        // already reproduced by supplying the same key and domain-separated tag.
         SamplingMode::Fresh,
         ExecutionConfig::default(),
     )
@@ -482,7 +606,11 @@ fn run_nand_case(
     let production = produced.production_id.unwrap();
     drop(produced.outputs);
     drop(store);
-    let mut store = FileArtifactStore::open(directory.path()).unwrap();
+    let mut store = FileArtifactStore::open(directory).unwrap();
+    // The manifest records the IR version, production/spec identity, and each
+    // artifact's type, family cardinality, confidentiality, and optional public
+    // content hash. Loading validates that metadata; payload hashes are checked
+    // later when the corresponding public artifacts are loaded.
     let manifest = store.load_manifest(&production).unwrap();
     let descriptor = serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
     let readout_descriptor =
@@ -516,6 +644,8 @@ fn run_nand_case(
         )
         .unwrap();
     let encoded = scheme.encode(&mask_secret, &key, &material).unwrap();
+    // Derive the mask-secret-dependent online rows for every imported gate
+    // helper. The public heavy preprocessing itself remains in `reopened`.
     let online_helpers = reopened.prepare_online_helpers(&mask_secret).unwrap();
     let online_rhs =
         rhs_public.into_iter().map(|(id, rhs)| (id, RnsBggPublicRhs::Identity(rhs.id()))).collect();
@@ -530,9 +660,15 @@ fn run_nand_case(
             Some(&online_helpers),
         ))
         .unwrap();
+    // `evaluate` interprets the compiled Program using the encoded input,
+    // identity-only references to the already prepared RHS artifacts, and the
+    // online mask rows. The selected output wire is the encrypted NAND result.
     let accumulation = values[&output].0.clone();
     let online_masks =
         scheme.prepare_online_masks(&mask_secret, &prepared_readout.mask_bank()).unwrap();
+    // Readout evaluation converts the terminal encoding into its masked
+    // canonical-value representation; projection computes the matching public
+    // matrix used by the trusted test oracle below.
     let readout_value = scheme
         .evaluate_readout(
             &readout,
@@ -545,6 +681,10 @@ fn run_nand_case(
     let mask = scheme.mask_at(&mask_secret, level).unwrap();
     let public_readout =
         scheme.project_readout(&readout, &public_readout_input, &prepared_readout, &()).unwrap();
+    // The online graph exports all values needed to verify this exact execution:
+    // `readout` is the masked encoding result, `mask` is its matching secret row,
+    // and `public-readout` is the public matrix used in c - mask*A. Exporting all
+    // three prevents the oracle from rebuilding a second stochastic online run.
     let online = DslContext::new("nand-online")
         .output("readout", readout_value.values.scalar().unwrap().clone())
         .unwrap()
@@ -649,7 +789,7 @@ fn run_nand_case(
     let decoded = decrypted
         .entry(0, 0)
         .clone()
-        .threshold_decode_bools(4, 1)
+        .threshold_decode_bools(2, 1)
         .into_iter()
         .next()
         .expect("decrypted readout decoder output");
